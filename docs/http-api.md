@@ -49,6 +49,8 @@ summary or a 404. the shape:
       "name": "fetch_orders",
       "deps": [],
       "retries": 0,
+      "timeout_secs": 30.0,
+      "pool": "orders_api",
       "input_type": null,
       "output_type": null,
       "params_type": "demo::FetchParams"
@@ -59,12 +61,20 @@ summary or a 404. the shape:
       "next_fire": "2026-08-07T12:34:00+00:00" }
   ],
   "last_run": { "...": "a run object, or null" },
+  "max_parallel": 4,
+  "pools": [ { "name": "orders_api", "limit": 3 } ],
+  "overlap": "skip",
   "interval_secs": 120,
   "overdue": false
 }
 ```
 
-`interval_secs` is the gap between the next two fires, minimized across the
+`max_parallel` caps ops of this job (null for uncapped). `pools` lists the
+[concurrency pools](concepts.md#concurrency-pools) this job's ops draw from,
+in first-use order, with the limit each carries — that limit is shared with
+every other job in the process, not per job. an op's `pool` is the pool it
+takes a permit from (null for most ops) and `timeout_secs` its per-attempt
+time limit (null for none). `interval_secs` is the gap between the next two fires, minimized across the
 job's unpaused schedules (`null` without one); `overdue` is true when the
 previous scheduled fire is more than half an interval past and no successful
 run has finished since it (see [scheduling](scheduling.md)). the type fields
@@ -150,9 +160,14 @@ without `before` is ignored. a run:
   "created_at": "2026-08-07T12:00:00Z",
   "started_at": "2026-08-07T12:00:00Z",
   "finished_at": "2026-08-07T12:00:03Z",
+  "error": null,
   "resumed_from": null
 }
 ```
+
+a failed run's `error` names the first op that terminally failed, as
+`"op publish failed: warehouse connection reset"` — the same pair an
+`on_failure` hook receives. it is null on runs that did not fail.
 
 `status` is `queued | running | success | failed | canceled`; `trigger` is
 `manual | schedule | retry | resume | build | sensor`. an op run's status is
@@ -257,9 +272,11 @@ list.
 ## Cancel
 
 `POST /api/runs/{id}/cancel` asks a queued or running run to stop — the
-semantics (which ops end up `canceled`, the blocking-section caveat) are in
-[concepts](concepts.md). 202 `{"ok": true}` when the signal was sent: the
-cancel is asynchronous, so poll the run until its status flips. 404 for an
+semantics (which ops end up `canceled`, what a blocking op has to do to stop
+at all, and why some canceled op runs have no `finished_at`) are in
+[concepts](concepts.md#cancellation). 202 `{"ok": true}` when the signal was
+sent: the cancel is asynchronous, and the run holds a short grace period open
+for its ops to land, so poll the run until its status flips. 404 for an
 unknown id. 409 (`run already finished: ...`) when the run is terminal —
 including a run recorded as active by a process that died, which the next
 startup's sweep marks failed.

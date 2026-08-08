@@ -611,6 +611,7 @@ mod tests {
             created_at: chrono::Utc::now(),
             started_at: None,
             finished_at: None,
+            error: None,
             resumed_from: None,
         };
         store.create_run(&active, &[]).unwrap();
@@ -625,7 +626,9 @@ mod tests {
         assert_eq!(store.runs(None, None, None, None, 10).unwrap().len(), 1);
 
         // the next tick sees an unchanged fingerprint and still catches up
-        store.run_finished("active", RunStatus::Success).unwrap();
+        store
+            .run_finished("active", RunStatus::Success, None)
+            .unwrap();
         evaluate(&entry, &runner, &reg).await;
         let ticks = store.sensor_ticks(Some("probe:docs"), 10).unwrap();
         assert_eq!(ticks[0].outcome, SensorOutcome::Fired);

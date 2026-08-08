@@ -69,7 +69,9 @@ server's message inline, and nothing is recorded.
 
 the graph section draws the dag, columns laid out by longest dependency path.
 clicking a node opens the op inspector: deps and dependents, the retry
-budget, declared params/input/output types, and history over the last 50
+budget, any per-attempt `timeout`, the [concurrency pool](concepts.md#concurrency-pools)
+the op draws from with that pool's process-wide limit, declared
+params/input/output types, and history over the last 50
 runs: average and p95 duration, failure count, a duration trend, and the most
 recent error verbatim. when the op has committed watermark state via
 `ctx.set_state` ([op state](state.md)), a state line shows the value as json

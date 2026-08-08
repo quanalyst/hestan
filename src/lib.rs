@@ -3,6 +3,7 @@
 
 mod app;
 mod asset;
+mod backoff;
 mod error;
 mod executor;
 mod graph;

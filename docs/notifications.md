@@ -16,7 +16,8 @@ database write) without stalling the executor or other runs, and a panicking
 one is caught and logged as a warning without touching the others. driving
 `Runner` directly, the same hooks go in through
 `Runner::with_failure_hooks(jobs, store, hooks)`; `Runner::new` is that with
-no hooks.
+no hooks, and `Runner::with_pools(jobs, store, hooks, pools)` adds
+[concurrency pools](concepts.md#concurrency-pools).
 
 ## RunFailure
 
@@ -34,6 +35,11 @@ the hook receives one `RunFailure` per failed run:
 `failed_op` is the first terminal failure; with parallel branches other ops
 may have failed after it, and their errors are in the run's op runs and
 events, queryable by `run_id`.
+
+the run row itself carries the same thing: `run.error` is
+`op {failed_op} failed: {error}`, so an alert that only ever sees a run —
+from `GET /api/runs/{id}`, or straight out of the store — is not left
+guessing why it failed.
 
 ## When nothing fires
 

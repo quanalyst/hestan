@@ -32,6 +32,14 @@ no server. `launch` and `run` as described in [concepts](concepts.md), with
 last and logs a warning, while `Hestan` refuses to build
 (`Error::DuplicateJob`).
 
+`Runner::new` declares no [concurrency pools](concepts.md#concurrency-pools),
+so an op with `.pool(name)` fails at run time with
+`op takes from pool {name}, which is not declared` — running it unlimited
+would quietly break the promise the pool exists to keep. use
+`Runner::with_pools(jobs, store, hooks, [("api".into(), 3)])`, which validates
+every op's pool up front and returns `Error::Graph` if one is missing;
+`Hestan::pool(name, limit)` is the same check at build.
+
 ## Testing your jobs
 
 `Store::open(":memory:")` makes job tests self-contained and fast — this is

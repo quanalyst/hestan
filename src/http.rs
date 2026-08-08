@@ -130,8 +130,9 @@ impl HttpSource {
         self
     }
 
-    /// backoff base: the nth retry waits `retry_delay * 2^n`, capped at 30s
-    /// (default 1s).
+    /// backoff base: the nth retry waits a jittered slice of
+    /// `retry_delay * 2^n`, capped at 30s (default 1s). a numeric
+    /// `Retry-After` from the server overrides it and is honored exactly.
     pub fn retry_delay(mut self, d: Duration) -> Self {
         self.retry_delay = d;
         self
@@ -300,13 +301,15 @@ impl Request {
             if attempt >= self.retries {
                 return Err(msg.into());
             }
-            let backoff = self
-                .retry_delay
-                .saturating_mul(2u32.saturating_pow(attempt))
-                .min(MAX_BACKOFF);
-            let delay = retry_after
-                .map_or(backoff, |ra| ra.max(backoff))
-                .min(MAX_RETRY_AFTER);
+            let backoff =
+                crate::backoff::capped_exponential(self.retry_delay, attempt, MAX_BACKOFF);
+            // a server that named a delay gets exactly that delay; one that did
+            // not gets a jittered window, so a fan-out doesn't come back as a
+            // herd on the same second
+            let delay = match retry_after {
+                Some(ra) => ra.max(backoff).min(MAX_RETRY_AFTER),
+                None => crate::backoff::full_jitter(backoff),
+            };
             ctx.warn(format!("{brief}, retrying in {delay:?}"));
             tokio::time::sleep(delay).await;
             attempt += 1;

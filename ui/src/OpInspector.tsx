@@ -1,7 +1,7 @@
 import { useEffect } from "react";
 import MicroBars from "./MicroBars";
 import type { MicroBar } from "./MicroBars";
-import type { JobState, OpStat, OpSummary } from "./types";
+import type { JobPool, JobState, OpStat, OpSummary } from "./types";
 import { fmtDuration, relTime } from "./util";
 
 const TITLE_CAP = 2000;
@@ -15,12 +15,14 @@ const statBars = (stat: OpStat): MicroBar[] =>
 export default function OpInspector({
   ops,
   name,
+  pools = [],
   stat,
   state,
   onClose,
 }: {
   ops: OpSummary[];
   name: string;
+  pools?: JobPool[];
   stat?: OpStat;
   state?: JobState;
   onClose: () => void;
@@ -36,6 +38,9 @@ export default function OpInspector({
   const op = ops.find((o) => o.name === name);
   if (!op) return null;
   const dependents = ops.filter((o) => o.deps.includes(name)).map((o) => o.name);
+  // the limit belongs to the pool, not to this op: every job in the process
+  // draws from the same one
+  const poolLimit = pools.find((p) => p.name === op?.pool)?.limit ?? null;
   const stateJson = state === undefined ? null : JSON.stringify(state.value);
   const stateClipped = stateJson !== null && stateJson.length > 120;
   // capped, or a multi-megabyte state would sit in the DOM as one attribute
@@ -80,6 +85,21 @@ export default function OpInspector({
           <span className="op-line-label">retries</span>
           <span className="num">{op.retries}</span>
         </div>
+        {op.timeout_secs !== null && (
+          <div className="op-line">
+            <span className="op-line-label">timeout</span>
+            <span className="num">{fmtDuration(op.timeout_secs * 1000)}</span>
+          </div>
+        )}
+        {op.pool && (
+          <div className="op-line">
+            <span className="op-line-label">pool</span>
+            <span className="mono">
+              {op.pool}
+              {poolLimit !== null && ` · ${poolLimit} at once`}
+            </span>
+          </div>
+        )}
         {op.params_type && (
           <div className="op-line">
             <span className="op-line-label">params</span>

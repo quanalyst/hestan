@@ -21,6 +21,7 @@ pub struct Hestan {
     schedules: Vec<(String, String, String)>,
     assets: Vec<Asset>,
     sensors: Vec<Sensor>,
+    pools: Vec<(String, usize)>,
     db_path: String,
     hooks: Vec<FailureHook>,
     retention_days: Option<u32>,
@@ -35,6 +36,7 @@ impl Default for Hestan {
             schedules: Vec::new(),
             assets: Vec::new(),
             sensors: Vec::new(),
+            pools: Vec::new(),
             db_path: "hestan.db".into(),
             hooks: Vec::new(),
             retention_days: None,
@@ -74,6 +76,18 @@ impl Hestan {
     /// sensor (and every source probe) on its interval.
     pub fn sensor(mut self, sensor: Sensor) -> Self {
         self.sensors.push(sensor);
+        self
+    }
+
+    /// declare a named concurrency pool: at most `limit` ops that name it via
+    /// [`Op::pool`](crate::Op::pool) run at once, across every job in this
+    /// process. that is the shape most external limits have — "at most 3
+    /// requests to this api, ever" — which per-job `max_parallel` cannot
+    /// express once two jobs can overlap. stackable; declaring the same name
+    /// twice, or naming an undeclared pool from an op, fails the build with
+    /// [`Error::Graph`]. a limit below 1 means 1.
+    pub fn pool(mut self, name: impl Into<String>, limit: usize) -> Self {
+        self.pools.push((name.into(), limit));
         self
     }
 
@@ -264,7 +278,7 @@ impl Hestan {
                 tracing::info!("retention: removed {removed} runs older than {days} days");
             }
         }
-        let runner = Runner::with_failure_hooks(jobs, store, self.hooks);
+        let runner = Runner::with_pools(jobs, store, self.hooks, self.pools)?;
         Ok(Built {
             runner,
             entries,
@@ -279,4 +293,53 @@ struct Built {
     entries: Vec<ScheduleEntry>,
     registry: Arc<AssetRegistry>,
     sensor_entries: Vec<SensorEntry>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::job::Job;
+    use crate::model::RunStatus;
+    use crate::op::Op;
+    use serde_json::json;
+
+    fn pooled(job: &str) -> Job {
+        Job::builder(job)
+            .op(Op::new("call", |_| async { Ok(serde_json::json!(null)) }).pool("api"))
+            .build()
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_pool_must_be_declared_before_an_op_takes_from_it() {
+        let err = Hestan::new()
+            .job(pooled("pull"))
+            .db(":memory:")
+            .run_once("pull", json!({}))
+            .await
+            .err()
+            .unwrap();
+        assert!(matches!(err, Error::Graph(_)), "{err}");
+        assert!(err.to_string().contains("not declared"), "{err}");
+
+        let err = Hestan::new()
+            .job(pooled("pull"))
+            .pool("api", 2)
+            .pool("api", 3)
+            .db(":memory:")
+            .run_once("pull", json!({}))
+            .await
+            .err()
+            .unwrap();
+        assert!(err.to_string().contains("declared twice"), "{err}");
+
+        let run = Hestan::new()
+            .job(pooled("pull"))
+            .pool("api", 2)
+            .db(":memory:")
+            .run_once("pull", json!({}))
+            .await
+            .unwrap();
+        assert_eq!(run.status, RunStatus::Success);
+    }
 }

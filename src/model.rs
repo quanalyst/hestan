@@ -159,6 +159,9 @@ pub struct Run {
     pub created_at: DateTime<Utc>,
     pub started_at: Option<DateTime<Utc>>,
     pub finished_at: Option<DateTime<Utc>>,
+    /// why the run failed: the first op that terminally failed, named, as
+    /// `"op {name} failed: {message}"`. `None` on a run that never failed.
+    pub error: Option<String>,
     /// the run this one resumed, for a run launched by
     /// [`Runner::resume_from`](crate::Runner::resume_from); `None` otherwise.
     pub resumed_from: Option<String>,

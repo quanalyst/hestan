@@ -1117,3 +1117,347 @@ async fn resume_refuses_a_changed_graph() {
     // no half-built run survives a refusal
     assert_eq!(store.runs(None, None, None, None, 10).unwrap().len(), 1);
 }
+
+// ---- cancellation, pools, timeouts, run errors ----
+
+// waits past `wait_until`'s three seconds: a canceled run holds its grace
+// period open before it will say anything about ops that never came back
+async fn settled_slowly(runner: &Runner, id: &str) -> Run {
+    for _ in 0..2000 {
+        let run = runner.store().run(id).unwrap().unwrap();
+        if !matches!(run.status, RunStatus::Queued | RunStatus::Running) {
+            return run;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("run {id} never reached a terminal status");
+}
+
+// blocking work cannot be aborted. one op polls the cancel signal and stops,
+// the other never yields at all, and the record has to tell them apart instead
+// of stamping a finish time on both.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cancel_stops_polling_blocking_work_and_owns_up_to_the_rest() {
+    let stopped_at: Arc<Mutex<Option<std::time::Instant>>> = Arc::new(Mutex::new(None));
+    let release = Arc::new(AtomicBool::new(false));
+    let (mark, freed) = (stopped_at.clone(), release.clone());
+    let job = Job::builder("blocking")
+        .op(Op::new("polls", move |ctx| {
+            let mark = mark.clone();
+            async move {
+                let verdict = tokio::task::spawn_blocking(move || {
+                    for _ in 0..600 {
+                        if ctx.is_cancelled() {
+                            *mark.lock().unwrap() = Some(std::time::Instant::now());
+                            return "stopped on request";
+                        }
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    "ran to completion"
+                })
+                .await?;
+                Ok(json!(verdict))
+            }
+        }))
+        .op(Op::new("ignores", move |_| {
+            let freed = freed.clone();
+            async move {
+                // never awaits and never reads the signal: nothing can stop it,
+                // and the test itself is the only thing that ever will
+                for _ in 0..3000 {
+                    if freed.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Ok(json!("ran to completion"))
+            }
+        }))
+        .build()
+        .unwrap();
+
+    let runner = Runner::new([job], Store::open(":memory:").unwrap());
+    let id = runner
+        .launch("blocking", json!({}), Trigger::Manual)
+        .unwrap();
+    {
+        let (runner, id) = (runner.clone(), id.clone());
+        wait_until(move || {
+            runner
+                .store()
+                .op_runs(&id)
+                .unwrap()
+                .iter()
+                .filter(|o| o.status == OpStatus::Running)
+                .count()
+                == 2
+        })
+        .await;
+    }
+
+    let asked = std::time::Instant::now();
+    assert_eq!(runner.cancel(&id).unwrap(), CancelOutcome::Requested);
+    let run = settled_slowly(&runner, &id).await;
+    assert_eq!(run.status, RunStatus::Canceled);
+
+    let ops = runner.store().op_runs(&run.id).unwrap();
+    let by_name = |name: &str| ops.iter().find(|o| o.op == name).unwrap();
+
+    // the polling op saw the signal and stopped, well inside the grace period
+    let stopped = stopped_at
+        .lock()
+        .unwrap()
+        .expect("blocking work never saw the cancel");
+    assert!(
+        stopped.duration_since(asked) < Duration::from_secs(2),
+        "polling op took {:?} to notice",
+        stopped.duration_since(asked)
+    );
+    let polls = by_name("polls");
+    assert_eq!(polls.status, OpStatus::Canceled);
+    assert!(
+        polls.finished_at.is_some(),
+        "an op that stopped has a finish"
+    );
+    assert_eq!(polls.error.as_deref(), Some("canceled"));
+
+    // the op that never yielded is still running right now, and says so
+    let ignores = by_name("ignores");
+    assert_eq!(ignores.status, OpStatus::Canceled);
+    let msg = ignores.error.as_deref().unwrap_or_default();
+    assert!(msg.contains("not observed to stop"), "{msg}");
+    assert!(msg.contains("is_cancelled"), "{msg}");
+    assert_eq!(
+        ignores.finished_at, None,
+        "claimed a finish time for work that was still running"
+    );
+    let events = runner.store().events(&run.id, 0).unwrap();
+    assert!(
+        events
+            .iter()
+            .any(|e| e.op.as_deref() == Some("ignores")
+                && e.message.contains("not observed to stop")),
+        "the log never mentions the op that would not stop"
+    );
+
+    release.store(true, Ordering::SeqCst);
+}
+
+fn pooled_job(name: &str, gauge: &Arc<AtomicU32>, peak: &Arc<AtomicU32>) -> Job {
+    let mut builder = Job::builder(name);
+    for i in 0..4 {
+        let (gauge, peak) = (gauge.clone(), peak.clone());
+        builder = builder.op(Op::new(format!("call{i}"), move |_| {
+            let (gauge, peak) = (gauge.clone(), peak.clone());
+            async move {
+                let now = gauge.fetch_add(1, Ordering::SeqCst) + 1;
+                peak.fetch_max(now, Ordering::SeqCst);
+                tokio::time::sleep(Duration::from_millis(40)).await;
+                gauge.fetch_sub(1, Ordering::SeqCst);
+                Ok(json!(null))
+            }
+        })
+        .pool("api"));
+    }
+    builder.build().unwrap()
+}
+
+// max_parallel is per job, so two jobs overlapping used to add up. a pool is
+// the whole process's budget for one external resource.
+#[tokio::test]
+async fn a_pool_caps_ops_across_two_overlapping_jobs() {
+    let gauge = Arc::new(AtomicU32::new(0));
+    let peak = Arc::new(AtomicU32::new(0));
+    let runner = Runner::with_pools(
+        [
+            pooled_job("pull_a", &gauge, &peak),
+            pooled_job("pull_b", &gauge, &peak),
+        ],
+        Store::open(":memory:").unwrap(),
+        vec![],
+        [("api".to_string(), 2)],
+    )
+    .unwrap();
+
+    let a = runner.launch("pull_a", json!({}), Trigger::Manual).unwrap();
+    let b = runner.launch("pull_b", json!({}), Trigger::Manual).unwrap();
+    assert_eq!(settled(&runner, &a).await.status, RunStatus::Success);
+    assert_eq!(settled(&runner, &b).await.status, RunStatus::Success);
+
+    assert!(
+        peak.load(Ordering::SeqCst) <= 2,
+        "peak was {}, over a pool limit of 2",
+        peak.load(Ordering::SeqCst)
+    );
+    // success has to mean all eight ran, not that the survivors passed
+    let ran = [&a, &b]
+        .iter()
+        .flat_map(|id| runner.store().op_runs(id).unwrap())
+        .filter(|o| o.status == OpStatus::Success)
+        .count();
+    assert_eq!(ran, 8);
+    // an op that queued for a permit says so rather than sitting silently
+    let events = runner.store().events(&a, 0).unwrap();
+    assert!(
+        events
+            .iter()
+            .any(|e| e.message.contains("waiting for a api")),
+        "no sign of the queue in the log"
+    );
+}
+
+#[tokio::test]
+async fn an_undeclared_pool_is_refused() {
+    let job = || {
+        Job::builder("pull")
+            .op(Op::new("call", |_| async { Ok(json!(null)) }).pool("api"))
+            .build()
+            .unwrap()
+    };
+    let err = Runner::with_pools(
+        [job()],
+        Store::open(":memory:").unwrap(),
+        vec![],
+        Vec::new(),
+    )
+    .err()
+    .unwrap();
+    assert!(matches!(err, Error::Graph(_)), "{err}");
+    assert!(err.to_string().contains("not declared"), "{err}");
+
+    let err = Runner::with_pools(
+        [job()],
+        Store::open(":memory:").unwrap(),
+        vec![],
+        [("api".to_string(), 1), ("api".to_string(), 3)],
+    )
+    .err()
+    .unwrap();
+    assert!(err.to_string().contains("declared twice"), "{err}");
+
+    // a runner assembled without pools at all must not quietly run unlimited
+    let runner = Runner::new([job()], Store::open(":memory:").unwrap());
+    let run = runner
+        .run("pull", json!({}), Trigger::Manual)
+        .await
+        .unwrap();
+    assert_eq!(run.status, RunStatus::Failed);
+    let op = &runner.store().op_runs(&run.id).unwrap()[0];
+    assert!(
+        op.error.as_deref().unwrap_or_default().contains("api"),
+        "{:?}",
+        op.error
+    );
+}
+
+// a hung op used to run forever, holding its slot and blocking Overlap::Skip
+#[tokio::test]
+async fn op_timeout_fires_retries_and_trips_the_cancel_signal() {
+    let noticed = Arc::new(AtomicBool::new(false));
+    let seen = noticed.clone();
+    let job = Job::builder("hung")
+        .op(Op::new("hang", move |ctx| {
+            let noticed = noticed.clone();
+            async move {
+                // blocking work the timeout can only ask to stop
+                tokio::task::spawn_blocking(move || {
+                    for _ in 0..300 {
+                        if ctx.is_cancelled() {
+                            noticed.store(true, Ordering::SeqCst);
+                            return;
+                        }
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                });
+                // and an op that never returns on its own
+                tokio::time::sleep(Duration::from_secs(30)).await;
+                Ok(json!("never"))
+            }
+        })
+        .timeout(Duration::from_millis(120))
+        .retries(1)
+        .retry_delay(Duration::from_millis(10)))
+        .build()
+        .unwrap();
+
+    let runner = Runner::new([job], Store::open(":memory:").unwrap());
+    let run = runner
+        .run("hung", json!({}), Trigger::Manual)
+        .await
+        .unwrap();
+    assert_eq!(run.status, RunStatus::Failed);
+
+    let op = &runner.store().op_runs(&run.id).unwrap()[0];
+    assert_eq!(op.status, OpStatus::Failed);
+    assert_eq!(op.attempts, 2, "a timeout must go through the retry policy");
+    let err = op.error.as_deref().unwrap_or_default();
+    assert!(err.contains("timed out after 120ms"), "{err}");
+
+    let events = runner.store().events(&run.id, 0).unwrap();
+    let retry = events
+        .iter()
+        .find(|e| e.kind == EventKind::OpRetry)
+        .expect("no retry event");
+    assert!(retry.message.contains("timed out after 120ms"), "{retry:?}");
+
+    // the timeout trips the same signal cancellation does
+    wait_until(move || seen.load(Ordering::SeqCst)).await;
+}
+
+// an on_failure hook could name the op, the run row could not
+#[tokio::test]
+async fn a_failed_run_names_the_failing_op_in_its_error() {
+    let (seen, hook) = collector();
+    let brittle = Job::builder("brittle")
+        .op(Op::new("pull", |_| async { Ok(json!(1)) }))
+        .op(Op::new("push", |_| async { Err("429 too many requests".into()) }).after(["pull"]))
+        .op(Op::new("report", |_| async { Ok(json!(null)) }).after(["push"]))
+        .build()
+        .unwrap();
+    let clean = Job::builder("clean")
+        .op(Op::new("noop", |_| async { Ok(json!(null)) }))
+        .build()
+        .unwrap();
+    let runner = Runner::with_failure_hooks(
+        [brittle, clean],
+        Store::open(":memory:").unwrap(),
+        vec![hook],
+    );
+
+    let run = runner
+        .run("brittle", json!({}), Trigger::Manual)
+        .await
+        .unwrap();
+    assert_eq!(run.status, RunStatus::Failed);
+    let error = run
+        .error
+        .as_deref()
+        .expect("a failed run with a null error is the bug");
+    assert!(error.contains("push"), "{error}");
+    assert!(error.contains("429 too many requests"), "{error}");
+
+    // the hook and the run row must not tell different stories
+    {
+        let seen = seen.clone();
+        wait_until(move || seen.lock().unwrap().len() == 1).await;
+    }
+    let failure = seen.lock().unwrap()[0].clone();
+    assert_eq!(
+        error,
+        format!(
+            "op {} failed: {}",
+            failure.failed_op.unwrap(),
+            failure.error.unwrap()
+        )
+    );
+    // and it reads the same back out of the list endpoint's query
+    let listed = runner.store().runs(None, None, None, None, 10).unwrap();
+    assert_eq!(listed[0].error.as_deref(), Some(error));
+
+    let ok = runner
+        .run("clean", json!({}), Trigger::Manual)
+        .await
+        .unwrap();
+    assert_eq!(ok.status, RunStatus::Success);
+    assert_eq!(ok.error, None, "a run that worked carries no error");
+}

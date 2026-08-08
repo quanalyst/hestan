@@ -58,6 +58,7 @@ async fn main() -> Result<(), hestan::Error> {
             ctx.info(format!("fetched {} rows", rows.len()));
             Ok(json!(rows))
         })
+        .timeout(Duration::from_secs(5))
         .params::<FetchParams>())
         .op(Op::new("validate", |ctx| async move {
             let rows = ctx.input("fetch_orders").cloned().unwrap_or_default();
@@ -112,6 +113,9 @@ async fn main() -> Result<(), hestan::Error> {
             }
         })
         .after(["aggregate"])
+        // one warehouse, shared with the healthcheck job: the pool is the
+        // budget for it, whichever job is running
+        .pool("warehouse")
         .retries(2))
         .build()?;
 
@@ -120,7 +124,8 @@ async fn main() -> Result<(), hestan::Error> {
         .op(Op::new("ping", |_ctx| async {
             tokio::time::sleep(Duration::from_millis(50)).await;
             Ok(json!({"latency_ms": 50}))
-        }))
+        })
+        .pool("warehouse"))
         .op(Op::new("report", |ctx| async move {
             let ping = ctx.input("ping").cloned().unwrap_or_default();
             ctx.info(format!("warehouse ok, ping {}ms", ping["latency_ms"]));
@@ -133,6 +138,7 @@ async fn main() -> Result<(), hestan::Error> {
     Hestan::new()
         .job(orders)
         .job(health)
+        .pool("warehouse", 1)
         .schedule("orders_etl", "*/2 * * * *")
         .schedule("warehouse_healthcheck", "*/5 * * * *")
         .db("demo.db")

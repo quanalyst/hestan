@@ -41,7 +41,7 @@ Hestan::new()
 | `.cron(expr)` | none | 5-field cron in utc (see [scheduling](scheduling.md)) |
 | `.cron_tz(expr, tz)` | none | same, evaluated in a named iana timezone |
 | `.retries(n)` | 2 | extra attempts inside the request loop |
-| `.retry_delay(d)` | 1s | backoff base: the nth retry waits `d * 2^n`, capped at 30s |
+| `.retry_delay(d)` | 1s | backoff base: the nth retry waits a jittered slice of `d * 2^n`, capped at 30s |
 | `.max_parallel(n)` | unlimited | cap concurrent requests when fanning out; below 1 means 1 |
 | `.overlap(o)` | skip | overlap policy for the generated job (see [scheduling](scheduling.md)) |
 | `.timeout(d)` | 30s | per-request timeout |
@@ -72,7 +72,9 @@ another attempt:
   `bearer_env` variable, or a request that can't be built at all (a header
   value with a newline, say) — deterministic failures that no retry fixes.
 
-the nth retry waits `retry_delay * 2^n`, capped at 30 seconds. on 429 and 503
+the nth retry waits a random slice of `retry_delay * 2^n`, capped at 30
+seconds — full jitter, so a fan-out knocked over by one rate limit does not
+come back as a herd on the same second. on 429 and 503
 a numeric `Retry-After` header (seconds; http-date form is ignored) is
 honored when it's longer than the computed backoff, capped at 5 minutes —
 servers ask for absurd waits often enough. each retry logs a warn event

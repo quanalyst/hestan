@@ -111,7 +111,15 @@ const SCHEMA_V5: &str = r#"
 ALTER TABLE runs ADD COLUMN resumed_from TEXT;
 "#;
 
-const SCHEMA_VERSION: u32 = 5;
+// the run's own error: the first op that terminally failed, named. derivable
+// from op_runs in principle, but only the executor knows which failure came
+// first, and a stored column keeps the run row and the failure hook saying the
+// same thing without a correlated subquery on every list query.
+const SCHEMA_V6: &str = r#"
+ALTER TABLE runs ADD COLUMN error TEXT;
+"#;
+
+const SCHEMA_VERSION: u32 = 6;
 
 // one transaction around every pending step and the version stamp (sqlite DDL
 // is transactional), so a crash mid-migration leaves the db exactly as found
@@ -139,6 +147,9 @@ fn migrate(conn: &mut Connection) -> Result<(), Error> {
     }
     if version < 5 {
         tx.execute_batch(SCHEMA_V5)?;
+    }
+    if version < 6 {
+        tx.execute_batch(SCHEMA_V6)?;
     }
     if version != SCHEMA_VERSION {
         tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
@@ -177,8 +188,8 @@ impl Store {
         let mut conn = self.0.lock().unwrap();
         let tx = conn.transaction()?;
         tx.execute(
-            r#"INSERT INTO runs (id, job, status, "trigger", params, created_at, started_at, finished_at, resumed_from)
-               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)"#,
+            r#"INSERT INTO runs (id, job, status, "trigger", params, created_at, started_at, finished_at, error, resumed_from)
+               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)"#,
             params![
                 run.id,
                 run.job,
@@ -188,6 +199,7 @@ impl Store {
                 run.created_at.to_rfc3339(),
                 run.started_at.map(|t| t.to_rfc3339()),
                 run.finished_at.map(|t| t.to_rfc3339()),
+                run.error,
                 run.resumed_from,
             ],
         )?;
@@ -235,7 +247,8 @@ impl Store {
             params![now],
         )?;
         tx.execute(
-            "UPDATE runs SET status = 'failed', finished_at = ?1
+            "UPDATE runs SET status = 'failed', finished_at = ?1,
+                 error = COALESCE(error, 'interrupted: process exited')
              WHERE status IN ('queued', 'running')",
             params![now],
         )?;
@@ -264,11 +277,19 @@ impl Store {
         Ok(())
     }
 
-    pub(crate) fn run_finished(&self, id: &str, status: RunStatus) -> Result<(), Error> {
+    /// `error` is the run's own failure summary: the first op that terminally
+    /// failed, named. `None` leaves any existing value alone.
+    pub(crate) fn run_finished(
+        &self,
+        id: &str,
+        status: RunStatus,
+        error: Option<&str>,
+    ) -> Result<(), Error> {
         let conn = self.0.lock().unwrap();
         conn.execute(
-            "UPDATE runs SET status = ?1, finished_at = ?2 WHERE id = ?3",
-            params![status.as_str(), Utc::now().to_rfc3339(), id],
+            "UPDATE runs SET status = ?1, finished_at = ?2, error = COALESCE(?3, error)
+             WHERE id = ?4",
+            params![status.as_str(), Utc::now().to_rfc3339(), error, id],
         )?;
         Ok(())
     }
@@ -310,6 +331,19 @@ impl Store {
                 run_id,
                 op,
             ],
+        )?;
+        Ok(())
+    }
+
+    /// mark an op canceled without claiming a finish time: cancellation was
+    /// requested and the task never joined, so when — or whether — the work
+    /// stopped is exactly what this process does not know.
+    pub(crate) fn op_unstopped(&self, run_id: &str, op: &str, error: &str) -> Result<(), Error> {
+        let conn = self.0.lock().unwrap();
+        conn.execute(
+            "UPDATE op_runs SET status = ?1, finished_at = NULL, output = NULL, error = ?2
+             WHERE run_id = ?3 AND op = ?4",
+            params![OpStatus::Canceled.as_str(), error, run_id, op],
         )?;
         Ok(())
     }
@@ -491,7 +525,7 @@ impl Store {
         let run = conn
             .query_row(
                 r#"SELECT id, job, status, "trigger", params, created_at, started_at, finished_at,
-                          resumed_from
+                          resumed_from, error
                    FROM runs WHERE id = ?1"#,
                 params![id],
                 run_from_row,
@@ -513,7 +547,7 @@ impl Store {
         let conn = self.0.lock().unwrap();
         let mut stmt = conn.prepare(
             r#"SELECT id, job, status, "trigger", params, created_at, started_at, finished_at,
-                      resumed_from
+                      resumed_from, error
                FROM runs
                WHERE (?1 IS NULL OR job = ?1) AND (?2 IS NULL OR created_at >= ?2)
                  AND (?3 IS NULL OR created_at < ?3
@@ -772,6 +806,7 @@ fn run_from_row(row: &Row) -> rusqlite::Result<Run> {
         started_at: opt_ts_col(row, 6)?,
         finished_at: opt_ts_col(row, 7)?,
         resumed_from: row.get(8)?,
+        error: row.get(9)?,
     })
 }
 
@@ -893,6 +928,7 @@ mod tests {
             created_at,
             started_at: None,
             finished_at: None,
+            error: None,
             resumed_from: None,
         }
     }
@@ -931,7 +967,7 @@ mod tests {
         store
             .op_finished("r1", "b", OpStatus::Failed, None, Some("boom"))
             .unwrap();
-        store.run_finished("r1", RunStatus::Failed).unwrap();
+        store.run_finished("r1", RunStatus::Failed, None).unwrap();
 
         let got = store.run("r1").unwrap().unwrap();
         assert_eq!(got.status, RunStatus::Failed);
@@ -1144,7 +1180,7 @@ mod tests {
             store
                 .create_run(&mk_run(id, "etl", old), &["a".into()])
                 .unwrap();
-            store.run_finished(id, status).unwrap();
+            store.run_finished(id, status, None).unwrap();
         }
         store
             .create_run(&mk_run("live", "etl", old), &["a".into()])
@@ -1153,7 +1189,9 @@ mod tests {
         store
             .create_run(&mk_run("young", "etl", Utc::now()), &["a".into()])
             .unwrap();
-        store.run_finished("young", RunStatus::Success).unwrap();
+        store
+            .run_finished("young", RunStatus::Success, None)
+            .unwrap();
         store
             .set_op_state("etl", "a", &json!({"cursor": 9}))
             .unwrap();
@@ -1195,7 +1233,7 @@ mod tests {
         assert!(store.has_active_run("etl").unwrap());
         store.run_started("r1").unwrap();
         assert!(store.has_active_run("etl").unwrap());
-        store.run_finished("r1", RunStatus::Failed).unwrap();
+        store.run_finished("r1", RunStatus::Failed, None).unwrap();
         assert!(!store.has_active_run("etl").unwrap());
     }
 
@@ -1217,7 +1255,9 @@ mod tests {
         store
             .op_finished("done", "a", OpStatus::Success, None, None)
             .unwrap();
-        store.run_finished("done", RunStatus::Success).unwrap();
+        store
+            .run_finished("done", RunStatus::Success, None)
+            .unwrap();
 
         store.fail_interrupted().unwrap();
 
@@ -1382,14 +1422,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("future.db");
         let path = path.to_str().unwrap();
-        phase1_db(path, 6);
+        phase1_db(path, 7);
         let err = Store::open(path).err().unwrap();
-        assert_eq!(err.to_string(), "db schema v6 is newer than this build");
+        assert_eq!(err.to_string(), "db schema v7 is newer than this build");
         let conn = Connection::open(path).unwrap();
         let version: u32 = conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 6);
+        assert_eq!(version, 7);
     }
 
     #[test]
@@ -1498,6 +1538,85 @@ mod tests {
         assert_eq!(
             store.runs(None, None, None, None, 10).unwrap()[0].resumed_from,
             Some("r1".to_string())
+        );
+    }
+
+    #[test]
+    fn v5_db_migrates_to_v6_keeping_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v5.db");
+        let path = path.to_str().unwrap();
+        // every batch up to v5, stamped 5: the runs table has no error yet
+        let conn = Connection::open(path).unwrap();
+        conn.execute_batch(PHASE1_SCHEMA).unwrap();
+        conn.execute_batch(SCHEMA_V2).unwrap();
+        conn.execute_batch(SCHEMA_V3).unwrap();
+        conn.execute_batch(SCHEMA_V4).unwrap();
+        conn.execute_batch(SCHEMA_V5).unwrap();
+        conn.pragma_update(None, "user_version", 5).unwrap();
+        drop(conn);
+
+        let store = Store::open(path).unwrap();
+        // a run recorded before the column existed keeps its row, without one
+        let old = store.run("r1").unwrap().unwrap();
+        assert_eq!(old.status, RunStatus::Success);
+        assert_eq!(old.error, None);
+
+        store
+            .create_run(&mk_run("r2", "etl", Utc::now()), &["a".into()])
+            .unwrap();
+        store
+            .run_finished("r2", RunStatus::Failed, Some("op a failed: boom"))
+            .unwrap();
+        drop(store);
+        let store = Store::open(path).unwrap();
+        assert_eq!(
+            store.run("r2").unwrap().unwrap().error.as_deref(),
+            Some("op a failed: boom")
+        );
+        assert_eq!(
+            store.runs(None, None, None, None, 10).unwrap()[0]
+                .error
+                .as_deref(),
+            Some("op a failed: boom")
+        );
+    }
+
+    #[test]
+    fn run_error_survives_a_later_status_write() {
+        let store = Store::open(":memory:").unwrap();
+        store
+            .create_run(&mk_run("r1", "etl", Utc::now()), &["a".into()])
+            .unwrap();
+        store
+            .run_finished("r1", RunStatus::Failed, Some("op a failed: boom"))
+            .unwrap();
+        // None must not blank an error a caller already recorded
+        store.run_finished("r1", RunStatus::Failed, None).unwrap();
+        assert_eq!(
+            store.run("r1").unwrap().unwrap().error.as_deref(),
+            Some("op a failed: boom")
+        );
+    }
+
+    #[test]
+    fn unstopped_op_keeps_no_finish_time() {
+        let store = Store::open(":memory:").unwrap();
+        store
+            .create_run(&mk_run("r1", "etl", Utc::now()), &["a".into()])
+            .unwrap();
+        store.op_started("r1", "a", 1).unwrap();
+        store
+            .op_unstopped("r1", "a", "not observed to stop")
+            .unwrap();
+
+        let op = &store.op_runs("r1").unwrap()[0];
+        assert_eq!(op.status, OpStatus::Canceled);
+        assert_eq!(op.error.as_deref(), Some("not observed to stop"));
+        assert!(op.started_at.is_some());
+        assert_eq!(
+            op.finished_at, None,
+            "claimed a finish time for work it never saw finish"
         );
     }
 

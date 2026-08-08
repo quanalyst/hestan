@@ -77,7 +77,8 @@ hestan = { version = "0.1.0-alpha.1", features = ["http"] }
 ```
 
 transport errors, 429s, and 5xx responses are retried with capped exponential
-backoff (a numeric `Retry-After` is honored, capped at 5 minutes); any other
+backoff and full jitter (a numeric `Retry-After` is honored exactly, capped at
+5 minutes); any other
 non-2xx fails the op immediately. `query_each("ids", ["bitcoin", "ethereum"])`
 fans the source out into one op per value, named `btc_spot_bitcoin`-style:
 the value lowercased, with anything outside `[a-z0-9_]` replaced by `_`.
@@ -110,10 +111,19 @@ appears.
   deserialize into `P` is rejected before any run is recorded (http 400 from
   the launch endpoint)
 - runs execute on tokio: every op whose deps are done runs concurrently
-  (capped per job with `max_parallel`). a terminal op failure skips its
-  downstream and fails the run, while independent branches keep going
-- failed ops retry up to `.retries(n)` extra attempts with a fixed
-  `.retry_delay`
+  (capped per job with `max_parallel`, and across jobs with named
+  concurrency pools — `Hestan::pool("api", 3)` plus `Op::pool("api")` is one
+  budget for one external resource, however many jobs overlap). a terminal op
+  failure skips its downstream and fails the run, while independent branches
+  keep going
+- failed ops retry up to `.retries(n)` extra attempts, backing off
+  exponentially with full jitter by default so ops that fail together don't
+  retry together; `.retry_delay(d)` keeps a fixed pause
+- `.timeout(d)` fails a hung attempt instead of letting it hold a slot
+  forever, and cancellation (or a timeout) is readable from the op itself via
+  `ctx.is_cancelled()` — the only way blocking work ever stops early. an op
+  that stops is recorded as stopped; one that never comes back is recorded as
+  exactly that, with no invented finish time
 - ops can carry persisted state: `ctx.set_state` stages a watermark that
   commits only when the attempt succeeds, so the next run picks up where the
   last successful one left off
@@ -142,7 +152,8 @@ appears.
   evaluations. probes run as internal sensors on the same loop, and both are
   pausable with tick history
 - `on_failure` hooks fire for every failed run, with ready-made webhook and
-  slack helpers behind the `http` feature
+  slack helpers behind the `http` feature; the failed run row carries the same
+  `op {name} failed: {message}` summary for anything reading history instead
 - the web ui is a prebuilt react bundle embedded in the binary; it polls the
   json api under `/api`
 
@@ -180,7 +191,8 @@ the binary is yours: define jobs, then `Hestan::new()...serve(addr)`, or
 
 - [ ] asset ranges/partitions: per-partition staleness and backfills — the
       next thing
-- [ ] max concurrent runs per job (overlap policies gate scheduled fires only)
+- [ ] max concurrent runs per job (overlap policies gate scheduled fires
+      only; concurrency pools cap ops across runs, not the runs themselves)
 - [ ] per-schedule params (scheduled fires launch with `{}`, so a job whose
       ops require typed params can never fire from cron)
 - [ ] postgres store

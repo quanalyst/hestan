@@ -22,7 +22,8 @@ CREATE TABLE runs (
     created_at TEXT NOT NULL,
     started_at TEXT,
     finished_at TEXT,
-    resumed_from TEXT                   -- added in v5
+    resumed_from TEXT,                  -- added in v5
+    error TEXT                          -- added in v6
 );
 CREATE INDEX runs_job_created ON runs(job, created_at DESC);
 
@@ -103,6 +104,21 @@ CREATE TABLE sensor_ticks (            -- added in v4
 );
 ```
 
+`runs.error` is the run's own failure summary: the first op that terminally
+failed, as `op {name} failed: {message}`, written in the same statement as
+the terminal status. it is stored rather than derived from `op_runs` on read
+for three reasons — only the executor knows which failure came *first*
+(`op_runs.finished_at` is a proxy that ties and lies under retries), the run
+list is polled by the ui and a correlated subquery per row would be paid on
+every poll, and a stored column is what keeps the run row and the
+[`on_failure` hook](notifications.md) saying the same thing by construction.
+runs and their op runs are pruned together, so the two can never drift apart.
+
+an `op_runs` row with a terminal status and a null `finished_at` is not a
+bug: it is a [canceled op that was never observed to stop](concepts.md#cancellation),
+and the missing timestamp is the record refusing to invent one. anything
+computing durations (op stats, the gantt) skips those rows.
+
 statuses, triggers, levels, kinds, and outcomes are stored as their
 lowercase/snake_case string forms (`success`, `type_check_failed`, ...).
 params, outputs, and event data are json text. timestamps are rfc3339 text,
@@ -122,12 +138,13 @@ forward on every open. version 1 is the phase-1 schema (`runs`, `op_runs`,
 `events.data` plus the `schedules` and `schedule_ticks` tables; version 3
 adds `op_state`; version 4 adds `asset_materializations`, `sensors`, and
 `sensor_ticks`; version 5 adds `runs.resumed_from`, the link a
-[resume](concepts.md#resume) follows back to the run it continued. an older
-file at any version opens straight into v5, rows intact. every pending step
+[resume](concepts.md#resume) follows back to the run it continued; version 6
+adds `runs.error`. an older file at any version opens straight into v6, rows
+intact. every pending step
 and the version stamp run in one transaction
 (sqlite DDL is transactional), so a crash or failure mid-migration leaves
 the file exactly as it was found, never half-migrated. a database stamped
-with a version newer than the build refuses to open (`db schema v6 is newer
+with a version newer than the build refuses to open (`db schema v7 is newer
 than this build`) instead of quietly writing an older stamp over it.
 
 one wrinkle: databases written before the migration mechanism existed carry
@@ -143,8 +160,8 @@ launches. any run still `queued` or `running` was left behind by a dead
 process; its `running` op runs become `failed` with error
 `interrupted: process exited`, its `pending` op runs become `skipped`, a
 `run_failed` event (`run interrupted: process exited`) is appended, and the
-run itself is marked `failed` with a finish time. terminal runs are
-untouched. constructing a `Runner` directly skips the sweep — it belongs to
+run itself is marked `failed` with a finish time and that same message as its
+`error`. terminal runs are untouched. constructing a `Runner` directly skips the sweep — it belongs to
 process startup, not to the executor.
 
 ## Retention

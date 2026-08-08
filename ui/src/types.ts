@@ -27,9 +27,17 @@ export interface OpSummary {
   name: string;
   deps: string[];
   retries: number;
+  timeout_secs: number | null;
+  pool: string | null;
   input_type: string | null;
   output_type: string | null;
   params_type: string | null;
+}
+
+// a named concurrency limit shared process-wide, not per job
+export interface JobPool {
+  name: string;
+  limit: number | null;
 }
 
 export interface JobSchedule {
@@ -46,6 +54,7 @@ export interface JobSummary {
   schedules: JobSchedule[];
   last_run: Run | null;
   max_parallel: number | null;
+  pools: JobPool[];
   overlap: "allow" | "skip" | "queue";
   overdue: boolean;
 }
@@ -65,6 +74,8 @@ export interface Run {
   created_at: string;
   started_at: string | null;
   finished_at: string | null;
+  // the first op that terminally failed, named; null unless the run failed
+  error: string | null;
   resumed_from: string | null;
 }
 

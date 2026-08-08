@@ -161,6 +161,7 @@ function JobView({ name }: { name: string }) {
   // only what departs from the defaults, as with a schedule's tz
   const policy = [
     job.max_parallel === null ? null : `max_parallel ${job.max_parallel}`,
+    ...job.pools.map((p) => `pool ${p.name}${p.limit === null ? "" : ` ${p.limit}`}`),
     job.overlap === "skip" ? null : `overlap ${job.overlap}`,
   ]
     .filter(Boolean)
@@ -216,6 +217,7 @@ function JobView({ name }: { name: string }) {
         <OpInspector
           ops={job.ops}
           name={opSel}
+          pools={job.pools}
           stat={stats?.find((s) => s.op === opSel)}
           state={states.find((s) => s.op === opSel)}
           onClose={() => setOpSel(null)}

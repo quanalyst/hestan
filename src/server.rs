@@ -129,11 +129,27 @@ fn job_summary(job: &Job, st: &AppState) -> Result<Value, Error> {
                 "name": op.name(),
                 "deps": op.deps(),
                 "retries": op.max_retries(),
+                "timeout_secs": op.timeout_after().map(|d| d.as_secs_f64()),
+                "pool": op.pool_name(),
                 "input_type": op.input_type(),
                 "output_type": op.output_type(),
                 "params_type": op.params_type(),
             })
         })
+        .collect();
+    // the pools this job's ops take from, in first-use order, with the limit
+    // each one actually carries — the cap is process-wide, not the job's
+    let mut seen: Vec<&str> = Vec::new();
+    for op in job.ops() {
+        if let Some(pool) = op.pool_name()
+            && !seen.contains(&pool)
+        {
+            seen.push(pool);
+        }
+    }
+    let pools: Vec<Value> = seen
+        .into_iter()
+        .map(|name| json!({ "name": name, "limit": st.runner.pool_limit(name) }))
         .collect();
     let rows: Vec<ScheduleRow> = st
         .runner
@@ -177,6 +193,7 @@ fn job_summary(job: &Job, st: &AppState) -> Result<Value, Error> {
         "ops": ops,
         "schedules": schedules,
         "max_parallel": job.max_parallel(),
+        "pools": pools,
         "overlap": job.overlap(),
         "last_run": last_run,
         "interval_secs": interval_secs,
@@ -815,6 +832,7 @@ mod tests {
             created_at: Utc::now(),
             started_at: None,
             finished_at: None,
+            error: None,
             resumed_from: None,
         };
         st.runner.store().create_run(&run, &[]).unwrap();
@@ -835,6 +853,7 @@ mod tests {
                 created_at: t0 - Duration::minutes(age),
                 started_at: None,
                 finished_at: None,
+                error: None,
                 resumed_from: None,
             };
             st.runner.store().create_run(&run, &[]).unwrap();
@@ -883,6 +902,7 @@ mod tests {
                 created_at: t0 + Duration::minutes(i),
                 started_at: None,
                 finished_at: None,
+                error: None,
                 resumed_from: None,
             };
             st.runner.store().create_run(&run, &[]).unwrap();
@@ -942,6 +962,7 @@ mod tests {
                 created_at: at,
                 started_at: None,
                 finished_at: None,
+                error: None,
                 resumed_from: None,
             };
             st.runner.store().create_run(&run, &[]).unwrap();
@@ -1034,6 +1055,7 @@ mod tests {
                 created_at: t0 + Duration::minutes(i),
                 started_at: None,
                 finished_at: None,
+                error: None,
                 resumed_from: None,
             };
             store.create_run(&run, &["a".into(), "b".into()]).unwrap();
@@ -1141,6 +1163,41 @@ mod tests {
         .unwrap_err();
         assert_eq!(status, StatusCode::NOT_FOUND);
         assert_eq!(body["error"], "unknown job: nope");
+    }
+
+    #[tokio::test]
+    async fn job_summary_reports_pools_and_timeouts() {
+        let job = Job::builder("pull")
+            .op(Op::new("first", |_| async { Ok(json!(null)) })
+                .pool("api")
+                .timeout(std::time::Duration::from_secs(30)))
+            .op(Op::new("second", |_| async { Ok(json!(null)) }).pool("api"))
+            .op(Op::new("local", |_| async { Ok(json!(null)) }))
+            .build()
+            .unwrap();
+        let runner = Runner::with_pools(
+            [job],
+            Store::open(":memory:").unwrap(),
+            vec![],
+            [("api".to_string(), 3)],
+        )
+        .unwrap();
+        let st = AppState {
+            jobs: Arc::new(runner.jobs().clone()),
+            runner,
+            assets: Arc::new(AssetRegistry::empty()),
+            sensors: Arc::new(Vec::new()),
+        };
+
+        let Json(body) = get_job(State(st), Path("pull".into())).await.unwrap();
+        let ops = body["ops"].as_array().unwrap();
+        assert_eq!(ops[0]["pool"], "api");
+        assert_eq!(ops[0]["timeout_secs"], json!(30.0));
+        assert_eq!(ops[1]["pool"], "api");
+        assert_eq!(ops[2]["pool"], json!(null));
+        assert_eq!(ops[2]["timeout_secs"], json!(null));
+        // one entry per pool the job draws from, with the process-wide limit
+        assert_eq!(body["pools"], json!([{ "name": "api", "limit": 3 }]));
     }
 
     #[tokio::test]
@@ -1300,7 +1357,7 @@ mod tests {
 
         st.runner
             .store()
-            .run_finished("r1", RunStatus::Failed)
+            .run_finished("r1", RunStatus::Failed, None)
             .unwrap();
         let (status, Json(body)) = retry_run(State(st.clone()), Path("r1".into()))
             .await
@@ -1373,6 +1430,7 @@ mod tests {
             created_at: Utc::now(),
             started_at: None,
             finished_at: None,
+            error: None,
             resumed_from: None,
         };
         let ops: Vec<String> = ops.iter().map(|o| o.to_string()).collect();
@@ -1582,6 +1640,7 @@ mod tests {
             created_at: Utc::now() - Duration::days(400),
             started_at: None,
             finished_at: Some(Utc::now() - Duration::days(400)),
+            error: None,
             resumed_from: None,
         };
         st.runner.store().create_run(&stale, &[]).unwrap();
@@ -1814,7 +1873,7 @@ mod tests {
 
         st.runner
             .store()
-            .run_finished("b1", RunStatus::Success)
+            .run_finished("b1", RunStatus::Success, None)
             .unwrap();
         let (status, _) = build_one_asset(State(st.clone()), Path("totals".into()))
             .await

@@ -196,6 +196,7 @@ function RunView({ id }: { id: string }) {
               </>
             )}
           </p>
+          {run.error && <p className="mono muted op-err">{run.error}</p>}
         </div>
         <div className="run-actions">
           <div className="run-side">

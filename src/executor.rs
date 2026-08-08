@@ -1,24 +1,40 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::panic::AssertUnwindSafe;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use futures::FutureExt;
 use serde::Serialize;
 use serde_json::{Value, json};
-use tokio::sync::watch;
+use tokio::sync::{Semaphore, watch};
 use tokio::task::{Id, JoinSet};
 
 use crate::error::Error;
 use crate::graph;
 use crate::job::Job;
 use crate::model::{EventKind, EventLevel, OpStatus, Run, RunStatus, Trigger, new_run_id};
-use crate::op::{Op, OpCtx};
+use crate::op::{Cancel, Op, OpCtx};
 use crate::store::Store;
 
 /// how far back a resume follows `resumed_from` links. resuming a resume is
 /// normal; a chain this long is a bug, and the walk says so instead of looping.
 const MAX_RESUME_CHAIN: usize = 256;
+
+/// how long a canceled run waits for its aborted tasks to actually join before
+/// recording them as never observed to stop. aborting an async op lands at its
+/// next await point, which is usually immediate; blocking work cannot be
+/// aborted at all, and waiting forever for it would hang the run.
+const CANCEL_GRACE: Duration = Duration::from_secs(3);
+
+/// a named concurrency limit shared by every job in the process, declared with
+/// `Hestan::pool` and taken by [`Op::pool`].
+pub(crate) struct Pool {
+    pub(crate) limit: usize,
+    sem: Arc<Semaphore>,
+}
+
+pub(crate) type Pools = Arc<HashMap<String, Pool>>;
 
 /// what [`Runner::cancel`] did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -74,6 +90,7 @@ pub struct Runner {
     // one watch sender per in-flight run; cancel() flips it to true
     active: Arc<Mutex<HashMap<String, watch::Sender<bool>>>>,
     hooks: Arc<Vec<FailureHook>>,
+    pools: Pools,
 }
 
 impl Runner {
@@ -83,6 +100,9 @@ impl Runner {
 
     /// like [`Runner::new`] with failure hooks attached: each is invoked on
     /// its own task whenever a run finishes failed. canceled runs don't fire.
+    ///
+    /// no pools are declared, so an op that names one fails at run time; use
+    /// [`Runner::with_pools`] (or `Hestan::pool`) when any op does.
     pub fn with_failure_hooks(
         jobs: impl IntoIterator<Item = Job>,
         store: Store,
@@ -100,7 +120,52 @@ impl Runner {
             store,
             active: Arc::new(Mutex::new(HashMap::new())),
             hooks: Arc::new(hooks),
+            pools: Arc::new(HashMap::new()),
         }
+    }
+
+    /// like [`Runner::with_failure_hooks`] plus named concurrency pools, each
+    /// a `(name, limit)` shared by every job this runner owns. an op naming a
+    /// pool that isn't declared here is [`Error::Graph`], as is declaring the
+    /// same pool twice; a limit below 1 means 1.
+    pub fn with_pools(
+        jobs: impl IntoIterator<Item = Job>,
+        store: Store,
+        hooks: Vec<FailureHook>,
+        pools: impl IntoIterator<Item = (String, usize)>,
+    ) -> Result<Runner, Error> {
+        let mut declared: HashMap<String, Pool> = HashMap::new();
+        for (name, limit) in pools {
+            if declared.contains_key(&name) {
+                return Err(Error::Graph(format!("pool {name} is declared twice")));
+            }
+            let limit = limit.max(1);
+            let pool = Pool {
+                limit,
+                sem: Arc::new(Semaphore::new(limit)),
+            };
+            declared.insert(name, pool);
+        }
+        let runner = Runner::with_failure_hooks(jobs, store, hooks);
+        // every op that names a pool must find it, or the limit it was written
+        // to respect would silently not exist
+        for job in runner.jobs.values() {
+            for op in job.ops() {
+                if let Some(pool) = op.pool_name()
+                    && !declared.contains_key(pool)
+                {
+                    return Err(Error::Graph(format!(
+                        "job {}: op {} takes from pool {pool}, which is not declared",
+                        job.name(),
+                        op.name()
+                    )));
+                }
+            }
+        }
+        Ok(Runner {
+            pools: Arc::new(declared),
+            ..runner
+        })
     }
 
     pub fn store(&self) -> &Store {
@@ -109,6 +174,11 @@ impl Runner {
 
     pub fn jobs(&self) -> &HashMap<String, Job> {
         &self.jobs
+    }
+
+    /// the limit declared for `name`, for reporting it back.
+    pub fn pool_limit(&self, name: &str) -> Option<usize> {
+        self.pools.get(name).map(|p| p.limit)
     }
 
     /// create the run queued and execute it on a spawned task.
@@ -455,6 +525,7 @@ impl Runner {
             created_at: Utc::now(),
             started_at: None,
             finished_at: None,
+            error: None,
             resumed_from: resumed_from.map(str::to_string),
         };
         // registered before create_run so a cancel that can see the queued run
@@ -545,6 +616,8 @@ async fn execute(
                 params.clone(),
                 Arc::new(inputs),
                 store.clone(),
+                runner.pools.clone(),
+                cancel.clone(),
             ));
             names.insert(handle.id(), name);
         }
@@ -602,9 +675,18 @@ async fn execute(
     }
 
     if canceled {
-        // abort lands at the next await point: a blocking section finishes its call
+        // abort lands at an op's next await point; an op that never awaits, and
+        // blocking work an op spawned, never land at all
         tasks.abort_all();
-        while let Some(joined) = tasks.join_next_with_id().await {
+        // a bounded grace period, so an op that really does stop is recorded as
+        // whatever it really did rather than guessed at
+        let deadline = tokio::time::Instant::now() + CANCEL_GRACE;
+        loop {
+            let joined = match tokio::time::timeout_at(deadline, tasks.join_next_with_id()).await {
+                Ok(Some(joined)) => joined,
+                // every task landed, or the grace ran out with some still running
+                Ok(None) | Err(_) => break,
+            };
             match joined {
                 // won the race against the abort: record what really happened
                 Ok((id, (name, Ok((output, state))))) => {
@@ -637,6 +719,14 @@ async fn execute(
                 }
             }
         }
+        // whatever is still in `names` never joined. aborting cannot stop
+        // blocking work, so hestan does not know if it is over — and says so
+        // instead of stamping a finish time it never observed.
+        let mut unstopped: Vec<String> = names.drain().map(|(_, name)| name).collect();
+        unstopped.sort();
+        for name in unstopped {
+            op_unstopped(&store, &run_id, &name);
+        }
         for name in pending.drain(..) {
             op_canceled(&store, &run_id, &name);
         }
@@ -655,9 +745,14 @@ async fn execute(
         RunStatus::Canceled => (EventLevel::Warn, EventKind::RunCanceled, "run canceled"),
         _ => (EventLevel::Info, EventKind::RunSuccess, "run succeeded"),
     };
+    // the run's own error: the first op that terminally failed, named, so a
+    // hook or an alert reading the run row sees what RunFailure carries
+    let error = first_failure
+        .as_ref()
+        .map(|(op, msg)| format!("op {op} failed: {msg}"));
     // event first: anyone who reads a terminal status must also see this line
     note(store.append_event(&run_id, None, level, kind, msg, None));
-    note(store.run_finished(&run_id, status));
+    note(store.run_finished(&run_id, status, error.as_deref()));
     runner.active.lock().unwrap().remove(&run_id);
 
     // canceled runs stay quiet, and the boot sweep never comes through here
@@ -703,6 +798,25 @@ fn op_canceled(store: &Store, run_id: &str, name: &str) {
     ));
 }
 
+// canceled, but only the request is a fact: the op never joined, so it gets no
+// finish time and an error that says exactly that
+fn op_unstopped(store: &Store, run_id: &str, name: &str) {
+    let msg = format!(
+        "cancellation requested; this op was not observed to stop within {CANCEL_GRACE:?} \
+         and may still be running (blocking work stops only if it polls ctx.is_cancelled())"
+    );
+    note(store.append_event(
+        run_id,
+        Some(name),
+        EventLevel::Warn,
+        EventKind::OpCanceled,
+        &msg,
+        None,
+    ));
+    note(store.op_unstopped(run_id, name, &msg));
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn run_op(
     op: Op,
     job: String,
@@ -710,6 +824,8 @@ async fn run_op(
     params: Value,
     inputs: Arc<HashMap<String, Value>>,
     store: Store,
+    pools: Pools,
+    cancel: watch::Receiver<bool>,
 ) -> OpOutcome {
     let name = op.name().to_string();
     // loaded once, before attempt 1: every retry sees the same starting state
@@ -730,10 +846,38 @@ async fn run_op(
         "starting",
         None,
     ));
+    // Runner::with_pools refuses this at build time; a Runner assembled without
+    // pools can still reach it, and running unlimited would quietly break the
+    // very promise the pool was declared to keep
+    let pool = match op.pool_name() {
+        None => None,
+        Some(pool) => match pools.get(pool) {
+            Some(p) => Some((pool.to_string(), p.sem.clone())),
+            None => {
+                let msg = format!("op takes from pool {pool}, which is not declared");
+                note(store.append_event(
+                    &run_id,
+                    Some(&name),
+                    EventLevel::Error,
+                    EventKind::OpFailed,
+                    &msg,
+                    Some(&json!({ "error": &msg })),
+                ));
+                return (name, Err(msg));
+            }
+        },
+    };
     loop {
         // fresh buffer per attempt: a failed attempt's staged state must not leak
         let new_state = Arc::new(Mutex::new(None));
+        // one more stop signal per attempt, flipped by this attempt's timeout;
+        // the run's own cancel channel is the other half
+        let (expired, on_expiry) = watch::channel(false);
         let ctx = OpCtx {
+            cancel: Cancel {
+                run: cancel.clone(),
+                attempt: on_expiry,
+            },
             run_id: run_id.clone(),
             job: job.clone(),
             op: name.clone(),
@@ -744,19 +888,48 @@ async fn run_op(
             new_fingerprint: Arc::new(Mutex::new(None)),
             store: store.clone(),
         };
-        // the call sits inside the async block, so a closure that panics before
-        // returning its future is caught by the retry policy too
-        let result = match AssertUnwindSafe(async { op.call(ctx).await })
-            .catch_unwind()
-            .await
-        {
-            Ok(Ok(output)) => Ok(output),
-            Ok(Err(e)) => Err(e.to_string()),
+        // Err(limit) means the attempt timed out; the permit is scoped to this
+        // block, so a retry sleep never sits on the resource it backed off from
+        let caught = {
+            let _permit = match &pool {
+                None => None,
+                Some((pool, sem)) => Some(match sem.clone().try_acquire_owned() {
+                    Ok(permit) => permit,
+                    Err(_) => {
+                        // otherwise a queued op is just an op sitting in `running`
+                        ctx.info(format!("waiting for a {pool} pool permit"));
+                        sem.clone()
+                            .acquire_owned()
+                            .await
+                            .expect("pool semaphores are never closed")
+                    }
+                }),
+            };
+            // the call sits inside the async block, so a closure that panics before
+            // returning its future is caught by the retry policy too
+            let call = AssertUnwindSafe(async { op.call(ctx).await }).catch_unwind();
+            match op.timeout_after() {
+                None => Ok(call.await),
+                Some(limit) => match tokio::time::timeout(limit, call).await {
+                    Ok(caught) => Ok(caught),
+                    // dropping the future stops an async op here; a blocking one
+                    // only stops if it polls, so flip the flag it polls
+                    Err(_) => {
+                        let _ = expired.send(true);
+                        Err(limit)
+                    }
+                },
+            }
+        };
+        let result = match caught {
+            Ok(Ok(Ok(output))) => Ok(output),
+            Ok(Ok(Err(e))) => Err(e.to_string()),
             // as_ref, not &: &Box<dyn Any> would downcast against the box itself
-            Err(panic) => Err(match panic_payload(panic.as_ref()) {
+            Ok(Err(panic)) => Err(match panic_payload(panic.as_ref()) {
                 Some(s) => format!("op panicked: {s}"),
                 None => "op panicked".to_string(),
             }),
+            Err(limit) => Err(format!("timed out after {limit:?}")),
         };
         match result {
             Ok(output) => {
@@ -794,7 +967,7 @@ async fn run_op(
                     Some(&data),
                 ));
                 if retrying {
-                    tokio::time::sleep(op.delay()).await;
+                    tokio::time::sleep(op.delay(attempt)).await;
                     attempt += 1;
                     note(store.op_started(&run_id, &name, attempt));
                 } else {
