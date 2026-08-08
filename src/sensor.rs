@@ -355,6 +355,51 @@ mod tests {
             .cursor
     }
 
+    // a sensor names its own params per request; nothing about the schedule
+    // path applies here, and the launch validates them like any other
+    #[tokio::test]
+    async fn a_sensor_launches_each_request_with_its_own_params() {
+        let store = Store::open(":memory:").unwrap();
+        store.sync_sensors(&["watch".into()]).unwrap();
+        let runner = echo_runner(store.clone());
+        let entry = SensorEntry::user(Sensor::new(
+            "watch",
+            Duration::from_secs(3600),
+            |_ctx: SensorCtx| async move {
+                Ok(vec![
+                    RunRequest {
+                        job: "etl".into(),
+                        params: json!({"shard": 1}),
+                    },
+                    RunRequest {
+                        job: "etl".into(),
+                        params: json!({"shard": 2}),
+                    },
+                ])
+            },
+        ));
+        evaluate(&entry, &runner, &AssetRegistry::empty()).await;
+
+        let ticks = store.sensor_ticks(Some("watch"), 10).unwrap();
+        assert_eq!(ticks[0].outcome, SensorOutcome::Fired);
+        assert_eq!(ticks[0].launched, 2);
+        let runs = store.runs(None, None, None, None, 10).unwrap();
+        assert_eq!(runs.len(), 2);
+        assert!(runs.iter().all(|r| r.trigger == Trigger::Sensor));
+        for run in &runs {
+            assert_eq!(wait_terminal(&runner, &run.id).await, RunStatus::Success);
+            // the echo op returns its params, so the output proves they arrived
+            let out = store.op_runs(&run.id).unwrap()[0].output.clone();
+            assert_eq!(out, Some(run.params.clone()));
+        }
+        let mut shards: Vec<i64> = runs
+            .iter()
+            .map(|r| r.params["shard"].as_i64().unwrap())
+            .collect();
+        shards.sort();
+        assert_eq!(shards, [1, 2]);
+    }
+
     #[tokio::test]
     async fn cursor_commits_on_success_and_rolls_back_on_error() {
         let store = Store::open(":memory:").unwrap();

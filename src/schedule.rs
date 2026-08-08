@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use chrono::Utc;
 use chrono_tz::Tz;
-use serde_json::json;
+use serde_json::{Value, json};
 
 use crate::error::Error;
 use crate::executor::Runner;
@@ -17,6 +17,15 @@ pub(crate) struct ScheduleEntry {
     pub expr: String,
     pub tz: Tz,
     pub schedule: cron::Schedule,
+    /// what every fire launches with; `{}` unless the declaration set it.
+    pub params: Value,
+}
+
+impl ScheduleEntry {
+    pub(crate) fn with_params(mut self, params: Value) -> ScheduleEntry {
+        self.params = params;
+        self
+    }
 }
 
 pub(crate) fn parse(job: &str, expr: &str, tz: &str) -> Result<ScheduleEntry, Error> {
@@ -40,6 +49,7 @@ pub(crate) fn parse(job: &str, expr: &str, tz: &str) -> Result<ScheduleEntry, Er
         expr: expr.to_string(),
         tz,
         schedule,
+        params: json!({}),
     })
 }
 
@@ -103,15 +113,17 @@ pub(crate) async fn run_scheduler(mut entries: Vec<ScheduleEntry>, runner: Runne
     if entries.is_empty() {
         return;
     }
-    // queue-policy fires wait here until their job frees up, one per job
-    let mut deferred: HashMap<String, (String, chrono::DateTime<Utc>)> = HashMap::new();
+    // queue-policy fires wait here until their job frees up, one per job. the
+    // params are the ones captured when the fire was held, not the ones the
+    // declaration carries by the time it launches
+    let mut deferred: HashMap<String, (String, chrono::DateTime<Utc>, Value)> = HashMap::new();
     loop {
         let paused_now = if deferred.is_empty() {
             HashSet::new()
         } else {
             paused_set(runner.store())
         };
-        deferred.retain(|job, (expr, due)| {
+        deferred.retain(|job, (expr, due, params)| {
             if paused_now.contains(&(job.clone(), expr.clone())) {
                 tracing::info!(job = %job, expr = %expr, "deferred fire dropped: schedule paused");
                 note_runless_tick(&runner, job, expr, *due, TickOutcome::Skipped);
@@ -121,7 +133,7 @@ pub(crate) async fn run_scheduler(mut entries: Vec<ScheduleEntry>, runner: Runne
                 Ok(true) => true,
                 Ok(false) => {
                     tracing::info!(job = %job, expr = %expr, "deferred fire launching");
-                    note_tick(&runner, job, expr, *due);
+                    note_tick(&runner, job, expr, *due, params);
                     false
                 }
                 Err(e) => {
@@ -131,10 +143,15 @@ pub(crate) async fn run_scheduler(mut entries: Vec<ScheduleEntry>, runner: Runne
             }
         });
 
-        let mut fires: Vec<(chrono::DateTime<Utc>, String, String)> = Vec::new();
+        let mut fires: Vec<(chrono::DateTime<Utc>, String, String, Value)> = Vec::new();
         entries.retain(|e| match e.schedule.upcoming(e.tz).next() {
             Some(t) => {
-                fires.push((t.with_timezone(&Utc), e.job.clone(), e.expr.clone()));
+                fires.push((
+                    t.with_timezone(&Utc),
+                    e.job.clone(),
+                    e.expr.clone(),
+                    e.params.clone(),
+                ));
                 true
             }
             None => {
@@ -169,7 +186,7 @@ pub(crate) async fn run_scheduler(mut entries: Vec<ScheduleEntry>, runner: Runne
         let paused = paused_set(runner.store());
         // two schedules on the same job sharing a tick fire one run, not two
         let mut fired: HashSet<String> = HashSet::new();
-        for (t, job, expr) in fires {
+        for (t, job, expr, params) in fires {
             if t > now || paused.contains(&(job.clone(), expr.clone())) {
                 continue;
             }
@@ -187,12 +204,12 @@ pub(crate) async fn run_scheduler(mut entries: Vec<ScheduleEntry>, runner: Runne
                 .unwrap_or_default();
             if !active || policy == Overlap::Allow {
                 tracing::info!(job = %job, expr = %expr, "schedule fired");
-                note_tick(&runner, &job, &expr, t);
+                note_tick(&runner, &job, &expr, t, &params);
             } else if policy == Overlap::Queue && !deferred.contains_key(&job) {
                 tracing::info!(job = %job, expr = %expr, "fire deferred: run still active");
                 // the wait itself lives in memory; this tick is its durable trace
                 note_runless_tick(&runner, &job, &expr, t, TickOutcome::Deferred);
-                deferred.insert(job.clone(), (expr.clone(), t));
+                deferred.insert(job.clone(), (expr.clone(), t, params));
             } else {
                 tracing::info!(job = %job, expr = %expr, "fire skipped: run still active");
                 note_runless_tick(&runner, &job, &expr, t, TickOutcome::Skipped);
@@ -216,8 +233,8 @@ fn note_runless_tick(
     }
 }
 
-fn note_tick(runner: &Runner, job: &str, expr: &str, due: chrono::DateTime<Utc>) {
-    let tick = match runner.launch(job, json!({}), Trigger::Schedule) {
+fn note_tick(runner: &Runner, job: &str, expr: &str, due: chrono::DateTime<Utc>, params: &Value) {
+    let tick = match runner.launch(job, params.clone(), Trigger::Schedule) {
         Ok(run_id) => {
             runner
                 .store()
@@ -248,6 +265,20 @@ mod tests {
     use crate::store::Store;
     use chrono::Timelike;
     use serde_json::json;
+    use std::sync::{Arc, Mutex};
+
+    fn echo_params_job(name: &str, seen: Arc<Mutex<Vec<serde_json::Value>>>) -> Job {
+        Job::builder(name)
+            .op(Op::new("echo", move |ctx: crate::op::OpCtx| {
+                let seen = seen.clone();
+                async move {
+                    seen.lock().unwrap().push(ctx.params().clone());
+                    Ok(json!(null))
+                }
+            }))
+            .build()
+            .unwrap()
+    }
 
     fn nap_job(name: &str, ms: u64, overlap: Overlap) -> Job {
         Job::builder(name)
@@ -356,6 +387,51 @@ mod tests {
         }
         let runs = store.runs(None, None, None, None, 20).unwrap();
         assert_eq!(runs.len(), fired.len());
+    }
+
+    #[tokio::test]
+    async fn a_fire_launches_with_the_schedules_params() {
+        let store = Store::open(":memory:").unwrap();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let runner = crate::Runner::new([echo_params_job("p", seen.clone())], store.clone());
+        let entry = parse("p", "* * * * * *", "UTC")
+            .unwrap()
+            .with_params(json!({"region": "eu"}));
+        let sched = tokio::spawn(run_scheduler(vec![entry], runner));
+        tokio::time::sleep(Duration::from_millis(1300)).await;
+        sched.abort();
+
+        let runs = store.runs(None, None, None, None, 10).unwrap();
+        assert!(!runs.is_empty(), "no fire in over a second");
+        assert!(runs.iter().all(|r| r.params == json!({"region": "eu"})));
+        let seen = seen.lock().unwrap();
+        assert!(!seen.is_empty(), "no op ran");
+        assert!(seen.iter().all(|p| *p == json!({"region": "eu"})));
+    }
+
+    #[tokio::test]
+    async fn a_deferred_fire_keeps_the_params_it_was_held_with() {
+        let store = Store::open(":memory:").unwrap();
+        let runner = crate::Runner::new([nap_job("q", 1500, Overlap::Queue)], store.clone());
+        let entry = parse("q", "* * * * * *", "UTC")
+            .unwrap()
+            .with_params(json!({"batch": 7}));
+        let sched = tokio::spawn(run_scheduler(vec![entry], runner));
+        tokio::time::sleep(Duration::from_millis(4500)).await;
+        sched.abort();
+
+        let ticks = store.ticks(Some("q"), 20).unwrap();
+        assert!(
+            ticks.iter().any(|t| t.outcome == TickOutcome::Deferred),
+            "no fire was ever deferred"
+        );
+        let runs = store.runs(None, None, None, None, 20).unwrap();
+        assert!(
+            runs.len() >= 2,
+            "expected a deferred catch-up run, got {}",
+            runs.len()
+        );
+        assert!(runs.iter().all(|r| r.params == json!({"batch": 7})));
     }
 
     #[test]

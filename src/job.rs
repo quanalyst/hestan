@@ -1,3 +1,5 @@
+use serde_json::Value;
+
 use crate::error::Error;
 use crate::graph;
 use crate::model::Overlap;
@@ -50,6 +52,17 @@ impl Job {
 
     pub fn overlap(&self) -> Overlap {
         self.overlap
+    }
+
+    /// the first op that refuses `params`, with its reason — the same check a
+    /// launch runs, minus the store and the run. `None` means every op that
+    /// declared [`Op::params`](crate::Op::params) accepts them.
+    pub fn params_error(&self, params: &Value) -> Option<(String, String)> {
+        self.ops.iter().find_map(|op| {
+            op.validate_params(params)
+                .err()
+                .map(|reason| (op.name().to_string(), reason))
+        })
     }
 
     pub(crate) fn order(&self) -> &[String] {

@@ -8,8 +8,8 @@ use serde_json::Value;
 
 use crate::error::Error;
 use crate::model::{
-    Event, EventKind, EventLevel, Materialization, OpRun, OpStatus, Run, RunStatus, ScheduleRow,
-    SensorOutcome, SensorRow, SensorTick, Tick, TickOutcome,
+    Event, EventKind, EventLevel, Materialization, OpRun, OpStatus, Run, RunStatus, ScheduleDef,
+    ScheduleRow, SensorOutcome, SensorRow, SensorTick, Tick, TickOutcome,
 };
 
 // `trigger` is a reserved word in sqlite, hence the quoted column name in
@@ -119,7 +119,13 @@ const SCHEMA_V6: &str = r#"
 ALTER TABLE runs ADD COLUMN error TEXT;
 "#;
 
-const SCHEMA_VERSION: u32 = 6;
+// the params a scheduled fire launches with. before this a cron fire always
+// used `{}`, so a job whose ops declare `.params::<P>()` could never fire.
+const SCHEMA_V7: &str = r#"
+ALTER TABLE schedules ADD COLUMN params TEXT NOT NULL DEFAULT '{}';
+"#;
+
+const SCHEMA_VERSION: u32 = 7;
 
 // one transaction around every pending step and the version stamp (sqlite DDL
 // is transactional), so a crash mid-migration leaves the db exactly as found
@@ -150,6 +156,9 @@ fn migrate(conn: &mut Connection) -> Result<(), Error> {
     }
     if version < 6 {
         tx.execute_batch(SCHEMA_V6)?;
+    }
+    if version < 7 {
+        tx.execute_batch(SCHEMA_V7)?;
     }
     if version != SCHEMA_VERSION {
         tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
@@ -375,18 +384,22 @@ impl Store {
     }
 
     /// make the schedules table mirror the code: insert new (job, expr) pairs,
-    /// refresh tz on existing ones (pause state survives), drop the rest.
-    pub(crate) fn sync_schedules(&self, defined: &[(String, String, String)]) -> Result<(), Error> {
+    /// refresh tz and params on existing ones (pause state survives), drop the
+    /// rest.
+    pub(crate) fn sync_schedules(&self, defined: &[ScheduleDef]) -> Result<(), Error> {
         let mut conn = self.0.lock().unwrap();
         let tx = conn.transaction()?;
         {
-            let mut insert =
-                tx.prepare("INSERT OR IGNORE INTO schedules (job, expr, tz) VALUES (?1, ?2, ?3)")?;
-            let mut update =
-                tx.prepare("UPDATE schedules SET tz = ?3 WHERE job = ?1 AND expr = ?2")?;
-            for (job, expr, tz) in defined {
-                insert.execute(params![job, expr, tz])?;
-                update.execute(params![job, expr, tz])?;
+            let mut insert = tx.prepare(
+                "INSERT OR IGNORE INTO schedules (job, expr, tz, params) VALUES (?1, ?2, ?3, ?4)",
+            )?;
+            let mut update = tx.prepare(
+                "UPDATE schedules SET tz = ?3, params = ?4 WHERE job = ?1 AND expr = ?2",
+            )?;
+            for (job, expr, tz, declared) in defined {
+                let declared = declared.to_string();
+                insert.execute(params![job, expr, tz, declared])?;
+                update.execute(params![job, expr, tz, declared])?;
             }
         }
         let existing: Vec<(String, String)> = {
@@ -396,7 +409,7 @@ impl Store {
         };
         let keep: HashSet<(&str, &str)> = defined
             .iter()
-            .map(|(j, e, _)| (j.as_str(), e.as_str()))
+            .map(|(j, e, ..)| (j.as_str(), e.as_str()))
             .collect();
         for (job, expr) in &existing {
             if !keep.contains(&(job.as_str(), expr.as_str())) {
@@ -413,13 +426,14 @@ impl Store {
     pub fn schedules(&self) -> Result<Vec<ScheduleRow>, Error> {
         let conn = self.0.lock().unwrap();
         let mut stmt =
-            conn.prepare("SELECT job, expr, tz, paused FROM schedules ORDER BY job, expr")?;
+            conn.prepare("SELECT job, expr, tz, paused, params FROM schedules ORDER BY job, expr")?;
         let rows = stmt.query_map([], |r| {
             Ok(ScheduleRow {
                 job: r.get(0)?,
                 expr: r.get(1)?,
                 tz: r.get(2)?,
                 paused: r.get(3)?,
+                params: json_col(r, 4)?,
             })
         })?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
@@ -1422,14 +1436,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("future.db");
         let path = path.to_str().unwrap();
-        phase1_db(path, 7);
+        phase1_db(path, 8);
         let err = Store::open(path).err().unwrap();
-        assert_eq!(err.to_string(), "db schema v7 is newer than this build");
+        assert_eq!(err.to_string(), "db schema v8 is newer than this build");
         let conn = Connection::open(path).unwrap();
         let version: u32 = conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 7);
+        assert_eq!(version, 8);
     }
 
     #[test]
@@ -1580,6 +1594,49 @@ mod tests {
                 .as_deref(),
             Some("op a failed: boom")
         );
+    }
+
+    #[test]
+    fn v6_db_migrates_to_v7_keeping_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v6.db");
+        let path = path.to_str().unwrap();
+        // every batch up to v6, stamped 6: schedules has no params column yet
+        let conn = Connection::open(path).unwrap();
+        conn.execute_batch(PHASE1_SCHEMA).unwrap();
+        conn.execute_batch(SCHEMA_V2).unwrap();
+        conn.execute_batch(SCHEMA_V3).unwrap();
+        conn.execute_batch(SCHEMA_V4).unwrap();
+        conn.execute_batch(SCHEMA_V5).unwrap();
+        conn.execute_batch(SCHEMA_V6).unwrap();
+        conn.execute(
+            "INSERT INTO schedules (job, expr, paused) VALUES ('etl', '0 * * * *', 1)",
+            [],
+        )
+        .unwrap();
+        conn.pragma_update(None, "user_version", 6).unwrap();
+        drop(conn);
+
+        // a schedule declared before params existed reads back as `{}`, paused
+        let store = Store::open(path).unwrap();
+        let rows = store.schedules().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].paused);
+        assert_eq!(rows[0].params, json!({}));
+
+        store
+            .sync_schedules(&[(
+                "etl".into(),
+                "0 * * * *".into(),
+                "UTC".into(),
+                json!({"region": "eu"}),
+            )])
+            .unwrap();
+        drop(store);
+        let store = Store::open(path).unwrap();
+        let rows = store.schedules().unwrap();
+        assert_eq!(rows[0].params, json!({"region": "eu"}));
+        assert!(rows[0].paused, "sync dropped the paused flag");
     }
 
     #[test]
@@ -1769,31 +1826,38 @@ mod tests {
                 "etl".to_string(),
                 "0 * * * *".to_string(),
                 "UTC".to_string(),
+                json!({"full": true}),
             ),
             (
                 "health".to_string(),
                 "*/5 * * * *".to_string(),
                 "UTC".to_string(),
+                json!({}),
             ),
         ];
         store.sync_schedules(&defined).unwrap();
         let rows = store.schedules().unwrap();
         assert_eq!(rows.len(), 2);
         assert!(rows.iter().all(|r| !r.paused));
+        assert_eq!(rows[0].params, json!({"full": true}));
+        assert_eq!(rows[1].params, json!({}));
 
         assert!(store.set_schedule_paused("etl", "0 * * * *", true).unwrap());
         assert!(!store.set_schedule_paused("etl", "bogus", true).unwrap());
 
+        // tz and params follow the declaration; the paused flag stays put
         let defined = vec![(
             "etl".to_string(),
             "0 * * * *".to_string(),
             "Europe/London".to_string(),
+            json!({"full": false}),
         )];
         store.sync_schedules(&defined).unwrap();
         let rows = store.schedules().unwrap();
         assert_eq!(rows.len(), 1);
         assert!(rows[0].paused);
         assert_eq!(rows[0].tz, "Europe/London");
+        assert_eq!(rows[0].params, json!({"full": false}));
     }
 
     #[test]

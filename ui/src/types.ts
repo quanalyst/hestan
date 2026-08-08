@@ -44,6 +44,8 @@ export interface JobSchedule {
   expr: string;
   tz: string;
   paused: boolean;
+  // what every fire of this schedule launches with, {} unless declared
+  params: unknown;
   next_fire: string | null;
 }
 

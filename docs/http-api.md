@@ -15,6 +15,7 @@ failures. timestamps are rfc3339 strings in utc.
 | GET | `/api/jobs` | all job summaries, sorted by name |
 | GET | `/api/jobs/{name}` | one job summary |
 | POST | `/api/jobs/{name}/runs` | launch a run |
+| POST | `/api/jobs/{name}/validate_params` | check params without launching |
 | GET | `/api/jobs/{name}/op_stats` | per-op aggregates over recent runs |
 | GET | `/api/jobs/{name}/state` | the job's committed op state |
 | GET | `/api/runs` | run list with filters and paging |
@@ -58,7 +59,7 @@ summary or a 404. the shape:
   ],
   "schedules": [
     { "expr": "*/2 * * * *", "tz": "UTC", "paused": false,
-      "next_fire": "2026-08-07T12:34:00+00:00" }
+      "params": {}, "next_fire": "2026-08-07T12:34:00+00:00" }
   ],
   "last_run": { "...": "a run object, or null" },
   "max_parallel": 4,
@@ -90,6 +91,16 @@ id is immediately queryable. a body that isn't `{"params": ...}`-shaped is a
 400 (`invalid body: ...`), params rejected by an op's `.params::<P>()` are a
 400 (`invalid params for op fetch: ...`) with nothing written, and an unknown
 job is a 404.
+
+## Validating params
+
+`POST /api/jobs/{name}/validate_params` with the same `{"params": {...}}` body
+runs a launch's params check and stops there — nothing is written and no run
+is created. `200 {"ok": true}` when every op that declared `.params::<P>()`
+accepts them, `400 {"error": "invalid params for op fetch: ..."}` when one
+doesn't, `404` for an unknown job. an empty body means `{}`, which is what a
+launch would use. the ui's params editor calls this on blur so a typo shows up
+before the launch rather than as a failed run.
 
 ## Op stats
 
@@ -359,9 +370,14 @@ expression:
 ```json
 { "schedules": [
   { "job": "orders_etl", "expr": "*/2 * * * *", "tz": "UTC",
-    "paused": false, "next_fire": "2026-08-07T12:34:00+00:00" }
+    "paused": false, "params": {"region": "eu"},
+    "next_fire": "2026-08-07T12:34:00+00:00" }
 ] }
 ```
+
+`params` is what every fire of that schedule launches with — `{}` unless the
+declaration set it with `schedule_with` / `schedule_tz_with`, and validated
+against the job's ops at startup (see [scheduling](scheduling.md)).
 
 `POST /api/schedules/state` with `{"job": ..., "expr": ..., "paused": true}`
 flips the flag and returns `{"ok": true}`; an unregistered `(job, expr)` pair

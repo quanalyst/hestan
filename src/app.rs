@@ -8,7 +8,7 @@ use crate::asset::{Asset, AssetRegistry, mats_map, plan_target};
 use crate::error::Error;
 use crate::executor::{FailureHook, RunFailure, Runner};
 use crate::job::Job;
-use crate::model::{Run, Trigger};
+use crate::model::{Run, ScheduleDef, Trigger};
 use crate::schedule::{self, ScheduleEntry};
 use crate::sensor::{Sensor, SensorEntry, SensorEval, run_sensors};
 use crate::server::{AppState, SensorInfo, router};
@@ -18,7 +18,7 @@ use crate::store::Store;
 /// or `run_once` headless.
 pub struct Hestan {
     jobs: Vec<Job>,
-    schedules: Vec<(String, String, String)>,
+    schedules: Vec<ScheduleDef>,
     assets: Vec<Asset>,
     sensors: Vec<Sensor>,
     pools: Vec<(String, usize)>,
@@ -91,23 +91,47 @@ impl Hestan {
         self
     }
 
-    /// attach a 5-field cron expression to a job, evaluated in utc;
-    /// validated in serve/run_once.
-    pub fn schedule(mut self, job: impl Into<String>, cron_expr: impl Into<String>) -> Self {
-        self.schedules
-            .push((job.into(), cron_expr.into(), "UTC".into()));
-        self
+    /// attach a 5-field cron expression to a job, evaluated in utc; fires
+    /// launch with params `{}`. validated in serve/run_once.
+    pub fn schedule(self, job: impl Into<String>, cron_expr: impl Into<String>) -> Self {
+        self.schedule_with(job, cron_expr, serde_json::json!({}))
     }
 
     /// like [`Hestan::schedule`] but evaluated in a named iana timezone.
     pub fn schedule_tz(
-        mut self,
+        self,
         job: impl Into<String>,
         cron_expr: impl Into<String>,
         tz: impl Into<String>,
     ) -> Self {
+        self.schedule_tz_with(job, cron_expr, tz, serde_json::json!({}))
+    }
+
+    /// like [`Hestan::schedule`] with the params every fire launches with.
+    /// they go through the job's op validators at build, so a schedule that
+    /// could never launch is [`Error::InvalidParams`] at startup rather than a
+    /// tick that fails forever at 3am.
+    pub fn schedule_with(
+        mut self,
+        job: impl Into<String>,
+        cron_expr: impl Into<String>,
+        params: Value,
+    ) -> Self {
         self.schedules
-            .push((job.into(), cron_expr.into(), tz.into()));
+            .push((job.into(), cron_expr.into(), "UTC".into(), params));
+        self
+    }
+
+    /// [`Hestan::schedule_with`] in a named iana timezone.
+    pub fn schedule_tz_with(
+        mut self,
+        job: impl Into<String>,
+        cron_expr: impl Into<String>,
+        tz: impl Into<String>,
+        params: Value,
+    ) -> Self {
+        self.schedules
+            .push((job.into(), cron_expr.into(), tz.into(), params));
         self
     }
 
@@ -211,7 +235,7 @@ impl Hestan {
                 // dropped-cron warning would be a lie here
                 jobs.push(src.build_job(&name)?);
                 if let Some((expr, tz)) = &src.cron {
-                    schedules.push((name, expr.clone(), tz.clone()));
+                    schedules.push((name, expr.clone(), tz.clone(), serde_json::json!({})));
                 }
             }
             (jobs, schedules)
@@ -236,11 +260,19 @@ impl Hestan {
             }
         }
         let mut entries = Vec::new();
-        for (job, expr, tz) in &schedules {
-            if !names.contains(job.as_str()) {
+        for (job, expr, tz, params) in &schedules {
+            let Some(defined) = jobs.iter().find(|j| j.name() == job) else {
                 return Err(Error::UnknownJob(job.clone()));
+            };
+            // the same validators a launch runs, at startup: a schedule whose
+            // params no op accepts is a build error, not a 3am tick that fails
+            if let Some((op, reason)) = defined.params_error(params) {
+                return Err(Error::InvalidParams {
+                    op,
+                    reason: format!("schedule {expr} on job {job}: {reason}"),
+                });
             }
-            entries.push(schedule::parse(job, expr, tz)?);
+            entries.push(schedule::parse(job, expr, tz)?.with_params(params.clone()));
         }
 
         let mut sensor_entries: Vec<SensorEntry> =
@@ -303,6 +335,19 @@ mod tests {
     use crate::op::Op;
     use serde_json::json;
 
+    #[derive(serde::Deserialize)]
+    #[allow(dead_code)]
+    struct Window {
+        days: u32,
+    }
+
+    fn windowed(name: &str) -> Job {
+        Job::builder(name)
+            .op(Op::new("render", |_| async { Ok(json!(null)) }).params::<Window>())
+            .build()
+            .unwrap()
+    }
+
     fn pooled(job: &str) -> Job {
         Job::builder(job)
             .op(Op::new("call", |_| async { Ok(serde_json::json!(null)) }).pool("api"))
@@ -341,5 +386,77 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(run.status, RunStatus::Success);
+    }
+
+    // a schedule that could never launch is a startup error, not a tick that
+    // fails forever at 3am
+    #[tokio::test]
+    async fn schedule_params_are_validated_at_build() {
+        let good = json!({"days": 7});
+        let err = Hestan::new()
+            .job(windowed("report"))
+            .schedule_with("report", "0 9 * * *", json!({"days": "many"}))
+            .db(":memory:")
+            .run_once("report", good.clone())
+            .await
+            .err()
+            .unwrap();
+        assert!(
+            matches!(err, Error::InvalidParams { ref op, .. } if op == "render"),
+            "{err}"
+        );
+        assert!(
+            err.to_string().contains("schedule 0 9 * * * on job report"),
+            "{err}"
+        );
+
+        // the plain form fires with {}, which this job's op also refuses
+        let err = Hestan::new()
+            .job(windowed("report"))
+            .schedule("report", "0 9 * * *")
+            .db(":memory:")
+            .run_once("report", good.clone())
+            .await
+            .err()
+            .unwrap();
+        assert!(matches!(err, Error::InvalidParams { .. }), "{err}");
+
+        let run = Hestan::new()
+            .job(windowed("report"))
+            .schedule_with("report", "0 9 * * *", good.clone())
+            .db(":memory:")
+            .run_once("report", good)
+            .await
+            .unwrap();
+        assert_eq!(run.status, RunStatus::Success);
+    }
+
+    #[tokio::test]
+    async fn schedule_params_survive_a_pause_and_a_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hestan.db");
+        let path = path.to_str().unwrap().to_string();
+        let boot = || {
+            Hestan::new()
+                .job(windowed("report"))
+                .schedule_with("report", "0 9 * * *", json!({"days": 7}))
+                .db(path.clone())
+        };
+
+        boot().run_once("report", json!({"days": 1})).await.unwrap();
+        let store = Store::open(&path).unwrap();
+        assert!(
+            store
+                .set_schedule_paused("report", "0 9 * * *", true)
+                .unwrap()
+        );
+        drop(store);
+
+        boot().run_once("report", json!({"days": 1})).await.unwrap();
+        let store = Store::open(&path).unwrap();
+        let rows = store.schedules().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].paused, "the pause did not survive the restart");
+        assert_eq!(rows[0].params, json!({"days": 7}));
     }
 }

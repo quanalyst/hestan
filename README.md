@@ -193,8 +193,6 @@ the binary is yours: define jobs, then `Hestan::new()...serve(addr)`, or
       next thing
 - [ ] max concurrent runs per job (overlap policies gate scheduled fires
       only; concurrency pools cap ops across runs, not the runs themselves)
-- [ ] per-schedule params (scheduled fires launch with `{}`, so a job whose
-      ops require typed params can never fire from cron)
 - [ ] postgres store
 - [ ] dynamic / fan-out ops
 - [ ] post/body http sources

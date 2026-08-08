@@ -197,7 +197,14 @@ pub struct ScheduleRow {
     pub expr: String,
     pub tz: String,
     pub paused: bool,
+    /// the params every fire of this schedule launches with, `{}` unless the
+    /// declaration set them.
+    pub params: Value,
 }
+
+/// one schedule as the code declares it — job, cron expression, timezone,
+/// params — which is what a sync writes over the stored rows.
+pub(crate) type ScheduleDef = (String, String, String, Value);
 
 #[derive(Debug, Clone, Serialize)]
 pub struct Tick {

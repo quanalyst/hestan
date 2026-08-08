@@ -273,3 +273,10 @@ both validate params before the run row is written. if any op declared
 `.params::<P>()` and the given params don't deserialize, the launch fails with
 `Error::InvalidParams` and leaves no trace in the database. launching an
 unregistered job is `Error::UnknownJob`.
+
+a schedule's params are checked earlier still. `schedule_with` (and
+`schedule_tz_with`) attach the params every cron fire launches with, and
+`Hestan::build` runs them through those same validators, so a schedule whose
+params no op accepts is a startup error rather than a fire that fails forever
+at 3am. `Job::params_error` is that check on its own, without a store or a run,
+and is what `POST /api/jobs/{name}/validate_params` answers with.

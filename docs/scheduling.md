@@ -13,8 +13,32 @@ Hestan::new()
 
 a job can carry several schedules; a schedule on an unregistered job, a bad
 expression, or an unknown timezone is an error from `serve`/`run_once` — at
-startup, not at fire time. scheduled runs launch with params `{}` and trigger
-`schedule`.
+startup, not at fire time. scheduled runs carry the trigger `schedule`.
+
+## Params
+
+`schedule` and `schedule_tz` fire with params `{}`. `schedule_with` and
+`schedule_tz_with` take what every fire should launch with instead:
+
+```rust
+Hestan::new()
+    .job(backfill)
+    .schedule_with("backfill", "0 3 * * *", json!({"days": 1}))
+    .schedule_tz_with("report", "0 9 * * 1-5", "Europe/London", json!({"full": true}))
+```
+
+they are validated **at build**, not at fire time: `serve`/`run_once` run each
+schedule's params through the same op validators a launch runs, so a schedule
+a job's ops could never accept is an `Error::InvalidParams` naming the op, the
+expression and the job — instead of a tick that fails every night at 3am. that
+also means a job whose ops declare required params needs `schedule_with`; the
+plain form's `{}` is refused at startup.
+
+the params live in the schedules table and sync from the code like the
+timezone: changing them updates the row in place, and the paused flag survives
+(as ever, changing the *expression* is a new row). a queue-policy fire that
+waits launches with the params it was held with, not with whatever the
+declaration says by the time its turn comes.
 
 ## Cron syntax
 

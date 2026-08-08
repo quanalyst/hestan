@@ -43,6 +43,7 @@ pub(crate) fn router(state: AppState) -> Router {
         .route("/api/jobs", get(list_jobs))
         .route("/api/jobs/{name}", get(get_job))
         .route("/api/jobs/{name}/runs", post(launch_run))
+        .route("/api/jobs/{name}/validate_params", post(validate_params))
         .route("/api/jobs/{name}/op_stats", get(op_stats))
         .route("/api/jobs/{name}/state", get(job_state))
         .route("/api/runs", get(list_runs))
@@ -165,6 +166,7 @@ fn job_summary(job: &Job, st: &AppState) -> Result<Value, Error> {
                 "expr": s.expr,
                 "tz": s.tz,
                 "paused": s.paused,
+                "params": s.params,
                 "next_fire": next_fire(s),
             })
         })
@@ -249,6 +251,33 @@ async fn launch_run(
         Err(e @ Error::UnknownJob(_)) => Err(err(StatusCode::NOT_FOUND, e.to_string())),
         Err(e @ Error::InvalidParams { .. }) => Err(err(StatusCode::BAD_REQUEST, e.to_string())),
         Err(e) => Err(internal(e)),
+    }
+}
+
+// the same check a launch runs, without launching: the launchpad asks before
+// it commits, so a typo in the params editor is a message, not a failed run
+async fn validate_params(
+    State(st): State<AppState>,
+    Path(name): Path<String>,
+    body: Bytes,
+) -> Result<Json<Value>, ApiError> {
+    let job = st
+        .jobs
+        .get(&name)
+        .ok_or_else(|| err(StatusCode::NOT_FOUND, format!("unknown job: {name}")))?;
+    let params = if body.is_empty() {
+        json!({})
+    } else {
+        let parsed: LaunchBody = serde_json::from_slice(&body)
+            .map_err(|e| err(StatusCode::BAD_REQUEST, format!("invalid body: {e}")))?;
+        parsed.params.unwrap_or_else(|| json!({}))
+    };
+    match job.params_error(&params) {
+        None => Ok(Json(json!({ "ok": true }))),
+        Some((op, reason)) => Err(err(
+            StatusCode::BAD_REQUEST,
+            Error::InvalidParams { op, reason }.to_string(),
+        )),
     }
 }
 
@@ -521,6 +550,7 @@ async fn list_schedules(State(st): State<AppState>) -> Result<Json<Value>, ApiEr
                 "expr": s.expr,
                 "tz": s.tz,
                 "paused": s.paused,
+                "params": s.params,
                 "next_fire": next_fire(s),
             })
         })
@@ -1201,6 +1231,76 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn validate_params_endpoint_answers_ok_bad_and_unknown() {
+        #[derive(Deserialize)]
+        #[allow(dead_code)]
+        struct Params {
+            threshold: u32,
+        }
+        let job = Job::builder("gated")
+            .op(Op::new("check", |_| async { Ok(json!(null)) }).params::<Params>())
+            .build()
+            .unwrap();
+        let st = state(vec![job]);
+        let check = |body: &'static str| {
+            validate_params(State(st.clone()), Path("gated".into()), raw(body))
+        };
+
+        let Json(body) = check(r#"{"params": {"threshold": 3}}"#).await.unwrap();
+        assert_eq!(body, json!({"ok": true}));
+
+        let (status, Json(body)) = check(r#"{"params": {"threshold": "high"}}"#)
+            .await
+            .unwrap_err();
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(
+            body["error"]
+                .as_str()
+                .unwrap()
+                .starts_with("invalid params for op check:"),
+            "{body}"
+        );
+
+        // an empty body means {}, which this op also refuses
+        let (status, _) = check("").await.unwrap_err();
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+
+        let (status, Json(body)) = check("{not json}").await.unwrap_err();
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(
+            body["error"].as_str().unwrap().starts_with("invalid body"),
+            "{body}"
+        );
+
+        let (status, Json(body)) =
+            validate_params(State(st), Path("nope".into()), raw(r#"{"params": {}}"#))
+                .await
+                .unwrap_err();
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body["error"], "unknown job: nope");
+    }
+
+    #[tokio::test]
+    async fn schedules_report_their_params() {
+        let st = state(vec![echo_job("etl")]);
+        st.runner
+            .store()
+            .sync_schedules(&[(
+                "etl".to_string(),
+                "0 * * * *".to_string(),
+                "UTC".to_string(),
+                json!({"region": "eu"}),
+            )])
+            .unwrap();
+
+        let Json(body) = list_schedules(State(st.clone())).await.unwrap();
+        assert_eq!(body["schedules"][0]["params"], json!({"region": "eu"}));
+
+        let Json(body) = get_job(State(st), Path("etl".into())).await.unwrap();
+        assert_eq!(body["schedules"][0]["params"], json!({"region": "eu"}));
+    }
+
+    #[tokio::test]
     async fn job_state_endpoint_lists_and_404s() {
         let st = state(vec![echo_job("etl")]);
         let (status, Json(body)) = job_state(State(st.clone()), Path("nope".into()))
@@ -1277,11 +1377,13 @@ mod tests {
                     "etl".to_string(),
                     "* * * * *".to_string(),
                     "UTC".to_string(),
+                    json!({}),
                 ),
                 (
                     "health".to_string(),
                     "0 * * * *".to_string(),
                     "UTC".to_string(),
+                    json!({}),
                 ),
             ])
             .unwrap();
@@ -1624,6 +1726,7 @@ mod tests {
                 "etl".to_string(),
                 "0,1 0 1 1 *".to_string(),
                 "UTC".to_string(),
+                json!({}),
             )])
             .unwrap();
 
@@ -1671,6 +1774,7 @@ mod tests {
             expr: "0 9 * * 1-5".into(),
             tz: "UTC".into(),
             paused: false,
+            params: json!({}),
         };
         // sunday noon: the weekday schedule last fired friday 09:00
         let sunday = Utc.with_ymd_and_hms(2026, 8, 9, 12, 0, 0).unwrap();

@@ -56,6 +56,7 @@ CREATE TABLE schedules (
     expr TEXT NOT NULL,
     tz TEXT NOT NULL DEFAULT 'UTC',
     paused INTEGER NOT NULL DEFAULT 0,
+    params TEXT NOT NULL DEFAULT '{}',  -- added in v7
     PRIMARY KEY (job, expr)
 );
 
@@ -139,12 +140,14 @@ forward on every open. version 1 is the phase-1 schema (`runs`, `op_runs`,
 adds `op_state`; version 4 adds `asset_materializations`, `sensors`, and
 `sensor_ticks`; version 5 adds `runs.resumed_from`, the link a
 [resume](concepts.md#resume) follows back to the run it continued; version 6
-adds `runs.error`. an older file at any version opens straight into v6, rows
-intact. every pending step
+adds `runs.error`; version 7 adds `schedules.params`, the params a cron fire
+launches with ([scheduling](scheduling.md)) — schedules declared before it
+default to `{}`, which is what they always fired with. an older file at any
+version opens straight into v7, rows intact. every pending step
 and the version stamp run in one transaction
 (sqlite DDL is transactional), so a crash or failure mid-migration leaves
 the file exactly as it was found, never half-migrated. a database stamped
-with a version newer than the build refuses to open (`db schema v7 is newer
+with a version newer than the build refuses to open (`db schema v8 is newer
 than this build`) instead of quietly writing an older stamp over it.
 
 one wrinkle: databases written before the migration mechanism existed carry

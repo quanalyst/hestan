@@ -49,6 +49,14 @@ function validJson(text: string): boolean {
   }
 }
 
+// a schedule's params next to its expression: short mono json, full on hover
+const SCHED_PARAMS_CAP = 44;
+
+function paramsLabel(params: unknown): string | null {
+  const json = JSON.stringify(params);
+  return json === undefined || json === "{}" ? null : json;
+}
+
 export default function JobPage() {
   const { name } = useParams();
   if (!name) return null;
@@ -71,6 +79,7 @@ function JobView({ name }: { name: string }) {
   const [paramsText, setParamsText] = useState(() => loadParams(name));
   const [launching, setLaunching] = useState(false);
   const [launchError, setLaunchError] = useState<string | null>(null);
+  const [paramsError, setParamsError] = useState<string | null>(null);
   const [schedError, setSchedError] = useState<string | null>(null);
   const [missing, setMissing] = useState(false);
   const enc = encodeURIComponent(name);
@@ -122,6 +131,21 @@ function JobView({ name }: { name: string }) {
   );
 
   const paramsValid = validJson(paramsText);
+
+  // the client-side parse is the first gate; the server owns the second, since
+  // only it knows what the ops declared
+  const checkParams = async () => {
+    if (!paramsValid) return;
+    const text = paramsText.trim();
+    try {
+      await post<{ ok: boolean }>(`/api/jobs/${enc}/validate_params`, {
+        params: text ? JSON.parse(text) : {},
+      });
+      setParamsError(null);
+    } catch (e) {
+      setParamsError(e instanceof Error ? e.message : String(e));
+    }
+  };
 
   const launch = async () => {
     setLaunching(true);
@@ -197,9 +221,14 @@ function JobView({ name }: { name: string }) {
                 value={paramsText}
                 placeholder="{}"
                 spellCheck={false}
-                onChange={(e) => setParamsText(e.target.value)}
+                onChange={(e) => {
+                  setParamsText(e.target.value);
+                  setParamsError(null);
+                }}
+                onBlur={checkParams}
               />
               {!paramsValid && <p className="muted params-hint">invalid json</p>}
+              {paramsValid && paramsError && <p className="muted params-hint">{paramsError}</p>}
             </div>
           )}
           {!paramsValid && !paramsOpen && <p className="muted">saved params are invalid json — open params to fix</p>}
@@ -241,10 +270,17 @@ function JobView({ name }: { name: string }) {
       {job.schedules.length > 0 && (
         <>
           <h2>schedules</h2>
-          {job.schedules.map((s) => (
+          {job.schedules.map((s) => {
+            const params = paramsLabel(s.params);
+            return (
             <div key={s.expr} className="sched-row">
               <span className="mono">{s.expr}</span>
               {s.tz !== "UTC" && <span className="muted">{s.tz}</span>}
+              {params && (
+                <span className="mono muted" title={params}>
+                  {params.length > SCHED_PARAMS_CAP ? params.slice(0, SCHED_PARAMS_CAP - 1) + "…" : params}
+                </span>
+              )}
               <span className="muted">
                 {s.paused ? "paused" : s.next_fire ? `next ${untilTime(s.next_fire)}` : "next —"}
               </span>
@@ -252,7 +288,8 @@ function JobView({ name }: { name: string }) {
                 {s.paused ? "resume" : "pause"}
               </button>
             </div>
-          ))}
+            );
+          })}
           {schedError && <p className="muted">schedule update failed: {schedError}</p>}
           {ticks.length > 0 && (
             <>
