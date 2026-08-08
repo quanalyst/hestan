@@ -507,6 +507,7 @@ pub(crate) fn launch_plan(
         plan.seeds,
         json!({}),
         trigger,
+        None,
     )
 }
 

@@ -4,10 +4,10 @@ everything lives under `/api`, speaks json, and is what the ui itself runs
 on — there is no privileged path. errors are always
 `{"error": "<message>"}` with an appropriate status: 400 for bad input
 (malformed query parameters included), 404 for unknown names, 409 for a
-request that conflicts with reality (a retry of a run still active or whose
-job has left the code, a cancel of a finished run, an asset build while one
-is already running), 500 for storage failures. timestamps are rfc3339
-strings in utc.
+request that conflicts with reality (a retry or resume of a run still active
+or whose job has left the code, a resume of a run that succeeded, a cancel of
+a finished run, an asset build while one is already running), 500 for storage
+failures. timestamps are rfc3339 strings in utc.
 
 | method | path | purpose |
 | --- | --- | --- |
@@ -21,6 +21,8 @@ strings in utc.
 | GET | `/api/runs/{id}` | one run plus its op runs |
 | GET | `/api/runs/{id}/events` | the run's event log, cursored |
 | POST | `/api/runs/{id}/retry` | launch a fresh run with the same params |
+| POST | `/api/runs/{id}/resume` | continue a run from where it broke |
+| GET | `/api/runs/{id}/resume_preview` | what a resume would do |
 | POST | `/api/runs/{id}/cancel` | stop a queued or running run |
 | GET | `/api/assets` | every asset with lineage and staleness |
 | POST | `/api/assets/{name}/build` | build one asset (and stale ancestors) |
@@ -147,13 +149,16 @@ without `before` is ignored. a run:
   "params": {},
   "created_at": "2026-08-07T12:00:00Z",
   "started_at": "2026-08-07T12:00:00Z",
-  "finished_at": "2026-08-07T12:00:03Z"
+  "finished_at": "2026-08-07T12:00:03Z",
+  "resumed_from": null
 }
 ```
 
 `status` is `queued | running | success | failed | canceled`; `trigger` is
-`manual | schedule | retry | build | sensor`. an op run's status is
-`pending | running | success | failed | skipped | canceled`.
+`manual | schedule | retry | resume | build | sensor`. an op run's status is
+`pending | running | success | failed | skipped | canceled`. `resumed_from`
+is the id of the run this one continued, null for every run that isn't a
+[resume](#resume).
 
 `GET /api/runs/{id}` returns `{"run": ..., "ops": [...]}` (404 for an unknown
 id), the op runs sorted by op name:
@@ -197,15 +202,57 @@ and `data` are catalogued in [concepts](concepts.md).
 ## Retry
 
 `POST /api/runs/{id}/retry` launches a fresh run of the same job with the
-original params and trigger `retry` — it does not resume the old run, and it
-is for finished runs only. 202 with the new `run_id`; 404 when the run id is
-unknown; 409 (`run still active: ...`) when the run is still queued or
-running — retrying a live run would only double it, and a manual launch is
-the ungated escape hatch when an overlapping run is really wanted; 409
+original params and trigger `retry` — it redoes everything, where
+[resume](#resume) continues, and it is for finished runs only. 202 with the
+new `run_id`; 404 when the run id is unknown; 409 (`run still active: ...`)
+when the run is still queued or running — retrying a live run would only
+double it, and a manual launch is the ungated escape hatch when an
+overlapping run is really wanted; 409
 (`job no longer defined: ...`) when the run exists but its job is no longer
 registered — a 404 would lie, the run is right there; 400 when the recorded
 params no longer pass a `.params::<P>()` check the job has since grown. the
 checks apply in that order.
+
+## Resume
+
+`POST /api/runs/{id}/resume` launches a run that continues a finished one:
+the ops that did not succeed run again with their downstream, the ops that
+did are seeded from their recorded outputs. the new run keeps the original
+params, gets trigger `resume`, and records `resumed_from`. the semantics —
+what is reused, the chain walk, the changed-graph refusal — are in
+[concepts](concepts.md).
+
+the body is optional: empty, `{}`, or `{"from": []}` all mean "from the
+failure". `{"from": ["clean", "publish"]}` re-runs exactly those ops and
+their transitive downstream whatever their last status was, which is how
+"re-run from here" is expressed and the one form that also applies to a run
+that succeeded.
+
+202 with the new `run_id`; 404 when the run id is unknown; 409
+(`run still active: ...`) when the run is still queued or running; 409
+(`run did not fail: ...`) for a plain resume of a successful run — a
+targeted `from` on the same run is fine; 409 (`job no longer defined: ...`)
+when the run exists but its job is no longer registered — a 404 would lie,
+the run is right there; 400 for a body that isn't `{"from": [...]}`-shaped,
+for `from` naming ops the job does not have, when the ops recorded across the
+resume chain are no longer exactly the job's ops, when an ancestor run has
+been pruned out of the history, when nothing is left to re-run, when a
+re-run op's input was never produced, and when the recorded params no longer
+pass a `.params::<P>()` check the job has since grown. the checks apply in
+that order.
+
+`GET /api/runs/{id}/resume_preview?from=clean,publish` answers what that
+resume would do, without launching anything:
+
+```json
+{ "reuse": ["fetch_orders"], "rerun": ["clean", "publish"] }
+```
+
+both lists are in the job's topological order. `from` is optional and comma
+separated (blank means "from the failure"), and every refusal above applies
+here identically — a preview never promises a run the launch would reject.
+ops that neither re-run nor have an output worth reusing appear in neither
+list.
 
 ## Cancel
 

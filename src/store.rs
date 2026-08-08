@@ -105,7 +105,13 @@ CREATE TABLE sensor_ticks (
 );
 "#;
 
-const SCHEMA_VERSION: u32 = 4;
+// the run a resumed run continues, so a chain of resumes can be walked back to
+// the outputs its ancestors recorded
+const SCHEMA_V5: &str = r#"
+ALTER TABLE runs ADD COLUMN resumed_from TEXT;
+"#;
+
+const SCHEMA_VERSION: u32 = 5;
 
 // one transaction around every pending step and the version stamp (sqlite DDL
 // is transactional), so a crash mid-migration leaves the db exactly as found
@@ -130,6 +136,9 @@ fn migrate(conn: &mut Connection) -> Result<(), Error> {
     }
     if version < 4 {
         tx.execute_batch(SCHEMA_V4)?;
+    }
+    if version < 5 {
+        tx.execute_batch(SCHEMA_V5)?;
     }
     if version != SCHEMA_VERSION {
         tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
@@ -168,8 +177,8 @@ impl Store {
         let mut conn = self.0.lock().unwrap();
         let tx = conn.transaction()?;
         tx.execute(
-            r#"INSERT INTO runs (id, job, status, "trigger", params, created_at, started_at, finished_at)
-               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)"#,
+            r#"INSERT INTO runs (id, job, status, "trigger", params, created_at, started_at, finished_at, resumed_from)
+               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)"#,
             params![
                 run.id,
                 run.job,
@@ -179,6 +188,7 @@ impl Store {
                 run.created_at.to_rfc3339(),
                 run.started_at.map(|t| t.to_rfc3339()),
                 run.finished_at.map(|t| t.to_rfc3339()),
+                run.resumed_from,
             ],
         )?;
         {
@@ -480,7 +490,8 @@ impl Store {
         let conn = self.0.lock().unwrap();
         let run = conn
             .query_row(
-                r#"SELECT id, job, status, "trigger", params, created_at, started_at, finished_at
+                r#"SELECT id, job, status, "trigger", params, created_at, started_at, finished_at,
+                          resumed_from
                    FROM runs WHERE id = ?1"#,
                 params![id],
                 run_from_row,
@@ -501,7 +512,8 @@ impl Store {
     ) -> Result<Vec<Run>, Error> {
         let conn = self.0.lock().unwrap();
         let mut stmt = conn.prepare(
-            r#"SELECT id, job, status, "trigger", params, created_at, started_at, finished_at
+            r#"SELECT id, job, status, "trigger", params, created_at, started_at, finished_at,
+                      resumed_from
                FROM runs
                WHERE (?1 IS NULL OR job = ?1) AND (?2 IS NULL OR created_at >= ?2)
                  AND (?3 IS NULL OR created_at < ?3
@@ -759,6 +771,7 @@ fn run_from_row(row: &Row) -> rusqlite::Result<Run> {
         created_at: ts_col(row, 5)?,
         started_at: opt_ts_col(row, 6)?,
         finished_at: opt_ts_col(row, 7)?,
+        resumed_from: row.get(8)?,
     })
 }
 
@@ -880,6 +893,7 @@ mod tests {
             created_at,
             started_at: None,
             finished_at: None,
+            resumed_from: None,
         }
     }
 
@@ -1368,14 +1382,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("future.db");
         let path = path.to_str().unwrap();
-        phase1_db(path, 5);
+        phase1_db(path, 6);
         let err = Store::open(path).err().unwrap();
-        assert_eq!(err.to_string(), "db schema v5 is newer than this build");
+        assert_eq!(err.to_string(), "db schema v6 is newer than this build");
         let conn = Connection::open(path).unwrap();
         let version: u32 = conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 5);
+        assert_eq!(version, 6);
     }
 
     #[test]
@@ -1451,6 +1465,40 @@ mod tests {
             "abc"
         );
         assert_eq!(store.sensors().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn v4_db_migrates_to_v5_keeping_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v4.db");
+        let path = path.to_str().unwrap();
+        // every batch up to v4, stamped 4: the runs table has no resumed_from yet
+        let conn = Connection::open(path).unwrap();
+        conn.execute_batch(PHASE1_SCHEMA).unwrap();
+        conn.execute_batch(SCHEMA_V2).unwrap();
+        conn.execute_batch(SCHEMA_V3).unwrap();
+        conn.execute_batch(SCHEMA_V4).unwrap();
+        conn.pragma_update(None, "user_version", 4).unwrap();
+        drop(conn);
+
+        let store = Store::open(path).unwrap();
+        let old = store.run("r1").unwrap().unwrap();
+        assert_eq!(old.status, RunStatus::Success);
+        assert_eq!(old.resumed_from, None);
+
+        let mut resumed = mk_run("r2", "etl", Utc::now());
+        resumed.resumed_from = Some("r1".into());
+        store.create_run(&resumed, &["a".into()]).unwrap();
+        drop(store);
+        let store = Store::open(path).unwrap();
+        assert_eq!(
+            store.run("r2").unwrap().unwrap().resumed_from,
+            Some("r1".to_string())
+        );
+        assert_eq!(
+            store.runs(None, None, None, None, 10).unwrap()[0].resumed_from,
+            Some("r1".to_string())
+        );
     }
 
     #[test]

@@ -9,9 +9,21 @@ export class HttpError extends Error {
   }
 }
 
+// the api answers {"error": "..."} on every failure; fall back to the status line
+async function detail(res: Response): Promise<string | null> {
+  try {
+    const data: unknown = await res.json();
+    if (data && typeof data === "object" && typeof (data as { error?: unknown }).error === "string")
+      return (data as { error: string }).error;
+  } catch {
+    // non-json error body; the status line is all we have
+  }
+  return null;
+}
+
 export async function get<T>(path: string): Promise<T> {
   const res = await fetch(path);
-  if (!res.ok) throw new HttpError(res.status, path);
+  if (!res.ok) throw new HttpError(res.status, path, await detail(res));
   return res.json() as Promise<T>;
 }
 
@@ -21,17 +33,7 @@ export async function post<T>(path: string, body?: unknown): Promise<T> {
     headers: { "content-type": "application/json" },
     body: JSON.stringify(body ?? {}),
   });
-  if (!res.ok) {
-    let detail: string | null = null;
-    try {
-      const data: unknown = await res.json();
-      if (data && typeof data === "object" && typeof (data as { error?: unknown }).error === "string")
-        detail = (data as { error: string }).error;
-    } catch {
-      // non-json error body; the status line is all we have
-    }
-    throw new HttpError(res.status, path, detail);
-  }
+  if (!res.ok) throw new HttpError(res.status, path, await detail(res));
   return res.json() as Promise<T>;
 }
 

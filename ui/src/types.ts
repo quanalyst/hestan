@@ -1,6 +1,6 @@
 export type RunStatus = "queued" | "running" | "success" | "failed" | "canceled";
 export type OpStatus = "pending" | "running" | "success" | "failed" | "skipped" | "canceled";
-export type Trigger = "manual" | "schedule" | "retry" | "build" | "sensor";
+export type Trigger = "manual" | "schedule" | "retry" | "resume" | "build" | "sensor";
 export type EventLevel = "info" | "warn" | "error";
 
 export type EventKind =
@@ -65,6 +65,13 @@ export interface Run {
   created_at: string;
   started_at: string | null;
   finished_at: string | null;
+  resumed_from: string | null;
+}
+
+// what a resume would do: ops it executes, ops it seeds from a recorded output
+export interface ResumePreview {
+  rerun: string[];
+  reuse: string[];
 }
 
 export interface OpRun {

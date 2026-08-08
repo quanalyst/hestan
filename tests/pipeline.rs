@@ -1,12 +1,12 @@
 use std::collections::HashSet;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use hestan::prelude::*;
 use hestan::{
-    CancelOutcome, Error, EventKind, FailureHook, OpStatus, RunFailure, RunStatus, Runner, Store,
-    Trigger,
+    CancelOutcome, Error, EventKind, FailureHook, OpStatus, Run, RunFailure, RunStatus, Runner,
+    Store, Trigger,
 };
 use serde::{Deserialize, Serialize};
 
@@ -799,4 +799,321 @@ async fn max_parallel_zero_still_makes_progress() {
         ops.iter().all(|o| o.status == OpStatus::Success),
         "ops were silently dropped"
     );
+}
+
+// a -> b -> c, where b fails until `fixed` flips. a's output counts its own
+// calls, so a reused seed and a recomputed one are told apart by value.
+struct Chain {
+    job: Job,
+    a_calls: Arc<AtomicU32>,
+    b_saw: Arc<Mutex<Option<Value>>>,
+    fixed: Arc<AtomicBool>,
+}
+
+fn chain() -> Chain {
+    let a_calls = Arc::new(AtomicU32::new(0));
+    let b_saw: Arc<Mutex<Option<Value>>> = Arc::new(Mutex::new(None));
+    let fixed = Arc::new(AtomicBool::new(false));
+    let (calls, saw, ok) = (a_calls.clone(), b_saw.clone(), fixed.clone());
+    let job = Job::builder("chain")
+        .op(Op::new("a", move |_| {
+            let calls = calls.clone();
+            async move { Ok(json!({ "rows": calls.fetch_add(1, Ordering::SeqCst) })) }
+        }))
+        .op(Op::new("b", move |ctx| {
+            let (saw, ok) = (saw.clone(), ok.clone());
+            async move {
+                *saw.lock().unwrap() = ctx.input("a").cloned();
+                if !ok.load(Ordering::SeqCst) {
+                    return Err("b exploded".into());
+                }
+                Ok(json!("b done"))
+            }
+        })
+        .after(["a"]))
+        .op(Op::new(
+            "c",
+            |ctx| async move { Ok(ctx.input("b").cloned().unwrap()) },
+        )
+        .after(["b"]))
+        .build()
+        .unwrap();
+    Chain {
+        job,
+        a_calls,
+        b_saw,
+        fixed,
+    }
+}
+
+async fn settled(runner: &Runner, id: &str) -> Run {
+    let (store, wanted) = (runner.store().clone(), id.to_string());
+    wait_until(move || {
+        let status = store.run(&wanted).unwrap().unwrap().status;
+        !matches!(status, RunStatus::Queued | RunStatus::Running)
+    })
+    .await;
+    runner.store().run(id).unwrap().unwrap()
+}
+
+fn op_names(runner: &Runner, run_id: &str) -> Vec<String> {
+    runner
+        .store()
+        .op_runs(run_id)
+        .unwrap()
+        .into_iter()
+        .map(|o| o.op)
+        .collect()
+}
+
+#[tokio::test]
+async fn resume_reruns_only_the_failed_subset() {
+    let Chain {
+        job,
+        a_calls,
+        fixed,
+        ..
+    } = chain();
+    let runner = Runner::new([job], Store::open(":memory:").unwrap());
+    let first = runner
+        .run("chain", json!({}), Trigger::Manual)
+        .await
+        .unwrap();
+    assert_eq!(first.status, RunStatus::Failed);
+    assert_eq!(a_calls.load(Ordering::SeqCst), 1);
+
+    fixed.store(true, Ordering::SeqCst);
+    let second = runner.resume(&first.id).unwrap();
+    let second = settled(&runner, &second).await;
+    assert_eq!(second.status, RunStatus::Success);
+    // the failed op and its downstream, and nothing that already succeeded
+    assert_eq!(op_names(&runner, &second.id), ["b", "c"]);
+    assert_eq!(a_calls.load(Ordering::SeqCst), 1, "a ran again");
+}
+
+#[tokio::test]
+async fn resume_seeds_the_recorded_upstream_output() {
+    let Chain {
+        job, b_saw, fixed, ..
+    } = chain();
+    let runner = Runner::new([job], Store::open(":memory:").unwrap());
+    let first = runner
+        .run("chain", json!({}), Trigger::Manual)
+        .await
+        .unwrap();
+    let recorded = runner
+        .store()
+        .op_runs(&first.id)
+        .unwrap()
+        .into_iter()
+        .find(|o| o.op == "a")
+        .unwrap()
+        .output;
+    assert_eq!(recorded, Some(json!({"rows": 0})));
+
+    fixed.store(true, Ordering::SeqCst);
+    let second = runner.resume(&first.id).unwrap();
+    let second = settled(&runner, &second).await;
+    assert_eq!(second.status, RunStatus::Success);
+    // b read the first run's output through ctx.input, value for value
+    assert_eq!(*b_saw.lock().unwrap(), recorded);
+    let ops = runner.store().op_runs(&second.id).unwrap();
+    assert_eq!(ops[1].output, Some(json!("b done")));
+}
+
+#[tokio::test]
+async fn resumed_run_records_trigger_params_and_parent() {
+    let Chain { job, fixed, .. } = chain();
+    let runner = Runner::new([job], Store::open(":memory:").unwrap());
+    let first = runner
+        .run("chain", json!({"n": 5}), Trigger::Manual)
+        .await
+        .unwrap();
+    fixed.store(true, Ordering::SeqCst);
+    let second = runner.resume(&first.id).unwrap();
+    let second = settled(&runner, &second).await;
+
+    assert_eq!(second.trigger, Trigger::Resume);
+    assert_eq!(second.params, json!({"n": 5}));
+    assert_eq!(second.resumed_from.as_deref(), Some(first.id.as_str()));
+    assert_eq!(first.resumed_from, None);
+}
+
+#[tokio::test]
+async fn chained_resume_seeds_from_two_runs_back() {
+    let ran: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let two_ok = Arc::new(AtomicBool::new(false));
+    let three_ok = Arc::new(AtomicBool::new(false));
+    // one -> two -> three -> four, breaking one op further along each run
+    let step = |name: &'static str, dep: Option<&'static str>, ok: Option<Arc<AtomicBool>>| {
+        let ran = ran.clone();
+        let op = Op::new(name, move |ctx: OpCtx| {
+            let (ran, ok) = (ran.clone(), ok.clone());
+            async move {
+                ran.lock().unwrap().push(name.to_string());
+                if ok.is_some_and(|f| !f.load(Ordering::SeqCst)) {
+                    return Err(format!("{name} exploded").into());
+                }
+                Ok(json!({ "op": name, "from": dep.and_then(|d| ctx.input(d).cloned()) }))
+            }
+        });
+        match dep {
+            Some(d) => op.after([d]),
+            None => op,
+        }
+    };
+    let job = Job::builder("steps")
+        .op(step("one", None, None))
+        .op(step("two", Some("one"), Some(two_ok.clone())))
+        .op(step("three", Some("two"), Some(three_ok.clone())))
+        .op(step("four", Some("three"), None))
+        .build()
+        .unwrap();
+    let runner = Runner::new([job], Store::open(":memory:").unwrap());
+
+    let first = runner
+        .run("steps", json!({}), Trigger::Manual)
+        .await
+        .unwrap();
+    assert_eq!(first.status, RunStatus::Failed);
+
+    two_ok.store(true, Ordering::SeqCst);
+    let second = runner.resume(&first.id).unwrap();
+    let second = settled(&runner, &second).await;
+    assert_eq!(second.status, RunStatus::Failed);
+    assert_eq!(op_names(&runner, &second.id), ["four", "three", "two"]);
+
+    three_ok.store(true, Ordering::SeqCst);
+    let third = runner.resume(&second.id).unwrap();
+    let third = settled(&runner, &third).await;
+    assert_eq!(third.status, RunStatus::Success);
+    assert_eq!(op_names(&runner, &third.id), ["four", "three"]);
+    assert_eq!(third.resumed_from.as_deref(), Some(second.id.as_str()));
+
+    // one succeeded two hops back and two one hop back; neither ran again
+    assert_eq!(
+        *ran.lock().unwrap(),
+        ["one", "two", "two", "three", "three", "four"]
+    );
+    let ops = runner.store().op_runs(&third.id).unwrap();
+    let three = ops.iter().find(|o| o.op == "three").unwrap();
+    // three's input carries two's output, which carries one's: the seed for
+    // two came from the original run, through the resume chain
+    assert_eq!(
+        three.output,
+        Some(json!({
+            "op": "three",
+            "from": { "op": "two", "from": { "op": "one", "from": null } }
+        }))
+    );
+}
+
+#[tokio::test]
+async fn resume_from_reruns_the_chosen_op_and_downstream() {
+    let Chain {
+        job,
+        a_calls,
+        b_saw,
+        fixed,
+    } = chain();
+    fixed.store(true, Ordering::SeqCst);
+    let runner = Runner::new([job], Store::open(":memory:").unwrap());
+    let first = runner
+        .run("chain", json!({}), Trigger::Manual)
+        .await
+        .unwrap();
+    assert_eq!(first.status, RunStatus::Success);
+    *b_saw.lock().unwrap() = None;
+
+    // a succeeded, but the ask is to run again from b whatever its last status
+    let second = runner
+        .resume_from(&first.id, Some(&["b".to_string()]))
+        .unwrap();
+    let second = settled(&runner, &second).await;
+    assert_eq!(second.status, RunStatus::Success);
+    assert_eq!(op_names(&runner, &second.id), ["b", "c"]);
+    assert_eq!(a_calls.load(Ordering::SeqCst), 1, "a ran again");
+    assert_eq!(*b_saw.lock().unwrap(), Some(json!({"rows": 0})));
+
+    let err = runner
+        .resume_from(&first.id, Some(&["ghost".to_string()]))
+        .unwrap_err();
+    assert!(matches!(err, Error::Graph(_)), "{err}");
+    assert!(err.to_string().contains("ghost"), "{err}");
+}
+
+#[tokio::test]
+async fn resume_rejects_unknown_active_and_successful_runs() {
+    let Chain { job, fixed, .. } = chain();
+    let slow = Job::builder("slow")
+        .op(Op::new("nap", |_| async {
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            Ok(json!(null))
+        }))
+        .build()
+        .unwrap();
+    let runner = Runner::new([job, slow], Store::open(":memory:").unwrap());
+
+    let err = runner.resume("nope").unwrap_err();
+    assert!(matches!(err, Error::UnknownRun(_)), "{err}");
+    assert_eq!(err.to_string(), "unknown run: nope");
+
+    let live = runner.launch("slow", json!({}), Trigger::Manual).unwrap();
+    let err = runner.resume(&live).unwrap_err();
+    assert!(matches!(err, Error::RunActive(_)), "{err}");
+    assert_eq!(runner.cancel(&live).unwrap(), CancelOutcome::Requested);
+
+    fixed.store(true, Ordering::SeqCst);
+    let good = runner
+        .run("chain", json!({}), Trigger::Manual)
+        .await
+        .unwrap();
+    assert_eq!(good.status, RunStatus::Success);
+    let err = runner.resume(&good.id).unwrap_err();
+    assert!(matches!(err, Error::RunNotFailed(_)), "{err}");
+    // the same run is still a valid starting point for a targeted re-run
+    assert!(
+        runner
+            .resume_from(&good.id, Some(&["c".to_string()]))
+            .is_ok()
+    );
+}
+
+#[tokio::test]
+async fn resume_refuses_a_changed_graph() {
+    let store = Store::open(":memory:").unwrap();
+    let Chain { job, .. } = chain();
+    let runner = Runner::new([job], store.clone());
+    let first = runner
+        .run("chain", json!({}), Trigger::Manual)
+        .await
+        .unwrap();
+    assert_eq!(first.status, RunStatus::Failed);
+
+    // the job has since grown an op the run never knew about
+    let grown = Job::builder("chain")
+        .op(Op::new("a", |_| async { Ok(json!(1)) }))
+        .op(Op::new("b", |_| async { Ok(json!(2)) }).after(["a"]))
+        .op(Op::new("c", |_| async { Ok(json!(3)) }).after(["b"]))
+        .op(Op::new("d", |_| async { Ok(json!(4)) }).after(["c"]))
+        .build()
+        .unwrap();
+    let err = Runner::new([grown], store.clone())
+        .resume(&first.id)
+        .unwrap_err();
+    assert!(matches!(err, Error::Graph(_)), "{err}");
+    assert!(err.to_string().contains("only in the job: d"), "{err}");
+
+    // and the other way: an op the run recorded is gone
+    let shrunk = Job::builder("chain")
+        .op(Op::new("a", |_| async { Ok(json!(1)) }))
+        .build()
+        .unwrap();
+    let err = Runner::new([shrunk], store.clone())
+        .resume(&first.id)
+        .unwrap_err();
+    assert!(err.to_string().contains("only in the run: b, c"), "{err}");
+
+    // no half-built run survives a refusal
+    assert_eq!(store.runs(None, None, None, None, 10).unwrap().len(), 1);
 }

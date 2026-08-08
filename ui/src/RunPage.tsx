@@ -5,8 +5,10 @@ import DagView from "./DagView";
 import type { NodeStatus } from "./DagView";
 import GanttChart from "./GanttChart";
 import StatusDot from "./StatusDot";
-import type { EventLevel, JobSummary, OpRun, OpStatus, Run, RunEvent } from "./types";
+import type { EventLevel, JobSummary, OpRun, OpStatus, ResumePreview, Run, RunEvent } from "./types";
 import { clockTime, durationMs, fmtDuration, isTerminal, relTime, shortId } from "./util";
+
+const plan = (p: ResumePreview) => `${p.rerun.length} to re-run · ${p.reuse.length} reused`;
 
 export default function RunPage() {
   const { id } = useParams();
@@ -23,8 +25,12 @@ function RunView({ id }: { id: string }) {
   const [level, setLevel] = useState<"all" | EventLevel>("all");
   const [opSel, setOpSel] = useState<string | null>(null);
   const [job, setJob] = useState<JobSummary | null>(null);
-  const [retrying, setRetrying] = useState(false);
-  const [retryError, setRetryError] = useState<string | null>(null);
+  const [pending, setPending] = useState<null | "re-run" | "resume">(null);
+  const [launchError, setLaunchError] = useState<string | null>(null);
+  const [preview, setPreview] = useState<ResumePreview | null>(null);
+  const [previewError, setPreviewError] = useState<string | null>(null);
+  const [fromPlan, setFromPlan] = useState<ResumePreview | null>(null);
+  const [fromError, setFromError] = useState<string | null>(null);
   const [canceling, setCanceling] = useState(false);
   const [cancelError, setCancelError] = useState<string | null>(null);
   const [missing, setMissing] = useState(false);
@@ -34,6 +40,9 @@ function RunView({ id }: { id: string }) {
   const stick = useRef(true);
 
   const done = run !== null && isTerminal(run.status);
+  // a run that ended badly is the one resume continues; any finished run can be
+  // re-run from a chosen op
+  const resumable = run !== null && (run.status === "failed" || run.status === "canceled");
 
   usePoll(
     () => {
@@ -77,6 +86,41 @@ function RunView({ id }: { id: string }) {
       .catch(() => {});
   }, [jobName]);
 
+  // what resume would do, before the click rather than after it
+  useEffect(() => {
+    if (!resumable) {
+      setPreview(null);
+      setPreviewError(null);
+      return;
+    }
+    get<ResumePreview>(`/api/runs/${id}/resume_preview`)
+      .then((p) => {
+        setPreview(p);
+        setPreviewError(null);
+      })
+      .catch((e) => {
+        setPreview(null);
+        setPreviewError(e instanceof Error ? e.message : String(e));
+      });
+  }, [id, resumable]);
+
+  useEffect(() => {
+    if (!done || !opSel) {
+      setFromPlan(null);
+      setFromError(null);
+      return;
+    }
+    get<ResumePreview>(`/api/runs/${id}/resume_preview?from=${encodeURIComponent(opSel)}`)
+      .then((p) => {
+        setFromPlan(p);
+        setFromError(null);
+      })
+      .catch((e) => {
+        setFromPlan(null);
+        setFromError(e instanceof Error ? e.message : String(e));
+      });
+  }, [id, done, opSel]);
+
   useEffect(() => {
     const el = logRef.current;
     if (el && stick.current) el.scrollTop = el.scrollHeight;
@@ -87,16 +131,19 @@ function RunView({ id }: { id: string }) {
     if (el) stick.current = el.scrollHeight - el.scrollTop - el.clientHeight < 40;
   };
 
-  const retry = async () => {
-    setRetrying(true);
-    setRetryError(null);
+  // re-run redoes the whole job; resume continues this run, optionally from a
+  // chosen op. both land on the new run's page
+  const relaunch = async (kind: "re-run" | "resume", from?: string[]) => {
+    setPending(kind);
+    setLaunchError(null);
     try {
-      const r = await post<{ run_id: string }>(`/api/runs/${id}/retry`);
+      const path = kind === "resume" ? "resume" : "retry";
+      const r = await post<{ run_id: string }>(`/api/runs/${id}/${path}`, from && { from });
       nav(`/runs/${r.run_id}`);
     } catch (e) {
-      setRetryError(e instanceof Error ? e.message : String(e));
+      setLaunchError(`${kind} failed: ${e instanceof Error ? e.message : String(e)}`);
     } finally {
-      setRetrying(false);
+      setPending(null);
     }
   };
 
@@ -139,6 +186,15 @@ function RunView({ id }: { id: string }) {
           <p className="muted">
             {run.trigger} · created {relTime(run.created_at)}
             {dur !== null && <> · took {fmtDuration(dur)}</>}
+            {run.resumed_from && (
+              <>
+                {" "}
+                · continues{" "}
+                <Link className="head-link mono" to={`/runs/${run.resumed_from}`}>
+                  {shortId(run.resumed_from)}
+                </Link>
+              </>
+            )}
           </p>
         </div>
         <div className="run-actions">
@@ -147,16 +203,33 @@ function RunView({ id }: { id: string }) {
               <StatusDot status={run.status} />
             </span>
             {done ? (
-              <button className="text-btn" onClick={retry} disabled={retrying}>
-                re-run
-              </button>
+              <>
+                <button
+                  className="text-btn"
+                  onClick={() => relaunch("re-run")}
+                  disabled={pending !== null}
+                >
+                  re-run
+                </button>
+                {resumable && (
+                  <button
+                    className="text-btn"
+                    onClick={() => relaunch("resume")}
+                    disabled={pending !== null}
+                  >
+                    resume
+                  </button>
+                )}
+              </>
             ) : (
               <button className="text-btn" onClick={cancel} disabled={canceling}>
                 cancel
               </button>
             )}
           </div>
-          {retryError && <p className="muted">re-run failed: {retryError}</p>}
+          {resumable && preview && <p className="muted">resume: {plan(preview)}</p>}
+          {resumable && previewError && <p className="muted">no resume: {previewError}</p>}
+          {launchError && <p className="muted">{launchError}</p>}
           {cancelError && <p className="muted">cancel failed: {cancelError}</p>}
         </div>
       </div>
@@ -168,6 +241,25 @@ function RunView({ id }: { id: string }) {
           selected={opSel}
           onSelect={(op) => setOpSel((prev) => (prev === op ? null : op))}
         />
+      )}
+
+      {done && opSel && (
+        <p className="muted dag-action">
+          {fromError ? (
+            `cannot re-run from ${opSel}: ${fromError}`
+          ) : (
+            <>
+              <button
+                className="text-btn"
+                onClick={() => relaunch("resume", [opSel])}
+                disabled={pending !== null}
+              >
+                re-run from {opSel}
+              </button>
+              {fromPlan && <> · {plan(fromPlan)}</>}
+            </>
+          )}
+        </p>
       )}
 
       {job && <GanttChart ops={job.ops.filter((o) => o.name in statuses)} opRuns={ops} />}

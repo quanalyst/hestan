@@ -303,6 +303,16 @@ button:disabled {
   padding: 2px 0;
 }
 
+/* the action a dag selection offers, tucked under the graph it belongs to */
+.dag-action {
+  margin: 2px 0 14px;
+  font-size: 12px;
+}
+
+.dag-action .text-btn {
+  padding-left: 0;
+}
+
 .dag-node {
   fill: var(--surface);
   stroke: var(--rule);

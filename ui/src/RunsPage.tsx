@@ -8,7 +8,7 @@ import { durationMs, fmtDuration, isTerminal, relTime, shortId } from "./util";
 
 const PAGE = 100;
 const STATUSES = ["all", "queued", "running", "success", "failed", "canceled"] as const;
-const TRIGGERS = ["all", "manual", "schedule", "retry", "build", "sensor"] as const;
+const TRIGGERS = ["all", "manual", "schedule", "retry", "resume", "build", "sensor"] as const;
 const WINDOWS = [
   { label: "all", secs: null },
   { label: "1h", secs: 3600 },
@@ -140,12 +140,13 @@ export default function RunsPage() {
     }
   };
 
-  const rerun = async (e: ReactMouseEvent, id: string) => {
+  // retry redoes the whole job, resume continues where the run broke
+  const relaunch = async (e: ReactMouseEvent, id: string, kind: "retry" | "resume") => {
     e.stopPropagation();
     setBusyId(id);
     setRowErr(null);
     try {
-      const r = await post<{ run_id: string }>(`/api/runs/${id}/retry`);
+      const r = await post<{ run_id: string }>(`/api/runs/${id}/${kind}`);
       nav(`/runs/${r.run_id}`);
     } catch (err) {
       setRowErr({ id, msg: err instanceof Error ? err.message : String(err) });
@@ -247,9 +248,18 @@ export default function RunsPage() {
                           <button
                             className="text-btn"
                             disabled={busyId === run.id}
-                            onClick={(e) => rerun(e, run.id)}
+                            onClick={(e) => relaunch(e, run.id, "retry")}
                           >
                             re-run
+                          </button>
+                        )}
+                        {(run.status === "failed" || run.status === "canceled") && (
+                          <button
+                            className="text-btn"
+                            disabled={busyId === run.id}
+                            onClick={(e) => relaunch(e, run.id, "resume")}
+                          >
+                            resume
                           </button>
                         )}
                         {rowErr?.id === run.id && <span className="muted row-err">{rowErr.msg}</span>}

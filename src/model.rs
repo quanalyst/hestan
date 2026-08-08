@@ -68,6 +68,7 @@ pub enum Trigger {
     Manual,
     Schedule,
     Retry,
+    Resume,
     Build,
     Sensor,
 }
@@ -75,6 +76,7 @@ str_enum!(Trigger {
     Manual => "manual",
     Schedule => "schedule",
     Retry => "retry",
+    Resume => "resume",
     Build => "build",
     Sensor => "sensor",
 });
@@ -157,6 +159,9 @@ pub struct Run {
     pub created_at: DateTime<Utc>,
     pub started_at: Option<DateTime<Utc>>,
     pub finished_at: Option<DateTime<Utc>>,
+    /// the run this one resumed, for a run launched by
+    /// [`Runner::resume_from`](crate::Runner::resume_from); `None` otherwise.
+    pub resumed_from: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]

@@ -611,6 +611,7 @@ mod tests {
             created_at: chrono::Utc::now(),
             started_at: None,
             finished_at: None,
+            resumed_from: None,
         };
         store.create_run(&active, &[]).unwrap();
         evaluate(&entry, &runner, &reg).await;

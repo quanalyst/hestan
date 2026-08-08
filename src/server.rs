@@ -49,6 +49,8 @@ pub(crate) fn router(state: AppState) -> Router {
         .route("/api/runs/{id}", get(get_run))
         .route("/api/runs/{id}/events", get(run_events))
         .route("/api/runs/{id}/retry", post(retry_run))
+        .route("/api/runs/{id}/resume", post(resume_run))
+        .route("/api/runs/{id}/resume_preview", get(resume_preview))
         .route("/api/runs/{id}/cancel", post(cancel_run))
         .route("/api/assets", get(list_assets))
         .route("/api/assets/build", post(build_all_assets))
@@ -648,6 +650,80 @@ async fn retry_run(
     }
 }
 
+#[derive(Deserialize)]
+struct ResumeBody {
+    from: Option<Vec<String>>,
+}
+
+fn resume_from_body(body: &Bytes) -> Result<Vec<String>, ApiError> {
+    if body.is_empty() {
+        return Ok(Vec::new());
+    }
+    let parsed: ResumeBody = serde_json::from_slice(body)
+        .map_err(|e| err(StatusCode::BAD_REQUEST, format!("invalid body: {e}")))?;
+    Ok(parsed.from.unwrap_or_default())
+}
+
+// the checks live in Runner::resume_plan, so the preview and the launch that
+// follows it answer with the same status
+fn resume_error(e: Error) -> ApiError {
+    match e {
+        e @ Error::UnknownRun(_) => err(StatusCode::NOT_FOUND, e.to_string()),
+        e @ (Error::RunActive(_) | Error::RunNotFailed(_)) => {
+            err(StatusCode::CONFLICT, e.to_string())
+        }
+        // the run exists but its job left the code since; a 404 would lie
+        Error::UnknownJob(job) => err(
+            StatusCode::CONFLICT,
+            format!("job no longer defined: {job}"),
+        ),
+        e @ (Error::Graph(_)
+        | Error::NothingToResume(_)
+        | Error::ResumeChain(_)
+        | Error::InvalidParams { .. }) => err(StatusCode::BAD_REQUEST, e.to_string()),
+        e => internal(e),
+    }
+}
+
+async fn resume_run(
+    State(st): State<AppState>,
+    Path(id): Path<String>,
+    body: Bytes,
+) -> Result<(StatusCode, Json<Value>), ApiError> {
+    let from = resume_from_body(&body)?;
+    match st.runner.resume_from(&id, Some(&from)) {
+        Ok(run_id) => Ok((StatusCode::ACCEPTED, Json(json!({ "run_id": run_id })))),
+        Err(e) => Err(resume_error(e)),
+    }
+}
+
+#[derive(Deserialize)]
+struct ResumePreviewQuery {
+    from: Option<String>,
+}
+
+async fn resume_preview(
+    State(st): State<AppState>,
+    Path(id): Path<String>,
+    q: Result<Query<ResumePreviewQuery>, QueryRejection>,
+) -> Result<Json<Value>, ApiError> {
+    let Query(q) = q.map_err(bad_query)?;
+    let from: Vec<String> = q
+        .from
+        .as_deref()
+        .unwrap_or_default()
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(String::from)
+        .collect();
+    let plan = st
+        .runner
+        .resume_plan(&id, Some(&from))
+        .map_err(resume_error)?;
+    Ok(Json(json!({ "reuse": plan.reuse, "rerun": plan.rerun })))
+}
+
 async fn get_run(
     State(st): State<AppState>,
     Path(id): Path<String>,
@@ -739,6 +815,7 @@ mod tests {
             created_at: Utc::now(),
             started_at: None,
             finished_at: None,
+            resumed_from: None,
         };
         st.runner.store().create_run(&run, &[]).unwrap();
         run
@@ -758,6 +835,7 @@ mod tests {
                 created_at: t0 - Duration::minutes(age),
                 started_at: None,
                 finished_at: None,
+                resumed_from: None,
             };
             st.runner.store().create_run(&run, &[]).unwrap();
         }
@@ -805,6 +883,7 @@ mod tests {
                 created_at: t0 + Duration::minutes(i),
                 started_at: None,
                 finished_at: None,
+                resumed_from: None,
             };
             st.runner.store().create_run(&run, &[]).unwrap();
         }
@@ -863,6 +942,7 @@ mod tests {
                 created_at: at,
                 started_at: None,
                 finished_at: None,
+                resumed_from: None,
             };
             st.runner.store().create_run(&run, &[]).unwrap();
         }
@@ -954,6 +1034,7 @@ mod tests {
                 created_at: t0 + Duration::minutes(i),
                 started_at: None,
                 finished_at: None,
+                resumed_from: None,
             };
             store.create_run(&run, &["a".into(), "b".into()]).unwrap();
             store.op_started(&run.id, "a", 1).unwrap();
@@ -1268,6 +1349,207 @@ mod tests {
         assert!(body["error"].as_str().unwrap().contains("invalid params"));
     }
 
+    fn raw(s: &str) -> Bytes {
+        Bytes::from(s.to_string())
+    }
+
+    // a -> b -> c with b failing: enough shape for a resume to have a subset
+    fn brittle_job(name: &str) -> Job {
+        Job::builder(name)
+            .op(Op::new("a", |_| async { Ok(json!({"rows": 3})) }))
+            .op(Op::new("b", |_| async { Err("boom".into()) }).after(["a"]))
+            .op(Op::new("c", |_| async { Ok(json!(null)) }).after(["b"]))
+            .build()
+            .unwrap()
+    }
+
+    fn insert_run_with_ops(st: &AppState, id: &str, job: &str, status: RunStatus, ops: &[&str]) {
+        let run = Run {
+            id: id.into(),
+            job: job.into(),
+            status,
+            trigger: Trigger::Manual,
+            params: json!({}),
+            created_at: Utc::now(),
+            started_at: None,
+            finished_at: None,
+            resumed_from: None,
+        };
+        let ops: Vec<String> = ops.iter().map(|o| o.to_string()).collect();
+        st.runner.store().create_run(&run, &ops).unwrap();
+    }
+
+    #[tokio::test]
+    async fn resume_endpoint_launches_the_unfinished_subset() {
+        let st = state(vec![brittle_job("etl")]);
+        let failed = st
+            .runner
+            .run("etl", json!({"n": 5}), Trigger::Manual)
+            .await
+            .unwrap();
+        assert_eq!(failed.status, RunStatus::Failed);
+
+        let (status, Json(body)) = resume_run(State(st.clone()), Path(failed.id.clone()), raw(""))
+            .await
+            .unwrap();
+        assert_eq!(status, StatusCode::ACCEPTED);
+        let new_id = body["run_id"].as_str().unwrap();
+        let run = st.runner.store().run(new_id).unwrap().unwrap();
+        assert_eq!(run.trigger, Trigger::Resume);
+        assert_eq!(run.params, json!({"n": 5}));
+        assert_eq!(run.resumed_from.as_deref(), Some(failed.id.as_str()));
+        // the rows exist from the launch on: only the failed op and downstream
+        let ops: Vec<String> = st
+            .runner
+            .store()
+            .op_runs(new_id)
+            .unwrap()
+            .into_iter()
+            .map(|o| o.op)
+            .collect();
+        assert_eq!(ops, ["b", "c"]);
+
+        // and from a chosen op: a succeeded, and still runs again
+        let (status, Json(body)) = resume_run(
+            State(st.clone()),
+            Path(failed.id.clone()),
+            raw(r#"{"from": ["a"]}"#),
+        )
+        .await
+        .unwrap();
+        assert_eq!(status, StatusCode::ACCEPTED);
+        let ops = st
+            .runner
+            .store()
+            .op_runs(body["run_id"].as_str().unwrap())
+            .unwrap();
+        assert_eq!(ops.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn resume_endpoint_statuses() {
+        let st = state(vec![echo_job("etl")]);
+        let resume = |st: &AppState, id: &str, b: &'static str| {
+            resume_run(State(st.clone()), Path(id.into()), raw(b))
+        };
+
+        let (status, Json(b)) = resume(&st, "nope", "").await.unwrap_err();
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(b["error"], "unknown run: nope");
+
+        insert_run_with_ops(&st, "live", "etl", RunStatus::Queued, &["echo"]);
+        let (status, Json(b)) = resume(&st, "live", "").await.unwrap_err();
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(b["error"], "run still active: live");
+
+        insert_run_with_ops(&st, "won", "etl", RunStatus::Success, &["echo"]);
+        let (status, Json(b)) = resume(&st, "won", "").await.unwrap_err();
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(b["error"], "run did not fail: won");
+
+        insert_run_with_ops(&st, "orphan", "gone", RunStatus::Failed, &["echo"]);
+        let (status, Json(b)) = resume(&st, "orphan", "").await.unwrap_err();
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(b["error"], "job no longer defined: gone");
+
+        // a run recorded against a graph the job no longer has
+        insert_run_with_ops(&st, "wide", "etl", RunStatus::Failed, &["echo", "extra"]);
+        let (status, Json(b)) = resume(&st, "wide", "").await.unwrap_err();
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(
+            b["error"]
+                .as_str()
+                .unwrap()
+                .contains("only in the run: extra"),
+            "{b}"
+        );
+
+        // failed as a whole, but every op of it succeeded
+        insert_run_with_ops(&st, "clean", "etl", RunStatus::Failed, &["echo"]);
+        st.runner
+            .store()
+            .op_finished("clean", "echo", OpStatus::Success, Some(&json!(1)), None)
+            .unwrap();
+        let (status, Json(b)) = resume(&st, "clean", "").await.unwrap_err();
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            b["error"],
+            "nothing to resume: every op of run clean already succeeded"
+        );
+
+        insert_run_with_ops(&st, "r1", "etl", RunStatus::Failed, &["echo"]);
+        let (status, Json(b)) = resume(&st, "r1", r#"{"from": ["ghost"]}"#)
+            .await
+            .unwrap_err();
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(b["error"].as_str().unwrap().contains("ghost"), "{b}");
+
+        let (status, Json(b)) = resume(&st, "r1", "{not json}").await.unwrap_err();
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(
+            b["error"].as_str().unwrap().starts_with("invalid body"),
+            "{b}"
+        );
+
+        // an empty body and an empty selection both mean "from the failure"
+        let (status, _) = resume(&st, "r1", r#"{"from": []}"#).await.unwrap();
+        assert_eq!(status, StatusCode::ACCEPTED);
+    }
+
+    #[tokio::test]
+    async fn resume_preview_lists_reuse_and_rerun() {
+        let st = state(vec![brittle_job("etl")]);
+        let preview = |st: &AppState, id: &str, from: Option<&str>| {
+            resume_preview(
+                State(st.clone()),
+                Path(id.into()),
+                Ok(Query(ResumePreviewQuery {
+                    from: from.map(String::from),
+                })),
+            )
+        };
+        let failed = st
+            .runner
+            .run("etl", json!({}), Trigger::Manual)
+            .await
+            .unwrap();
+
+        let Json(b) = preview(&st, &failed.id, None).await.unwrap();
+        assert_eq!(b, json!({"reuse": ["a"], "rerun": ["b", "c"]}));
+
+        // from an op that succeeded: it and its downstream, nothing reused
+        let Json(b) = preview(&st, &failed.id, Some("a")).await.unwrap();
+        assert_eq!(b, json!({"reuse": [], "rerun": ["a", "b", "c"]}));
+
+        // names are comma separated and trimmed
+        let Json(b) = preview(&st, &failed.id, Some("b, ")).await.unwrap();
+        assert_eq!(b, json!({"reuse": ["a"], "rerun": ["b", "c"]}));
+
+        // c's input never got produced, so no plan can honour re-running it
+        let (status, Json(b)) = preview(&st, &failed.id, Some("c")).await.unwrap_err();
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(
+            b["error"]
+                .as_str()
+                .unwrap()
+                .contains("has no recorded output"),
+            "{b}"
+        );
+
+        // the same refusals as the launch, so a preview never promises more
+        let (status, Json(b)) = preview(&st, "nope", None).await.unwrap_err();
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(b["error"], "unknown run: nope");
+
+        let (status, _) = preview(&st, &failed.id, Some("ghost")).await.unwrap_err();
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+
+        insert_run_with_ops(&st, "live", "etl", RunStatus::Running, &["a", "b", "c"]);
+        let (status, Json(b)) = preview(&st, "live", None).await.unwrap_err();
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(b["error"], "run still active: live");
+    }
+
     #[tokio::test]
     async fn overdue_follows_missed_fires() {
         let st = state(vec![echo_job("etl")]);
@@ -1300,6 +1582,7 @@ mod tests {
             created_at: Utc::now() - Duration::days(400),
             started_at: None,
             finished_at: Some(Utc::now() - Duration::days(400)),
+            resumed_from: None,
         };
         st.runner.store().create_run(&stale, &[]).unwrap();
         let s = job_summary(job, &st).unwrap();

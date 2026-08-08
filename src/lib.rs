@@ -21,7 +21,7 @@ mod store;
 pub use app::Hestan;
 pub use asset::Asset;
 pub use error::Error;
-pub use executor::{CancelOutcome, FailureHook, RunFailure, Runner};
+pub use executor::{CancelOutcome, FailureHook, ResumePlan, RunFailure, Runner};
 #[cfg(feature = "http")]
 pub use http::HttpSource;
 pub use job::{Job, JobBuilder};

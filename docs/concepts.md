@@ -26,12 +26,13 @@ what `ctx.info/warn/error` emit.
 
 the *trigger* records why a run exists: `manual` (launch endpoint,
 `run_once`), `schedule` (the cron scheduler), `retry` (the re-run endpoint),
+`resume` (the [resume endpoint](#resume), which continues an earlier run),
 `build` (an [asset build](assets.md): the endpoints, `build_asset`, and
 probe-driven auto builds), or `sensor` (a [sensor](sensors.md) evaluation
-asked for it). retry is for finished runs — the api answers 409 for one
-still queued or running, since a fresh copy of a live run would only double
-it. manual launches stay ungated: that is the documented escape hatch when
-an overlapping run is really wanted.
+asked for it). retry and resume are for finished runs — the api answers 409
+for one still queued or running, since a fresh copy of a live run would only
+double it. manual launches stay ungated: that is the documented escape hatch
+when an overlapping run is really wanted.
 
 an *asset* is an op with identity: a persisted latest value, a fingerprint,
 and explicit lineage on other assets, which makes staleness provable and
@@ -108,10 +109,45 @@ request and the abort keeps its real result: its success (and any staged
 
 `cancel` reports what it did: `Requested` (signal sent), `AlreadyFinished`
 (terminal already, or a run left over from before a restart), `Unknown` (no
-such run). canceled is terminal — there is no resume; the retry endpoint
-launches a fresh run with the same params. a canceled run counts as inactive
-for the scheduler's [overlap policy](scheduling.md), and
-[failure hooks](notifications.md) do not fire for it.
+such run). canceled is terminal: the run itself never continues, but its ops
+that did finish are reusable, so a canceled run is resumable exactly like a
+failed one. a canceled run counts as inactive for the scheduler's
+[overlap policy](scheduling.md), and [failure hooks](notifications.md) do
+not fire for it.
+
+## Resume
+
+`runner.resume(run_id)` (or `POST /api/runs/{id}/resume`) launches a new run
+that continues a finished one instead of redoing it. every op that did not
+succeed runs again, together with everything downstream of it; every op that
+did succeed is reused — its recorded output is seeded, and its body never
+runs. the new run carries the original run's params, trigger `resume`, and a
+`resumed_from` pointing at the run it continued.
+
+```rust
+let id = runner.resume(&failed)?;                        // from the failure
+let id = runner.resume_from(&id, Some(&["clean".into()]))?;  // from a chosen op
+```
+
+`resume_from` with a selection re-runs exactly those ops and their
+transitive downstream whatever their last status was — "re-run from here" —
+which works on a successful run too. a plain resume of one is refused:
+there is nothing to continue. re-run (`POST /api/runs/{id}/retry`) stays the
+way to redo everything.
+
+a resumed run's `op_runs` only holds the ops it actually ran, so resuming a
+resume walks the `resumed_from` chain backwards: each op is seeded with the
+most recent successful output recorded anywhere in the chain, which can be
+several runs back. a run pruned by [retention](storage.md) breaks its
+descendants' chains, and the resume says so rather than seeding a hole.
+
+the ops recorded across that chain must still be exactly the job's ops, or
+the resume is refused: resuming into a graph that has gained or lost an op
+would record lineage that never happened. the same rule refuses resuming a
+run that only ever covered part of the graph — an [asset build](assets.md)
+records rows for its plan alone. a resume is also refused when nothing is
+left to re-run, and when a chosen op's input was never produced by any run
+in the chain.
 
 ## launch() vs run()
 

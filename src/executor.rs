@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::panic::AssertUnwindSafe;
 use std::sync::{Arc, Mutex};
 
@@ -15,6 +15,10 @@ use crate::job::Job;
 use crate::model::{EventKind, EventLevel, OpStatus, Run, RunStatus, Trigger, new_run_id};
 use crate::op::{Op, OpCtx};
 use crate::store::Store;
+
+/// how far back a resume follows `resumed_from` links. resuming a resume is
+/// normal; a chain this long is a bug, and the walk says so instead of looping.
+const MAX_RESUME_CHAIN: usize = 256;
 
 /// what [`Runner::cancel`] did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -42,6 +46,23 @@ pub struct RunFailure {
 
 /// a callback invoked on its own task when a run finishes failed.
 pub type FailureHook = Arc<dyn Fn(RunFailure) + Send + Sync>;
+
+/// what a resume would do, from [`Runner::resume_plan`]. both lists are in the
+/// job's topological order, and together they cover every op the job has
+/// except ones that neither re-run nor have an output worth reusing.
+#[derive(Debug, Clone)]
+pub struct ResumePlan {
+    /// the job the resumed run belongs to.
+    pub job: String,
+    /// the ops the resumed run executes.
+    pub rerun: Vec<String>,
+    /// the ops it seeds from a recorded output instead of executing.
+    pub reuse: Vec<String>,
+    params: Value,
+    // `reuse`'s outputs plus the job's external names, which a launch seeds null
+    seeded: HashMap<String, Value>,
+    resumed_from: String,
+}
 
 type OpOutcome = (String, Result<(Value, Option<Value>), String>);
 
@@ -92,14 +113,14 @@ impl Runner {
 
     /// create the run queued and execute it on a spawned task.
     pub fn launch(&self, job: &str, params: Value, trigger: Trigger) -> Result<String, Error> {
-        let (id, fut) = self.prepare(job, None, params, trigger)?;
+        let (id, fut) = self.prepare(job, None, params, trigger, None)?;
         tokio::spawn(fut);
         Ok(id)
     }
 
     /// like [`Runner::launch`] but awaits completion.
     pub async fn run(&self, job: &str, params: Value, trigger: Trigger) -> Result<Run, Error> {
-        let (id, fut) = self.prepare(job, None, params, trigger)?;
+        let (id, fut) = self.prepare(job, None, params, trigger, None)?;
         // spawned so that dropping this future (timeout, select) detaches the
         // run instead of aborting its ops mid-write
         let _ = tokio::spawn(fut).await;
@@ -108,7 +129,7 @@ impl Runner {
 
     /// launch over a subset of the job's ops with upstream outputs pre-seeded.
     /// every subset member's dep must be in the subset or seeded, else
-    /// [`Error::Graph`]. asset builds are the one caller.
+    /// [`Error::Graph`]. asset builds and resumes are the callers.
     pub(crate) fn launch_subset(
         &self,
         job: &str,
@@ -116,10 +137,211 @@ impl Runner {
         seeded: HashMap<String, Value>,
         params: Value,
         trigger: Trigger,
+        resumed_from: Option<&str>,
     ) -> Result<String, Error> {
-        let (id, fut) = self.prepare(job, Some((ops, seeded)), params, trigger)?;
+        let (id, fut) = self.prepare(job, Some((ops, seeded)), params, trigger, resumed_from)?;
         tokio::spawn(fut);
         Ok(id)
+    }
+
+    /// re-run a finished run from where it broke: every op that did not
+    /// succeed runs again, with the outputs of the ones that did seeded in.
+    /// returns the new run's id.
+    pub fn resume(&self, run_id: &str) -> Result<String, Error> {
+        self.resume_from(run_id, None)
+    }
+
+    /// [`Runner::resume`] with a chosen starting point. `from` re-runs exactly
+    /// those ops and everything downstream of them whatever their last status
+    /// was — "re-run from here" — and `None` means every op that did not
+    /// succeed. the new run records `resumed_from`, carries the original run's
+    /// params, and is triggered [`Trigger::Resume`].
+    pub fn resume_from(&self, run_id: &str, from: Option<&[String]>) -> Result<String, Error> {
+        let plan = self.resume_plan(run_id, from)?;
+        self.launch_subset(
+            &plan.job,
+            plan.rerun.iter().cloned().collect(),
+            plan.seeded,
+            plan.params,
+            Trigger::Resume,
+            Some(&plan.resumed_from),
+        )
+    }
+
+    /// what [`Runner::resume_from`] would launch, without launching it. every
+    /// refusal it can raise is raised here too, so a preview and the launch
+    /// that follows it agree.
+    ///
+    /// outputs come from the run and, following `resumed_from`, from the runs
+    /// it continues: each op is seeded with the most recent successful output
+    /// recorded anywhere in that chain. the ops recorded across the chain must
+    /// still be exactly the job's ops, or the resume is refused — resuming
+    /// into a changed graph would record lineage that never happened. that
+    /// also rules out resuming a run that was itself launched as a subset
+    /// without being a resume (an asset build records rows for its plan only).
+    pub fn resume_plan(&self, run_id: &str, from: Option<&[String]>) -> Result<ResumePlan, Error> {
+        // an empty selection is a caller saying nothing, not asking for nothing
+        let from = from.filter(|names| !names.is_empty());
+        let run = self
+            .store
+            .run(run_id)?
+            .ok_or_else(|| Error::UnknownRun(run_id.to_string()))?;
+        match run.status {
+            RunStatus::Queued | RunStatus::Running => {
+                return Err(Error::RunActive(run_id.to_string()));
+            }
+            // nothing to continue in a run that worked; re-running from a
+            // chosen op is still meaningful, so only the plain resume refuses
+            RunStatus::Success if from.is_none() => {
+                return Err(Error::RunNotFailed(run_id.to_string()));
+            }
+            _ => {}
+        }
+        let job = self
+            .jobs
+            .get(&run.job)
+            .ok_or_else(|| Error::UnknownJob(run.job.clone()))?;
+
+        // newest run first, so the first row seen for an op is the one that counts
+        let mut latest: HashMap<String, OpStatus> = HashMap::new();
+        let mut reusable: HashMap<String, Value> = HashMap::new();
+        for prev in self.resume_chain(&run)? {
+            for row in self.store.op_runs(&prev.id)? {
+                latest.entry(row.op.clone()).or_insert(row.status);
+                if let (OpStatus::Success, Some(output)) = (row.status, row.output) {
+                    reusable.entry(row.op).or_insert(output);
+                }
+            }
+        }
+
+        let current: BTreeSet<&str> = job.ops().iter().map(|o| o.name()).collect();
+        let recorded: BTreeSet<&str> = latest.keys().map(String::as_str).collect();
+        if current != recorded {
+            let mut parts = Vec::new();
+            let only_job: Vec<&str> = current.difference(&recorded).copied().collect();
+            let only_run: Vec<&str> = recorded.difference(&current).copied().collect();
+            if !only_job.is_empty() {
+                parts.push(format!("only in the job: {}", only_job.join(", ")));
+            }
+            if !only_run.is_empty() {
+                parts.push(format!("only in the run: {}", only_run.join(", ")));
+            }
+            return Err(Error::Graph(format!(
+                "job {}: run {run_id} recorded a different set of ops ({})",
+                job.name(),
+                parts.join("; ")
+            )));
+        }
+
+        let roots: Vec<&str> = match from {
+            Some(names) => {
+                let unknown: Vec<&str> = names
+                    .iter()
+                    .map(String::as_str)
+                    .filter(|n| !current.contains(n))
+                    .collect();
+                if !unknown.is_empty() {
+                    return Err(Error::Graph(format!(
+                        "job {}: run {run_id} cannot re-run from ops the job does not have: {}",
+                        job.name(),
+                        unknown.join(", ")
+                    )));
+                }
+                names.iter().map(String::as_str).collect()
+            }
+            // a success with no recorded output has to run again whatever its row says
+            None => current
+                .iter()
+                .copied()
+                .filter(|n| {
+                    latest.get(*n) != Some(&OpStatus::Success) || !reusable.contains_key(*n)
+                })
+                .collect(),
+        };
+        let pairs = job.dep_pairs();
+        let mut subset: HashSet<String> = roots.iter().map(|n| n.to_string()).collect();
+        for root in &roots {
+            subset.extend(graph::downstream(&pairs, root));
+        }
+        if subset.is_empty() {
+            return Err(Error::NothingToResume(run_id.to_string()));
+        }
+
+        let rerun: Vec<String> = job
+            .order()
+            .iter()
+            .filter(|n| subset.contains(*n))
+            .cloned()
+            .collect();
+        let reuse: Vec<String> = job
+            .order()
+            .iter()
+            .filter(|n| !subset.contains(*n) && reusable.contains_key(*n))
+            .cloned()
+            .collect();
+        // every dep a re-run op reads has to come from somewhere: the subset
+        // itself, an output recorded up the chain, or an external name
+        for name in &rerun {
+            let op = job.op(name).expect("subset op is an op of the job");
+            for dep in op.deps() {
+                if subset.contains(dep)
+                    || reusable.contains_key(dep)
+                    || job.external().contains(dep)
+                {
+                    continue;
+                }
+                return Err(Error::Graph(format!(
+                    "job {}: run {run_id} cannot re-run {name}: its dep {dep} \
+                     has no recorded output to reuse",
+                    job.name()
+                )));
+            }
+        }
+
+        let mut seeded: HashMap<String, Value> = reuse
+            .iter()
+            .map(|n| (n.clone(), reusable[n].clone()))
+            .collect();
+        // externals are seeded null by a full launch; a resume of one keeps that
+        seeded.extend(job.external().iter().map(|n| (n.clone(), Value::Null)));
+        Ok(ResumePlan {
+            job: run.job,
+            rerun,
+            reuse,
+            params: run.params,
+            seeded,
+            resumed_from: run.id,
+        })
+    }
+
+    // the run, then every run it continues, newest first
+    fn resume_chain(&self, run: &Run) -> Result<Vec<Run>, Error> {
+        let mut chain = vec![run.clone()];
+        let mut seen: HashSet<String> = HashSet::from([run.id.clone()]);
+        while let Some(parent) = chain[chain.len() - 1].resumed_from.clone() {
+            if chain.len() >= MAX_RESUME_CHAIN {
+                return Err(Error::ResumeChain(format!(
+                    "run {} continues more than {MAX_RESUME_CHAIN} runs",
+                    run.id
+                )));
+            }
+            // uuid v7 ids only ever point backwards in time, so this is a
+            // corrupted chain rather than something a resume can produce
+            if !seen.insert(parent.clone()) {
+                return Err(Error::ResumeChain(format!(
+                    "run {} loops back to {parent}",
+                    run.id
+                )));
+            }
+            let Some(prev) = self.store.run(&parent)? else {
+                return Err(Error::ResumeChain(format!(
+                    "run {} continues {parent}, which is no longer in the run history",
+                    run.id
+                )));
+            };
+            chain.push(prev);
+        }
+        Ok(chain)
     }
 
     /// like [`Runner::launch_subset`] but awaits completion.
@@ -131,7 +353,7 @@ impl Runner {
         params: Value,
         trigger: Trigger,
     ) -> Result<Run, Error> {
-        let (id, fut) = self.prepare(job, Some((ops, seeded)), params, trigger)?;
+        let (id, fut) = self.prepare(job, Some((ops, seeded)), params, trigger, None)?;
         let _ = tokio::spawn(fut).await;
         Ok(self.store.run(&id)?.expect("run row written at launch"))
     }
@@ -162,6 +384,7 @@ impl Runner {
         subset: Option<(HashSet<String>, HashMap<String, Value>)>,
         params: Value,
         trigger: Trigger,
+        resumed_from: Option<&str>,
     ) -> Result<(String, impl Future<Output = ()> + Send + 'static), Error> {
         let job = self
             .jobs
@@ -232,6 +455,7 @@ impl Runner {
             created_at: Utc::now(),
             started_at: None,
             finished_at: None,
+            resumed_from: resumed_from.map(str::to_string),
         };
         // registered before create_run so a cancel that can see the queued run
         // always finds a live sender
@@ -744,6 +968,7 @@ mod tests {
                 HashMap::new(),
                 json!({}),
                 Trigger::Manual,
+                None,
             )
             .unwrap_err();
         assert!(matches!(err, Error::Graph(_)), "{err}");
@@ -756,6 +981,7 @@ mod tests {
                 HashMap::new(),
                 json!({}),
                 Trigger::Manual,
+                None,
             )
             .unwrap_err();
         assert!(err.to_string().contains("not an op of the job"), "{err}");
@@ -767,6 +993,7 @@ mod tests {
                 HashMap::from([("a".into(), json!(1))]),
                 json!({}),
                 Trigger::Manual,
+                None,
             )
             .unwrap_err();
         assert!(

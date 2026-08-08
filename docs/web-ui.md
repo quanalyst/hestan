@@ -135,8 +135,9 @@ zero launches. runs a sensor launches carry the `sensor` trigger.
 if anything is queued or running, a "running now" section lists it with a
 live elapsed clock (ticking every second; the ticker only runs while
 something is active). below that, filters: status, trigger (manual,
-schedule, retry, build, sensor), a time window (all/1h/6h/24h), and a quick
-find box matching substrings of the job name or run id (escape clears it).
+schedule, retry, resume, build, sensor), a time window (all/1h/6h/24h), and
+a quick find box matching substrings of the job name or run id (escape
+clears it).
 filters apply client-side to the loaded set.
 
 the table is the newest 100 runs, polled every 5s; "load more" pages
@@ -145,25 +146,36 @@ backwards through history using the oldest loaded run's `created_at` plus its
 runs never vanish between pages), 100 at a time, until a short page marks
 the history exhausted. terminal runs — success, failed, or canceled — have a
 re-run button that launches a fresh run with the original params and
-navigates to it; a refusal (409 when the run turns out to still be active or
-the job has left the code, 400 when the old params no longer validate) shows
-inline. each duration cell carries a bar scaled to the longest visible run;
-canceled bars draw dim and muted, and canceled never appears in "running
+navigates to it; failed and canceled ones carry a resume button beside it,
+which continues the run instead of redoing it
+([resume](concepts.md#resume)). a refusal (409 when the run turns out to
+still be active or the job has left the code, 400 when the old params no
+longer validate or the job's ops have changed) shows inline. each duration
+cell carries a bar scaled to the longest visible run; canceled bars draw dim and muted, and canceled never appears in "running
 now" — it is over, just not finished.
 
 ## Run page
 
 the header names the job (linked), the short run id, trigger, creation time,
-and duration, next to the status and one action: cancel while the run is
-queued or running, re-run once it is terminal. cancel posts and disables
-itself; cancellation is asynchronous, so the page keeps polling until the
-status flips to canceled. if the run finished in the race, the server's 409
-is swallowed — the next poll says the same thing better. canceled is
-terminal: polling stops, and re-run works from a canceled run exactly as
-from a failed one.
+and duration — plus, on a resumed run, a link back to the run it continued.
+next to the status sit the actions: cancel while the run is queued or
+running, re-run once it is terminal, and resume beside re-run when the run
+failed or was canceled. cancel posts and disables itself; cancellation is
+asynchronous, so the page keeps polling until the status flips to canceled.
+if the run finished in the race, the server's 409 is swallowed — the next
+poll says the same thing better. canceled is terminal: polling stops, and
+both re-run and resume work from a canceled run exactly as from a failed one.
+
+a resumable run also shows what resume would do before it is clicked — "3 to
+re-run · 2 reused", from `resume_preview` — or, when the resume is refused
+(the job's ops changed since), the reason instead.
 
 the dag reappears with each node showing that op's live status glyph and
-label. clicking a node filters the log below to that op.
+label. clicking a node filters the log below to that op; on a terminal run
+the selection also offers "re-run from here", with the same counts, which
+re-runs that op and everything downstream whatever their last status was.
+ops a subset run never contained read "not in run" and carry no glyph, which
+is how a resumed run shows what it reused.
 
 the gantt chart plots each op run against elapsed time from the first op's
 start, with duration labels at the bar ends and a glyph in place of a bar for

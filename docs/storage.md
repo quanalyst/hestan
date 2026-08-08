@@ -21,7 +21,8 @@ CREATE TABLE runs (
     params TEXT NOT NULL,
     created_at TEXT NOT NULL,
     started_at TEXT,
-    finished_at TEXT
+    finished_at TEXT,
+    resumed_from TEXT                   -- added in v5
 );
 CREATE INDEX runs_job_created ON runs(job, created_at DESC);
 
@@ -120,11 +121,13 @@ forward on every open. version 1 is the phase-1 schema (`runs`, `op_runs`,
 `events` without `kind`/`data`); version 2 adds `events.kind` and
 `events.data` plus the `schedules` and `schedule_ticks` tables; version 3
 adds `op_state`; version 4 adds `asset_materializations`, `sensors`, and
-`sensor_ticks`. an older file at any version opens straight into v4, rows
-intact. every pending step and the version stamp run in one transaction
+`sensor_ticks`; version 5 adds `runs.resumed_from`, the link a
+[resume](concepts.md#resume) follows back to the run it continued. an older
+file at any version opens straight into v5, rows intact. every pending step
+and the version stamp run in one transaction
 (sqlite DDL is transactional), so a crash or failure mid-migration leaves
 the file exactly as it was found, never half-migrated. a database stamped
-with a version newer than the build refuses to open (`db schema v5 is newer
+with a version newer than the build refuses to open (`db schema v6 is newer
 than this build`) instead of quietly writing an older stamp over it.
 
 one wrinkle: databases written before the migration mechanism existed carry
