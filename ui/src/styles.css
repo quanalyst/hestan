@@ -363,6 +363,26 @@ button:disabled {
   font-size: 10px;
 }
 
+.dag-badge {
+  fill: var(--muted);
+  font-size: 11px;
+}
+
+.op-instances {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 14px;
+  margin: 2px 0 14px;
+  font-size: 12px;
+}
+
+.op-instance {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  color: var(--ink2);
+}
+
 .bars {
   position: relative;
   display: inline-block;

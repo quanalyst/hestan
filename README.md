@@ -116,6 +116,12 @@ appears.
   budget for one external resource, however many jobs overlap). a terminal op
   failure skips its downstream and fails the run, while independent branches
   keep going
+- one op can fan out over a list only known at run time: `Op::mapped(f)
+  .over("pages")` runs an instance per element of that dep's json array, each
+  with its own op run row and its element as a typed argument, and hands
+  downstream the collected outputs in element order. instances are ordinary
+  tasks, so `max_parallel`, pools, retries and cancellation apply unchanged;
+  it is all-or-nothing, and an empty array is a legal zero-instance fan-out
 - failed ops retry up to `.retries(n)` extra attempts, backing off
   exponentially with full jitter by default so ops that fail together don't
   retry together; `.retry_delay(d)` keeps a fixed pause
@@ -194,7 +200,6 @@ the binary is yours: define jobs, then `Hestan::new()...serve(addr)`, or
 - [ ] max concurrent runs per job (overlap policies gate scheduled fires
       only; concurrency pools cap ops across runs, not the runs themselves)
 - [ ] postgres store
-- [ ] dynamic / fan-out ops
 - [ ] post/body http sources
 - [ ] incremental cursors for http sources
 - [ ] paired-param fan-out

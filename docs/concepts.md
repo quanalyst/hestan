@@ -21,8 +21,8 @@ start/finish times, and the output or error.
 *events* are the append-only log attached to a run. each carries a level
 (`info | warn | error`), a kind, a message, and optional structured json
 `data`. the kinds: `run_queued`, `run_started`, `run_success`, `run_failed`,
-`run_canceled`, `op_started`, `op_retry`, `op_success`, `op_failed`,
-`op_skipped`, `op_canceled`, `type_check_failed`, and `log` — the last is
+`run_canceled`, `op_started`, `op_expanded`, `op_retry`, `op_success`,
+`op_failed`, `op_skipped`, `op_canceled`, `type_check_failed`, and `log` — the last is
 what `ctx.info/warn/error` emit.
 
 the *trigger* records why a run exists: `manual` (launch endpoint,
@@ -251,6 +251,88 @@ run that only ever covered part of the graph — an [asset build](assets.md)
 records rows for its plan alone. a resume is also refused when nothing is
 left to re-run, and when a chosen op's input was never produced by any run
 in the chain.
+
+## Dynamic fan-out
+
+the static graph stays the unit of definition, but one node can become many
+at run time. `Op::mapped` is `Op::typed`'s sibling: the closure takes the
+deserialized *element* as its second argument, and `.over(dep)` names the one
+upstream op whose output it expands.
+
+```rust
+Op::mapped("fetch_page", |ctx: OpCtx, page: u32| async move {
+    Ok(fetch(page).await?)
+})
+.over("pages")        // exactly one mapped dep, required
+.after(["config"])    // ordinary deps too, read whole as usual
+```
+
+`.over` adds the dep if it wasn't declared, so `.over("pages")` alone is
+enough. the mapped op is **one node** in the static graph with its declared
+deps, so topo order, cycle checks, `max_parallel` and the `assets` job are
+untouched by any of this.
+
+### What a run does with it
+
+when every dep of a mapped op is satisfied the executor reads the mapped
+dep's output. it must be a json array, or the op fails with
+`mapped over pages, which produced a string rather than an array` — an
+ordinary op failure that skips downstream. for an array of n elements it
+creates n **instances** named `fetch_page[0]`, `fetch_page[1]`, … Each one:
+
+- gets its own `op_runs` row, inserted the moment the instances are created,
+  so the ui, the gantt and the run detail see it like any other op;
+- receives its element as the typed argument, and reads every other dep whole
+  with `ctx.input` — including the mapped dep itself, whose entry is the
+  entire array;
+- is an ordinary spawned task, so `max_parallel`, [pools](#concurrency-pools),
+  retries, [timeouts](#cancellation) and cancellation apply to it exactly as
+  they do to a static op, with no special cases.
+
+the mapped op's own output, which downstream ops see under its plain name, is
+the json array of instance outputs **in element order** — never in completion
+order, however the instances interleave. the mapped op itself gets **no
+`op_runs` row**: the instances are the record. its expansion is visible as an
+`op_expanded` event (`data: {"instances": n, "over": dep}`) against the
+parent's name, which is also the only trace left when n is 0.
+
+### All or nothing
+
+a mapped op counts as succeeded only if **every** instance succeeded. one
+instance failing fails the mapped op for skip propagation — its downstream is
+skipped, and the run fails naming the instance
+(`op fetch_page[3] failed: 429`). there is no partial array and no partial
+success. sibling instances already in flight run to the end, exactly as an
+op's siblings do when it fails: hestan skips downstream, it never cancels
+peers.
+
+n = 0 is legal and load-bearing: no instances, output `[]`, downstream runs
+normally on an empty array. that is the difference between "nothing to do"
+and "something went wrong", and a fan-out over a filtered list needs it.
+
+### Limits
+
+fan-out does not nest: a mapped op may not be `.over` another mapped op, and
+saying so fails the build (`fan-out does not nest`). so does a mapped op
+without `.over`, and `.over` on an op that isn't mapped. instances are not
+themselves mappable for the same reason — one level, deliberately, because
+the second level has no honest name for its rows.
+
+instance names are op names everywhere else in the system, which is what makes
+them free: `ctx.set_state` from an instance writes state keyed
+`(job, "fetch_page[3]")`, and op stats aggregate per static op, so a mapped op
+shows no history of its own.
+
+### Resume across a mapped op
+
+a [resume](#resume) reuses instance outputs by their instance names, rebuilt
+into the collected array. because the array a mapped op expands over can
+differ on a re-run, a mapped op is reusable **only if it fully succeeded** —
+every instance present, covering `0..n`, every one of them successful with a
+recorded output. anything less and the whole mapped op re-expands from its
+dep, instances and all, with its downstream. a mapped op that expanded over an
+empty array leaves no rows at all, and so is indistinguishable from one that
+never ran: it re-expands too, which costs nothing.
 
 ## launch() vs run()
 

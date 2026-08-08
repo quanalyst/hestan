@@ -101,6 +101,7 @@ impl Job {
             .into_iter()
             .filter(|n| !external.contains(n))
             .collect();
+        validate_mapped(&name, &ops)?;
         Ok(Job {
             name,
             description,
@@ -111,6 +112,38 @@ impl Job {
             external,
         })
     }
+}
+
+// a mapped op needs exactly one array to expand over, and its instances are
+// ordinary ops that cannot fan out again — one level, deliberately
+fn validate_mapped(job: &str, ops: &[Op]) -> Result<(), Error> {
+    for op in ops {
+        match (op.is_mapped(), op.mapped_over()) {
+            (true, None) => {
+                return Err(Error::Graph(format!(
+                    "job {job}: op {} is mapped but names no dep to map over; add .over(dep)",
+                    op.name()
+                )));
+            }
+            (false, Some(dep)) => {
+                return Err(Error::Graph(format!(
+                    "job {job}: op {} declares .over({dep}) without being an Op::mapped",
+                    op.name()
+                )));
+            }
+            (true, Some(dep)) => {
+                if ops.iter().any(|o| o.name() == dep && o.is_mapped()) {
+                    return Err(Error::Graph(format!(
+                        "job {job}: op {} maps over {dep}, which is itself mapped; \
+                         fan-out does not nest",
+                        op.name()
+                    )));
+                }
+            }
+            (false, None) => {}
+        }
+    }
+    Ok(())
 }
 
 pub struct JobBuilder {
@@ -154,6 +187,7 @@ impl JobBuilder {
             .collect();
         let order = graph::topo_order(&pairs)
             .map_err(|e| Error::Graph(format!("job {}: {e}", self.name)))?;
+        validate_mapped(&self.name, &self.ops)?;
         Ok(Job {
             name: self.name,
             description: self.description,

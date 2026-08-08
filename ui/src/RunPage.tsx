@@ -5,10 +5,60 @@ import DagView from "./DagView";
 import type { NodeStatus } from "./DagView";
 import GanttChart from "./GanttChart";
 import StatusDot from "./StatusDot";
-import type { EventLevel, JobSummary, OpRun, OpStatus, ResumePreview, Run, RunEvent } from "./types";
+import { GlyphShape } from "./StatusGlyph";
+import type {
+  EventLevel,
+  JobSummary,
+  OpRun,
+  OpStatus,
+  OpSummary,
+  ResumePreview,
+  Run,
+  RunEvent,
+} from "./types";
 import { clockTime, durationMs, fmtDuration, isTerminal, relTime, shortId } from "./util";
 
 const plan = (p: ResumePreview) => `${p.rerun.length} to re-run · ${p.reuse.length} reused`;
+
+const INSTANCE = /^(.*)\[(\d+)\]$/;
+
+// a mapped op writes no op_runs row of its own: its instances are the record,
+// so the ui rebuilds the group from their bracketed names
+function fanOut(job: JobSummary | null, ops: OpRun[]): Map<string, OpRun[]> {
+  const mapped = new Set((job?.ops ?? []).filter((o) => o.mapped_over).map((o) => o.name));
+  const out = new Map<string, OpRun[]>();
+  for (const o of ops) {
+    const m = INSTANCE.exec(o.op);
+    if (!m || !mapped.has(m[1])) continue;
+    const group = out.get(m[1]);
+    if (group) group.push(o);
+    else out.set(m[1], [o]);
+  }
+  // element order, which is what the collected output is in
+  for (const group of out.values())
+    group.sort((a, b) => Number(INSTANCE.exec(a.op)![2]) - Number(INSTANCE.exec(b.op)![2]));
+  return out;
+}
+
+// the worst thing any instance is doing is what the mapped op is doing:
+// it succeeds only if all of them did
+function rollup(rows: OpRun[]): OpStatus {
+  for (const st of ["failed", "canceled", "running", "pending", "skipped"] as const)
+    if (rows.some((r) => r.status === st)) return st;
+  return "success";
+}
+
+// how many instances a mapped op made, from the expansion event — the only
+// place the count lives when it expanded over an empty array
+function expansions(events: RunEvent[]): Map<string, number> {
+  const out = new Map<string, number>();
+  for (const e of events) {
+    if (e.kind !== "op_expanded" || !e.op) continue;
+    const n = (e.data as { instances?: number } | null)?.instances;
+    if (typeof n === "number") out.set(e.op, n);
+  }
+  return out;
+}
 
 export default function RunPage() {
   const { id } = useParams();
@@ -166,10 +216,42 @@ function RunView({ id }: { id: string }) {
 
   const dur = durationMs(run);
   const statuses: Record<string, OpStatus> = Object.fromEntries(ops.map((o) => [o.op, o.status]));
-  // a subset run (memoized asset build) writes no op_runs row for what it skipped
+  const instances = fanOut(job, ops);
+  const expanded = expansions(events);
+  // a subset run (memoized asset build) writes no op_runs row for what it
+  // skipped; a mapped op never has one, and reads through its instances
   const dagStatuses: Record<string, NodeStatus> = job
-    ? Object.fromEntries(job.ops.map((o) => [o.name, statuses[o.name] ?? "absent"]))
+    ? Object.fromEntries(
+        job.ops.map((o) => {
+          const group = instances.get(o.name);
+          if (group) return [o.name, rollup(group)];
+          // expanded over an empty array: it ran, with nothing to do
+          if (expanded.get(o.name) === 0) return [o.name, "success"];
+          return [o.name, statuses[o.name] ?? "absent"];
+        }),
+      )
     : {};
+  const dagNodes = (job?.ops ?? []).map((o) => {
+    if (!o.mapped_over) return o;
+    const n = expanded.get(o.name) ?? instances.get(o.name)?.length;
+    return { ...o, badge: n === undefined ? "×n" : `×${n}` };
+  });
+  // the gantt lists instances as their own rows, and hangs a mapped op's
+  // dependents off them, since the parent itself has no span to draw
+  const ganttOps: OpSummary[] = job
+    ? [
+        ...job.ops
+          .filter((o) => o.name in statuses)
+          .map((o) => ({
+            ...o,
+            deps: o.deps.flatMap((d) => instances.get(d)?.map((r) => r.op) ?? [d]),
+          })),
+        ...[...instances].flatMap(([parent, rows]) => {
+          const op = job.ops.find((o) => o.name === parent);
+          return op ? rows.map((r) => ({ ...op, name: r.op })) : [];
+        }),
+      ]
+    : [];
   const shown = events
     .filter((e) => filter === "all" || e.kind === "log")
     .filter((e) => level === "all" || e.level === level)
@@ -237,11 +319,25 @@ function RunView({ id }: { id: string }) {
 
       {job && (
         <DagView
-          nodes={job.ops}
+          nodes={dagNodes}
           statuses={dagStatuses}
           selected={opSel}
           onSelect={(op) => setOpSel((prev) => (prev === op ? null : op))}
         />
+      )}
+
+      {opSel && instances.has(opSel) && (
+        <div className="op-instances">
+          {instances.get(opSel)!.map((r) => (
+            <span key={r.op} className="op-instance">
+              <svg className="glyph" width={12} height={12} viewBox="-6 -6 12 12" aria-hidden="true">
+                <GlyphShape status={r.status} />
+              </svg>
+              <span className="mono">{r.op}</span>
+              <span className="muted">{r.status}</span>
+            </span>
+          ))}
+        </div>
       )}
 
       {done && opSel && (
@@ -263,7 +359,7 @@ function RunView({ id }: { id: string }) {
         </p>
       )}
 
-      {job && <GanttChart ops={job.ops.filter((o) => o.name in statuses)} opRuns={ops} />}
+      {job && <GanttChart ops={ganttOps} opRuns={ops} />}
 
       <h2>
         log

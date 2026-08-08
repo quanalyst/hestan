@@ -238,7 +238,9 @@ function JobView({ name }: { name: string }) {
 
       <h2>graph</h2>
       <DagView
-        nodes={job.ops}
+        // a mapped op is one node in the definition; how many instances it
+        // makes is only known inside a run
+        nodes={job.ops.map((o) => (o.mapped_over ? { ...o, badge: "×n" } : o))}
         selected={opSel}
         onSelect={(op) => setOpSel((prev) => (prev === op ? null : op))}
       />

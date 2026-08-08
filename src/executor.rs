@@ -1,4 +1,4 @@
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::panic::AssertUnwindSafe;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -13,7 +13,7 @@ use tokio::task::{Id, JoinSet};
 use crate::error::Error;
 use crate::graph;
 use crate::job::Job;
-use crate::model::{EventKind, EventLevel, OpStatus, Run, RunStatus, Trigger, new_run_id};
+use crate::model::{EventKind, EventLevel, OpRun, OpStatus, Run, RunStatus, Trigger, new_run_id};
 use crate::op::{Cancel, Op, OpCtx};
 use crate::store::Store;
 
@@ -81,6 +81,21 @@ pub struct ResumePlan {
 }
 
 type OpOutcome = (String, Result<(Value, Option<Value>), String>);
+
+/// one instance of a mapped op, keyed in the run by its `{op}[{i}]` name.
+struct Instance {
+    parent: String,
+    index: usize,
+    element: Value,
+}
+
+/// a mapped op mid-expansion: one slot per element, so the collected output
+/// comes out in element order however the instances interleave.
+struct Fanout {
+    slots: Vec<Option<Value>>,
+    remaining: usize,
+    failed: bool,
+}
 
 /// executes jobs against a store. cheap to clone.
 #[derive(Clone)]
@@ -276,20 +291,31 @@ impl Runner {
         let mut latest: HashMap<String, OpStatus> = HashMap::new();
         let mut reusable: HashMap<String, Value> = HashMap::new();
         for prev in self.resume_chain(&run)? {
-            for row in self.store.op_runs(&prev.id)? {
-                latest.entry(row.op.clone()).or_insert(row.status);
-                if let (OpStatus::Success, Some(output)) = (row.status, row.output) {
-                    reusable.entry(row.op).or_insert(output);
+            for (op, status, output) in fold_instances(job, self.store.op_runs(&prev.id)?) {
+                latest.entry(op.clone()).or_insert(status);
+                if let (OpStatus::Success, Some(output)) = (status, output) {
+                    reusable.entry(op).or_insert(output);
                 }
             }
         }
 
         let current: BTreeSet<&str> = job.ops().iter().map(|o| o.name()).collect();
         let recorded: BTreeSet<&str> = latest.keys().map(String::as_str).collect();
-        if current != recorded {
+        // a mapped op records no row of its own — its instances are the
+        // record, and an expansion over an empty array leaves none at all — so
+        // it stays out of the shape check and simply re-expands below
+        let mapped: BTreeSet<&str> = job
+            .ops()
+            .iter()
+            .filter(|o| o.mapped_over().is_some())
+            .map(|o| o.name())
+            .collect();
+        let want: BTreeSet<&str> = current.difference(&mapped).copied().collect();
+        let have: BTreeSet<&str> = recorded.difference(&mapped).copied().collect();
+        if want != have {
             let mut parts = Vec::new();
-            let only_job: Vec<&str> = current.difference(&recorded).copied().collect();
-            let only_run: Vec<&str> = recorded.difference(&current).copied().collect();
+            let only_job: Vec<&str> = want.difference(&have).copied().collect();
+            let only_run: Vec<&str> = have.difference(&want).copied().collect();
             if !only_job.is_empty() {
                 parts.push(format!("only in the job: {}", only_job.join(", ")));
             }
@@ -528,6 +554,13 @@ impl Runner {
             error: None,
             resumed_from: resumed_from.map(str::to_string),
         };
+        // a mapped op is never a row of its own: its instances are the record,
+        // and how many there are is not known until its dep has produced
+        let rows: Vec<String> = pending
+            .iter()
+            .filter(|n| job.op(n).expect("op in topo order").mapped_over().is_none())
+            .cloned()
+            .collect();
         // registered before create_run so a cancel that can see the queued run
         // always finds a live sender
         let (cancel_tx, cancel_rx) = watch::channel(false);
@@ -535,7 +568,7 @@ impl Runner {
             .lock()
             .unwrap()
             .insert(run.id.clone(), cancel_tx);
-        if let Err(e) = self.store.create_run(&run, &pending) {
+        if let Err(e) = self.store.create_run(&run, &rows) {
             self.active.lock().unwrap().remove(&run.id);
             return Err(e);
         }
@@ -552,6 +585,53 @@ impl Runner {
         );
         Ok((id, fut))
     }
+}
+
+// "process[3]" -> ("process", 3), but only when `process` is a mapped op of
+// this job; any other bracketed name is just an op name
+fn instance_of(job: &Job, name: &str) -> Option<(String, usize)> {
+    let (parent, index) = name.split_once('[')?;
+    let index: usize = index.strip_suffix(']')?.parse().ok()?;
+    job.op(parent)?.mapped_over()?;
+    Some((parent.to_string(), index))
+}
+
+/// collapse one run's fan-out instance rows into a single entry for the mapped
+/// op they belong to. it counts as succeeded only when the instances cover
+/// `0..n` and every one of them did: the array a mapped op expands over can
+/// differ on a re-run, so anything less has to expand again from scratch. a
+/// mapped op with no rows at all — never reached, or expanded over an empty
+/// array — is absent here, which resume planning reads the same way.
+fn fold_instances(job: &Job, rows: Vec<OpRun>) -> Vec<(String, OpStatus, Option<Value>)> {
+    let mut folded: Vec<(String, OpStatus, Option<Value>)> = Vec::with_capacity(rows.len());
+    let mut groups: HashMap<String, BTreeMap<usize, (OpStatus, Option<Value>)>> = HashMap::new();
+    for row in rows {
+        match instance_of(job, &row.op) {
+            Some((parent, index)) => {
+                groups
+                    .entry(parent)
+                    .or_default()
+                    .insert(index, (row.status, row.output));
+            }
+            None => folded.push((row.op, row.status, row.output)),
+        }
+    }
+    for (parent, slots) in groups {
+        let whole = slots.keys().copied().eq(0..slots.len())
+            && slots
+                .values()
+                .all(|(status, output)| *status == OpStatus::Success && output.is_some());
+        if !whole {
+            folded.push((parent, OpStatus::Failed, None));
+            continue;
+        }
+        let collected: Vec<Value> = slots
+            .into_values()
+            .map(|(_, output)| output.expect("checked just above"))
+            .collect();
+        folded.push((parent, OpStatus::Success, Some(Value::Array(collected))));
+    }
+    folded
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -586,10 +666,96 @@ async fn execute(
     let mut tasks: JoinSet<OpOutcome> = JoinSet::new();
     // JoinError only carries the task id, so remember which op each task is
     let mut names: HashMap<Id, String> = HashMap::new();
+    // fan-out state: what each instance is for, and where its output belongs
+    let mut instances: HashMap<String, Instance> = HashMap::new();
+    let mut fanouts: HashMap<String, Fanout> = HashMap::new();
 
     loop {
+        // a mapped op expands the moment its deps land: it leaves `pending`
+        // and its instances take its place, so everything below treats them as
+        // ordinary ops. this runs on the run's own task, which is why the rows
+        // an expansion inserts can never race the terminal status write.
+        let mut i = 0;
+        while i < pending.len() {
+            // an instance resolves to its parent's op, which is mapped too;
+            // only the parent ever expands
+            let expandable = !instances.contains_key(&pending[i]);
+            let op = unit_op(&job, &instances, &pending[i]);
+            let over = op.mapped_over().filter(|_| expandable).map(str::to_string);
+            let Some(over) = over.filter(|_| op.deps().iter().all(|d| outputs.contains_key(d)))
+            else {
+                i += 1;
+                continue;
+            };
+            let name = pending.remove(i);
+            let Some(elements) = outputs[&over].as_array().cloned() else {
+                let msg = format!(
+                    "mapped over {over}, which produced {} rather than an array",
+                    json_type(&outputs[&over])
+                );
+                note(store.append_event(
+                    &run_id,
+                    Some(&name),
+                    EventLevel::Error,
+                    EventKind::OpFailed,
+                    &msg,
+                    Some(&json!({ "error": &msg })),
+                ));
+                if first_failure.is_none() {
+                    first_failure = Some((name.clone(), msg));
+                }
+                failed = true;
+                skip_downstream(&pairs, &name, &mut pending, &run_id, &store);
+                continue;
+            };
+            // rows first, so a cancel or a skip has something to write to,
+            // exactly as a static op's row exists from the launch on
+            let created: Vec<String> = elements
+                .into_iter()
+                .enumerate()
+                .map(|(index, element)| {
+                    let instance = format!("{name}[{index}]");
+                    note(store.create_op_run(&run_id, &instance));
+                    instances.insert(
+                        instance.clone(),
+                        Instance {
+                            parent: name.clone(),
+                            index,
+                            element,
+                        },
+                    );
+                    instance
+                })
+                .collect();
+            note(store.append_event(
+                &run_id,
+                Some(&name),
+                EventLevel::Info,
+                EventKind::OpExpanded,
+                &format!("expanded into {} instances over {over}", created.len()),
+                Some(&json!({ "instances": created.len(), "over": over })),
+            ));
+            if created.is_empty() {
+                // nothing to wait on: an empty array is a legal fan-out, and
+                // downstream runs normally on `[]`
+                outputs.insert(name, json!([]));
+                continue;
+            }
+            let n = created.len();
+            fanouts.insert(
+                name,
+                Fanout {
+                    slots: vec![None; n],
+                    remaining: n,
+                    failed: false,
+                },
+            );
+            pending.splice(i..i, created);
+            i += n;
+        }
+
         let (ready, rest): (Vec<String>, Vec<String>) = pending.into_iter().partition(|n| {
-            let op = job.op(n).expect("op in topo order");
+            let op = unit_op(&job, &instances, n);
             op.deps().iter().all(|d| outputs.contains_key(d))
         });
         pending = rest;
@@ -603,7 +769,7 @@ async fn execute(
             pending.splice(0..0, leftover);
         }
         for name in spawnable {
-            let op = job.op(&name).expect("op in topo order").clone();
+            let op = unit_op(&job, &instances, &name).clone();
             let inputs: HashMap<String, Value> = op
                 .deps()
                 .iter()
@@ -611,6 +777,8 @@ async fn execute(
                 .collect();
             let handle = tasks.spawn(run_op(
                 op,
+                name.clone(),
+                instances.get(&name).map(|i| i.element.clone()),
                 job.name().to_string(),
                 run_id.clone(),
                 params.clone(),
@@ -641,7 +809,7 @@ async fn execute(
                 if let Some(state) = state {
                     note(store.set_op_state(job.name(), &name, &state));
                 }
-                outputs.insert(name, output);
+                collect(name, output, &instances, &mut fanouts, &mut outputs);
             }
             Ok((id, (name, Err(msg)))) => {
                 names.remove(&id);
@@ -650,7 +818,15 @@ async fn execute(
                     first_failure = Some((name.clone(), msg));
                 }
                 failed = true;
-                skip_downstream(&pairs, &name, &mut pending, &run_id, &store);
+                give_up(
+                    &name,
+                    &instances,
+                    &mut fanouts,
+                    &pairs,
+                    &mut pending,
+                    &run_id,
+                    &store,
+                );
             }
             Err(join_err) => {
                 let name = names.remove(&join_err.id()).expect("spawned with id");
@@ -669,7 +845,15 @@ async fn execute(
                     first_failure = Some((name.clone(), msg));
                 }
                 failed = true;
-                skip_downstream(&pairs, &name, &mut pending, &run_id, &store);
+                give_up(
+                    &name,
+                    &instances,
+                    &mut fanouts,
+                    &pairs,
+                    &mut pending,
+                    &run_id,
+                    &store,
+                );
             }
         }
     }
@@ -786,6 +970,80 @@ async fn execute(
     }
 }
 
+// an instance runs its parent's op under its own name; everything else is
+// itself
+fn unit_op<'a>(job: &'a Job, instances: &HashMap<String, Instance>, name: &str) -> &'a Op {
+    let op = instances.get(name).map_or(name, |i| i.parent.as_str());
+    job.op(op)
+        .expect("every unit is an op of the job or an instance of one")
+}
+
+fn json_type(v: &Value) -> &'static str {
+    match v {
+        Value::Null => "null",
+        Value::Bool(_) => "a bool",
+        Value::Number(_) => "a number",
+        Value::String(_) => "a string",
+        Value::Array(_) => "an array",
+        Value::Object(_) => "an object",
+    }
+}
+
+// an instance's output goes into its parent's slot; the mapped op's own
+// output appears, in element order, once every instance has landed
+fn collect(
+    name: String,
+    output: Value,
+    instances: &HashMap<String, Instance>,
+    fanouts: &mut HashMap<String, Fanout>,
+    outputs: &mut HashMap<String, Value>,
+) {
+    let Some(instance) = instances.get(&name) else {
+        outputs.insert(name, output);
+        return;
+    };
+    let fan = fanouts
+        .get_mut(&instance.parent)
+        .expect("an instance belongs to a live fan-out");
+    fan.slots[instance.index] = Some(output);
+    fan.remaining -= 1;
+    if fan.remaining == 0 && !fan.failed {
+        let collected: Vec<Value> = std::mem::take(&mut fan.slots)
+            .into_iter()
+            .map(|slot| slot.expect("every instance filled its slot"))
+            .collect();
+        outputs.insert(instance.parent.clone(), Value::Array(collected));
+    }
+}
+
+// a failed unit skips its downstream. one failing instance fails its whole
+// mapped op — there is no partial array — and the siblings still in flight
+// run to the end, exactly as an op's siblings do
+#[allow(clippy::too_many_arguments)]
+fn give_up(
+    name: &str,
+    instances: &HashMap<String, Instance>,
+    fanouts: &mut HashMap<String, Fanout>,
+    pairs: &[(String, Vec<String>)],
+    pending: &mut Vec<String>,
+    run_id: &str,
+    store: &Store,
+) {
+    let Some(instance) = instances.get(name) else {
+        skip_downstream(pairs, name, pending, run_id, store);
+        return;
+    };
+    let fan = fanouts
+        .get_mut(&instance.parent)
+        .expect("an instance belongs to a live fan-out");
+    fan.remaining -= 1;
+    // the first failure is what skips downstream; later ones just close a slot
+    if !fan.failed {
+        fan.failed = true;
+        skip_downstream(pairs, &instance.parent, pending, run_id, store);
+    }
+}
+
 fn op_canceled(store: &Store, run_id: &str, name: &str) {
     note(store.op_finished(run_id, name, OpStatus::Canceled, None, Some("canceled")));
     note(store.append_event(
@@ -819,6 +1077,10 @@ fn op_unstopped(store: &Store, run_id: &str, name: &str) {
 #[allow(clippy::too_many_arguments)]
 async fn run_op(
     op: Op,
+    // the op's own name, except on a fan-out instance, which runs its parent's
+    // body under `{parent}[{i}]` and is recorded under that everywhere
+    name: String,
+    element: Option<Value>,
     job: String,
     run_id: String,
     params: Value,
@@ -827,7 +1089,6 @@ async fn run_op(
     pools: Pools,
     cancel: watch::Receiver<bool>,
 ) -> OpOutcome {
-    let name = op.name().to_string();
     // loaded once, before attempt 1: every retry sees the same starting state
     let state = Arc::new(match store.op_state(&job, &name) {
         Ok(s) => s,
@@ -882,6 +1143,7 @@ async fn run_op(
             job: job.clone(),
             op: name.clone(),
             params: params.clone(),
+            element: element.clone(),
             inputs: inputs.clone(),
             state: state.clone(),
             new_state: new_state.clone(),

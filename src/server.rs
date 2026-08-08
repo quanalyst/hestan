@@ -132,6 +132,7 @@ fn job_summary(job: &Job, st: &AppState) -> Result<Value, Error> {
                 "retries": op.max_retries(),
                 "timeout_secs": op.timeout_after().map(|d| d.as_secs_f64()),
                 "pool": op.pool_name(),
+                "mapped_over": op.mapped_over(),
                 "input_type": op.input_type(),
                 "output_type": op.output_type(),
                 "params_type": op.params_type(),
@@ -829,7 +830,7 @@ async fn static_ui(method: Method, uri: Uri) -> Response {
 mod tests {
     use super::*;
     use crate::model::{Run, RunStatus};
-    use crate::op::Op;
+    use crate::op::{Op, OpCtx};
     use crate::store::Store;
 
     fn echo_job(name: &str) -> Job {
@@ -1278,6 +1279,43 @@ mod tests {
                 .unwrap_err();
         assert_eq!(status, StatusCode::NOT_FOUND);
         assert_eq!(body["error"], "unknown job: nope");
+    }
+
+    // the dag needs to know which node fans out; the instances themselves come
+    // back from the run detail as ordinary op runs
+    #[tokio::test]
+    async fn job_summary_names_the_dep_a_mapped_op_fans_out_over() {
+        let job = Job::builder("fanout")
+            .op(Op::new("pages", |_| async { Ok(json!([1, 2])) }))
+            .op(Op::mapped("process", |_ctx: OpCtx, page: u32| async move {
+                Ok(json!(page))
+            })
+            .over("pages"))
+            .build()
+            .unwrap();
+        let st = state(vec![job]);
+
+        let Json(body) = get_job(State(st.clone()), Path("fanout".into()))
+            .await
+            .unwrap();
+        let ops = body["ops"].as_array().unwrap();
+        assert_eq!(ops[0]["mapped_over"], json!(null));
+        assert_eq!(ops[1]["mapped_over"], "pages");
+        assert_eq!(ops[1]["deps"], json!(["pages"]));
+
+        let run = st
+            .runner
+            .run("fanout", json!({}), Trigger::Manual)
+            .await
+            .unwrap();
+        let Json(body) = get_run(State(st), Path(run.id)).await.unwrap();
+        let names: Vec<&str> = body["ops"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|o| o["op"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, ["pages", "process[0]", "process[1]"]);
     }
 
     #[tokio::test]

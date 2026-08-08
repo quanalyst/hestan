@@ -52,6 +52,7 @@ summary or a 404. the shape:
       "retries": 0,
       "timeout_secs": 30.0,
       "pool": "orders_api",
+      "mapped_over": null,
       "input_type": null,
       "output_type": null,
       "params_type": "demo::FetchParams"
@@ -75,7 +76,9 @@ summary or a 404. the shape:
 in first-use order, with the limit each carries — that limit is shared with
 every other job in the process, not per job. an op's `pool` is the pool it
 takes a permit from (null for most ops) and `timeout_secs` its per-attempt
-time limit (null for none). `interval_secs` is the gap between the next two fires, minimized across the
+time limit (null for none). `mapped_over` is the dep an
+[`Op::mapped`](concepts.md#dynamic-fan-out) fans out over, null for every
+ordinary op. `interval_secs` is the gap between the next two fires, minimized across the
 job's unpaused schedules (`null` without one); `overdue` is true when the
 previous scheduled fire is more than half an interval past and no successful
 run has finished since it (see [scheduling](scheduling.md)). the type fields
@@ -187,7 +190,10 @@ is the id of the run this one continued, null for every run that isn't a
 [resume](#resume).
 
 `GET /api/runs/{id}` returns `{"run": ..., "ops": [...]}` (404 for an unknown
-id), the op runs sorted by op name:
+id), the op runs sorted by op name. a [mapped op](concepts.md#dynamic-fan-out)
+appears here as its instances — `fetch_page[0]`, `fetch_page[1]`, … rows
+created during the run — and never under its own name, so no extra endpoint is
+needed to see a fan-out:
 
 ```json
 {
@@ -223,7 +229,9 @@ everything.
 ```
 
 `op` is null for run-level events (`run_queued`, `run_started`, ...). `kind`
-and `data` are catalogued in [concepts](concepts.md).
+and `data` are catalogued in [concepts](concepts.md); `op_expanded`
+(`data: {"instances": n, "over": dep}`) is how many instances a mapped op made,
+and the only record it leaves when that number is zero.
 
 ## Retry
 

@@ -115,6 +115,15 @@ every poll, and a stored column is what keeps the run row and the
 [`on_failure` hook](notifications.md) saying the same thing by construction.
 runs and their op runs are pruned together, so the two can never drift apart.
 
+`op_runs` rows are usually written in one transaction with the run, but not
+always: a [mapped op](concepts.md#dynamic-fan-out) has no row of its own, and
+one row per instance (`fetch_page[0]`, …) is inserted mid-run, the moment the
+expansion knows how many there are. those inserts happen on the run's own task
+and before the instances are spawned, so a row can never land after the run's
+terminal status write, and a cancel or a skip always has something to write
+to. an instance's name is an op name everywhere else in the schema, including
+`op_state` and the event log.
+
 an `op_runs` row with a terminal status and a null `finished_at` is not a
 bug: it is a [canceled op that was never observed to stop](concepts.md#cancellation),
 and the missing timestamp is the record refusing to invent one. anything

@@ -10,6 +10,7 @@ export type EventKind =
   | "run_failed"
   | "run_canceled"
   | "op_started"
+  | "op_expanded"
   | "op_retry"
   | "op_success"
   | "op_failed"
@@ -29,6 +30,9 @@ export interface OpSummary {
   retries: number;
   timeout_secs: number | null;
   pool: string | null;
+  // the dep this op fans out over, one instance per array element; null for
+  // every ordinary op
+  mapped_over: string | null;
   input_type: string | null;
   output_type: string | null;
   params_type: string | null;

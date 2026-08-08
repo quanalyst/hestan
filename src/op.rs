@@ -70,6 +70,10 @@ pub struct Op {
     output_type: Option<&'static str>,
     params_type: Option<&'static str>,
     params_check: Option<Arc<ParamsCheck>>,
+    // built by `mapped`, so `over` missing is a build error rather than an op
+    // that silently runs once over nothing
+    mapped: bool,
+    over: Option<String>,
     f: Arc<OpFn>,
 }
 
@@ -90,6 +94,8 @@ impl Op {
             output_type: None,
             params_type: None,
             params_check: None,
+            mapped: false,
+            over: None,
             f: Arc::new(move |ctx: OpCtx| -> BoxFuture<'static, OpResult> { Box::pin(f(ctx)) }),
         }
     }
@@ -116,6 +122,8 @@ impl Op {
             output_type: Some(std::any::type_name::<O>()),
             params_type: None,
             params_check: None,
+            mapped: false,
+            over: None,
             f: Arc::new(move |ctx: OpCtx| -> BoxFuture<'static, OpResult> {
                 let f = f.clone();
                 Box::pin(async move {
@@ -133,6 +141,68 @@ impl Op {
                 })
             }),
         }
+    }
+
+    /// an op that fans out: the dep named by [`over`](Self::over) must produce
+    /// a json array, and this op runs once per element with that element
+    /// deserialized into `T` as its second argument. the other deps are read
+    /// with `ctx.input` as usual, whole — including the mapped dep, whose
+    /// entry is the entire array.
+    ///
+    /// each element becomes an instance named `{op}[{i}]`, zero-based, with
+    /// its own `op_runs` row; the mapped op itself gets none. its output, seen
+    /// downstream under its plain name, is the array of instance outputs in
+    /// **element** order, and exists only if every instance succeeded. an
+    /// empty array is legal: no instances, output `[]`.
+    ///
+    /// ```no_run
+    /// # use hestan::{Op, OpCtx};
+    /// # use serde_json::json;
+    /// Op::mapped("fetch_page", |_ctx: OpCtx, page: u32| async move {
+    ///     Ok(json!({ "page": page }))
+    /// })
+    /// .over("pages");
+    /// ```
+    pub fn mapped<T, O, F, Fut>(name: impl Into<String>, f: F) -> Op
+    where
+        T: DeserializeOwned + Send + 'static,
+        O: Serialize + 'static,
+        F: Fn(OpCtx, T) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<O, Box<dyn std::error::Error + Send + Sync>>> + Send + 'static,
+    {
+        let f = Arc::new(f);
+        let mut op = Op::new(name, move |ctx: OpCtx| {
+            let f = f.clone();
+            async move {
+                // the executor hands every instance its element; nothing else
+                // ever calls a mapped body
+                let Some(element) = ctx.element.clone() else {
+                    return Err("mapped op ran without an element".into());
+                };
+                let element: T = match serde_json::from_value(element) {
+                    Ok(element) => element,
+                    Err(e) => return Err(ctx.type_check_failed(e)),
+                };
+                let output = f(ctx, element).await?;
+                Ok(serde_json::to_value(output)?)
+            }
+        });
+        op.input_type = Some(std::any::type_name::<T>());
+        op.output_type = Some(std::any::type_name::<O>());
+        op.mapped = true;
+        op
+    }
+
+    /// the dep an [`Op::mapped`] expands over; it is added to the deps if it
+    /// was not declared already. required on a mapped op, meaningless on any
+    /// other, and either mistake fails the job build.
+    pub fn over(mut self, dep: impl Into<String>) -> Op {
+        let dep = dep.into();
+        if !self.deps.contains(&dep) {
+            self.deps.push(dep.clone());
+        }
+        self.over = Some(dep);
+        self
     }
 
     /// declare upstream ops; appends to any already declared.
@@ -254,6 +324,16 @@ impl Op {
         self.params_type
     }
 
+    /// the dep this op fans out over, from [`over`](Self::over). `Some` only
+    /// on a built [`Op::mapped`], which makes it the runtime's test for one.
+    pub fn mapped_over(&self) -> Option<&str> {
+        self.over.as_deref()
+    }
+
+    pub(crate) fn is_mapped(&self) -> bool {
+        self.mapped
+    }
+
     pub(crate) fn validate_params(&self, params: &Value) -> Result<(), String> {
         match &self.params_check {
             Some(check) => check(params),
@@ -280,6 +360,7 @@ impl fmt::Debug for Op {
             .field("retry", &self.retry)
             .field("timeout", &self.timeout)
             .field("pool", &self.pool)
+            .field("mapped_over", &self.over)
             .finish_non_exhaustive()
     }
 }
@@ -316,6 +397,9 @@ pub struct OpCtx {
     pub(crate) job: String,
     pub(crate) op: String,
     pub(crate) params: Value,
+    /// the one array element this invocation is for, on a fan-out instance;
+    /// `None` for every ordinary op.
+    pub(crate) element: Option<Value>,
     pub(crate) inputs: Arc<HashMap<String, Value>>,
     pub(crate) state: Arc<Option<Value>>,
     pub(crate) new_state: Arc<Mutex<Option<Value>>>,
@@ -496,6 +580,7 @@ mod tests {
             job: "j".into(),
             op: "x".into(),
             params: json!({}),
+            element: None,
             inputs: Arc::new(HashMap::new()),
             state: Arc::new(None),
             new_state: Arc::new(Mutex::new(None)),

@@ -91,6 +91,12 @@ export default function OpInspector({
             <span className="num">{fmtDuration(op.timeout_secs * 1000)}</span>
           </div>
         )}
+        {op.mapped_over && (
+          <div className="op-line">
+            <span className="op-line-label">mapped over</span>
+            <span className="mono">{op.mapped_over}</span>
+          </div>
+        )}
         {op.pool && (
           <div className="op-line">
             <span className="op-line-label">pool</span>

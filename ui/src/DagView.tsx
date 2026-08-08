@@ -19,6 +19,8 @@ export interface DagNode {
   deps: string[];
   output_type?: string | null;
   note?: string;
+  // a short suffix on the label, for a mapped op's instance count ("×3")
+  badge?: string;
 }
 
 // "absent" is a node a subset run never contained: no status to claim, no glyph
@@ -85,8 +87,9 @@ export default function DagView({
   // no text metrics pre-render: ~7.5px/char at the 13px label, ~5.6 at the 10px
   const width = (n: DagNode) => {
     const sub = subOf(n);
+    const badge = n.badge ? Math.round(n.badge.length * 6.6) + 5 : 0;
     const text = Math.max(
-      Math.round(n.name.length * 7.5) + glyphW,
+      Math.round(n.name.length * 7.5) + glyphW + badge,
       sub ? Math.round(sub.length * 5.6) : 0,
     );
     return Math.max(72, text + PAD_X * 2);
@@ -158,6 +161,7 @@ export default function DagView({
               )}
               <text className="dag-label" x={nx + PAD_X + glyphW} y={labelCy} dominantBaseline="central">
                 {node.name}
+                {node.badge && <tspan className="dag-badge"> {node.badge}</tspan>}
               </text>
               {st && (
                 <text className="dag-status" x={nx + PAD_X + glyphW} y={y + STATUS_ROW_Y} dominantBaseline="central">

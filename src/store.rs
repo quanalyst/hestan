@@ -235,6 +235,19 @@ impl Store {
         Ok(())
     }
 
+    /// add a `pending` op_runs row to a run already under way, for one
+    /// instance a fan-out just created. the run's own loop is the only caller
+    /// and it inserts before spawning, so a row can never land after the run's
+    /// terminal status write; `OR IGNORE` keeps a repeat harmless.
+    pub(crate) fn create_op_run(&self, run_id: &str, op: &str) -> Result<(), Error> {
+        let conn = self.0.lock().unwrap();
+        conn.execute(
+            "INSERT OR IGNORE INTO op_runs (run_id, op, status) VALUES (?1, ?2, ?3)",
+            params![run_id, op, OpStatus::Pending.as_str()],
+        )?;
+        Ok(())
+    }
+
     /// mark runs left queued/running by a dead process as failed; called at startup.
     pub(crate) fn fail_interrupted(&self) -> Result<(), Error> {
         let mut conn = self.0.lock().unwrap();
