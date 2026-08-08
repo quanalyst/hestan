@@ -1,0 +1,9 @@
+# lf in the repo regardless of platform: crlf would break `cargo fmt --check`
+# and the ui/dist diff gate on a windows checkout
+* text=auto eol=lf
+
+# committed build output: generated, not authored. keeps it out of the
+# language stats and collapsed in diffs
+ui/dist/** linguist-generated=true
+ui/package-lock.json linguist-generated=true
+Cargo.lock linguist-generated=true

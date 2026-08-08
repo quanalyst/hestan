@@ -1,0 +1,266 @@
+import { useState } from "react";
+import { useNavigate } from "react-router-dom";
+import { get, post, usePoll } from "./api";
+import DagView from "./DagView";
+import { GlyphShape } from "./StatusGlyph";
+import type { Status } from "./StatusGlyph";
+import type { AssetSummary, SensorOutcome, SensorSummary } from "./types";
+import { relTime } from "./util";
+
+const SENSOR_GLYPH = {
+  fired: "success",
+  error: "failed",
+} as const satisfies Record<SensorOutcome, Status>;
+
+// enough hex to tell fingerprints apart at a glance; the title carries the rest
+const shortHash = (fp: string) => fp.slice(0, 12);
+
+function fmtEvery(secs: number): string {
+  if (secs >= 3600 && secs % 3600 === 0) return `${secs / 3600}h`;
+  if (secs >= 60 && secs % 60 === 0) return `${secs / 60}m`;
+  return `${secs}s`;
+}
+
+// stale with no reasons means no materialization exists at all
+function staleSummary(a: AssetSummary): string {
+  if (a.reasons.length === 0) return "never built";
+  if (a.reasons.length === 1) return `dep ${a.reasons[0].dep} changed`;
+  return `${a.reasons.length} deps changed`;
+}
+
+function staleTitle(a: AssetSummary): string | undefined {
+  if (a.reasons.length === 0) return undefined;
+  return a.reasons
+    .map((r) => `${r.dep}: ${r.had ? shortHash(r.had) : "—"} -> ${r.now ? shortHash(r.now) : "—"}`)
+    .join("\n");
+}
+
+function Freshness({ stale }: { stale: boolean }) {
+  return (
+    <span className="status">
+      <svg className="glyph" width={12} height={12} viewBox="-6 -6 12 12" aria-hidden="true">
+        <GlyphShape status={stale ? "pending" : "success"} />
+      </svg>
+      {stale ? "stale" : "fresh"}
+    </span>
+  );
+}
+
+export default function AssetsPage() {
+  const nav = useNavigate();
+  const [assets, setAssets] = useState<AssetSummary[] | null>(null);
+  const [sensors, setSensors] = useState<SensorSummary[]>([]);
+  const [building, setBuilding] = useState(false);
+  const [buildNote, setBuildNote] = useState<string | null>(null);
+  const [busyAsset, setBusyAsset] = useState<string | null>(null);
+  const [rowMsg, setRowMsg] = useState<{ asset: string; msg: string } | null>(null);
+  const [sensorErr, setSensorErr] = useState<string | null>(null);
+
+  usePoll(
+    () => {
+      get<{ assets: AssetSummary[] }>("/api/assets")
+        .then((r) => setAssets(r.assets))
+        .catch(() => {});
+      get<{ sensors: SensorSummary[] }>("/api/sensors")
+        .then((r) => setSensors(r.sensors))
+        .catch(() => {});
+    },
+    5000,
+    [],
+  );
+
+  const buildOne = async (asset: string) => {
+    setBusyAsset(asset);
+    setRowMsg(null);
+    try {
+      const r = await post<{ run_id?: string; up_to_date?: boolean }>(
+        `/api/assets/${encodeURIComponent(asset)}/build`,
+      );
+      if (r.run_id) nav(`/runs/${r.run_id}`);
+      else setRowMsg({ asset, msg: "up to date" });
+    } catch (e) {
+      setRowMsg({ asset, msg: e instanceof Error ? e.message : String(e) });
+    } finally {
+      setBusyAsset(null);
+    }
+  };
+
+  const buildStale = async () => {
+    setBuilding(true);
+    setBuildNote(null);
+    try {
+      const r = await post<{ run_ids?: string[]; up_to_date?: boolean }>("/api/assets/build");
+      const ids = r.run_ids ?? [];
+      if (ids.length === 1) nav(`/runs/${ids[0]}`);
+      else if (ids.length > 1) nav("/runs");
+      // nothing stale left: it got built between polls
+      else setBuildNote("already up to date");
+    } catch (e) {
+      setBuildNote(`build failed: ${e instanceof Error ? e.message : String(e)}`);
+    } finally {
+      setBuilding(false);
+    }
+  };
+
+  const setPaused = async (name: string, paused: boolean) => {
+    setSensorErr(null);
+    const flip = (list: SensorSummary[], p: boolean) =>
+      list.map((s) => (s.name === name ? { ...s, paused: p } : s));
+    setSensors((list) => flip(list, paused));
+    try {
+      await post<{ ok: boolean }>("/api/sensors/state", { name, paused });
+    } catch (e) {
+      setSensors((list) => flip(list, !paused));
+      setSensorErr(e instanceof Error ? e.message : String(e));
+    }
+  };
+
+  if (!assets) return <p className="muted">loading…</p>;
+
+  const anyStale = assets.some((a) => a.stale);
+  const staleness = Object.fromEntries(
+    assets.map((a) => [a.name, a.stale ? "stale" : "fresh"] as const),
+  );
+
+  return (
+    <>
+      <div className="page-head">
+        <h1>Assets</h1>
+        {anyStale && (
+          <div className="run-actions">
+            <button onClick={buildStale} disabled={building}>
+              build stale
+            </button>
+            {buildNote && <p className="muted">{buildNote}</p>}
+          </div>
+        )}
+      </div>
+
+      {assets.length === 0 ? (
+        <p className="muted">no assets registered — declare them with Hestan::assets</p>
+      ) : (
+        <>
+          <h2>graph</h2>
+          <DagView
+            label="asset dependency graph"
+            nodes={assets.map((a) => ({
+              name: a.name,
+              deps: a.deps,
+              note: a.kind === "source" ? "source" : undefined,
+            }))}
+            statuses={staleness}
+          />
+
+          <h2>assets</h2>
+          <table className="plain-rows">
+            <thead>
+              <tr>
+                <th>name</th>
+                <th>kind</th>
+                <th>deps</th>
+                <th>fingerprint</th>
+                <th>built</th>
+                <th>state</th>
+                <th>auto</th>
+                <th />
+              </tr>
+            </thead>
+            <tbody>
+              {assets.map((a) => (
+                <tr key={a.name}>
+                  <td>{a.name}</td>
+                  <td className="muted">{a.kind}</td>
+                  <td className="muted">{a.deps.length === 0 ? "—" : a.deps.join(", ")}</td>
+                  <td className="mono" title={a.fingerprint ?? undefined}>
+                    {a.fingerprint ? shortHash(a.fingerprint) : "—"}
+                  </td>
+                  <td className="muted" title={a.built_at ?? undefined}>
+                    {relTime(a.built_at)}
+                  </td>
+                  <td>
+                    <span className="status-cell">
+                      <Freshness stale={a.stale} />
+                      {a.stale && (
+                        <span className="muted" title={staleTitle(a)}>
+                          {staleSummary(a)}
+                        </span>
+                      )}
+                    </span>
+                  </td>
+                  <td>{a.auto && <span className="muted">auto</span>}</td>
+                  <td className="row-action">
+                    {/* sources are probed, never built — the endpoint 400s */}
+                    {a.kind !== "source" && (
+                      <button
+                        className="text-btn"
+                        disabled={busyAsset === a.name}
+                        onClick={() => buildOne(a.name)}
+                      >
+                        build
+                      </button>
+                    )}
+                    {rowMsg?.asset === a.name && <span className="muted row-err">{rowMsg.msg}</span>}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </>
+      )}
+
+      {sensors.length > 0 && (
+        <>
+          <h2>sensors</h2>
+          <table className="plain-rows">
+            <thead>
+              <tr>
+                <th>name</th>
+                <th>every</th>
+                <th>cursor</th>
+                <th>last tick</th>
+                <th className="num">launched</th>
+                <th />
+              </tr>
+            </thead>
+            <tbody>
+              {sensors.map((s) => {
+                const cursor = s.cursor === null ? null : JSON.stringify(s.cursor);
+                return (
+                  <tr key={s.name}>
+                    <td>
+                      {s.name}
+                      {s.paused && <span className="tag">paused</span>}
+                    </td>
+                    <td className="mono">{fmtEvery(s.every_secs)}</td>
+                    <td className="mono" title={cursor && cursor.length > 24 ? cursor : undefined}>
+                      {cursor === null ? "—" : cursor.length > 24 ? `${cursor.slice(0, 24)}…` : cursor}
+                    </td>
+                    <td>
+                      {s.last_tick ? (
+                        <span className="status-cell" title={s.last_tick.error ?? undefined}>
+                          <svg className="glyph" width={12} height={12} viewBox="-6 -6 12 12" aria-hidden="true">
+                            <GlyphShape status={SENSOR_GLYPH[s.last_tick.outcome]} />
+                          </svg>
+                          <span className="muted">{relTime(s.last_tick.evaluated_at)}</span>
+                        </span>
+                      ) : (
+                        <span className="muted">no ticks</span>
+                      )}
+                    </td>
+                    <td className="num">{s.last_tick ? s.last_tick.launched : "—"}</td>
+                    <td className="row-action">
+                      <button className="text-btn" onClick={() => setPaused(s.name, !s.paused)}>
+                        {s.paused ? "resume" : "pause"}
+                      </button>
+                    </td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+          {sensorErr && <p className="muted">sensor update failed: {sensorErr}</p>}
+        </>
+      )}
+    </>
+  );
+}

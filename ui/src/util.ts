@@ -1,0 +1,48 @@
+import type { RunStatus } from "./types";
+
+export function shortId(id: string): string {
+  return id.slice(0, 8);
+}
+
+export function isTerminal(status: RunStatus): boolean {
+  return status === "success" || status === "failed" || status === "canceled";
+}
+
+export function relTime(iso: string | null): string {
+  if (!iso) return "—";
+  const s = Math.max(0, (Date.now() - new Date(iso).getTime()) / 1000);
+  if (s < 60) return `${Math.floor(s)}s ago`;
+  if (s < 3600) return `${Math.floor(s / 60)}m ago`;
+  if (s < 86400) return `${Math.floor(s / 3600)}h ago`;
+  return `${Math.floor(s / 86400)}d ago`;
+}
+
+export function untilTime(iso: string): string {
+  const s = Math.max(0, (new Date(iso).getTime() - Date.now()) / 1000);
+  if (s < 60) return `in ${Math.floor(s)}s`;
+  if (s < 3600) return `in ${Math.floor(s / 60)}m`;
+  if (s < 86400) return `in ${Math.floor(s / 3600)}h`;
+  return `in ${Math.floor(s / 86400)}d`;
+}
+
+export function durationMs(run: { started_at: string | null; finished_at: string | null }): number | null {
+  if (!run.started_at || !run.finished_at) return null;
+  return new Date(run.finished_at).getTime() - new Date(run.started_at).getTime();
+}
+
+export function fmtDuration(ms: number | null): string {
+  if (ms === null) return "—";
+  ms = Math.max(0, ms); // clock skew can put finished_at before started_at
+  if (ms < 999.5) return `${Math.round(ms)}ms`; // 999.5+ rounds to "1.0s", not "1000ms"
+  if (ms < 60_000) {
+    const s = (ms / 1000).toFixed(1);
+    if (s !== "60.0") return `${s}s`;
+  }
+  const total = Math.round(ms / 1000);
+  if (total >= 3600) return `${Math.floor(total / 3600)}h ${Math.floor((total % 3600) / 60)}m`;
+  return `${Math.floor(total / 60)}m ${total % 60}s`;
+}
+
+export function clockTime(iso: string): string {
+  return new Date(iso).toLocaleTimeString([], { hour12: false });
+}

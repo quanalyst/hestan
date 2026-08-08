@@ -1,0 +1,55 @@
+[package]
+name = "hestan"
+version = "0.1.0-alpha.1"
+edition = "2024"
+rust-version = "1.87"
+description = "dag-based job orchestration with a small embedded web ui"
+license = "MIT"
+readme = "README.md"
+keywords = ["orchestration", "scheduler", "dag", "pipeline", "cron"]
+categories = ["asynchronous", "development-tools", "web-programming::http-server"]
+repository = "https://github.com/quanalyst/hestan"
+
+[package.metadata.docs.rs]
+all-features = true
+
+[dependencies]
+axum = "0.8"
+chrono = { version = "0.4", features = ["serde"] }
+chrono-tz = "0.10"
+cron = "0.17"
+futures = "0.3"
+include_dir = "0.7"
+mime_guess = "2"
+reqwest = { version = "0.12", optional = true, default-features = false, features = ["json", "rustls-tls"] }
+rusqlite = "0.32"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+thiserror = "2"
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "net", "time", "sync", "macros"] }
+tracing = "0.1"
+uuid = { version = "1", features = ["v7"] }
+
+[dev-dependencies]
+tempfile = "3"
+tower = { version = "0.5", features = ["util"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[features]
+default = ["bundled"]
+# compiles sqlite from source; disable to link the system library
+bundled = ["rusqlite/bundled"]
+http = ["dep:reqwest"]
+
+[[example]]
+name = "http_source"
+required-features = ["http"]
+
+[[test]]
+name = "http_source"
+required-features = ["http"]
+
+[[test]]
+name = "notify"
+required-features = ["http"]
