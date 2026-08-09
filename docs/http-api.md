@@ -341,7 +341,7 @@ startup's sweep marks failed.
     "fingerprint": "14a61f3c...", "built_at": "2026-08-08T11:01:36Z",
     "run_id": null, "stale": false, "reasons": [] },
   { "name": "doc_stats", "kind": "derived", "deps": ["docs_dir"], "auto": false,
-    "op": "doc_stats",
+    "op": "doc_stats", "partitions": null,
     "fingerprint": "3bffef12...", "built_at": "2026-08-08T11:01:36Z",
     "run_id": "019fe109-...", "stale": true,
     "reasons": [ { "dep": "docs_dir", "had": "14a61f3c...", "now": "9c01d2aa..." } ],
@@ -362,11 +362,46 @@ nothing has ever been recorded for this asset, which reads the same whether
 no check is declared or none has run yet. the semantics are in
 [assets](assets.md).
 
+`partitions` is null on an unpartitioned asset and, on a
+[partitioned](assets.md#partitioned-assets) one, replaces the single
+fingerprint (which is then null) with the shape of its key set:
+`{"total": 220, "materialized": 190, "stale": 12, "missing": 18}` — three
+disjoint states summing to `total`.
+
 `POST /api/assets/{name}/build` builds a stale asset: its stale ancestors
 plus the target as one run, 202 `{"run_id": "..."}`. a fresh target answers
 200 `{"up_to_date": true}` and launches nothing. an unknown name is a 404;
 a source is a 400 (`sources are probed, never built`) — a request that can
 never do anything, not an up-to-date one.
+
+the body is optional and, for a partitioned asset, may name the keys to build:
+
+```json
+{ "partitions": ["2026-01-05", "2026-01-06"] }
+```
+
+those keys are built whatever staleness says. a key the asset's set does not
+hold, an empty list, `partitions` on an asset that is not partitioned, and a
+body that does not parse are all 400s. with no body (or no `partitions`) a
+partitioned asset builds its default target set: missing or stale, newest
+first, capped by `Partitions::build_limit`.
+
+`GET /api/assets/{name}/partitions?limit=` returns one row per key, newest
+first (default 90, clamped 1..=1000), with the total so a capped list can say
+how much it left out:
+
+```json
+{ "total": 220, "shown": 90, "partitions": [
+  { "key": "2026-08-09", "state": "missing",
+    "fingerprint": null, "built_at": null, "run_id": null },
+  { "key": "2026-08-08", "state": "materialized",
+    "fingerprint": "3bffef12...", "built_at": "2026-08-08T11:01:36Z",
+    "run_id": "019fe109-..." }
+] }
+```
+
+`state` is `materialized`, `stale` or `missing`. 404 for an unknown asset and
+400 for one that is not partitioned.
 
 while any run of the `assets` job is active, both build endpoints are a 409
 (`asset build already running`): builds are serialized so overlapping runs

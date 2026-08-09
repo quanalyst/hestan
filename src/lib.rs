@@ -15,6 +15,7 @@ mod model;
 #[cfg(feature = "http")]
 pub mod notify;
 mod op;
+mod partition;
 mod resource;
 mod schedule;
 mod sensor;
@@ -35,6 +36,7 @@ pub use model::{
     TickOutcome, Trigger, When,
 };
 pub use op::{InputError, Meta, Op, OpCtx, OpResult};
+pub use partition::Partitions;
 pub use resource::ResourceCtx;
 pub use sensor::{RunRequest, Sensor, SensorCtx};
 pub use store::Store;
@@ -42,7 +44,7 @@ pub use store::Store;
 pub mod prelude {
     pub use crate::{
         Asset, AssetCheck, CheckResult, Graph, Hestan, Job, Meta, MultiAsset, Op, OpCtx, OpResult,
-        RunRequest, Sensor, Severity,
+        Partitions, RunRequest, Sensor, Severity,
     };
     pub use serde_json::{Value, json};
 }

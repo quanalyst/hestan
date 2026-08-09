@@ -274,6 +274,79 @@ async fn a_multi_asset_materializes_its_outputs_and_feeds_one_of_them_downstream
 }
 
 #[tokio::test]
+async fn a_partitioned_build_runs_one_instance_per_key_through_the_fan_out() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("hestan.db");
+    let db = db.to_str().unwrap();
+
+    let region = |name: &str| {
+        Asset::new(name, |ctx: OpCtx| async move {
+            let key = ctx.partition().expect("a partitioned body has its key");
+            Ok(json!({ "region": key }))
+        })
+        .partitioned(Partitions::keys(["emea", "amer"]))
+    };
+    // the default target set: nothing built, so both keys are missing
+    let run = Hestan::new()
+        .assets([region("sales")])
+        .db(db)
+        .build_asset("sales")
+        .await
+        .unwrap();
+    assert_eq!(run.status, RunStatus::Success);
+
+    let store = Store::open(db).unwrap();
+    let ops = store.op_runs(&run.id).unwrap();
+    let mut names: Vec<&str> = ops.iter().map(|o| o.op.as_str()).collect();
+    names.sort();
+    // one op_runs row per instance, named for its key — the same rows a mapped
+    // op's fan-out writes, because it is the same expansion
+    assert_eq!(names, ["sales[amer]", "sales[emea]"]);
+    for key in ["emea", "amer"] {
+        assert_eq!(
+            store
+                .materialization("sales", Some(key))
+                .unwrap()
+                .unwrap()
+                .value,
+            Some(json!({ "region": key }))
+        );
+    }
+    // nothing is materialized for the asset as a whole
+    assert!(store.materialization("sales", None).unwrap().is_none());
+
+    // everything fresh: the second build has no keys to target and runs none
+    let run = Hestan::new()
+        .assets([region("sales")])
+        .db(db)
+        .build_asset("sales")
+        .await
+        .unwrap();
+    assert_eq!(run.status, RunStatus::Success);
+    assert!(store.op_runs(&run.id).unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn an_unpartitioned_asset_may_not_depend_on_a_partitioned_one() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("hestan.db");
+    let daily = Asset::new("daily", |_| async { Ok(json!(null)) })
+        .partitioned(Partitions::daily("2026-01-01"));
+    let total = Asset::new("total", |_| async { Ok(json!(null)) }).from_named("daily");
+    let err = Hestan::new()
+        .assets([daily, total])
+        .db(db.to_str().unwrap())
+        .build_asset("total")
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("it is not partitioned but its dep daily is"),
+        "{err}"
+    );
+}
+
+#[tokio::test]
 async fn asset_graph_validation_happens_at_build() {
     let dir = tempfile::tempdir().unwrap();
     let db = dir.path().join("hestan.db");

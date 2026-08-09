@@ -1088,3 +1088,73 @@ table.plain-rows tbody tr:hover {
     animation: none;
   }
 }
+
+/* the partition grid: one cell per key, newest first. shape carries state
+   here as everywhere — solid built, hatched stale, hollow never built */
+.part-grid {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 3px;
+  margin: 6px 0 8px;
+}
+
+.part-cell {
+  width: 12px;
+  height: 12px;
+  padding: 0;
+  border: 1px solid var(--mark);
+  border-radius: 2px;
+  background: transparent;
+  cursor: pointer;
+}
+
+.part-cell.materialized {
+  background: var(--mark);
+}
+
+.part-cell.stale {
+  background: repeating-linear-gradient(
+    45deg,
+    var(--mark) 0 1.5px,
+    transparent 1.5px 4px
+  );
+}
+
+.part-cell.missing {
+  border-color: var(--rule);
+  opacity: var(--dim);
+}
+
+.part-cell:hover:not(:disabled) {
+  outline: 2px solid var(--rule);
+  outline-offset: 1px;
+}
+
+.part-cell:disabled {
+  cursor: default;
+}
+
+.part-legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  font-size: 12px;
+}
+
+.part-legend-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+}
+
+/* a legend swatch is a picture of a cell, not a control */
+.part-legend .part-cell {
+  width: 9px;
+  height: 9px;
+  cursor: default;
+}
+
+.part-more {
+  margin: 4px 0 0;
+  font-size: 12px;
+}

@@ -16,9 +16,11 @@ pub struct Job {
     order: Vec<String>,
     max_parallel: Option<usize>,
     overlap: Overlap,
-    // dep names satisfied from outside the job (asset sources): no ops, absent
-    // from `order`, seeded null at launch. empty for every user-built job.
-    external: Vec<String>,
+    // dep names satisfied from outside the job: no ops, absent from `order`,
+    // seeded at launch with the value declared here — null for an asset
+    // source, `[]` for the partition keys a partitioned asset fans out over,
+    // which only a build plan can work out. empty for every user-built job.
+    external: Vec<(String, Value)>,
 }
 
 impl Job {
@@ -73,8 +75,14 @@ impl Job {
         &self.order
     }
 
-    pub(crate) fn external(&self) -> &[String] {
-        &self.external
+    pub(crate) fn is_external(&self, name: &str) -> bool {
+        self.external.iter().any(|(n, _)| n == name)
+    }
+
+    /// what a launch seeds the job's external names with, before any subset
+    /// or resume seeds of its own.
+    pub(crate) fn external_seeds(&self) -> HashMap<String, Value> {
+        self.external.iter().cloned().collect()
     }
 
     pub(crate) fn dep_pairs(&self) -> Vec<(String, Vec<String>)> {
@@ -91,11 +99,13 @@ impl Job {
         name: impl Into<String>,
         description: Option<String>,
         ops: Vec<Op>,
-        external: Vec<String>,
+        external: Vec<(String, Value)>,
     ) -> Result<Job, Error> {
         let name = name.into();
-        let mut pairs: Vec<(String, Vec<String>)> =
-            external.iter().map(|n| (n.clone(), Vec::new())).collect();
+        let mut pairs: Vec<(String, Vec<String>)> = external
+            .iter()
+            .map(|(n, _)| (n.clone(), Vec::new()))
+            .collect();
         pairs.extend(
             ops.iter()
                 .map(|o| (o.name().to_string(), o.deps().to_vec())),
@@ -103,7 +113,7 @@ impl Job {
         let order = graph::topo_order(&pairs)
             .map_err(|e| Error::Graph(format!("job {name}: {e}")))?
             .into_iter()
-            .filter(|n| !external.contains(n))
+            .filter(|n| !external.iter().any(|(e, _)| e == n))
             .collect();
         validate_mapped(&name, &ops)?;
         Ok(Job {

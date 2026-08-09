@@ -190,6 +190,7 @@ export interface CheckSummary {
 export interface AssetCheckResult {
   id: number;
   asset: string;
+  partition: string | null;
   check: string;
   run_id: string;
   status: CheckStatus;
@@ -207,6 +208,10 @@ export interface AssetSummary {
   // the op that materializes it: the asset's own name, unless a multi-asset
   // produces it alongside others. null for a source, which has no op
   op: string | null;
+  // the shape of the key set, for a partitioned asset; null for every other
+  // one, which has a single fingerprint instead. the three states are disjoint
+  // and sum to total
+  partitions: PartitionCounts | null;
   fingerprint: string | null;
   built_at: string | null;
   run_id: string | null;
@@ -215,9 +220,29 @@ export interface AssetSummary {
   checks: CheckSummary;
 }
 
+export interface PartitionCounts {
+  total: number;
+  materialized: number;
+  stale: number;
+  missing: number;
+}
+
+export type PartitionState = "materialized" | "stale" | "missing";
+
+// one key of a partitioned asset, newest first from the api
+export interface PartitionEntry {
+  key: string;
+  state: PartitionState;
+  fingerprint: string | null;
+  built_at: string | null;
+  run_id: string | null;
+}
+
 // one entry of an asset's materialization history, newest first from the api
 export interface MaterializationEntry {
   id: number;
+  // the key this entry is for, on a partitioned asset
+  partition: string | null;
   fingerprint: string;
   // this build's fingerprint differs from the one before it in time — the
   // difference between having been rebuilt and having actually changed

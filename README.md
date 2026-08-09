@@ -228,8 +228,6 @@ the binary is yours: define jobs, then `Hestan::new()...serve(addr)`, or
 
 ## Not here yet
 
-- [ ] asset ranges/partitions: per-partition staleness and backfills — the
-      next thing
 - [ ] max concurrent runs per job (overlap policies gate scheduled fires
       only; concurrency pools cap ops across runs, not the runs themselves)
 - [ ] postgres store

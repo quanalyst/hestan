@@ -105,7 +105,10 @@ node — or a table row — opens the detail panel below.
 the table lists assets in dependency order: name, kind, deps, the current
 fingerprint as a 12-character prefix (hover for the full hash; an em dash
 for an asset never built), when it was last built, its state, and its
-checks. a stale asset says why: "dep X changed" or "N deps changed", with
+checks. a [partitioned](assets.md#partitioned-assets) asset has no single
+fingerprint, so that cell reads `built/total` keys instead and the built
+column is an em dash; its state says how many keys are stale and how many
+are missing. a stale asset says why: "dep X changed" or "N deps changed", with
 the recorded -> current short hashes per dep on hover, or "never built" when
 no materialization exists. the checks cell uses the same shapes as
 everything else — a solid disc with "n passed" when every check passed, an ×
@@ -127,8 +130,19 @@ they appear in its dag and gantt as `check:{asset}:{check}` nodes.
 ### The asset panel
 
 clicking an asset opens a drawer on the right, the same one job pages use
-for ops (escape or × closes it). it carries the asset's kind, deps and
-state, then each check's latest result — status shape, the check name, a
+for ops (escape or × closes it). it carries the asset's kind, the op that
+materializes it when that is not simply its own name (a
+[multi-asset](assets.md#one-op-several-assets)), its deps and its state.
+
+a partitioned asset then gets the **partition grid**: one cell per key,
+newest first, in the same shape vocabulary as everything else — solid for a
+materialized key, hatched for a stale one, hollow for one never built.
+hovering a cell names the key, its state, its short fingerprint and when it
+was built; clicking one builds exactly that key and follows the run. the grid
+shows the newest 120 keys and counts the rest, and it re-polls with the panel,
+so a backfill lands cell by cell while you watch.
+
+after that comes each check's latest result — status shape, the check name, a
 `warn` marker when a failure there would not fail the run, its message and
 its metadata — then the recent materializations: a `•` in the left gutter
 for the entries whose fingerprint actually moved, the short fingerprint,

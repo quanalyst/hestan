@@ -14,7 +14,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::asset::{
-    ASSETS_JOB, AssetRegistry, launch_plan, mats_map, plan_all, plan_target, staleness,
+    ASSETS_JOB, AssetRegistry, launch_plan, mats_map, plan_all, plan_partitions, staleness,
 };
 use crate::error::Error;
 use crate::executor::{CancelOutcome, Runner};
@@ -58,6 +58,7 @@ pub(crate) fn router(state: AppState) -> Router {
         .route("/api/assets/build", post(build_all_assets))
         .route("/api/assets/{name}/build", post(build_one_asset))
         .route("/api/assets/{name}/history", get(asset_history))
+        .route("/api/assets/{name}/partitions", get(asset_partitions))
         .route("/api/assets/{name}/checks", get(asset_checks))
         .route("/api/sensors", get(list_sensors))
         .route("/api/sensors/state", post(set_sensor_state))
@@ -411,13 +412,32 @@ async fn list_assets(State(st): State<AppState>) -> Result<Json<Value>, ApiError
         .assets
         .topo()
         .map(|meta| {
-            let mat = mats.get(&meta.name);
+            let mat = mats.get(&meta.name, None);
             let s = &stale[&meta.name];
             let reasons: Vec<Value> = s
                 .reasons
                 .iter()
                 .map(|r| json!({ "dep": r.dep, "had": r.had, "now": r.now }))
                 .collect();
+            // a partitioned asset has no single fingerprint to report, so it
+            // reports the shape of its key set instead: the three states are
+            // disjoint and sum to `total`
+            let partitions = meta.partitions.as_ref().map(|_| {
+                let (mut materialized, mut stale_keys, mut missing) = (0, 0, 0);
+                for (key, verdict) in &s.parts {
+                    match (mats.get(&meta.name, Some(key)).is_some(), verdict.stale) {
+                        (false, _) => missing += 1,
+                        (true, true) => stale_keys += 1,
+                        (true, false) => materialized += 1,
+                    }
+                }
+                json!({
+                    "total": s.parts.len(),
+                    "materialized": materialized,
+                    "stale": stale_keys,
+                    "missing": missing,
+                })
+            });
             json!({
                 "name": meta.name,
                 "kind": if meta.source { "source" } else { "derived" },
@@ -426,6 +446,7 @@ async fn list_assets(State(st): State<AppState>) -> Result<Json<Value>, ApiError
                 // the op that materializes it, which is the asset's own name
                 // unless a multi-asset produces it alongside others
                 "op": meta.op,
+                "partitions": partitions,
                 "fingerprint": mat.map(|m| m.fingerprint.clone()),
                 "built_at": mat.map(|m| m.built_at),
                 "run_id": mat.and_then(|m| m.run_id.clone()),
@@ -441,6 +462,9 @@ async fn list_assets(State(st): State<AppState>) -> Result<Json<Value>, ApiError
 #[derive(Deserialize)]
 struct HistoryQuery {
     limit: Option<u32>,
+    /// one key of a [partitioned asset](crate::Partitions); omitted, every
+    /// key of it, interleaved by time.
+    partition: Option<String>,
 }
 
 // what each build recorded, newest first. no `value`: like GET /api/assets,
@@ -459,12 +483,13 @@ async fn asset_history(
     let materializations: Vec<Value> = st
         .runner
         .store()
-        .materializations(&name, None, limit)
+        .materializations(&name, q.partition.as_deref(), limit)
         .map_err(internal)?
         .into_iter()
         .map(|(m, changed)| {
             json!({
                 "id": m.id,
+                "partition": m.partition,
                 "fingerprint": m.fingerprint,
                 "changed": changed,
                 "inputs": m.inputs,
@@ -475,6 +500,57 @@ async fn asset_history(
         })
         .collect();
     Ok(Json(json!({ "materializations": materializations })))
+}
+
+// one row per key of a partitioned asset, newest key first: what it is, what
+// it holds, and which of the three states it is in. this is what the partition
+// grid draws.
+async fn asset_partitions(
+    State(st): State<AppState>,
+    Path(name): Path<String>,
+    q: Result<Query<HistoryQuery>, QueryRejection>,
+) -> Result<Json<Value>, ApiError> {
+    let Query(q) = q.map_err(bad_query)?;
+    let Some(meta) = st.assets.get(&name) else {
+        return Err(err(StatusCode::NOT_FOUND, format!("unknown asset: {name}")));
+    };
+    if meta.partitions.is_none() {
+        return Err(err(
+            StatusCode::BAD_REQUEST,
+            format!("asset {name} is not partitioned"),
+        ));
+    }
+    let mats = mats_map(st.runner.store()).map_err(internal)?;
+    let verdict = &staleness(&st.assets, &mats)[&name];
+    // newest first, and capped: a daily set running for years is a long list,
+    // and the newest keys are the ones anyone is looking at
+    let limit = q.limit.unwrap_or(90).clamp(1, 1000) as usize;
+    let total = verdict.parts.len();
+    let partitions: Vec<Value> = verdict
+        .parts
+        .iter()
+        .rev()
+        .take(limit)
+        .map(|(key, s)| {
+            let mat = mats.get(&name, Some(key));
+            json!({
+                "key": key,
+                "state": match (mat.is_some(), s.stale) {
+                    (false, _) => "missing",
+                    (true, true) => "stale",
+                    (true, false) => "materialized",
+                },
+                "fingerprint": mat.map(|m| m.fingerprint.clone()),
+                "built_at": mat.map(|m| m.built_at),
+                "run_id": mat.and_then(|m| m.run_id.clone()),
+            })
+        })
+        .collect();
+    Ok(Json(json!({
+        "total": total,
+        "shown": partitions.len(),
+        "partitions": partitions,
+    })))
 }
 
 // every check's recent results, newest first, all checks on the asset mixed
@@ -492,7 +568,7 @@ async fn asset_checks(
     let checks = st
         .runner
         .store()
-        .asset_checks(&name, None, limit)
+        .asset_checks(&name, q.partition.as_deref(), limit)
         .map_err(internal)?;
     Ok(Json(json!({ "checks": checks })))
 }
@@ -527,10 +603,28 @@ fn build_gate(st: &AppState) -> Result<(), ApiError> {
     Ok(())
 }
 
+#[derive(Deserialize, Default)]
+struct BuildBody {
+    /// the keys to build, for a partitioned asset. omitted, the build takes
+    /// the asset's default target set.
+    partitions: Option<Vec<String>>,
+}
+
+// an empty body is the plain build; anything else has to parse, so a typo in
+// a key name is a 400 rather than a build of something else
+fn build_body(body: &Bytes) -> Result<BuildBody, ApiError> {
+    if body.is_empty() {
+        return Ok(BuildBody::default());
+    }
+    serde_json::from_slice(body).map_err(|e| err(StatusCode::BAD_REQUEST, format!("bad body: {e}")))
+}
+
 async fn build_one_asset(
     State(st): State<AppState>,
     Path(name): Path<String>,
+    body: Bytes,
 ) -> Result<(StatusCode, Json<Value>), ApiError> {
+    let body = build_body(&body)?;
     let Some(meta) = st.assets.get(&name) else {
         return Err(err(StatusCode::NOT_FOUND, format!("unknown asset: {name}")));
     };
@@ -540,15 +634,41 @@ async fn build_one_asset(
             "sources are probed, never built",
         ));
     }
+    let named: HashMap<String, Vec<String>> = match body.partitions {
+        None => HashMap::new(),
+        Some(keys) => {
+            if meta.partitions.is_none() {
+                return Err(err(
+                    StatusCode::BAD_REQUEST,
+                    format!("asset {name} is not partitioned"),
+                ));
+            }
+            if keys.is_empty() {
+                return Err(err(StatusCode::BAD_REQUEST, "no partitions named"));
+            }
+            HashMap::from([(name.clone(), keys)])
+        }
+    };
     build_gate(&st)?;
     let mats = mats_map(st.runner.store()).map_err(internal)?;
-    if !staleness(&st.assets, &mats)[&name].stale {
+    // named keys are a rebuild of exactly those, whatever staleness says; a
+    // plain build of a fresh asset has nothing to do
+    if named.is_empty() && !staleness(&st.assets, &mats)[&name].stale {
         return Ok((StatusCode::OK, Json(json!({ "up_to_date": true }))));
     }
-    let plan = plan_target(&st.assets, &mats, &name).map_err(internal)?;
+    let plan = plan_partitions(&st.assets, &mats, &[name], &named).map_err(bad_plan)?;
     match launch_plan(&st.runner, plan, Trigger::Build) {
         Ok(run_id) => Ok((StatusCode::ACCEPTED, Json(json!({ "run_id": run_id })))),
         Err(e) => Err(internal(e)),
+    }
+}
+
+// a plan that refuses is the request's fault — an unknown key, an asset that
+// is not partitioned — rather than the server's
+fn bad_plan(e: Error) -> ApiError {
+    match e {
+        Error::Graph(msg) => err(StatusCode::BAD_REQUEST, msg),
+        other => internal(other),
     }
 }
 
@@ -2120,7 +2240,10 @@ mod tests {
         let Json(body) = asset_history(
             State(st.clone()),
             Path("docs".into()),
-            Ok(Query(HistoryQuery { limit: None })),
+            Ok(Query(HistoryQuery {
+                limit: None,
+                partition: None,
+            })),
         )
         .await
         .unwrap();
@@ -2148,7 +2271,10 @@ mod tests {
             let Json(body) = asset_history(
                 State(st.clone()),
                 Path("docs".into()),
-                Ok(Query(HistoryQuery { limit: Some(asked) })),
+                Ok(Query(HistoryQuery {
+                    limit: Some(asked),
+                    partition: None,
+                })),
             )
             .await
             .unwrap();
@@ -2158,7 +2284,10 @@ mod tests {
         let (status, Json(body)) = asset_history(
             State(st),
             Path("nope".into()),
-            Ok(Query(HistoryQuery { limit: None })),
+            Ok(Query(HistoryQuery {
+                limit: None,
+                partition: None,
+            })),
         )
         .await
         .unwrap_err();
@@ -2219,7 +2348,10 @@ mod tests {
         let Json(body) = asset_checks(
             State(st.clone()),
             Path("stats".into()),
-            Ok(Query(HistoryQuery { limit: None })),
+            Ok(Query(HistoryQuery {
+                limit: None,
+                partition: None,
+            })),
         )
         .await
         .unwrap();
@@ -2238,7 +2370,10 @@ mod tests {
         let Json(body) = asset_checks(
             State(st.clone()),
             Path("stats".into()),
-            Ok(Query(HistoryQuery { limit: Some(0) })),
+            Ok(Query(HistoryQuery {
+                limit: Some(0),
+                partition: None,
+            })),
         )
         .await
         .unwrap();
@@ -2246,7 +2381,10 @@ mod tests {
         let (status, Json(body)) = asset_checks(
             State(st),
             Path("nope".into()),
-            Ok(Query(HistoryQuery { limit: None })),
+            Ok(Query(HistoryQuery {
+                limit: None,
+                partition: None,
+            })),
         )
         .await
         .unwrap_err();
@@ -2257,9 +2395,10 @@ mod tests {
     #[tokio::test]
     async fn build_endpoint_statuses() {
         let st = asset_state();
-        let (status, Json(body)) = build_one_asset(State(st.clone()), Path("nope".into()))
-            .await
-            .unwrap_err();
+        let (status, Json(body)) =
+            build_one_asset(State(st.clone()), Path("nope".into()), Bytes::new())
+                .await
+                .unwrap_err();
         assert_eq!(status, StatusCode::NOT_FOUND);
         assert_eq!(body["error"], "unknown asset: nope");
 
@@ -2269,9 +2408,10 @@ mod tests {
             .record_materialization("docs", None, "d1", &json!({}), None, None, None)
             .unwrap();
 
-        let (status, Json(body)) = build_one_asset(State(st.clone()), Path("totals".into()))
-            .await
-            .unwrap();
+        let (status, Json(body)) =
+            build_one_asset(State(st.clone()), Path("totals".into()), Bytes::new())
+                .await
+                .unwrap();
         assert_eq!(status, StatusCode::ACCEPTED);
         let run_id = body["run_id"].as_str().unwrap().to_string();
         wait_success(&st, &run_id).await;
@@ -2279,21 +2419,125 @@ mod tests {
         assert_eq!(run.job, "assets");
         assert_eq!(run.trigger, Trigger::Build);
 
-        let (status, Json(body)) = build_one_asset(State(st.clone()), Path("totals".into()))
-            .await
-            .unwrap();
+        let (status, Json(body)) =
+            build_one_asset(State(st.clone()), Path("totals".into()), Bytes::new())
+                .await
+                .unwrap();
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body, json!({"up_to_date": true}));
 
-        let (status, Json(body)) = build_one_asset(State(st.clone()), Path("docs".into()))
-            .await
-            .unwrap_err();
+        let (status, Json(body)) =
+            build_one_asset(State(st.clone()), Path("docs".into()), Bytes::new())
+                .await
+                .unwrap_err();
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(body["error"], "sources are probed, never built");
 
         let (status, Json(body)) = build_all_assets(State(st)).await.unwrap();
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body, json!({"up_to_date": true}));
+    }
+
+    fn partitioned_state() -> AppState {
+        let daily = crate::Asset::new("daily", |ctx: crate::OpCtx| async move {
+            Ok(json!({ "key": ctx.partition() }))
+        })
+        .partitioned(crate::Partitions::keys(["k1", "k2", "k3"]));
+        let registry = Arc::new(AssetRegistry::new(vec![daily], Vec::new(), Vec::new()).unwrap());
+        let runner = Runner::new(
+            [registry.lower_job().unwrap()],
+            Store::open(":memory:").unwrap(),
+        );
+        AppState {
+            jobs: Arc::new(runner.jobs().clone()),
+            runner,
+            assets: registry,
+            sensors: Arc::new(Vec::new()),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_partitioned_asset_reports_its_key_set_and_builds_one_key() {
+        let st = partitioned_state();
+        // nothing built: three keys, all missing
+        let Json(body) = list_assets(State(st.clone())).await.unwrap();
+        let asset = &body["assets"][0];
+        assert_eq!(
+            asset["fingerprint"],
+            Value::Null,
+            "a key set has no one fingerprint"
+        );
+        assert_eq!(
+            asset["partitions"],
+            json!({"total": 3, "materialized": 0, "stale": 0, "missing": 3})
+        );
+
+        // an unknown key is the request's fault, not the server's
+        let (status, Json(body)) = build_one_asset(
+            State(st.clone()),
+            Path("daily".into()),
+            Bytes::from(r#"{"partitions":["nope"]}"#),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(
+            body["error"].as_str().unwrap().contains("no partition"),
+            "{body}"
+        );
+        // and so is a body that does not parse
+        let (status, _) = build_one_asset(
+            State(st.clone()),
+            Path("daily".into()),
+            Bytes::from(r#"{"partitions": 7}"#),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+
+        let (status, Json(body)) = build_one_asset(
+            State(st.clone()),
+            Path("daily".into()),
+            Bytes::from(r#"{"partitions":["k2"]}"#),
+        )
+        .await
+        .unwrap();
+        assert_eq!(status, StatusCode::ACCEPTED);
+        wait_success(&st, body["run_id"].as_str().unwrap()).await;
+
+        let Json(body) = list_assets(State(st.clone())).await.unwrap();
+        assert_eq!(
+            body["assets"][0]["partitions"],
+            json!({"total": 3, "materialized": 1, "stale": 0, "missing": 2})
+        );
+
+        // the grid's data: newest key first, with what each one holds
+        let app = router(st.clone());
+        let (status, body, _) =
+            request(app.clone(), Method::GET, "/api/assets/daily/partitions").await;
+        assert_eq!(status, StatusCode::OK);
+        let body = body.unwrap();
+        assert_eq!(body["total"], 3);
+        let keys: Vec<&str> = body["partitions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|p| p["key"].as_str().unwrap())
+            .collect();
+        assert_eq!(keys, ["k3", "k2", "k1"]);
+        let built = &body["partitions"][1];
+        assert_eq!(built["state"], "materialized");
+        assert!(built["fingerprint"].is_string() && built["run_id"].is_string());
+        assert_eq!(body["partitions"][0]["state"], "missing");
+
+        // an unpartitioned asset has no grid to draw
+        let (status, _, _) = request(
+            router(asset_state()),
+            Method::GET,
+            "/api/assets/stats/partitions",
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]
@@ -2305,9 +2549,10 @@ mod tests {
             .unwrap();
         // an assets run planted as live, without an executor behind it
         insert_run(&st, "b1", "assets", RunStatus::Running, json!({}));
-        let (status, Json(body)) = build_one_asset(State(st.clone()), Path("totals".into()))
-            .await
-            .unwrap_err();
+        let (status, Json(body)) =
+            build_one_asset(State(st.clone()), Path("totals".into()), Bytes::new())
+                .await
+                .unwrap_err();
         assert_eq!(status, StatusCode::CONFLICT);
         assert_eq!(body["error"], "asset build already running");
         let (status, Json(body)) = build_all_assets(State(st.clone())).await.unwrap_err();
@@ -2322,7 +2567,7 @@ mod tests {
             1
         );
         // the more specific answer wins: a source is a 400 even while a build is live
-        let (status, _) = build_one_asset(State(st.clone()), Path("docs".into()))
+        let (status, _) = build_one_asset(State(st.clone()), Path("docs".into()), Bytes::new())
             .await
             .unwrap_err();
         assert_eq!(status, StatusCode::BAD_REQUEST);
@@ -2331,7 +2576,7 @@ mod tests {
             .store()
             .run_finished("b1", RunStatus::Success, None)
             .unwrap();
-        let (status, _) = build_one_asset(State(st.clone()), Path("totals".into()))
+        let (status, _) = build_one_asset(State(st.clone()), Path("totals".into()), Bytes::new())
             .await
             .unwrap();
         assert_eq!(status, StatusCode::ACCEPTED);

@@ -22,14 +22,23 @@ function fmtEvery(secs: number): string {
   return `${secs}s`;
 }
 
-// stale with no reasons means no materialization exists at all
+// stale with no reasons means no materialization exists at all. a partitioned
+// asset carries its evidence per key, so it counts keys instead
 function staleSummary(a: AssetSummary): string {
+  if (a.partitions) {
+    const { stale, missing } = a.partitions;
+    const parts = [];
+    if (stale > 0) parts.push(`${stale} stale`);
+    if (missing > 0) parts.push(`${missing} missing`);
+    return parts.join(", ") || "stale";
+  }
   if (a.reasons.length === 0) return "never built";
   if (a.reasons.length === 1) return `dep ${a.reasons[0].dep} changed`;
   return `${a.reasons.length} deps changed`;
 }
 
 function staleTitle(a: AssetSummary): string | undefined {
+  if (a.partitions) return `${a.partitions.total} partitions`;
   if (a.reasons.length === 0) return undefined;
   return a.reasons
     .map((r) => `${r.dep}: ${r.had ? shortHash(r.had) : "—"} -> ${r.now ? shortHash(r.now) : "—"}`)
@@ -196,11 +205,24 @@ export default function AssetsPage() {
                   <td>{a.name}</td>
                   <td className="muted">{a.kind}</td>
                   <td className="muted">{a.deps.length === 0 ? "—" : a.deps.join(", ")}</td>
-                  <td className="mono" title={a.fingerprint ?? undefined}>
-                    {a.fingerprint ? shortHash(a.fingerprint) : "—"}
+                  {/* a partitioned asset has no single fingerprint to show:
+                      how much of its key set is built is the fact instead */}
+                  <td
+                    className="mono"
+                    title={
+                      a.partitions
+                        ? `${a.partitions.materialized} of ${a.partitions.total} partitions built`
+                        : (a.fingerprint ?? undefined)
+                    }
+                  >
+                    {a.partitions
+                      ? `${a.partitions.materialized}/${a.partitions.total}`
+                      : a.fingerprint
+                        ? shortHash(a.fingerprint)
+                        : "—"}
                   </td>
                   <td className="muted" title={a.built_at ?? undefined}>
-                    {relTime(a.built_at)}
+                    {a.partitions ? "—" : relTime(a.built_at)}
                   </td>
                   <td>
                     <span className="status-cell">

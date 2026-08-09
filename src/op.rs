@@ -204,6 +204,9 @@ pub struct Op {
     // that silently runs once over nothing
     mapped: bool,
     over: Option<String>,
+    // instances named by their element rather than their index; set only by
+    // `fans_out_over`, which is how a partitioned asset expands
+    labeled: bool,
     f: Arc<OpFn>,
 }
 
@@ -230,6 +233,7 @@ impl Op {
             params_check: None,
             mapped: false,
             over: None,
+            labeled: false,
             f: Arc::new(move |ctx: OpCtx| -> BoxFuture<'static, OpResult> { Box::pin(f(ctx)) }),
         }
     }
@@ -262,6 +266,7 @@ impl Op {
             params_check: None,
             mapped: false,
             over: None,
+            labeled: false,
             f: Arc::new(move |ctx: OpCtx| -> BoxFuture<'static, OpResult> {
                 let f = f.clone();
                 Box::pin(async move {
@@ -341,6 +346,26 @@ impl Op {
         }
         self.over = Some(dep);
         self
+    }
+
+    /// fan out over `dep` like [`Op::mapped`], but with instances named by
+    /// their element rather than their index, and without the element being
+    /// deserialized into the body's second argument — it reads its own key off
+    /// the ctx instead. this is how a [partitioned
+    /// asset](crate::Partitions) reuses the fan-out machinery whole:
+    /// `daily_orders[2026-01-05]` rather than `daily_orders[4]`.
+    ///
+    /// elements that are not strings still fall back to the index, and
+    /// repeated ones fail the expansion — two instances cannot share a name.
+    pub(crate) fn fans_out_over(mut self, dep: impl Into<String>) -> Op {
+        self.mapped = true;
+        self.labeled = true;
+        self.over(dep)
+    }
+
+    /// whether an instance of this op is named by its element.
+    pub(crate) fn labels_instances(&self) -> bool {
+        self.labeled
     }
 
     /// declare upstream ops; appends to any already declared.
@@ -631,6 +656,9 @@ pub struct OpCtx {
     /// the one array element this invocation is for, on a fan-out instance;
     /// `None` for every ordinary op.
     pub(crate) element: Option<Value>,
+    /// the partition key this invocation is for, on a [partitioned
+    /// asset](crate::Partitions); `None` everywhere else.
+    pub(crate) partition: Option<String>,
     pub(crate) inputs: Arc<HashMap<String, Value>>,
     /// what each declared dep ended up doing, for an op with a
     /// [`when`](Op::when) rule that let it run anyway.
@@ -695,6 +723,19 @@ impl OpCtx {
 
     pub fn job(&self) -> &str {
         &self.job
+    }
+
+    /// the key this invocation is materializing, inside a [partitioned
+    /// asset](crate::Partitions). `None` in an unpartitioned asset and in
+    /// every ordinary op, which is what it has always effectively said.
+    pub fn partition(&self) -> Option<&str> {
+        self.partition.as_deref()
+    }
+
+    /// the array element a fan-out instance was handed, before any
+    /// deserialization; `None` for an ordinary op.
+    pub(crate) fn element(&self) -> Option<&Value> {
+        self.element.as_ref()
     }
 
     pub fn params(&self) -> &Value {
@@ -948,6 +989,7 @@ mod tests {
             op: "x".into(),
             params: json!({}),
             element: None,
+            partition: None,
             inputs: Arc::new(HashMap::new()),
             dep_statuses: Arc::new(HashMap::new()),
             resources: resource::none(),

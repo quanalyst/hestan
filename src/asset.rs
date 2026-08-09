@@ -13,10 +13,17 @@ use crate::graph;
 use crate::job::Job;
 use crate::model::{CheckStatus, Materialization, Severity, Trigger};
 use crate::op::{self, Meta, Op, OpCtx};
+use crate::partition::Partitions;
 use crate::store::Store;
 
 /// the internal job every asset build runs under.
 pub(crate) const ASSETS_JOB: &str = "assets";
+
+/// the external name a partitioned asset fans out over: the keys one build
+/// targets, which only a [`BuildPlan`] can work out.
+pub(crate) fn partition_keys_name(asset: &str) -> String {
+    format!("partitions:{asset}")
+}
 
 pub(crate) type ProbeFn = dyn Fn() -> BoxFuture<'static, Result<String, Box<dyn std::error::Error + Send + Sync>>>
     + Send
@@ -37,6 +44,7 @@ pub struct Asset {
     auto: bool,
     retries: u32,
     retry_delay: Option<Duration>,
+    partitions: Option<Partitions>,
 }
 
 impl Asset {
@@ -54,6 +62,7 @@ impl Asset {
             auto: false,
             retries: 0,
             retry_delay: None,
+            partitions: None,
         }
     }
 
@@ -76,6 +85,7 @@ impl Asset {
             auto: false,
             retries: 0,
             retry_delay: None,
+            partitions: None,
         }
     }
 
@@ -100,6 +110,7 @@ impl Asset {
             auto: false,
             retries: 0,
             retry_delay: None,
+            partitions: None,
         }
     }
 
@@ -154,6 +165,29 @@ impl Asset {
     /// without a probed source somewhere upstream it just waits forever.
     pub fn auto(mut self) -> Asset {
         self.auto = true;
+        self
+    }
+
+    /// materialize this asset once per key of `partitions` instead of once:
+    /// its own materialization, fingerprint, history and checks per key, and
+    /// `ctx.partition()` inside the body telling it which one it is for.
+    ///
+    /// ```no_run
+    /// # use hestan::{Asset, OpCtx, Partitions};
+    /// # use serde_json::json;
+    /// Asset::new("daily_orders", |ctx: OpCtx| async move {
+    ///     let day = ctx.partition().expect("partitioned");
+    ///     Ok(json!({ "day": day }))
+    /// })
+    /// .partitioned(Partitions::daily("2026-01-01"));
+    /// ```
+    ///
+    /// a build expands into one fan-out instance per target key, named
+    /// `{asset}[{key}]`. sources cannot be partitioned — a probe fingerprints
+    /// the whole thing — and neither can a [`MultiAsset`], which has no
+    /// `partitioned` at all.
+    pub fn partitioned(mut self, partitions: Partitions) -> Asset {
+        self.partitions = Some(partitions);
         self
     }
 }
@@ -378,6 +412,9 @@ pub(crate) struct AssetMeta {
     /// itself, the [`MultiAsset`]'s name when several assets share one, and
     /// `None` for a source, which has no op at all.
     pub op: Option<String>,
+    /// the key set this asset is materialized over, one materialization per
+    /// key; `None` for an unpartitioned asset, which is one of everything.
+    pub partitions: Option<Partitions>,
 }
 
 /// one op of the lowered `assets` job and the assets it produces — one for a
@@ -391,16 +428,21 @@ pub(crate) struct OpMeta {
     op: Op,
     retries: u32,
     retry_delay: Option<Duration>,
+    /// set only on a single-asset op: a multi-asset is never partitioned.
+    pub partitions: Option<Partitions>,
 }
 
 /// how one dep asset reaches the op that reads it: the op that produces it
-/// (which is the name the run knows it by), and the key to take out of that
-/// op's output when the producer is a multi-asset.
+/// (which is the name the run knows it by), the key to take out of that op's
+/// output when the producer is a multi-asset, and whether the dep is itself
+/// partitioned — in which case its value is read per key from the store
+/// rather than out of the run.
 #[derive(Clone)]
 struct DepLink {
     asset: String,
     op: String,
     key: Option<String>,
+    partitioned: bool,
 }
 
 /// the validated asset graph, in topo order, with the checks bound to it.
@@ -450,6 +492,16 @@ impl AssetRegistry {
                     a.name
                 )));
             }
+            if let Some(spec) = &a.partitions {
+                if a.source {
+                    return Err(Error::Graph(format!(
+                        "asset {}: a source cannot be partitioned (a probe fingerprints \
+                         the whole of it)",
+                        a.name
+                    )));
+                }
+                spec.validate(&a.name)?;
+            }
             if let Some(op) = a.op {
                 ops.push(OpMeta {
                     name: a.name.clone(),
@@ -458,6 +510,7 @@ impl AssetRegistry {
                     op,
                     retries: a.retries,
                     retry_delay: a.retry_delay,
+                    partitions: a.partitions.clone(),
                 });
             }
             metas.push(AssetMeta {
@@ -468,6 +521,7 @@ impl AssetRegistry {
                 probe: a.probe,
                 probe_every: a.probe_every,
                 op: (!a.source).then_some(a.name),
+                partitions: a.partitions,
             });
         }
         for m in multis {
@@ -486,6 +540,7 @@ impl AssetRegistry {
                     probe: None,
                     probe_every: Duration::from_secs(60),
                     op: Some(m.name.clone()),
+                    partitions: None,
                 });
             }
             ops.push(OpMeta {
@@ -495,6 +550,7 @@ impl AssetRegistry {
                 op: m.op,
                 retries: m.retries,
                 retry_delay: m.retry_delay,
+                partitions: None,
             });
         }
         let pairs: Vec<(String, Vec<String>)> = metas
@@ -504,6 +560,7 @@ impl AssetRegistry {
         // first, so a duplicate asset name reads as one rather than as
         // whatever the op-level checks below would make of it
         let order = graph::topo_order(&pairs).map_err(|e| Error::Graph(format!("assets: {e}")))?;
+        check_partition_deps(&metas)?;
         let mut seen_ops: HashSet<&str> = HashSet::new();
         for o in &ops {
             // ops and assets share one namespace inside the job, so a
@@ -639,6 +696,7 @@ impl AssetRegistry {
             asset: asset.to_string(),
             op,
             key,
+            partitioned: self.get(asset).is_some_and(|m| m.partitions.is_some()),
         }
     }
 
@@ -663,11 +721,21 @@ impl AssetRegistry {
             .map(|m| wrap_op(self, m))
             .chain(self.checks.iter().map(|c| check_op(self, c)))
             .collect();
-        let external: Vec<String> = self
+        // sources seed null: their value is lineage, not data. a partitioned
+        // asset's key list seeds `[]`, so a full launch of the job — which
+        // computes no plan and so no targets — expands it into nothing rather
+        // than guessing at a range
+        let external: Vec<(String, Value)> = self
             .metas
             .iter()
             .filter(|m| m.source)
-            .map(|m| m.name.clone())
+            .map(|m| (m.name.clone(), Value::Null))
+            .chain(
+                self.metas
+                    .iter()
+                    .filter(|m| m.partitions.is_some())
+                    .map(|m| (partition_keys_name(&m.name), json!([]))),
+            )
             .collect();
         Job::assemble(
             ASSETS_JOB,
@@ -676,6 +744,46 @@ impl AssetRegistry {
             external,
         )
     }
+}
+
+/// what lineage across a partition boundary is allowed to look like.
+///
+/// dependencies between partitioned assets are **identity mapping only**: a
+/// partition takes the same key from every partitioned dep it reads. that
+/// rules out two shapes, and both are refused here rather than left to
+/// produce something plausible and wrong.
+fn check_partition_deps(metas: &[AssetMeta]) -> Result<(), Error> {
+    let spec = |name: &str| {
+        metas
+            .iter()
+            .find(|m| m.name == name)
+            .and_then(|m| m.partitions.as_ref())
+    };
+    for meta in metas {
+        for dep in &meta.deps {
+            let Some(dep_spec) = spec(dep) else { continue };
+            let Some(own) = &meta.partitions else {
+                return Err(Error::Graph(format!(
+                    "asset {}: it is not partitioned but its dep {dep} is. reading every \
+                     partition of {dep} at once is an aggregation, and hestan has no \
+                     semantics for one yet — partition {} too, or aggregate inside the \
+                     body from a source",
+                    meta.name, meta.name
+                )));
+            };
+            if !own.same_kind(dep_spec) {
+                return Err(Error::Graph(format!(
+                    "asset {}: partitioned {}, but its dep {dep} is partitioned {}. \
+                     a partition reads the same key from its dep, which two kinds of key \
+                     set cannot agree on",
+                    meta.name,
+                    own.kind_label(),
+                    dep_spec.kind_label()
+                )));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// the value one dep asset has, out of what the run handed the op that reads
@@ -690,25 +798,58 @@ fn dep_value(ctx: &OpCtx, link: &DepLink) -> Option<Value> {
 }
 
 /// the ctx an asset body sees: inputs keyed by the *asset* names it declared,
-/// whatever ops the run actually ran to produce them. `ctx.input("orders")`
-/// reads the same inside an asset whether `orders` has an op to itself or is
-/// one output of a multi-asset.
-fn with_dep_inputs(ctx: &OpCtx, links: &[DepLink]) -> OpCtx {
+/// whatever ops the run actually ran to produce them, plus the partition key
+/// this invocation is for. `ctx.input("orders")` reads the same inside an
+/// asset whether `orders` has an op to itself or is one output of a
+/// multi-asset.
+///
+/// a **partitioned** dep is read from the store at the same key rather than
+/// out of the run. that is what makes identity mapping mean one thing: the
+/// consumer reads `dep[k]` whether `dep[k]` was rebuilt by this run — its
+/// materialization is written inside its own op, which has finished by now —
+/// or was already fresh and never ran at all.
+fn with_dep_inputs(ctx: &OpCtx, links: &[DepLink], key: Option<&str>) -> Result<OpCtx, Error> {
     let mut inputs: HashMap<String, Value> = HashMap::new();
     let mut dep_statuses: HashMap<String, crate::model::OpStatus> = HashMap::new();
     for link in links {
-        if let Some(v) = dep_value(ctx, link) {
+        let value = match (link.partitioned, key) {
+            (true, Some(key)) => ctx
+                .store
+                .materialization(&link.asset, Some(key))?
+                .and_then(|m| m.value),
+            _ => dep_value(ctx, link),
+        };
+        if let Some(v) = value {
             inputs.insert(link.asset.clone(), v);
         }
         if let Some(s) = ctx.dep_status(&link.op) {
             dep_statuses.insert(link.asset.clone(), s);
         }
     }
-    OpCtx {
+    Ok(OpCtx {
         inputs: Arc::new(inputs),
         dep_statuses: Arc::new(dep_statuses),
+        partition: key.map(str::to_string),
         ..ctx.clone()
+    })
+}
+
+/// the dep fingerprints one materialization records: the key it consumed for a
+/// partitioned dep, the whole asset otherwise.
+fn dep_fingerprints(ctx: &OpCtx, links: &[DepLink], key: Option<&str>) -> Result<Value, Error> {
+    let mut inputs = Map::new();
+    for link in links {
+        let at = key.filter(|_| link.partitioned);
+        let fp = ctx
+            .store
+            .materialization(&link.asset, at)?
+            .map(|m| m.fingerprint);
+        inputs.insert(
+            link.asset.clone(),
+            fp.map(Value::String).unwrap_or(Value::Null),
+        );
     }
+    Ok(Value::Object(inputs))
 }
 
 /// what each produced asset's value is, out of the op's output. one asset is
@@ -786,29 +927,26 @@ fn wrap_op(reg: &AssetRegistry, meta: &OpMeta) -> Op {
             after.push(link.op.clone());
         }
     }
+    let partitioned = meta.partitions.is_some();
     let mut op = Op::new(name.clone(), move |ctx: OpCtx| {
         let inner = inner.clone();
         let name = name.clone();
         let produces = produces.clone();
         let links = links.clone();
         async move {
-            let output = inner.call(with_dep_inputs(&ctx, &links)).await?;
+            // on a partitioned asset this op is one fan-out instance, and the
+            // element it was handed is the key it is for
+            let key = match partitioned {
+                false => None,
+                true => Some(partition_of(&ctx)?),
+            };
+            let inner_ctx = with_dep_inputs(&ctx, &links, key.as_deref())?;
+            let output = inner.call(inner_ctx).await?;
             let values = split_output(&name, &produces, &output)?;
             // deps' current fingerprints: ancestors in this run already wrote
             // theirs. one entry per dep asset, not per op, so lineage reads in
             // the names the asset graph uses
-            let mut inputs = Map::new();
-            for link in &links {
-                let fp = ctx
-                    .store
-                    .materialization(&link.asset, None)?
-                    .map(|m| m.fingerprint);
-                inputs.insert(
-                    link.asset.clone(),
-                    fp.map(Value::String).unwrap_or(Value::Null),
-                );
-            }
-            let inputs = Value::Object(inputs);
+            let inputs = dep_fingerprints(&ctx, &links, key.as_deref())?;
             // the op-wide override, which covers every output that did not
             // stage one of its own
             let shared = ctx.take_fingerprint();
@@ -827,7 +965,7 @@ fn wrap_op(reg: &AssetRegistry, meta: &OpMeta) -> Op {
                 };
                 ctx.store.record_materialization(
                     asset,
-                    None,
+                    key.as_deref(),
                     &fingerprint,
                     &inputs,
                     Some(value),
@@ -840,10 +978,23 @@ fn wrap_op(reg: &AssetRegistry, meta: &OpMeta) -> Op {
     })
     .after(after)
     .retries(meta.retries);
+    if let Some(spec) = &meta.partitions {
+        let _ = spec;
+        // the same expansion a mapped op gets, over the keys the plan chose
+        op = op.fans_out_over(partition_keys_name(&meta.name));
+    }
     if let Some(d) = meta.retry_delay {
         op = op.retry_delay(d);
     }
     op.with_types_of(&meta.op)
+}
+
+/// the key a partitioned asset's instance is for. the executor hands every
+/// instance its element, and for a partitioned asset that element is the key.
+fn partition_of(ctx: &OpCtx) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    ctx.element()
+        .and_then(|v| v.as_str().map(str::to_string))
+        .ok_or_else(|| "a partitioned asset ran without a partition key".into())
 }
 
 // a check is an op that depends on the op that materializes the asset it
@@ -858,10 +1009,32 @@ fn check_op(reg: &AssetRegistry, meta: &CheckMeta) -> Op {
     let check = meta.name.clone();
     let severity = meta.severity;
     let f = meta.f.clone();
-    Op::new(check_op_name(&meta.asset, &meta.name), move |ctx: OpCtx| {
+    // a check on a partitioned asset expands the same way the asset does, over
+    // the same keys: one check per partition, on the value that partition
+    // just produced
+    let partitioned = link.partitioned;
+    let op = Op::new(check_op_name(&meta.asset, &meta.name), move |ctx: OpCtx| {
         let (asset, check, f, link) = (asset.clone(), check.clone(), f.clone(), link.clone());
         async move {
-            let value = dep_value(&ctx, &link).unwrap_or(Value::Null);
+            let key = match partitioned {
+                false => None,
+                true => Some(partition_of(&ctx)?),
+            };
+            let value = match &key {
+                Some(key) => ctx
+                    .store
+                    .materialization(&asset, Some(key))?
+                    .and_then(|m| m.value)
+                    .unwrap_or(Value::Null),
+                None => dep_value(&ctx, &link).unwrap_or(Value::Null),
+            };
+            let ctx = match &key {
+                None => ctx.clone(),
+                Some(key) => OpCtx {
+                    partition: Some(key.clone()),
+                    ..ctx.clone()
+                },
+            };
             let result = f(ctx.clone(), value).await?;
             let status = if result.passed {
                 CheckStatus::Passed
@@ -872,7 +1045,7 @@ fn check_op(reg: &AssetRegistry, meta: &CheckMeta) -> Op {
             // that fails the run still leaves behind what it found
             ctx.store.record_check(
                 &asset,
-                None,
+                key.as_deref(),
                 &check,
                 ctx.run_id(),
                 status,
@@ -891,7 +1064,11 @@ fn check_op(reg: &AssetRegistry, meta: &CheckMeta) -> Op {
             }))
         }
     })
-    .after([producer])
+    .after([producer]);
+    match partitioned {
+        false => op,
+        true => op.fans_out_over(partition_keys_name(&meta.asset)),
+    }
 }
 
 /// the default fingerprint: sha256 hex of the output's json text. serde_json
@@ -905,10 +1082,58 @@ pub(crate) fn content_fingerprint(v: &Value) -> String {
     })
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// every asset's current materializations: one for an unpartitioned asset, one
+/// per key for a partitioned one. this is what staleness, seeding and the
+/// assets api all read.
+#[derive(Debug, Default)]
+pub(crate) struct Mats {
+    whole: HashMap<String, Materialization>,
+    parts: HashMap<String, BTreeMap<String, Materialization>>,
+}
+
+impl Mats {
+    /// the current materialization of one `(asset, partition)` pair.
+    pub(crate) fn get(&self, asset: &str, partition: Option<&str>) -> Option<&Materialization> {
+        match partition {
+            None => self.whole.get(asset),
+            Some(key) => self.parts.get(asset)?.get(key),
+        }
+    }
+
+    fn insert(&mut self, m: Materialization) {
+        match m.partition.clone() {
+            None => {
+                self.whole.insert(m.asset.clone(), m);
+            }
+            Some(key) => {
+                self.parts
+                    .entry(m.asset.clone())
+                    .or_default()
+                    .insert(key, m);
+            }
+        }
+    }
+}
+
+impl FromIterator<Materialization> for Mats {
+    fn from_iter<I: IntoIterator<Item = Materialization>>(iter: I) -> Mats {
+        let mut mats = Mats::default();
+        for m in iter {
+            mats.insert(m);
+        }
+        mats
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub(crate) struct Staleness {
     pub stale: bool,
     pub reasons: Vec<StaleReason>,
+    /// one verdict per key of a [partitioned asset](crate::Partitions), and
+    /// empty for an unpartitioned one. the asset as a whole is stale exactly
+    /// when one of its keys is, which is why `reasons` is empty here — the
+    /// evidence lives per key.
+    pub parts: BTreeMap<String, Staleness>,
 }
 
 /// why an asset is stale: dep's fingerprint when this asset last consumed it
@@ -924,44 +1149,84 @@ pub(crate) struct StaleReason {
 /// staleness for every asset, keyed by name: stale if it never materialized, if
 /// a dep's fingerprint moved or went missing, or if a dep is itself stale.
 /// computed in topo order, so staleness propagates before anything rebuilds.
-pub(crate) fn staleness(
-    reg: &AssetRegistry,
-    mats: &HashMap<String, Materialization>,
-) -> HashMap<String, Staleness> {
+///
+/// a partitioned asset is judged one key at a time, and is stale as a whole
+/// when any of its keys is. a partitioned dep is read at the *same* key —
+/// identity mapping — and an unpartitioned one whole, which is why a probe
+/// moving a source's fingerprint makes every partition of every descendant
+/// stale at once.
+pub(crate) fn staleness(reg: &AssetRegistry, mats: &Mats) -> HashMap<String, Staleness> {
     let mut out: HashMap<String, Staleness> = HashMap::new();
     for meta in reg.topo() {
-        let s = match mats.get(&meta.name) {
-            None => Staleness {
-                stale: true,
-                reasons: Vec::new(),
-            },
-            Some(mat) => {
-                let mut reasons = Vec::new();
-                for dep in &meta.deps {
-                    let had = mat
-                        .inputs
-                        .get(dep)
-                        .and_then(Value::as_str)
-                        .map(String::from);
-                    let now = mats.get(dep).map(|m| m.fingerprint.clone());
-                    let dep_stale = out.get(dep).is_some_and(|s| s.stale);
-                    if dep_stale || now.is_none() || had != now {
-                        reasons.push(StaleReason {
-                            dep: dep.clone(),
-                            had,
-                            now,
-                        });
-                    }
-                }
+        let s = match &meta.partitions {
+            None => one_staleness(reg, mats, meta, &out, None),
+            Some(spec) => {
+                let parts: BTreeMap<String, Staleness> = spec
+                    .keys_now()
+                    .into_iter()
+                    .map(|key| {
+                        let s = one_staleness(reg, mats, meta, &out, Some(&key));
+                        (key, s)
+                    })
+                    .collect();
                 Staleness {
-                    stale: !reasons.is_empty(),
-                    reasons,
+                    stale: parts.values().any(|s| s.stale),
+                    reasons: Vec::new(),
+                    parts,
                 }
             }
         };
         out.insert(meta.name.clone(), s);
     }
     out
+}
+
+/// one verdict: the whole of an unpartitioned asset, or one key of a
+/// partitioned one. `done` holds the verdicts of everything upstream, which
+/// topo order guarantees is already there.
+fn one_staleness(
+    reg: &AssetRegistry,
+    mats: &Mats,
+    meta: &AssetMeta,
+    done: &HashMap<String, Staleness>,
+    key: Option<&str>,
+) -> Staleness {
+    let Some(mat) = mats.get(&meta.name, key) else {
+        return Staleness {
+            stale: true,
+            ..Staleness::default()
+        };
+    };
+    let mut reasons = Vec::new();
+    for dep in &meta.deps {
+        let dep_partitioned = reg.get(dep).is_some_and(|m| m.partitions.is_some());
+        let at = key.filter(|_| dep_partitioned);
+        let had = mat
+            .inputs
+            .get(dep)
+            .and_then(Value::as_str)
+            .map(String::from);
+        let now = mats.get(dep, at).map(|m| m.fingerprint.clone());
+        let dep_stale = match (done.get(dep), at) {
+            // a key the dep's own set does not hold can never be fresh:
+            // identity mapping has nothing to read there
+            (Some(s), Some(key)) => s.parts.get(key).is_none_or(|s| s.stale),
+            (Some(s), None) => s.stale,
+            (None, _) => true,
+        };
+        if dep_stale || now.is_none() || had != now {
+            reasons.push(StaleReason {
+                dep: dep.clone(),
+                had,
+                now,
+            });
+        }
+    }
+    Staleness {
+        stale: !reasons.is_empty(),
+        reasons,
+        parts: BTreeMap::new(),
+    }
 }
 
 /// what one build run executes: materializing ops in topo order with their
@@ -1001,13 +1266,19 @@ fn with_checks(reg: &AssetRegistry, ops: Vec<String>) -> Vec<String> {
 /// run knows it by: a source is null, an asset with an op to itself is its
 /// stored value, and a multi-asset is the object its op returns — every asset
 /// it produces, so that whichever key a consumer reads is there.
-fn seed_value(reg: &AssetRegistry, mats: &HashMap<String, Materialization>, op: &str) -> Value {
+///
+/// a partitioned asset is seeded null whatever it holds: its consumers read it
+/// per key from the store, and no single value could stand for the set.
+fn seed_value(reg: &AssetRegistry, mats: &Mats, op: &str) -> Value {
     let Some(meta) = reg.op(op) else {
         // no op of that name: a source, whose value is null everywhere
         return Value::Null;
     };
+    if meta.partitions.is_some() {
+        return Value::Null;
+    }
     let stored = |asset: &String| {
-        mats.get(asset)
+        mats.get(asset, None)
             .and_then(|m| m.value.clone())
             .unwrap_or(Value::Null)
     };
@@ -1024,13 +1295,20 @@ fn seed_value(reg: &AssetRegistry, mats: &HashMap<String, Materialization>, op: 
 
 fn seeds_for(
     reg: &AssetRegistry,
-    mats: &HashMap<String, Materialization>,
+    mats: &Mats,
     ops: &[String],
+    keys: &HashMap<String, Vec<String>>,
 ) -> HashMap<String, Value> {
     let in_plan: HashSet<&str> = ops.iter().map(String::as_str).collect();
     let mut seeds = HashMap::new();
     for name in ops {
         let meta = reg.op(name).expect("planned op is registered");
+        // the keys this op fans out over, which is the whole of how a plan
+        // reaches the expansion
+        if meta.partitions.is_some() {
+            let targets = keys.get(name).cloned().unwrap_or_default();
+            seeds.insert(partition_keys_name(name), json!(targets));
+        }
         for dep in &meta.deps {
             let producer = reg.producer(dep);
             if in_plan.contains(producer.as_str()) || seeds.contains_key(&producer) {
@@ -1043,11 +1321,73 @@ fn seeds_for(
     seeds
 }
 
+/// the keys a build of `asset` targets when the caller names none: the ones
+/// that are missing or stale, newest first, capped by the set's
+/// [build limit](crate::Partitions::build_limit). the cap is what stops an
+/// unbounded daily range starting a thousand instances by accident.
+fn default_keys(spec: &Partitions, verdict: &Staleness) -> Vec<String> {
+    let mut keys: Vec<String> = verdict
+        .parts
+        .iter()
+        .filter(|(_, s)| s.stale)
+        .map(|(key, _)| key.clone())
+        .collect();
+    keys.reverse(); // parts are oldest first; a build wants the newest
+    keys.truncate(spec.limit());
+    keys
+}
+
+/// which keys each partitioned op in the plan will build.
+///
+/// walked from the sinks up, because identity mapping runs that way: an
+/// upstream partitioned asset has to cover every key its consumers are about
+/// to read, and only the keys of *its* that are actually stale are worth
+/// rebuilding. a target with no keys named takes its default set; anything
+/// upstream takes what its consumers need.
+fn key_targets(
+    reg: &AssetRegistry,
+    stale: &HashMap<String, Staleness>,
+    ops: &[String],
+    targets: &[String],
+    named: &HashMap<String, Vec<String>>,
+) -> HashMap<String, Vec<String>> {
+    let in_plan: HashSet<&str> = ops.iter().map(String::as_str).collect();
+    let mut keys: HashMap<String, Vec<String>> = HashMap::new();
+    for meta in reg.ops().collect::<Vec<_>>().into_iter().rev() {
+        let Some(spec) = &meta.partitions else {
+            continue;
+        };
+        if !in_plan.contains(meta.name.as_str()) {
+            continue;
+        }
+        let asset = &meta.name; // a partitioned op produces exactly one asset
+        let mut want: Vec<String> = match named.get(asset) {
+            Some(explicit) => explicit.clone(),
+            None if targets.contains(asset) => default_keys(spec, &stale[asset]),
+            None => Vec::new(),
+        };
+        // every key a consumer downstream will read, that this asset owes
+        for consumer in reg.ops() {
+            if !in_plan.contains(consumer.name.as_str()) || !consumer.deps.contains(asset) {
+                continue;
+            }
+            for key in keys.get(&consumer.name).into_iter().flatten() {
+                let owed = stale[asset].parts.get(key).is_none_or(|s| s.stale);
+                if owed && !want.contains(key) {
+                    want.push(key.clone());
+                }
+            }
+        }
+        keys.insert(meta.name.clone(), want);
+    }
+    keys
+}
+
 /// the plan for one target: its stale derived ancestors plus the target itself,
 /// always. errors on an unknown or source target.
 pub(crate) fn plan_target(
     reg: &AssetRegistry,
-    mats: &HashMap<String, Materialization>,
+    mats: &Mats,
     target: &str,
 ) -> Result<BuildPlan, Error> {
     plan_targets(reg, mats, &[target.to_string()])
@@ -1058,8 +1398,22 @@ pub(crate) fn plan_target(
 /// would each re-run the shared ancestors. errors on an unknown or source target.
 pub(crate) fn plan_targets(
     reg: &AssetRegistry,
-    mats: &HashMap<String, Materialization>,
+    mats: &Mats,
     targets: &[String],
+) -> Result<BuildPlan, Error> {
+    plan_partitions(reg, mats, targets, &HashMap::new())
+}
+
+/// [`plan_targets`] with the partitions of some targets named outright rather
+/// than defaulted — what `POST /api/assets/{name}/build` with a `partitions`
+/// body and what a [backfill](crate::Hestan) launch build. a key that is not
+/// in the asset's set, or named for an asset that is not partitioned, is an
+/// error rather than an instance that could never mean anything.
+pub(crate) fn plan_partitions(
+    reg: &AssetRegistry,
+    mats: &Mats,
+    targets: &[String],
+    named: &HashMap<String, Vec<String>>,
 ) -> Result<BuildPlan, Error> {
     let mut want: HashSet<String> = HashSet::new();
     let mut stack: Vec<String> = Vec::new();
@@ -1073,6 +1427,19 @@ pub(crate) fn plan_targets(
             )));
         }
         stack.push(target.clone());
+    }
+    for (asset, keys) in named {
+        let Some(meta) = reg.get(asset) else {
+            return Err(Error::UnknownAsset(asset.clone()));
+        };
+        let Some(spec) = &meta.partitions else {
+            return Err(Error::Graph(format!("asset {asset} is not partitioned")));
+        };
+        if let Some(unknown) = keys.iter().find(|k| !spec.contains(k)) {
+            return Err(Error::Graph(format!(
+                "asset {asset} has no partition {unknown:?}"
+            )));
+        }
     }
     while let Some(n) = stack.pop() {
         if want.insert(n.clone()) {
@@ -1094,8 +1461,9 @@ pub(crate) fn plan_targets(
         })
         .map(|o| o.name.clone())
         .collect();
+    let keys = key_targets(reg, &stale, &ops, targets, named);
     // seeds before checks: a check op produces no asset and seeds nothing
-    let seeds = seeds_for(reg, mats, &ops);
+    let seeds = seeds_for(reg, mats, &ops, &keys);
     Ok(BuildPlan {
         ops: with_checks(reg, ops),
         seeds,
@@ -1103,10 +1471,7 @@ pub(crate) fn plan_targets(
 }
 
 /// one plan covering every stale derived asset; `None` when nothing is stale.
-pub(crate) fn plan_all(
-    reg: &AssetRegistry,
-    mats: &HashMap<String, Materialization>,
-) -> Option<BuildPlan> {
+pub(crate) fn plan_all(reg: &AssetRegistry, mats: &Mats) -> Option<BuildPlan> {
     let stale = staleness(reg, mats);
     let ops: Vec<String> = reg
         .ops()
@@ -1116,19 +1481,23 @@ pub(crate) fn plan_all(
     if ops.is_empty() {
         return None;
     }
-    let seeds = seeds_for(reg, mats, &ops);
+    // every stale asset is a target of a build-all, partitioned ones included
+    let targets: Vec<String> = reg
+        .ops()
+        .flat_map(|o| o.produces.iter())
+        .filter(|a| stale[*a].stale)
+        .cloned()
+        .collect();
+    let keys = key_targets(reg, &stale, &ops, &targets, &HashMap::new());
+    let seeds = seeds_for(reg, mats, &ops, &keys);
     Some(BuildPlan {
         ops: with_checks(reg, ops),
         seeds,
     })
 }
 
-pub(crate) fn mats_map(store: &Store) -> Result<HashMap<String, Materialization>, Error> {
-    Ok(store
-        .latest_materializations()?
-        .into_iter()
-        .map(|m| (m.asset.clone(), m))
-        .collect())
+pub(crate) fn mats_map(store: &Store) -> Result<Mats, Error> {
+    Ok(store.latest_materializations()?.into_iter().collect())
 }
 
 /// launch a plan as one subset run of the assets job.
@@ -1168,8 +1537,15 @@ mod tests {
         }
     }
 
-    fn mats(list: Vec<Materialization>) -> HashMap<String, Materialization> {
-        list.into_iter().map(|m| (m.asset.clone(), m)).collect()
+    fn mats(list: Vec<Materialization>) -> Mats {
+        list.into_iter().collect()
+    }
+
+    fn part(asset: &str, key: &str, fp: &str, inputs: Value) -> Materialization {
+        Materialization {
+            partition: Some(key.into()),
+            ..mat(asset, fp, inputs, Some(json!({"key": key})))
+        }
     }
 
     fn echo(name: &str) -> Asset {
@@ -1246,7 +1622,7 @@ mod tests {
     #[test]
     fn staleness_never_built_and_first_probe() {
         let reg = chain();
-        let s = staleness(&reg, &HashMap::new());
+        let s = staleness(&reg, &Mats::default());
         for name in ["s", "a", "b"] {
             assert!(s[name].stale, "{name} should be stale");
             assert!(s[name].reasons.is_empty(), "{name} has no dep reasons");
@@ -1408,7 +1784,7 @@ mod tests {
         ]);
         assert!(plan_all(&reg, &fresh).is_none());
 
-        let plan = plan_all(&reg, &HashMap::new()).unwrap();
+        let plan = plan_all(&reg, &Mats::default()).unwrap();
         assert_eq!(plan.ops, ["a", "b"]);
         assert_eq!(plan.seeds, HashMap::from([("s".into(), Value::Null)]));
     }
@@ -1494,7 +1870,7 @@ mod tests {
         // the latest entry is the current one, and it is the only one
         // staleness reads: b consumed v1 and a now says v2
         let m = mats_map(&store).unwrap();
-        assert_eq!(m["a"].fingerprint, "v2");
+        assert_eq!(m.get("a", None).unwrap().fingerprint, "v2");
         let st = staleness(&reg, &m);
         assert!(!st["a"].stale);
         assert_eq!(
@@ -2070,7 +2446,7 @@ mod tests {
     fn one_stale_output_plans_the_op_once() {
         let reg = AssetRegistry::new(Vec::new(), vec![split()], Vec::new()).unwrap();
         // both outputs stale: still one op
-        let plan = plan_all(&reg, &HashMap::new()).unwrap();
+        let plan = plan_all(&reg, &Mats::default()).unwrap();
         assert_eq!(plan.ops, ["split_orders"]);
 
         // and so is one of them
@@ -2139,6 +2515,297 @@ mod tests {
         let results = store.asset_checks("orders_clean", None, 10).unwrap();
         // the check saw that key's value, not the whole object the op returned
         assert_eq!(results[0].metadata, Some(json!({"rows": {"int": 2}})));
+    }
+
+    // three keys, so "only the one targeted" is a claim about two others
+    fn keyed(name: &str) -> Asset {
+        Asset::new(name, |ctx: OpCtx| async move {
+            let key = ctx.partition().expect("a partitioned body has its key");
+            Ok(json!({ "key": key }))
+        })
+        .partitioned(Partitions::keys(["k1", "k2", "k3"]))
+    }
+
+    async fn build_plan(runner: &Runner, plan: BuildPlan) -> crate::model::Run {
+        runner
+            .run_subset(
+                ASSETS_JOB,
+                plan.ops.into_iter().collect(),
+                plan.seeds,
+                json!({}),
+                Trigger::Build,
+            )
+            .await
+            .unwrap()
+    }
+
+    fn on(asset: &str, keys: [&str; 1]) -> HashMap<String, Vec<String>> {
+        HashMap::from([(
+            asset.to_string(),
+            keys.iter().map(|k| k.to_string()).collect(),
+        )])
+    }
+
+    #[test]
+    fn staleness_is_per_key_and_the_asset_is_stale_when_any_key_is() {
+        let s = Asset::source("s");
+        let a = keyed("a").from(&s);
+        let reg = AssetRegistry::new(vec![s, a], Vec::new(), Vec::new()).unwrap();
+        let m = mats(vec![
+            mat("s", "s1", json!({}), None),
+            part("a", "k1", "a1", json!({"s": "s1"})),
+            part("a", "k2", "a2", json!({"s": "s0"})),
+        ]);
+        let st = staleness(&reg, &m);
+        assert!(!st["a"].parts["k1"].stale, "fresh key read as stale");
+        assert!(
+            st["a"].parts["k2"].stale,
+            "a moved dep leaves the key stale"
+        );
+        assert!(st["a"].parts["k3"].stale, "a key that never built is stale");
+        assert!(st["a"].stale, "any stale key makes the asset stale");
+        // the whole-asset verdict carries no reasons: the evidence is per key
+        assert!(st["a"].reasons.is_empty());
+        assert_eq!(
+            st["a"].parts["k2"].reasons,
+            vec![StaleReason {
+                dep: "s".into(),
+                had: Some("s0".into()),
+                now: Some("s1".into()),
+            }]
+        );
+    }
+
+    #[test]
+    fn a_moved_source_fingerprint_makes_every_key_stale() {
+        let s = Asset::source("s");
+        let a = keyed("a").from(&s);
+        let reg = AssetRegistry::new(vec![s, a], Vec::new(), Vec::new()).unwrap();
+        let fresh = mats(vec![
+            mat("s", "s1", json!({}), None),
+            part("a", "k1", "a1", json!({"s": "s1"})),
+            part("a", "k2", "a2", json!({"s": "s1"})),
+            part("a", "k3", "a3", json!({"s": "s1"})),
+        ]);
+        assert!(!staleness(&reg, &fresh)["a"].stale);
+
+        let probed = mats(vec![
+            mat("s", "s2", json!({}), None),
+            part("a", "k1", "a1", json!({"s": "s1"})),
+            part("a", "k2", "a2", json!({"s": "s1"})),
+            part("a", "k3", "a3", json!({"s": "s1"})),
+        ]);
+        let st = staleness(&reg, &probed);
+        // crude but honest: an unpartitioned dep is read whole, so every key
+        // of every descendant is stale at once
+        assert!(st["a"].parts.values().all(|s| s.stale));
+    }
+
+    #[test]
+    fn the_default_target_set_is_the_newest_stale_keys_capped() {
+        let daily = Asset::new("daily", |_| async { Ok(json!(null)) })
+            .partitioned(Partitions::daily("2026-01-01").build_limit(3));
+        let reg = AssetRegistry::new(vec![daily], Vec::new(), Vec::new()).unwrap();
+        // nothing built, so every key of an unbounded range is stale — and the
+        // build limit is what stops that being a thousand instances
+        let plan = plan_target(&reg, &Mats::default(), "daily").unwrap();
+        let keys = plan.seeds["partitions:daily"].as_array().unwrap().clone();
+        assert_eq!(keys.len(), 3, "the build limit did not cap the range");
+        let keys: Vec<&str> = keys.iter().map(|k| k.as_str().unwrap()).collect();
+        let mut newest_first = keys.clone();
+        newest_first.sort_by(|a, b| b.cmp(a));
+        assert_eq!(keys, newest_first, "keys are not newest first");
+    }
+
+    #[tokio::test]
+    async fn a_build_materializes_only_the_keys_it_targets() {
+        let store = Store::open(":memory:").unwrap();
+        let reg = AssetRegistry::new(vec![keyed("a")], Vec::new(), Vec::new()).unwrap();
+        let runner = Runner::new([reg.lower_job().unwrap()], store.clone());
+        let m = mats_map(&store).unwrap();
+        let plan = plan_partitions(&reg, &m, &["a".into()], &on("a", ["k2"])).unwrap();
+        let run = build_plan(&runner, plan).await;
+        assert_eq!(run.status, RunStatus::Success);
+
+        // one instance, named for its key rather than its index
+        let ops = store.op_runs(&run.id).unwrap();
+        let names: Vec<&str> = ops.iter().map(|o| o.op.as_str()).collect();
+        assert_eq!(names, ["a[k2]"]);
+        assert_eq!(
+            store
+                .materialization("a", Some("k2"))
+                .unwrap()
+                .unwrap()
+                .value,
+            Some(json!({"key": "k2"}))
+        );
+        for untouched in ["k1", "k3"] {
+            assert!(
+                store
+                    .materialization("a", Some(untouched))
+                    .unwrap()
+                    .is_none(),
+                "{untouched} was built without being asked for"
+            );
+        }
+        // and nothing lands under the asset's unpartitioned name
+        assert!(store.materialization("a", None).unwrap().is_none());
+
+        // a key the set does not hold is refused rather than expanded
+        let err = plan_partitions(&reg, &m, &["a".into()], &on("a", ["k9"])).unwrap_err();
+        assert!(err.to_string().contains("no partition \"k9\""), "{err}");
+    }
+
+    #[tokio::test]
+    async fn identity_mapping_reads_the_matching_upstream_partition() {
+        let store = Store::open(":memory:").unwrap();
+        let a = keyed("a");
+        let b = Asset::new("b", |ctx: OpCtx| async move {
+            let up = ctx.input("a").expect("the upstream partition");
+            Ok(json!({"from": up["key"], "at": ctx.partition()}))
+        })
+        .from_named("a")
+        .partitioned(Partitions::keys(["k1", "k2", "k3"]));
+        let reg = AssetRegistry::new(vec![a, b], Vec::new(), Vec::new()).unwrap();
+        let runner = Runner::new([reg.lower_job().unwrap()], store.clone());
+
+        let m = mats_map(&store).unwrap();
+        let plan = plan_partitions(&reg, &m, &["b".into()], &on("b", ["k2"])).unwrap();
+        // the upstream key b needs comes along, and only that one
+        assert_eq!(plan.seeds["partitions:a"], json!(["k2"]));
+        let run = build_plan(&runner, plan).await;
+        assert_eq!(run.status, RunStatus::Success);
+        let ops = store.op_runs(&run.id).unwrap();
+        let mut names: Vec<&str> = ops.iter().map(|o| o.op.as_str()).collect();
+        names.sort();
+        assert_eq!(names, ["a[k2]", "b[k2]"]);
+        assert_eq!(
+            store
+                .materialization("b", Some("k2"))
+                .unwrap()
+                .unwrap()
+                .value,
+            Some(json!({"from": "k2", "at": "k2"}))
+        );
+        // lineage records the fingerprint of the key it consumed, not the asset
+        let a2 = store.materialization("a", Some("k2")).unwrap().unwrap();
+        assert_eq!(
+            store
+                .materialization("b", Some("k2"))
+                .unwrap()
+                .unwrap()
+                .inputs,
+            json!({"a": a2.fingerprint})
+        );
+
+        // with a fresh upstream, the same build runs b alone and still reads a[k1]
+        let m = mats_map(&store).unwrap();
+        let plan = plan_partitions(&reg, &m, &["a".into()], &on("a", ["k1"])).unwrap();
+        build_plan(&runner, plan).await;
+        let m = mats_map(&store).unwrap();
+        let plan = plan_partitions(&reg, &m, &["b".into()], &on("b", ["k1"])).unwrap();
+        assert_eq!(
+            plan.seeds["partitions:a"],
+            json!([]),
+            "a fresh upstream key was rebuilt anyway"
+        );
+        let run = build_plan(&runner, plan).await;
+        assert_eq!(run.status, RunStatus::Success);
+        assert_eq!(
+            store
+                .materialization("b", Some("k1"))
+                .unwrap()
+                .unwrap()
+                .value,
+            Some(json!({"from": "k1", "at": "k1"}))
+        );
+    }
+
+    #[test]
+    fn lineage_across_a_partition_boundary_is_identity_or_nothing() {
+        let a = keyed("a");
+        let flat = Asset::new("flat", |_| async { Ok(json!(null)) }).from_named("a");
+        let err = reg_err(vec![a, flat]);
+        assert!(
+            err.to_string()
+                .contains("it is not partitioned but its dep a is"),
+            "{err}"
+        );
+
+        // two kinds of key set cannot agree on "the same key"
+        let day = Asset::new("day", |_| async { Ok(json!(null)) })
+            .partitioned(Partitions::daily("2026-01-01"));
+        let hour = Asset::new("hour", |_| async { Ok(json!(null)) })
+            .from_named("day")
+            .partitioned(Partitions::hourly("2026-01-01T00"));
+        let err = reg_err(vec![day, hour]);
+        assert!(err.to_string().contains("partitioned hourly"), "{err}");
+
+        // a probe fingerprints the whole of a source, so there is no key to be
+        let err = reg_err(vec![
+            Asset::source("s").partitioned(Partitions::keys(["k"])),
+        ]);
+        assert!(
+            err.to_string().contains("source cannot be partitioned"),
+            "{err}"
+        );
+
+        // partitioned on unpartitioned is the fine direction
+        let s = Asset::source("s");
+        AssetRegistry::new(vec![s, keyed("a")], Vec::new(), Vec::new()).unwrap();
+    }
+
+    #[tokio::test]
+    async fn checks_metadata_and_history_all_key_on_the_partition() {
+        let store = Store::open(":memory:").unwrap();
+        let a = Asset::new("a", |ctx: OpCtx| async move {
+            let key = ctx.partition().unwrap().to_string();
+            ctx.meta("built", key.clone());
+            Ok(json!({"key": key, "rows": 1}))
+        })
+        .partitioned(Partitions::keys(["k1", "k2", "k3"]));
+        let reg =
+            AssetRegistry::new(vec![a], Vec::new(), vec![rows_check("has_rows", "a", 1)]).unwrap();
+        let runner = Runner::new([reg.lower_job().unwrap()], store.clone());
+        let m = mats_map(&store).unwrap();
+        let plan = plan_partitions(&reg, &m, &["a".into()], &on("a", ["k2"])).unwrap();
+        let run = build_plan(&runner, plan).await;
+        assert_eq!(run.status, RunStatus::Success);
+
+        // the check expanded over the same key and saw that key's value
+        let ops = store.op_runs(&run.id).unwrap();
+        let mut names: Vec<&str> = ops.iter().map(|o| o.op.as_str()).collect();
+        names.sort();
+        assert_eq!(names, ["a[k2]", "check:a:has_rows[k2]"]);
+        let results = store.asset_checks("a", None, 10).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].partition.as_deref(), Some("k2"));
+        assert_eq!(results[0].status, CheckStatus::Passed);
+        assert!(store.asset_checks("a", Some("k1"), 10).unwrap().is_empty());
+
+        // metadata lands on the key's own materialization
+        let m2 = store.materialization("a", Some("k2")).unwrap().unwrap();
+        assert_eq!(m2.metadata, Some(json!({"built": {"text": "k2"}})));
+
+        // history is per key: k2 twice, k1 never
+        let m = mats_map(&store).unwrap();
+        let plan = plan_partitions(&reg, &m, &["a".into()], &on("a", ["k2"])).unwrap();
+        build_plan(&runner, plan).await;
+        let history = store.materializations("a", Some("k2"), 10).unwrap();
+        assert_eq!(history.len(), 2);
+        // same value twice, so the second build is not a change
+        assert_eq!(
+            history.iter().map(|(_, c)| *c).collect::<Vec<bool>>(),
+            [false, true]
+        );
+        assert!(
+            store
+                .materializations("a", Some("k1"), 10)
+                .unwrap()
+                .is_empty()
+        );
+        // and asking for every key interleaves them
+        assert_eq!(store.materializations("a", None, 10).unwrap().len(), 2);
     }
 
     #[tokio::test]

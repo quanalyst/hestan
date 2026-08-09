@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { Link } from "react-router-dom";
 import { get, usePoll } from "./api";
 import MetaList from "./MetaList";
+import PartitionGrid from "./PartitionGrid";
 import { GlyphShape } from "./StatusGlyph";
 import type { AssetCheckResult, AssetSummary, MaterializationEntry } from "./types";
 import { relTime, shortId } from "./util";
@@ -80,7 +81,22 @@ export default function AssetPanel({
           <span className="op-line-label">state</span>
           <span className="mono">{asset.stale ? "stale" : "fresh"}</span>
         </div>
+        {asset.partitions && (
+          <div className="op-line">
+            <span className="op-line-label">partitions</span>
+            <span className="mono">
+              {asset.partitions.materialized}/{asset.partitions.total} built
+            </span>
+          </div>
+        )}
       </div>
+
+      {asset.partitions && (
+        <>
+          <div className="sub-label">partitions</div>
+          <PartitionGrid asset={asset.name} />
+        </>
+      )}
 
       {latestChecks.length > 0 && (
         <>
@@ -121,6 +137,7 @@ export default function AssetPanel({
                 {m.changed ? "•" : ""}
               </span>
               <span className="mono mat-fp" title={m.fingerprint}>
+                {m.partition ? `${m.partition} ` : ""}
                 {shortHash(m.fingerprint)}
               </span>
               <span className="muted mat-when" title={m.built_at}>

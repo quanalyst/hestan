@@ -166,6 +166,99 @@ stale and the asset is stale transitively. an asset that has never
 materialized is stale with an empty reasons list — nothing was recorded to
 compare against.
 
+## Partitioned assets
+
+an asset can be materialized once per key instead of once:
+
+```rust
+let daily_orders = Asset::new("daily_orders", |ctx: OpCtx| async move {
+    let day = ctx.partition().expect("partitioned");   // "2026-01-05"
+    Ok(pull_orders_for(day).await?)
+})
+.partitioned(Partitions::daily("2026-01-01"));
+// also: Partitions::hourly("2026-01-01T00"), Partitions::keys(["emea", "amer"])
+```
+
+`daily` keys are `YYYY-MM-DD` and `hourly` keys are `YYYY-MM-DDTHH`, both utc,
+running from the start to now — so the set grows with the clock.
+`Partitions::keys` is a fixed set of whatever strings you like. keys may not
+contain brackets, for a reason the next paragraph makes obvious.
+`ctx.partition()` is `Some(key)` inside a partitioned asset and `None`
+everywhere else, exactly as it has always effectively been.
+
+everything an asset has is per key: its materialization, its fingerprint, its
+history, its checks and its metadata. `GET /api/assets` reports an
+unpartitioned asset exactly as before, and reports a partitioned one as
+`partitions: {total, materialized, stale, missing}` — three disjoint states
+summing to `total` — instead of a single fingerprint, because there isn't one.
+
+### Building is fan-out
+
+a build of a partitioned asset expands into one instance per target key,
+named `{asset}[{key}]`, through the **same machinery a mapped op uses**. that
+is the whole implementation, and it is why `max_parallel`, pools, retries,
+cancellation, per-instance `op_runs` rows, the gantt and the event log all
+apply to partitions without any of them knowing partitions exist.
+
+concretely: the lowered `assets` job gains an external name
+`partitions:{asset}` per partitioned asset, the asset's op fans out over it,
+and the build plan seeds it with the keys that build targets. one consequence
+worth knowing: launching the `assets` job directly
+(`POST /api/jobs/assets/runs`) computes no plan, so that external seeds `[]`
+and partitioned assets expand into nothing. a full launch is a full rebuild of
+the *unpartitioned* graph; the build endpoints and backfills are how
+partitions get built.
+
+with nothing named, a build targets the keys that are missing or stale, newest
+first, capped by `Partitions::build_limit` (default 31) — so an unbounded daily
+range cannot start a thousand instances by accident. `Hestan::build_asset` and
+`POST /api/assets/{name}/build` both work this way, which means the "a build
+always rebuilds its target" rule of unpartitioned assets reads slightly
+differently here: a partitioned asset with nothing stale has no keys to target
+and builds nothing. name keys outright to rebuild regardless:
+
+```
+POST /api/assets/daily_orders/build  {"partitions": ["2026-01-05"]}
+```
+
+a key the asset's set does not hold is a 400, as is naming partitions on an
+asset that has none.
+
+### Identity mapping only
+
+dependencies between partitioned assets take **the same key**, and nothing
+else:
+
+- **partitioned on partitioned** — `daily_report` reading `daily_orders` at
+  its own key. the value comes from the store at `(dep, key)` rather than out
+  of the run, which is what makes "the same key" mean one thing whether the
+  upstream partition was rebuilt by this run or was already fresh. a build
+  pulls the upstream keys its targets need along with them.
+- **partitioned on unpartitioned** — fine, and the whole value arrives.
+- **unpartitioned on partitioned** — **rejected at build.** reading every
+  partition of something at once is an aggregation, and hestan does not define
+  one yet. partition the consumer too, or aggregate inside the body from a
+  source.
+
+two partitioned assets in a dep relationship must also use the same *kind* of
+key set (daily/hourly/static): "the same key" is not a thing two different
+kinds can agree on, so it is a build error rather than a shape that quietly
+never matches. there are no partition mapping functions and no partition sets
+added at runtime in this phase.
+
+a key the upstream's set does not contain keeps the downstream partition
+stale forever — identity mapping has nothing to read there. that is the honest
+reading of a range that starts later upstream than downstream.
+
+### Probes mark everything stale
+
+a probe fingerprint change marks **all** partitions of a descendant stale.
+that is not a special rule; it falls out of the ordinary one. each partition
+records the source's fingerprint at the moment it was built, and an
+unpartitioned dep is read whole, so when the source moves every key's
+recorded input disagrees at once. crude but honest — hestan cannot know which
+days of your data an external change touched.
+
 ## Memoized builds
 
 building a target materializes exactly the stale ancestors plus the target,

@@ -94,7 +94,9 @@ struct Produced {
 
 type OpOutcome = (String, Result<Produced, String>);
 
-/// one instance of a mapped op, keyed in the run by its `{op}[{i}]` name.
+/// one instance of a mapped op, keyed in the run by its `{op}[{label}]` name —
+/// the element's index, or the element itself on an op that
+/// [labels its instances](Op::labels_instances).
 struct Instance {
     parent: String,
     index: usize,
@@ -102,8 +104,11 @@ struct Instance {
 }
 
 /// a mapped op mid-expansion: one slot per element, so the collected output
-/// comes out in element order however the instances interleave.
+/// comes out in element order however the instances interleave. `names` is
+/// what each slot's instance is called, which is the key its output was
+/// persisted under.
 struct Fanout {
+    names: Vec<String>,
     slots: Vec<Option<Value>>,
     remaining: usize,
     failed: bool,
@@ -475,10 +480,7 @@ impl Runner {
         for name in &rerun {
             let op = job.op(name).expect("subset op is an op of the job");
             for dep in op.deps() {
-                if subset.contains(dep)
-                    || reusable.contains_key(dep)
-                    || job.external().contains(dep)
-                {
+                if subset.contains(dep) || reusable.contains_key(dep) || job.is_external(dep) {
                     continue;
                 }
                 return Err(Error::Graph(format!(
@@ -494,7 +496,7 @@ impl Runner {
             .map(|n| (n.clone(), reusable[n].clone()))
             .collect();
         // externals are seeded null by a full launch; a resume of one keeps that
-        seeded.extend(job.external().iter().map(|n| (n.clone(), Value::Null)));
+        seeded.extend(job.external_seeds());
         Ok(ResumePlan {
             job: run.job,
             rerun,
@@ -583,13 +585,7 @@ impl Runner {
             .ok_or_else(|| Error::UnknownJob(job.to_string()))?
             .clone();
         let (pending, seeded) = match subset {
-            None => (
-                job.order().to_vec(),
-                job.external()
-                    .iter()
-                    .map(|n| (n.clone(), Value::Null))
-                    .collect(),
-            ),
+            None => (job.order().to_vec(), job.external_seeds()),
             Some((ops, seeded)) => {
                 for name in &ops {
                     let Some(op) = job.op(name) else {
@@ -682,14 +678,28 @@ impl Runner {
     }
 }
 
-// "process[3]" -> ("process", 3), but only when `process` is a mapped op of
+// "process[3]" -> ("process", "3"), but only when `process` is a mapped op of
 // this job; any other bracketed name is just an op name
-fn instance_of(job: &Job, name: &str) -> Option<(String, usize)> {
-    let (parent, index) = name.split_once('[')?;
-    let index: usize = index.strip_suffix(']')?.parse().ok()?;
+fn instance_of(job: &Job, name: &str) -> Option<(String, String)> {
+    let (parent, label) = name.split_once('[')?;
+    let label = label.strip_suffix(']')?;
     job.op(parent)?.mapped_over()?;
-    Some((parent.to_string(), index))
+    Some((parent.to_string(), label.to_string()))
 }
+
+/// what one instance of a fan-out is called after the `[`: its index, or the
+/// element itself on an op that names its instances by them — which is what
+/// makes a partitioned asset's instances read as `daily_orders[2026-01-05]`.
+fn instance_label(op: &Op, index: usize, element: &Value) -> String {
+    match element.as_str().filter(|_| op.labels_instances()) {
+        Some(key) => key.to_string(),
+        None => index.to_string(),
+    }
+}
+
+/// one mapped op's instance rows mid-fold, by index: the instance's name, what
+/// it did, and what it recorded.
+type InstanceRows = BTreeMap<usize, (String, OpStatus, Option<Value>)>;
 
 /// collapse one run's fan-out instance rows into a single entry for the mapped
 /// op they belong to. it counts as succeeded only when the instances cover
@@ -704,23 +714,38 @@ fn fold_instances(
     rows: Vec<OpRun>,
 ) -> Vec<(String, OpStatus, Option<Value>)> {
     let mut folded: Vec<(String, OpStatus, Option<Value>)> = Vec::with_capacity(rows.len());
-    let mut groups: HashMap<String, BTreeMap<usize, (OpStatus, Option<Value>)>> = HashMap::new();
+    let mut groups: HashMap<String, InstanceRows> = HashMap::new();
+    let mut labeled: HashSet<String> = HashSet::new();
     for row in rows {
         match instance_of(job, &row.op) {
-            Some((parent, index)) => {
-                groups
-                    .entry(parent)
-                    .or_default()
-                    .insert(index, (row.status, row.output));
+            Some((parent, label)) => {
+                // an op that names its instances by their element has no index
+                // to order or count them by, so it never folds back into a
+                // reusable array — it expands again from scratch
+                match label.parse::<usize>() {
+                    Ok(index) if !job.op(&parent).is_some_and(Op::labels_instances) => {
+                        groups
+                            .entry(parent)
+                            .or_default()
+                            .insert(index, (row.op, row.status, row.output));
+                    }
+                    _ => {
+                        labeled.insert(parent);
+                    }
+                }
             }
             None => folded.push((row.op, row.status, row.output)),
         }
+    }
+    for parent in labeled {
+        groups.remove(&parent);
+        folded.push((parent, OpStatus::Failed, None));
     }
     for (parent, slots) in groups {
         let whole = slots.keys().copied().eq(0..slots.len())
             && slots
                 .values()
-                .all(|(status, output)| *status == OpStatus::Success && output.is_some());
+                .all(|(_, status, output)| *status == OpStatus::Success && output.is_some());
         if !whole {
             folded.push((parent, OpStatus::Failed, None));
             continue;
@@ -731,12 +756,12 @@ fn fold_instances(
         let manager = io.manager(job.op(&parent).and_then(Op::io_name));
         let mut collected: Vec<Value> = Vec::with_capacity(slots.len());
         let mut readable = true;
-        for (index, (_, output)) in slots {
+        for (_, (op, _, output)) in slots {
             let handle = output.expect("checked just above");
             let key = IoKey {
                 run_id: run_id.to_string(),
                 job: job.name().to_string(),
-                op: format!("{parent}[{index}]"),
+                op,
             };
             match manager.get(&key, &handle) {
                 Ok(v) => collected.push(v),
@@ -882,10 +907,27 @@ async fn execute(
                         None
                     }
                 };
+                // every instance is a row of its own, so two elements that
+                // would be called the same thing are not an expansion at all
+                let mut repeated: Option<String> = None;
+                let elements = elements.filter(|elements| {
+                    let mut labels: HashSet<String> = HashSet::new();
+                    for (i, element) in elements.iter().enumerate() {
+                        let label = instance_label(op, i, element);
+                        if !labels.insert(label.clone()) {
+                            repeated = Some(label);
+                            return false;
+                        }
+                    }
+                    true
+                });
                 let Some(elements) = elements else {
-                    let msg = match &unreadable {
-                        Some(e) => format!("could not read the output of {over}: {e}"),
-                        None => format!(
+                    let msg = match (&unreadable, &repeated) {
+                        (Some(e), _) => format!("could not read the output of {over}: {e}"),
+                        (None, Some(label)) => {
+                            format!("expanded over {over}, which named the key {label:?} twice")
+                        }
+                        (None, None) => format!(
                             "mapped over {over}, which produced {} rather than an array",
                             expanded_over.unwrap_or("something else")
                         ),
@@ -922,7 +964,8 @@ async fn execute(
                     .into_iter()
                     .enumerate()
                     .map(|(index, element)| {
-                        let instance = format!("{name}[{index}]");
+                        let label = instance_label(op, index, &element);
+                        let instance = format!("{name}[{label}]");
                         note(store.create_op_run(&run_id, &instance));
                         instances.insert(
                             instance.clone(),
@@ -954,6 +997,7 @@ async fn execute(
                 fanouts.insert(
                     name,
                     Fanout {
+                        names: created.clone(),
                         slots: vec![None; n],
                         remaining: n,
                         failed: false,
@@ -1430,7 +1474,7 @@ fn collect(
             let key = IoKey {
                 run_id: run_id.to_string(),
                 job: job.name().to_string(),
-                op: format!("{}[{index}]", instance.parent),
+                op: fan.names[index].clone(),
             };
             match manager.get(&key, &handle) {
                 Ok(v) => collected.push(v),
@@ -1618,6 +1662,7 @@ async fn run_op(
             op: name.clone(),
             params: params.clone(),
             element: element.clone(),
+            partition: None,
             inputs: inputs.clone(),
             dep_statuses: dep_statuses.clone(),
             resources: resources.clone(),
