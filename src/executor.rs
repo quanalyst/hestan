@@ -838,16 +838,19 @@ async fn execute(
             // a dep a rule let this op run past may have produced nothing, so
             // its entry is simply absent — `ctx.input` says None, and
             // `ctx.dep_status` says what it did instead
-            let inputs: HashMap<String, Value> = op
-                .deps()
-                .iter()
-                .filter_map(|d| outputs.get(d).map(|v| (d.clone(), v.clone())))
-                .collect();
-            let dep_statuses: HashMap<String, OpStatus> = op
-                .deps()
-                .iter()
-                .filter_map(|d| statuses.get(d).map(|s| (d.clone(), *s)))
-                .collect();
+            // keyed by what the body calls each dep, which differs from the
+            // job-level name only inside a flattened graph instance
+            let mut inputs: HashMap<String, Value> = HashMap::new();
+            let mut dep_statuses: HashMap<String, OpStatus> = HashMap::new();
+            for dep in op.deps() {
+                let seen = op.dep_alias(dep).to_string();
+                if let Some(v) = outputs.get(dep) {
+                    inputs.entry(seen.clone()).or_insert_with(|| v.clone());
+                }
+                if let Some(s) = statuses.get(dep) {
+                    dep_statuses.entry(seen).or_insert(*s);
+                }
+            }
             let handle = tasks.spawn(run_op(
                 op,
                 name.clone(),

@@ -116,6 +116,10 @@ appears.
   budget for one external resource, however many jobs overlap). a terminal op
   failure skips its downstream and fails the run, while independent branches
   keep going
+- a reusable `Graph` of ops drops into a job as many times as you like:
+  `.graph("clean_a", &clean).after(["fetch"])`. it is flattened at build into
+  ordinary ops named `{instance}.{inner}`, so nothing at run time — resume,
+  fan-out, assets, the ui — has to know graphs exist
 - an op's trigger rule says when it runs: `.when(When::Always)` or
   `.when(When::AnyFailed)` makes a summary, an alert or a cleanup after a
   failure expressible, where the default `AllSucceeded` skips it. skip

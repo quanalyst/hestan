@@ -7,7 +7,7 @@ src/
   lib.rs        public exports and the prelude
   app.rs        the Hestan builder: collect jobs/schedules/assets/sensors, build, serve
   op.rs         Op, OpCtx, OpResult, typed io
-  job.rs        Job and JobBuilder (dag validation)
+  job.rs        Job and JobBuilder (dag validation), Graph and graph flattening
   graph.rs      topo order (kahn's) and transitive-downstream
   executor.rs   Runner and the run loop: concurrency, retries, skips, subset runs
   asset.rs      Asset, the registry, staleness/planning, the materializing wrapper
@@ -90,7 +90,8 @@ version 0 for anything.
 ## Tests
 
 unit tests sit at the bottom of the module they exercise: `graph.rs`
-(ordering, cycles), `schedule.rs` (cron normalization, dow remap, windows),
+(ordering, cycles), `job.rs` (graph flattening: prefixes, wiring, nesting,
+rejected shapes), `schedule.rs` (cron normalization, dow remap, windows),
 `store.rs` (lifecycle roundtrips, migrations, sweep), `server.rs` (handlers
 called directly with axum extractors — no live server needed).
 

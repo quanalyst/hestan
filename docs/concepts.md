@@ -10,7 +10,10 @@ output or an error.
 
 a *job* is a validated dag of ops. `Job::builder(name)...build()` rejects
 duplicate op names, deps on unknown ops, and cycles, and fixes a deterministic
-topological order (ties broken by declaration order).
+topological order (ties broken by declaration order). a *graph* is a reusable
+bundle of ops instantiated into a job by name; it is
+[flattened away at build](#reusable-graphs), so nothing past this line ever
+sees one.
 
 a *run* is one execution of a job: an id (uuid v7, so ids sort by creation
 time), params (arbitrary json), a trigger, and a status that moves
@@ -325,6 +328,71 @@ run that only ever covered part of the graph — an [asset build](assets.md)
 records rows for its plan alone. a resume is also refused when nothing is
 left to re-run, and when a chosen op's input was never produced by any run
 in the chain.
+
+## Reusable graphs
+
+a *graph* is a unit of ops you can drop into a job more than once. it is a
+build-time thing and nothing else: `JobBuilder::build` flattens every instance
+into ordinary ops, so runs, resume, fan-out, assets, the gantt and the ui
+never learn that a graph existed.
+
+```rust
+let clean = Graph::builder("clean")
+    .op(Op::new("parse", ..))
+    .op(Op::new("dedupe", ..).after(["parse"]))
+    .input("parse")        // inner ops that receive the instance's deps
+    .output("dedupe")      // the one inner op that supplies the instance output
+    .build()?;
+
+Job::builder("nightly")
+    .op(Op::new("fetch", ..))
+    .graph("clean_a", &clean)      // instance name
+    .after(["fetch"])              // ...and what it waits on
+    .op(Op::new("load", ..).after(["clean_a"]))
+    .build()?
+```
+
+that job has four ops: `fetch`, `clean_a.parse`, `clean_a.dedupe`, `load`.
+
+- inner ops are renamed `{instance}.{inner}`, and their deps on each other are
+  rewritten to match. inner names may not contain a dot, since that is the
+  separator.
+- the ops named by `input` additionally wait on whatever the instance waits
+  on — that is the only way into a graph, and an inner dep that names nothing
+  inside the graph is a build error rather than a reach outward.
+- anything depending on the instance name is rewired to the op named by
+  `output`. `input` and `output` are both required, and an unknown or
+  dot-containing name is a build error naming it.
+- two instances of one graph must not share a name — that is exactly what the
+  instance name is for — and an instance colliding with an op is `Error::Graph`.
+
+### Reading inputs inside a graph
+
+a graph's ops keep their own vocabulary. inside `clean`, `dedupe` reads
+`ctx.input("parse")`, not `ctx.input("clean_a.parse")`; at job level, `load`
+reads `ctx.input("clean_a")` — the name it wrote in `.after`, not the inner op
+that happened to supply it. renaming is a wiring concern, so it stays out of
+the bodies.
+
+what a graph's *input* op cannot know is what the job called the dep it was
+handed (`fetch` here, something else in the next job). `ctx.inputs()` is the
+way out: every dep that produced output, name and value, sorted by name.
+
+### Nesting
+
+a graph may contain a graph — `GraphBuilder::graph` is the same call — and
+`input`/`output` may name a nested instance, which resolves through it to a
+real op. names compound: `s.inner.pages`. it is all one flattening, so a
+recursive self-inclusion could not terminate; that is refused with a clear
+error, though the immutable builder makes it unreachable in practice (a graph
+can only contain graphs that were built before it).
+
+### In the ui
+
+the dag mutes an op's `{instance}.` prefix and draws the inner name at full
+strength, so a graph instance's ops read as a group without a second layout.
+they are ordinary nodes otherwise — clickable, statused, and gantt rows like
+any other op.
 
 ## Dynamic fan-out
 

@@ -363,6 +363,10 @@ button:disabled {
   font-size: 10px;
 }
 
+.dag-prefix {
+  fill: var(--muted);
+}
+
 .dag-badge {
   fill: var(--muted);
   font-size: 11px;

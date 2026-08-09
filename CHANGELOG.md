@@ -2,6 +2,13 @@
 
 ## unreleased
 
+- reusable graphs: `Graph::builder(name).op(..).input(..).output(..).build()` bundles ops into a unit a job can instantiate more than once with `JobBuilder::graph("clean_a", &clean).after([..])`. purely a build-time transformation — `JobBuilder::build` flattens each instance into ordinary ops named `{instance}.{inner}`, so the executor, resume, fan-out, assets and the ui are untouched
+- declared `input` ops additionally wait on the instance's own deps (the only way into a graph — an inner dep naming something outside is a build error), and anything depending on the instance name is rewired to the op it declared as its `output`. duplicate instance names, an instance colliding with an op, and an unknown or dot-containing `input`/`output` are all `Error::Graph`
+- a graph may contain a graph, and `input`/`output` may name a nested instance, which resolves through it; names compound (`s.inner.pages`). self-inclusion is refused rather than flattened forever
+- ops keep their own vocabulary through the rename: `dedupe` inside `clean` still reads `ctx.input("parse")`, and a job-level op reads `ctx.input("clean_a")` — the name it wrote in `.after` — rather than the inner op that supplied it
+- `OpCtx::inputs()` lists every dep that produced output, name and value, sorted: a reusable graph's input op cannot know what the job called the dep it was handed
+- the dag mutes an op's `{instance}.` prefix so a graph instance's ops read as a group
+
 - trigger rules: `Op::when(When::Always | When::AnyFailed | When::AllSucceeded)` decides whether an op runs once its deps settle, so a summary, an alert or a cleanup after a failure is expressible at last — the thing you most want after a failure used to be exactly what got skipped. `AllSucceeded` is the default and is what every op has always meant
 - readiness moved from "every dep produced output" to "every dep reached a terminal status"; the rule then decides run vs skip. an op a rule turns down is `skipped` with an `op_skipped` event naming the rule (`skipped by rule any_failed: every dep succeeded`, `data: {"when": ...}`), worded apart from the upstream-failure skip so the log says which happened
 - `OpCtx::dep_status(dep)` reports what each declared dep did; `ctx.input(dep)` for a dep that produced nothing stays `None`. deps seeded from outside the run — a resume's reused output, a memoized asset value, a source asset — read as `success`

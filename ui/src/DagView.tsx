@@ -29,6 +29,12 @@ export type NodeStatus = OpStatus | "fresh" | "stale" | "absent";
 const glyphFor = (st: Exclude<NodeStatus, "absent">): Status =>
   st === "fresh" ? "success" : st === "stale" ? "pending" : st;
 
+// ops flattened out of a graph instance are named "{instance}.{inner}", so
+// everything up to the last dot is the group this node belongs to
+const cut = (name: string) => name.lastIndexOf(".");
+const prefixOf = (name: string) => (cut(name) < 0 ? "" : name.slice(0, cut(name) + 1));
+const leafOf = (name: string) => (cut(name) < 0 ? name : name.slice(cut(name) + 1));
+
 interface Placed {
   node: DagNode;
   x: number;
@@ -160,7 +166,9 @@ export default function DagView({
                 </g>
               )}
               <text className="dag-label" x={nx + PAD_X + glyphW} y={labelCy} dominantBaseline="central">
-                {node.name}
+                {/* a graph instance's ops share a prefix; muting it groups them by eye */}
+                {prefixOf(node.name) && <tspan className="dag-prefix">{prefixOf(node.name)}</tspan>}
+                {leafOf(node.name)}
                 {node.badge && <tspan className="dag-badge"> {node.badge}</tspan>}
               </text>
               {st && (

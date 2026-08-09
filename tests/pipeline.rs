@@ -5,8 +5,8 @@ use std::time::Duration;
 
 use hestan::prelude::*;
 use hestan::{
-    CancelOutcome, Error, EventKind, FailureHook, OpStatus, Run, RunFailure, RunStatus, Runner,
-    Store, Trigger, When,
+    CancelOutcome, Error, EventKind, FailureHook, Graph, OpStatus, Run, RunFailure, RunStatus,
+    Runner, Store, Trigger, When,
 };
 use serde::{Deserialize, Serialize};
 
@@ -2207,4 +2207,132 @@ async fn always_on_a_mapped_op_whose_array_never_arrived_runs_zero_instances() {
             && e.data == Some(json!({"instances": 0, "over": "pages"}))),
         "no zero-instance expansion recorded"
     );
+}
+
+// ---- reusable graphs ----
+
+// a graph instance is flattened at build, so a run only ever sees ops
+#[tokio::test]
+async fn two_graph_instances_run_independently_end_to_end() {
+    let double = Graph::builder("double")
+        // a reusable graph cannot know what the job named its dep, so it
+        // reads whatever it was handed
+        .op(Op::new("parse", |ctx: OpCtx| async move {
+            let n: i64 = ctx.inputs().iter().filter_map(|(_, v)| v.as_i64()).sum();
+            Ok(json!(n * 2))
+        }))
+        .op(Op::new("dedupe", |ctx: OpCtx| async move {
+            Ok(json!(ctx.input("parse").unwrap().as_i64().unwrap() + 1))
+        })
+        .after(["parse"]))
+        .input("parse")
+        .output("dedupe")
+        .build()
+        .unwrap();
+
+    let job = Job::builder("nightly")
+        .op(Op::new("fetch_a", |_| async { Ok(json!(10)) }))
+        .op(Op::new("fetch_b", |_| async { Ok(json!(100)) }))
+        .graph("clean_a", &double)
+        .after(["fetch_a"])
+        .graph("clean_b", &double)
+        .after(["fetch_b"])
+        .op(Op::new("merge", |ctx: OpCtx| async move {
+            // an instance is read under the name the job gave it
+            Ok(json!([ctx.input("clean_a"), ctx.input("clean_b")]))
+        })
+        .after(["clean_a", "clean_b"]))
+        .build()
+        .unwrap();
+
+    let runner = Runner::new([job], Store::open(":memory:").unwrap());
+    let run = runner
+        .run("nightly", json!({}), Trigger::Manual)
+        .await
+        .unwrap();
+    assert_eq!(run.status, RunStatus::Success);
+
+    let ops = runner.store().op_runs(&run.id).unwrap();
+    let out = |name: &str| {
+        ops.iter()
+            .find(|o| o.op == name)
+            .unwrap_or_else(|| panic!("no op run for {name}"))
+            .output
+            .clone()
+    };
+    // each instance saw only its own external dep
+    assert_eq!(out("clean_a.parse"), Some(json!(20)));
+    assert_eq!(out("clean_b.parse"), Some(json!(200)));
+    assert_eq!(out("clean_a.dedupe"), Some(json!(21)));
+    assert_eq!(out("clean_b.dedupe"), Some(json!(201)));
+    // and the outside got each instance's declared output
+    assert_eq!(out("merge"), Some(json!([21, 201])));
+}
+
+// nesting is the same transformation one level down, and fan-out inside a
+// graph is just a mapped op with a prefixed dep
+#[tokio::test]
+async fn a_nested_graph_with_fan_out_runs_flattened() {
+    let paged = Graph::builder("paged")
+        .op(Op::new("pages", |ctx: OpCtx| async move {
+            let n = ctx.input("config").and_then(Value::as_u64).unwrap_or(0);
+            Ok(json!((0..n).collect::<Vec<u64>>()))
+        }))
+        .op(Op::mapped("fetch", |_ctx: OpCtx, page: u64| async move {
+            Ok(json!(page * 10))
+        })
+        .over("pages"))
+        .input("pages")
+        .output("fetch")
+        .build()
+        .unwrap();
+    let stage = Graph::builder("stage")
+        .graph("inner", &paged)
+        .op(Op::new("total", |ctx: OpCtx| async move {
+            let pages = ctx.input("inner").unwrap().as_array().unwrap();
+            Ok(json!(pages.iter().filter_map(Value::as_i64).sum::<i64>()))
+        })
+        .after(["inner"]))
+        .input("inner")
+        .output("total")
+        .build()
+        .unwrap();
+
+    let job = Job::builder("nightly")
+        .op(Op::new("config", |_| async { Ok(json!(3)) }))
+        .graph("s", &stage)
+        .after(["config"])
+        .op(Op::new("report", |ctx: OpCtx| async move {
+            Ok(json!({"total": ctx.input("s")}))
+        })
+        .after(["s"]))
+        .build()
+        .unwrap();
+
+    let runner = Runner::new([job], Store::open(":memory:").unwrap());
+    let run = runner
+        .run("nightly", json!({}), Trigger::Manual)
+        .await
+        .unwrap();
+    assert_eq!(run.status, RunStatus::Success);
+
+    let ops = runner.store().op_runs(&run.id).unwrap();
+    let mut names: Vec<&str> = ops.iter().map(|o| o.op.as_str()).collect();
+    names.sort_unstable();
+    // the mapped op has no row of its own; its instances carry the prefix
+    assert_eq!(
+        names,
+        [
+            "config",
+            "report",
+            "s.inner.fetch[0]",
+            "s.inner.fetch[1]",
+            "s.inner.fetch[2]",
+            "s.inner.pages",
+            "s.total",
+        ]
+    );
+    let out = |name: &str| ops.iter().find(|o| o.op == name).unwrap().output.clone();
+    assert_eq!(out("s.total"), Some(json!(30)));
+    assert_eq!(out("report"), Some(json!({"total": 30})));
 }

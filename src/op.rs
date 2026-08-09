@@ -62,6 +62,10 @@ pub enum InputError {
 pub struct Op {
     name: String,
     deps: Vec<String>,
+    // on an op flattened out of a Graph instance: (job-level dep name, the
+    // name this body calls it). empty everywhere else, where they are the
+    // same thing.
+    aliases: Vec<(String, String)>,
     when: When,
     retries: u32,
     retry: Retry,
@@ -87,6 +91,7 @@ impl Op {
         Op {
             name: name.into(),
             deps: Vec::new(),
+            aliases: Vec::new(),
             when: When::default(),
             retries: 0,
             retry: DEFAULT_BACKOFF,
@@ -116,6 +121,7 @@ impl Op {
         Op {
             name: name.into(),
             deps: Vec::new(),
+            aliases: Vec::new(),
             when: When::default(),
             retries: 0,
             retry: DEFAULT_BACKOFF,
@@ -307,6 +313,35 @@ impl Op {
     pub(crate) fn with_output_type(mut self, t: &'static str) -> Op {
         self.output_type = Some(t);
         self
+    }
+
+    /// rename this op and replace every dep name it holds — including the one
+    /// an [`Op::mapped`] fans out over, which is a dep name like any other.
+    /// flattening a [`Graph`](crate::Graph) instance is the only caller.
+    pub(crate) fn rebound(
+        mut self,
+        name: String,
+        deps: Vec<String>,
+        over: Option<String>,
+        aliases: Vec<(String, String)>,
+    ) -> Op {
+        self.name = name;
+        self.deps = deps;
+        self.over = over;
+        self.aliases = aliases;
+        self
+    }
+
+    /// what this op's body calls the dep now named `dep`: inside a flattened
+    /// [`Graph`](crate::Graph) instance that is the name the graph's author
+    /// wrote, and everywhere else it is `dep` itself. this is what keeps a
+    /// graph's ops readable — `ctx.input("parse")` inside a graph, not
+    /// `ctx.input("clean_a.parse")`.
+    pub(crate) fn dep_alias<'a>(&'a self, dep: &'a str) -> &'a str {
+        self.aliases
+            .iter()
+            .find(|(flat, _)| flat == dep)
+            .map_or(dep, |(_, local)| local.as_str())
     }
 
     /// copy `other`'s declared io types; the asset wrapper op uses this so a
@@ -506,6 +541,19 @@ impl OpCtx {
     /// output of a declared upstream op.
     pub fn input(&self, op: &str) -> Option<&Value> {
         self.inputs.get(op)
+    }
+
+    /// every dep that produced output, name and value, sorted by name.
+    ///
+    /// an op inside a reusable [`Graph`](crate::Graph) is the reason this
+    /// exists: the instance's external deps arrive under the names the *job*
+    /// gave them, which the graph's author cannot know, so an input op reads
+    /// whatever it was handed rather than a name it made up.
+    pub fn inputs(&self) -> Vec<(&str, &Value)> {
+        let mut all: Vec<(&str, &Value)> =
+            self.inputs.iter().map(|(k, v)| (k.as_str(), v)).collect();
+        all.sort_by_key(|(name, _)| *name);
+        all
     }
 
     /// what a declared upstream op ended up doing. this is how an op with a
