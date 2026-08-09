@@ -12,7 +12,7 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use hestan::prelude::*;
-use hestan::{OpRun, Runner, Store, Trigger};
+use hestan::{LogStream, OpRun, Runner, Store, Trigger};
 
 /// where every process in this test — the parent and each op subprocess it
 /// spawns — finds the run log. a deployment's `main` reads this out of its own
@@ -75,9 +75,11 @@ fn jobs() -> Vec<Job> {
             .isolated())
             .build()
             .unwrap(),
-        // something to kill from outside
+        // something to kill from outside. it says so first, because what a
+        // killed process printed before it went is the whole of the evidence
         Job::builder("sleeper")
             .op(Op::new("nap", |_| async {
+                println!("napping, and not expecting to wake up");
                 tokio::time::sleep(Duration::from_secs(120)).await;
                 Ok(json!(null))
             })
@@ -136,6 +138,71 @@ fn jobs() -> Vec<Job> {
             .memory_limit(512 * 1024 * 1024))
             .build()
             .unwrap(),
+        // both pipes, in order, from a body that only ever prints
+        Job::builder("talker")
+            .op(Op::new("say", |_| async {
+                for i in 0..3 {
+                    println!("out {i}");
+                    eprintln!("err {i}");
+                }
+                // no newline on the end: a child that stops mid-line still
+                // said what it managed to say
+                print!("half a line");
+                use std::io::Write;
+                std::io::stdout().flush().unwrap();
+                Ok(json!("said it"))
+            })
+            .isolated())
+            .build()
+            .unwrap(),
+        // more output than the default byte cap allows, from a process that
+        // then finishes perfectly well: capture stopping is not the op failing.
+        //
+        // it floods *both* pipes on purpose, and that is what makes this a
+        // test of the concurrent drain rather than only of the cap: 600 KiB a
+        // side is ten times a pipe buffer, so a parent that read one pipe to
+        // its end before touching the other would leave this child blocked on
+        // a full pipe forever, and the case would hang instead of failing
+        Job::builder("chatty")
+            .op(Op::new("flood", |_| async {
+                for i in 0..100 {
+                    println!("{i:04} {}", "a great deal of output. ".repeat(250));
+                    eprintln!("{i:04} {}", "and rather a lot beside it. ".repeat(214));
+                }
+                Ok(json!("finished anyway"))
+            })
+            .isolated())
+            .build()
+            .unwrap(),
+        // prints, then takes its process down without recording anything
+        Job::builder("dying_words")
+            .op(Op::new("shout", |_| async {
+                println!("about to do the thing");
+                eprintln!("the thing went badly");
+                std::process::abort();
+            })
+            .isolated())
+            .build()
+            .unwrap(),
+        // prints which attempt it is, and fails the first one
+        Job::builder("twice")
+            .op(Op::new("again", |_| async {
+                let marker = marker_named("twice");
+                if !marker.exists() {
+                    std::fs::write(&marker, b"first attempt was here").unwrap();
+                    println!("attempt one, and it is going to fail");
+                    use std::io::Write;
+                    std::io::stdout().flush().unwrap();
+                    std::process::abort();
+                }
+                println!("attempt two, and it worked");
+                Ok(json!("done"))
+            })
+            .isolated()
+            .retries(1)
+            .retry_delay(Duration::from_millis(10)))
+            .build()
+            .unwrap(),
         // and a loop that will never stop on its own
         Job::builder("spinner")
             .op(Op::new("spin", |_| async {
@@ -182,7 +249,11 @@ async fn deaf_to_signals() -> hestan::OpResult {
 /// the file the flaky op's first attempt leaves behind. beside the database,
 /// so every process in the test agrees where it is.
 fn marker() -> PathBuf {
-    PathBuf::from(std::env::var(DB).unwrap() + ".flaky")
+    marker_named("flaky")
+}
+
+fn marker_named(name: &str) -> PathBuf {
+    PathBuf::from(std::env::var(DB).unwrap() + "." + name)
 }
 
 /// record the window this op actually occupied, which is what a pool permit is
@@ -256,6 +327,26 @@ async fn cases(db: &str) {
         the_cpu_limit_bites(&runner),
     )
     .await;
+    case(
+        "both_of_a_childs_pipes_are_captured_in_order",
+        both_pipes_are_captured(&runner),
+    )
+    .await;
+    case(
+        "a_chatty_child_is_capped_and_finishes_anyway",
+        the_cap_holds(&runner),
+    )
+    .await;
+    case(
+        "a_child_that_dies_keeps_what_it_printed",
+        last_words_survive(&runner),
+    )
+    .await;
+    case(
+        "a_retry_captures_its_output_as_a_separate_attempt",
+        attempts_are_separate(&runner),
+    )
+    .await;
 }
 
 // ------------------------------------------------------------------ the cases
@@ -316,6 +407,11 @@ async fn a_kill_is_reported(runner: &Runner) {
         .launch("sleeper", json!({}), Trigger::Manual)
         .unwrap();
     let pid = wait_for_pid(runner, &id, "nap").await;
+    // the row carries a pid the moment the child is spawned, which is a good
+    // while before that child has booted far enough to run the op body. wait
+    // for the line it prints, or this kills a process that has printed nothing
+    // and asserts nothing about what a killed child keeps
+    wait_for_line(runner, &id, "napping").await;
     // SAFETY: kill(2) on a pid this test read off a row that says it is running
     assert_eq!(unsafe { libc::kill(pid, libc::SIGKILL) }, 0, "kill failed");
 
@@ -326,6 +422,12 @@ async fn a_kill_is_reported(runner: &Runner) {
     assert!(
         err.contains("signal 9 (killed)") && err.contains("without recording a result"),
         "an externally killed child was not reported as one: {err}"
+    );
+    // and what it printed before it was killed is still there
+    let lines = runner.store().op_logs(&id, None, 0, 100).unwrap();
+    assert_eq!(
+        said(&lines, LogStream::Stdout),
+        ["napping, and not expecting to wake up"]
     );
 }
 
@@ -467,6 +569,140 @@ async fn the_cpu_limit_bites(runner: &Runner) {
     );
 }
 
+async fn both_pipes_are_captured(runner: &Runner) {
+    let run = runner
+        .run("talker", json!({}), Trigger::Manual)
+        .await
+        .unwrap();
+    assert_eq!(run.status, RunStatus::Success, "{:?}", run.error);
+
+    let lines = runner.store().op_logs(&run.id, None, 0, 1_000).unwrap();
+    assert_eq!(
+        said(&lines, LogStream::Stdout),
+        ["out 0", "out 1", "out 2", "half a line"],
+        "stdout is not in the order the child printed it"
+    );
+    assert_eq!(
+        said(&lines, LogStream::Stderr),
+        ["err 0", "err 1", "err 2"],
+        "stderr is not in the order the child printed it"
+    );
+    // a captured line is the op's own output, not an event: no level, no
+    // target, and the attempt it belongs to
+    assert!(
+        lines
+            .iter()
+            .all(|l| l.level.is_none() && l.target.is_none())
+    );
+    assert!(lines.iter().all(|l| l.attempt == 1 && l.op == "say"));
+
+    // an op that printed nothing has nothing stored, rather than a marker
+    // saying it was quiet
+    let quiet = runner
+        .run("feed", json!({}), Trigger::Manual)
+        .await
+        .unwrap();
+    assert!(
+        runner
+            .store()
+            .op_logs(&quiet.id, None, 0, 100)
+            .unwrap()
+            .is_empty(),
+        "a silent child left rows behind"
+    );
+}
+
+async fn the_cap_holds(runner: &Runner) {
+    let run = runner
+        .run("chatty", json!({}), Trigger::Manual)
+        .await
+        .unwrap();
+    // the op is not the thing that failed here: it printed too much, which is
+    // hestan's problem and not the run's
+    assert_eq!(run.status, RunStatus::Success, "{:?}", run.error);
+    assert_eq!(
+        runner
+            .store()
+            .op_run(&run.id, "flood")
+            .unwrap()
+            .unwrap()
+            .output,
+        Some(json!("finished anyway"))
+    );
+
+    let lines = runner.store().op_logs(&run.id, None, 0, 10_000).unwrap();
+    assert!(
+        lines.len() < 200,
+        "the 1 MiB cap stored all 200 lines: {}",
+        lines.len()
+    );
+    // both pipes were being read, or the child would still be blocked on one
+    assert!(
+        lines.iter().any(|l| l.stream == Some(LogStream::Stdout))
+            && lines.iter().any(|l| l.stream == Some(LogStream::Stderr)),
+        "only one of the two pipes was drained"
+    );
+    let stored: usize = lines.iter().map(|l| l.message.len()).sum();
+    assert!(stored <= (1 << 20) + 8 * 1024, "stored {stored} bytes");
+    // exactly one line explains it, and it is hestan speaking
+    let markers: Vec<&str> = lines
+        .iter()
+        .filter(|l| l.target.as_deref() == Some("hestan"))
+        .map(|l| l.message.as_str())
+        .collect();
+    assert_eq!(markers.len(), 1, "{markers:?}");
+    assert!(markers[0].contains("cap of 1 MiB"), "{}", markers[0]);
+    assert_eq!(lines.last().unwrap().message, markers[0]);
+}
+
+async fn last_words_survive(runner: &Runner) {
+    let run = runner
+        .run("dying_words", json!({}), Trigger::Manual)
+        .await
+        .unwrap();
+    assert_eq!(run.status, RunStatus::Failed);
+    // it recorded no result at all, so what it printed is the whole of what
+    // anyone has to go on
+    let lines = runner.store().op_logs(&run.id, None, 0, 100).unwrap();
+    assert_eq!(said(&lines, LogStream::Stdout), ["about to do the thing"]);
+    assert_eq!(said(&lines, LogStream::Stderr), ["the thing went badly"]);
+}
+
+async fn attempts_are_separate(runner: &Runner) {
+    let _ = std::fs::remove_file(marker_named("twice"));
+    let run = runner
+        .run("twice", json!({}), Trigger::Manual)
+        .await
+        .unwrap();
+    assert_eq!(run.status, RunStatus::Success, "{:?}", run.error);
+
+    let lines = runner
+        .store()
+        .op_logs(&run.id, Some("again"), 0, 100)
+        .unwrap();
+    let by_attempt: Vec<(u32, &str)> = lines
+        .iter()
+        .map(|l| (l.attempt, l.message.as_str()))
+        .collect();
+    assert_eq!(
+        by_attempt,
+        [
+            (1, "attempt one, and it is going to fail"),
+            (2, "attempt two, and it worked"),
+        ],
+        "a retry's output is not separable from the attempt it replaced"
+    );
+}
+
+/// what a child said on one of its pipes, in the order it said it.
+fn said(lines: &[hestan::OpLog], stream: LogStream) -> Vec<&str> {
+    lines
+        .iter()
+        .filter(|l| l.stream == Some(stream))
+        .map(|l| l.message.as_str())
+        .collect()
+}
+
 // ---------------------------------------------------------------- the harness
 
 /// whether a process still exists. a reaped child is gone; an unreaped one is
@@ -511,6 +747,18 @@ async fn wait_for_pid(runner: &Runner, run_id: &str, op: &str) -> libc::pid_t {
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
     panic!("op {op} of run {run_id} never recorded a process");
+}
+
+/// wait until a run has captured a line containing `needle`.
+async fn wait_for_line(runner: &Runner, run_id: &str, needle: &str) {
+    for _ in 0..600 {
+        let lines = runner.store().op_logs(run_id, None, 0, 100).unwrap();
+        if lines.iter().any(|l| l.message.contains(needle)) {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("run {run_id} never printed anything containing {needle}");
 }
 
 async fn wait_terminal(runner: &Runner, id: &str) -> hestan::Run {

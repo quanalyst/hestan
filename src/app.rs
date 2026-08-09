@@ -770,8 +770,8 @@ impl Hestan {
             Ok(crate::isolate::Worked::Success) => 0,
             Ok(crate::isolate::Worked::Failed) => 1,
             // printed rather than traced: a worker whose store or registry is
-            // wrong cannot record anything anywhere, and its stderr is its
-            // parent's stderr
+            // wrong cannot record anything anywhere, and its stderr is piped
+            // by its parent, which stores it as this attempt's output
             Err(e) => {
                 eprintln!("hestan op subprocess: {e}");
                 1

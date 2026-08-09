@@ -2506,7 +2506,7 @@ async fn run_op(
                 // the body runs in a child, which owns the whole of what an
                 // attempt is: its own timeout, its own kill
                 Some(invocation) => {
-                    isolated(&op, &run_id, &name, invocation, &store, &cancel).await
+                    isolated(&op, &run_id, &name, attempt, invocation, &store, &cancel).await
                 }
                 None => {
                     // the call sits inside the async block, so a closure that panics
@@ -2612,21 +2612,24 @@ async fn run_op(
 ///
 /// off unix there is no such thing, and the job build says so long before a run
 /// could reach this — see `validate_isolated`.
+#[allow(clippy::too_many_arguments)]
 async fn isolated(
     op: &Op,
     run_id: &str,
     name: &str,
+    // which attempt this is, because what the child prints is stored under it
+    attempt: u32,
     invocation: &Value,
     store: &Store,
     cancel: &watch::Receiver<bool>,
 ) -> Ended {
     #[cfg(unix)]
     {
-        crate::isolate::attempt(op, run_id, name, invocation, store, cancel).await
+        crate::isolate::attempt(op, run_id, name, attempt, invocation, store, cancel).await
     }
     #[cfg(not(unix))]
     {
-        let _ = (op, run_id, invocation, store, cancel);
+        let _ = (op, run_id, attempt, invocation, store, cancel);
         Ended::Failed(format!(
             "op {name} is isolated, which hestan supports on unix only"
         ))

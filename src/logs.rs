@@ -13,10 +13,6 @@
 //! says so — hestan speaking rather than the op, which is what the `hestan`
 //! target on a row with no stream means.
 
-// the table, the cap and the endpoints land before either writer does, so for
-// exactly one commit the only caller of the cap is its own test
-#![allow(dead_code)]
-
 use std::borrow::Cow;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -151,6 +147,7 @@ impl Budget {
     }
 
     /// whether this attempt has stopped storing.
+    #[cfg(test)]
     pub(crate) fn is_spent(&self) -> bool {
         self.spent
     }
@@ -198,6 +195,66 @@ fn clip(message: &str) -> Cow<'_, str> {
         end -= 1;
     }
     Cow::Owned(format!("{}{CLIPPED}", &message[..end]))
+}
+
+/// a byte stream cut into lines, holding at most one capped line at a time.
+///
+/// `read_until(b'\n')` would be four lines shorter and would also let a child
+/// that never prints a newline grow the parent's heap until it dies. this
+/// keeps at most [`LINE_MAX`] bytes: the line that reaches the limit is handed
+/// over there and then, and the rest of it is dropped up to the next newline
+/// rather than buffered. that also makes the clip *per line* rather than a
+/// long line arriving as a hundred 8 KiB ones.
+#[derive(Default)]
+pub(crate) struct Split {
+    pending: Vec<u8>,
+    /// past the limit, waiting for the newline that ends the line we gave up
+    /// on. the line itself has already been emitted, clipped.
+    dropping: bool,
+}
+
+impl Split {
+    /// feed one read's worth of bytes, calling `line` for each line completed.
+    pub(crate) fn feed(&mut self, chunk: &[u8], mut line: impl FnMut(&str)) {
+        for byte in chunk {
+            if *byte == b'\n' {
+                if self.dropping {
+                    self.dropping = false;
+                } else {
+                    emit(&mut self.pending, &mut line);
+                }
+                continue;
+            }
+            if self.dropping {
+                continue;
+            }
+            self.pending.push(*byte);
+            // clipped here so the rest of this line costs nothing to skip
+            if self.pending.len() >= LINE_MAX {
+                emit(&mut self.pending, &mut line);
+                self.dropping = true;
+            }
+        }
+    }
+
+    /// whatever was still buffered at end of stream: a child that died
+    /// mid-line still said what it managed to say.
+    pub(crate) fn finish(&mut self, mut line: impl FnMut(&str)) {
+        if !self.pending.is_empty() {
+            emit(&mut self.pending, &mut line);
+        }
+    }
+}
+
+/// one line out of the buffer: `\r` dropped so a CRLF child reads right, and
+/// invalid utf-8 replaced rather than dropping the line — a pipe carries
+/// bytes, and a mangled character is worth more than nothing at all.
+fn emit(pending: &mut Vec<u8>, line: &mut impl FnMut(&str)) {
+    if pending.last() == Some(&b'\r') {
+        pending.pop();
+    }
+    line(&String::from_utf8_lossy(pending));
+    pending.clear();
 }
 
 /// a byte count the way a limit is written down, since `1048576` in a log line
@@ -321,6 +378,55 @@ mod tests {
         assert!(rows[0].message.starts_with("éé"));
         // and capture carries on, because one long line is not a cap
         assert_eq!(rows[1].message, "after it");
+    }
+
+    /// what a `Split` makes of a stream arriving in these chunks.
+    fn split(chunks: &[&[u8]]) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut split = Split::default();
+        for chunk in chunks {
+            split.feed(chunk, |line| out.push(line.to_string()));
+        }
+        split.finish(|line| out.push(line.to_string()));
+        out
+    }
+
+    #[test]
+    fn lines_are_cut_wherever_the_reads_landed() {
+        // a line split across three reads is still one line
+        assert_eq!(
+            split(&[b"one\ntw", b"o\nthr", b"ee\n"]),
+            ["one", "two", "three"]
+        );
+        // a child that died mid-line still gets what it wrote
+        assert_eq!(split(&[b"finished\nhalf a li"]), ["finished", "half a li"]);
+        // and one that wrote nothing at all produces nothing, not an empty line
+        assert!(split(&[]).is_empty());
+        assert!(split(&[b""]).is_empty());
+        // an empty line the child really did print is a line
+        assert_eq!(split(&[b"\n\n"]), ["", ""]);
+        // crlf reads as a line ending rather than as a character
+        assert_eq!(split(&[b"windows\r\nnext\r\n"]), ["windows", "next"]);
+    }
+
+    #[test]
+    fn a_child_that_never_prints_a_newline_cannot_grow_the_parent() {
+        let mut split = Split::default();
+        let mut lines = Vec::new();
+        // a megabyte with no newline in it, arriving 4 KiB at a time
+        for _ in 0..256 {
+            split.feed(&[b'x'; 4096], |line| lines.push(line.to_string()));
+            assert!(
+                split.pending.len() <= LINE_MAX,
+                "the buffer grew past one line"
+            );
+        }
+        split.feed(b"\nafter it\n", |line| lines.push(line.to_string()));
+        split.finish(|line| lines.push(line.to_string()));
+        // one clipped line, not two hundred and fifty-six of them
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0].len(), LINE_MAX);
+        assert_eq!(lines[1], "after it");
     }
 
     #[test]
