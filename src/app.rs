@@ -5,13 +5,15 @@ use std::sync::Arc;
 
 use serde_json::Value;
 
-use crate::asset::{Asset, AssetCheck, AssetRegistry, MultiAsset, mats_map, plan_target};
+use crate::asset::{
+    Asset, AssetCheck, AssetRegistry, MultiAsset, asset_tag, mats_map, plan_target,
+};
 use crate::error::Error;
 use crate::executor::{FailureHook, RunFailure, Runner};
 use crate::freshness::{self, LateEvent, LateHook};
 use crate::io::{Io, IoManager};
 use crate::job::Job;
-use crate::model::{Run, Trigger};
+use crate::model::{Run, RunTags, Trigger};
 use crate::resource::{self, Resource, ResourceCtx, ResourceFn};
 use crate::schedule::{self, Schedule, ScheduleEntry};
 use crate::sensor::{RunStatusSensor, Sensor, SensorEntry, run_sensors};
@@ -28,6 +30,7 @@ pub struct Hestan {
     jobs: Vec<Job>,
     schedules: Vec<Schedule>,
     presets: Vec<(String, String, Value)>,
+    run_tags: RunTags,
     assets: Vec<Asset>,
     multis: Vec<MultiAsset>,
     checks: Vec<AssetCheck>,
@@ -52,6 +55,7 @@ impl Default for Hestan {
             jobs: Vec::new(),
             schedules: Vec::new(),
             presets: Vec::new(),
+            run_tags: RunTags::new(),
             assets: Vec::new(),
             multis: Vec::new(),
             checks: Vec::new(),
@@ -306,6 +310,29 @@ impl Hestan {
         self
     }
 
+    /// tag every run this process launches with `tags` — the deployment,
+    /// the region, whatever a run's provenance needs to say. stackable, and a
+    /// repeated key keeps the last.
+    ///
+    /// ```no_run
+    /// # use hestan::Hestan;
+    /// Hestan::new().run_tags([("env", "prod"), ("cluster", "eu-1")]);
+    /// ```
+    ///
+    /// these are **defaults**: a launch that names the same key wins, since a
+    /// default is a fact about the deployment and the launch is closer to the
+    /// truth. automatic tags on machine-made runs win the same way.
+    pub fn run_tags<I, K, V>(mut self, tags: I) -> Self
+    where
+        I: IntoIterator<Item = (K, V)>,
+        K: Into<String>,
+        V: Into<String>,
+    {
+        self.run_tags
+            .extend(tags.into_iter().map(|(k, v)| (k.into(), v.into())));
+        self
+    }
+
     /// register an http source: build lowers it into a job named after the
     /// source, plus a schedule if `cron` was set.
     #[cfg(feature = "http")]
@@ -393,6 +420,7 @@ impl Hestan {
                 plan.seeds,
                 serde_json::json!({}),
                 Trigger::Build,
+                asset_tag(name),
             )
             .await
     }
@@ -580,7 +608,8 @@ impl Hestan {
             }
         }
         let io = Io::new(self.io_default, self.io_named);
-        let runner = Runner::with_resources(jobs, store, self.hooks, self.pools, resources, io)?;
+        let runner = Runner::with_resources(jobs, store, self.hooks, self.pools, resources, io)?
+            .with_run_tags(self.run_tags);
         Ok(Built {
             runner,
             entries,
@@ -784,6 +813,49 @@ mod tests {
         );
         assert_eq!(presets[0].params, json!({"days": 30}));
         assert_eq!(presets[1].params, json!({"days": 7}));
+    }
+
+    // a default says something about the deployment; the launch is closer to
+    // the truth about the run
+    #[tokio::test]
+    async fn default_run_tags_merge_with_per_launch_tags() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hestan.db");
+        let path = path.to_str().unwrap().to_string();
+        Hestan::new()
+            .job(windowed("report"))
+            .run_tags([("env", "prod"), ("cluster", "eu-1")])
+            .run_tags([("cluster", "eu-2")])
+            .db(path.clone())
+            .run_once("report", json!({"days": 1}))
+            .await
+            .unwrap();
+
+        let store = Store::open(&path).unwrap();
+        let run = &store.runs(None, None, None, None, None, 10).unwrap()[0];
+        // stackable, last wins within the defaults themselves
+        assert_eq!(run.tags["env"], "prod");
+        assert_eq!(run.tags["cluster"], "eu-2");
+        drop(store);
+
+        // and a launch that names a default's key overrides it for that run
+        let store = Store::open(&path).unwrap();
+        let runner = Runner::new(vec![windowed("report")], store.clone())
+            .with_run_tags(RunTags::from([("env".to_string(), "prod".to_string())]));
+        let id = runner
+            .launch_tagged(
+                "report",
+                json!({"days": 1}),
+                Trigger::Manual,
+                RunTags::from([
+                    ("env".to_string(), "staging".to_string()),
+                    ("kind".to_string(), "smoke".to_string()),
+                ]),
+            )
+            .unwrap();
+        let tags = store.run(&id).unwrap().unwrap().tags;
+        assert_eq!(tags["env"], "staging");
+        assert_eq!(tags["kind"], "smoke");
     }
 
     #[tokio::test]

@@ -18,7 +18,7 @@ use crate::asset::{
 use crate::backoff::{capped_exponential, full_jitter};
 use crate::error::Error;
 use crate::executor::Runner;
-use crate::model::{Run, RunCursor, RunStatus, SensorOutcome, Trigger};
+use crate::model::{Run, RunCursor, RunStatus, RunTags, SensorOutcome, Trigger};
 use crate::op::InputError;
 use crate::store::RunKey;
 
@@ -716,6 +716,12 @@ async fn evaluate(entry: &SensorEntry, runner: &Runner, registry: &AssetRegistry
     outcome
 }
 
+/// the tag every sensor-launched run carries. `Trigger::Sensor` says a sensor
+/// did it; this says which one, which is what you actually want at 3am.
+fn sensor_tag(sensor: &str) -> RunTags {
+    RunTags::from([("sensor".to_string(), sensor.to_string())])
+}
+
 /// what launching one request did.
 enum Fired {
     Launched,
@@ -734,7 +740,7 @@ fn launch_request(sensor: &str, req: RunRequest, runner: &Runner) -> Result<Fire
     let RunRequest { job, params, key } = req;
     let fail = |e: Error| format!("launch of job {job:?} failed: {e}");
     let Some(key) = key.as_deref() else {
-        return match runner.launch(&job, params, Trigger::Sensor) {
+        return match runner.launch_tagged(&job, params, Trigger::Sensor, sensor_tag(sensor)) {
             Ok(run_id) => {
                 tracing::info!(sensor = %sensor, job = %job, run = %run_id, "sensor fired");
                 Ok(Fired::Launched)
@@ -750,7 +756,13 @@ fn launch_request(sensor: &str, req: RunRequest, runner: &Runner) -> Result<Fire
         Ok(false) => {}
         Err(e) => return Err(format!("run key read failed: {e}")),
     }
-    match runner.launch_keyed(&job, params, Trigger::Sensor, RunKey { sensor, key }) {
+    match runner.launch_keyed(
+        &job,
+        params,
+        Trigger::Sensor,
+        RunKey { sensor, key },
+        sensor_tag(sensor),
+    ) {
         Ok(Some(run_id)) => {
             tracing::info!(sensor = %sensor, job = %job, key = %key, run = %run_id, "sensor fired");
             Ok(Fired::Launched)
@@ -1033,7 +1045,9 @@ fn launch_stale_auto(
         return Ok(0);
     }
     let plan = plan_targets(registry, &mats, &targets).map_err(|e| e.to_string())?;
-    let run_id = launch_plan(runner, plan, Trigger::Build)
+    // a probe is a sensor named after the source it watches, and `build` does
+    // not say which one woke this up
+    let run_id = launch_plan(runner, plan, Trigger::Build, sensor_tag(asset))
         .map_err(|e| format!("auto build of {} failed: {e}", targets.join(", ")))?;
     tracing::info!(assets = %targets.join(", "), run = %run_id, "auto build launched");
     Ok(1)
@@ -1088,6 +1102,39 @@ mod tests {
             .cursor
     }
 
+    // `sensor` as a trigger says a sensor did it; the tag says which one,
+    // which is the question you actually have at 3am
+    #[tokio::test]
+    async fn a_sensor_launched_run_is_tagged_with_the_sensor_name() {
+        let store = Store::open(":memory:").unwrap();
+        store.sync_sensors(&["watch".into()]).unwrap();
+        let runner = echo_runner(store.clone());
+        let entry = SensorEntry::user(Sensor::new(
+            "watch",
+            Duration::from_secs(3600),
+            |_ctx: SensorCtx| async move {
+                Ok(vec![
+                    RunRequest::new("etl"),
+                    // keyed and keyless take different launch paths; both tag
+                    RunRequest::new("etl").key("2026-08-09"),
+                ])
+            },
+        ));
+        evaluate(&entry, &runner, &AssetRegistry::empty()).await;
+
+        let runs = store
+            .runs(None, None, None, None, Some(("sensor", "watch")), 10)
+            .unwrap();
+        assert_eq!(runs.len(), 2);
+        assert!(runs.iter().all(|r| r.trigger == Trigger::Sensor));
+        assert!(
+            store
+                .runs(None, None, None, None, Some(("sensor", "other")), 10)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
     // a sensor names its own params per request; nothing about the schedule
     // path applies here, and the launch validates them like any other
     #[tokio::test]
@@ -1110,7 +1157,7 @@ mod tests {
         let ticks = store.sensor_ticks(Some("watch"), 10).unwrap();
         assert_eq!(ticks[0].outcome, SensorOutcome::Fired);
         assert_eq!(ticks[0].launched, 2);
-        let runs = store.runs(None, None, None, None, 10).unwrap();
+        let runs = store.runs(None, None, None, None, None, 10).unwrap();
         assert_eq!(runs.len(), 2);
         assert!(runs.iter().all(|r| r.trigger == Trigger::Sensor));
         for run in &runs {
@@ -1175,7 +1222,12 @@ mod tests {
         assert_eq!(ticks[1].launched, 0);
         assert_eq!(ticks[2].outcome, SensorOutcome::Error);
         assert_eq!(ticks[2].error.as_deref(), Some("flaky"));
-        assert!(store.runs(None, None, None, None, 10).unwrap().is_empty());
+        assert!(
+            store
+                .runs(None, None, None, None, None, 10)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[tokio::test]
@@ -1193,7 +1245,7 @@ mod tests {
         ));
         evaluate(&entry, &runner, &AssetRegistry::empty()).await;
 
-        let runs = store.runs(None, None, None, None, 10).unwrap();
+        let runs = store.runs(None, None, None, None, None, 10).unwrap();
         assert_eq!(runs.len(), 1);
         assert_eq!(runs[0].trigger, Trigger::Sensor);
         assert_eq!(runs[0].params, json!({"n": 4}));
@@ -1261,7 +1313,7 @@ mod tests {
         assert_eq!(docs.fingerprint, "one");
         assert_eq!(docs.value, None);
         assert_eq!(docs.run_id, None);
-        let runs = store.runs(None, None, None, None, 10).unwrap();
+        let runs = store.runs(None, None, None, None, None, 10).unwrap();
         assert_eq!(runs.len(), 1);
         assert_eq!(runs[0].trigger, Trigger::Build);
         assert_eq!(
@@ -1276,7 +1328,10 @@ mod tests {
         assert_eq!(ticks[0].launched, 1);
 
         evaluate(&entry, &runner, &reg).await;
-        assert_eq!(store.runs(None, None, None, None, 10).unwrap().len(), 1);
+        assert_eq!(
+            store.runs(None, None, None, None, None, 10).unwrap().len(),
+            1
+        );
         let docs_again = store.materialization("docs", None).unwrap().unwrap();
         assert_eq!(docs_again.built_at, docs.built_at);
         let ticks = store.sensor_ticks(Some("probe:docs"), 10).unwrap();
@@ -1294,7 +1349,7 @@ mod tests {
                 .fingerprint,
             "two"
         );
-        let runs = store.runs(None, None, None, None, 10).unwrap();
+        let runs = store.runs(None, None, None, None, None, 10).unwrap();
         assert_eq!(runs.len(), 2);
         assert_eq!(
             wait_terminal(&runner, &runs[0].id).await,
@@ -1338,7 +1393,7 @@ mod tests {
         let entry = probe_entry(&reg, "s");
 
         evaluate(&entry, &runner, &reg).await;
-        let runs = store.runs(None, None, None, None, 10).unwrap();
+        let runs = store.runs(None, None, None, None, None, 10).unwrap();
         assert_eq!(runs.len(), 1);
         let ops = store.op_runs(&runs[0].id).unwrap();
         let names: Vec<&str> = ops.iter().map(|o| o.op.as_str()).collect();
@@ -1377,6 +1432,7 @@ mod tests {
             error: None,
             resumed_from: None,
             scheduled_for: None,
+            tags: Default::default(),
         };
         store.create_run(&active, &[]).unwrap();
         evaluate(&entry, &runner, &reg).await;
@@ -1391,7 +1447,10 @@ mod tests {
         let ticks = store.sensor_ticks(Some("probe:docs"), 10).unwrap();
         assert_eq!(ticks[0].outcome, SensorOutcome::Fired);
         assert_eq!(ticks[0].launched, 0);
-        assert_eq!(store.runs(None, None, None, None, 10).unwrap().len(), 1);
+        assert_eq!(
+            store.runs(None, None, None, None, None, 10).unwrap().len(),
+            1
+        );
 
         // the next tick sees an unchanged fingerprint and still catches up
         store
@@ -1401,7 +1460,7 @@ mod tests {
         let ticks = store.sensor_ticks(Some("probe:docs"), 10).unwrap();
         assert_eq!(ticks[0].outcome, SensorOutcome::Fired);
         assert_eq!(ticks[0].launched, 1);
-        let runs = store.runs(None, None, None, None, 10).unwrap();
+        let runs = store.runs(None, None, None, None, None, 10).unwrap();
         assert_eq!(runs.len(), 2);
         let build = runs.iter().find(|r| r.id != "active").unwrap();
         assert_eq!(wait_terminal(&runner, &build.id).await, RunStatus::Success);
@@ -1437,14 +1496,19 @@ mod tests {
                 .fingerprint,
             "one"
         );
-        assert!(store.runs(None, None, None, None, 10).unwrap().is_empty());
+        assert!(
+            store
+                .runs(None, None, None, None, None, 10)
+                .unwrap()
+                .is_empty()
+        );
 
         let runner = Runner::new([reg.lower_job().unwrap()], store.clone());
         evaluate(&entry, &runner, &reg).await;
         let ticks = store.sensor_ticks(Some("probe:docs"), 10).unwrap();
         assert_eq!(ticks[0].outcome, SensorOutcome::Fired);
         assert_eq!(ticks[0].launched, 1);
-        let runs = store.runs(None, None, None, None, 10).unwrap();
+        let runs = store.runs(None, None, None, None, None, 10).unwrap();
         assert_eq!(runs.len(), 1);
         assert_eq!(
             wait_terminal(&runner, &runs[0].id).await,
@@ -1548,7 +1612,9 @@ mod tests {
     /// what the chain launched, oldest first — sensor-triggered only, so a
     /// manual `publish` planted by a test is not mistaken for a chained one.
     fn published(store: &Store) -> Vec<Value> {
-        let mut runs = store.runs(Some("publish"), None, None, None, 20).unwrap();
+        let mut runs = store
+            .runs(Some("publish"), None, None, None, None, 20)
+            .unwrap();
         runs.retain(|r| r.trigger == Trigger::Sensor);
         runs.sort_by_key(|r| r.created_at);
         runs.into_iter().map(|r| r.params).collect()
@@ -1672,7 +1738,10 @@ mod tests {
         let seed = finish(&runner, "publish", json!({"manual": true})).await;
         for _ in 0..4 {
             evaluate(&entry, &runner, &reg).await;
-            for run in store.runs(Some("publish"), None, None, None, 20).unwrap() {
+            for run in store
+                .runs(Some("publish"), None, None, None, None, 20)
+                .unwrap()
+            {
                 wait_terminal(&runner, &run.id).await;
             }
         }
@@ -1793,7 +1862,7 @@ mod tests {
     }
 
     fn launched_kinds(store: &Store) -> Vec<String> {
-        let mut runs = store.runs(None, None, None, None, 20).unwrap();
+        let mut runs = store.runs(None, None, None, None, None, 20).unwrap();
         runs.sort_by_key(|r| r.created_at);
         runs.iter()
             .map(|r| r.params["kind"].as_str().unwrap_or("?").to_string())
@@ -1850,7 +1919,12 @@ mod tests {
         let ticks = store.sensor_ticks(Some("watch"), 10).unwrap();
         assert_eq!(ticks[0].outcome, SensorOutcome::Error);
         assert_eq!((ticks[0].launched, ticks[0].skipped), (0, 0));
-        assert!(store.runs(None, None, None, None, 10).unwrap().is_empty());
+        assert!(
+            store
+                .runs(None, None, None, None, None, 10)
+                .unwrap()
+                .is_empty()
+        );
         assert!(
             !store.run_key_claimed("watch", "once").unwrap(),
             "a key outlived the launch it was supposed to record"
@@ -2083,7 +2157,12 @@ mod tests {
             ticks[0].error
         );
         assert_eq!(cursor_of(&store, "stuck"), None);
-        assert!(store.runs(None, None, None, None, 10).unwrap().is_empty());
+        assert!(
+            store
+                .runs(None, None, None, None, None, 10)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[tokio::test]
@@ -2249,7 +2328,12 @@ mod tests {
             0,
             "a paused flag nobody could read let the sensor fire"
         );
-        assert!(store.runs(None, None, None, None, 10).unwrap().is_empty());
+        assert!(
+            store
+                .runs(None, None, None, None, None, 10)
+                .unwrap()
+                .is_empty()
+        );
         assert!(store.sensor_ticks(Some("watch"), 10).unwrap().is_empty());
     }
 

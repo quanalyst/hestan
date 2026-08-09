@@ -9,8 +9,8 @@ use serde_json::Value;
 use crate::error::Error;
 use crate::model::{
     AssetCheckRow, Backfill, BackfillStatus, CheckStatus, Event, EventKind, EventLevel,
-    FreshnessRow, Materialization, OpRun, OpStatus, Preset, Run, RunCursor, RunStatus, ScheduleRow,
-    SensorOutcome, SensorRow, SensorTick, Severity, Tick, TickOutcome,
+    FreshnessRow, Materialization, OpRun, OpStatus, Preset, Run, RunCursor, RunStatus, RunTags,
+    ScheduleRow, SensorOutcome, SensorRow, SensorTick, Severity, Tick, TickOutcome,
 };
 use crate::schedule::Schedule;
 
@@ -386,8 +386,8 @@ impl Store {
         }
         tx.execute(
             r#"INSERT INTO runs (id, job, status, "trigger", params, created_at, started_at,
-                                 finished_at, error, resumed_from, scheduled_for)
-               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)"#,
+                                 finished_at, error, resumed_from, scheduled_for, tags)
+               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)"#,
             params![
                 run.id,
                 run.job,
@@ -400,6 +400,7 @@ impl Store {
                 run.error,
                 run.resumed_from,
                 run.scheduled_for.map(|t| t.to_rfc3339()),
+                tags_col(&run.tags),
             ],
         )?;
         {
@@ -871,7 +872,7 @@ impl Store {
         let run = conn
             .query_row(
                 r#"SELECT id, job, status, "trigger", params, created_at, started_at, finished_at,
-                          resumed_from, error, scheduled_for
+                          resumed_from, error, scheduled_for, tags
                    FROM runs WHERE id = ?1"#,
                 params![id],
                 run_from_row,
@@ -882,27 +883,36 @@ impl Store {
 
     // created_at is always rfc3339 utc, so the comparisons below are plain string
     // ordering; `before_id` only refines `before`, never stands alone
+    #[allow(clippy::too_many_arguments)]
     pub fn runs(
         &self,
         job: Option<&str>,
         since: Option<DateTime<Utc>>,
         before: Option<DateTime<Utc>>,
         before_id: Option<&str>,
+        tag: Option<(&str, &str)>,
         limit: u32,
     ) -> Result<Vec<Run>, Error> {
         let conn = self.0.lock().unwrap();
         let mut stmt = conn.prepare(
             r#"SELECT id, job, status, "trigger", params, created_at, started_at, finished_at,
-                      resumed_from, error, scheduled_for
+                      resumed_from, error, scheduled_for, tags
                FROM runs
                WHERE (?1 IS NULL OR job = ?1) AND (?2 IS NULL OR created_at >= ?2)
                  AND (?3 IS NULL OR created_at < ?3
                       OR (?4 IS NOT NULL AND created_at = ?3 AND id < ?4))
-               ORDER BY created_at DESC, id DESC LIMIT ?5"#,
+                 AND (?5 IS NULL OR EXISTS (
+                      SELECT 1 FROM json_each(runs.tags)
+                      WHERE json_each.key = ?5 AND json_each.value = ?6))
+               ORDER BY created_at DESC, id DESC LIMIT ?7"#,
         )?;
         let since = since.map(|t| t.to_rfc3339());
         let before = before.map(|t| t.to_rfc3339());
-        let rows = stmt.query_map(params![job, since, before, before_id, limit], run_from_row)?;
+        let (key, value) = (tag.map(|t| t.0), tag.map(|t| t.1));
+        let rows = stmt.query_map(
+            params![job, since, before, before_id, key, value, limit],
+            run_from_row,
+        )?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 
@@ -924,7 +934,7 @@ impl Store {
         let conn = self.0.lock().unwrap();
         let mut stmt = conn.prepare(
             r#"SELECT id, job, status, "trigger", params, created_at, started_at, finished_at,
-                      resumed_from, error, scheduled_for
+                      resumed_from, error, scheduled_for, tags
                FROM runs
                WHERE status IN ('success', 'failed', 'canceled') AND finished_at IS NOT NULL
                  AND (?1 IS NULL OR job = ?1)
@@ -1573,7 +1583,24 @@ fn run_from_row(row: &Row) -> rusqlite::Result<Run> {
         resumed_from: row.get(8)?,
         error: row.get(9)?,
         scheduled_for: opt_ts_col(row, 10)?,
+        tags: tags_from_col(row, 11)?,
     })
+}
+
+/// a tag map as it is stored, or `None` when it is empty — a null column, not
+/// an empty object, so an untagged run and a run written before tags existed
+/// are the same row.
+fn tags_col(tags: &RunTags) -> Option<String> {
+    (!tags.is_empty()).then(|| serde_json::to_string(tags).expect("string map serializes"))
+}
+
+// null and anything that is not a flat string map read as no tags: the column
+// is a fact about a run, and a run is not worth failing to list over it
+fn tags_from_col(row: &Row, idx: usize) -> rusqlite::Result<RunTags> {
+    match row.get::<_, Option<String>>(idx)? {
+        Some(s) => Ok(serde_json::from_str(&s).unwrap_or_default()),
+        None => Ok(RunTags::new()),
+    }
 }
 
 fn op_run_from_row(row: &Row) -> rusqlite::Result<OpRun> {
@@ -1748,6 +1775,7 @@ mod tests {
             error: None,
             resumed_from: None,
             scheduled_for: None,
+            tags: Default::default(),
         }
     }
 
@@ -1852,15 +1880,18 @@ mod tests {
             store.create_run(&run, &[]).unwrap();
         }
 
-        let etl = store.runs(Some("etl"), None, None, None, 10).unwrap();
+        let etl = store.runs(Some("etl"), None, None, None, None, 10).unwrap();
         assert_eq!(
             etl.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(),
             ["r3", "r1", "r0"]
         );
-        assert_eq!(store.runs(None, None, None, None, 2).unwrap().len(), 2);
+        assert_eq!(
+            store.runs(None, None, None, None, None, 2).unwrap().len(),
+            2
+        );
         assert!(
             store
-                .runs(Some("nope"), None, None, None, 10)
+                .runs(Some("nope"), None, None, None, None, 10)
                 .unwrap()
                 .is_empty()
         );
@@ -1876,14 +1907,14 @@ mod tests {
         }
 
         let since = t0 + chrono::Duration::minutes(2);
-        let recent = store.runs(None, Some(since), None, None, 10).unwrap();
+        let recent = store.runs(None, Some(since), None, None, None, 10).unwrap();
         assert_eq!(
             recent.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(),
             ["r3", "r2"]
         );
 
         let etl = store
-            .runs(Some("etl"), Some(since), None, None, 10)
+            .runs(Some("etl"), Some(since), None, None, None, 10)
             .unwrap();
         assert_eq!(
             etl.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(),
@@ -1893,7 +1924,7 @@ mod tests {
         let future = t0 + chrono::Duration::hours(1);
         assert!(
             store
-                .runs(None, Some(future), None, None, 10)
+                .runs(None, Some(future), None, None, None, 10)
                 .unwrap()
                 .is_empty()
         );
@@ -1909,7 +1940,9 @@ mod tests {
         }
 
         let before = t0 + chrono::Duration::minutes(2);
-        let older = store.runs(None, None, Some(before), None, 10).unwrap();
+        let older = store
+            .runs(None, None, Some(before), None, None, 10)
+            .unwrap();
         assert_eq!(
             older.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(),
             ["r1", "r0"]
@@ -1917,20 +1950,20 @@ mod tests {
 
         let since = t0 + chrono::Duration::minutes(1);
         let etl = store
-            .runs(Some("etl"), Some(since), Some(before), None, 10)
+            .runs(Some("etl"), Some(since), Some(before), None, None, 10)
             .unwrap();
         assert_eq!(
             etl.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(),
             ["r1"]
         );
 
-        let page = store.runs(None, None, None, None, 2).unwrap();
+        let page = store.runs(None, None, None, None, None, 2).unwrap();
         assert_eq!(
             page.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(),
             ["r3", "r2"]
         );
         let next = store
-            .runs(None, None, Some(page[1].created_at), None, 2)
+            .runs(None, None, Some(page[1].created_at), None, None, 2)
             .unwrap();
         assert_eq!(
             next.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(),
@@ -1953,9 +1986,9 @@ mod tests {
         loop {
             let page = match &cursor {
                 Some((ts, id)) => store
-                    .runs(None, None, Some(*ts), Some(id.as_str()), 1)
+                    .runs(None, None, Some(*ts), Some(id.as_str()), None, 1)
                     .unwrap(),
-                None => store.runs(None, None, None, None, 1).unwrap(),
+                None => store.runs(None, None, None, None, None, 1).unwrap(),
             };
             let Some(run) = page.into_iter().next() else {
                 break;
@@ -2291,6 +2324,61 @@ mod tests {
     }
 
     #[test]
+    fn run_tags_round_trip_and_the_filter_matches_exactly() {
+        let store = Store::open(":memory:").unwrap();
+        let tagged = |id: &str, tags: RunTags| {
+            let mut run = mk_run(id, "etl", Utc::now());
+            run.tags = tags;
+            store.create_run(&run, &[]).unwrap();
+        };
+        tagged(
+            "r1",
+            RunTags::from([
+                ("kind".to_string(), "backfill".to_string()),
+                ("env".to_string(), "prod".to_string()),
+            ]),
+        );
+        tagged("r2", RunTags::from([("kind".to_string(), "smoke".into())]));
+        tagged("r3", RunTags::new());
+
+        let read = store.run("r1").unwrap().unwrap().tags;
+        assert_eq!(read["kind"], "backfill");
+        assert_eq!(read["env"], "prod");
+        // an untagged run reads as no tags, not as a null anything
+        assert!(store.run("r3").unwrap().unwrap().tags.is_empty());
+
+        let ids = |tag: Option<(&str, &str)>| -> Vec<String> {
+            store
+                .runs(None, None, None, None, tag, 10)
+                .unwrap()
+                .into_iter()
+                .map(|r| r.id)
+                .collect()
+        };
+        assert_eq!(ids(Some(("kind", "backfill"))), ["r1"]);
+        assert_eq!(ids(Some(("env", "prod"))), ["r1"]);
+        // exactly: neither a different value nor a prefix of one matches, and
+        // an unknown key matches nothing rather than everything
+        assert!(ids(Some(("kind", "back"))).is_empty());
+        assert!(ids(Some(("kind", "backfills"))).is_empty());
+        assert!(ids(Some(("kind", "prod"))).is_empty());
+        assert!(ids(Some(("ghost", "backfill"))).is_empty());
+        // and no filter is still every run, tagged or not
+        assert_eq!(ids(None).len(), 3);
+
+        // the filter composes with the others rather than replacing them
+        let run = mk_run("r4", "other", Utc::now());
+        store.create_run(&run, &[]).unwrap();
+        assert_eq!(
+            store
+                .runs(Some("etl"), None, None, None, Some(("kind", "smoke")), 10)
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
     fn presets_are_stored_upserted_and_deleted_per_job() {
         let store = Store::open(":memory:").unwrap();
         assert!(store.presets("etl").unwrap().is_empty());
@@ -2519,7 +2607,7 @@ mod tests {
             Some("r1".to_string())
         );
         assert_eq!(
-            store.runs(None, None, None, None, 10).unwrap()[0].resumed_from,
+            store.runs(None, None, None, None, None, 10).unwrap()[0].resumed_from,
             Some("r1".to_string())
         );
     }
@@ -2558,7 +2646,7 @@ mod tests {
             Some("op a failed: boom")
         );
         assert_eq!(
-            store.runs(None, None, None, None, 10).unwrap()[0]
+            store.runs(None, None, None, None, None, 10).unwrap()[0]
                 .error
                 .as_deref(),
             Some("op a failed: boom")

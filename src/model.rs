@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
@@ -297,6 +298,15 @@ impl Serialize for Catchup {
     }
 }
 
+/// the flat `{"k": "v"}` map a run carries: what
+/// [`trigger`](Trigger) cannot say about why a run exists. set at launch, from
+/// [`Hestan::run_tags`](crate::Hestan::run_tags) defaults, and automatically
+/// on machine-made runs.
+///
+/// a `BTreeMap` rather than a `Value` because the shape is the promise: flat,
+/// string to string, and stably ordered wherever it is written or shown.
+pub type RunTags = BTreeMap<String, String>;
+
 #[derive(Debug, Clone, Serialize)]
 pub struct Run {
     pub id: String,
@@ -318,6 +328,10 @@ pub struct Run {
     /// launch, a retry, a resume, a build or a sensor fire, which represent
     /// nothing but themselves.
     pub scheduled_for: Option<DateTime<Utc>>,
+    /// what this run was [tagged](RunTags) with; empty on an untagged run,
+    /// which is what an untagged launch and every run older than tags both
+    /// read as.
+    pub tags: RunTags,
 }
 
 /// a named parameter set stored against one job: what

@@ -153,6 +153,9 @@ export interface Run {
   // the cron occurrence this run stands for, not the clock it launched at;
   // null on a manual launch, retry, resume, build or sensor fire
   scheduled_for: string | null;
+  // flat key:value marks on the run: set at launch, defaulted process-wide,
+  // and set automatically on machine-made runs. {} on an untagged run
+  tags: Record<string, string>;
 }
 
 // what a resume would do: ops it executes, ops it seeds from a recorded output

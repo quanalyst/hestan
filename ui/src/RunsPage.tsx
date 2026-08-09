@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import type { MouseEvent as ReactMouseEvent } from "react";
 import { Link, useNavigate, useSearchParams } from "react-router-dom";
-import { get, post, usePoll } from "./api";
+import { get, HttpError, post, usePoll } from "./api";
 import StatusDot from "./StatusDot";
 import type { Run } from "./types";
 import { durationMs, fmtDuration, isTerminal, relTime, shortId } from "./util";
@@ -41,6 +41,21 @@ function FilterGroup<T extends string>({
 
 const isActive = (r: Run) => r.status === "queued" || r.status === "running";
 
+// muted key:value chips, in the stable order the api sends them in
+function TagChips({ tags }: { tags: Record<string, string> }) {
+  const pairs = Object.entries(tags);
+  if (pairs.length === 0) return null;
+  return (
+    <>
+      {pairs.map(([k, v]) => (
+        <span key={k} className="run-tag mono">
+          {k}:{v}
+        </span>
+      ))}
+    </>
+  );
+}
+
 export default function RunsPage() {
   const nav = useNavigate();
   const [search] = useSearchParams();
@@ -55,21 +70,27 @@ export default function RunsPage() {
   const [trigger, setTrigger] = useState<(typeof TRIGGERS)[number]>("all");
   const [win, setWin] = useState<(typeof WINDOWS)[number]["label"]>("all");
   const [q, setQ] = useState("");
+  // unlike the others this one is served: tags are not in the polled page
+  // unless the server was asked for them
+  const [tag, setTag] = useState("");
+  const [tagQ, setTagQ] = useState("");
+  const [tagErr, setTagErr] = useState<string | null>(null);
   const [busyId, setBusyId] = useState<string | null>(null);
   const [rowErr, setRowErr] = useState<{ id: string; msg: string } | null>(null);
   const [now, setNow] = useState(() => Date.now());
   const jobQ = job ? `&job=${encodeURIComponent(job)}` : "";
+  const tagParam = tagQ ? `&tag=${encodeURIComponent(tagQ)}` : "";
 
   useEffect(() => {
     headRef.current = null;
     setHead(null);
     setTail([]);
     setExhausted(false);
-  }, [job]);
+  }, [job, tagQ]);
 
   usePoll(
     () => {
-      get<{ runs: Run[] }>(`/api/runs?limit=${PAGE}${jobQ}`)
+      get<{ runs: Run[] }>(`/api/runs?limit=${PAGE}${jobQ}${tagParam}`)
         .then((r) => {
           // rows new runs push off the head page fall into the gap before the tail
           const prev = headRef.current;
@@ -85,11 +106,16 @@ export default function RunsPage() {
           }
           headRef.current = r.runs;
           setHead(r.runs);
+          setTagErr(null);
         })
-        .catch(() => {});
+        // a refused tag has to say so: the alternative is a list that quietly
+        // stays as it was and looks like an answer
+        .catch((e) => {
+          if (e instanceof HttpError && e.status === 400) setTagErr(e.message);
+        });
     },
     5000,
-    [job],
+    [job, tagParam],
   );
 
   const hasActive = (head ?? []).some(isActive) || tail.some(isActive);
@@ -129,7 +155,7 @@ export default function RunsPage() {
       // before_id breaks created_at ties so simultaneous runs never drop out
       const r = await get<{ runs: Run[] }>(
         `/api/runs?limit=${PAGE}&before=${encodeURIComponent(oldest.created_at)}` +
-          `&before_id=${encodeURIComponent(oldest.id)}${jobQ}`,
+          `&before_id=${encodeURIComponent(oldest.id)}${jobQ}${tagParam}`,
       );
       setTail((t) => [...t, ...r.runs]);
       if (r.runs.length < PAGE) setExhausted(true);
@@ -166,8 +192,11 @@ export default function RunsPage() {
           </span>
         )}
       </h1>
+      {tagErr && <p className="muted">{tagErr}</p>}
       {runs.length === 0 ? (
-        <p className="muted">no runs yet — launch one from a job page</p>
+        <p className="muted">
+          {tagQ ? `no runs tagged ${tagQ}` : "no runs yet — launch one from a job page"}
+        </p>
       ) : (
         <>
           {active.length > 0 && (
@@ -187,6 +216,25 @@ export default function RunsPage() {
             <FilterGroup label="status" value={status} options={STATUSES} onPick={setStatus} />
             <FilterGroup label="trigger" value={trigger} options={TRIGGERS} onPick={setTrigger} />
             <FilterGroup label="window" value={win} options={WINDOWS.map((w) => w.label)} onPick={setWin} />
+            <span className="filter-group">
+              <span className="filter-label">tag</span>
+              <input
+                className="filter-input"
+                value={tag}
+                placeholder="key:value"
+                onChange={(e) => setTag(e.target.value)}
+                onKeyDown={(e) => {
+                  // the server owns this filter, so it applies on enter rather
+                  // than on every keystroke
+                  if (e.key === "Enter") setTagQ(tag.trim());
+                  if (e.key === "Escape") {
+                    setTag("");
+                    setTagQ("");
+                  }
+                }}
+                onBlur={() => setTagQ(tag.trim())}
+              />
+            </span>
             <span className="filter-group">
               <span className="filter-label">find</span>
               <input
@@ -224,7 +272,10 @@ export default function RunsPage() {
                         <StatusDot status={run.status} />
                       </td>
                       <td className="mono">{shortId(run.id)}</td>
-                      <td>{run.job}</td>
+                      <td>
+                        {run.job}
+                        <TagChips tags={run.tags} />
+                      </td>
                       <td>{run.trigger}</td>
                       <td className="muted">{relTime(run.started_at ?? run.created_at)}</td>
                       <td className="num">

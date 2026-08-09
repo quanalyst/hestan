@@ -111,3 +111,54 @@ pointed at, never refused, since the schema does not decide what launches.
 
 it is deliberately a legend and not a form builder. json is what the api takes
 and what a preset stores, so the editor stays the thing you edit.
+
+## Run tags
+
+a tag is a flat `{"k": "v"}` mark on a run. `trigger` already says *what kind
+of thing* launched it — schedule, sensor, build, resume — and tags say the rest:
+this is a backfill, this was a manual smoke test, this one belongs to backfill
+41.
+
+set them at launch:
+
+```
+POST /api/jobs/orders_etl/runs  {"params": {...}, "tags": {"kind": "smoke"}}
+```
+
+or process-wide, for facts about the deployment rather than the run:
+
+```rust
+Hestan::new().run_tags([("env", "prod"), ("cluster", "eu-1")])
+```
+
+defaults are **defaults**: a launch naming the same key wins, since a default
+describes the deployment and the launch is closer to the truth about the run.
+
+### automatic tags
+
+machine-made runs are tagged with what `trigger` cannot say, and nothing more:
+
+| run | tags | why |
+| --- | --- | --- |
+| sensor launch | `sensor: {name}` | `sensor` says a sensor did it, not which |
+| probe auto build | `sensor: {source}` | a probe is a sensor named after its source |
+| backfill chunk | `asset: {name}`, `backfill: {id}` | a chunk you cannot trace back to its backfill is a run adrift |
+| build of one asset | `asset: {name}` | `build` does not say what was asked for |
+
+a build of *everything* stale carries no `asset` tag: there is no single asset
+to name, and inventing one would be worse than the silence. nothing tags a
+manual launch, a schedule fire or a retry — `trigger` already says all there is
+to say about those.
+
+### filtering
+
+`GET /api/runs?tag=key:value` matches exactly — not a prefix, not a substring —
+and composes with `job`, `since`, `before` and paging. the split is at the
+*first* colon, so a value may contain one (`at:12:30` is `at` = `12:30`). a
+`tag` that is not a `key:value` pair is a 400 rather than a filter quietly
+doing nothing.
+
+runs carry `tags` in their json, `{}` when untagged. the runs page has a tag
+box beside the other filters — served, unlike the rest, since a tag the page
+never fetched cannot be filtered for client-side — and shows each run's tags as
+muted `key:value` chips.

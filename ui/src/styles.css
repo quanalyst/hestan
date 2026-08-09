@@ -993,6 +993,13 @@ textarea.params-input::placeholder {
   font-size: 12px;
 }
 
+/* a run's tags, muted enough to read past when you are not looking for them */
+.run-tag {
+  margin-left: 8px;
+  color: var(--muted);
+  font-size: 11px;
+}
+
 /* the schema as a legend under the editor: one line a field */
 .params-fields {
   margin-top: 6px;

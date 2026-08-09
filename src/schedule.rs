@@ -586,7 +586,7 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(2600)).await;
         sched.abort();
 
-        let runs = store.runs(None, None, None, None, 10).unwrap();
+        let runs = store.runs(None, None, None, None, None, 10).unwrap();
         assert_eq!(runs.len(), 1);
         let ticks = store.ticks(Some("slow"), 10).unwrap();
         assert_eq!(
@@ -608,7 +608,7 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(4500)).await;
         sched.abort();
 
-        let mut runs = store.runs(None, None, None, None, 20).unwrap();
+        let mut runs = store.runs(None, None, None, None, None, 20).unwrap();
         assert!(
             runs.len() >= 2,
             "expected a deferred catch-up run, got {}",
@@ -671,7 +671,7 @@ mod tests {
                 f.scheduled_for
             );
         }
-        let runs = store.runs(None, None, None, None, 20).unwrap();
+        let runs = store.runs(None, None, None, None, None, 20).unwrap();
         assert_eq!(runs.len(), fired.len());
     }
 
@@ -687,7 +687,7 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(1300)).await;
         sched.abort();
 
-        let runs = store.runs(None, None, None, None, 10).unwrap();
+        let runs = store.runs(None, None, None, None, None, 10).unwrap();
         assert!(!runs.is_empty(), "no fire in over a second");
         assert!(runs.iter().all(|r| r.params == json!({"region": "eu"})));
         let seen = seen.lock().unwrap();
@@ -711,7 +711,7 @@ mod tests {
             ticks.iter().any(|t| t.outcome == TickOutcome::Deferred),
             "no fire was ever deferred"
         );
-        let runs = store.runs(None, None, None, None, 20).unwrap();
+        let runs = store.runs(None, None, None, None, None, 20).unwrap();
         assert!(
             runs.len() >= 2,
             "expected a deferred catch-up run, got {}",
@@ -770,7 +770,12 @@ mod tests {
 
         catch_up(&entry, &runner, stored(&store).get(&entry.key()), now);
 
-        assert!(store.runs(None, None, None, None, 10).unwrap().is_empty());
+        assert!(
+            store
+                .runs(None, None, None, None, None, 10)
+                .unwrap()
+                .is_empty()
+        );
         assert!(store.ticks(Some("etl"), 10).unwrap().is_empty());
         // 07:30 to 10:30 swallowed 08:00, 09:00 and 10:00; the cursor now says
         // so, which is the whole point — without it the next boot would have
@@ -779,7 +784,12 @@ mod tests {
 
         // and a second pass has nothing left to find
         catch_up(&entry, &runner, stored(&store).get(&entry.key()), now);
-        assert!(store.runs(None, None, None, None, 10).unwrap().is_empty());
+        assert!(
+            store
+                .runs(None, None, None, None, None, 10)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[tokio::test]
@@ -792,7 +802,7 @@ mod tests {
         catch_up(&entry, &runner, stored(&store).get(&entry.key()), now);
 
         let ten = now - chrono::Duration::minutes(30);
-        let runs = store.runs(None, None, None, None, 10).unwrap();
+        let runs = store.runs(None, None, None, None, None, 10).unwrap();
         assert_eq!(runs.len(), 1);
         assert_eq!(runs[0].scheduled_for, Some(ten));
         assert_eq!(runs[0].trigger, Trigger::Schedule);
@@ -838,7 +848,7 @@ mod tests {
         }
         wait_idle(&store, "etl").await;
 
-        let mut runs = store.runs(None, None, None, None, 10).unwrap();
+        let mut runs = store.runs(None, None, None, None, None, 10).unwrap();
         runs.sort_by_key(|r| r.created_at);
         assert_eq!(
             runs.iter().map(|r| r.scheduled_for).collect::<Vec<_>>(),
@@ -904,7 +914,7 @@ mod tests {
         // to anything that pulls data *for* an hour
         let ten = now - chrono::Duration::minutes(30);
         assert_eq!(*seen.lock().unwrap(), [Some(ten)]);
-        let runs = store.runs(None, None, None, None, 10).unwrap();
+        let runs = store.runs(None, None, None, None, None, 10).unwrap();
         assert_eq!(runs[0].scheduled_for, Some(ten));
         assert_eq!(
             serde_json::to_value(&runs[0]).unwrap()["scheduled_for"],
@@ -963,14 +973,18 @@ mod tests {
         let entry = hourly_entry("etl", Catchup::One);
         catch_up(&entry, &runner, stored(&store).get(&entry.key()), now);
         assert!(
-            store.runs(Some("etl"), None, None, None, 10).unwrap().len() <= 1,
+            store
+                .runs(Some("etl"), None, None, None, None, 10)
+                .unwrap()
+                .len()
+                <= 1,
             "the cursor already accounted for those occurrences"
         );
 
         drain_pending(&[entry], &runner, &stored(&store));
         wait_idle(&store, "etl").await;
         let held_run = store
-            .runs(None, None, None, None, 10)
+            .runs(None, None, None, None, None, 10)
             .unwrap()
             .into_iter()
             .find(|r| r.scheduled_for == Some(held));
@@ -993,7 +1007,12 @@ mod tests {
 
         // pause means stop, including the catch-up: resuming must not fire a
         // week of backlog at whatever the schedule was paused for
-        assert!(store.runs(None, None, None, None, 10).unwrap().is_empty());
+        assert!(
+            store
+                .runs(None, None, None, None, None, 10)
+                .unwrap()
+                .is_empty()
+        );
         assert!(store.ticks(Some("etl"), 10).unwrap().is_empty());
         assert_eq!(cursor_of(&store), Some(now - chrono::Duration::minutes(30)));
     }
@@ -1133,7 +1152,10 @@ mod tests {
         sched.abort();
 
         assert!(
-            store.runs(None, None, None, None, 10).unwrap().is_empty(),
+            store
+                .runs(None, None, None, None, None, 10)
+                .unwrap()
+                .is_empty(),
             "a paused flag nobody could read let a schedule fire"
         );
         assert!(seen.lock().unwrap().is_empty());

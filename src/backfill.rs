@@ -2,7 +2,9 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::asset::{ASSETS_JOB, AssetRegistry, launch_plan, mats_map, plan_partitions, staleness};
+use crate::asset::{
+    ASSETS_JOB, AssetRegistry, asset_tag, launch_plan, mats_map, plan_partitions, staleness,
+};
 use crate::error::Error;
 use crate::executor::Runner;
 use crate::model::{Backfill, BackfillStatus, RunStatus, Trigger};
@@ -161,7 +163,11 @@ fn launch_next(
     let named = HashMap::from([(backfill.asset.clone(), chunk.clone())]);
     let targets = std::slice::from_ref(&backfill.asset);
     let plan = plan_partitions(registry, &mats, targets, &named)?;
-    let run_id = launch_plan(runner, plan, Trigger::Build)?;
+    // which asset and which backfill: `build` says neither, and a chunk with
+    // no way back to the backfill it belongs to is a run you cannot follow
+    let mut tags = asset_tag(&backfill.asset);
+    tags.insert("backfill".to_string(), backfill.id.to_string());
+    let run_id = launch_plan(runner, plan, Trigger::Build, tags)?;
     runner
         .store()
         .backfill_launched(backfill.id, &run_id, backfill.launched + chunk.len())?;
@@ -219,6 +225,36 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         tick(runner, reg).unwrap();
+    }
+
+    // `build` is what a chunk's trigger says; which asset and which backfill
+    // is what it cannot, and a chunk you cannot trace back is a run adrift
+    #[tokio::test]
+    async fn a_chunk_run_is_tagged_with_its_asset_and_backfill() {
+        let store = Store::open(":memory:").unwrap();
+        let reg = regions();
+        let runner = runner_for(&reg, store.clone());
+
+        let b = start(&runner, &reg, "sales", "r1", "r5", true).unwrap();
+        let run = store.run(&b.run_ids[0]).unwrap().unwrap();
+        assert_eq!(run.trigger, Trigger::Build);
+        assert_eq!(run.tags["asset"], "sales");
+        assert_eq!(run.tags["backfill"], b.id.to_string());
+
+        // and the filter finds every chunk of one backfill, which is the point
+        settle(&runner, &reg).await;
+        let tag = Some(("backfill", b.id.to_string()));
+        let chunks = store
+            .runs(
+                None,
+                None,
+                None,
+                None,
+                tag.as_ref().map(|(k, v)| (*k, v.as_str())),
+                10,
+            )
+            .unwrap();
+        assert_eq!(chunks.len(), 2);
     }
 
     #[tokio::test]

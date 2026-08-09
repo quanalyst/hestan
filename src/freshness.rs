@@ -268,6 +268,7 @@ mod tests {
             error: None,
             resumed_from: None,
             scheduled_for: None,
+            tags: Default::default(),
         };
         store.create_run(&run, &[]).unwrap();
         store

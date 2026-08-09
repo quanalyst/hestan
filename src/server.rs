@@ -14,7 +14,8 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::asset::{
-    ASSETS_JOB, AssetRegistry, launch_plan, mats_map, plan_all, plan_partitions, staleness,
+    ASSETS_JOB, AssetRegistry, asset_tag, launch_plan, mats_map, plan_all, plan_partitions,
+    staleness,
 };
 use crate::backfill;
 use crate::error::Error;
@@ -22,7 +23,8 @@ use crate::executor::{CancelOutcome, Runner};
 use crate::freshness::{self, asset_freshness};
 use crate::job::Job;
 use crate::model::{
-    AssetCheckRow, CheckStatus, Freshness, OpRun, OpStatus, RunStatus, ScheduleRow, Trigger,
+    AssetCheckRow, CheckStatus, Freshness, OpRun, OpStatus, RunStatus, RunTags, ScheduleRow,
+    Trigger,
 };
 use crate::schedule;
 use crate::sensor::SensorState;
@@ -233,7 +235,7 @@ fn job_summary(job: &Job, st: &AppState) -> Result<Value, Error> {
     let last_run = st
         .runner
         .store()
-        .runs(Some(job.name()), None, None, None, 1)?
+        .runs(Some(job.name()), None, None, None, None, 1)?
         .pop();
     Ok(json!({
         "name": job.name(),
@@ -295,6 +297,8 @@ struct LaunchBody {
     /// launch with a stored [preset](crate::Preset)'s params instead of
     /// inline ones; naming both is a 400.
     preset: Option<String>,
+    /// a flat `{"k": "v"}` map to [tag](crate::RunTags) the run with.
+    tags: Option<RunTags>,
 }
 
 /// a body that carries nothing but `params` — validation and preset writes.
@@ -351,7 +355,12 @@ async fn launch_run(
                 .params
         }
     };
-    match st.runner.launch(&name, params, Trigger::Manual) {
+    match st.runner.launch_tagged(
+        &name,
+        params,
+        Trigger::Manual,
+        body.tags.unwrap_or_default(),
+    ) {
         Ok(run_id) => Ok((StatusCode::ACCEPTED, Json(json!({ "run_id": run_id })))),
         Err(e @ Error::UnknownJob(_)) => Err(err(StatusCode::NOT_FOUND, e.to_string())),
         Err(e @ Error::InvalidParams { .. }) => Err(err(StatusCode::BAD_REQUEST, e.to_string())),
@@ -797,8 +806,9 @@ async fn build_one_asset(
     if named.is_empty() && !staleness(&st.assets, &mats)[&name].stale {
         return Ok((StatusCode::OK, Json(json!({ "up_to_date": true }))));
     }
-    let plan = plan_partitions(&st.assets, &mats, &[name], &named).map_err(bad_plan)?;
-    match launch_plan(&st.runner, plan, Trigger::Build) {
+    let plan = plan_partitions(&st.assets, &mats, std::slice::from_ref(&name), &named)
+        .map_err(bad_plan)?;
+    match launch_plan(&st.runner, plan, Trigger::Build, asset_tag(&name)) {
         Ok(run_id) => Ok((StatusCode::ACCEPTED, Json(json!({ "run_id": run_id })))),
         Err(e) => Err(internal(e)),
     }
@@ -901,7 +911,7 @@ async fn build_all_assets(
     let Some(plan) = plan_all(&st.assets, &mats) else {
         return Ok((StatusCode::OK, Json(json!({ "up_to_date": true }))));
     };
-    match launch_plan(&st.runner, plan, Trigger::Build) {
+    match launch_plan(&st.runner, plan, Trigger::Build, RunTags::new()) {
         Ok(run_id) => Ok((StatusCode::ACCEPTED, Json(json!({ "run_ids": [run_id] })))),
         Err(e) => Err(internal(e)),
     }
@@ -1102,7 +1112,25 @@ struct RunsQuery {
     since: Option<String>,
     before: Option<String>,
     before_id: Option<String>,
+    /// one `k:v` pair, matched exactly against the run's tags.
+    tag: Option<String>,
     limit: Option<u32>,
+}
+
+// `k:v`, split at the first colon so a value may hold one. a pair with no
+// colon, an empty key or an empty value names nothing, and saying so beats
+// listing every run as if no filter had been asked for
+fn tag_param(v: Option<&str>) -> Result<Option<(&str, &str)>, ApiError> {
+    let Some(v) = v.filter(|s| !s.is_empty()) else {
+        return Ok(None);
+    };
+    match v.split_once(':') {
+        Some((k, value)) if !k.is_empty() && !value.is_empty() => Ok(Some((k, value))),
+        _ => Err(err(
+            StatusCode::BAD_REQUEST,
+            format!("invalid tag: {v}; expected key:value"),
+        )),
+    }
 }
 
 fn time_param(v: Option<&str>, name: &str) -> Result<Option<DateTime<Utc>>, ApiError> {
@@ -1125,13 +1153,14 @@ async fn list_runs(
     let before = time_param(q.before.as_deref(), "before")?;
     // before_id only refines `before`; alone it means nothing and is dropped
     let before_id = before.and(q.before_id.as_deref().filter(|s| !s.is_empty()));
+    let tag = tag_param(q.tag.as_deref())?;
     // windowed fetches page through whole days of runs, hence the wider cap
     let max = if since.is_some() { 2000 } else { 500 };
     let limit = q.limit.unwrap_or(50).clamp(1, max);
     let runs = st
         .runner
         .store()
-        .runs(job, since, before, before_id, limit)
+        .runs(job, since, before, before_id, tag, limit)
         .map_err(internal)?;
     Ok(Json(json!({ "runs": runs })))
 }
@@ -1331,6 +1360,7 @@ mod tests {
             error: None,
             resumed_from: None,
             scheduled_for: None,
+            tags: Default::default(),
         };
         st.runner.store().create_run(&run, &[]).unwrap();
         run
@@ -1353,6 +1383,7 @@ mod tests {
                 error: None,
                 resumed_from: None,
                 scheduled_for: None,
+                tags: Default::default(),
             };
             st.runner.store().create_run(&run, &[]).unwrap();
         }
@@ -1362,6 +1393,7 @@ mod tests {
             since: since.map(String::from),
             before: None,
             before_id: None,
+            tag: None,
             limit: None,
         };
         let Json(body) = list_runs(State(st.clone()), Ok(Query(q(Some(&t0.to_rfc3339())))))
@@ -1403,6 +1435,7 @@ mod tests {
                 error: None,
                 resumed_from: None,
                 scheduled_for: None,
+                tags: Default::default(),
             };
             st.runner.store().create_run(&run, &[]).unwrap();
         }
@@ -1412,6 +1445,7 @@ mod tests {
             since,
             before,
             before_id: None,
+            tag: None,
             limit: None,
         };
         let ids = |body: &Value| -> Vec<String> {
@@ -1464,6 +1498,7 @@ mod tests {
                 error: None,
                 resumed_from: None,
                 scheduled_for: None,
+                tags: Default::default(),
             };
             st.runner.store().create_run(&run, &[]).unwrap();
         }
@@ -1480,6 +1515,7 @@ mod tests {
                 since: None,
                 before,
                 before_id,
+                tag: None,
                 limit: Some(1),
             };
             let Json(body) = list_runs(State(st.clone()), Ok(Query(q))).await.unwrap();
@@ -1559,6 +1595,7 @@ mod tests {
                 error: None,
                 resumed_from: None,
                 scheduled_for: None,
+                tags: Default::default(),
             };
             store.create_run(&run, &["a".into(), "b".into()]).unwrap();
             store.op_started(&run.id, "a", 1).unwrap();
@@ -2005,7 +2042,7 @@ mod tests {
         assert_eq!(
             st.runner
                 .store()
-                .runs(None, None, None, None, 10)
+                .runs(None, None, None, None, None, 10)
                 .unwrap()
                 .len(),
             1
@@ -2019,6 +2056,72 @@ mod tests {
         .await
         .unwrap_err();
         assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn a_launch_carries_its_tags_and_the_runs_filter_finds_them() {
+        let st = state(vec![echo_job("etl")]);
+        let launch =
+            |body: &'static str| launch_run(State(st.clone()), Path("etl".into()), raw(body));
+
+        let (_, Json(body)) = launch(r#"{"tags": {"kind": "smoke", "who": "me"}}"#)
+            .await
+            .unwrap();
+        let tagged = body["run_id"].as_str().unwrap().to_string();
+        let (_, Json(body)) = launch(r#"{"params": {"n": 1}}"#).await.unwrap();
+        let plain = body["run_id"].as_str().unwrap().to_string();
+
+        let run = st.runner.store().run(&tagged).unwrap().unwrap();
+        assert_eq!(run.tags["kind"], "smoke");
+        assert_eq!(run.tags["who"], "me");
+        assert!(
+            st.runner
+                .store()
+                .run(&plain)
+                .unwrap()
+                .unwrap()
+                .tags
+                .is_empty()
+        );
+
+        let ids = |tag: Option<&str>| {
+            let q = RunsQuery {
+                job: None,
+                since: None,
+                before: None,
+                before_id: None,
+                tag: tag.map(String::from),
+                limit: None,
+            };
+            list_runs(State(st.clone()), Ok(Query(q)))
+        };
+        let Json(body) = ids(Some("kind:smoke")).await.unwrap();
+        let listed = body["runs"].as_array().unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0]["id"], tagged);
+        assert_eq!(listed[0]["tags"], json!({"kind": "smoke", "who": "me"}));
+        // a run with no tags reports an empty map rather than a null
+        let Json(body) = ids(None).await.unwrap();
+        assert_eq!(body["runs"].as_array().unwrap().len(), 2);
+        assert_eq!(body["runs"][0]["tags"], json!({}));
+        // a value the run does not carry matches nothing
+        let Json(body) = ids(Some("kind:backfill")).await.unwrap();
+        assert!(body["runs"].as_array().unwrap().is_empty());
+
+        // a filter that is not a pair is a 400, not a silently ignored filter
+        for bad in ["kind", "kind:", ":smoke", ":"] {
+            let (status, Json(body)) = ids(Some(bad)).await.unwrap_err();
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{bad}");
+            assert!(
+                body["error"].as_str().unwrap().starts_with("invalid tag:"),
+                "{body}"
+            );
+        }
+        // a value may hold a colon; only the first splits
+        let (_, Json(body)) = launch(r#"{"tags": {"at": "12:30"}}"#).await.unwrap();
+        let colon = body["run_id"].as_str().unwrap().to_string();
+        let Json(body) = ids(Some("at:12:30")).await.unwrap();
+        assert_eq!(body["runs"][0]["id"], colon);
     }
 
     #[tokio::test]
@@ -2044,7 +2147,7 @@ mod tests {
         assert!(
             st.runner
                 .store()
-                .runs(None, None, None, None, 10)
+                .runs(None, None, None, None, None, 10)
                 .unwrap()
                 .is_empty()
         );
@@ -2386,6 +2489,7 @@ mod tests {
             error: None,
             resumed_from: None,
             scheduled_for: None,
+            tags: Default::default(),
         };
         let ops: Vec<String> = ops.iter().map(|o| o.to_string()).collect();
         st.runner.store().create_run(&run, &ops).unwrap();
@@ -2600,6 +2704,7 @@ mod tests {
             error: None,
             resumed_from: None,
             scheduled_for: None,
+            tags: Default::default(),
         };
         st.runner.store().create_run(&stale, &[]).unwrap();
         let s = job_summary(job, &st).unwrap();
@@ -2667,7 +2772,7 @@ mod tests {
         let id = st
             .runner
             .store()
-            .runs(Some("etl"), None, None, None, 1)
+            .runs(Some("etl"), None, None, None, None, 1)
             .unwrap()[0]
             .id
             .clone();
@@ -2776,6 +2881,40 @@ mod tests {
             }
         }
         panic!("run {run_id} never succeeded");
+    }
+
+    // a build of one named asset says which one; a build of everything stale
+    // names nothing, because there is nothing to name
+    #[tokio::test]
+    async fn a_build_of_one_asset_is_tagged_with_it() {
+        let st = asset_state();
+        st.runner
+            .store()
+            .record_materialization("docs", None, "d1", &json!({}), None, None, None)
+            .unwrap();
+
+        let (_, Json(body)) =
+            build_one_asset(State(st.clone()), Path("stats".into()), Bytes::new())
+                .await
+                .unwrap();
+        let run_id = body["run_id"].as_str().unwrap().to_string();
+        wait_success(&st, &run_id).await;
+        let run = st.runner.store().run(&run_id).unwrap().unwrap();
+        assert_eq!(run.trigger, Trigger::Build);
+        assert_eq!(run.tags["asset"], "stats");
+
+        let (_, Json(body)) = build_all_assets(State(st.clone())).await.unwrap();
+        let all_id = body["run_ids"][0].as_str().unwrap().to_string();
+        wait_success(&st, &all_id).await;
+        assert!(
+            st.runner
+                .store()
+                .run(&all_id)
+                .unwrap()
+                .unwrap()
+                .tags
+                .is_empty()
+        );
     }
 
     #[tokio::test]
@@ -3231,7 +3370,7 @@ mod tests {
         assert_eq!(
             st.runner
                 .store()
-                .runs(None, None, None, None, 10)
+                .runs(None, None, None, None, None, 10)
                 .unwrap()
                 .len(),
             1

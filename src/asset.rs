@@ -11,7 +11,7 @@ use sha2::{Digest, Sha256};
 use crate::error::Error;
 use crate::graph;
 use crate::job::Job;
-use crate::model::{CheckStatus, Materialization, Severity, Trigger};
+use crate::model::{CheckStatus, Materialization, RunTags, Severity, Trigger};
 use crate::op::{self, Meta, Op, OpCtx};
 use crate::partition::Partitions;
 use crate::store::Store;
@@ -1523,11 +1523,14 @@ pub(crate) fn mats_map(store: &Store) -> Result<Mats, Error> {
     Ok(store.latest_materializations()?.into_iter().collect())
 }
 
-/// launch a plan as one subset run of the assets job.
+/// launch a plan as one subset run of the assets job, [tagged](RunTags) with
+/// whatever the caller can say that `Trigger::Build` cannot — which asset it
+/// was asked for, which backfill it is a chunk of, which sensor set it off.
 pub(crate) fn launch_plan(
     runner: &crate::executor::Runner,
     plan: BuildPlan,
     trigger: Trigger,
+    tags: RunTags,
 ) -> Result<String, Error> {
     runner.launch_subset(
         ASSETS_JOB,
@@ -1536,7 +1539,13 @@ pub(crate) fn launch_plan(
         json!({}),
         trigger,
         None,
+        tags,
     )
+}
+
+/// the tag a build of one named asset carries.
+pub(crate) fn asset_tag(asset: &str) -> RunTags {
+    RunTags::from([("asset".to_string(), asset.to_string())])
 }
 
 #[cfg(test)]
@@ -1834,6 +1843,7 @@ mod tests {
                 plan.seeds,
                 json!({}),
                 Trigger::Build,
+                RunTags::new(),
             )
             .await
             .unwrap()
@@ -1849,6 +1859,7 @@ mod tests {
                 plan.seeds,
                 json!({}),
                 Trigger::Build,
+                RunTags::new(),
             )
             .await
             .unwrap()
@@ -2063,6 +2074,7 @@ mod tests {
                 plan.seeds,
                 json!({}),
                 Trigger::Build,
+                RunTags::new(),
             )
             .await
             .unwrap();
@@ -2266,6 +2278,7 @@ mod tests {
                 plan.seeds,
                 json!({}),
                 Trigger::Build,
+                RunTags::new(),
             )
             .await
             .unwrap();
@@ -2458,6 +2471,7 @@ mod tests {
                 plan.seeds,
                 json!({}),
                 Trigger::Build,
+                RunTags::new(),
             )
             .await
             .unwrap();
@@ -2557,6 +2571,7 @@ mod tests {
                 plan.seeds,
                 json!({}),
                 Trigger::Build,
+                RunTags::new(),
             )
             .await
             .unwrap()

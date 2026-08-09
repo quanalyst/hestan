@@ -198,6 +198,13 @@ a quick find box matching substrings of the job name or run id (escape
 clears it).
 filters apply client-side to the loaded set.
 
+one exception: the tag box is **served**. it takes `key:value` and applies on
+enter or blur, refetching from `/api/runs?tag=`, because a
+[tag](launching.md#run-tags) on a run the page never loaded cannot be filtered
+for locally; escape clears it, and a pair the server refuses says so rather
+than leaving the old list looking like an answer. each row shows its run's tags
+as muted `key:value` chips beside the job name.
+
 the table is the newest 100 runs, polled every 5s; "load more" pages
 backwards through history using the oldest loaded run's `created_at` plus its
 `id` as a composite cursor (the id breaks created_at ties, so simultaneous

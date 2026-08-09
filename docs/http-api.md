@@ -143,6 +143,10 @@ instead, which is an alternative to `params` rather than a base for it:
 naming both is a 400 (`params and preset are alternatives; name one`) and a
 name nothing is stored under is a 404, in both cases with nothing launched.
 
+`{"tags": {"kind": "smoke"}}` [tags](launching.md#run-tags) the run: a flat
+string-to-string map that lands on the run row and comes back on every run
+object. `Hestan::run_tags` defaults merge underneath it, per-launch winning.
+
 ## Presets
 
 `GET /api/jobs/{name}/presets` returns the job's stored
@@ -222,7 +226,7 @@ skips `set_state` on empty pulls.
 
 ## Runs
 
-`GET /api/runs?job=&since=&before=&before_id=&limit=` returns
+`GET /api/runs?job=&since=&before=&before_id=&tag=&limit=` returns
 `{"runs": [...]}`, newest first — ordered by `created_at` then `id`, both
 descending (ids are uuid v7, so the tiebreak follows creation order). `job`
 filters exactly; `since` (inclusive) and `before` (exclusive) are rfc3339
@@ -233,7 +237,10 @@ backwards by passing the oldest loaded run's `created_at` as `before` and
 its `id` as `before_id`: the composite cursor keeps runs sharing a
 `created_at` from being dropped or repeated across pages. `before` alone
 stays a plain exclusive timestamp compare (back-compat), and `before_id`
-without `before` is ignored. a run:
+without `before` is ignored. `tag=key:value` keeps runs carrying that exact
+[tag](launching.md#run-tags) — exact, not a prefix — split at the first colon
+so a value may hold one; anything that is not a `key:value` pair is a 400
+(`invalid tag: ...`) rather than a filter that quietly does nothing. a run:
 
 ```json
 {
@@ -247,7 +254,8 @@ without `before` is ignored. a run:
   "finished_at": "2026-08-07T12:00:03Z",
   "error": null,
   "resumed_from": null,
-  "scheduled_for": "2026-08-07T12:00:00Z"
+  "scheduled_for": "2026-08-07T12:00:00Z",
+  "tags": { "kind": "backfill", "backfill": "41" }
 }
 ```
 
@@ -263,6 +271,9 @@ is the id of the run this one continued, null for every run that isn't a
 not the clock it started at, once a schedule is
 [catching up](scheduling.md#missed-fire-catch-up) or a held fire drains — and
 is null on a manual launch, a retry, a resume, a build or a sensor fire.
+`tags` is the run's [tag map](launching.md#run-tags), `{}` when it carries
+none — set at launch, defaulted with `Hestan::run_tags`, and set automatically
+on sensor, backfill and single-asset build runs.
 
 `GET /api/runs/{id}` returns `{"run": ..., "ops": [...]}` (404 for an unknown
 id), the op runs sorted by op name. a [mapped op](concepts.md#dynamic-fan-out)

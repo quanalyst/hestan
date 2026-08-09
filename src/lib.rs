@@ -36,7 +36,8 @@ pub use job::{Graph, GraphBuilder, Job, JobBuilder};
 pub use model::{
     AssetCheckRow, Backfill, BackfillStatus, Catchup, CheckStatus, Event, EventKind, EventLevel,
     Freshness, FreshnessRow, Materialization, OpRun, OpStatus, Overlap, Preset, Run, RunStatus,
-    ScheduleRow, SensorOutcome, SensorRow, SensorTick, Severity, Tick, TickOutcome, Trigger, When,
+    RunTags, ScheduleRow, SensorOutcome, SensorRow, SensorTick, Severity, Tick, TickOutcome,
+    Trigger, When,
 };
 pub use op::{InputError, Meta, Op, OpCtx, OpResult};
 pub use partition::Partitions;

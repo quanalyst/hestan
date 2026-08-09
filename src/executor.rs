@@ -15,7 +15,7 @@ use crate::graph;
 use crate::io::{Io, IoKey, IoManager};
 use crate::job::Job;
 use crate::model::{
-    EventKind, EventLevel, OpRun, OpStatus, Run, RunStatus, Trigger, When, new_run_id,
+    EventKind, EventLevel, OpRun, OpStatus, Run, RunStatus, RunTags, Trigger, When, new_run_id,
 };
 use crate::op::{self, Cancel, MetaBuf, Op, OpCtx};
 use crate::resource::{self, Resources};
@@ -150,6 +150,9 @@ pub struct Runner {
     pools: Pools,
     resources: Resources,
     io: Io,
+    // tags every run this runner launches carries, under whatever the launch
+    // itself said
+    run_tags: Arc<RunTags>,
 }
 
 impl Runner {
@@ -182,6 +185,16 @@ impl Runner {
             pools: Arc::new(HashMap::new()),
             resources: resource::none(),
             io: Io::default(),
+            run_tags: Arc::new(RunTags::new()),
+        }
+    }
+
+    /// tag every run this runner launches with `tags`, under whatever the
+    /// launch itself asked for. `Hestan::run_tags` is the way in.
+    pub fn with_run_tags(self, tags: RunTags) -> Runner {
+        Runner {
+            run_tags: Arc::new(tags),
+            ..self
         }
     }
 
@@ -325,6 +338,22 @@ impl Runner {
         self.launch_at(job, params, trigger, None)
     }
 
+    /// [`Runner::launch`] with [tags](RunTags) on the run: the launch's own,
+    /// merged over whatever `with_run_tags` set, per-launch winning.
+    pub fn launch_tagged(
+        &self,
+        job: &str,
+        params: Value,
+        trigger: Trigger,
+        tags: RunTags,
+    ) -> Result<String, Error> {
+        let (id, fut) = self
+            .prepare(job, None, params, trigger, None, None, None, tags)?
+            .expect("only a claimed run key skips a launch");
+        tokio::spawn(fut);
+        Ok(id)
+    }
+
     /// [`Runner::launch`] for a run that stands for a logical time: the cron
     /// occurrence it fires for, which is not the wall clock it launched at
     /// once a schedule is catching up or a held fire drains. the ops read it
@@ -338,7 +367,16 @@ impl Runner {
         scheduled_for: Option<DateTime<Utc>>,
     ) -> Result<String, Error> {
         let (id, fut) = self
-            .prepare(job, None, params, trigger, None, scheduled_for, None)?
+            .prepare(
+                job,
+                None,
+                params,
+                trigger,
+                None,
+                scheduled_for,
+                None,
+                RunTags::new(),
+            )?
             .expect("only a claimed run key skips a launch");
         tokio::spawn(fut);
         Ok(id)
@@ -355,8 +393,10 @@ impl Runner {
         params: Value,
         trigger: Trigger,
         key: RunKey<'_>,
+        tags: RunTags,
     ) -> Result<Option<String>, Error> {
-        let Some((id, fut)) = self.prepare(job, None, params, trigger, None, None, Some(key))?
+        let Some((id, fut)) =
+            self.prepare(job, None, params, trigger, None, None, Some(key), tags)?
         else {
             return Ok(None);
         };
@@ -367,7 +407,7 @@ impl Runner {
     /// like [`Runner::launch`] but awaits completion.
     pub async fn run(&self, job: &str, params: Value, trigger: Trigger) -> Result<Run, Error> {
         let (id, fut) = self
-            .prepare(job, None, params, trigger, None, None, None)?
+            .prepare(job, None, params, trigger, None, None, None, RunTags::new())?
             .expect("only a claimed run key skips a launch");
         // spawned so that dropping this future (timeout, select) detaches the
         // run instead of aborting its ops mid-write
@@ -378,6 +418,7 @@ impl Runner {
     /// launch over a subset of the job's ops with upstream outputs pre-seeded.
     /// every subset member's dep must be in the subset or seeded, else
     /// [`Error::Graph`]. asset builds and resumes are the callers.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn launch_subset(
         &self,
         job: &str,
@@ -386,6 +427,7 @@ impl Runner {
         params: Value,
         trigger: Trigger,
         resumed_from: Option<&str>,
+        tags: RunTags,
     ) -> Result<String, Error> {
         let (id, fut) = self
             .prepare(
@@ -396,6 +438,7 @@ impl Runner {
                 resumed_from,
                 None,
                 None,
+                tags,
             )?
             .expect("only a claimed run key skips a launch");
         tokio::spawn(fut);
@@ -423,6 +466,7 @@ impl Runner {
             plan.params,
             Trigger::Resume,
             Some(&plan.resumed_from),
+            RunTags::new(),
         )
     }
 
@@ -619,9 +663,19 @@ impl Runner {
         seeded: HashMap<String, Value>,
         params: Value,
         trigger: Trigger,
+        tags: RunTags,
     ) -> Result<Run, Error> {
         let (id, fut) = self
-            .prepare(job, Some((ops, seeded)), params, trigger, None, None, None)?
+            .prepare(
+                job,
+                Some((ops, seeded)),
+                params,
+                trigger,
+                None,
+                None,
+                None,
+                tags,
+            )?
             .expect("only a claimed run key skips a launch");
         let _ = tokio::spawn(fut).await;
         Ok(self.store.run(&id)?.expect("run row written at launch"))
@@ -659,6 +713,7 @@ impl Runner {
         resumed_from: Option<&str>,
         scheduled_for: Option<DateTime<Utc>>,
         key: Option<RunKey<'_>>,
+        tags: RunTags,
     ) -> Result<Option<(String, impl Future<Output = ()> + Send + 'static)>, Error> {
         let job = self
             .jobs
@@ -726,6 +781,16 @@ impl Runner {
             error: None,
             resumed_from: resumed_from.map(str::to_string),
             scheduled_for,
+            // a default is a fact about the deployment and the launch is
+            // closer to the truth, so the launch's own tags win
+            tags: match self.run_tags.is_empty() {
+                true => tags,
+                false => {
+                    let mut all = (*self.run_tags).clone();
+                    all.extend(tags);
+                    all
+                }
+            },
         };
         // a mapped op is never a row of its own: its instances are the record,
         // and how many there are is not known until its dep has produced
@@ -1985,7 +2050,7 @@ mod tests {
         assert!(
             runner
                 .store()
-                .runs(None, None, None, None, 10)
+                .runs(None, None, None, None, None, 10)
                 .unwrap()
                 .is_empty()
         );
@@ -2030,6 +2095,7 @@ mod tests {
                 json!({}),
                 Trigger::Manual,
                 None,
+                RunTags::new(),
             )
             .unwrap_err();
         assert!(matches!(err, Error::Graph(_)), "{err}");
@@ -2043,6 +2109,7 @@ mod tests {
                 json!({}),
                 Trigger::Manual,
                 None,
+                RunTags::new(),
             )
             .unwrap_err();
         assert!(err.to_string().contains("not an op of the job"), "{err}");
@@ -2055,6 +2122,7 @@ mod tests {
                 json!({}),
                 Trigger::Manual,
                 None,
+                RunTags::new(),
             )
             .unwrap_err();
         assert!(
@@ -2065,7 +2133,7 @@ mod tests {
         assert!(
             runner
                 .store()
-                .runs(None, None, None, None, 10)
+                .runs(None, None, None, None, None, 10)
                 .unwrap()
                 .is_empty()
         );
@@ -2081,6 +2149,7 @@ mod tests {
                 HashMap::from([("a".into(), json!(5))]),
                 json!({}),
                 Trigger::Manual,
+                RunTags::new(),
             )
             .await
             .unwrap();
