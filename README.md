@@ -224,8 +224,7 @@ the binary is yours: define jobs, then `Hestan::new()...serve(addr)`, or
 
 `cd ui && npm run dev` starts the vite dev server, which proxies `/api` to
 `localhost:4000` — run the demo alongside it. `just ui-build` regenerates
-`ui/dist`, which is committed so cargo users don't need node. see
-[contributing](CONTRIBUTING.md).
+`ui/dist`, which is committed so cargo users don't need node.
 
 ## Not here yet
 
