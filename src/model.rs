@@ -332,6 +332,18 @@ pub struct Run {
     /// which is what an untagged launch and every run older than tags both
     /// read as.
     pub tags: RunTags,
+    /// where this run sits in the queue: higher starts first, ties broken by
+    /// `created_at`. 0 unless the launch or
+    /// [`Hestan::priority`](crate::Hestan::priority) said otherwise.
+    pub priority: i64,
+    /// the [instance](crate::Hestan::work) that claimed this run out of the
+    /// queue, and is executing it. `None` on a run nobody has claimed — which
+    /// is what a queued run is — and on every run written before the queue.
+    pub claimed_by: Option<String>,
+    pub claimed_at: Option<DateTime<Utc>>,
+    /// how long the claim is good for. the claimer renews it on a heartbeat;
+    /// past it, the claim is reclaimable by anyone. `None` once the run is over.
+    pub lease_until: Option<DateTime<Utc>>,
 }
 
 /// a named parameter set stored against one job: what

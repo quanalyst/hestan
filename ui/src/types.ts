@@ -161,6 +161,38 @@ export interface Run {
   // flat key:value marks on the run: set at launch, defaulted process-wide,
   // and set automatically on machine-made runs. {} on an untagged run
   tags: Record<string, string>;
+  // where this run sits in the queue: higher goes first, ties by created_at
+  priority: number;
+  // the instance executing this run; null on one nobody has claimed, which is
+  // what a queued run is
+  claimed_by: string | null;
+  claimed_at: string | null;
+  lease_until: string | null;
+}
+
+// why a queued run is not executing: which limit, and the sentence to show
+export interface Blocker {
+  scope: "global" | "job" | "tag" | "undefined";
+  reason: string;
+}
+
+export interface QueueEntry {
+  run: Run;
+  // 1 for the head of the queue
+  position: number;
+  // null on one the next dispatch pass starts
+  blocked_by: Blocker | null;
+}
+
+export interface QueueView {
+  // every unclaimed queued run, not just the page below
+  depth: number;
+  queued: QueueEntry[];
+  limits: {
+    global: number | null;
+    jobs: { job: string; limit: number }[];
+    tags: { key: string; value: string; limit: number }[];
+  };
 }
 
 // what a resume would do: ops it executes, ops it seeds from a recorded output

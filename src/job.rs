@@ -16,6 +16,7 @@ pub struct Job {
     ops: Vec<Op>,
     order: Vec<String>,
     max_parallel: Option<usize>,
+    max_concurrent_runs: Option<usize>,
     overlap: Overlap,
     fresh_within: Option<Duration>,
     // every op's declared params schema merged into one, computed at build so
@@ -37,6 +38,7 @@ impl Job {
             ops: Vec::new(),
             instances: Vec::new(),
             max_parallel: None,
+            max_concurrent_runs: None,
             overlap: Overlap::default(),
             fresh_within: None,
             error: None,
@@ -61,6 +63,13 @@ impl Job {
 
     pub fn max_parallel(&self) -> Option<usize> {
         self.max_parallel
+    }
+
+    /// how many runs of this job may execute at once, from
+    /// [`JobBuilder::max_concurrent_runs`]. `None` is as many as the global
+    /// limit allows.
+    pub fn max_concurrent_runs(&self) -> Option<usize> {
+        self.max_concurrent_runs
     }
 
     pub fn overlap(&self) -> Overlap {
@@ -153,6 +162,7 @@ impl Job {
             ops,
             order,
             max_parallel: None,
+            max_concurrent_runs: None,
             overlap: Overlap::default(),
             fresh_within: None,
             params_schema,
@@ -749,6 +759,7 @@ pub struct JobBuilder {
     ops: Vec<Op>,
     instances: Vec<Instance>,
     max_parallel: Option<usize>,
+    max_concurrent_runs: Option<usize>,
     overlap: Overlap,
     fresh_within: Option<Duration>,
     error: Option<String>,
@@ -801,6 +812,21 @@ impl JobBuilder {
         self
     }
 
+    /// cap how many **runs** of this job execute at once; a value below 1
+    /// means one. the queue holds back the rest, in priority order, and starts
+    /// them as earlier ones finish.
+    ///
+    /// this is not [`overlap`](Self::overlap), and the two answer different
+    /// questions. overlap decides whether a scheduled fire should exist at all
+    /// while the job has a run outstanding — a policy about the work. this caps
+    /// how much of that work runs at once — a policy about the machine. a job
+    /// with `Overlap::Skip` never has two runs to limit; a job with
+    /// `Overlap::Allow` and this at 2 has as many as it likes and runs two.
+    pub fn max_concurrent_runs(mut self, n: usize) -> Self {
+        self.max_concurrent_runs = Some(n.max(1));
+        self
+    }
+
     /// what a scheduled fire does while a run of this job is still active.
     /// skip is the default; manual launches are never gated.
     pub fn overlap(mut self, o: Overlap) -> Self {
@@ -840,6 +866,7 @@ impl JobBuilder {
             ops,
             order,
             max_parallel: self.max_parallel,
+            max_concurrent_runs: self.max_concurrent_runs,
             overlap: self.overlap,
             fresh_within: self.fresh_within,
             params_schema,

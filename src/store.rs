@@ -8,6 +8,7 @@ use rusqlite::{Connection, OptionalExtension, Row, params};
 use serde_json::Value;
 
 use crate::error::Error;
+use crate::executor::{Blocked, InFlight, Limits, QUEUE_SCAN, Queued};
 use crate::model::{
     AssetCheckRow, Backfill, BackfillStatus, CheckStatus, Event, EventKind, EventLevel,
     FreshnessRow, Materialization, OpRun, OpStatus, Preset, Run, RunCursor, RunStatus, RunTags,
@@ -267,7 +268,33 @@ ALTER TABLE op_runs ADD COLUMN pid INTEGER;
 ALTER TABLE op_runs ADD COLUMN inputs TEXT;
 "#;
 
-const SCHEMA_VERSION: u32 = 13;
+// the run queue, and the claims that make it safe for more than one process to
+// pull from. the whole phase's schema, landed at once so nothing after this
+// migrates again.
+//
+// `priority` orders the queue (higher first, ties by `created_at`), and the
+// three claim columns are the whole of the ownership protocol: `claimed_by` is
+// the instance executing the run, `lease_until` is how long that is believed
+// for, and a claim past its lease is reclaimable by anyone. a queued run with
+// `claimed_by IS NULL` is a run nobody owns — which is what makes the queue
+// durable, and what a second process may take.
+//
+// `plan` is what the launch decided the run would execute:
+// `{"ops": [...] | null, "seeds": {op: handle}}`, null for a run of the whole
+// job. it exists because starting a run is no longer the job of the process
+// that asked for it: an asset build's memoized seeds and a resume's reused
+// outputs live in the launching process's memory and nowhere else, and a
+// claimer in another process has to be able to start the run without them.
+const SCHEMA_V14: &str = r#"
+ALTER TABLE runs ADD COLUMN priority INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE runs ADD COLUMN claimed_by TEXT;
+ALTER TABLE runs ADD COLUMN claimed_at TEXT;
+ALTER TABLE runs ADD COLUMN lease_until TEXT;
+ALTER TABLE runs ADD COLUMN plan TEXT;
+CREATE INDEX runs_queue ON runs(status, claimed_by, priority DESC, created_at);
+"#;
+
+const SCHEMA_VERSION: u32 = 14;
 
 // one transaction around every pending step and the version stamp (sqlite DDL
 // is transactional), so a crash mid-migration leaves the db exactly as found
@@ -320,6 +347,9 @@ fn migrate(conn: &mut Connection) -> Result<(), Error> {
     if version < 13 {
         tx.execute_batch(SCHEMA_V13)?;
     }
+    if version < 14 {
+        tx.execute_batch(SCHEMA_V14)?;
+    }
     if version != SCHEMA_VERSION {
         tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     }
@@ -346,6 +376,12 @@ pub(crate) struct RunKey<'a> {
     pub sensor: &'a str,
     pub key: &'a str,
 }
+
+/// every column [`run_from_row`] reads, in the order it reads them. one list
+/// rather than four copies of it, since a run now carries enough columns that
+/// two of them drifting apart is a real way to spend an afternoon.
+const RUN_COLS: &str = r#"id, job, status, "trigger", params, created_at, started_at, finished_at,
+    resumed_from, error, scheduled_for, tags, priority, claimed_by, claimed_at, lease_until"#;
 
 /// how long a write waits for another connection to let go of the file before
 /// giving up. an [isolated op](crate::Op::isolated) means two processes write
@@ -379,12 +415,13 @@ impl Store {
         &*self.1 == ":memory:"
     }
 
-    /// [`create_run_keyed`](Self::create_run_keyed) with no key, which is what
-    /// every launch that is not a keyed sensor request does. tests plant runs
-    /// through it; the executor calls the keyed form and passes `None`.
+    /// [`create_run_keyed`](Self::create_run_keyed) with no key and no plan,
+    /// which is what every launch of a whole job that is not a keyed sensor
+    /// request does. tests plant runs through it; the executor calls the keyed
+    /// form.
     #[cfg(test)]
     pub(crate) fn create_run(&self, run: &Run, ops: &[String]) -> Result<(), Error> {
-        self.create_run_keyed(run, ops, None).map(|_| ())
+        self.create_run_keyed(run, ops, None, None).map(|_| ())
     }
 
     /// [`create_run`](Self::create_run) with the [run key](RunKey) this run
@@ -400,11 +437,14 @@ impl Store {
     ///
     /// returns false when the key was already claimed: nothing is written, and
     /// the caller launches nothing.
+    /// `plan` is what this run will execute when something claims it — see the
+    /// `runs.plan` note on the v14 migration. `None` means the whole job.
     pub(crate) fn create_run_keyed(
         &self,
         run: &Run,
         ops: &[String],
         key: Option<RunKey<'_>>,
+        plan: Option<&Value>,
     ) -> Result<bool, Error> {
         let mut conn = self.0.lock().unwrap();
         let tx = conn.transaction()?;
@@ -422,8 +462,9 @@ impl Store {
         }
         tx.execute(
             r#"INSERT INTO runs (id, job, status, "trigger", params, created_at, started_at,
-                                 finished_at, error, resumed_from, scheduled_for, tags)
-               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)"#,
+                                 finished_at, error, resumed_from, scheduled_for, tags,
+                                 priority, plan)
+               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)"#,
             params![
                 run.id,
                 run.job,
@@ -437,6 +478,8 @@ impl Store {
                 run.resumed_from,
                 run.scheduled_for.map(|t| t.to_rfc3339()),
                 tags_col(&run.tags),
+                run.priority,
+                plan.map(|v| v.to_string()),
             ],
         )?;
         {
@@ -500,36 +543,78 @@ impl Store {
         Ok(())
     }
 
-    /// mark runs left queued/running by a dead process as failed; called at startup.
+    /// which runs a boot sweep may declare dead, as a `WHERE` fragment over
+    /// `runs`.
+    ///
+    /// a **queued run nobody has claimed is not a casualty, it is the queue**.
+    /// before the queue was durable, a run left `queued` was one whose executing
+    /// task died with the process, so failing it was the only honest thing to
+    /// do. now it is a row waiting for a dispatcher — possibly one in another
+    /// process, right now — and failing it at boot would empty the queue every
+    /// time anything restarted.
+    ///
+    /// everything else non-terminal is still swept: a claimed run whose claimer
+    /// is not here, and a `running` run with no claim at all, which can only
+    /// have been written before the queue existed.
+    const INTERRUPTED: &'static str =
+        "status IN ('queued', 'running') AND (status = 'running' OR claimed_by IS NOT NULL)";
+
+    /// mark runs left behind by a dead process as failed; called at startup.
+    /// see [`INTERRUPTED`](Self::INTERRUPTED) for what that does and does not
+    /// cover.
     pub(crate) fn fail_interrupted(&self) -> Result<(), Error> {
         let mut conn = self.0.lock().unwrap();
-        let tx = conn.transaction()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let now = Utc::now().to_rfc3339();
+        let doomed = format!("SELECT id FROM runs WHERE {}", Self::INTERRUPTED);
         tx.execute(
-            "UPDATE op_runs SET
-                 status = CASE status WHEN 'running' THEN 'failed' ELSE 'skipped' END,
-                 error = CASE status WHEN 'running' THEN 'interrupted: process exited' ELSE error END,
-                 finished_at = ?1
-             WHERE status IN ('pending', 'running')
-               AND run_id IN (SELECT id FROM runs WHERE status IN ('queued', 'running'))",
+            &format!(
+                "UPDATE op_runs SET
+                     status = CASE status WHEN 'running' THEN 'failed' ELSE 'skipped' END,
+                     error = CASE status WHEN 'running' THEN 'interrupted: process exited'
+                             ELSE error END,
+                     finished_at = ?1
+                 WHERE status IN ('pending', 'running') AND run_id IN ({doomed})"
+            ),
             params![now],
         )?;
         tx.execute(
-            "INSERT INTO events (run_id, op, level, kind, message, ts)
-             SELECT id, NULL, 'error', 'run_failed', 'run interrupted: process exited', ?1
-             FROM runs WHERE status IN ('queued', 'running')",
+            &format!(
+                "INSERT INTO events (run_id, op, level, kind, message, ts)
+                 SELECT id, NULL, 'error', 'run_failed', 'run interrupted: process exited', ?1
+                 FROM runs WHERE {}",
+                Self::INTERRUPTED
+            ),
             params![now],
         )?;
         tx.execute(
-            "UPDATE runs SET status = 'failed', finished_at = ?1,
-                 error = COALESCE(error, 'interrupted: process exited')
-             WHERE status IN ('queued', 'running')",
+            &format!(
+                "UPDATE runs SET status = 'failed', finished_at = ?1, lease_until = NULL,
+                     error = COALESCE(error, 'interrupted: process exited')
+                 WHERE {}",
+                Self::INTERRUPTED
+            ),
             params![now],
         )?;
         tx.commit()?;
         Ok(())
     }
 
+    /// whether `job` has work outstanding: a run of it queued or running,
+    /// claimed or not.
+    ///
+    /// deliberately unchanged by the queue, and the reason is worth writing
+    /// down. this is what [`Overlap`](crate::Overlap) asks, and what the
+    /// backfill chunker and the asset build endpoints ask, and every one of
+    /// them means "does this job already have a run outstanding" rather than
+    /// "is one executing this second". a queued run that nobody has claimed
+    /// yet is outstanding: a schedule that ignored it would enqueue another
+    /// every minute a limit held the first one back, which is exactly the
+    /// pile-up `Overlap::Skip` exists to prevent, and a backfill that ignored
+    /// it would fire every chunk of a 400-day range at once.
+    ///
+    /// [`Limits`](crate::Limits) asks the other question, and counts the other
+    /// set.
     pub(crate) fn has_active_run(&self, job: &str) -> Result<bool, Error> {
         let conn = self.0.lock().unwrap();
         let found = conn
@@ -540,6 +625,162 @@ impl Store {
             )
             .optional()?;
         Ok(found.is_some())
+    }
+
+    /// take the best queued run this claimer is allowed to start, and claim it.
+    ///
+    /// "best" is highest priority first, ties by `created_at`, **skipping any
+    /// run a limit would break**. skipping is deliberate: head-of-line blocking
+    /// — a `env:prod` run at the front of the queue stopping every unrelated
+    /// run behind it — is worse than a priority order that is a preference
+    /// rather than a promise. it does mean priority is not strict, and that is
+    /// documented where a user meets it.
+    ///
+    /// the claim itself is `UPDATE ... WHERE claimed_by IS NULL`: one winner by
+    /// construction, whoever else is looking at the same row. counting and
+    /// claiming share one immediate transaction, so two dispatchers cannot both
+    /// read capacity for the last slot and both take it. postgres would use
+    /// `SELECT ... FOR UPDATE SKIP LOCKED` here and hold no global write lock;
+    /// sqlite serializes writers for us, which is the same guarantee on one
+    /// host and no guarantee at all across several.
+    ///
+    /// returns the claimed run and its [plan](Self::create_run_keyed).
+    pub(crate) fn claim_next(
+        &self,
+        claimer: &str,
+        limits: &Limits,
+        defined: &HashSet<String>,
+    ) -> Result<Option<(Run, Option<Value>)>, Error> {
+        let mut conn = self.0.lock().unwrap();
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let counts = in_flight(&tx, limits)?;
+        let candidates = queued(&tx, QUEUE_SCAN)?;
+        let now = Utc::now();
+        for (mut run, plan) in candidates {
+            if !defined.contains(&run.job) {
+                continue;
+            }
+            if counts.blocker(limits, &run.job, &run.tags).is_some() {
+                continue;
+            }
+            let won = tx.execute(
+                "UPDATE runs SET claimed_by = ?1, claimed_at = ?2
+                 WHERE id = ?3 AND claimed_by IS NULL AND status = 'queued'",
+                params![claimer, now.to_rfc3339(), run.id.clone()],
+            )?;
+            if won == 0 {
+                continue;
+            }
+            tx.commit()?;
+            run.claimed_by = Some(claimer.to_string());
+            run.claimed_at = Some(now);
+            return Ok(Some((run, plan)));
+        }
+        tx.commit()?;
+        Ok(None)
+    }
+
+    /// the queue as somebody looking at it wants it: in the order a dispatcher
+    /// would take them, each with what is holding it back.
+    ///
+    /// the walk is the dispatcher's own, dry: a run that would start counts
+    /// against the limits for everything behind it, so what this reports is
+    /// what the next pass will actually do rather than a per-run guess that
+    /// would call the whole queue unblocked.
+    pub(crate) fn queue(
+        &self,
+        limits: &Limits,
+        defined: &HashSet<String>,
+        limit: u32,
+    ) -> Result<Vec<Queued>, Error> {
+        let conn = self.0.lock().unwrap();
+        let mut counts = in_flight(&conn, limits)?;
+        let mut out = Vec::new();
+        for (position, (run, _)) in queued(&conn, limit)?.into_iter().enumerate() {
+            let blocked = match defined.contains(&run.job) {
+                false => Some(Blocked::Undefined(run.job.clone())),
+                true => counts.blocker(limits, &run.job, &run.tags),
+            };
+            if blocked.is_none() {
+                counts.take(limits, &run.job, &run.tags);
+            }
+            out.push(Queued {
+                run,
+                position: position + 1,
+                blocked,
+            });
+        }
+        Ok(out)
+    }
+
+    /// how many runs are queued and unclaimed, which is what "queue depth"
+    /// means. counted rather than taken from [`queue`](Self::queue), which caps.
+    pub(crate) fn queue_depth(&self) -> Result<usize, Error> {
+        let conn = self.0.lock().unwrap();
+        let n: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM runs WHERE status = 'queued' AND claimed_by IS NULL",
+            [],
+            |r| r.get(0),
+        )?;
+        Ok(n as usize)
+    }
+
+    /// move a run up or down the queue. false when there is no such run, and
+    /// [`Error::RunActive`] once something has claimed it — by then the
+    /// priority has already been spent.
+    pub(crate) fn set_run_priority(&self, id: &str, priority: i64) -> Result<bool, Error> {
+        let conn = self.0.lock().unwrap();
+        let found: Option<(String, Option<String>)> = conn
+            .query_row(
+                "SELECT status, claimed_by FROM runs WHERE id = ?1",
+                params![id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        let Some((status, claimed_by)) = found else {
+            return Ok(false);
+        };
+        if status != RunStatus::Queued.as_str() || claimed_by.is_some() {
+            return Err(Error::RunActive(id.to_string()));
+        }
+        conn.execute(
+            "UPDATE runs SET priority = ?2 WHERE id = ?1 AND claimed_by IS NULL",
+            params![id, priority],
+        )?;
+        Ok(true)
+    }
+
+    /// cancel a run out of the queue: only one that nobody has claimed, and
+    /// atomically, so a claimer racing this either wins the run or finds it
+    /// canceled. false means it was claimed in the meantime and has to be
+    /// stopped the ordinary way.
+    pub(crate) fn cancel_queued(&self, id: &str) -> Result<bool, Error> {
+        let mut conn = self.0.lock().unwrap();
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let now = Utc::now().to_rfc3339();
+        let taken = tx.execute(
+            "UPDATE runs SET status = 'canceled', finished_at = ?2,
+                 error = COALESCE(error, 'canceled before it started')
+             WHERE id = ?1 AND status = 'queued' AND claimed_by IS NULL",
+            params![id, now],
+        )?;
+        if taken == 0 {
+            tx.commit()?;
+            return Ok(false);
+        }
+        tx.execute(
+            "UPDATE op_runs SET status = 'canceled', error = 'canceled before it started',
+                 finished_at = ?2
+             WHERE run_id = ?1 AND status = 'pending'",
+            params![id, now],
+        )?;
+        tx.execute(
+            "INSERT INTO events (run_id, op, level, kind, message, ts)
+             VALUES (?1, NULL, 'warn', 'run_canceled', 'canceled before it started', ?2)",
+            params![id, now],
+        )?;
+        tx.commit()?;
+        Ok(true)
     }
 
     pub(crate) fn run_started(&self, id: &str) -> Result<(), Error> {
@@ -560,8 +801,11 @@ impl Store {
         error: Option<&str>,
     ) -> Result<(), Error> {
         let conn = self.0.lock().unwrap();
+        // and the lease with it: there is nothing left to renew, and a run that
+        // is over must never look reclaimable
         conn.execute(
-            "UPDATE runs SET status = ?1, finished_at = ?2, error = COALESCE(?3, error)
+            "UPDATE runs SET status = ?1, finished_at = ?2, error = COALESCE(?3, error),
+                 lease_until = NULL
              WHERE id = ?4",
             params![status.as_str(), Utc::now().to_rfc3339(), error, id],
         )?;
@@ -958,9 +1202,7 @@ impl Store {
         let conn = self.0.lock().unwrap();
         let run = conn
             .query_row(
-                r#"SELECT id, job, status, "trigger", params, created_at, started_at, finished_at,
-                          resumed_from, error, scheduled_for, tags
-                   FROM runs WHERE id = ?1"#,
+                &format!("SELECT {RUN_COLS} FROM runs WHERE id = ?1"),
                 params![id],
                 run_from_row,
             )
@@ -981,9 +1223,8 @@ impl Store {
         limit: u32,
     ) -> Result<Vec<Run>, Error> {
         let conn = self.0.lock().unwrap();
-        let mut stmt = conn.prepare(
-            r#"SELECT id, job, status, "trigger", params, created_at, started_at, finished_at,
-                      resumed_from, error, scheduled_for, tags
+        let mut stmt = conn.prepare(&format!(
+            r#"SELECT {RUN_COLS}
                FROM runs
                WHERE (?1 IS NULL OR job = ?1) AND (?2 IS NULL OR created_at >= ?2)
                  AND (?3 IS NULL OR created_at < ?3
@@ -991,8 +1232,8 @@ impl Store {
                  AND (?5 IS NULL OR EXISTS (
                       SELECT 1 FROM json_each(runs.tags)
                       WHERE json_each.key = ?5 AND json_each.value = ?6))
-               ORDER BY created_at DESC, id DESC LIMIT ?7"#,
-        )?;
+               ORDER BY created_at DESC, id DESC LIMIT ?7"#
+        ))?;
         let since = since.map(|t| t.to_rfc3339());
         let before = before.map(|t| t.to_rfc3339());
         let (key, value) = (tag.map(|t| t.0), tag.map(|t| t.1));
@@ -1019,15 +1260,14 @@ impl Store {
         limit: u32,
     ) -> Result<Vec<Run>, Error> {
         let conn = self.0.lock().unwrap();
-        let mut stmt = conn.prepare(
-            r#"SELECT id, job, status, "trigger", params, created_at, started_at, finished_at,
-                      resumed_from, error, scheduled_for, tags
+        let mut stmt = conn.prepare(&format!(
+            r#"SELECT {RUN_COLS}
                FROM runs
                WHERE status IN ('success', 'failed', 'canceled') AND finished_at IS NOT NULL
                  AND (?1 IS NULL OR job = ?1)
                  AND (?2 IS NULL OR finished_at > ?2 OR (finished_at = ?2 AND id > ?3))
-               ORDER BY finished_at, id LIMIT ?4"#,
-        )?;
+               ORDER BY finished_at, id LIMIT ?4"#
+        ))?;
         let at = after.map(|c| c.finished_at.to_rfc3339());
         let id = after.map(|c| c.id.as_str());
         let rows = stmt.query_map(params![job, at, id, limit], run_from_row)?;
@@ -1674,6 +1914,36 @@ impl Store {
     }
 }
 
+/// what is executing right now, counted against `limits`. "executing" is
+/// claimed and not finished — the set a concurrency limit is about.
+fn in_flight(conn: &Connection, limits: &Limits) -> Result<InFlight, Error> {
+    let mut counts = InFlight::new();
+    let mut stmt = conn.prepare(
+        "SELECT job, tags FROM runs
+         WHERE claimed_by IS NOT NULL AND status IN ('queued', 'running')",
+    )?;
+    let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, tags_from_col(r, 1)?)))?;
+    for row in rows {
+        let (job, tags) = row?;
+        counts.take(limits, &job, &tags);
+    }
+    Ok(counts)
+}
+
+/// the queue itself: runs nobody has claimed, in the order a dispatcher takes
+/// them, with the plan each would execute.
+fn queued(conn: &Connection, limit: u32) -> Result<Vec<(Run, Option<Value>)>, Error> {
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {RUN_COLS}, plan FROM runs
+         WHERE status = 'queued' AND claimed_by IS NULL
+         ORDER BY priority DESC, created_at, id LIMIT ?1"
+    ))?;
+    let rows = stmt.query_map(params![limit], |r| {
+        Ok((run_from_row(r)?, opt_json_col(r, 16)?))
+    })?;
+    Ok(rows.collect::<Result<Vec<_>, _>>()?)
+}
+
 fn run_from_row(row: &Row) -> rusqlite::Result<Run> {
     Ok(Run {
         id: row.get(0)?,
@@ -1688,6 +1958,10 @@ fn run_from_row(row: &Row) -> rusqlite::Result<Run> {
         error: row.get(9)?,
         scheduled_for: opt_ts_col(row, 10)?,
         tags: tags_from_col(row, 11)?,
+        priority: row.get(12)?,
+        claimed_by: row.get(13)?,
+        claimed_at: opt_ts_col(row, 14)?,
+        lease_until: opt_ts_col(row, 15)?,
     })
 }
 
@@ -1881,6 +2155,10 @@ mod tests {
             resumed_from: None,
             scheduled_for: None,
             tags: Default::default(),
+            priority: 0,
+            claimed_by: None,
+            claimed_at: None,
+            lease_until: None,
         }
     }
 
@@ -2381,14 +2659,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("future.db");
         let path = path.to_str().unwrap();
-        phase1_db(path, 14);
+        phase1_db(path, 15);
         let err = Store::open(path).err().unwrap();
-        assert_eq!(err.to_string(), "db schema v14 is newer than this build");
+        assert_eq!(err.to_string(), "db schema v15 is newer than this build");
         let conn = Connection::open(path).unwrap();
         let version: u32 = conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 14);
+        assert_eq!(version, 15);
     }
 
     #[test]
@@ -2635,7 +2913,12 @@ mod tests {
         };
         assert!(
             store
-                .create_run_keyed(&mk_run("r1", "etl", Utc::now()), &["a".into()], Some(key))
+                .create_run_keyed(
+                    &mk_run("r1", "etl", Utc::now()),
+                    &["a".into()],
+                    Some(key),
+                    None
+                )
                 .unwrap()
         );
         assert!(store.run_key_claimed("watch", "2026-08-09").unwrap());
@@ -2645,7 +2928,12 @@ mod tests {
         // second key — because the whole thing is one transaction
         assert!(
             !store
-                .create_run_keyed(&mk_run("r2", "etl", Utc::now()), &["a".into()], Some(key))
+                .create_run_keyed(
+                    &mk_run("r2", "etl", Utc::now()),
+                    &["a".into()],
+                    Some(key),
+                    None
+                )
                 .unwrap()
         );
         assert!(store.run("r2").unwrap().is_none());

@@ -32,6 +32,9 @@ use crate::sensor::SensorState;
 
 static UI_DIST: Dir<'static> = include_dir!("$CARGO_MANIFEST_DIR/ui/dist");
 
+/// how much of the queue `GET /api/queue` shows.
+const QUEUE_PAGE: u32 = 200;
+
 pub(crate) struct SensorInfo {
     pub name: String,
     pub every: std::time::Duration,
@@ -74,6 +77,8 @@ pub(crate) fn router(state: AppState) -> Router {
         .route("/api/runs/{id}/resume_preview", get(resume_preview))
         .route("/api/runs/{id}/clone", get(clone_run))
         .route("/api/runs/{id}/cancel", post(cancel_run))
+        .route("/api/runs/{id}/priority", post(set_run_priority))
+        .route("/api/queue", get(list_queue))
         .route("/api/assets", get(list_assets))
         .route("/api/assets/build", post(build_all_assets))
         .route("/api/assets/{name}/build", post(build_one_asset))
@@ -308,6 +313,9 @@ struct LaunchBody {
     tags: Option<RunTags>,
     /// run only these ops and everything downstream of them, seeding nothing.
     ops: Option<Vec<String>>,
+    /// where in the queue this run goes: higher starts first. absent is
+    /// whatever `Hestan::priority` set.
+    priority: Option<i64>,
 }
 
 /// a body that carries nothing but `params` — validation and preset writes.
@@ -368,8 +376,8 @@ async fn launch_run(
     let launched = match body.ops {
         None => st
             .runner
-            .launch_tagged(&name, params, Trigger::Manual, tags),
-        Some(ops) => launch_subset(&st, &name, ops, params, tags)?,
+            .launch_prioritized(&name, params, Trigger::Manual, tags, body.priority),
+        Some(ops) => launch_subset(&st, &name, ops, params, tags, body.priority)?,
     };
     match launched {
         Ok(run_id) => Ok((StatusCode::ACCEPTED, Json(json!({ "run_id": run_id })))),
@@ -401,6 +409,7 @@ fn launch_subset(
     ops: Vec<String>,
     params: Value,
     tags: RunTags,
+    priority: Option<i64>,
 ) -> Result<Result<String, Error>, ApiError> {
     let job = st
         .jobs
@@ -424,6 +433,7 @@ fn launch_subset(
         Trigger::Manual,
         None,
         tags,
+        priority,
     ))
 }
 
@@ -604,6 +614,67 @@ async fn cancel_run(
             StatusCode::CONFLICT,
             format!("run already finished: {id}"),
         )),
+        Err(e) => Err(internal(e)),
+    }
+}
+
+/// the queue: what is waiting, in the order it will be taken, and what is
+/// holding each one back.
+///
+/// `depth` counts every unclaimed queued run; `queued` is capped, because a
+/// queue ten thousand deep is a fact about the deployment rather than a list
+/// anybody reads to the end.
+async fn list_queue(State(st): State<AppState>) -> Result<Json<Value>, ApiError> {
+    let queued: Vec<Value> = st
+        .runner
+        .queue(QUEUE_PAGE)
+        .map_err(internal)?
+        .into_iter()
+        .map(|q| {
+            json!({
+                "run": q.run,
+                "position": q.position,
+                "blocked_by": q.blocked.as_ref().map(|b| json!({
+                    "scope": b.scope(),
+                    "reason": b.reason(),
+                })),
+            })
+        })
+        .collect();
+    let limits = st.runner.limits();
+    Ok(Json(json!({
+        "depth": st.runner.queue_depth().map_err(internal)?,
+        "queued": queued,
+        "limits": {
+            "global": limits.global_limit(),
+            "jobs": limits.jobs().into_iter().map(|(j, n)| json!({"job": j, "limit": n}))
+                .collect::<Vec<_>>(),
+            "tags": limits.tag_limits().into_iter()
+                .map(|(k, v, n)| json!({"key": k, "value": v, "limit": n}))
+                .collect::<Vec<_>>(),
+        },
+    })))
+}
+
+#[derive(Deserialize)]
+struct PriorityBody {
+    priority: i64,
+}
+
+/// move a queued run up or down the queue. only one nobody has claimed: past
+/// that the priority has already been spent, and saying so beats a 200 that
+/// changed nothing.
+async fn set_run_priority(
+    State(st): State<AppState>,
+    Path(id): Path<String>,
+    body: Bytes,
+) -> Result<Json<Value>, ApiError> {
+    let body: PriorityBody = serde_json::from_slice(&body)
+        .map_err(|e| err(StatusCode::BAD_REQUEST, format!("invalid body: {e}")))?;
+    match st.runner.set_priority(&id, body.priority) {
+        Ok(true) => Ok(Json(json!({ "run_id": id, "priority": body.priority }))),
+        Ok(false) => Err(err(StatusCode::NOT_FOUND, format!("unknown run: {id}"))),
+        Err(e @ Error::RunActive(_)) => Err(err(StatusCode::CONFLICT, e.to_string())),
         Err(e) => Err(internal(e)),
     }
 }
@@ -1450,6 +1521,10 @@ mod tests {
             resumed_from: None,
             scheduled_for: None,
             tags: Default::default(),
+            priority: 0,
+            claimed_by: None,
+            claimed_at: None,
+            lease_until: None,
         };
         st.runner.store().create_run(&run, &[]).unwrap();
         run
@@ -1473,6 +1548,10 @@ mod tests {
                 resumed_from: None,
                 scheduled_for: None,
                 tags: Default::default(),
+                priority: 0,
+                claimed_by: None,
+                claimed_at: None,
+                lease_until: None,
             };
             st.runner.store().create_run(&run, &[]).unwrap();
         }
@@ -1525,6 +1604,10 @@ mod tests {
                 resumed_from: None,
                 scheduled_for: None,
                 tags: Default::default(),
+                priority: 0,
+                claimed_by: None,
+                claimed_at: None,
+                lease_until: None,
             };
             st.runner.store().create_run(&run, &[]).unwrap();
         }
@@ -1588,6 +1671,10 @@ mod tests {
                 resumed_from: None,
                 scheduled_for: None,
                 tags: Default::default(),
+                priority: 0,
+                claimed_by: None,
+                claimed_at: None,
+                lease_until: None,
             };
             st.runner.store().create_run(&run, &[]).unwrap();
         }
@@ -1686,6 +1773,10 @@ mod tests {
                 resumed_from: None,
                 scheduled_for: None,
                 tags: Default::default(),
+                priority: 0,
+                claimed_by: None,
+                claimed_at: None,
+                lease_until: None,
             };
             store.create_run(&run, &["a".into(), "b".into()]).unwrap();
             store.op_started(&run.id, "a", 1).unwrap();
@@ -2617,6 +2708,81 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_queue_endpoint_reports_depth_and_blockers_and_takes_a_bump() {
+        let slow = Job::builder("slow")
+            .op(Op::new("nap", |_| async {
+                tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                Ok(json!(null))
+            }))
+            .build()
+            .unwrap();
+        let runner = Runner::new([slow], Store::open(":memory:").unwrap())
+            .with_limits(crate::executor::Limits::new().global(1), 0);
+        let st = AppState {
+            jobs: Arc::new(runner.jobs().clone()),
+            runner,
+            assets: Arc::new(AssetRegistry::empty()),
+            sensors: Arc::new(Vec::new()),
+        };
+
+        st.runner
+            .launch("slow", json!({}), Trigger::Manual)
+            .unwrap();
+        let first = st
+            .runner
+            .launch("slow", json!({}), Trigger::Manual)
+            .unwrap();
+        let second = st
+            .runner
+            .launch("slow", json!({}), Trigger::Manual)
+            .unwrap();
+
+        let Json(body) = list_queue(State(st.clone())).await.unwrap();
+        assert_eq!(body["depth"], 2);
+        assert_eq!(body["limits"]["global"], 1);
+        let queued = body["queued"].as_array().unwrap();
+        assert_eq!(queued[0]["run"]["id"], first.as_str());
+        assert_eq!(queued[0]["position"], 1);
+        assert_eq!(queued[0]["blocked_by"]["scope"], "global");
+        assert!(
+            queued[0]["blocked_by"]["reason"]
+                .as_str()
+                .unwrap()
+                .contains("which is the limit"),
+            "{}",
+            queued[0]["blocked_by"]
+        );
+        // the run json carries the queue's own fields now
+        assert_eq!(queued[0]["run"]["priority"], 0);
+        assert_eq!(queued[0]["run"]["claimed_by"], Value::Null);
+
+        // a bump moves it to the head, and a run already claimed refuses
+        let bump = |id: String, n: i64| {
+            set_run_priority(
+                State(st.clone()),
+                Path(id),
+                Bytes::from(format!("{{\"priority\":{n}}}")),
+            )
+        };
+        let _ = bump(second.clone(), 5).await.unwrap();
+        let Json(body) = list_queue(State(st.clone())).await.unwrap();
+        assert_eq!(body["queued"].as_array().unwrap()[0]["run"]["id"], second);
+
+        let (status, _) = bump("nope".into(), 1).await.unwrap_err();
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        let running = st
+            .runner
+            .store()
+            .runs(None, None, None, None, None, 10)
+            .unwrap()
+            .into_iter()
+            .find(|r| r.claimed_by.is_some())
+            .unwrap();
+        let (status, _) = bump(running.id, 1).await.unwrap_err();
+        assert_eq!(status, StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
     async fn cancel_endpoint_statuses() {
         let slow = Job::builder("slow")
             .op(Op::new("nap", |_| async {
@@ -2640,8 +2806,21 @@ mod tests {
         assert_eq!(status, StatusCode::CONFLICT);
         assert_eq!(body["error"], "run already finished: done");
 
-        // an active-status row with no live executor, as a restart leaves behind
-        insert_run(&st, "stale", "slow", RunStatus::Queued, json!({}));
+        // a queued run nobody has claimed is cancellable whoever asks: it is a
+        // row on the queue, and taking it off is the whole of stopping it
+        insert_run(&st, "waiting", "slow", RunStatus::Queued, json!({}));
+        let (status, _) = cancel_run(State(st.clone()), Path("waiting".into()))
+            .await
+            .unwrap();
+        assert_eq!(status, StatusCode::ACCEPTED);
+        assert_eq!(
+            st.runner.store().run("waiting").unwrap().unwrap().status,
+            RunStatus::Canceled
+        );
+
+        // a running row with no live executor, as a restart leaves behind: the
+        // signal has nowhere to go, and saying so beats pretending
+        insert_run(&st, "stale", "slow", RunStatus::Running, json!({}));
         let (status, _) = cancel_run(State(st.clone()), Path("stale".into()))
             .await
             .unwrap_err();
@@ -2815,6 +2994,10 @@ mod tests {
             resumed_from: None,
             scheduled_for: None,
             tags: Default::default(),
+            priority: 0,
+            claimed_by: None,
+            claimed_at: None,
+            lease_until: None,
         };
         let ops: Vec<String> = ops.iter().map(|o| o.to_string()).collect();
         st.runner.store().create_run(&run, &ops).unwrap();
@@ -3030,6 +3213,10 @@ mod tests {
             resumed_from: None,
             scheduled_for: None,
             tags: Default::default(),
+            priority: 0,
+            claimed_by: None,
+            claimed_at: None,
+            lease_until: None,
         };
         st.runner.store().create_run(&stale, &[]).unwrap();
         let s = job_summary(job, &st).unwrap();

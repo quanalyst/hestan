@@ -3,7 +3,7 @@ import type { MouseEvent as ReactMouseEvent } from "react";
 import { Link, useNavigate, useSearchParams } from "react-router-dom";
 import { get, HttpError, post, usePoll } from "./api";
 import StatusDot from "./StatusDot";
-import type { Run } from "./types";
+import type { QueueView, Run } from "./types";
 import { durationMs, fmtDuration, isTerminal, relTime, shortId } from "./util";
 
 const PAGE = 100;
@@ -75,6 +75,7 @@ export default function RunsPage() {
   const [tag, setTag] = useState("");
   const [tagQ, setTagQ] = useState("");
   const [tagErr, setTagErr] = useState<string | null>(null);
+  const [queue, setQueue] = useState<QueueView | null>(null);
   const [busyId, setBusyId] = useState<string | null>(null);
   const [rowErr, setRowErr] = useState<{ id: string; msg: string } | null>(null);
   const [now, setNow] = useState(() => Date.now());
@@ -116,6 +117,18 @@ export default function RunsPage() {
     },
     5000,
     [job, tagParam],
+  );
+
+  usePoll(
+    () => {
+      get<QueueView>("/api/queue")
+        .then(setQueue)
+        // a queue that cannot be read is not a queue of nothing; leave the last
+        // answer up rather than claiming it drained
+        .catch(() => {});
+    },
+    5000,
+    [],
   );
 
   const hasActive = (head ?? []).some(isActive) || tail.some(isActive);
@@ -166,6 +179,24 @@ export default function RunsPage() {
     }
   };
 
+  // one step up the queue rather than a number to type: what somebody wants at
+  // 3am is this run next, and the head of the queue is one above whatever is
+  // there now
+  const bump = async (e: ReactMouseEvent, id: string, priority: number) => {
+    e.stopPropagation();
+    const top = Math.max(...(queue?.queued ?? []).map((q) => q.run.priority), priority);
+    setBusyId(id);
+    setRowErr(null);
+    try {
+      await post(`/api/runs/${id}/priority`, { priority: top + 1 });
+      setQueue(await get<QueueView>("/api/queue"));
+    } catch (err) {
+      setRowErr({ id, msg: err instanceof Error ? err.message : String(err) });
+    } finally {
+      setBusyId(null);
+    }
+  };
+
   // retry redoes the whole job, resume continues where the run broke
   const relaunch = async (e: ReactMouseEvent, id: string, kind: "retry" | "resume") => {
     e.stopPropagation();
@@ -199,6 +230,59 @@ export default function RunsPage() {
         </p>
       ) : (
         <>
+          {queue && queue.depth > 0 && (
+            <>
+              <h2>
+                queued
+                <span className="secondary"> — {queue.depth} waiting</span>
+              </h2>
+              <table>
+                <thead>
+                  <tr>
+                    <th className="num">#</th>
+                    <th>run</th>
+                    <th>job</th>
+                    <th className="num">priority</th>
+                    <th>waiting on</th>
+                    <th />
+                  </tr>
+                </thead>
+                <tbody>
+                  {queue.queued.map((q) => (
+                    <tr key={q.run.id} onClick={() => nav(`/runs/${q.run.id}`)}>
+                      <td className="num muted">{q.position}</td>
+                      <td className="mono">{shortId(q.run.id)}</td>
+                      <td>
+                        {q.run.job}
+                        <TagChips tags={q.run.tags} />
+                      </td>
+                      <td className="num">{q.run.priority}</td>
+                      <td className="muted">
+                        {q.blocked_by ? q.blocked_by.reason : "starting now"}
+                      </td>
+                      <td className="row-action">
+                        <button
+                          className="text-btn"
+                          disabled={busyId === q.run.id}
+                          onClick={(e) => bump(e, q.run.id, q.run.priority)}
+                        >
+                          bump
+                        </button>
+                        {rowErr?.id === q.run.id && (
+                          <span className="muted row-err">{rowErr.msg}</span>
+                        )}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+              {queue.depth > queue.queued.length && (
+                <p className="muted">
+                  showing the first {queue.queued.length} of {queue.depth}
+                </p>
+              )}
+            </>
+          )}
           {active.length > 0 && (
             <>
               <h2>running now</h2>

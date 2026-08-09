@@ -7,7 +7,7 @@ use chrono::{DateTime, Utc};
 use futures::FutureExt;
 use serde::Serialize;
 use serde_json::{Value, json};
-use tokio::sync::{Semaphore, watch};
+use tokio::sync::{Notify, Semaphore, watch};
 use tokio::task::{Id, JoinSet};
 
 use crate::error::Error;
@@ -33,6 +33,198 @@ const MAX_RESUME_CHAIN: usize = 256;
 /// an [isolated op](Op::isolated) gets the same window between its SIGTERM and
 /// its SIGKILL, so "a few seconds to wind down" means one thing across hestan.
 pub(crate) const CANCEL_GRACE: Duration = Duration::from_secs(3);
+
+/// how often the dispatcher looks at the queue on its own.
+///
+/// it is also poked whenever a run is enqueued and whenever one finishes, so
+/// this is the backstop rather than the mechanism: what it covers is a run
+/// another process enqueued, and a limit that changed under a queue nobody is
+/// touching.
+pub(crate) const DISPATCH_POLL: Duration = Duration::from_millis(500);
+
+/// how deep into the queue one dispatch pass looks for something startable.
+/// past this the head of the queue really is the queue.
+pub(crate) const QUEUE_SCAN: u32 = 500;
+
+/// what the dispatcher will not start past.
+///
+/// every limit here counts runs that are **executing** — claimed and not yet
+/// finished. a queued run nobody has claimed costs nothing and counts as
+/// nothing, which is the difference between this and
+/// [`Overlap`](crate::Overlap): a limit is about machines, and overlap is about
+/// whether a job should have two of itself outstanding at all.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Limits {
+    pub(crate) global: Option<usize>,
+    pub(crate) per_job: BTreeMap<String, usize>,
+    pub(crate) tags: BTreeMap<(String, String), usize>,
+}
+
+impl Limits {
+    pub fn new() -> Limits {
+        Limits::default()
+    }
+
+    /// at most `n` runs executing anywhere in this deployment. below 1 means 1:
+    /// a limit of zero is a queue that never drains, which is never what
+    /// anybody meant.
+    pub fn global(mut self, n: usize) -> Limits {
+        self.global = Some(n.max(1));
+        self
+    }
+
+    /// at most `n` runs of `job` executing at once.
+    pub fn job(mut self, job: impl Into<String>, n: usize) -> Limits {
+        self.per_job.insert(job.into(), n.max(1));
+        self
+    }
+
+    /// at most `n` runs carrying the [tag](RunTags) `key: value` executing at
+    /// once — `env: prod` at 2, whatever the jobs are.
+    pub fn tag(mut self, key: impl Into<String>, value: impl Into<String>, n: usize) -> Limits {
+        self.tags.insert((key.into(), value.into()), n.max(1));
+        self
+    }
+
+    /// the global cap, if there is one.
+    pub fn global_limit(&self) -> Option<usize> {
+        self.global
+    }
+
+    /// every per-job cap, by job.
+    pub fn jobs(&self) -> Vec<(&str, usize)> {
+        self.per_job.iter().map(|(j, n)| (j.as_str(), *n)).collect()
+    }
+
+    /// every tag-scoped cap, as `(key, value, limit)`.
+    pub fn tag_limits(&self) -> Vec<(&str, &str, usize)> {
+        self.tags
+            .iter()
+            .map(|((k, v), n)| (k.as_str(), v.as_str(), *n))
+            .collect()
+    }
+}
+
+/// why a queued run is not starting right now.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Blocked {
+    Global(usize),
+    Job {
+        job: String,
+        limit: usize,
+    },
+    Tag {
+        key: String,
+        value: String,
+        limit: usize,
+    },
+    /// nothing here can run it: this process does not define the job. a run
+    /// left over from a job that was deleted, or — once workers are split by
+    /// what they can build — one waiting for a process that knows how.
+    Undefined(String),
+}
+
+impl Blocked {
+    /// which limit this is, for anything grouping by it.
+    pub fn scope(&self) -> &'static str {
+        match self {
+            Blocked::Global(_) => "global",
+            Blocked::Job { .. } => "job",
+            Blocked::Tag { .. } => "tag",
+            Blocked::Undefined(_) => "undefined",
+        }
+    }
+
+    /// the sentence a queue view shows.
+    pub fn reason(&self) -> String {
+        match self {
+            Blocked::Global(n) => format!("{n} runs are already executing, which is the limit"),
+            Blocked::Job { job, limit } => {
+                format!("{limit} runs of {job} are already executing, which is its limit")
+            }
+            Blocked::Tag { key, value, limit } => {
+                format!(
+                    "{limit} runs tagged {key}:{value} are already executing, which is the limit"
+                )
+            }
+            Blocked::Undefined(job) => format!("no job named {job} is defined in this process"),
+        }
+    }
+}
+
+/// what is executing right now, counted only where a limit asks.
+///
+/// tag counts are kept for the pairs [`Limits`] names and no others: a run
+/// tagged with a backfill id would otherwise put a row in this map per
+/// backfill, forever, to answer a question nobody asked.
+pub(crate) struct InFlight {
+    total: usize,
+    per_job: HashMap<String, usize>,
+    tags: HashMap<(String, String), usize>,
+}
+
+impl InFlight {
+    pub(crate) fn new() -> InFlight {
+        InFlight {
+            total: 0,
+            per_job: HashMap::new(),
+            tags: HashMap::new(),
+        }
+    }
+
+    /// count one executing run against every limit it touches.
+    pub(crate) fn take(&mut self, limits: &Limits, job: &str, tags: &RunTags) {
+        self.total += 1;
+        *self.per_job.entry(job.to_string()).or_default() += 1;
+        for (key, value) in tags {
+            let pair = (key.clone(), value.clone());
+            if limits.tags.contains_key(&pair) {
+                *self.tags.entry(pair).or_default() += 1;
+            }
+        }
+    }
+
+    /// the first limit starting this run would break, if any. the order is
+    /// broadest first, so a run held back by two limits names the one an
+    /// operator would raise.
+    pub(crate) fn blocker(&self, limits: &Limits, job: &str, tags: &RunTags) -> Option<Blocked> {
+        if let Some(n) = limits.global
+            && self.total >= n
+        {
+            return Some(Blocked::Global(n));
+        }
+        if let Some(&n) = limits.per_job.get(job)
+            && self.per_job.get(job).copied().unwrap_or(0) >= n
+        {
+            return Some(Blocked::Job {
+                job: job.to_string(),
+                limit: n,
+            });
+        }
+        for (key, value) in tags {
+            let pair = (key.clone(), value.clone());
+            if let Some(&n) = limits.tags.get(&pair)
+                && self.tags.get(&pair).copied().unwrap_or(0) >= n
+            {
+                return Some(Blocked::Tag {
+                    key: key.clone(),
+                    value: value.clone(),
+                    limit: n,
+                });
+            }
+        }
+        None
+    }
+}
+
+/// one queued run as the queue view reports it.
+pub struct Queued {
+    pub run: Run,
+    /// 1 for the head of the queue.
+    pub position: usize,
+    /// why it is not executing; `None` on one the next dispatch pass starts.
+    pub blocked: Option<Blocked>,
+}
 
 /// a named concurrency limit shared by every job in the process, declared with
 /// `Hestan::pool` and taken by [`Op::pool`].
@@ -167,6 +359,14 @@ struct Fanout {
     failed: bool,
 }
 
+/// this process's identity: eight hex digits, made once, short enough to read
+/// off a run row and unlikely enough to collide with the process next to it.
+pub(crate) fn instance_id() -> &'static str {
+    static ID: std::sync::LazyLock<String> =
+        std::sync::LazyLock::new(|| uuid::Uuid::now_v7().simple().to_string()[24..].to_string());
+    &ID
+}
+
 /// executes jobs against a store. cheap to clone.
 #[derive(Clone)]
 pub struct Runner {
@@ -181,6 +381,19 @@ pub struct Runner {
     // tags every run this runner launches carries, under whatever the launch
     // itself said
     run_tags: Arc<RunTags>,
+    // what this process claims runs as
+    claimer: &'static str,
+    // read at the top of every dispatch pass, so raising a limit takes effect
+    // on the next one rather than on the next deploy
+    limits: Arc<Mutex<Limits>>,
+    // the queue position a launch that does not ask gets
+    priority: i64,
+    // one dispatch pass at a time in this process: two passes counting the same
+    // free slot would both fill it
+    dispatching: Arc<Mutex<()>>,
+    // woken whenever a run reaches a terminal status, which is what `run` waits
+    // on instead of polling
+    settled: Arc<Notify>,
 }
 
 impl Runner {
@@ -214,6 +427,11 @@ impl Runner {
             resources: resource::none(),
             io: Io::default(),
             run_tags: Arc::new(RunTags::new()),
+            claimer: instance_id(),
+            limits: Arc::new(Mutex::new(Limits::new())),
+            priority: 0,
+            dispatching: Arc::new(Mutex::new(())),
+            settled: Arc::new(Notify::new()),
         }
     }
 
@@ -224,6 +442,46 @@ impl Runner {
             run_tags: Arc::new(tags),
             ..self
         }
+    }
+
+    /// what the dispatcher will not start past, and the queue position a launch
+    /// that does not ask for one gets. `Hestan::max_concurrent_runs`,
+    /// `Hestan::tag_limit` and `Hestan::priority` are the way in.
+    ///
+    /// per-job limits declared with
+    /// [`JobBuilder::max_concurrent_runs`](crate::JobBuilder::max_concurrent_runs)
+    /// are folded in here too, so one place answers "what holds this run back".
+    pub fn with_limits(self, limits: Limits, priority: i64) -> Runner {
+        let mut limits = limits;
+        for job in self.jobs.values() {
+            if let Some(n) = job.max_concurrent_runs() {
+                limits.per_job.entry(job.name().to_string()).or_insert(n);
+            }
+        }
+        Runner {
+            limits: Arc::new(Mutex::new(limits)),
+            priority,
+            ..self
+        }
+    }
+
+    /// what the dispatcher is enforcing right now.
+    pub fn limits(&self) -> Limits {
+        self.limits.lock().unwrap().clone()
+    }
+
+    /// change what the dispatcher enforces, live. the next pass reads it — and
+    /// there is a pass whenever a run finishes and every
+    /// [`DISPATCH_POLL`] besides — so raising a limit drains the queue it was
+    /// holding back without a restart.
+    pub fn set_limits(&self, limits: Limits) {
+        *self.limits.lock().unwrap() = limits;
+        self.dispatch();
+    }
+
+    /// the id this process claims runs under, as it appears on a run row.
+    pub fn instance(&self) -> &str {
+        self.claimer
     }
 
     /// like [`Runner::with_failure_hooks`] plus named concurrency pools, each
@@ -379,7 +637,13 @@ impl Runner {
         self.pools.get(name).map(|p| p.limit)
     }
 
-    /// create the run queued and execute it on a spawned task.
+    /// put a run of `job` on the queue.
+    ///
+    /// launching is a request, not a start: the run row exists when this
+    /// returns and the [dispatcher](Runner::dispatch) starts it as soon as no
+    /// [limit](Limits) says otherwise, which with no limits declared is the
+    /// same instant. the caller never blocks either way — what comes back is
+    /// the run id, exactly as it always did.
     pub fn launch(&self, job: &str, params: Value, trigger: Trigger) -> Result<String, Error> {
         self.launch_at(job, params, trigger, None)
     }
@@ -393,11 +657,27 @@ impl Runner {
         trigger: Trigger,
         tags: RunTags,
     ) -> Result<String, Error> {
-        let (id, fut) = self
-            .prepare(job, None, params, trigger, None, None, None, tags)?
-            .expect("only a claimed run key skips a launch");
-        tokio::spawn(fut);
-        Ok(id)
+        self.launch_prioritized(job, params, trigger, tags, None)
+    }
+
+    /// [`Runner::launch_tagged`] at a chosen queue position: higher goes first,
+    /// ties by creation time, `None` for whatever `Hestan::priority` set.
+    ///
+    /// priority is a preference, not an order. the dispatcher skips a run a
+    /// limit would block and starts the next one that fits, because one
+    /// `env:prod` run at the head of the queue holding up everything unrelated
+    /// behind it is worse than starting things slightly out of order.
+    pub fn launch_prioritized(
+        &self,
+        job: &str,
+        params: Value,
+        trigger: Trigger,
+        tags: RunTags,
+        priority: Option<i64>,
+    ) -> Result<String, Error> {
+        Ok(self
+            .enqueue(job, None, params, trigger, None, None, None, tags, priority)?
+            .expect("only a claimed run key skips a launch"))
     }
 
     /// [`Runner::launch`] for a run that stands for a logical time: the cron
@@ -412,8 +692,8 @@ impl Runner {
         trigger: Trigger,
         scheduled_for: Option<DateTime<Utc>>,
     ) -> Result<String, Error> {
-        let (id, fut) = self
-            .prepare(
+        Ok(self
+            .enqueue(
                 job,
                 None,
                 params,
@@ -422,10 +702,9 @@ impl Runner {
                 scheduled_for,
                 None,
                 RunTags::new(),
+                None,
             )?
-            .expect("only a claimed run key skips a launch");
-        tokio::spawn(fut);
-        Ok(id)
+            .expect("only a claimed run key skips a launch"))
     }
 
     /// [`Runner::launch`] for a request carrying a [run
@@ -441,24 +720,126 @@ impl Runner {
         key: RunKey<'_>,
         tags: RunTags,
     ) -> Result<Option<String>, Error> {
-        let Some((id, fut)) =
-            self.prepare(job, None, params, trigger, None, None, Some(key), tags)?
-        else {
-            return Ok(None);
-        };
-        tokio::spawn(fut);
-        Ok(Some(id))
+        self.enqueue(
+            job,
+            None,
+            params,
+            trigger,
+            None,
+            None,
+            Some(key),
+            tags,
+            None,
+        )
     }
 
-    /// like [`Runner::launch`] but awaits completion.
+    /// like [`Runner::launch`] but awaits completion — including the time the
+    /// run spends queued, if a limit is holding it back.
     pub async fn run(&self, job: &str, params: Value, trigger: Trigger) -> Result<Run, Error> {
-        let (id, fut) = self
-            .prepare(job, None, params, trigger, None, None, None, RunTags::new())?
-            .expect("only a claimed run key skips a launch");
-        // spawned so that dropping this future (timeout, select) detaches the
-        // run instead of aborting its ops mid-write
-        let _ = tokio::spawn(fut).await;
-        Ok(self.store.run(&id)?.expect("run row written at launch"))
+        let id = self.launch(job, params, trigger)?;
+        self.settle(&id).await
+    }
+
+    /// wait for a run to reach a terminal status, whoever ends up executing it.
+    ///
+    /// the wake-up is a notification rather than a poll, so the common case —
+    /// this process started the run and this process finished it — costs one
+    /// wake. the timeout beside it covers the two cases no local notification
+    /// can: another process claimed the run, and a limit freed up somewhere
+    /// nothing here was watching.
+    async fn settle(&self, id: &str) -> Result<Run, Error> {
+        loop {
+            // registered before the status is read, so a run that finishes
+            // between the two is not a wake-up missed
+            let waiter = self.settled.notified();
+            tokio::pin!(waiter);
+            waiter.as_mut().enable();
+            let run = self.store.run(id)?.expect("run row written at launch");
+            if !matches!(run.status, RunStatus::Queued | RunStatus::Running) {
+                return Ok(run);
+            }
+            self.dispatch();
+            tokio::select! {
+                () = waiter => {}
+                () = tokio::time::sleep(DISPATCH_POLL) => {}
+            }
+        }
+    }
+
+    /// start whatever the queue will let this process start, now.
+    ///
+    /// called whenever a run is enqueued and whenever one finishes, and on a
+    /// timer besides. each pass claims one run at a time and re-reads the queue
+    /// after every claim, so a limit is counted against what is actually
+    /// executing rather than against a snapshot taken before this pass started
+    /// filling it.
+    pub(crate) fn dispatch(&self) {
+        // one pass at a time in this process: two passes counting the same free
+        // slot would both fill it. across processes the store's claim does it,
+        // which is the only place it can be done
+        let _pass = self.dispatching.lock().unwrap();
+        let limits = self.limits.lock().unwrap().clone();
+        let defined: HashSet<String> = self.jobs.keys().cloned().collect();
+        loop {
+            match self.store.claim_next(self.claimer, &limits, &defined) {
+                Ok(Some((run, plan))) => self.start(run, plan),
+                Ok(None) => return,
+                Err(e) => {
+                    tracing::warn!("dispatch failed: {e}");
+                    return;
+                }
+            }
+        }
+    }
+
+    /// execute a run this process has claimed.
+    fn start(&self, run: Run, plan: Option<Value>) {
+        let job = self
+            .jobs
+            .get(&run.job)
+            .cloned()
+            .expect("a claim only ever names a job this process defines");
+        let (pending, seeded) = planned(&job, plan.as_ref());
+        // registered before the task is spawned, so a cancel that can see the
+        // claimed run always finds a live sender
+        let (cancel_tx, cancel_rx) = watch::channel(false);
+        self.active
+            .lock()
+            .unwrap()
+            .insert(run.id.clone(), cancel_tx);
+        tokio::spawn(execute(
+            job,
+            run.id,
+            run.params,
+            run.trigger,
+            run.scheduled_for,
+            self.clone(),
+            cancel_rx,
+            pending,
+            seeded,
+        ));
+    }
+
+    /// the queue: runs nobody has claimed, in the order they will be taken,
+    /// each with what is holding it back.
+    pub(crate) fn queue(&self, limit: u32) -> Result<Vec<Queued>, Error> {
+        let limits = self.limits.lock().unwrap().clone();
+        let defined: HashSet<String> = self.jobs.keys().cloned().collect();
+        self.store.queue(&limits, &defined, limit)
+    }
+
+    /// how many runs are waiting on the queue, uncapped.
+    pub(crate) fn queue_depth(&self) -> Result<usize, Error> {
+        self.store.queue_depth()
+    }
+
+    /// move a queued run up or down the queue, and look at the queue again.
+    pub(crate) fn set_priority(&self, run_id: &str, priority: i64) -> Result<bool, Error> {
+        let moved = self.store.set_run_priority(run_id, priority)?;
+        if moved {
+            self.dispatch();
+        }
+        Ok(moved)
     }
 
     /// launch over a subset of the job's ops with upstream outputs pre-seeded.
@@ -474,9 +855,10 @@ impl Runner {
         trigger: Trigger,
         resumed_from: Option<&str>,
         tags: RunTags,
+        priority: Option<i64>,
     ) -> Result<String, Error> {
-        let (id, fut) = self
-            .prepare(
+        Ok(self
+            .enqueue(
                 job,
                 Some((ops, seeded)),
                 params,
@@ -485,10 +867,9 @@ impl Runner {
                 None,
                 None,
                 tags,
+                priority,
             )?
-            .expect("only a claimed run key skips a launch");
-        tokio::spawn(fut);
-        Ok(id)
+            .expect("only a claimed run key skips a launch"))
     }
 
     /// re-run a finished run from where it broke: every op that did not
@@ -513,6 +894,7 @@ impl Runner {
             Trigger::Resume,
             Some(&plan.resumed_from),
             RunTags::new(),
+            None,
         )
     }
 
@@ -711,20 +1093,8 @@ impl Runner {
         trigger: Trigger,
         tags: RunTags,
     ) -> Result<Run, Error> {
-        let (id, fut) = self
-            .prepare(
-                job,
-                Some((ops, seeded)),
-                params,
-                trigger,
-                None,
-                None,
-                None,
-                tags,
-            )?
-            .expect("only a claimed run key skips a launch");
-        let _ = tokio::spawn(fut).await;
-        Ok(self.store.run(&id)?.expect("run row written at launch"))
+        let id = self.launch_subset(job, ops, seeded, params, trigger, None, tags, None)?;
+        self.settle(&id).await
     }
 
     /// ask a queued or running run to stop. in-flight ops are aborted, every
@@ -737,6 +1107,18 @@ impl Runner {
         if !matches!(run.status, RunStatus::Queued | RunStatus::Running) {
             return Ok(CancelOutcome::AlreadyFinished);
         }
+        // still on the queue with nobody executing it: take it off the queue,
+        // which is the only way to stop a run that has not started. atomic
+        // against a dispatcher reaching for the same row — one of the two wins,
+        // and if the claim does, the sender below is there to signal
+        if run.status == RunStatus::Queued
+            && run.claimed_by.is_none()
+            && self.store.cancel_queued(run_id)?
+        {
+            self.active.lock().unwrap().remove(run_id);
+            self.settled.notify_waiters();
+            return Ok(CancelOutcome::Requested);
+        }
         match self.active.lock().unwrap().get(run_id) {
             Some(tx) => {
                 let _ = tx.send(true);
@@ -747,10 +1129,10 @@ impl Runner {
         }
     }
 
-    /// build the run row and the future that executes it. `Ok(None)` only ever
-    /// comes back for a `key` another run already claimed.
+    /// write the run row and poke the dispatcher. `Ok(None)` only ever comes
+    /// back for a `key` another run already claimed.
     #[allow(clippy::too_many_arguments)]
-    fn prepare(
+    fn enqueue(
         &self,
         job: &str,
         subset: Option<(HashSet<String>, HashMap<String, Value>)>,
@@ -760,12 +1142,14 @@ impl Runner {
         scheduled_for: Option<DateTime<Utc>>,
         key: Option<RunKey<'_>>,
         tags: RunTags,
-    ) -> Result<Option<(String, impl Future<Output = ()> + Send + 'static)>, Error> {
+        priority: Option<i64>,
+    ) -> Result<Option<String>, Error> {
         let job = self
             .jobs
             .get(job)
             .ok_or_else(|| Error::UnknownJob(job.to_string()))?
             .clone();
+        let subset_plan = subset.is_some();
         let (pending, seeded) = match subset {
             None => (job.order().to_vec(), job.external_seeds()),
             Some((ops, seeded)) => {
@@ -837,6 +1221,10 @@ impl Runner {
                     all
                 }
             },
+            priority: priority.unwrap_or(self.priority),
+            claimed_by: None,
+            claimed_at: None,
+            lease_until: None,
         };
         // a mapped op is never a row of its own: its instances are the record,
         // and how many there are is not known until its dep has produced
@@ -845,40 +1233,54 @@ impl Runner {
             .filter(|n| job.op(n).expect("op in topo order").mapped_over().is_none())
             .cloned()
             .collect();
-        // registered before create_run so a cancel that can see the queued run
-        // always finds a live sender
-        let (cancel_tx, cancel_rx) = watch::channel(false);
-        self.active
-            .lock()
-            .unwrap()
-            .insert(run.id.clone(), cancel_tx);
-        match self.store.create_run_keyed(&run, &rows, key) {
-            Ok(true) => {}
+        // a full launch reconstructs itself from the job, so only a subset has
+        // anything to record — and it has to, because its seeds are outputs of
+        // an earlier run that live in this process's memory and nowhere a
+        // claimer in another process could look
+        let plan = subset_plan.then(|| json!({ "ops": &pending, "seeds": &seeded }));
+        if !self
+            .store
+            .create_run_keyed(&run, &rows, key, plan.as_ref())?
+        {
             // the key was claimed between the caller's check and this insert:
-            // no run row was written, so there is nothing to unwind but this
-            Ok(false) => {
-                self.active.lock().unwrap().remove(&run.id);
-                return Ok(None);
-            }
-            Err(e) => {
-                self.active.lock().unwrap().remove(&run.id);
-                return Err(e);
-            }
+            // no run row was written, and nothing launched
+            return Ok(None);
         }
-        let id = run.id.clone();
-        let fut = execute(
-            job,
-            run.id,
-            run.params,
-            trigger,
-            scheduled_for,
-            self.clone(),
-            cancel_rx,
-            pending,
-            seeded,
-        );
-        Ok(Some((id, fut)))
+        // enqueued and on disk; whether it starts now is the dispatcher's
+        // business, and with no limits declared "now" is this call
+        self.dispatch();
+        Ok(Some(run.id))
     }
+}
+
+/// what a claimed run is to execute: the ops, in the job's topological order,
+/// and the outputs seeded in ahead of them.
+///
+/// `None` is a run of the whole job, which is every launch that is not a
+/// resume, an asset build or a subset — it needs nothing recorded because the
+/// job itself is the plan. anything else was written at
+/// [enqueue](Runner::enqueue) time, because by the time it is read the process
+/// that decided it may be gone.
+fn planned(job: &Job, plan: Option<&Value>) -> (Vec<String>, HashMap<String, Value>) {
+    let whole = || (job.order().to_vec(), job.external_seeds());
+    let Some(plan) = plan else { return whole() };
+    let (Some(ops), Some(seeds)) = (plan.get("ops").and_then(Value::as_array), plan.get("seeds"))
+    else {
+        // written by this crate and nothing else, so this is a plan from a
+        // future version or a hand-edited row. running the whole job is the
+        // one option that cannot silently run less than was asked for
+        tracing::warn!(job = %job.name(), "run plan unreadable; running the whole job");
+        return whole();
+    };
+    let ops = ops
+        .iter()
+        .filter_map(|v| v.as_str().map(str::to_string))
+        .collect();
+    let seeds = seeds
+        .as_object()
+        .map(|o| o.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
+        .unwrap_or_default();
+    (ops, seeds)
 }
 
 // "process[3]" -> ("process", "3"), but only when `process` is a mapped op of
@@ -982,6 +1384,16 @@ fn fold_instances(
         folded.push((parent, OpStatus::Success, Some(Value::Array(collected))));
     }
     folded
+}
+
+/// the loop `serve` runs: [`Runner::dispatch`] every [`DISPATCH_POLL`], forever.
+pub(crate) async fn run_dispatcher(runner: Runner) {
+    let mut ticker = tokio::time::interval(DISPATCH_POLL);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        ticker.tick().await;
+        runner.dispatch();
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1619,6 +2031,10 @@ async fn execute(
     note(store.append_event(&run_id, None, level, kind, msg, None));
     note(store.run_finished(&run_id, status, error.as_deref()));
     runner.active.lock().unwrap().remove(&run_id);
+    // this run's slot is free: wake anything waiting on it, then go and see
+    // what the queue can start in its place
+    runner.settled.notify_waiters();
+    runner.dispatch();
 
     // canceled runs stay quiet, and the boot sweep never comes through here
     if status == RunStatus::Failed {
@@ -2153,6 +2569,7 @@ pub(crate) fn note(res: Result<(), Error>) {
 mod tests {
     use super::*;
     use crate::op::Op;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::Duration;
 
     fn sleepy_job(name: &str, ms: u64) -> Job {
@@ -2299,6 +2716,7 @@ mod tests {
                 Trigger::Manual,
                 None,
                 RunTags::new(),
+                None,
             )
             .unwrap_err();
         assert!(matches!(err, Error::Graph(_)), "{err}");
@@ -2313,6 +2731,7 @@ mod tests {
                 Trigger::Manual,
                 None,
                 RunTags::new(),
+                None,
             )
             .unwrap_err();
         assert!(err.to_string().contains("not an op of the job"), "{err}");
@@ -2326,6 +2745,7 @@ mod tests {
                 Trigger::Manual,
                 None,
                 RunTags::new(),
+                None,
             )
             .unwrap_err();
         assert!(
@@ -2362,6 +2782,369 @@ mod tests {
         assert_eq!(names, ["b", "c"]);
         assert_eq!(ops[0].output, Some(json!(50)));
         assert_eq!(ops[1].output, Some(json!(51)));
+    }
+
+    // ------------------------------------------------------------- the queue
+
+    /// a job whose op announces itself and then waits for `gate`, so a test can
+    /// hold runs open and see exactly which ones the dispatcher started.
+    fn gated(name: &str, gate: Arc<AtomicBool>, started: Arc<Mutex<Vec<String>>>) -> Job {
+        Job::builder(name)
+            .op(Op::new("work", move |ctx: crate::op::OpCtx| {
+                let gate = gate.clone();
+                let started = started.clone();
+                let who = ctx
+                    .params()
+                    .get("who")
+                    .and_then(Value::as_str)
+                    .unwrap_or("?")
+                    .to_string();
+                async move {
+                    started.lock().unwrap().push(who);
+                    while !gate.load(Ordering::SeqCst) {
+                        tokio::time::sleep(Duration::from_millis(2)).await;
+                    }
+                    Ok(json!(null))
+                }
+            }))
+            .build()
+            .unwrap()
+    }
+
+    fn who(n: &str) -> Value {
+        json!({ "who": n })
+    }
+
+    async fn until(what: &str, mut held: impl FnMut() -> bool) {
+        for _ in 0..1_000 {
+            if held() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        panic!("{what} never happened");
+    }
+
+    /// what the ops of these tests have announced, in order.
+    fn order(started: &Arc<Mutex<Vec<String>>>) -> Vec<String> {
+        started.lock().unwrap().clone()
+    }
+
+    #[tokio::test]
+    async fn a_global_limit_holds_and_the_queue_drains_as_runs_finish() {
+        let gate = Arc::new(AtomicBool::new(false));
+        let started = Arc::new(Mutex::new(Vec::new()));
+        let runner = Runner::new(
+            [gated("etl", gate.clone(), started.clone())],
+            Store::open(":memory:").unwrap(),
+        )
+        .with_limits(Limits::new().global(1), 0);
+
+        let first = runner.launch("etl", who("a"), Trigger::Manual).unwrap();
+        let second = runner.launch("etl", who("b"), Trigger::Manual).unwrap();
+        until("the first run started", || order(&started) == ["a"]).await;
+
+        // the second is on the queue, unclaimed, and stays there: a limit is
+        // about what is executing, and one thing is
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(order(&started), ["a"]);
+        let waiting = runner.store().run(&second).unwrap().unwrap();
+        assert_eq!(waiting.status, RunStatus::Queued);
+        assert_eq!(waiting.claimed_by, None);
+        assert_eq!(
+            runner.store().run(&first).unwrap().unwrap().claimed_by,
+            Some(runner.instance().to_string())
+        );
+
+        gate.store(true, Ordering::SeqCst);
+        until("the queue drained", || order(&started) == ["a", "b"]).await;
+        assert_eq!(wait_terminal(&runner, &second).await, RunStatus::Success);
+        assert_eq!(runner.queue_depth().unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_per_job_limit_holds_that_job_and_nothing_else() {
+        let gate = Arc::new(AtomicBool::new(false));
+        let started = Arc::new(Mutex::new(Vec::new()));
+        // the limit declared on the job itself, which is where the readme
+        // always said it would go
+        let one_at_a_time = Job::builder("etl")
+            .op(gated("etl", gate.clone(), started.clone()).ops()[0].clone())
+            .max_concurrent_runs(1)
+            .build()
+            .unwrap();
+        let runner = Runner::new(
+            [
+                one_at_a_time,
+                gated("reports", gate.clone(), started.clone()),
+            ],
+            Store::open(":memory:").unwrap(),
+        )
+        .with_limits(Limits::new(), 0);
+
+        runner.launch("etl", who("etl-1"), Trigger::Manual).unwrap();
+        let held = runner.launch("etl", who("etl-2"), Trigger::Manual).unwrap();
+        runner
+            .launch("reports", who("reports-1"), Trigger::Manual)
+            .unwrap();
+        runner
+            .launch("reports", who("reports-2"), Trigger::Manual)
+            .unwrap();
+
+        until("the unlimited job ran both", || {
+            let seen = order(&started);
+            seen.contains(&"reports-1".to_string()) && seen.contains(&"reports-2".to_string())
+        })
+        .await;
+        let seen = order(&started);
+        assert!(seen.contains(&"etl-1".to_string()));
+        assert!(!seen.contains(&"etl-2".to_string()), "{seen:?}");
+        let blocked = runner.queue(10).unwrap();
+        assert_eq!(blocked.len(), 1);
+        assert_eq!(blocked[0].run.id, held);
+        assert_eq!(blocked[0].position, 1);
+        assert_eq!(blocked[0].blocked.as_ref().unwrap().scope(), "job");
+
+        gate.store(true, Ordering::SeqCst);
+        until("the held run started", || {
+            order(&started).contains(&"etl-2".to_string())
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn a_tag_limit_holds_across_jobs() {
+        let gate = Arc::new(AtomicBool::new(false));
+        let started = Arc::new(Mutex::new(Vec::new()));
+        let runner = Runner::new(
+            [
+                gated("etl", gate.clone(), started.clone()),
+                gated("reports", gate.clone(), started.clone()),
+            ],
+            Store::open(":memory:").unwrap(),
+        )
+        .with_limits(Limits::new().tag("env", "prod", 1), 0);
+
+        let prod = || RunTags::from([("env".to_string(), "prod".to_string())]);
+        runner
+            .launch_tagged("etl", who("prod-etl"), Trigger::Manual, prod())
+            .unwrap();
+        let held = runner
+            .launch_tagged("reports", who("prod-reports"), Trigger::Manual, prod())
+            .unwrap();
+        runner
+            .launch_tagged(
+                "reports",
+                who("staging"),
+                Trigger::Manual,
+                RunTags::from([("env".to_string(), "staging".to_string())]),
+            )
+            .unwrap();
+
+        // the tag is what is scarce, not the job: one prod run of either job
+        until("the untagged pair ran", || {
+            order(&started).contains(&"staging".to_string())
+        })
+        .await;
+        let seen = order(&started);
+        assert!(seen.contains(&"prod-etl".to_string()));
+        assert!(!seen.contains(&"prod-reports".to_string()), "{seen:?}");
+        let blocked = runner.queue(10).unwrap();
+        assert_eq!(blocked[0].run.id, held);
+        let why = blocked[0].blocked.as_ref().unwrap();
+        assert_eq!(why.scope(), "tag");
+        assert!(why.reason().contains("env:prod"), "{}", why.reason());
+    }
+
+    #[tokio::test]
+    async fn priority_decides_which_queued_run_starts_next() {
+        let gate = Arc::new(AtomicBool::new(false));
+        let started = Arc::new(Mutex::new(Vec::new()));
+        let runner = Runner::new(
+            [gated("etl", gate.clone(), started.clone())],
+            Store::open(":memory:").unwrap(),
+        )
+        .with_limits(Limits::new().global(1), 0);
+
+        runner.launch("etl", who("first"), Trigger::Manual).unwrap();
+        until("the first run started", || order(&started) == ["first"]).await;
+        // enqueued oldest first, and deliberately not in priority order
+        for (name, priority) in [("low", -1), ("high", 10), ("middle", 1)] {
+            runner
+                .launch_prioritized(
+                    "etl",
+                    who(name),
+                    Trigger::Manual,
+                    RunTags::new(),
+                    Some(priority),
+                )
+                .unwrap();
+        }
+        assert_eq!(runner.queue_depth().unwrap(), 3);
+        // and the queue is already in the order they will be taken
+        let queue = runner.queue(10).unwrap();
+        let waiting: Vec<&str> = queue
+            .iter()
+            .map(|q| q.run.params["who"].as_str().unwrap())
+            .collect();
+        assert_eq!(waiting, ["high", "middle", "low"]);
+
+        gate.store(true, Ordering::SeqCst);
+        until("the queue drained", || order(&started).len() == 4).await;
+        assert_eq!(order(&started), ["first", "high", "middle", "low"]);
+    }
+
+    // head-of-line blocking would be worse, so the dispatcher skips a run a
+    // limit holds back and starts the next one that fits — which is exactly why
+    // priority is a preference and not an order
+    #[tokio::test]
+    async fn a_blocked_run_does_not_hold_up_a_lower_priority_one_behind_it() {
+        let gate = Arc::new(AtomicBool::new(false));
+        let started = Arc::new(Mutex::new(Vec::new()));
+        let runner = Runner::new(
+            [
+                gated("etl", gate.clone(), started.clone()),
+                gated("reports", gate.clone(), started.clone()),
+            ],
+            Store::open(":memory:").unwrap(),
+        )
+        .with_limits(Limits::new().job("etl", 1), 0);
+
+        runner.launch("etl", who("etl-1"), Trigger::Manual).unwrap();
+        until("the first run started", || order(&started) == ["etl-1"]).await;
+        let blocked = runner
+            .launch_prioritized(
+                "etl",
+                who("etl-2"),
+                Trigger::Manual,
+                RunTags::new(),
+                Some(9),
+            )
+            .unwrap();
+        runner
+            .launch_prioritized(
+                "reports",
+                who("reports"),
+                Trigger::Manual,
+                RunTags::new(),
+                Some(0),
+            )
+            .unwrap();
+
+        until("the lower-priority run started", || {
+            order(&started).contains(&"reports".to_string())
+        })
+        .await;
+        // the higher-priority one is still waiting, and the queue says why
+        let queue = runner.queue(10).unwrap();
+        assert_eq!(queue.len(), 1);
+        assert_eq!(queue[0].run.id, blocked);
+        assert_eq!(queue[0].blocked.as_ref().unwrap().scope(), "job");
+        gate.store(true, Ordering::SeqCst);
+        until("the blocked run started", || {
+            order(&started).contains(&"etl-2".to_string())
+        })
+        .await;
+    }
+
+    // the limits are read at the top of every pass, so raising one drains the
+    // queue it was holding back without a restart and without a run finishing
+    #[tokio::test]
+    async fn raising_a_limit_starts_the_queue_without_a_restart() {
+        let gate = Arc::new(AtomicBool::new(false));
+        let started = Arc::new(Mutex::new(Vec::new()));
+        let runner = Runner::new(
+            [gated("etl", gate.clone(), started.clone())],
+            Store::open(":memory:").unwrap(),
+        )
+        .with_limits(Limits::new().global(1), 0);
+
+        runner.launch("etl", who("a"), Trigger::Manual).unwrap();
+        runner.launch("etl", who("b"), Trigger::Manual).unwrap();
+        until("the first run started", || order(&started) == ["a"]).await;
+        assert_eq!(runner.queue_depth().unwrap(), 1);
+        assert_eq!(runner.limits().global_limit(), Some(1));
+
+        runner.set_limits(Limits::new().global(2));
+        until("the queued run started", || order(&started) == ["a", "b"]).await;
+        // nothing finished to make room: the limit moved, and the queue noticed
+        assert_eq!(
+            runner
+                .store()
+                .run(
+                    &runner
+                        .store()
+                        .runs(None, None, None, None, None, 10)
+                        .unwrap()[1]
+                        .id
+                )
+                .unwrap()
+                .unwrap()
+                .status,
+            RunStatus::Running
+        );
+    }
+
+    // a run bumped up the queue is taken next, and one nobody can bump any more
+    // says so rather than answering as if it had moved
+    #[tokio::test]
+    async fn a_queued_runs_priority_can_be_changed_until_it_is_claimed() {
+        let gate = Arc::new(AtomicBool::new(false));
+        let started = Arc::new(Mutex::new(Vec::new()));
+        let runner = Runner::new(
+            [gated("etl", gate.clone(), started.clone())],
+            Store::open(":memory:").unwrap(),
+        )
+        .with_limits(Limits::new().global(1), 0);
+
+        let running = runner.launch("etl", who("a"), Trigger::Manual).unwrap();
+        until("the first run started", || order(&started) == ["a"]).await;
+        runner.launch("etl", who("b"), Trigger::Manual).unwrap();
+        let last = runner.launch("etl", who("c"), Trigger::Manual).unwrap();
+
+        assert!(runner.set_priority(&last, 5).unwrap());
+        let queue = runner.queue(10).unwrap();
+        assert_eq!(queue[0].run.id, last);
+
+        // one already claimed has spent its priority, and one that never
+        // existed is not the same mistake
+        let err = runner.set_priority(&running, 5).unwrap_err();
+        assert!(matches!(err, Error::RunActive(_)), "{err}");
+        assert!(!runner.set_priority("nope", 5).unwrap());
+
+        gate.store(true, Ordering::SeqCst);
+        until("the queue drained", || order(&started).len() == 3).await;
+        assert_eq!(order(&started), ["a", "c", "b"]);
+    }
+
+    // a subset launch's seeds belong to an earlier run and live nowhere on this
+    // one, so the plan is written down — which is what lets a claimer that was
+    // not the launcher start it
+    #[tokio::test]
+    async fn a_subset_launch_records_the_plan_it_will_execute() {
+        let runner = Runner::new([abc_job()], Store::open(":memory:").unwrap());
+        let run = runner
+            .run_subset(
+                "abc",
+                HashSet::from(["b".into(), "c".into()]),
+                HashMap::from([("a".into(), json!(5))]),
+                json!({}),
+                Trigger::Manual,
+                RunTags::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(run.status, RunStatus::Success);
+
+        let job = runner.jobs()["abc"].clone();
+        let plan = json!({ "ops": ["b", "c"], "seeds": { "a": 5 } });
+        let (pending, seeded) = planned(&job, Some(&plan));
+        assert_eq!(pending, ["b", "c"]);
+        assert_eq!(seeded["a"], json!(5));
+        // and a run of the whole job needs nothing recorded at all
+        let (pending, seeded) = planned(&job, None);
+        assert_eq!(pending, ["a", "b", "c"]);
+        assert!(seeded.is_empty());
     }
 
     #[tokio::test]

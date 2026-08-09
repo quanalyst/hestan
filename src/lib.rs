@@ -31,7 +31,9 @@ mod store;
 pub use app::Hestan;
 pub use asset::{Asset, AssetCheck, CheckOutcome, CheckResult, MultiAsset};
 pub use error::Error;
-pub use executor::{CancelOutcome, FailureHook, ResumePlan, RunFailure, Runner};
+pub use executor::{
+    Blocked, CancelOutcome, FailureHook, Limits, Queued, ResumePlan, RunFailure, Runner,
+};
 pub use freshness::{LateEvent, LateHook, LateKind};
 #[cfg(feature = "http")]
 pub use http::HttpSource;

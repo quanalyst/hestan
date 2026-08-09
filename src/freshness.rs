@@ -269,6 +269,10 @@ mod tests {
             resumed_from: None,
             scheduled_for: None,
             tags: Default::default(),
+            priority: 0,
+            claimed_by: None,
+            claimed_at: None,
+            lease_until: None,
         };
         store.create_run(&run, &[]).unwrap();
         store

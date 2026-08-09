@@ -9,7 +9,7 @@ use crate::asset::{
     Asset, AssetCheck, AssetRegistry, MultiAsset, asset_tag, mats_map, plan_target,
 };
 use crate::error::Error;
-use crate::executor::{FailureHook, RunFailure, Runner};
+use crate::executor::{FailureHook, Limits, RunFailure, Runner};
 use crate::freshness::{self, LateEvent, LateHook};
 use crate::io::{Io, IoManager};
 use crate::job::Job;
@@ -43,6 +43,8 @@ pub struct Hestan {
     db_path: String,
     hooks: Vec<FailureHook>,
     late_hooks: Vec<LateHook>,
+    limits: Limits,
+    priority: i64,
     retention_days: Option<u32>,
     asset_history: usize,
     #[cfg(feature = "http")]
@@ -68,6 +70,8 @@ impl Default for Hestan {
             db_path: "hestan.db".into(),
             hooks: Vec::new(),
             late_hooks: Vec::new(),
+            limits: Limits::new(),
+            priority: 0,
             retention_days: None,
             asset_history: DEFAULT_ASSET_HISTORY,
             #[cfg(feature = "http")]
@@ -146,6 +150,50 @@ impl Hestan {
     /// [`Error::Graph`]. a limit below 1 means 1.
     pub fn pool(mut self, name: impl Into<String>, limit: usize) -> Self {
         self.pools.push((name.into(), limit));
+        self
+    }
+
+    /// cap how many runs execute at once, across every job. the rest wait on
+    /// the queue in priority order and start as earlier ones finish; a value
+    /// below 1 means 1.
+    ///
+    /// this is a limit on *executing* runs. a run sitting on the queue costs
+    /// nothing and counts as nothing — which is what makes it different from
+    /// [`Overlap`](crate::Overlap), the policy that decides whether a scheduled
+    /// fire should exist at all while its job has a run outstanding.
+    ///
+    /// [`JobBuilder::max_concurrent_runs`](crate::JobBuilder::max_concurrent_runs)
+    /// is the same thing scoped to one job, and [`tag_limit`](Self::tag_limit)
+    /// scoped to a [tag](crate::RunTags).
+    pub fn max_concurrent_runs(mut self, n: usize) -> Self {
+        self.limits = std::mem::take(&mut self.limits).global(n);
+        self
+    }
+
+    /// at most `n` runs carrying the tag `key: value` executing at once —
+    /// `tag_limit("env", "prod", 2)` whatever the jobs are. stackable; the same
+    /// pair twice keeps the last. a value below 1 means 1.
+    ///
+    /// tags are how a run says what it is beyond its job — see
+    /// [`run_tags`](Self::run_tags) — so this is the limit to reach for when
+    /// what is scarce belongs to none of the jobs in particular: the production
+    /// warehouse, the paid api, the one machine with the gpu.
+    pub fn tag_limit(mut self, key: impl Into<String>, value: impl Into<String>, n: usize) -> Self {
+        self.limits = std::mem::take(&mut self.limits).tag(key, value, n);
+        self
+    }
+
+    /// the queue position runs launched by this process get unless the launch
+    /// asks for another. higher goes first, ties by creation time; 0 is the
+    /// default and negatives are legal, which is how a deployment says "these
+    /// are the background ones".
+    ///
+    /// priority is a preference rather than an order: the dispatcher skips a
+    /// run a limit would block and starts the next one that fits, because one
+    /// blocked run at the head of the queue holding up everything unrelated
+    /// behind it is worse than starting things slightly out of turn.
+    pub fn priority(mut self, n: i64) -> Self {
+        self.priority = n;
         self
     }
 
@@ -472,6 +520,11 @@ impl Hestan {
             built.runner.clone(),
             built.registry.clone(),
         ));
+        // the dispatcher: the queue's own loop. every launch pokes it and
+        // every run that finishes pokes it, so what this covers is the two
+        // things no local poke can — a run another process enqueued, and a
+        // limit that changed under a queue nobody is touching
+        let dispatcher = tokio::spawn(crate::executor::run_dispatcher(built.runner.clone()));
         let checker = tokio::spawn(freshness::run_checker(
             built.runner.clone(),
             built.registry.clone(),
@@ -488,6 +541,7 @@ impl Hestan {
         scheduler.abort();
         sensors.abort();
         backfills.abort();
+        dispatcher.abort();
         checker.abort();
         served?;
         Ok(())
@@ -676,7 +730,8 @@ impl Hestan {
         }
         let io = Io::new(self.io_default, self.io_named);
         let runner = Runner::with_resources(jobs, store, self.hooks, self.pools, resources, io)?
-            .with_run_tags(self.run_tags);
+            .with_run_tags(self.run_tags)
+            .with_limits(self.limits, self.priority);
         Ok(Built {
             runner,
             entries,
@@ -959,6 +1014,10 @@ mod tests {
             resumed_from: None,
             scheduled_for: None,
             tags: RunTags::new(),
+            priority: 0,
+            claimed_by: None,
+            claimed_at: None,
+            lease_until: None,
         };
         store
             .create_run(&planted("mine"), &["quick".to_string()])
