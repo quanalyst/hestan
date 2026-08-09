@@ -49,6 +49,7 @@ summary or a 404. the shape:
     {
       "name": "fetch_orders",
       "deps": [],
+      "when": "all_succeeded",
       "retries": 0,
       "timeout_secs": 30.0,
       "pool": "orders_api",
@@ -76,7 +77,9 @@ summary or a 404. the shape:
 in first-use order, with the limit each carries — that limit is shared with
 every other job in the process, not per job. an op's `pool` is the pool it
 takes a permit from (null for most ops) and `timeout_secs` its per-attempt
-time limit (null for none). `mapped_over` is the dep an
+time limit (null for none). `when` is the op's
+[trigger rule](concepts.md#trigger-rules) — `all_succeeded` (the default),
+`any_failed` or `always`. `mapped_over` is the dep an
 [`Op::mapped`](concepts.md#dynamic-fan-out) fans out over, null for every
 ordinary op. `interval_secs` is the gap between the next two fires, minimized across the
 job's unpaused schedules (`null` without one); `overdue` is true when the

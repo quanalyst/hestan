@@ -1,7 +1,18 @@
-import type { RunStatus } from "./types";
+import type { OpSummary, RunStatus, When } from "./types";
 
 export function shortId(id: string): string {
   return id.slice(0, 8);
+}
+
+// how a trigger rule reads on a node; the default rule earns no marker,
+// because every op used to have it
+export function whenLabel(when: When): string | null {
+  return when === "always" ? "always" : when === "any_failed" ? "if failed" : null;
+}
+
+// a dag node's muted suffix: an instance count, a trigger rule, or both
+export function opBadge(op: OpSummary, count?: string | null): string | undefined {
+  return [count, whenLabel(op.when)].filter(Boolean).join(" ") || undefined;
 }
 
 export function isTerminal(status: RunStatus): boolean {

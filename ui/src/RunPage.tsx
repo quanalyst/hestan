@@ -16,7 +16,7 @@ import type {
   Run,
   RunEvent,
 } from "./types";
-import { clockTime, durationMs, fmtDuration, isTerminal, relTime, shortId } from "./util";
+import { clockTime, durationMs, fmtDuration, isTerminal, opBadge, relTime, shortId } from "./util";
 
 const plan = (p: ResumePreview) => `${p.rerun.length} to re-run · ${p.reuse.length} reused`;
 
@@ -232,9 +232,9 @@ function RunView({ id }: { id: string }) {
       )
     : {};
   const dagNodes = (job?.ops ?? []).map((o) => {
-    if (!o.mapped_over) return o;
+    if (!o.mapped_over) return { ...o, badge: opBadge(o) };
     const n = expanded.get(o.name) ?? instances.get(o.name)?.length;
-    return { ...o, badge: n === undefined ? "×n" : `×${n}` };
+    return { ...o, badge: opBadge(o, n === undefined ? "×n" : `×${n}`) };
   });
   // the gantt lists instances as their own rows, and hangs a mapped op's
   // dependents off them, since the parent itself has no span to draw

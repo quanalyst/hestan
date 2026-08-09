@@ -13,7 +13,9 @@ use tokio::task::{Id, JoinSet};
 use crate::error::Error;
 use crate::graph;
 use crate::job::Job;
-use crate::model::{EventKind, EventLevel, OpRun, OpStatus, Run, RunStatus, Trigger, new_run_id};
+use crate::model::{
+    EventKind, EventLevel, OpRun, OpStatus, Run, RunStatus, Trigger, When, new_run_id,
+};
 use crate::op::{Cancel, Op, OpCtx};
 use crate::store::Store;
 
@@ -660,6 +662,14 @@ async fn execute(
     let cap = job.max_parallel().unwrap_or(usize::MAX).max(1);
     let mut pending = pending;
     let mut outputs: HashMap<String, Value> = seeded;
+    // what each settled unit did, which is what readiness and the trigger
+    // rules are asked about. seeded names count as succeeded: a resume's
+    // reused output, an asset build's memoized value and a source asset all
+    // stand in for a run that worked.
+    let mut statuses: HashMap<String, OpStatus> = outputs
+        .keys()
+        .map(|n| (n.clone(), OpStatus::Success))
+        .collect();
     let mut failed = false;
     let mut canceled = false;
     let mut first_failure: Option<(String, String)> = None;
@@ -671,94 +681,149 @@ async fn execute(
     let mut fanouts: HashMap<String, Fanout> = HashMap::new();
 
     loop {
-        // a mapped op expands the moment its deps land: it leaves `pending`
+        // settle every unit whose deps have all reached a terminal status: its
+        // trigger rule either admits it or skips it here, and a skip is itself
+        // terminal, so this repeats until a sweep settles nothing new.
+        //
+        // an admitted mapped op expands in the same sweep: it leaves `pending`
         // and its instances take its place, so everything below treats them as
-        // ordinary ops. this runs on the run's own task, which is why the rows
-        // an expansion inserts can never race the terminal status write.
-        let mut i = 0;
-        while i < pending.len() {
-            // an instance resolves to its parent's op, which is mapped too;
-            // only the parent ever expands
-            let expandable = !instances.contains_key(&pending[i]);
-            let op = unit_op(&job, &instances, &pending[i]);
-            let over = op.mapped_over().filter(|_| expandable).map(str::to_string);
-            let Some(over) = over.filter(|_| op.deps().iter().all(|d| outputs.contains_key(d)))
-            else {
-                i += 1;
-                continue;
-            };
-            let name = pending.remove(i);
-            let Some(elements) = outputs[&over].as_array().cloned() else {
-                let msg = format!(
-                    "mapped over {over}, which produced {} rather than an array",
-                    json_type(&outputs[&over])
-                );
+        // ordinary ops. all of it runs on the run's own task, which is why the
+        // rows an expansion inserts can never race the terminal status write.
+        let mut ready: Vec<String> = Vec::new();
+        loop {
+            let mut settled = false;
+            let mut i = 0;
+            while i < pending.len() {
+                let name = pending[i].clone();
+                let op = unit_op(&job, &instances, &name);
+                if !op.deps().iter().all(|d| statuses.contains_key(d)) {
+                    i += 1;
+                    continue;
+                }
+                settled = true;
+                if let Err(reason) = admits(op, &statuses) {
+                    pending.remove(i);
+                    note(store.append_event(
+                        &run_id,
+                        Some(&name),
+                        EventLevel::Warn,
+                        EventKind::OpSkipped,
+                        reason,
+                        Some(&json!({ "when": op.runs_when() })),
+                    ));
+                    note(store.op_finished(&run_id, &name, OpStatus::Skipped, None, None));
+                    statuses.insert(name.clone(), OpStatus::Skipped);
+                    let reason = format!("skipped: upstream {name} was skipped");
+                    skip_downstream(
+                        &job,
+                        &pairs,
+                        &name,
+                        &reason,
+                        &mut pending,
+                        &mut statuses,
+                        &run_id,
+                        &store,
+                    );
+                    continue;
+                }
+                // an instance resolves to its parent's op, which is mapped
+                // too; only the parent ever expands
+                let expandable = !instances.contains_key(&name);
+                let Some(over) = op.mapped_over().filter(|_| expandable).map(str::to_string) else {
+                    ready.push(pending.remove(i));
+                    continue;
+                };
+                pending.remove(i);
+                // a rule can admit a mapped op whose array never arrived. there
+                // is nothing to expand over, so it expands into nothing: the
+                // same zero-instance fan-out an empty array gives, output `[]`
+                let elements = match outputs.get(&over) {
+                    None => Some(Vec::new()),
+                    Some(Value::Array(a)) => Some(a.clone()),
+                    Some(_) => None,
+                };
+                let Some(elements) = elements else {
+                    let msg = format!(
+                        "mapped over {over}, which produced {} rather than an array",
+                        json_type(&outputs[&over])
+                    );
+                    note(store.append_event(
+                        &run_id,
+                        Some(&name),
+                        EventLevel::Error,
+                        EventKind::OpFailed,
+                        &msg,
+                        Some(&json!({ "error": &msg })),
+                    ));
+                    if first_failure.is_none() {
+                        first_failure = Some((name.clone(), msg));
+                    }
+                    failed = true;
+                    statuses.insert(name.clone(), OpStatus::Failed);
+                    let reason = format!("skipped: upstream {name} failed");
+                    skip_downstream(
+                        &job,
+                        &pairs,
+                        &name,
+                        &reason,
+                        &mut pending,
+                        &mut statuses,
+                        &run_id,
+                        &store,
+                    );
+                    continue;
+                };
+                // rows first, so a cancel or a skip has something to write to,
+                // exactly as a static op's row exists from the launch on
+                let created: Vec<String> = elements
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, element)| {
+                        let instance = format!("{name}[{index}]");
+                        note(store.create_op_run(&run_id, &instance));
+                        instances.insert(
+                            instance.clone(),
+                            Instance {
+                                parent: name.clone(),
+                                index,
+                                element,
+                            },
+                        );
+                        instance
+                    })
+                    .collect();
                 note(store.append_event(
                     &run_id,
                     Some(&name),
-                    EventLevel::Error,
-                    EventKind::OpFailed,
-                    &msg,
-                    Some(&json!({ "error": &msg })),
+                    EventLevel::Info,
+                    EventKind::OpExpanded,
+                    &format!("expanded into {} instances over {over}", created.len()),
+                    Some(&json!({ "instances": created.len(), "over": over })),
                 ));
-                if first_failure.is_none() {
-                    first_failure = Some((name.clone(), msg));
+                if created.is_empty() {
+                    // nothing to wait on: an empty array is a legal fan-out,
+                    // and downstream runs normally on `[]`
+                    outputs.insert(name.clone(), json!([]));
+                    statuses.insert(name, OpStatus::Success);
+                    continue;
                 }
-                failed = true;
-                skip_downstream(&pairs, &name, &mut pending, &run_id, &store);
-                continue;
-            };
-            // rows first, so a cancel or a skip has something to write to,
-            // exactly as a static op's row exists from the launch on
-            let created: Vec<String> = elements
-                .into_iter()
-                .enumerate()
-                .map(|(index, element)| {
-                    let instance = format!("{name}[{index}]");
-                    note(store.create_op_run(&run_id, &instance));
-                    instances.insert(
-                        instance.clone(),
-                        Instance {
-                            parent: name.clone(),
-                            index,
-                            element,
-                        },
-                    );
-                    instance
-                })
-                .collect();
-            note(store.append_event(
-                &run_id,
-                Some(&name),
-                EventLevel::Info,
-                EventKind::OpExpanded,
-                &format!("expanded into {} instances over {over}", created.len()),
-                Some(&json!({ "instances": created.len(), "over": over })),
-            ));
-            if created.is_empty() {
-                // nothing to wait on: an empty array is a legal fan-out, and
-                // downstream runs normally on `[]`
-                outputs.insert(name, json!([]));
-                continue;
+                let n = created.len();
+                fanouts.insert(
+                    name,
+                    Fanout {
+                        slots: vec![None; n],
+                        remaining: n,
+                        failed: false,
+                    },
+                );
+                // at `i`, so the instances settle in this same sweep
+                pending.splice(i..i, created);
             }
-            let n = created.len();
-            fanouts.insert(
-                name,
-                Fanout {
-                    slots: vec![None; n],
-                    remaining: n,
-                    failed: false,
-                },
-            );
-            pending.splice(i..i, created);
-            i += n;
+            if !settled {
+                break;
+            }
         }
 
-        let (ready, rest): (Vec<String>, Vec<String>) = pending.into_iter().partition(|n| {
-            let op = unit_op(&job, &instances, n);
-            op.deps().iter().all(|d| outputs.contains_key(d))
-        });
-        pending = rest;
         let mut ready = ready.into_iter();
         let spawnable: Vec<String> = ready
             .by_ref()
@@ -770,10 +835,18 @@ async fn execute(
         }
         for name in spawnable {
             let op = unit_op(&job, &instances, &name).clone();
+            // a dep a rule let this op run past may have produced nothing, so
+            // its entry is simply absent — `ctx.input` says None, and
+            // `ctx.dep_status` says what it did instead
             let inputs: HashMap<String, Value> = op
                 .deps()
                 .iter()
-                .map(|d| (d.clone(), outputs[d].clone()))
+                .filter_map(|d| outputs.get(d).map(|v| (d.clone(), v.clone())))
+                .collect();
+            let dep_statuses: HashMap<String, OpStatus> = op
+                .deps()
+                .iter()
+                .filter_map(|d| statuses.get(d).map(|s| (d.clone(), *s)))
                 .collect();
             let handle = tasks.spawn(run_op(
                 op,
@@ -783,6 +856,7 @@ async fn execute(
                 run_id.clone(),
                 params.clone(),
                 Arc::new(inputs),
+                Arc::new(dep_statuses),
                 store.clone(),
                 runner.pools.clone(),
                 cancel.clone(),
@@ -809,7 +883,14 @@ async fn execute(
                 if let Some(state) = state {
                     note(store.set_op_state(job.name(), &name, &state));
                 }
-                collect(name, output, &instances, &mut fanouts, &mut outputs);
+                collect(
+                    name,
+                    output,
+                    &instances,
+                    &mut fanouts,
+                    &mut outputs,
+                    &mut statuses,
+                );
             }
             Ok((id, (name, Err(msg)))) => {
                 names.remove(&id);
@@ -822,8 +903,10 @@ async fn execute(
                     &name,
                     &instances,
                     &mut fanouts,
+                    &job,
                     &pairs,
                     &mut pending,
+                    &mut statuses,
                     &run_id,
                     &store,
                 );
@@ -849,8 +932,10 @@ async fn execute(
                     &name,
                     &instances,
                     &mut fanouts,
+                    &job,
                     &pairs,
                     &mut pending,
+                    &mut statuses,
                     &run_id,
                     &store,
                 );
@@ -989,6 +1074,25 @@ fn json_type(v: &Value) -> &'static str {
     }
 }
 
+/// what an op's trigger rule says about the statuses its deps reached: `Ok`
+/// to run it, `Err(reason)` to skip it with that reason recorded. the reason
+/// names the rule, so a rule-declined skip never reads like the
+/// upstream-failure skip that [`skip_downstream`] writes.
+fn admits(op: &Op, statuses: &HashMap<String, OpStatus>) -> Result<(), &'static str> {
+    let all_succeeded = op
+        .deps()
+        .iter()
+        .all(|d| statuses.get(d) == Some(&OpStatus::Success));
+    match op.runs_when() {
+        When::AllSucceeded if !all_succeeded => {
+            Err("skipped by rule all_succeeded: a dep did not succeed")
+        }
+        // an op with no deps has nothing that could have failed
+        When::AnyFailed if all_succeeded => Err("skipped by rule any_failed: every dep succeeded"),
+        _ => Ok(()),
+    }
+}
+
 // an instance's output goes into its parent's slot; the mapped op's own
 // output appears, in element order, once every instance has landed
 fn collect(
@@ -997,7 +1101,9 @@ fn collect(
     instances: &HashMap<String, Instance>,
     fanouts: &mut HashMap<String, Fanout>,
     outputs: &mut HashMap<String, Value>,
+    statuses: &mut HashMap<String, OpStatus>,
 ) {
+    statuses.insert(name.clone(), OpStatus::Success);
     let Some(instance) = instances.get(&name) else {
         outputs.insert(name, output);
         return;
@@ -1013,6 +1119,7 @@ fn collect(
             .map(|slot| slot.expect("every instance filled its slot"))
             .collect();
         outputs.insert(instance.parent.clone(), Value::Array(collected));
+        statuses.insert(instance.parent.clone(), OpStatus::Success);
     }
 }
 
@@ -1024,23 +1131,33 @@ fn give_up(
     name: &str,
     instances: &HashMap<String, Instance>,
     fanouts: &mut HashMap<String, Fanout>,
+    job: &Job,
     pairs: &[(String, Vec<String>)],
     pending: &mut Vec<String>,
+    statuses: &mut HashMap<String, OpStatus>,
     run_id: &str,
     store: &Store,
 ) {
+    statuses.insert(name.to_string(), OpStatus::Failed);
     let Some(instance) = instances.get(name) else {
-        skip_downstream(pairs, name, pending, run_id, store);
+        let reason = format!("skipped: upstream {name} failed");
+        skip_downstream(job, pairs, name, &reason, pending, statuses, run_id, store);
         return;
     };
     let fan = fanouts
         .get_mut(&instance.parent)
         .expect("an instance belongs to a live fan-out");
     fan.remaining -= 1;
-    // the first failure is what skips downstream; later ones just close a slot
+    // the first failure is what fails the mapped op and skips downstream;
+    // later ones just close a slot
     if !fan.failed {
         fan.failed = true;
-        skip_downstream(pairs, &instance.parent, pending, run_id, store);
+        let parent = instance.parent.clone();
+        statuses.insert(parent.clone(), OpStatus::Failed);
+        let reason = format!("skipped: upstream {parent} failed");
+        skip_downstream(
+            job, pairs, &parent, &reason, pending, statuses, run_id, store,
+        );
     }
 }
 
@@ -1085,6 +1202,7 @@ async fn run_op(
     run_id: String,
     params: Value,
     inputs: Arc<HashMap<String, Value>>,
+    dep_statuses: Arc<HashMap<String, OpStatus>>,
     store: Store,
     pools: Pools,
     cancel: watch::Receiver<bool>,
@@ -1145,6 +1263,7 @@ async fn run_op(
             params: params.clone(),
             element: element.clone(),
             inputs: inputs.clone(),
+            dep_statuses: dep_statuses.clone(),
             state: state.clone(),
             new_state: new_state.clone(),
             new_fingerprint: Arc::new(Mutex::new(None)),
@@ -1247,14 +1366,27 @@ fn panic_payload(panic: &(dyn std::any::Any + Send)) -> Option<&str> {
         .or_else(|| panic.downcast_ref::<String>().map(String::as_str))
 }
 
+/// mark what `root` not succeeding cuts off. propagation asks each candidate's
+/// [trigger rule](When) instead of assuming: an op that would still run is not
+/// skipped, and neither is anything hanging off it, which waits on what that
+/// op does rather than on what happened above it. everything reached through
+/// plain [`When::AllSucceeded`] ops is skipped as one, naming `root` — that is
+/// one failure with one cause, not a chain of them.
+#[allow(clippy::too_many_arguments)]
 fn skip_downstream(
+    job: &Job,
     pairs: &[(String, Vec<String>)],
     root: &str,
+    reason: &str,
     pending: &mut Vec<String>,
+    statuses: &mut HashMap<String, OpStatus>,
     run_id: &str,
     store: &Store,
 ) {
-    let down = graph::downstream(pairs, root);
+    let down = graph::downstream_through(pairs, root, |n| {
+        job.op(n)
+            .is_none_or(|o| o.runs_when() == When::AllSucceeded)
+    });
     let mut i = 0;
     while i < pending.len() {
         if down.contains(&pending[i]) {
@@ -1265,10 +1397,11 @@ fn skip_downstream(
                 Some(&name),
                 EventLevel::Warn,
                 EventKind::OpSkipped,
-                &format!("skipped: upstream {root} failed"),
+                reason,
                 None,
             ));
             note(store.op_finished(run_id, &name, OpStatus::Skipped, None, None));
+            statuses.insert(name, OpStatus::Skipped);
         } else {
             i += 1;
         }

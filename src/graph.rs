@@ -60,6 +60,19 @@ pub(crate) fn topo_order(ops: &[(String, Vec<String>)]) -> Result<Vec<String>, S
 
 // transitive dependents of root, root itself excluded
 pub(crate) fn downstream(ops: &[(String, Vec<String>)], root: &str) -> HashSet<String> {
+    downstream_through(ops, root, |_| true)
+}
+
+/// transitive dependents of `root` (excluded) reached only through nodes
+/// `through` accepts: a rejected node is left out and the walk does not
+/// continue past it, so whatever hangs off it is left out too. that is a
+/// [trigger rule](crate::When) boundary — an op that would run anyway is not
+/// cut off, and neither is its downstream, which waits on what it does.
+pub(crate) fn downstream_through(
+    ops: &[(String, Vec<String>)],
+    root: &str,
+    mut through: impl FnMut(&str) -> bool,
+) -> HashSet<String> {
     let mut dependents: HashMap<&str, Vec<&str>> = HashMap::new();
     for (name, deps) in ops {
         for d in deps {
@@ -73,7 +86,7 @@ pub(crate) fn downstream(ops: &[(String, Vec<String>)], root: &str) -> HashSet<S
     let mut stack = vec![root];
     while let Some(n) = stack.pop() {
         for &k in dependents.get(n).map(Vec::as_slice).unwrap_or_default() {
-            if out.insert(k.to_string()) {
+            if through(k) && out.insert(k.to_string()) {
                 stack.push(k);
             }
         }
@@ -137,5 +150,21 @@ mod tests {
         let want: HashSet<String> = ["b", "c", "d"].iter().map(|s| s.to_string()).collect();
         assert_eq!(downstream(&g, "a"), want);
         assert!(downstream(&g, "e").is_empty());
+    }
+
+    #[test]
+    fn downstream_through_stops_at_a_rejected_node() {
+        let g = ops(&[
+            ("a", &[]),
+            ("b", &["a"]),
+            ("c", &["b"]),
+            ("d", &["a"]),
+            ("e", &["d"]),
+        ]);
+        // b is not cut off, so c — which hangs off b alone — is not either
+        let want: HashSet<String> = ["d", "e"].iter().map(|s| s.to_string()).collect();
+        assert_eq!(downstream_through(&g, "a", |n| n != "b"), want);
+        // rejecting nothing is the plain walk
+        assert_eq!(downstream_through(&g, "a", |_| true), downstream(&g, "a"));
     }
 }

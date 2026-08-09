@@ -3,9 +3,10 @@
 ## Vocabulary
 
 an *op* is a named async fn plus the upstream ops it waits on: `Op::new` or
-`Op::typed`, then `.after([...])`, `.retries(n)`, `.retry_backoff(base, max)`
-or `.retry_delay(d)`, `.timeout(d)`, `.pool(name)`, `.params::<P>()`. it
-receives an `OpCtx` and returns json output or an error.
+`Op::typed`, then `.after([...])`, `.when(rule)`, `.retries(n)`,
+`.retry_backoff(base, max)` or `.retry_delay(d)`, `.timeout(d)`,
+`.pool(name)`, `.params::<P>()`. it receives an `OpCtx` and returns json
+output or an error.
 
 a *job* is a validated dag of ops. `Job::builder(name)...build()` rejects
 duplicate op names, deps on unknown ops, and cycles, and fixes a deterministic
@@ -64,7 +65,8 @@ returns `None` even if that op ran.
 
 ## How a run executes
 
-every op whose deps have all produced output is spawned as its own tokio
+every op whose deps have all reached a terminal status — and whose
+[trigger rule](#trigger-rules) admits it — is spawned as its own tokio
 task, so independent branches run concurrently — in a diamond
 `a -> {b, c} -> d`, `b` and `c` run at the same time.
 `Job::builder(..).max_parallel(n)` caps how many ops of one run are in
@@ -76,7 +78,8 @@ persisted as a side effect); downstream ops never read the database.
 when an op exhausts its attempts, its transitive downstream is marked
 `skipped`, each with an `op_skipped` event naming the failed root, and the
 run will be failed. branches that don't depend on the failed op keep running
-to completion.
+to completion. propagation stops at any op whose [trigger rule](#trigger-rules)
+would still run it.
 
 retries are extra attempts: `.retries(2)` means up to 3 total. a failed
 attempt emits `op_retry` (`data: {"attempt": n}`), sleeps, and tries again;
@@ -110,6 +113,77 @@ which is the same pair an [`on_failure` hook](notifications.md) receives. the
 terminal event (`run_failed` / `run_success` / `run_canceled`) is committed
 before the terminal status, so anything that observes a finished run can also
 read its closing event.
+
+## Trigger rules
+
+by default an op runs when its whole upstream worked. that makes the one op
+you most want after a failure — a summary, an alert, a cleanup — exactly the
+one that gets skipped. `.when(rule)` says otherwise:
+
+```rust
+use hestan::When;
+
+Op::new("summary", |ctx: OpCtx| async move {
+    let load = ctx.dep_status("load");          // Some(OpStatus::Failed)
+    ctx.warn(format!("load ended {load:?}"));
+    Ok(json!({ "reported": true }))
+})
+.after(["extract", "load"])
+.when(When::Always)
+```
+
+- `When::AllSucceeded` — every dep succeeded. the default, and what an op
+  without a rule has always meant.
+- `When::AnyFailed` — at least one dep did **not** succeed: failed, skipped
+  or canceled. an op with no deps never qualifies, so it is always skipped.
+- `When::Always` — whatever the deps did.
+
+readiness is the same for all three: an op waits until every dep has reached
+a *terminal* status, not until every dep has produced output. the rule then
+decides run vs skip. an op the rule turns down is `skipped` with an
+`op_skipped` event that names the rule
+(`skipped by rule any_failed: every dep succeeded`, `data: {"when": ...}`) —
+deliberately different wording from the upstream-failure skip
+(`skipped: upstream load failed`), so the log says which of the two happened.
+
+inside such an op, `ctx.input(dep)` for a dep that produced nothing is `None`
+— there is no output to hand over — and `ctx.dep_status(dep)` is how it finds
+out what happened instead. a dep seeded from outside the run (a
+[resume](#resume)'s reused output, an [asset build](assets.md)'s memoized
+value, a source asset) reads as `success`, since that is what it stands in
+for.
+
+### What a rule does not change
+
+the run's own outcome. any op that finished `failed` fails the run, however
+many cleanup ops ran happily afterwards. there is no "recovered" state: a
+cleanup that worked is not evidence that the thing it cleaned up after
+worked.
+
+### Propagation
+
+skip propagation asks each candidate's rule rather than assuming. when an op
+fails, the walk down its dependents stops at the first op that would still
+run — and therefore at everything hanging off that op, which waits on what it
+does rather than on what happened above it:
+
+```
+boom(failed) -> cut_off(skipped) -> deeper(skipped)
+             -> cleanup(always, runs) -> after_cleanup(runs, if cleanup succeeded)
+```
+
+everything reached through plain `all_succeeded` ops is skipped as one group
+naming the original root — one failure with one cause, not a chain of them.
+if `cleanup` then fails, its own downstream is cut off naming `cleanup`.
+
+### Rules and fan-out
+
+a rule applies to a [mapped op](#dynamic-fan-out) as a whole; its instances
+are all-or-nothing already, so there is nothing finer to apply it to. a
+mapped op admitted by its rule when the array it maps over never arrived has
+nothing to expand over, so it expands into **zero instances**: no bodies run,
+no instance rows, an `op_expanded` event with `instances: 0`, and output `[]`
+downstream — exactly the empty fan-out an empty array would have given.
 
 ## Concurrency pools
 

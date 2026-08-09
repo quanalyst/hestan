@@ -9,7 +9,7 @@ import { GlyphShape } from "./StatusGlyph";
 import type { Status } from "./StatusGlyph";
 import TimelinePlot, { futureWindowSecs } from "./TimelinePlot";
 import type { JobState, JobSummary, OpStat, Run, Tick, TickOutcome, UpcomingSchedule } from "./types";
-import { durationMs, fmtDuration, relTime, shortId, untilTime } from "./util";
+import { durationMs, fmtDuration, opBadge, relTime, shortId, untilTime } from "./util";
 
 const STATS_RUNS = 50;
 
@@ -240,7 +240,7 @@ function JobView({ name }: { name: string }) {
       <DagView
         // a mapped op is one node in the definition; how many instances it
         // makes is only known inside a run
-        nodes={job.ops.map((o) => (o.mapped_over ? { ...o, badge: "×n" } : o))}
+        nodes={job.ops.map((o) => ({ ...o, badge: opBadge(o, o.mapped_over ? "×n" : null) }))}
         selected={opSel}
         onSelect={(op) => setOpSel((prev) => (prev === op ? null : op))}
       />

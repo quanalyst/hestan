@@ -28,7 +28,7 @@ pub use http::HttpSource;
 pub use job::{Job, JobBuilder};
 pub use model::{
     Event, EventKind, EventLevel, Materialization, OpRun, OpStatus, Overlap, Run, RunStatus,
-    ScheduleRow, SensorOutcome, SensorRow, SensorTick, Tick, TickOutcome, Trigger,
+    ScheduleRow, SensorOutcome, SensorRow, SensorTick, Tick, TickOutcome, Trigger, When,
 };
 pub use op::{InputError, Op, OpCtx, OpResult};
 pub use sensor::{RunRequest, Sensor, SensorCtx};

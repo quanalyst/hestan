@@ -24,9 +24,13 @@ export type TickOutcome = "fired" | "error" | "skipped" | "deferred";
 // narrower than TickOutcome: skipped/deferred are schedule ideas, not sensor ones
 export type SensorOutcome = "fired" | "error";
 
+// an op's trigger rule: what its deps must have done for it to run at all
+export type When = "all_succeeded" | "any_failed" | "always";
+
 export interface OpSummary {
   name: string;
   deps: string[];
+  when: When;
   retries: number;
   timeout_secs: number | null;
   pool: string | null;

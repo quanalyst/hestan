@@ -116,6 +116,11 @@ appears.
   budget for one external resource, however many jobs overlap). a terminal op
   failure skips its downstream and fails the run, while independent branches
   keep going
+- an op's trigger rule says when it runs: `.when(When::Always)` or
+  `.when(When::AnyFailed)` makes a summary, an alert or a cleanup after a
+  failure expressible, where the default `AllSucceeded` skips it. skip
+  propagation stops at such an op, and `ctx.dep_status(dep)` tells it what
+  each dep actually did
 - one op can fan out over a list only known at run time: `Op::mapped(f)
   .over("pages")` runs an instance per element of that dep's json array, each
   with its own op run row and its element as a typed argument, and hands

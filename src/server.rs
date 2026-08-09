@@ -129,6 +129,7 @@ fn job_summary(job: &Job, st: &AppState) -> Result<Value, Error> {
             json!({
                 "name": op.name(),
                 "deps": op.deps(),
+                "when": op.runs_when(),
                 "retries": op.max_retries(),
                 "timeout_secs": op.timeout_after().map(|d| d.as_secs_f64()),
                 "pool": op.pool_name(),
@@ -1279,6 +1280,29 @@ mod tests {
                 .unwrap_err();
         assert_eq!(status, StatusCode::NOT_FOUND);
         assert_eq!(body["error"], "unknown job: nope");
+    }
+
+    // the dag draws a muted marker from this, and the default rule is the
+    // absence of one
+    #[tokio::test]
+    async fn job_summary_reports_each_ops_trigger_rule() {
+        let job = Job::builder("nightly")
+            .op(Op::new("load", |_| async { Ok(json!(null)) }))
+            .op(Op::new("summary", |_| async { Ok(json!(null)) })
+                .after(["load"])
+                .when(crate::model::When::Always))
+            .op(Op::new("alert", |_| async { Ok(json!(null)) })
+                .after(["load"])
+                .when(crate::model::When::AnyFailed))
+            .build()
+            .unwrap();
+        let Json(body) = get_job(State(state(vec![job])), Path("nightly".into()))
+            .await
+            .unwrap();
+        let ops = body["ops"].as_array().unwrap();
+        assert_eq!(ops[0]["when"], "all_succeeded");
+        assert_eq!(ops[1]["when"], "always");
+        assert_eq!(ops[2]["when"], "any_failed");
     }
 
     // the dag needs to know which node fans out; the instances themselves come

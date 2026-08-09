@@ -81,6 +81,12 @@ export default function OpInspector({
       )}
 
       <div className="op-lines">
+        {op.when !== "all_succeeded" && (
+          <div className="op-line">
+            <span className="op-line-label">runs</span>
+            <span className="mono">{op.when === "always" ? "always" : "if a dep failed"}</span>
+          </div>
+        )}
         <div className="op-line">
           <span className="op-line-label">retries</span>
           <span className="num">{op.retries}</span>

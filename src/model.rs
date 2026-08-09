@@ -140,6 +140,28 @@ str_enum!(TickOutcome {
     Deferred => "deferred",
 });
 
+/// an op's trigger rule: what its deps have to have done for it to run, from
+/// [`Op::when`](crate::Op::when). readiness is the same either way — every dep
+/// terminal — and this decides run vs skip once they are.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum When {
+    /// every dep succeeded. the default, and the only rule there was before
+    /// trigger rules existed.
+    #[default]
+    AllSucceeded,
+    /// at least one dep did not succeed — failed, skipped, or canceled. an op
+    /// with no deps never qualifies.
+    AnyFailed,
+    /// whatever the deps did, including nothing.
+    Always,
+}
+str_enum!(When {
+    AllSucceeded => "all_succeeded",
+    AnyFailed => "any_failed",
+    Always => "always",
+});
+
 /// what a schedule does when it fires while the job still has an active run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]

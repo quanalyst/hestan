@@ -2,6 +2,14 @@
 
 ## unreleased
 
+- trigger rules: `Op::when(When::Always | When::AnyFailed | When::AllSucceeded)` decides whether an op runs once its deps settle, so a summary, an alert or a cleanup after a failure is expressible at last — the thing you most want after a failure used to be exactly what got skipped. `AllSucceeded` is the default and is what every op has always meant
+- readiness moved from "every dep produced output" to "every dep reached a terminal status"; the rule then decides run vs skip. an op a rule turns down is `skipped` with an `op_skipped` event naming the rule (`skipped by rule any_failed: every dep succeeded`, `data: {"when": ...}`), worded apart from the upstream-failure skip so the log says which happened
+- `OpCtx::dep_status(dep)` reports what each declared dep did; `ctx.input(dep)` for a dep that produced nothing stays `None`. deps seeded from outside the run — a resume's reused output, a memoized asset value, a source asset — read as `success`
+- skip propagation asks each candidate's rule instead of blanket-skipping: the walk stops at an op that would still run, and at whatever hangs off it, which waits on that op instead. everything reached through plain `all_succeeded` ops is still skipped as one group naming the original root
+- a rule applies to a mapped op whole. one admitted when its array never arrived expands into zero instances — no bodies, no rows, `op_expanded` with `instances: 0`, and `[]` downstream
+- the run outcome is unchanged: any op failure still fails the run, however many cleanup ops succeed afterwards. there is no "recovered" state
+- job summaries report each op's `when`; the dag marks such nodes with a muted `always` / `if failed`, and the op inspector spells the rule out
+
 - dynamic fan-out: `Op::mapped(name, f).over(dep)` runs one instance per element of a dep's json array, discovered at run time. each instance is named `{op}[{i}]`, gets its own `op_runs` row and its element as a typed second argument, and is an ordinary spawned task — `max_parallel`, pools, retries, timeouts and cancellation apply with no special cases
 - a mapped op's output, seen downstream under its plain name, is the array of instance outputs **in element order**, not completion order, and exists only if every instance succeeded: one failure fails the mapped op, skips its downstream and fails the run naming the instance. an empty array is legal — no instances, output `[]`, downstream runs normally
 - the mapped op itself gets no `op_runs` row; the instances are the record, and an `op_expanded` event carries the count. resume reuses a mapped op only when it fully succeeded, and otherwise re-expands it whole, since the array can differ on a re-run

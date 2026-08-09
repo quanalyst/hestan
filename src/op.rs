@@ -10,7 +10,7 @@ use serde_json::{Value, json};
 use tokio::sync::watch;
 
 use crate::backoff;
-use crate::model::{EventKind, EventLevel};
+use crate::model::{EventKind, EventLevel, OpStatus, When};
 use crate::store::Store;
 
 /// what an op body returns: json output on success, any error on failure.
@@ -62,6 +62,7 @@ pub enum InputError {
 pub struct Op {
     name: String,
     deps: Vec<String>,
+    when: When,
     retries: u32,
     retry: Retry,
     timeout: Option<Duration>,
@@ -86,6 +87,7 @@ impl Op {
         Op {
             name: name.into(),
             deps: Vec::new(),
+            when: When::default(),
             retries: 0,
             retry: DEFAULT_BACKOFF,
             timeout: None,
@@ -114,6 +116,7 @@ impl Op {
         Op {
             name: name.into(),
             deps: Vec::new(),
+            when: When::default(),
             retries: 0,
             retry: DEFAULT_BACKOFF,
             timeout: None,
@@ -215,6 +218,30 @@ impl Op {
         self
     }
 
+    /// the trigger rule: what the deps have to have done for this op to run.
+    /// the default, [`When::AllSucceeded`], is the whole upstream working —
+    /// what an op without a rule has always meant.
+    ///
+    /// readiness does not change: an op waits for every dep to reach a
+    /// terminal status either way. the rule only decides what happens then,
+    /// which is what makes a summary or a cleanup expressible — the thing you
+    /// most want to run after a failure is exactly what the default skips.
+    ///
+    /// ```no_run
+    /// # use hestan::{Op, OpCtx, When};
+    /// # use serde_json::json;
+    /// Op::new("summary", |ctx: OpCtx| async move {
+    ///     let load = ctx.dep_status("load");
+    ///     Ok(json!({ "load": load.map(|s| s.as_str()) }))
+    /// })
+    /// .after(["extract", "load"])
+    /// .when(When::Always);
+    /// ```
+    pub fn when(mut self, when: When) -> Op {
+        self.when = when;
+        self
+    }
+
     /// declare the params type; a launch whose params don't deserialize into
     /// `P` is rejected before any run row is written.
     pub fn params<P: DeserializeOwned + 'static>(mut self) -> Op {
@@ -298,6 +325,11 @@ impl Op {
         &self.deps
     }
 
+    /// this op's trigger rule, from [`when`](Self::when).
+    pub fn runs_when(&self) -> When {
+        self.when
+    }
+
     pub fn max_retries(&self) -> u32 {
         self.retries
     }
@@ -356,6 +388,7 @@ impl fmt::Debug for Op {
         f.debug_struct("Op")
             .field("name", &self.name)
             .field("deps", &self.deps)
+            .field("when", &self.when)
             .field("retries", &self.retries)
             .field("retry", &self.retry)
             .field("timeout", &self.timeout)
@@ -401,6 +434,9 @@ pub struct OpCtx {
     /// `None` for every ordinary op.
     pub(crate) element: Option<Value>,
     pub(crate) inputs: Arc<HashMap<String, Value>>,
+    /// what each declared dep ended up doing, for an op with a
+    /// [`when`](Op::when) rule that let it run anyway.
+    pub(crate) dep_statuses: Arc<HashMap<String, OpStatus>>,
     pub(crate) state: Arc<Option<Value>>,
     pub(crate) new_state: Arc<Mutex<Option<Value>>>,
     pub(crate) new_fingerprint: Arc<Mutex<Option<String>>>,
@@ -470,6 +506,19 @@ impl OpCtx {
     /// output of a declared upstream op.
     pub fn input(&self, op: &str) -> Option<&Value> {
         self.inputs.get(op)
+    }
+
+    /// what a declared upstream op ended up doing. this is how an op with a
+    /// [`when`](Op::when) rule reports on the run that reached it: `input` for
+    /// a dep that produced nothing is `None`, but its status is still a fact.
+    ///
+    /// `None` means the name is not a declared dep of this op. a dep seeded
+    /// from outside the run — a resume's reused output, an asset build's
+    /// memoized value, a source asset — reads as
+    /// [`Success`](crate::OpStatus::Success), since that is what it stands in
+    /// for.
+    pub fn dep_status(&self, op: &str) -> Option<OpStatus> {
+        self.dep_statuses.get(op).copied()
     }
 
     /// output of a declared upstream op, deserialized into `T`.
@@ -582,6 +631,7 @@ mod tests {
             params: json!({}),
             element: None,
             inputs: Arc::new(HashMap::new()),
+            dep_statuses: Arc::new(HashMap::new()),
             state: Arc::new(None),
             new_state: Arc::new(Mutex::new(None)),
             new_fingerprint: Arc::new(Mutex::new(None)),

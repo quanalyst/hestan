@@ -6,7 +6,7 @@ use std::time::Duration;
 use hestan::prelude::*;
 use hestan::{
     CancelOutcome, Error, EventKind, FailureHook, OpStatus, Run, RunFailure, RunStatus, Runner,
-    Store, Trigger,
+    Store, Trigger, When,
 };
 use serde::{Deserialize, Serialize};
 
@@ -1966,4 +1966,245 @@ async fn an_instance_retries_on_its_own_like_a_static_op() {
     let rows = runner.store().op_runs(&run.id).unwrap();
     assert_eq!(op_row(&rows, "process[0]").attempts, 1);
     assert_eq!(op_row(&rows, "process[1]").attempts, 2);
+}
+
+// ---- trigger rules ----
+
+// the whole point: the op you most want after a failure is the one the
+// default rule skips
+#[tokio::test]
+async fn always_op_runs_after_a_failure_and_reports_dep_statuses() {
+    let seen: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let seen2 = seen.clone();
+    let job = Job::builder("nightly")
+        .op(Op::new("extract", |_| async { Ok(json!({"rows": 3})) }))
+        .op(Op::new("load", |_| async { Err("disk full".into()) }).after(["extract"]))
+        .op(Op::new("summary", move |ctx: OpCtx| {
+            let seen = seen2.clone();
+            async move {
+                let mut seen = seen.lock().unwrap();
+                for dep in ["extract", "load"] {
+                    let status = ctx.dep_status(dep).map_or("none", |s| s.as_str());
+                    seen.push(format!("{dep}={status}"));
+                }
+                // a dep that produced nothing has no input, only a status
+                assert_eq!(ctx.input("extract"), Some(&json!({"rows": 3})));
+                assert_eq!(ctx.input("load"), None);
+                // and a name that isn't a dep at all has neither
+                assert_eq!(ctx.dep_status("ghost"), None);
+                Ok(json!("reported"))
+            }
+        })
+        .after(["extract", "load"])
+        .when(When::Always))
+        .build()
+        .unwrap();
+
+    let runner = Runner::new([job], Store::open(":memory:").unwrap());
+    let run = runner
+        .run("nightly", json!({}), Trigger::Manual)
+        .await
+        .unwrap();
+
+    // a cleanup that worked does not launder the failure that called it
+    assert_eq!(run.status, RunStatus::Failed);
+    assert!(run.error.unwrap().contains("op load failed: disk full"));
+    let ops = runner.store().op_runs(&run.id).unwrap();
+    let row = |name: &str| ops.iter().find(|o| o.op == name).unwrap();
+    assert_eq!(row("load").status, OpStatus::Failed);
+    assert_eq!(row("summary").status, OpStatus::Success);
+    assert_eq!(row("summary").output, Some(json!("reported")));
+    assert_eq!(*seen.lock().unwrap(), ["extract=success", "load=failed"]);
+}
+
+#[tokio::test]
+async fn any_failed_is_skipped_when_everything_succeeded() {
+    let alerted = Arc::new(AtomicBool::new(false));
+    let flag = alerted.clone();
+    let job = Job::builder("watched")
+        .op(Op::new("work", |_| async { Ok(json!(1)) }))
+        .op(Op::new("alert", move |_| {
+            let flag = flag.clone();
+            async move {
+                flag.store(true, Ordering::SeqCst);
+                Ok(json!(null))
+            }
+        })
+        .after(["work"])
+        .when(When::AnyFailed))
+        .build()
+        .unwrap();
+
+    let runner = Runner::new([job], Store::open(":memory:").unwrap());
+    let run = runner
+        .run("watched", json!({}), Trigger::Manual)
+        .await
+        .unwrap();
+
+    // nothing failed, so the run succeeds even though an op was skipped
+    assert_eq!(run.status, RunStatus::Success);
+    let ops = runner.store().op_runs(&run.id).unwrap();
+    let row = |name: &str| ops.iter().find(|o| o.op == name).unwrap();
+    assert_eq!(row("work").status, OpStatus::Success);
+    assert_eq!(row("alert").status, OpStatus::Skipped);
+    assert!(!alerted.load(Ordering::SeqCst), "the alert body ran");
+}
+
+// a rule-declined skip has to be tellable from an upstream-failure skip, or
+// the log cannot say why an op did not run
+#[tokio::test]
+async fn a_rule_declined_op_records_its_own_skip_event() {
+    let job = Job::builder("mixed")
+        .op(Op::new("boom", |_| async { Err("no good".into()) }))
+        .op(Op::new("cut_off", |_| async { Ok(json!(null)) }).after(["boom"]))
+        .op(Op::new("clean", |_| async { Ok(json!(null)) })
+            .after(["boom"])
+            .when(When::Always))
+        .op(Op::new("idle", |_| async { Ok(json!(null)) })
+            .after(["clean"])
+            .when(When::AnyFailed))
+        .build()
+        .unwrap();
+
+    let runner = Runner::new([job], Store::open(":memory:").unwrap());
+    let run = runner
+        .run("mixed", json!({}), Trigger::Manual)
+        .await
+        .unwrap();
+    assert_eq!(run.status, RunStatus::Failed);
+
+    let events = runner.store().events(&run.id, 0).unwrap();
+    let skip = |op: &str| {
+        events
+            .iter()
+            .find(|e| e.kind == EventKind::OpSkipped && e.op.as_deref() == Some(op))
+            .unwrap_or_else(|| panic!("no skip event for {op}"))
+            .clone()
+    };
+    // the upstream-failure wording names the op that broke
+    assert_eq!(skip("cut_off").message, "skipped: upstream boom failed");
+    assert_eq!(skip("cut_off").data, None);
+    // the rule wording names the rule that was asked, and carries it
+    assert_eq!(
+        skip("idle").message,
+        "skipped by rule any_failed: every dep succeeded"
+    );
+    assert_eq!(skip("idle").data, Some(json!({"when": "any_failed"})));
+}
+
+// propagation must ask each candidate's rule instead of blanket-skipping a
+// whole downstream, and must reach the downstream of whatever it stops at
+#[tokio::test]
+async fn skip_propagation_stops_at_a_rule_that_still_runs() {
+    // boom -> cleanup(always) -> after_cleanup, plus a plain branch either side
+    let build = |cleanup_works: bool| {
+        Job::builder("chain")
+            .op(Op::new("boom", |_| async { Err("no good".into()) }))
+            .op(Op::new("cut_off", |_| async { Ok(json!(null)) }).after(["boom"]))
+            .op(Op::new("deeper", |_| async { Ok(json!(null)) }).after(["cut_off"]))
+            .op(Op::new("cleanup", move |_| async move {
+                if cleanup_works {
+                    Ok(json!("swept"))
+                } else {
+                    Err("sweep failed".into())
+                }
+            })
+            .after(["boom"])
+            .when(When::Always))
+            .op(Op::new("after_cleanup", |ctx: OpCtx| async move {
+                Ok(ctx.input("cleanup").cloned().unwrap_or(json!(null)))
+            })
+            .after(["cleanup"]))
+            .build()
+            .unwrap()
+    };
+
+    let runner = Runner::new([build(true)], Store::open(":memory:").unwrap());
+    let run = runner
+        .run("chain", json!({}), Trigger::Manual)
+        .await
+        .unwrap();
+    assert_eq!(run.status, RunStatus::Failed);
+    let ops = runner.store().op_runs(&run.id).unwrap();
+    let status = |name: &str| ops.iter().find(|o| o.op == name).unwrap().status;
+    // the blanket skip stops at cleanup and never reached what hangs off it
+    assert_eq!(status("cut_off"), OpStatus::Skipped);
+    assert_eq!(status("deeper"), OpStatus::Skipped);
+    assert_eq!(status("cleanup"), OpStatus::Success);
+    assert_eq!(status("after_cleanup"), OpStatus::Success);
+    let out = ops
+        .iter()
+        .find(|o| o.op == "after_cleanup")
+        .unwrap()
+        .output
+        .clone();
+    assert_eq!(out, Some(json!("swept")));
+
+    // and when the op that stopped it fails, its own downstream is cut off
+    let runner = Runner::new([build(false)], Store::open(":memory:").unwrap());
+    let run = runner
+        .run("chain", json!({}), Trigger::Manual)
+        .await
+        .unwrap();
+    assert_eq!(run.status, RunStatus::Failed);
+    let ops = runner.store().op_runs(&run.id).unwrap();
+    let row = ops.iter().find(|o| o.op == "after_cleanup").unwrap();
+    assert_eq!(row.status, OpStatus::Skipped);
+    let events = runner.store().events(&run.id, 0).unwrap();
+    assert!(
+        events.iter().any(|e| e.kind == EventKind::OpSkipped
+            && e.op.as_deref() == Some("after_cleanup")
+            && e.message == "skipped: upstream cleanup failed"),
+        "the second failure did not name itself"
+    );
+}
+
+// a rule applies to a mapped op whole; with no array to expand there is
+// nothing to run it over, so it expands into nothing
+#[tokio::test]
+async fn always_on_a_mapped_op_whose_array_never_arrived_runs_zero_instances() {
+    let ran = Arc::new(AtomicU32::new(0));
+    let count = ran.clone();
+    let job = Job::builder("fanned")
+        .op(Op::new("pages", |_| async { Err("no pages".into()) }))
+        .op(Op::mapped("process", move |_ctx: OpCtx, page: u32| {
+            let count = count.clone();
+            async move {
+                count.fetch_add(1, Ordering::SeqCst);
+                Ok(json!(page))
+            }
+        })
+        .over("pages")
+        .when(When::Always))
+        .op(Op::new("collect", |ctx: OpCtx| async move {
+            Ok(ctx.input("process").cloned().unwrap_or(json!(null)))
+        })
+        .after(["process"]))
+        .build()
+        .unwrap();
+
+    let runner = Runner::new([job], Store::open(":memory:").unwrap());
+    let run = runner
+        .run("fanned", json!({}), Trigger::Manual)
+        .await
+        .unwrap();
+    assert_eq!(run.status, RunStatus::Failed);
+    assert_eq!(ran.load(Ordering::SeqCst), 0, "an instance body ran");
+
+    let ops = runner.store().op_runs(&run.id).unwrap();
+    // no instance rows, and the mapped op still has none of its own
+    let mut names: Vec<&str> = ops.iter().map(|o| o.op.as_str()).collect();
+    names.sort_unstable();
+    assert_eq!(names, ["collect", "pages"]);
+    // downstream sees the empty fan-out like any other
+    let collect = ops.iter().find(|o| o.op == "collect").unwrap();
+    assert_eq!(collect.status, OpStatus::Success);
+    assert_eq!(collect.output, Some(json!([])));
+    let events = runner.store().events(&run.id, 0).unwrap();
+    assert!(
+        events.iter().any(|e| e.kind == EventKind::OpExpanded
+            && e.op.as_deref() == Some("process")
+            && e.data == Some(json!({"instances": 0, "over": "pages"}))),
+        "no zero-instance expansion recorded"
+    );
 }
