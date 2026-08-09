@@ -8,9 +8,9 @@ use serde_json::Value;
 
 use crate::error::Error;
 use crate::model::{
-    AssetCheckRow, CheckStatus, Event, EventKind, EventLevel, Materialization, OpRun, OpStatus,
-    Run, RunStatus, ScheduleDef, ScheduleRow, SensorOutcome, SensorRow, SensorTick, Severity, Tick,
-    TickOutcome,
+    AssetCheckRow, Backfill, BackfillStatus, CheckStatus, Event, EventKind, EventLevel,
+    Materialization, OpRun, OpStatus, Run, RunStatus, ScheduleDef, ScheduleRow, SensorOutcome,
+    SensorRow, SensorTick, Severity, Tick, TickOutcome,
 };
 
 // `trigger` is a reserved word in sqlite, hence the quoted column name in
@@ -963,6 +963,115 @@ impl Store {
         Ok(removed)
     }
 
+    /// record a backfill request and the keys it resolved to, `running` with
+    /// nothing launched yet. `keys` is fixed here on purpose: a backfill
+    /// builds the range it was asked for even as a daily set grows under it.
+    pub(crate) fn create_backfill(
+        &self,
+        asset: &str,
+        from_key: &str,
+        to_key: &str,
+        keys: &[String],
+    ) -> Result<i64, Error> {
+        let conn = self.0.lock().unwrap();
+        // a range that resolved to nothing is complete the moment it is made,
+        // which is a truer record than refusing to write one
+        let (status, finished) = match keys.is_empty() {
+            true => (BackfillStatus::Complete, Some(Utc::now().to_rfc3339())),
+            false => (BackfillStatus::Running, None),
+        };
+        conn.execute(
+            "INSERT INTO backfills
+                 (asset, from_key, to_key, partition_keys, total, created_at, finished_at, status)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                asset,
+                from_key,
+                to_key,
+                serde_json::to_string(keys).unwrap_or_else(|_| "[]".into()),
+                keys.len() as i64,
+                Utc::now().to_rfc3339(),
+                finished,
+                status.as_str(),
+            ],
+        )?;
+        Ok(conn.last_insert_rowid())
+    }
+
+    pub fn backfill(&self, id: i64) -> Result<Option<Backfill>, Error> {
+        let conn = self.0.lock().unwrap();
+        let row = conn
+            .query_row(
+                "SELECT id, asset, from_key, to_key, partition_keys, run_ids, total, launched,
+                        created_at, finished_at, status
+                 FROM backfills WHERE id = ?1",
+                params![id],
+                backfill_from_row,
+            )
+            .optional()?;
+        Ok(row)
+    }
+
+    /// recent backfills, newest first.
+    pub fn backfills(&self, limit: u32) -> Result<Vec<Backfill>, Error> {
+        let conn = self.0.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, asset, from_key, to_key, partition_keys, run_ids, total, launched,
+                    created_at, finished_at, status
+             FROM backfills ORDER BY id DESC LIMIT ?1",
+        )?;
+        let rows = stmt.query_map(params![limit], backfill_from_row)?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    /// every backfill still going, oldest first — what the loop that chunks
+    /// them reads, and what makes a second one for the same asset a conflict.
+    pub(crate) fn running_backfills(&self) -> Result<Vec<Backfill>, Error> {
+        let conn = self.0.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, asset, from_key, to_key, partition_keys, run_ids, total, launched,
+                    created_at, finished_at, status
+             FROM backfills WHERE status = ?1 ORDER BY id",
+        )?;
+        let rows = stmt.query_map(params![BackfillStatus::Running.as_str()], backfill_from_row)?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    /// record that a chunk went out: its run, and how many keys are now
+    /// launched in total.
+    pub(crate) fn backfill_launched(
+        &self,
+        id: i64,
+        run_id: &str,
+        launched: usize,
+    ) -> Result<(), Error> {
+        let conn = self.0.lock().unwrap();
+        conn.execute(
+            "UPDATE backfills
+             SET launched = ?2,
+                 run_ids = json_insert(run_ids, '$[#]', ?3)
+             WHERE id = ?1",
+            params![id, launched as i64, run_id],
+        )?;
+        Ok(())
+    }
+
+    /// close a backfill. the first terminal status wins, so a cancel racing
+    /// the chunker cannot be overwritten by what the run did next.
+    pub(crate) fn finish_backfill(&self, id: i64, status: BackfillStatus) -> Result<(), Error> {
+        let conn = self.0.lock().unwrap();
+        conn.execute(
+            "UPDATE backfills SET status = ?2, finished_at = ?3 WHERE id = ?1 AND status = ?4",
+            params![
+                id,
+                status.as_str(),
+                Utc::now().to_rfc3339(),
+                BackfillStatus::Running.as_str(),
+            ],
+        )?;
+        Ok(())
+    }
+
     /// make the sensors table mirror the code: insert new names, drop the
     /// rest. existing rows keep their paused flag and cursor.
     pub(crate) fn sync_sensors(&self, defined: &[String]) -> Result<(), Error> {
@@ -1137,6 +1246,26 @@ fn asset_check_from_row(row: &Row) -> rusqlite::Result<AssetCheckRow> {
         message: row.get(7)?,
         metadata: opt_json_col(row, 8)?,
         checked_at: ts_col(row, 9)?,
+    })
+}
+
+fn backfill_from_row(row: &Row) -> rusqlite::Result<Backfill> {
+    let list = |idx: usize| -> rusqlite::Result<Vec<String>> {
+        let text: String = row.get(idx)?;
+        serde_json::from_str(&text).map_err(|e| conv_err(idx, e))
+    };
+    Ok(Backfill {
+        id: row.get(0)?,
+        asset: row.get(1)?,
+        from_key: row.get(2)?,
+        to_key: row.get(3)?,
+        partitions: list(4)?,
+        run_ids: list(5)?,
+        total: row.get::<_, i64>(6)? as usize,
+        launched: row.get::<_, i64>(7)? as usize,
+        created_at: ts_col(row, 8)?,
+        finished_at: opt_ts_col(row, 9)?,
+        status: parse_col(row, 10)?,
     })
 }
 

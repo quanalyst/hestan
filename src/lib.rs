@@ -3,6 +3,7 @@
 
 mod app;
 mod asset;
+mod backfill;
 mod backoff;
 mod error;
 mod executor;
@@ -31,9 +32,9 @@ pub use http::HttpSource;
 pub use io::{FileIo, Inline, IoKey, IoManager, IoResult};
 pub use job::{Graph, GraphBuilder, Job, JobBuilder};
 pub use model::{
-    AssetCheckRow, CheckStatus, Event, EventKind, EventLevel, Materialization, OpRun, OpStatus,
-    Overlap, Run, RunStatus, ScheduleRow, SensorOutcome, SensorRow, SensorTick, Severity, Tick,
-    TickOutcome, Trigger, When,
+    AssetCheckRow, Backfill, BackfillStatus, CheckStatus, Event, EventKind, EventLevel,
+    Materialization, OpRun, OpStatus, Overlap, Run, RunStatus, ScheduleRow, SensorOutcome,
+    SensorRow, SensorTick, Severity, Tick, TickOutcome, Trigger, When,
 };
 pub use op::{InputError, Meta, Op, OpCtx, OpResult};
 pub use partition::Partitions;

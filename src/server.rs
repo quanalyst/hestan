@@ -16,6 +16,7 @@ use serde_json::{Value, json};
 use crate::asset::{
     ASSETS_JOB, AssetRegistry, launch_plan, mats_map, plan_all, plan_partitions, staleness,
 };
+use crate::backfill;
 use crate::error::Error;
 use crate::executor::{CancelOutcome, Runner};
 use crate::job::Job;
@@ -60,6 +61,10 @@ pub(crate) fn router(state: AppState) -> Router {
         .route("/api/assets/{name}/history", get(asset_history))
         .route("/api/assets/{name}/partitions", get(asset_partitions))
         .route("/api/assets/{name}/checks", get(asset_checks))
+        .route("/api/assets/{name}/backfill", post(start_backfill))
+        .route("/api/backfills", get(list_backfills))
+        .route("/api/backfills/{id}", get(get_backfill))
+        .route("/api/backfills/{id}/cancel", post(cancel_backfill))
         .route("/api/sensors", get(list_sensors))
         .route("/api/sensors/state", post(set_sensor_state))
         .route("/api/sensors/ticks", get(sensor_ticks))
@@ -668,7 +673,86 @@ async fn build_one_asset(
 fn bad_plan(e: Error) -> ApiError {
     match e {
         Error::Graph(msg) => err(StatusCode::BAD_REQUEST, msg),
+        Error::UnknownAsset(name) => err(StatusCode::NOT_FOUND, format!("unknown asset: {name}")),
+        Error::UnknownBackfill(id) => err(StatusCode::NOT_FOUND, format!("unknown backfill: {id}")),
+        Error::Conflict(msg) => err(StatusCode::CONFLICT, msg),
         other => internal(other),
+    }
+}
+
+#[derive(Deserialize)]
+struct BackfillBody {
+    from: String,
+    to: String,
+    /// skip the keys that are already materialized and fresh (default true).
+    only_missing: Option<bool>,
+}
+
+async fn start_backfill(
+    State(st): State<AppState>,
+    Path(name): Path<String>,
+    body: Bytes,
+) -> Result<(StatusCode, Json<Value>), ApiError> {
+    let body: BackfillBody = serde_json::from_slice(&body)
+        .map_err(|e| err(StatusCode::BAD_REQUEST, format!("bad body: {e}")))?;
+    let backfill = backfill::start(
+        &st.runner,
+        &st.assets,
+        &name,
+        &body.from,
+        &body.to,
+        body.only_missing.unwrap_or(true),
+    )
+    .map_err(bad_plan)?;
+    Ok((StatusCode::ACCEPTED, Json(json!(backfill))))
+}
+
+#[derive(Deserialize)]
+struct LimitQuery {
+    limit: Option<u32>,
+}
+
+async fn list_backfills(
+    State(st): State<AppState>,
+    q: Result<Query<LimitQuery>, QueryRejection>,
+) -> Result<Json<Value>, ApiError> {
+    let Query(q) = q.map_err(bad_query)?;
+    let limit = q.limit.unwrap_or(20).clamp(1, 200);
+    let backfills = st.runner.store().backfills(limit).map_err(internal)?;
+    Ok(Json(json!({ "backfills": backfills })))
+}
+
+// the record plus the runs it launched, oldest first — a backfill's progress
+// is what its runs did, and this is where you go to see which one broke
+async fn get_backfill(
+    State(st): State<AppState>,
+    Path(id): Path<i64>,
+) -> Result<Json<Value>, ApiError> {
+    let Some(backfill) = st.runner.store().backfill(id).map_err(internal)? else {
+        return Err(err(
+            StatusCode::NOT_FOUND,
+            format!("unknown backfill: {id}"),
+        ));
+    };
+    let mut runs = Vec::new();
+    for run_id in &backfill.run_ids {
+        if let Some(run) = st.runner.store().run(run_id).map_err(internal)? {
+            runs.push(run);
+        }
+    }
+    Ok(Json(json!({ "backfill": backfill, "runs": runs })))
+}
+
+async fn cancel_backfill(
+    State(st): State<AppState>,
+    Path(id): Path<i64>,
+) -> Result<Json<Value>, ApiError> {
+    match backfill::cancel(&st.runner, id).map_err(bad_plan)? {
+        true => Ok(Json(json!({ "canceled": true }))),
+        false => Err(err(
+            StatusCode::CONFLICT,
+            format!("backfill {id} already finished"),
+        )),
     }
 }
 
@@ -2538,6 +2622,78 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn the_backfill_endpoints_record_a_range_and_cancel_it() {
+        let st = partitioned_state();
+        let app = router(st.clone());
+
+        let (status, Json(body)) = start_backfill(
+            State(st.clone()),
+            Path("daily".into()),
+            Bytes::from(r#"{"from":"k1","to":"k3"}"#),
+        )
+        .await
+        .unwrap();
+        assert_eq!(status, StatusCode::ACCEPTED);
+        assert_eq!(body["asset"], "daily");
+        assert_eq!(body["partitions"], json!(["k1", "k2", "k3"]));
+        assert_eq!(body["status"], "running");
+        let id = body["id"].as_i64().unwrap();
+
+        // a second one for the same asset waits its turn
+        let (status, Json(body)) = start_backfill(
+            State(st.clone()),
+            Path("daily".into()),
+            Bytes::from(r#"{"from":"k1","to":"k2"}"#),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert!(body["error"].as_str().unwrap().contains("still running"));
+
+        let (status, body, _) = request(app.clone(), Method::GET, "/api/backfills").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body.unwrap()["backfills"][0]["id"], id);
+
+        // the record with the runs it launched
+        let (status, body, _) =
+            request(app.clone(), Method::GET, &format!("/api/backfills/{id}")).await;
+        assert_eq!(status, StatusCode::OK);
+        let body = body.unwrap();
+        assert_eq!(body["backfill"]["total"], 3);
+        assert_eq!(body["runs"].as_array().unwrap().len(), 1);
+        assert_eq!(body["runs"][0]["job"], "assets");
+
+        let Json(body) = cancel_backfill(State(st.clone()), Path(id)).await.unwrap();
+        assert_eq!(body, json!({"canceled": true}));
+        // cancelling twice says what happened rather than lying
+        let (status, _) = cancel_backfill(State(st.clone()), Path(id))
+            .await
+            .unwrap_err();
+        assert_eq!(status, StatusCode::CONFLICT);
+
+        let (status, _) = start_backfill(
+            State(st.clone()),
+            Path("daily".into()),
+            Bytes::from(r#"{"from":"k1","to":"nope"}"#),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+
+        let (status, _) = start_backfill(
+            State(st.clone()),
+            Path("ghost".into()),
+            Bytes::from(r#"{"from":"k1","to":"k2"}"#),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        let (status, _, _) = request(app, Method::GET, "/api/backfills/999").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]

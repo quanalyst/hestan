@@ -121,6 +121,12 @@ while a build that finds nothing to do reports "up to date" inline. when any
 asset is stale the header shows a "build stale" button that materializes
 every stale asset as a single run.
 
+a **backfills** section appears under the table once any exist: the asset, the
+range, how many partitions have been launched against the total, the status in
+the usual shapes, a link to the chunk running now, and a cancel action while
+one is running. the partition grid re-polls with the panel, so a backfill lands
+cell by cell while you watch it.
+
 asset builds are ordinary runs of the internal `assets` job, so the run
 page, gantt, cancel, and re-run all apply unchanged; the `assets` job
 appears on the jobs overview like any other job, and asset build runs carry

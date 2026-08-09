@@ -2,6 +2,7 @@ use std::fs;
 use std::path::Path;
 use std::time::{Duration, UNIX_EPOCH};
 
+use chrono::{DateTime, Utc};
 use hestan::prelude::*;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -108,6 +109,41 @@ async fn main() -> Result<(), hestan::Error> {
     .from(&doc_stats)
     .auto();
 
+    // one op, two assets: splitting what was measured once rather than
+    // measuring it twice
+    let split_docs = MultiAsset::new("split_docs", |ctx: OpCtx| async move {
+        let value = ctx.input("doc_stats").cloned().unwrap_or(json!([]));
+        let stats: Vec<DocStat> = serde_json::from_value(value)?;
+        let (long, short): (Vec<DocStat>, Vec<DocStat>) =
+            stats.into_iter().partition(|s| s.lines >= 100);
+        ctx.meta_of("long_docs", "files", long.len() as i64);
+        ctx.meta_of("short_docs", "files", short.len() as i64);
+        Ok(json!({ "long_docs": long, "short_docs": short }))
+    })
+    .produces(["long_docs", "short_docs"])
+    .from(&doc_stats);
+
+    // one materialization per utc day: which docs changed that day. the last
+    // ten days, so the partition grid has something to draw
+    let start = (Utc::now() - chrono::Duration::days(9))
+        .format("%Y-%m-%d")
+        .to_string();
+    let daily_changes = Asset::new("daily_doc_changes", |ctx: OpCtx| async move {
+        let day = ctx.partition().expect("partitioned").to_string();
+        let mut changed = Vec::new();
+        for (file, bytes, mtime) in dir_entries(DOCS_DIR)? {
+            let at = DateTime::<Utc>::from_timestamp_millis(mtime as i64)
+                .ok_or("a file mtime outside the representable range")?;
+            if at.format("%Y-%m-%d").to_string() == day {
+                changed.push(json!({ "file": file, "bytes": bytes }));
+            }
+        }
+        ctx.meta("files", changed.len() as i64);
+        Ok(json!({ "day": day, "files": changed }))
+    })
+    .from(&docs_dir)
+    .partitioned(Partitions::daily(start).build_limit(10));
+
     // every doc has content, and there are enough of them to be a doc set. the
     // first fails the run when it breaks; the second only says so.
     let non_empty = AssetCheck::new(
@@ -173,7 +209,8 @@ async fn main() -> Result<(), hestan::Error> {
 
     println!("hestan assets example: http://127.0.0.1:4002");
     Hestan::new()
-        .assets([docs_dir, doc_stats, doc_totals])
+        .assets([docs_dir, doc_stats, doc_totals, daily_changes])
+        .multi_assets([split_docs])
         .check(non_empty)
         .check(enough_docs)
         .job(ingest)

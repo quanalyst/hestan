@@ -458,6 +458,48 @@ on `GET /api/assets`: these are the facts about a build, not its payload.
 `metadata` is what the op that built it reported, the same map its op run
 carries ([metadata](metadata.md)). 404 for an unknown asset.
 
+`history` and `checks` both take `partition=` to narrow to one key of a
+partitioned asset; without it they interleave every key by time, and each row
+carries the `partition` it belongs to (null on an unpartitioned asset).
+
+## Backfills
+
+`POST /api/assets/{name}/backfill` records a request to materialize a range of
+one asset's partitions and launches its first chunk:
+
+```json
+{ "from": "2026-01-01", "to": "2026-01-31", "only_missing": true }
+```
+
+`only_missing` defaults to true and drops the keys that are already
+materialized and fresh. the answer is 202 with the record:
+
+```json
+{ "id": 3, "asset": "daily_orders",
+  "from_key": "2026-01-01", "to_key": "2026-01-31",
+  "partitions": ["2026-01-04", "2026-01-05"],
+  "run_ids": ["019fe109-..."], "total": 2, "launched": 2,
+  "created_at": "2026-08-09T09:12:00Z", "finished_at": null,
+  "status": "running" }
+```
+
+404 for an unknown asset, 400 for one that is not partitioned or a range whose
+ends are not keys of it, and **409 while another backfill of that asset is
+running** — one at a time per asset. a range that resolves to no keys comes
+back `complete` with `total` 0.
+
+`GET /api/backfills?limit=` lists them newest first (default 20, clamped
+1..=200). `GET /api/backfills/{id}` returns `{"backfill": {..}, "runs": [..]}`
+— the record plus the full run rows of every chunk it launched, oldest first,
+which is where you go to see which chunk broke. 404 for an unknown id.
+
+`POST /api/backfills/{id}/cancel` asks the run in flight to stop and sends no
+further chunk: 200 `{"canceled": true}`, 409 for a backfill that already
+finished, 404 for an unknown id.
+
+`status` is `running`, `complete`, `failed` or `canceled`, derived from the
+runs — see [backfills](assets.md#backfills).
+
 ## Sensors
 
 `GET /api/sensors` returns every sensor, probes included (named

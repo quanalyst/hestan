@@ -9,7 +9,7 @@ scale, and it also means hestan assumes it is the only process writing (see
 
 ## Schema
 
-eleven tables. `trigger` is a reserved word in sqlite, hence the quoted column
+twelve tables. `trigger` is a reserved word in sqlite, hence the quoted column
 name in the schema and every statement that touches it.
 
 ```sql

@@ -310,6 +310,43 @@ pub struct AssetCheckRow {
     pub checked_at: DateTime<Utc>,
 }
 
+/// how a [backfill](crate::Hestan) ended, derived from the runs it launched.
+/// `running` covers a chunk in flight and the pause between chunks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum BackfillStatus {
+    Running,
+    Complete,
+    Failed,
+    Canceled,
+}
+str_enum!(BackfillStatus {
+    Running => "running",
+    Complete => "complete",
+    Failed => "failed",
+    Canceled => "canceled",
+});
+
+/// a recorded request to materialize a range of one asset's partitions.
+/// `partitions` is what the range resolved to at the moment it was made, so a
+/// backfill builds what it was asked for even as the key set grows underneath
+/// it; `launched` counts how many of them have been handed to a run.
+#[derive(Debug, Clone, Serialize)]
+pub struct Backfill {
+    pub id: i64,
+    pub asset: String,
+    pub from_key: String,
+    pub to_key: String,
+    pub partitions: Vec<String>,
+    /// one per chunk launched, oldest first.
+    pub run_ids: Vec<String>,
+    pub total: usize,
+    pub launched: usize,
+    pub created_at: DateTime<Utc>,
+    pub finished_at: Option<DateTime<Utc>>,
+    pub status: BackfillStatus,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct SensorRow {
     pub name: String,

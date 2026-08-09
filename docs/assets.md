@@ -250,6 +250,42 @@ a key the upstream's set does not contain keeps the downstream partition
 stale forever — identity mapping has nothing to read there. that is the honest
 reading of a range that starts later upstream than downstream.
 
+### Backfills
+
+a backfill is a recorded, watchable request to materialize a range of one
+asset's partitions:
+
+```
+POST /api/assets/daily_orders/backfill
+     {"from": "2026-01-01", "to": "2026-01-31", "only_missing": true}
+```
+
+the range resolves against the asset's key set at the moment it is made and is
+then **fixed** — a daily set grows, and a backfill should build what it was
+asked for rather than whatever that range means tomorrow. `only_missing`
+(default true) drops the keys that are already materialized and fresh, which
+is what makes re-running a backfill after a partial failure cheap. a range
+that resolves to nothing is recorded `complete` on arrival rather than
+refused: "there was nothing to do" is a better record than a 400.
+
+it then launches **in chunks of `Partitions::build_limit`**, one run at a time:
+the first goes out immediately, and each next one starts as the previous
+finishes. that is the whole point — a 400-day range fired as a single run
+would be 400 instances at somebody's api at once. each chunk is an ordinary
+build run of the `assets` job, so the run page, the gantt, cancel and the
+event log all work on it.
+
+the record lives in the `backfills` table and its status derives from its runs:
+`running` while a chunk is in flight or between chunks, `complete` when the
+last one succeeded, `failed` when one failed (chunking stops there), and
+`canceled` when one was canceled or the backfill itself was. `launched` counts
+the keys handed to a run so far, against `total`.
+
+limits: **one backfill per asset at a time** — a second is a 409 — and no
+cross-asset backfills; back one asset at a time. a backfill also respects the
+one-build-at-a-time gate: while any assets run is active the next chunk simply
+waits for the following tick, the same self-heal the probe path uses.
+
 ### Probes mark everything stale
 
 a probe fingerprint change marks **all** partitions of a descendant stale.

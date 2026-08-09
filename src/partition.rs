@@ -201,6 +201,29 @@ impl Partitions {
     pub(crate) fn contains(&self, key: &str) -> bool {
         self.keys_now().iter().any(|k| k == key)
     }
+
+    /// the keys from `from` to `to` inclusive — what a
+    /// [backfill](crate::Hestan) resolves its range to. a generated set is in
+    /// time order, so the range is every key between the two; a static set is
+    /// in the order it was declared, so the range is the slice between them.
+    pub(crate) fn range(&self, from: &str, to: &str) -> Result<Vec<String>, Error> {
+        let keys = self.keys_now();
+        let at = |key: &str| {
+            keys.iter().position(|k| k == key).ok_or_else(|| {
+                Error::Graph(format!(
+                    "{key:?} is not a key of this asset's {} partitions",
+                    self.kind_label()
+                ))
+            })
+        };
+        let (first, last) = (at(from)?, at(to)?);
+        if first > last {
+            return Err(Error::Graph(format!(
+                "range runs backwards: {from:?} comes after {to:?}"
+            )));
+        }
+        Ok(keys[first..=last].to_vec())
+    }
 }
 
 fn bracketed(key: &str) -> bool {
@@ -307,6 +330,17 @@ mod tests {
         let err = Partitions::keys(["eu[1]"]).validate("a").unwrap_err();
         assert!(err.to_string().contains("contains a bracket"), "{err}");
         Partitions::daily("2026-01-01").validate("a").unwrap();
+    }
+
+    #[test]
+    fn a_range_is_the_keys_between_its_ends() {
+        let p = Partitions::keys(["emea", "amer", "apac"]);
+        assert_eq!(p.range("emea", "apac").unwrap(), ["emea", "amer", "apac"]);
+        assert_eq!(p.range("amer", "amer").unwrap(), ["amer"]);
+        let err = p.range("apac", "emea").unwrap_err();
+        assert!(err.to_string().contains("runs backwards"), "{err}");
+        let err = p.range("emea", "nowhere").unwrap_err();
+        assert!(err.to_string().contains("is not a key"), "{err}");
     }
 
     #[test]

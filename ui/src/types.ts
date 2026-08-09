@@ -229,6 +229,25 @@ export interface PartitionCounts {
 
 export type PartitionState = "materialized" | "stale" | "missing";
 
+export type BackfillStatus = "running" | "complete" | "failed" | "canceled";
+
+// a recorded request to materialize a range of one asset's partitions,
+// launched in chunks so a long range never fires every partition at once
+export interface Backfill {
+  id: number;
+  asset: string;
+  from_key: string;
+  to_key: string;
+  partitions: string[];
+  // one per chunk launched, oldest first
+  run_ids: string[];
+  total: number;
+  launched: number;
+  created_at: string;
+  finished_at: string | null;
+  status: BackfillStatus;
+}
+
 // one key of a partitioned asset, newest first from the api
 export interface PartitionEntry {
   key: string;

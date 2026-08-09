@@ -3,7 +3,8 @@
 /// `DuplicateJob`, `Resource`) surface at build time, before anything is
 /// written. the
 /// resume variants (`UnknownRun`, `RunActive`, `RunNotFailed`,
-/// `NothingToResume`, `ResumeChain`) say why a run cannot be resumed.
+/// `NothingToResume`, `ResumeChain`) say why a run cannot be resumed, and
+/// `Conflict` is something already under way that this would collide with.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error("invalid job graph: {0}")]
@@ -22,6 +23,10 @@ pub enum Error {
     ResumeChain(String),
     #[error("unknown asset: {0}")]
     UnknownAsset(String),
+    #[error("unknown backfill: {0}")]
+    UnknownBackfill(i64),
+    #[error("{0}")]
+    Conflict(String),
     #[error("duplicate job: {0}")]
     DuplicateJob(String),
     #[error("bad cron expression {expr:?}: {reason}")]

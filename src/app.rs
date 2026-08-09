@@ -330,6 +330,12 @@ impl Hestan {
             built.runner.clone(),
             built.registry.clone(),
         ));
+        // the chunker: it launches each backfill's next range as the last one
+        // finishes, so a long backfill never fires every partition at once
+        let backfills = tokio::spawn(crate::backfill::run_backfills(
+            built.runner.clone(),
+            built.registry.clone(),
+        ));
         let state = AppState {
             jobs: Arc::new(built.runner.jobs().clone()),
             runner: built.runner,
@@ -340,6 +346,7 @@ impl Hestan {
         let served = axum::serve(listener, router(state)).await;
         scheduler.abort();
         sensors.abort();
+        backfills.abort();
         served?;
         Ok(())
     }

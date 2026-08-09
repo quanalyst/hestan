@@ -1,17 +1,32 @@
 import { useState } from "react";
-import { useNavigate } from "react-router-dom";
+import { Link, useNavigate } from "react-router-dom";
 import { get, post, usePoll } from "./api";
 import AssetPanel from "./AssetPanel";
 import DagView from "./DagView";
 import { GlyphShape } from "./StatusGlyph";
 import type { Status } from "./StatusGlyph";
-import type { AssetSummary, CheckSummary, SensorOutcome, SensorSummary } from "./types";
+import type {
+  AssetSummary,
+  Backfill,
+  BackfillStatus,
+  CheckSummary,
+  SensorOutcome,
+  SensorSummary,
+} from "./types";
 import { relTime } from "./util";
 
 const SENSOR_GLYPH = {
   fired: "success",
   error: "failed",
 } as const satisfies Record<SensorOutcome, Status>;
+
+// a backfill's states map onto the run states they are made of
+const BACKFILL_GLYPH = {
+  running: "running",
+  complete: "success",
+  failed: "failed",
+  canceled: "canceled",
+} as const satisfies Record<BackfillStatus, Status>;
 
 // enough hex to tell fingerprints apart at a glance; the title carries the rest
 const shortHash = (fp: string) => fp.slice(0, 12);
@@ -76,6 +91,8 @@ export default function AssetsPage() {
   const nav = useNavigate();
   const [assets, setAssets] = useState<AssetSummary[] | null>(null);
   const [sensors, setSensors] = useState<SensorSummary[]>([]);
+  const [backfills, setBackfills] = useState<Backfill[]>([]);
+  const [backfillErr, setBackfillErr] = useState<string | null>(null);
   const [building, setBuilding] = useState(false);
   const [buildNote, setBuildNote] = useState<string | null>(null);
   const [busyAsset, setBusyAsset] = useState<string | null>(null);
@@ -90,6 +107,9 @@ export default function AssetsPage() {
         .catch(() => {});
       get<{ sensors: SensorSummary[] }>("/api/sensors")
         .then((r) => setSensors(r.sensors))
+        .catch(() => {});
+      get<{ backfills: Backfill[] }>("/api/backfills?limit=20")
+        .then((r) => setBackfills(r.backfills))
         .catch(() => {});
     },
     5000,
@@ -126,6 +146,17 @@ export default function AssetsPage() {
       setBuildNote(`build failed: ${e instanceof Error ? e.message : String(e)}`);
     } finally {
       setBuilding(false);
+    }
+  };
+
+  const cancelBackfill = async (id: number) => {
+    setBackfillErr(null);
+    try {
+      await post<{ canceled: boolean }>(`/api/backfills/${id}/cancel`);
+      const r = await get<{ backfills: Backfill[] }>("/api/backfills?limit=20");
+      setBackfills(r.backfills);
+    } catch (e) {
+      setBackfillErr(e instanceof Error ? e.message : String(e));
     }
   };
 
@@ -258,6 +289,71 @@ export default function AssetsPage() {
               ))}
             </tbody>
           </table>
+        </>
+      )}
+
+      {backfills.length > 0 && (
+        <>
+          <h2>backfills</h2>
+          <table className="plain-rows">
+            <thead>
+              <tr>
+                <th>asset</th>
+                <th>range</th>
+                <th className="num">progress</th>
+                <th>status</th>
+                <th>run</th>
+                <th>started</th>
+                <th />
+              </tr>
+            </thead>
+            <tbody>
+              {backfills.map((b) => {
+                const current = b.run_ids[b.run_ids.length - 1];
+                return (
+                  <tr key={b.id}>
+                    <td>{b.asset}</td>
+                    <td className="mono">
+                      {b.from_key} → {b.to_key}
+                    </td>
+                    {/* launched, not materialized: what a chunk's run did is
+                        the run's story, and the grid above tells the rest */}
+                    <td className="num" title={`${b.launched} of ${b.total} partitions launched`}>
+                      {b.launched}/{b.total}
+                    </td>
+                    <td>
+                      <span className="status">
+                        <svg className="glyph" width={12} height={12} viewBox="-6 -6 12 12" aria-hidden="true">
+                          <GlyphShape status={BACKFILL_GLYPH[b.status]} />
+                        </svg>
+                        {b.status}
+                      </span>
+                    </td>
+                    <td>
+                      {current ? (
+                        <Link className="mono" to={`/runs/${current}`}>
+                          {current.slice(0, 8)}
+                        </Link>
+                      ) : (
+                        <span className="muted">—</span>
+                      )}
+                    </td>
+                    <td className="muted" title={b.created_at}>
+                      {relTime(b.created_at)}
+                    </td>
+                    <td className="row-action">
+                      {b.status === "running" && (
+                        <button className="text-btn" onClick={() => cancelBackfill(b.id)}>
+                          cancel
+                        </button>
+                      )}
+                    </td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+          {backfillErr && <p className="muted">cancel failed: {backfillErr}</p>}
         </>
       )}
 
