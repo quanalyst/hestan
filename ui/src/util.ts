@@ -46,6 +46,25 @@ export function fmtBytes(bytes: number): string {
   return `${bytes} B`;
 }
 
+// a data volume in decimal units — 1.2 GB — which is how storage, warehouses
+// and file sizes are quoted. fmtBytes above stays binary because a memory
+// rlimit genuinely is, and the two are never showing the same kind of number.
+// signed, since a byte delta comes through here too
+export function fmtDataSize(bytes: number): string {
+  for (const [unit, size] of [
+    ["TB", 1e12],
+    ["GB", 1e9],
+    ["MB", 1e6],
+    ["kB", 1e3],
+  ] as const) {
+    if (Math.abs(bytes) >= size) {
+      const n = bytes / size;
+      return `${Math.abs(n) < 10 ? n.toFixed(1) : Math.round(n)} ${unit}`;
+    }
+  }
+  return `${Math.round(bytes)} B`;
+}
+
 export function isTerminal(status: RunStatus): boolean {
   return status === "success" || status === "failed" || status === "canceled";
 }

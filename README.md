@@ -161,11 +161,14 @@ appears.
 - ops can carry persisted state: `ctx.set_state` stages a watermark that
   commits only when the attempt succeeds, so the next run picks up where the
   last successful one left off
-- `ctx.meta("rows", 1_234)` attaches typed facts to what an op produced —
-  ints, floats, text, urls, markdown, json — staged per attempt like state
-  and committed with the op's terminal write, so a failed attempt's numbers
-  never get recorded. an asset op's metadata lands on its materialization
-  too, so the history says what each build reported
+- `ctx.meta("rows", Meta::count(1_240))` attaches typed facts to what an op
+  produced — counts, sizes, durations, tables, paths, urls, markdown, json,
+  and links to another run or asset of the same deployment — staged per
+  attempt like state and committed with the op's terminal write, so a failed
+  attempt's numbers never get recorded. the units are not decoration: the ui
+  renders `1.2 GB` and `3.4s` rather than the integers. an asset op's metadata
+  lands on its materialization too, so the history says what each build
+  reported
 - launching is a request rather than a start: a launch writes a **queued** run
   and a dispatcher starts it as soon as no limit says otherwise — with no
   limits declared, the same instant. `Hestan::max_concurrent_runs(n)` caps the

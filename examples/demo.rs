@@ -58,6 +58,8 @@ async fn main() -> Result<(), hestan::Error> {
             ];
             let rows: Vec<Value> = rows.into_iter().take(limit).collect();
             ctx.info(format!("fetched {} rows", rows.len()));
+            ctx.meta("source", Meta::Url("https://example.test/orders".into()));
+            ctx.meta("took", Duration::from_millis(400));
             Ok(json!(rows))
         })
         .timeout(Duration::from_secs(5))
@@ -95,6 +97,32 @@ async fn main() -> Result<(), hestan::Error> {
             Op::typed("aggregate", |ctx: OpCtx, input: AggregateIn| async move {
                 let revenue: f64 = input.validate.iter().map(|o| o.total).sum();
                 ctx.info(format!("aggregated {} orders", input.validate.len()));
+                ctx.meta("orders", Meta::count(input.validate.len() as u64));
+                ctx.meta("revenue", revenue);
+                ctx.meta(
+                    "dropped",
+                    Meta::count(input.enrich.len().saturating_sub(input.validate.len()) as u64),
+                );
+                ctx.meta(
+                    "sample",
+                    Meta::table(
+                        [("id", "int"), ("total", "float")],
+                        input
+                            .validate
+                            .iter()
+                            .take(5)
+                            .map(|o| vec![json!(o.id), json!(o.total)]),
+                    ),
+                );
+                ctx.meta(
+                    "notes",
+                    Meta::Markdown(
+                        "rows are dropped when `id` or `total` is missing — see\n\
+                         [metadata](https://github.com/quanalyst/hestan) for what\n\
+                         *this* block is."
+                            .into(),
+                    ),
+                );
                 Ok(Summary {
                     orders: input.validate.len(),
                     revenue,

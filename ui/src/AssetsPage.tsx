@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { Link, useNavigate } from "react-router-dom";
+import { Link, useNavigate, useSearchParams } from "react-router-dom";
 import { get, post, usePoll } from "./api";
 import AssetPanel from "./AssetPanel";
 import DagView from "./DagView";
@@ -99,7 +99,13 @@ export default function AssetsPage() {
   const [busyAsset, setBusyAsset] = useState<string | null>(null);
   const [rowMsg, setRowMsg] = useState<{ asset: string; msg: string } | null>(null);
   const [sensorErr, setSensorErr] = useState<string | null>(null);
-  const [sel, setSel] = useState<string | null>(null);
+  // the selection lives in the url, so `?asset=orders` opens that asset's
+  // panel — which is where a Meta::AssetRef link goes, and what makes a
+  // panel worth sending to somebody
+  const [params, setParams] = useSearchParams();
+  const sel = params.get("asset");
+  const select = (name: string | null) =>
+    setParams(name === null || name === sel ? {} : { asset: name }, { replace: true });
 
   usePoll(
     () => {
@@ -210,7 +216,7 @@ export default function AssetsPage() {
             }))}
             statuses={staleness}
             selected={sel}
-            onSelect={(name) => setSel((prev) => (prev === name ? null : name))}
+            onSelect={select}
           />
 
           <h2>assets</h2>
@@ -232,7 +238,7 @@ export default function AssetsPage() {
               {assets.map((a) => (
                 <tr
                   key={a.name}
-                  onClick={() => setSel((prev) => (prev === a.name ? null : a.name))}
+                  onClick={() => select(a.name)}
                 >
                   <td>
                     {a.name}
@@ -430,7 +436,7 @@ export default function AssetsPage() {
         </>
       )}
 
-      {selected && <AssetPanel key={selected.name} asset={selected} onClose={() => setSel(null)} />}
+      {selected && <AssetPanel key={selected.name} asset={selected} onClose={() => select(null)} />}
     </>
   );
 }

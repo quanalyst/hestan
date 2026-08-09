@@ -183,7 +183,12 @@ its metadata — then the recent materializations: a `•` in the left gutter
 for the entries whose fingerprint actually moved, the short fingerprint,
 when it happened, and a link to the run that built it (or `probe` for a
 source row, which no run wrote). anything a build reported with `ctx.meta`
-sits under its entry, rendered by type.
+sits under its entry, rendered by type exactly as the run page renders an
+op's.
+
+the panel's selection lives in the url — `/assets?asset=orders` opens that
+asset with its panel already open, which is what a `Meta::asset_ref` links to
+and what makes a panel worth sending to somebody.
 
 ### Sensors
 
@@ -271,9 +276,12 @@ op shows the process id it is running in — which is what to reach for when the
 question is what to look at in `top`. under the graph, the selected op's
 output shows on one line, and whatever it reported with `ctx.meta`
 ([metadata](metadata.md)) below it — rendered by type rather than as raw
-json: numbers right-aligned and tabular, urls as links, text inline,
-markdown and json in a muted preformatted block. markdown is shown as
-source; hestan carries no markdown parser.
+json: numbers right-aligned and tabular in whatever unit they were reported
+in (`1,240`, `1.2 GB`, `3.4s`), urls as links, a reported run id or asset
+name as a link into this ui, paths monospace with the basename emphasised,
+tables as small scrolling tables that say so when they were truncated at the
+source, text inline, markdown and json in a muted preformatted block.
+markdown is shown as source; hestan carries no markdown parser.
 
 the gantt chart plots each op run against elapsed time from the first op's
 start, with duration labels at the bar ends and a glyph in place of a bar for

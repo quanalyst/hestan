@@ -45,7 +45,7 @@ pub use model::{
     RunStatus, RunTags, ScheduleRow, SensorOutcome, SensorRow, SensorTick, Severity, Tick,
     TickOutcome, Trigger, When,
 };
-pub use op::{InputError, Meta, Op, OpCtx, OpResult};
+pub use op::{InputError, META_TABLE_ROWS, Meta, MetaColumn, MetaTable, Op, OpCtx, OpResult};
 pub use partition::Partitions;
 pub use resource::ResourceCtx;
 pub use schedule::Schedule;

@@ -398,10 +398,23 @@ needed to see a fan-out:
 ```
 
 `metadata` is what the op reported with `ctx.meta`, one tagged value per
-name — `int`, `float`, `text`, `url`, `markdown`, `json` — and `null` when
-it reported nothing, which is not the same as `{}`. only the attempt that
-succeeded contributes: a failed attempt's metadata is discarded. see
-[metadata](metadata.md).
+name, and `null` when it reported nothing, which is not the same as `{}`. the
+tags are `int`, `float`, `text`, `url`, `markdown`, `json`, `table`, `bytes`,
+`duration_secs` (seconds, as a float), `count`, `path`, `run` (a run id) and
+`asset` (an asset name); a reader that does not know a tag should show the
+value as it is rather than guess, and no tag ever changes meaning. only the
+attempt that succeeded contributes: a failed attempt's metadata is discarded.
+see [metadata](metadata.md).
+
+a `table` carries its own shape, capped at 100 rows where it was built:
+
+```json
+{ "by_region": { "table": {
+  "columns": [ {"name": "region", "type": "text"},
+               {"name": "orders", "type": "int"} ],
+  "rows": [ ["emea", 812], ["amer", 428] ],
+  "truncated": false } } }
+```
 
 `pid` is the child process an [isolated op](isolation.md) is running in right
 now. it is null for every op that runs in the orchestrator itself, and null

@@ -17,33 +17,216 @@ use crate::store::Store;
 /// what an op body returns: json output on success, any error on failure.
 pub type OpResult = Result<Value, Box<dyn std::error::Error + Send + Sync>>;
 
+/// how many rows a [`Meta::table`] keeps, applied at construction. a metadata
+/// table is a sample you read at a glance — the top regions, the columns that
+/// changed type — not a result set, and a pipeline that reports its whole
+/// output here would put it in every run page, every history entry and every
+/// api response.
+pub const META_TABLE_ROWS: usize = 100;
+
+/// one column of a [`MetaTable`]: a name, and the type it holds when the op
+/// knows it. `"orders"` and `("orders", "int")` both convert, so a table's
+/// columns are usually written as a literal array.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MetaColumn {
+    name: String,
+    ty: Option<String>,
+}
+
+impl MetaColumn {
+    pub fn new(name: impl Into<String>) -> MetaColumn {
+        MetaColumn {
+            name: name.into(),
+            ty: None,
+        }
+    }
+
+    /// a column that also names its type. the type is a label for whoever
+    /// reads it — hestan never parses it, so it is your vocabulary, not one
+    /// hestan imposes.
+    pub fn typed(name: impl Into<String>, ty: impl Into<String>) -> MetaColumn {
+        MetaColumn {
+            name: name.into(),
+            ty: Some(ty.into()),
+        }
+    }
+
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub fn ty(&self) -> Option<&str> {
+        self.ty.as_deref()
+    }
+}
+
+impl From<&str> for MetaColumn {
+    fn from(name: &str) -> MetaColumn {
+        MetaColumn::new(name)
+    }
+}
+
+impl From<String> for MetaColumn {
+    fn from(name: String) -> MetaColumn {
+        MetaColumn::new(name)
+    }
+}
+
+impl<N: Into<String>, T: Into<String>> From<(N, T)> for MetaColumn {
+    fn from((name, ty): (N, T)) -> MetaColumn {
+        MetaColumn::typed(name, ty)
+    }
+}
+
+/// a small table an op reports about what it produced — a sample of the rows,
+/// a per-region breakdown, a schema. built with [`Meta::table`], which is the
+/// only way to make one: the row cap and the rectangle below are invariants
+/// rather than things a caller is asked to maintain.
+///
+/// rows are padded with `null` and truncated to the column count, so every row
+/// has exactly one cell per column and nothing downstream has to decide what a
+/// ragged row means.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MetaTable {
+    columns: Vec<MetaColumn>,
+    rows: Vec<Vec<Value>>,
+    truncated: bool,
+}
+
+impl MetaTable {
+    pub fn columns(&self) -> &[MetaColumn] {
+        &self.columns
+    }
+
+    pub fn rows(&self) -> &[Vec<Value>] {
+        &self.rows
+    }
+
+    /// whether rows were dropped to fit [`META_TABLE_ROWS`]. carried through
+    /// to the api and the ui, so a hundred-row table that is all there was and
+    /// one that is the head of a million read differently.
+    pub fn truncated(&self) -> bool {
+        self.truncated
+    }
+}
+
 /// a typed fact an op attaches to what it produced, via [`OpCtx::meta`]. the
 /// type is not decoration: it is what lets a row count render as a number, a
 /// source as a link, and a blob as a blob, without anything downstream
 /// guessing from the value.
 ///
 /// the obvious rust types convert on their own — `ctx.meta("rows", 1_234)`,
-/// `ctx.meta("note", "backfilled")` — and the rest are named:
-/// `ctx.meta("source", Meta::Url(url))`. `u64` and `usize` deliberately do
+/// `ctx.meta("note", "backfilled")`, `ctx.meta("took", elapsed)` — and the
+/// rest are named: `ctx.meta("source", Meta::Url(url))`,
+/// `ctx.meta("rows", Meta::count(1_240))`. `u64` and `usize` deliberately do
 /// not convert, since narrowing them is a lie waiting to happen; cast them
-/// yourself.
+/// yourself, or say which kind of number you meant with
+/// [`count`](Meta::count) or [`bytes`](Meta::bytes).
 #[derive(Debug, Clone, PartialEq)]
 pub enum Meta {
     Int(i64),
     Float(f64),
     Text(String),
     Url(String),
-    /// markdown source. hestan stores and shows the source and does not
-    /// render it — there is no markdown parser in this crate.
+    /// markdown source, rendered by the ui as a
+    /// [documented subset](../docs/metadata.md#the-markdown-subset).
     Markdown(String),
     Json(Value),
+    /// a sample of rows with named columns; build it with [`Meta::table`].
+    Table(MetaTable),
+    /// a size in bytes, rendered `1.2 GB` rather than as the integer.
+    Bytes(u64),
+    /// an elapsed time, rendered `3.4s`. stored as seconds.
+    Duration(Duration),
+    /// a plain count, rendered `1,240`. the same number as an [`Int`](Meta::Int)
+    /// and a different claim about it: a count is a quantity of things, so it
+    /// is never negative and a delta against it means something.
+    Count(u64),
+    /// a filesystem path, rendered monospace with the basename emphasised.
+    Path(String),
+    /// another run of this deployment, by id, rendered as a link to it. dagster
+    /// needs a url here; hestan knows its own graph.
+    RunRef(String),
+    /// an asset of this deployment, by name, rendered as a link to it.
+    AssetRef(String),
 }
 
 impl Meta {
+    /// a table of at most [`META_TABLE_ROWS`] rows. columns are names or
+    /// `(name, type)` pairs; rows are json cells, padded and truncated to the
+    /// column count:
+    ///
+    /// ```no_run
+    /// # use hestan::{Meta, Op, OpCtx};
+    /// # use serde_json::json;
+    /// # let rows: Vec<Vec<serde_json::Value>> = vec![];
+    /// Meta::table([("region", "text"), ("orders", "int")], rows);
+    /// ```
+    pub fn table<C, R>(columns: C, rows: R) -> Meta
+    where
+        C: IntoIterator,
+        C::Item: Into<MetaColumn>,
+        R: IntoIterator<Item = Vec<Value>>,
+    {
+        let columns: Vec<MetaColumn> = columns.into_iter().map(Into::into).collect();
+        let width = columns.len();
+        let mut kept: Vec<Vec<Value>> = Vec::new();
+        let mut truncated = false;
+        for mut row in rows {
+            if kept.len() == META_TABLE_ROWS {
+                truncated = true;
+                break;
+            }
+            row.truncate(width);
+            row.resize(width, Value::Null);
+            kept.push(row);
+        }
+        Meta::Table(MetaTable {
+            columns,
+            rows: kept,
+            truncated,
+        })
+    }
+
+    /// a size in bytes: `Meta::bytes(1_288_490_188)` reads as `1.2 GB`.
+    pub fn bytes(n: u64) -> Meta {
+        Meta::Bytes(n)
+    }
+
+    /// a quantity of things: `Meta::count(1_240)` reads as `1,240`.
+    pub fn count(n: u64) -> Meta {
+        Meta::Count(n)
+    }
+
+    pub fn duration(d: Duration) -> Meta {
+        Meta::Duration(d)
+    }
+
+    pub fn path(p: impl Into<String>) -> Meta {
+        Meta::Path(p.into())
+    }
+
+    /// a link to another run of this deployment, by id.
+    pub fn run_ref(id: impl Into<String>) -> Meta {
+        Meta::RunRef(id.into())
+    }
+
+    /// a link to an asset of this deployment, by name.
+    pub fn asset_ref(name: impl Into<String>) -> Meta {
+        Meta::AssetRef(name.into())
+    }
+
     /// the stored shape: one tagged value per name, so
     /// `{"rows": {"int": 1234}, "source": {"url": ".."}}`. written out rather
-    /// than derived, because it is a wire format the api and the ui read.
-    fn tagged(&self) -> Value {
+    /// than derived, because it is a wire format the api and the ui read — and
+    /// a format nothing may quietly renumber, since rows written by an older
+    /// hestan are still on disk. every tag ever emitted still reads
+    /// ([`from_tagged`](Self::from_tagged)); the ones this phase added are
+    /// `table`, `bytes`, `duration_secs`, `count`, `path`, `run` and `asset`.
+    ///
+    /// a duration's tag names its unit, because the number alone cannot: it is
+    /// seconds, as a float.
+    pub fn tagged(&self) -> Value {
         match self {
             Meta::Int(v) => json!({ "int": v }),
             Meta::Float(v) => json!({ "float": v }),
@@ -51,7 +234,92 @@ impl Meta {
             Meta::Url(v) => json!({ "url": v }),
             Meta::Markdown(v) => json!({ "markdown": v }),
             Meta::Json(v) => json!({ "json": v }),
+            Meta::Table(t) => json!({ "table": {
+                "columns": t.columns.iter()
+                    .map(|c| json!({ "name": c.name, "type": c.ty }))
+                    .collect::<Vec<Value>>(),
+                "rows": t.rows,
+                "truncated": t.truncated,
+            }}),
+            Meta::Bytes(v) => json!({ "bytes": v }),
+            Meta::Duration(d) => json!({ "duration_secs": d.as_secs_f64() }),
+            Meta::Count(v) => json!({ "count": v }),
+            Meta::Path(v) => json!({ "path": v }),
+            Meta::RunRef(v) => json!({ "run": v }),
+            Meta::AssetRef(v) => json!({ "asset": v }),
         }
+    }
+
+    /// read one stored value back, the inverse of [`tagged`](Self::tagged).
+    /// `None` for anything that is not a one-key object with a tag this
+    /// version knows — a value written by a *newer* hestan reads as unknown
+    /// rather than as a guess.
+    pub fn from_tagged(v: &Value) -> Option<Meta> {
+        let object = v.as_object()?;
+        if object.len() != 1 {
+            return None;
+        }
+        let (tag, v) = object.iter().next()?;
+        Some(match tag.as_str() {
+            "int" => Meta::Int(v.as_i64()?),
+            "float" => Meta::Float(v.as_f64()?),
+            "text" => Meta::Text(v.as_str()?.to_string()),
+            "url" => Meta::Url(v.as_str()?.to_string()),
+            "markdown" => Meta::Markdown(v.as_str()?.to_string()),
+            "json" => Meta::Json(v.clone()),
+            "table" => {
+                let t = v.as_object()?;
+                let columns = t
+                    .get("columns")?
+                    .as_array()?
+                    .iter()
+                    .map(|c| {
+                        let name = c.get("name")?.as_str()?.to_string();
+                        let ty = match c.get("type") {
+                            None | Some(Value::Null) => None,
+                            Some(ty) => Some(ty.as_str()?.to_string()),
+                        };
+                        Some(MetaColumn { name, ty })
+                    })
+                    .collect::<Option<Vec<MetaColumn>>>()?;
+                let rows = t
+                    .get("rows")?
+                    .as_array()?
+                    .iter()
+                    .map(|r| Some(r.as_array()?.clone()))
+                    .collect::<Option<Vec<Vec<Value>>>>()?;
+                Meta::Table(MetaTable {
+                    columns,
+                    rows,
+                    truncated: t.get("truncated").and_then(Value::as_bool).unwrap_or(false),
+                })
+            }
+            "bytes" => Meta::Bytes(v.as_u64()?),
+            "duration_secs" => Meta::Duration(Duration::from_secs_f64(v.as_f64()?.max(0.0))),
+            "count" => Meta::Count(v.as_u64()?),
+            "path" => Meta::Path(v.as_str()?.to_string()),
+            "run" => Meta::RunRef(v.as_str()?.to_string()),
+            "asset" => Meta::AssetRef(v.as_str()?.to_string()),
+            _ => return None,
+        })
+    }
+
+    /// the number a numeric variant carries — `Int`, `Float`, `Bytes`,
+    /// `Duration` (seconds) and `Count` — and `None` for every variant that is
+    /// not a number. this is what deltas and trends are computed over, so the
+    /// units are display types over the same one number and a `Count` compares
+    /// against an `Int` of the same value.
+    pub fn as_f64(&self) -> Option<f64> {
+        let n = match self {
+            Meta::Int(v) => *v as f64,
+            Meta::Float(v) => *v,
+            Meta::Bytes(v) | Meta::Count(v) => *v as f64,
+            Meta::Duration(d) => d.as_secs_f64(),
+            _ => return None,
+        };
+        // NaN and the infinities compare against nothing; a stored one is a
+        // json null anyway, which never reads back as a Float
+        n.is_finite().then_some(n)
     }
 }
 
@@ -94,6 +362,12 @@ impl From<&str> for Meta {
 impl From<Value> for Meta {
     fn from(v: Value) -> Meta {
         Meta::Json(v)
+    }
+}
+
+impl From<Duration> for Meta {
+    fn from(d: Duration) -> Meta {
+        Meta::Duration(d)
     }
 }
 
@@ -1251,6 +1525,161 @@ mod tests {
         tokio::time::timeout(Duration::from_millis(20), ctx.cancelled())
             .await
             .expect("cancelled() never resolved");
+    }
+
+    // exactly what phase 12 wrote, and what is on disk in every database made
+    // since. the enum has grown four times over since; these six rows have to
+    // read back as the same six values or history stops being readable
+    const PHASE12_ROW: &str = r##"{
+        "rows": {"int": 1234},
+        "ratio": {"float": 0.5},
+        "note": {"text": "backfilled from the archive"},
+        "source": {"url": "https://example.test/orders"},
+        "report": {"markdown": "# heading\n\nbody"},
+        "shape": {"json": {"cols": 3}}
+    }"##;
+
+    #[test]
+    fn phase12_metadata_still_reads_after_the_enum_grew() {
+        let stored: Value = serde_json::from_str(PHASE12_ROW).unwrap();
+        let read: BTreeMap<String, Meta> = stored
+            .as_object()
+            .unwrap()
+            .iter()
+            .map(|(k, v)| (k.clone(), Meta::from_tagged(v).expect(k)))
+            .collect();
+
+        assert_eq!(read["rows"], Meta::Int(1234));
+        assert_eq!(read["ratio"], Meta::Float(0.5));
+        assert_eq!(
+            read["note"],
+            Meta::Text("backfilled from the archive".into())
+        );
+        assert_eq!(
+            read["source"],
+            Meta::Url("https://example.test/orders".into())
+        );
+        assert_eq!(read["report"], Meta::Markdown("# heading\n\nbody".into()));
+        assert_eq!(read["shape"], Meta::Json(json!({"cols": 3})));
+
+        // and writing them again produces byte-for-byte the same row: the tags
+        // this phase added are new tags, not renamed ones
+        assert_eq!(tagged_map(&read), Some(stored));
+        // the numbers among them are still numbers, which is what deltas read
+        assert_eq!(read["rows"].as_f64(), Some(1234.0));
+        assert_eq!(read["ratio"].as_f64(), Some(0.5));
+        assert_eq!(read["note"].as_f64(), None);
+    }
+
+    #[test]
+    fn every_variant_round_trips_through_its_tag() {
+        let all = [
+            Meta::Int(-3),
+            Meta::Float(1.5),
+            Meta::Text("t".into()),
+            Meta::Url("https://example.test".into()),
+            Meta::Markdown("# h".into()),
+            Meta::Json(json!([1, 2])),
+            Meta::table(["a", "b"], [vec![json!(1), json!("x")]]),
+            Meta::table([("a", "int")], [vec![json!(1)]]),
+            Meta::bytes(1_288_490_188),
+            Meta::duration(Duration::from_millis(3_400)),
+            Meta::count(1_240),
+            Meta::path("/tmp/orders.parquet".to_string()),
+            Meta::run_ref("019fe109"),
+            Meta::asset_ref("orders"),
+        ];
+        for meta in all {
+            assert_eq!(
+                Meta::from_tagged(&meta.tagged()),
+                Some(meta.clone()),
+                "{meta:?} did not survive its own tag"
+            );
+        }
+
+        // the tags themselves, since they are the wire format
+        assert_eq!(Meta::count(7).tagged(), json!({"count": 7}));
+        assert_eq!(Meta::bytes(7).tagged(), json!({"bytes": 7}));
+        assert_eq!(
+            Meta::duration(Duration::from_millis(1500)).tagged(),
+            json!({"duration_secs": 1.5})
+        );
+        assert_eq!(Meta::run_ref("r1").tagged(), json!({"run": "r1"}));
+        assert_eq!(Meta::asset_ref("a").tagged(), json!({"asset": "a"}));
+    }
+
+    // a value from a newer hestan, and a few shapes that are not values at all
+    #[test]
+    fn an_unknown_tag_reads_as_nothing_rather_than_a_guess() {
+        for v in [
+            json!({"histogram": [1, 2, 3]}),
+            json!({"int": 1, "count": 2}),
+            json!({}),
+            json!({"int": "twelve"}),
+            json!(12),
+            json!(null),
+        ] {
+            assert_eq!(Meta::from_tagged(&v), None, "{v} read as something");
+        }
+    }
+
+    #[test]
+    fn a_table_is_capped_and_rectangular_at_construction() {
+        let rows = (0..META_TABLE_ROWS as i64 + 40).map(|i| vec![json!(i), json!("x")]);
+        let Meta::Table(t) = Meta::table(["n", "s"], rows) else {
+            unreachable!()
+        };
+        assert_eq!(t.rows().len(), META_TABLE_ROWS);
+        assert!(t.truncated(), "a table that lost rows says so");
+        assert_eq!(t.rows()[0], [json!(0), json!("x")]);
+
+        // exactly the cap is not truncation: nothing was dropped
+        let rows = (0..META_TABLE_ROWS as i64).map(|i| vec![json!(i)]);
+        let Meta::Table(t) = Meta::table(["n"], rows) else {
+            unreachable!()
+        };
+        assert_eq!(t.rows().len(), META_TABLE_ROWS);
+        assert!(!t.truncated());
+
+        // ragged rows are padded and trimmed to the columns, so nothing
+        // downstream has to decide what a short row means
+        let Meta::Table(t) = Meta::table(
+            ["a", "b"],
+            [vec![json!(1)], vec![json!(1), json!(2), json!(3)]],
+        ) else {
+            unreachable!()
+        };
+        assert_eq!(t.rows()[0], [json!(1), Value::Null]);
+        assert_eq!(t.rows()[1], [json!(1), json!(2)]);
+        assert_eq!(t.columns()[1].name(), "b");
+        assert_eq!(t.columns()[1].ty(), None);
+        assert_eq!(MetaColumn::from(("orders", "int")).ty(), Some("int"));
+    }
+
+    // the units are display types over one number, so a delta can be computed
+    // between them; everything else has no number to report
+    #[test]
+    fn only_the_numeric_variants_carry_a_number() {
+        assert_eq!(Meta::count(1_240).as_f64(), Some(1_240.0));
+        assert_eq!(Meta::bytes(1_024).as_f64(), Some(1_024.0));
+        assert_eq!(
+            Meta::duration(Duration::from_millis(3_400)).as_f64(),
+            Some(3.4)
+        );
+        assert_eq!(Meta::Int(-3).as_f64(), Some(-3.0));
+        assert_eq!(Meta::Float(f64::NAN).as_f64(), None);
+        for meta in [
+            Meta::Text("12".into()),
+            Meta::Url("https://example.test".into()),
+            Meta::Markdown("12".into()),
+            Meta::Json(json!(12)),
+            Meta::path("/tmp/12"),
+            Meta::run_ref("12"),
+            Meta::asset_ref("12"),
+            Meta::table(["n"], [vec![json!(12)]]),
+        ] {
+            assert_eq!(meta.as_f64(), None, "{meta:?} reported a number");
+        }
     }
 
     #[test]

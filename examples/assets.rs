@@ -47,7 +47,7 @@ fn docs_fingerprint() -> Result<String, Box<dyn std::error::Error + Send + Sync>
     Ok(hex(&hasher.finalize()))
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct DocStat {
     file: String,
     bytes: u64,
@@ -87,8 +87,22 @@ async fn main() -> Result<(), hestan::Error> {
             });
         }
         ctx.info(format!("measured {} files", stats.len()));
-        ctx.meta("files", stats.len() as i64);
-        ctx.meta("bytes", stats.iter().map(|s| s.bytes).sum::<u64>() as i64);
+        ctx.meta("files", Meta::count(stats.len() as u64));
+        ctx.meta("bytes", Meta::bytes(stats.iter().map(|s| s.bytes).sum()));
+        ctx.meta("dir", Meta::path(DOCS_DIR));
+        // the five longest, which is the sample worth reading in the ui
+        let mut longest = stats.clone();
+        longest.sort_by_key(|s| std::cmp::Reverse(s.lines));
+        ctx.meta(
+            "longest",
+            Meta::table(
+                [("file", "text"), ("lines", "int"), ("bytes", "int")],
+                longest
+                    .iter()
+                    .take(5)
+                    .map(|s| vec![json!(s.file), json!(s.lines), json!(s.bytes)]),
+            ),
+        );
         Ok(serde_json::to_value(stats)?)
     })
     .from(&docs_dir);
@@ -99,6 +113,10 @@ async fn main() -> Result<(), hestan::Error> {
             "source",
             Meta::Url("https://github.com/quanalyst/hestan".into()),
         );
+        // what these totals are of: the ui links it, because hestan knows the
+        // graph and does not need a url to point inside itself
+        ctx.meta("measured", Meta::asset_ref("doc_stats"));
+        ctx.meta("bytes", Meta::bytes(stats.iter().map(|s| s.bytes).sum()));
         Ok(Totals {
             files: stats.len(),
             bytes: stats.iter().map(|s| s.bytes).sum(),

@@ -201,15 +201,42 @@ export interface ResumePreview {
   reuse: string[];
 }
 
+// one column of a metadata table: its name, and the type the op named when it
+// knew one — a label to print, never anything the ui parses
+export interface MetaColumn {
+  name: string;
+  type: string | null;
+}
+
+// a sample of rows an op reported. rectangular by construction: the source
+// pads and trims every row to the column count
+export interface MetaTable {
+  columns: MetaColumn[];
+  rows: unknown[][];
+  // rows were dropped to fit the cap where it was built, so a full table and
+  // the head of a much larger one read differently
+  truncated: boolean;
+}
+
 // a typed fact an op reported with ctx.meta, stored tagged by its type so
-// nothing downstream has to guess how to show it
+// nothing downstream has to guess how to show it. bytes, duration_secs and
+// count are display types over one number: the same integer an `int` carries,
+// with the unit it is in
 export type MetaValue =
   | { int: number }
   | { float: number }
   | { text: string }
   | { url: string }
   | { markdown: string }
-  | { json: unknown };
+  | { json: unknown }
+  | { table: MetaTable }
+  | { bytes: number }
+  | { duration_secs: number }
+  | { count: number }
+  | { path: string }
+  // a run id and an asset name of this deployment, which the ui links to
+  | { run: string }
+  | { asset: string };
 
 export type Metadata = Record<string, MetaValue>;
 

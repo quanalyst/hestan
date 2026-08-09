@@ -915,6 +915,65 @@ button.text-btn.active {
   overflow-wrap: anywhere;
 }
 
+.meta-path {
+  overflow-wrap: anywhere;
+}
+
+/* a table takes the width the row's value column has, and scrolls sideways
+   rather than pushing the panel wider */
+.meta-table-wrap {
+  flex: 1;
+  min-width: 0;
+  max-height: 220px;
+  overflow: auto;
+}
+
+/* the page's table rules are for rows you click; this one is a value */
+.meta-table {
+  width: auto;
+  margin: 0;
+  font-size: 11px;
+}
+
+.meta-table tbody tr {
+  cursor: default;
+}
+
+.meta-table tbody tr:hover {
+  background: none;
+}
+
+.meta-table th,
+.meta-table td {
+  padding: 2px 12px 2px 0;
+  border-bottom: none;
+  text-align: left;
+  white-space: nowrap;
+}
+
+.meta-table th {
+  position: sticky;
+  top: 0;
+  background: var(--surface);
+  border-bottom: 1px solid var(--hairline);
+  color: var(--muted);
+  font-weight: 500;
+}
+
+.meta-table td.num {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
+.meta-col-type {
+  font-weight: 400;
+}
+
+.meta-table-note {
+  padding-top: 2px;
+  font-size: 10px;
+}
+
 .mat-entry .meta-list {
   margin: 0 0 6px 16px;
 }
