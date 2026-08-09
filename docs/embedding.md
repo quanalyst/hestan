@@ -9,17 +9,18 @@ each dropping a layer of machinery.
 database, sweep runs that a dead process left behind, sync the schedules
 and sensors tables to the code, start the in-process scheduler and the
 sensor loop, and serve the ui and api.
-`.retention_days(n)` folds one more step into that startup work: terminal
-runs older than `n` days are pruned before anything new launches (the
-default keeps everything — see [storage](storage.md)).
+`.retention(Retention::days(n))` folds one more step into that startup work:
+terminal runs older than `n` days are pruned before anything new launches, and
+a sweeper loop keeps pruning every hour after that (the default keeps
+everything — see [storage](storage.md#retention)).
 it binds the listener *before* spawning the loops, so a bind failure
 (port taken) can't leave a detached loop firing jobs into a server that never
 started. when serve returns, both loop tasks are aborted with it.
 
 `Hestan::new()...run_once(job, params)` builds the same way — including the
-crash sweep and the schedule/sensor sync — but runs a single manual run to
-completion and returns the final `Run`. no server, no scheduler, no sensor
-loop. good for cron-driven containers or one-off backfills where hestan is
+crash sweep, the schedule/sensor sync and one retention sweep — but runs a
+single manual run to completion and returns the final `Run`. no server, no
+scheduler, no sensor loop. good for cron-driven containers or one-off backfills where hestan is
 the executor and something else owns the clock.
 `Hestan::new()...build_asset(name)` is the same shape for
 [assets](assets.md): one headless build run of the named asset and its

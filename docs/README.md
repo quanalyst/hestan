@@ -14,7 +14,7 @@
 - [sensors](sensors.md) — the sensor loop, cursor commit-on-success, `RunRequest` and run keys, timeouts and concurrency, failure backoff, probes and run-status chains as sensors, pausing and tick history.
 - [scheduling](scheduling.md) — cron syntax, timezones, the durable cursor, missed-fire catch-up, pause/resume, ticks, and the scheduler loop.
 - [http sources](http-sources.md) — declarative REST pulls: the full `HttpSource` builder, fan-out, retry policy.
-- [notifications](notifications.md) — hooks: `on_failure`/`RunFailure`, `on_late`/`LateEvent`, the webhook and slack helpers.
+- [notifications](notifications.md) — hooks: `on_run_finished`/`RunEvent`, `on_op_finished`/`OpEvent`, per-job scoping, `on_failure`/`RunFailure`, `on_late`/`LateEvent`, the webhook and slack helpers, and durable at-least-once delivery.
 - [launching](launching.md) — presets, params schemas, run tags, subset launches, and cloning a past run.
 - [web ui](web-ui.md) — page-by-page tour of the embedded ui and how it draws status.
 - [scaling](scaling.md) — the run queue, concurrency limits, priority, claims and leases, scheduler and worker roles, the compose example, and the honest limits of sqlite.

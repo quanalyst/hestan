@@ -145,7 +145,7 @@ Hestan::new().work(None).await                          // executes
 Hestan::new().serve(addr).await                         // both; the default
 ```
 
-| role | schedules, sensors, freshness, backfill chunking | claims and executes |
+| role | schedules, sensors, freshness, backfill chunking, retention, notification delivery | claims and executes |
 | --- | --- | --- |
 | `Role::All` (default) | yes | yes |
 | `Role::Scheduler` | yes | no |
@@ -156,6 +156,13 @@ freshness checks and backfill chunking are decisions, and two processes making
 them independently is two of every scheduled run — there is no lock that would
 stop it. **Any number of processes may be `Worker`**; that is the entire point
 of a claimable queue.
+
+The [retention sweep](storage.md#retention) is on the same side of that line
+and for a sharper reason: a worker owns none of the history, and one pruning
+the scheduler's runs is data loss nothing reports. So is
+[notification delivery](notifications.md#durable-delivery) — two processes
+delivering would send every alert twice — which means the hooks want
+registering on the process that decides.
 
 `Hestan::work(addr)` is `role(Role::Worker)` with the address made optional,
 because a worker may want no socket at all. Give it one and you get the same

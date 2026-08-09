@@ -408,7 +408,8 @@ history grows without bound, so it is capped rather than left to. at startup
 every asset is trimmed to its newest 200 entries; `Hestan::asset_history(n)`
 sets the number. the newest entry is never trimmed whatever `n` says — it is
 current state, and losing it would read as an asset that has never been
-built. unlike `retention_days` this happens whether you ask or not.
+built. unlike a [retention policy](storage.md#retention) this happens whether
+you ask or not.
 
 that cap is the only thing that ever removes a materialization. run retention
 still does not: an asset keeps its latest value and fingerprint long after

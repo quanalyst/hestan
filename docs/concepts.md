@@ -129,7 +129,10 @@ against it. expiry also trips `ctx.is_cancelled()` — see
 a run is `failed` if any op finished `failed`, otherwise `success` — unless
 it was canceled, which wins over both. a failed run carries an `error` of its
 own: the first op that terminally failed, as `op {name} failed: {message}`,
-which is the same pair an [`on_failure` hook](notifications.md) receives. the
+which is the same pair an [`on_failure` hook](notifications.md) receives.
+whichever status it reached, an [`on_run_finished`](notifications.md) hook
+gets one event carrying it, and each terminal **attempt** of each op gets an
+[`on_op_finished`](notifications.md) event of its own. the
 terminal event (`run_failed` / `run_success` / `run_canceled`) is committed
 before the terminal status, so anything that observes a finished run can also
 read its closing event.
@@ -367,7 +370,9 @@ such run). canceled is terminal: the run itself never continues, but its ops
 that did finish are reusable, so a canceled run is resumable exactly like a
 failed one. a canceled run counts as inactive for the scheduler's
 [overlap policy](scheduling.md), and [failure hooks](notifications.md) do
-not fire for it.
+not fire for it — though `on_run_finished` does, with `status = canceled`, as
+long as the run had started. cancel one still on the queue and nothing
+reports on it: it never ran.
 
 ## Resume
 

@@ -81,8 +81,9 @@ upstream run id, the file's mtime. `"2026-08-09"` is a key; `Utc::now()` is not.
 
 **keys are never collected on their own.** a daily-keyed sensor writes a row a
 day for as long as the database exists.
-[`retention_days(n)`](storage.md#retention) prunes them on the same cutoff it
-prunes runs on; without it they accumulate. that is deliberate — a key deleted
+[retention](storage.md#retention) prunes them on the same age cutoff it prunes
+runs on, on every sweep rather than only at boot; without a policy they
+accumulate. that is deliberate — a key deleted
 early is a duplicate launch, so nothing throws one away by default.
 
 ## Timeouts and concurrency

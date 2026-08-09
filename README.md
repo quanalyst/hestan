@@ -186,8 +186,10 @@ appears.
   every host can reach, and [scaling](docs/scaling.md) says so plainly
 - every run, op attempt, output, and log event lands in a sqlite file (WAL,
   one connection behind a mutex — plenty at this scale) with no extra services
-  and optional retention (`retention_days(n)` prunes terminal runs older than
-  n days at startup; the default keeps everything). the schema migrates
+  and optional retention: `Retention::days(30).keep_last(20).failed_days(90)`,
+  globally or per job, swept at startup and every hour after it rather than
+  only at boot. a run goes only when **every** rule would take it, which is the
+  conservative direction; the default keeps everything. the schema migrates
   itself forward via `PRAGMA user_version`, and runs whose claimer went away
   are marked failed on the next start — while a run another process is holding
   a live lease on is left exactly alone
@@ -253,11 +255,20 @@ appears.
   or an asset says how old its latest success may get, and past that it is
   `late` — per key on a partitioned asset, so one late partition carries the
   asset. a declared policy replaces the cron-derived `overdue` heuristic
-- `on_failure` hooks fire for every failed run, `on_late` hooks fire when
-  something crosses into late — once per crossing, not per poll, and the state
-  survives restarts. ready-made webhook and slack helpers behind the `http`
-  feature serve both; the failed run row carries the same
-  `op {name} failed: {message}` summary for anything reading history instead
+- `on_run_finished` fires for every terminal run with the status on the event,
+  `on_op_finished` once per op **attempt** with its number, and both scope to
+  one job with `JobBuilder::on_run_finished` — so an alert can cover prod
+  without covering every backfill. `on_failure` is that path with a filter on
+  it and is unchanged. `on_late` fires when something crosses into late — once
+  per crossing, not per poll, and the state survives restarts. ready-made
+  webhook and slack helpers behind the `http` feature serve all of them, and a
+  run that succeeded does not read like an alarm
+- `durable_notifications()` writes each run's event **in the same transaction
+  as the run's terminal row** and delivers it from a loop that retries on the
+  same backoff op retries use and gives up loudly after eight attempts, leaving
+  the row visible as `failed` with its error. delivery is at-least-once and the
+  docs say so next to the api rather than in a footnote. off by default: a hook
+  that bumps a metric wants a callback, not a table
 - the web ui is a prebuilt react bundle embedded in the binary; it polls the
   json api under `/api`
 

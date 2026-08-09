@@ -897,6 +897,35 @@ the same moment, so the alert and the list cannot disagree. something that has
 never succeeded is `never`, not late, and does not appear here. an empty
 `late` is the normal answer.
 
+## Notifications
+
+`GET /api/notifications?state=&limit=` lists
+[durable notifications](notifications.md#durable-delivery), newest first:
+
+```json
+{ "notifications": [
+  { "id": 41, "kind": "run",
+    "payload": { "run_id": "0198...", "job": "orders_etl", "status": "failed",
+                 "failed_op": "load", "error": "connection refused",
+                 "started_at": "2026-08-08T02:00:01Z",
+                 "finished_at": "2026-08-08T02:00:09Z", "duration_secs": 8.1 },
+    "created_at": "2026-08-08T02:00:09Z", "attempts": 3,
+    "next_attempt_at": "2026-08-08T02:04:41Z", "delivered_at": null,
+    "last_error": "hook panicked: 503", "state": "pending" }
+] }
+```
+
+`state` is `pending` (undelivered and due again), `failed` (given up on after
+its attempts ran out — nothing will retry it) or `delivered`; anything else is
+a 400. omit it for all three. `limit` defaults to 50 and is clamped to 500.
+`payload` is the event exactly as the hook receives it, so an operator reading
+this and a hook receiving it are looking at the same thing.
+
+the list is empty unless a process asked for `durable_notifications()`, which
+is off by default. the runs page shows the undelivered and given-up rows,
+because an alert nobody received should be visible in the ui the alert was
+about.
+
 ## Everything else
 
 a GET outside `/api` serves the embedded ui: the file from the bundled

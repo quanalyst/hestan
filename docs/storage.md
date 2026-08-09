@@ -22,7 +22,7 @@ than shipping a config that would corrupt.
 
 ## Schema
 
-fifteen tables. `trigger` is a reserved word in sqlite, hence the quoted
+sixteen tables. `trigger` is a reserved word in sqlite, hence the quoted
 column name in the schema and every statement that touches it.
 
 ```sql
@@ -194,7 +194,33 @@ CREATE TABLE op_logs (                  -- added in v15
     message TEXT NOT NULL
 );
 CREATE INDEX op_logs_run ON op_logs(run_id, op, id);
+
+CREATE TABLE notifications (            -- added in v16
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    kind TEXT NOT NULL,        -- which event shape payload holds; "run" today
+    payload TEXT NOT NULL,     -- the event, as the hook will receive it
+    created_at TEXT NOT NULL,
+    attempts INTEGER NOT NULL DEFAULT 0,
+    next_attempt_at TEXT,      -- when it is next due; null once nothing will
+    delivered_at TEXT,
+    last_error TEXT
+);
+CREATE INDEX notifications_due ON notifications(next_attempt_at)
+    WHERE delivered_at IS NULL;
+CREATE INDEX notifications_delivered ON notifications(delivered_at);
 ```
+
+`notifications` is empty unless
+[`durable_notifications()`](notifications.md#durable-delivery) is on. the row
+is written in the same transaction as the run's terminal row, which is the
+whole of what durable delivery is: written after it, a crash in the gap loses
+the alert about the failure the alert existed to report, and nothing records
+that it was owed. `next_attempt_at` carries the state — set and undelivered is
+`pending`, **null** and undelivered is given up on — so a row is inserted due
+now rather than null, and giving up clears it, which keeps a permanently
+failing notification out of the delivery scan while leaving it visible with
+the error that stopped it. the partial index is that scan and nothing else:
+the pending rows are a handful and the delivered ones are the table.
 
 `op_logs` is what an op *printed*, as opposed to what hestan said about it in
 `events` — a table of its own precisely because a chatty op would otherwise
@@ -297,8 +323,10 @@ of the whole job, which is most of them: it exists because a resume's reused
 outputs and an asset build's memoized seeds live in the launching process's
 memory, and whoever claims the run may not be that process; version 15 adds
 the `op_logs` table ([logs](logs.md)), empty for every run that finished
-before there was anywhere to put what an op printed. an older file at
-any version opens straight into v15, rows intact — the v8 rebuild copies
+before there was anywhere to put what an op printed; version 16 adds the
+`notifications` table ([durable delivery](notifications.md#durable-delivery)),
+which stays empty unless a process asks for it. an older file at
+any version opens straight into v16, rows intact — the v8 rebuild copies
 every keyed materialization across, where it becomes that asset's first
 history entry and stays its current one, and v9 leaves every existing row
 with a null partition, which is exactly what an unpartitioned asset is. every
@@ -306,7 +334,7 @@ pending step
 and the version stamp run in one transaction
 (sqlite DDL is transactional), so a crash or failure mid-migration leaves
 the file exactly as it was found, never half-migrated. a database stamped
-with a version newer than the build refuses to open (`db schema v16 is newer
+with a version newer than the build refuses to open (`db schema v17 is newer
 than this build`) instead of quietly writing an older stamp over it.
 
 one wrinkle: databases written before the migration mechanism existed carry
@@ -345,27 +373,90 @@ anything nobody has renewed for 60, failing it or requeueing it per
 
 ## Retention
 
-by default nothing is ever deleted — runs, op runs, events and captured
-output accumulate for as long as the file exists. `retention_days(n)` on the builder opts in
-to pruning: at startup, after the crash sweep, terminal runs (success,
-failed, or canceled) created more than `n` days ago are deleted together
-with their op runs, events and [captured output](logs.md), all in one
-transaction. active runs are never pruned, whatever their age — a
-[reclaimed](scaling.md) run is back on the queue rather than terminal, so
-what its first claimer captured is still there for the second one. neither is `op_state` — watermarks outlive their
-runs, so a job that fires rarely keeps its cursor even after every run that
-wrote it is gone. an asset's latest materialization is the same: it survives
-the run that built it being retired, so a materialization's `run_id` can
-point at a run retention has since deleted.
+by default nothing is ever deleted — runs, op runs, events and captured output
+accumulate for as long as the file exists. `Hestan::retention(policy)` opts in,
+and `Retention` says how much history to keep:
 
-three logs are trimmed at every startup whether retention is configured or
-not, because all three grow with time rather than with what you keep.
-`schedule_ticks` and `sensor_ticks` are each capped at their newest 5000
-rows. `asset_materializations` is capped *per asset*, and `asset_checks` per
+```rust
+Hestan::new()
+    .retention(Retention::days(30).keep_last(20).failed_days(90))
+    .job(Job::builder("audit_export").retention(Retention::days(365)).op(export).build()?)
+```
+
+| knob | what it says |
+| --- | --- |
+| `Retention::days(n)` | delete a terminal run `n` days after it was **created** |
+| `.keep_last(n)` | hold the newest `n` finished runs of the job back from that cutoff, whatever their age |
+| `.failed_days(n)` | a longer age for runs that failed or were canceled; without it they age like successes |
+
+`retention_days(n)` is still there and still means `Retention::days(n)`.
+`JobBuilder::retention` overrides the global policy for one job entirely — it
+is that job's whole policy, not an addition to the deployment's.
+
+the age is measured from `created_at` rather than from the finish, so a run
+that sat on the queue for a week ages while it waits, which is what "keep 30
+days" means to whoever asked for it. `failed_days` is worth reaching for: a
+successful run is noise a week later, and the failure you want next quarter is
+the one about to go.
+
+### The combination rule
+
+**a run is deleted only when every knob would delete it.** `days(7)` with
+`keep_last(50)` keeps a run that is eight days old if it is among the last
+fifty, and keeps the last fifty only until they are eight days old — whichever
+rule holds it back wins. keep-if-either is the conservative direction, and the
+other reading silently deletes history you find out about afterwards.
+
+that also means `keep_last` on its own deletes nothing. with no age policy
+there is nothing for it to hold anything back *from*, and reading it as "delete
+everything past the newest n" would make an unconfigured `Retention` empty a
+database.
+
+a run that has not finished is **never** pruned, whatever its age: a queued run
+older than the cutoff is a queue problem, not a retention one. a
+[reclaimed](scaling.md) run is back on the queue rather than terminal, so what
+its first claimer captured is still there for the second one. `op_state` is
+never touched either — watermarks outlive their runs, so a job that fires
+rarely keeps its cursor even after every run that wrote it is gone. an asset's
+latest materialization is the same: it survives the run that built it being
+retired, so a materialization's `run_id` can point at a run retention has since
+deleted.
+
+### The sweep
+
+a sweep runs at startup **and every `Hestan::retention_interval` after it**,
+an hour by default. the interval is the point: retention used to run once, at
+boot, so a server up for three months pruned nothing after its first second —
+the one deployment shape a retention policy is for is the one where it never
+ran. the startup sweep stays as well, because a process that runs for an hour
+and exits should still tidy up.
+
+**only a process that [decides](scaling.md) sweeps** — `Role::All` or
+`Role::Scheduler`. a worker owns none of the history, and one pruning the
+scheduler's runs would be data loss nothing reports.
+
+each job is swept in its own transaction, so a run and its children always go
+together and a database with fifty jobs in it does not hold the write lock for
+the length of all fifty. the cost is one index seek per job rather than one
+visit per run: the jobs with runs are walked by a loose index scan over
+`runs_job_created`, and each job's doomed rows are a range seek on the same
+index.
+
+the sweep also takes [sensor run keys](sensors.md) older than the age cutoff —
+nothing else collects them, and a sensor keyed by the day would keep a row per
+day forever — and delivered [notifications](notifications.md) older than it.
+undelivered notifications stay at any age: one that never got through is not
+history, it is something outstanding.
+
+two tick logs are trimmed by the same sweep whether or not a retention policy
+is configured, because both grow with time rather than with what you keep:
+`schedule_ticks` and `sensor_ticks` are each capped at their newest 5000 rows.
+`asset_materializations` is capped *per asset*, and `asset_checks` per
 `(asset, check)`, at the newest 200 each — or whatever
-`Hestan::asset_history(n)` says. the newest row of either is never trimmed at
-any `n`: an asset's latest materialization is its current state and a check's
-latest result is what the asset summary counts ([assets](assets.md)).
+`Hestan::asset_history(n)` says — and those two are trimmed at startup. the
+newest row of either is never trimmed at any `n`: an asset's latest
+materialization is its current state and a check's latest result is what the
+asset summary counts ([assets](assets.md)).
 
 ## What's stored and what stays in memory
 

@@ -210,6 +210,16 @@ zero launches. runs a sensor launches carry the `sensor` trigger.
 
 ## Runs page
 
+an "undelivered notifications" section leads the page whenever a
+[durable notification](notifications.md#durable-delivery) has not got through:
+its state (`pending`, or `failed` for one hestan has given up retrying), the
+run and job it is about, how many attempts it has had, and the error that
+stopped the last one. clicking a row goes to the run. an alert nobody received
+should be visible in the ui the alert was about, rather than in a log line
+from Tuesday — so it sits above the filters and outside them, and delivered
+ones never appear at all. the section is absent entirely unless a process
+asked for `durable_notifications()`, which is off by default.
+
 when the [queue](scaling.md) has anything on it, a "queued" section leads the
 page: how many are waiting, and then each waiting run in the order a
 dispatcher will take them — position, run, job, priority, and **what is
