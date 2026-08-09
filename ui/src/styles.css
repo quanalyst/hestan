@@ -485,6 +485,24 @@ button:disabled {
   font-size: 11px;
 }
 
+/* hestan speaking about the capture rather than the op speaking: set apart by
+   a rule down the side, so it never reads as a line the op printed */
+.ev-marker {
+  margin: 3px 0;
+  padding-left: 8px;
+  border-left: 2px solid var(--rule);
+  color: var(--muted);
+  font-style: italic;
+}
+
+.log-download {
+  margin-left: 12px;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 400;
+  vertical-align: middle;
+}
+
 .filter-sep {
   display: inline-block;
   width: 1px;

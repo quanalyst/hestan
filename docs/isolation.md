@@ -91,8 +91,9 @@ died, which in a child would mean marking its own parent's in-flight runs.
 
 ## The store is the channel
 
-there is no pipe, no serialization format, and nothing to keep in sync between
-the two processes, because everything an op invocation needs is already a row:
+there is no protocol, no serialization format, and nothing to keep in sync
+between the two processes, because everything an op invocation needs is
+already a row:
 
 | the op needs      | it reads                                    |
 | ----------------- | ------------------------------------------- |
@@ -121,6 +122,27 @@ gigabyte through `FileIo` reads it once, in the process that wants it.
 the run's cancellation is the only signal that does not travel through the
 store, for the good reason that a process being asked to stop should not have
 to poll a database to find out.
+
+## What the child printed
+
+the one thing that does travel down a pipe. stdout and stderr are the child's,
+whole — nobody else in that process can claim them — so the parent pipes both
+and stores every line under this attempt, tagged with the stream it came out
+of. `println!`, a python subprocess, a linked c library writing to fd 2: all
+of it, verbatim, with nothing to switch on.
+
+the parent reads **both pipes concurrently**, and that is load-bearing rather
+than tidy: draining stdout to its end and stderr afterwards leaves stderr's
+pipe buffer to fill, and a child blocked writing into a full pipe never exits.
+
+a child that is killed, aborts or dies mid-line keeps what it wrote — the
+pipes are drained after the kill, since a pipe ends when the process holding
+the other side of it is gone. for the segfault case above, what the op printed
+before it went is usually the only evidence there is. an in-process op gets no
+such thing, for a reason [docs/logs.md](logs.md) states plainly: redirecting
+fd 1 process-wide would hijack the host application's output. capture is
+capped per attempt (1 MiB and 10,000 lines by default) and reading carries on
+after the cap, so a chatty child never blocks on a pipe nobody is draining.
 
 ## A child that dies without recording anything
 

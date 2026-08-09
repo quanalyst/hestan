@@ -22,7 +22,7 @@ than shipping a config that would corrupt.
 
 ## Schema
 
-fourteen tables. `trigger` is a reserved word in sqlite, hence the quoted
+fifteen tables. `trigger` is a reserved word in sqlite, hence the quoted
 column name in the schema and every statement that touches it.
 
 ```sql
@@ -181,7 +181,29 @@ CREATE TABLE presets (                  -- added in v12
     created_at TEXT NOT NULL,
     PRIMARY KEY (job, name)
 );
+
+CREATE TABLE op_logs (                  -- added in v15
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id TEXT NOT NULL,
+    op TEXT NOT NULL,
+    attempt INTEGER NOT NULL,  -- which attempt of that op printed it
+    at TEXT NOT NULL,
+    stream TEXT,               -- stdout | stderr, for subprocess capture
+    level TEXT,                -- info | warn | error, for a captured event
+    target TEXT,               -- the event's module path
+    message TEXT NOT NULL
+);
+CREATE INDEX op_logs_run ON op_logs(run_id, op, id);
 ```
+
+`op_logs` is what an op *printed*, as opposed to what hestan said about it in
+`events` — a table of its own precisely because a chatty op would otherwise
+bury the eight events that describe what the run did. exactly one half of the
+middle three columns is filled per row, and which half says where the line
+came from: `stream` for an [isolated op](isolation.md)'s pipe, which has no
+levels and no targets, and `level`/`target` for a `tracing` event captured by
+the [`capture` layer](logs.md), which was never on a pipe. rows are capped per
+attempt, at 1 MiB and 10,000 lines by default — see [logs](logs.md).
 
 `presets` holds named parameter sets ([launching](launching.md#presets)).
 they are runtime data, not part of a job definition: `Hestan::preset` seeds
@@ -273,8 +295,10 @@ run that finished before there was a queue is. `plan` is what a launch decided
 the run would execute (`{"ops": [...], "seeds": {...}}`) and is null for a run
 of the whole job, which is most of them: it exists because a resume's reused
 outputs and an asset build's memoized seeds live in the launching process's
-memory, and whoever claims the run may not be that process. an older file at
-any version opens straight into v14, rows intact — the v8 rebuild copies
+memory, and whoever claims the run may not be that process; version 15 adds
+the `op_logs` table ([logs](logs.md)), empty for every run that finished
+before there was anywhere to put what an op printed. an older file at
+any version opens straight into v15, rows intact — the v8 rebuild copies
 every keyed materialization across, where it becomes that asset's first
 history entry and stays its current one, and v9 leaves every existing row
 with a null partition, which is exactly what an unpartitioned asset is. every
@@ -282,7 +306,7 @@ pending step
 and the version stamp run in one transaction
 (sqlite DDL is transactional), so a crash or failure mid-migration leaves
 the file exactly as it was found, never half-migrated. a database stamped
-with a version newer than the build refuses to open (`db schema v15 is newer
+with a version newer than the build refuses to open (`db schema v16 is newer
 than this build`) instead of quietly writing an older stamp over it.
 
 one wrinkle: databases written before the migration mechanism existed carry
@@ -321,12 +345,14 @@ anything nobody has renewed for 60, failing it or requeueing it per
 
 ## Retention
 
-by default nothing is ever deleted — runs, op runs, and events accumulate
-for as long as the file exists. `retention_days(n)` on the builder opts in
+by default nothing is ever deleted — runs, op runs, events and captured
+output accumulate for as long as the file exists. `retention_days(n)` on the builder opts in
 to pruning: at startup, after the crash sweep, terminal runs (success,
 failed, or canceled) created more than `n` days ago are deleted together
-with their op runs and events, all in one transaction. active runs are never
-pruned, whatever their age. neither is `op_state` — watermarks outlive their
+with their op runs, events and [captured output](logs.md), all in one
+transaction. active runs are never pruned, whatever their age — a
+[reclaimed](scaling.md) run is back on the queue rather than terminal, so
+what its first claimer captured is still there for the second one. neither is `op_state` — watermarks outlive their
 runs, so a job that fires rarely keeps its cursor even after every run that
 wrote it is gone. an asset's latest materialization is the same: it survives
 the run that built it being retired, so a materialization's `run_id` can

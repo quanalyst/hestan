@@ -3,8 +3,10 @@ check:
     cargo fmt --check
     cargo clippy --all-targets -- -D warnings
     cargo clippy --all-targets --features http -- -D warnings
+    cargo clippy --all-targets --features capture -- -D warnings
     cargo test
     cargo test --features http
+    cargo test --features capture
 
 demo:
     cargo run --example demo

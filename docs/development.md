@@ -20,24 +20,31 @@ src/
   model.rs      Run/OpRun/Event/Tick/Materialization rows and the status enums
   http.rs       HttpSource (behind the http feature)
   notify.rs     webhook/slack failure hooks (behind the http feature)
+  logs.rs       what an op printed: the op_logs writers and their cap
+  isolate.rs    isolated ops: the parent, the child, the output capture
+  capture.rs    the tracing layer (behind the capture feature)
   error.rs      the Error enum
 ui/             react + vite app; ui/dist is committed and embedded
 examples/       demo.rs, assets.rs, http_source.rs (needs --features http)
-tests/          pipeline.rs, assets.rs; http_source.rs and notify.rs (need the http feature)
+tests/          pipeline.rs, assets.rs, isolation.rs, queue.rs; http_source.rs
+                and notify.rs (need the http feature); capture.rs (needs capture)
 ```
 
 ## Gates
 
-`just check` runs exactly what ci runs. the `http` feature compiles real extra
-code (and gates a test target and an example via `required-features`), so both
-configurations are checked:
+`just check` runs exactly what ci runs. `http` and `capture` each compile real
+extra code (and each gates a test target via `required-features`), and the
+crate has to be clean without them as well as with them — so three
+configurations are checked rather than one:
 
 ```
 cargo fmt --check
 cargo clippy --all-targets -- -D warnings
 cargo clippy --all-targets --features http -- -D warnings
+cargo clippy --all-targets --features capture -- -D warnings
 cargo test
 cargo test --features http
+cargo test --features capture
 ```
 
 ci additionally runs the ui's own gates — `npm run lint`, `npm test` and
@@ -106,9 +113,17 @@ http retry policy, fan-out, and `bearer_env`; `tests/notify.rs` does the
 same for the webhook and slack hooks. both only exist under
 `--features http`.
 
-the ui has one suite of its own, `ui/test/markdown.test.tsx`, run with
-`npm test` (or `just ui-test`): the [markdown
-subset](metadata.md#the-markdown-subset) construct by construct, and the
-injection cases asserted against the exact string react renders. it needs no
-test framework and no browser — vite bundles it for node with the same config
-the app is built with, and `node:test` runs it.
+`tests/capture.rs` is the [capture layer](logs.md) against a real subscriber,
+and it is a binary of its own for a reason worth knowing: `tracing` caches a
+callsite's interest the first time that callsite is hit, using whatever
+subscriber the thread that hit it had. in a binary where hundreds of other
+tests run ops with no subscriber installed, the executor's op span would be
+registered as "nobody is interested" by whichever thread got there first, and
+the layer's cases would fail about one run in three.
+
+the ui has suites of its own under `ui/test/`, run with `npm test` (or
+`just ui-test`): the [markdown subset](metadata.md#the-markdown-subset)
+construct by construct with the injection cases asserted against the exact
+string react renders, the metadata row, and the run page's log merge. they
+need no test framework and no browser — vite bundles them for node with the
+same config the app is built with, and `node:test` runs them.

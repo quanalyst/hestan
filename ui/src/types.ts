@@ -293,6 +293,24 @@ export interface RunEvent {
   ts: string;
 }
 
+export type LogStream = "stdout" | "stderr";
+
+// one line an op produced, as opposed to one hestan wrote about it. a
+// subprocess's pipe fills `stream`; a captured tracing event fills `level` and
+// `target`; a line hestan wrote about the capture itself carries the target
+// `hestan` and no stream.
+export interface OpLog {
+  id: number;
+  run_id: string;
+  op: string;
+  attempt: number;
+  at: string;
+  stream: LogStream | null;
+  level: EventLevel | null;
+  target: string | null;
+  message: string;
+}
+
 export interface OpStatSample {
   run_id: string;
   status: OpStatus;

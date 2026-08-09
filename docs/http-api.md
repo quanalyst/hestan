@@ -26,6 +26,8 @@ failures. timestamps are rfc3339 strings in utc.
 | GET | `/api/runs` | run list with filters and paging |
 | GET | `/api/runs/{id}` | one run plus its op runs |
 | GET | `/api/runs/{id}/events` | the run's event log, cursored |
+| GET | `/api/runs/{id}/logs` | what the run's ops printed, cursored |
+| GET | `/api/runs/{id}/logs/download` | the same as `text/plain`, to grep |
 | POST | `/api/runs/{id}/retry` | launch a fresh run with the same params |
 | POST | `/api/runs/{id}/resume` | continue a run from where it broke |
 | GET | `/api/runs/{id}/resume_preview` | what a resume would do |
@@ -479,6 +481,47 @@ everything.
 and `data` are catalogued in [concepts](concepts.md); `op_expanded`
 (`data: {"instances": n, "over": dep}`) is how many instances a mapped op made,
 and the only record it leaves when that number is zero.
+
+## Captured output
+
+`GET /api/runs/{id}/logs?op=&after=0&limit=500` returns `{"logs": [...]}` —
+what the run's ops *printed*, as opposed to what hestan said about them.
+cursored on `id` exactly as events are cursored on `seq`, ascending, `limit`
+clamped to 1..=2000. `op` narrows to one op. an unknown run id is a 404.
+
+```json
+{
+  "id": 412,
+  "run_id": "0198f2a4-...",
+  "op": "publish",
+  "attempt": 2,
+  "at": "2026-08-07T12:00:02.481Z",
+  "stream": "stderr",
+  "level": null,
+  "target": null,
+  "message": "warehouse connection reset"
+}
+```
+
+exactly one half of `stream` and `level`/`target` is filled and which half
+says where the line came from: `stream` is `stdout`/`stderr` for an
+[isolated op](isolation.md)'s subprocess capture, and `level`/`target` belong
+to a `tracing` event captured by the [`capture` layer](logs.md). a row with no
+`stream` and the target `hestan` is hestan speaking about the capture itself —
+the line that says a cap was reached. [logs](logs.md) is the whole story,
+including the caps and what is deliberately not captured.
+
+`GET /api/runs/{id}/logs/download?op=` is the same rows as `text/plain`, one
+line per line, because at some point everyone wants to grep it:
+
+```
+2026-08-07T12:00:01.412Z publish #1 stdout connecting to the warehouse
+2026-08-07T12:00:02.481Z publish #2 stderr warehouse connection reset
+```
+
+the columns are the timestamp, the op, `#attempt`, and the stream or level.
+the download stops at 100,000 lines and says so on the last line if it hit
+that; what is stored is capped per attempt long before then.
 
 ## Retry
 

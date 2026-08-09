@@ -29,6 +29,15 @@ start/finish times, and the output or error.
 `op_failed`, `op_skipped`, `op_canceled`, `type_check_failed`, and `log` — the last is
 what `ctx.info/warn/error` emit.
 
+*captured output* is the other log, and a different thing: what the op itself
+printed rather than what hestan said about it. an [isolated op](isolation.md)'s
+stdout and stderr are piped and stored whole; an in-process op's `tracing`
+events are stored if you compose hestan's [capture layer](logs.md) into your
+subscriber. it lives in its own table for the good reason that a chatty op
+would otherwise bury the eight events that describe what the run did. the
+[logs page](logs.md) has the rest, including the one thing that is *not*
+captured and why.
+
 the *trigger* records why a run exists: `manual` (launch endpoint,
 `run_once`), `schedule` (the cron scheduler), `retry` (the re-run endpoint),
 `resume` (the [resume endpoint](#resume), which continues an earlier run),

@@ -194,6 +194,18 @@ appears.
 - events are structured: each carries a `kind` (`run_queued`, `op_retry`,
   `type_check_failed`, ...) and optional json data alongside the
   human-readable message; `ctx.info/warn/error` emit `kind=log`
+- **what an op *printed* is captured too**, and the two cases differ on
+  purpose. an isolated op is a subprocess, so its stdout and stderr are piped
+  and stored whole — `println!`, a linked c library, all of it — with both
+  pipes drained concurrently, because reading one while the other fills its
+  buffer deadlocks the child. an in-process op emits `tracing` events instead,
+  and the `capture` feature offers a **layer you compose into your own
+  subscriber**: hestan installs no global subscriber and redirects no file
+  descriptor, so an in-process `println!` is *not* captured — hijacking fd 1
+  would take the host application's output with it, and
+  [docs/logs.md](docs/logs.md) says so rather than hiding it. capped per
+  attempt (1 MiB and 10,000 lines by default), because an op in a print loop
+  must not fill the disk the run log lives on
 - the scheduler keeps a **durable cursor** per schedule: the newest occurrence
   it has accounted for. everything between the cursor and now is what downtime
   swallowed, so `Catchup::{Skip, One, All { limit }}` can say what to do about
@@ -274,7 +286,7 @@ the details live in [docs/](docs/README.md):
 [typed io](docs/typed-io.md), [resources](docs/resources.md),
 [io managers](docs/io-managers.md), [op state](docs/state.md),
 [isolation](docs/isolation.md),
-[metadata](docs/metadata.md),
+[metadata](docs/metadata.md), [logs](docs/logs.md),
 [assets](docs/assets.md), [freshness](docs/freshness.md),
 [sensors](docs/sensors.md),
 [scheduling](docs/scheduling.md), [http sources](docs/http-sources.md),

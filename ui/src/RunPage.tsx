@@ -7,9 +7,12 @@ import GanttChart from "./GanttChart";
 import MetaList from "./MetaList";
 import StatusDot from "./StatusDot";
 import { GlyphShape } from "./StatusGlyph";
+import { logRows } from "./log";
+import type { Source } from "./log";
 import type {
   EventLevel,
   JobSummary,
+  OpLog,
   OpRun,
   OpStatus,
   OpSummary,
@@ -70,6 +73,35 @@ function expansions(events: RunEvent[]): Map<string, number> {
   return out;
 }
 
+// captured output is paged, and a finished run's poll only fires once — so
+// this drains the cursor rather than showing the first page and stopping.
+// bounded: an op is capped at 10,000 lines and a run may hold several, and a
+// page that keeps fetching for a minute is not a page anyone is reading
+const LOG_PAGE = 2000;
+const LOG_PAGES = 8;
+
+async function pullOutput(
+  id: string,
+  cursor: { current: number },
+  onRows: (fn: (prev: OpLog[]) => OpLog[]) => void,
+) {
+  for (let page = 0; page < LOG_PAGES; page++) {
+    let batch: OpLog[];
+    try {
+      const r = await get<{ logs: OpLog[] }>(
+        `/api/runs/${id}/logs?after=${cursor.current}&limit=${LOG_PAGE}`,
+      );
+      batch = r.logs;
+    } catch {
+      return;
+    }
+    if (batch.length === 0) return;
+    cursor.current = batch[batch.length - 1].id;
+    onRows((prev) => [...prev, ...batch]);
+    if (batch.length < LOG_PAGE) return;
+  }
+}
+
 export default function RunPage() {
   const { id } = useParams();
   if (!id) return null;
@@ -81,7 +113,12 @@ function RunView({ id }: { id: string }) {
   const [run, setRun] = useState<Run | null>(null);
   const [ops, setOps] = useState<OpRun[]>([]);
   const [events, setEvents] = useState<RunEvent[]>([]);
+  const [output, setOutput] = useState<OpLog[]>([]);
   const [filter, setFilter] = useState<"all" | "logs">("all");
+  // what an op printed and what hestan said about it, together by default:
+  // hiding either one behind a click is how you miss the line that explains
+  // the failure above it
+  const [source, setSource] = useState<Source>("both");
   const [level, setLevel] = useState<"all" | EventLevel>("all");
   const [opSel, setOpSel] = useState<string | null>(null);
   const [job, setJob] = useState<JobSummary | null>(null);
@@ -95,6 +132,7 @@ function RunView({ id }: { id: string }) {
   const [cancelError, setCancelError] = useState<string | null>(null);
   const [missing, setMissing] = useState(false);
   const lastSeq = useRef(0);
+  const lastLog = useRef(0);
   const doneRef = useRef(false);
   const logRef = useRef<HTMLDivElement>(null);
   const stick = useRef(true);
@@ -132,7 +170,8 @@ function RunView({ id }: { id: string }) {
               });
             })
             .catch(() => {}),
-        );
+        )
+        .then(() => pullOutput(id, lastLog, setOutput));
     },
     done || missing ? null : 1500,
     [id, done, missing],
@@ -184,7 +223,7 @@ function RunView({ id }: { id: string }) {
   useEffect(() => {
     const el = logRef.current;
     if (el && stick.current) el.scrollTop = el.scrollHeight;
-  }, [events]);
+  }, [events, output]);
 
   const onScroll = () => {
     const el = logRef.current;
@@ -271,10 +310,7 @@ function RunView({ id }: { id: string }) {
         }),
       ]
     : [];
-  const shown = events
-    .filter((e) => filter === "all" || e.kind === "log")
-    .filter((e) => level === "all" || e.level === level)
-    .filter((e) => opSel === null || e.op === opSel);
+  const shown = logRows(events, output, { source, kind: filter, level, op: opSel });
 
   return (
     <>
@@ -417,15 +453,32 @@ function RunView({ id }: { id: string }) {
       <h2>
         log
         <span className="log-filter">
-          {(["all", "logs"] as const).map((f) => (
+          {/* what an op printed is a different thing from what hestan said
+              about it, and reading them together is usually the point */}
+          {(["events", "output", "both"] as const).map((s) => (
             <button
-              key={f}
-              className={filter === f ? "text-btn active" : "text-btn"}
-              onClick={() => setFilter(f)}
+              key={s}
+              className={source === s ? "text-btn active" : "text-btn"}
+              onClick={() => setSource(s)}
             >
-              {f}
+              {s}
             </button>
           ))}
+          {/* an event kind filter has nothing to filter when no events are shown */}
+          {source !== "output" && (
+            <>
+              <span className="filter-sep" />
+              {(["all", "logs"] as const).map((f) => (
+                <button
+                  key={f}
+                  className={filter === f ? "text-btn active" : "text-btn"}
+                  onClick={() => setFilter(f)}
+                >
+                  {f}
+                </button>
+              ))}
+            </>
+          )}
           <span className="filter-sep" />
           {(["all", "info", "warn", "error"] as const).map((l) => (
             <button
@@ -445,17 +498,45 @@ function RunView({ id }: { id: string }) {
             </>
           )}
         </span>
+        {output.length > 0 && (
+          <a
+            className="log-download"
+            href={`/api/runs/${id}/logs${opSel ? `/download?op=${encodeURIComponent(opSel)}` : "/download"}`}
+          >
+            download output
+          </a>
+        )}
       </h2>
       <div className="log" ref={logRef} onScroll={onScroll}>
         {shown.length === 0 && (
-          <span className="muted">{events.length === 0 ? "no events yet" : "no events match the filter"}</span>
+          <span className="muted">
+            {events.length === 0 && output.length === 0
+              ? "nothing yet"
+              : "nothing matches the filter"}
+          </span>
         )}
-        {shown.map((e) => (
-          <div key={e.seq} className={e.kind === "log" ? `ev ev-${e.level}` : "ev ev-system"}>
-            <span className="ev-ts">{clockTime(e.ts)}</span>{" "}
-            <span className="ev-op">[{e.op ?? "run"}]</span>{" "}
-            {e.kind !== "log" && <span className="ev-kind">{e.kind} </span>}
-            {e.message}
+        {shown.map((r) => (
+          <div
+            key={r.key}
+            className={
+              r.marker
+                ? "ev ev-marker"
+                : r.level === null
+                  ? "ev"
+                  : r.source === "event" && r.tag !== null
+                    ? "ev ev-system"
+                    : `ev ev-${r.level}`
+            }
+          >
+            <span className="ev-ts">{clockTime(r.ts)}</span>{" "}
+            <span className="ev-op">
+              [{r.op ?? "run"}
+              {/* the attempt only when there was more than one, since a retry's
+                  output and the output it replaced read identically otherwise */}
+              {r.attempt !== null && ` #${r.attempt}`}]
+            </span>{" "}
+            {r.tag !== null && <span className="ev-kind">{r.tag} </span>}
+            {r.message}
           </div>
         ))}
       </div>

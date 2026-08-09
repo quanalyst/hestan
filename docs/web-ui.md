@@ -311,13 +311,25 @@ hatched; canceled ops draw dim and muted whatever their path position, with
 the diamond for any that never got to start. it answers "what would I speed
 up to make this run faster".
 
-the log streams events while the run is live (polling every 1.5s on a
-sequence cursor, stopping once the run is terminal). it auto-follows the tail
-unless you've scrolled up. filters sit in the header: `all` vs `logs`
-(`kind=log` only — just your `ctx.info/warn/error` lines), a level filter
-(all/info/warn/error), and the op chip when one is selected in the dag.
+the log streams while the run is live (polling every 1.5s on a cursor,
+stopping once the run is terminal). it auto-follows the tail unless you've
+scrolled up. filters sit in the header, starting with the source: `events`
+(hestan narrating the run), `output` ([what the ops printed](logs.md)), or
+both interleaved by time, which is the default. then `all` vs `logs`
+(`kind=log` only — just your `ctx.info/warn/error` lines, and only relevant
+while events are shown), a level filter (all/info/warn/error) that applies to
+both sources, and the op chip when one is selected in the dag.
+
 system events print their kind (`op_retry`, `run_canceled`,
-`type_check_failed`, ...) before the message.
+`type_check_failed`, ...) before the message; a captured line prints its op,
+its attempt once there has been more than one, and its stream or level. a
+line hestan wrote about the capture itself — "capture stopped: this attempt
+reached its cap" — is set apart by a rule down its side, because that is
+hestan speaking and not the op. a `download output` link beside the filters
+fetches the whole thing as text, narrowed to the selected op if there is one.
+
+a line off a pipe has no level, so a level filter hides it rather than
+inventing one for it.
 
 ## Command palette
 
