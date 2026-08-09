@@ -621,6 +621,8 @@ fn note_skipped_tick(runner: &Runner, name: &str) {
         SensorOutcome::Skipped,
         0,
         0,
+        // no evaluation ran, so there is no duration to claim
+        0,
         Some("previous evaluation still running"),
     ) {
         tracing::warn!(sensor = %name, "tick write failed: {e}");
@@ -667,7 +669,8 @@ impl Counts {
 /// paces the next evaluation from.
 async fn evaluate(entry: &SensorEntry, runner: &Runner, registry: &AssetRegistry) -> SensorOutcome {
     let counts = Counts::default();
-    let deadline = Instant::now() + entry.timeout;
+    let started = Instant::now();
+    let deadline = started + entry.timeout;
     let eval = async {
         match &entry.eval {
             SensorEval::User(f) => evaluate_user(&entry.name, f, runner, &counts, deadline).await,
@@ -705,6 +708,7 @@ async fn evaluate(entry: &SensorEntry, runner: &Runner, registry: &AssetRegistry
         outcome,
         counts.launched.load(Ordering::Relaxed),
         counts.skipped.load(Ordering::Relaxed),
+        started.elapsed().as_millis() as u64,
         error.as_deref(),
     ) {
         tracing::warn!(sensor = %entry.name, "tick write failed: {e}");
@@ -2247,5 +2251,47 @@ mod tests {
         );
         assert!(store.runs(None, None, None, None, 10).unwrap().is_empty());
         assert!(store.sensor_ticks(Some("watch"), 10).unwrap().is_empty());
+    }
+
+    // ---- evaluation metrics --------------------------------------------
+
+    #[tokio::test]
+    async fn a_tick_records_how_long_the_evaluation_took_and_what_it_skipped() {
+        let store = Store::open(":memory:").unwrap();
+        store.sync_sensors(&["watch".into()]).unwrap();
+        let runner = echo_runner(store.clone());
+        let reg = AssetRegistry::empty();
+        // a slow closure asking for the same keyed run twice over
+        let entry = SensorEntry::user(Sensor::new(
+            "watch",
+            Duration::from_secs(3600),
+            |_ctx: SensorCtx| async move {
+                tokio::time::sleep(Duration::from_millis(40)).await;
+                Ok(vec![
+                    RunRequest::new("etl")
+                        .params(json!({"kind": "keyed"}))
+                        .key("2026-08-09"),
+                ])
+            },
+        ));
+
+        evaluate(&entry, &runner, &reg).await;
+        let first = &store.sensor_ticks(Some("watch"), 10).unwrap()[0];
+        assert!(
+            first.duration_ms >= 35,
+            "a 40ms evaluation recorded {}ms",
+            first.duration_ms
+        );
+        assert_eq!((first.launched, first.skipped), (1, 0));
+
+        evaluate(&entry, &runner, &reg).await;
+        let second = &store.sensor_ticks(Some("watch"), 10).unwrap()[0];
+        assert!(second.duration_ms >= 35);
+        assert_eq!(
+            (second.launched, second.skipped),
+            (0, 1),
+            "the keyed duplicate should be a skip, not a quiet nothing"
+        );
+        assert_eq!(launched_kinds(&store), ["keyed"]);
     }
 }

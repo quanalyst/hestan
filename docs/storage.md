@@ -140,7 +140,7 @@ CREATE TABLE sensor_ticks (            -- added in v4
     outcome TEXT NOT NULL,    -- fired | error | skipped
     launched INTEGER NOT NULL DEFAULT 0,
     skipped INTEGER NOT NULL DEFAULT 0,      -- added in v11: keyed duplicates
-    duration_ms INTEGER NOT NULL DEFAULT 0,  -- added in v11
+    duration_ms INTEGER NOT NULL DEFAULT 0,  -- added in v11; 0 on a skipped tick
     error TEXT
 );
 

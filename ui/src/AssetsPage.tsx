@@ -13,7 +13,7 @@ import type {
   SensorOutcome,
   SensorSummary,
 } from "./types";
-import { relTime } from "./util";
+import { fmtDuration, relTime, untilTime } from "./util";
 
 const SENSOR_GLYPH = {
   fired: "success",
@@ -372,6 +372,8 @@ export default function AssetsPage() {
                 <th>cursor</th>
                 <th>last tick</th>
                 <th className="num">launched</th>
+                <th className="num">skipped</th>
+                <th className="num">took</th>
                 <th>next</th>
                 <th />
               </tr>
@@ -402,8 +404,12 @@ export default function AssetsPage() {
                       )}
                     </td>
                     <td className="num">{s.last_tick ? s.last_tick.launched : "—"}</td>
+                    <td className="num">{s.last_tick ? s.last_tick.skipped : "—"}</td>
+                    <td className="num mono">
+                      {s.last_tick ? fmtDuration(s.last_tick.duration_ms) : "—"}
+                    </td>
                     <td className="muted">
-                      {relTime(s.next_eval)}
+                      {untilTime(s.next_eval)}
                       {s.consecutive_failures > 0 && (
                         <span className="tag" title={`${s.consecutive_failures} failed evaluations in a row`}>
                           backing off

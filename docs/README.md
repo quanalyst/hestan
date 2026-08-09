@@ -9,7 +9,7 @@
 - [io managers](io-managers.md) — where op outputs live: the `IoManager` trait, `Inline`, `FileIo`, per-op managers, and where handles are resolved.
 - [assets](assets.md) — fingerprints, provable staleness, memoized builds, serialized builds, probes, and `.auto()`.
 - [freshness](freshness.md) — declared policies: `fresh_within`, fresh/late/never, `on_late` alerts, and how a policy relates to `overdue` and to staleness.
-- [sensors](sensors.md) — the sensor loop, cursor commit-on-success, `RunRequest`, probes and run-status chains as sensors, pausing and tick history.
+- [sensors](sensors.md) — the sensor loop, cursor commit-on-success, `RunRequest` and run keys, timeouts and concurrency, failure backoff, probes and run-status chains as sensors, pausing and tick history.
 - [scheduling](scheduling.md) — cron syntax, timezones, the durable cursor, missed-fire catch-up, pause/resume, ticks, and the scheduler loop.
 - [http sources](http-sources.md) — declarative REST pulls: the full `HttpSource` builder, fan-out, retry policy.
 - [notifications](notifications.md) — hooks: `on_failure`/`RunFailure`, `on_late`/`LateEvent`, the webhook and slack helpers.

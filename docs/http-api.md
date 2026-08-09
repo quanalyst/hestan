@@ -528,7 +528,7 @@ sensors, then probes in asset topo order:
     "next_eval": "2026-08-08T11:02:11Z", "consecutive_failures": 0,
     "last_tick": { "id": 7, "sensor": "marker_file",
       "evaluated_at": "2026-08-08T11:02:06Z", "outcome": "fired",
-      "launched": 1, "skipped": 0, "error": null } },
+      "launched": 1, "skipped": 0, "duration_ms": 34, "error": null } },
   { "name": "run:chain", "every_secs": 15, "paused": false,
     "cursor": { "finished_at": "2026-08-08T11:02:04Z", "id": "0198f2a4-..." },
     "filter": { "job": "orders_etl", "statuses": ["success"] },
@@ -563,6 +563,9 @@ one per turn). `skipped` counts the requests whose
 [run key](sensors.md#run-keys) was already claimed, so they were not launched
 a second time — a keyed sensor in its steady state reports
 `launched: 0, skipped: n`, which is not the same fact as launching nothing.
+`duration_ms` is how long the evaluation took, and is 0 on a `skipped` tick,
+which records a turn that was never taken. between them, outcome, duration and
+the two counts are what answer "is this sensor healthy".
 
 ## Schedules
 

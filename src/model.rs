@@ -522,6 +522,9 @@ pub struct SensorTick {
     /// requests this evaluation did not launch because their [run
     /// key](crate::RunRequest::key) had already been claimed.
     pub skipped: u32,
+    /// how long the evaluation took. 0 on a `skipped` tick, which records a
+    /// turn that was never taken.
+    pub duration_ms: u64,
     pub error: Option<String>,
 }
 

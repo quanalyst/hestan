@@ -316,6 +316,8 @@ export interface SensorTick {
   launched: number;
   // requests whose run key was already claimed, so they were not launched again
   skipped: number;
+  // how long the evaluation took; 0 on a skipped tick, which never ran
+  duration_ms: number;
   error: string | null;
 }
 

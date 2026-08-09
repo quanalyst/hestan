@@ -1397,25 +1397,30 @@ impl Store {
     }
 
     /// `skipped` counts the requests this evaluation did not launch because
-    /// their run key was already claimed — distinct from launching nothing.
+    /// their run key was already claimed — distinct from launching nothing —
+    /// and `duration_ms` is how long the evaluation took, which is the other
+    /// half of "is this sensor healthy".
     pub(crate) fn record_sensor_tick(
         &self,
         sensor: &str,
         outcome: SensorOutcome,
         launched: u32,
         skipped: u32,
+        duration_ms: u64,
         error: Option<&str>,
     ) -> Result<(), Error> {
         let conn = self.0.lock().unwrap();
         conn.execute(
-            "INSERT INTO sensor_ticks (sensor, evaluated_at, outcome, launched, skipped, error)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            "INSERT INTO sensor_ticks
+                 (sensor, evaluated_at, outcome, launched, skipped, duration_ms, error)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             params![
                 sensor,
                 Utc::now().to_rfc3339(),
                 outcome.as_str(),
                 launched,
                 skipped,
+                duration_ms,
                 error
             ],
         )?;
@@ -1425,7 +1430,7 @@ impl Store {
     pub fn sensor_ticks(&self, sensor: Option<&str>, limit: u32) -> Result<Vec<SensorTick>, Error> {
         let conn = self.0.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT id, sensor, evaluated_at, outcome, launched, skipped, error
+            "SELECT id, sensor, evaluated_at, outcome, launched, skipped, duration_ms, error
              FROM sensor_ticks WHERE (?1 IS NULL OR sensor = ?1)
              ORDER BY id DESC LIMIT ?2",
         )?;
@@ -1585,7 +1590,8 @@ fn sensor_tick_from_row(row: &Row) -> rusqlite::Result<SensorTick> {
         outcome: parse_col(row, 3)?,
         launched: row.get(4)?,
         skipped: row.get(5)?,
-        error: row.get(6)?,
+        duration_ms: row.get(6)?,
+        error: row.get(7)?,
     })
 }
 
@@ -2790,13 +2796,13 @@ mod tests {
     fn sensor_ticks_record_filter_and_prune() {
         let store = Store::open(":memory:").unwrap();
         store
-            .record_sensor_tick("watch", SensorOutcome::Fired, 2, 1, None)
+            .record_sensor_tick("watch", SensorOutcome::Fired, 2, 1, 12, None)
             .unwrap();
         store
-            .record_sensor_tick("watch", SensorOutcome::Error, 0, 0, Some("boom"))
+            .record_sensor_tick("watch", SensorOutcome::Error, 0, 0, 4, Some("boom"))
             .unwrap();
         store
-            .record_sensor_tick("probe:docs", SensorOutcome::Fired, 0, 0, None)
+            .record_sensor_tick("probe:docs", SensorOutcome::Fired, 0, 0, 0, None)
             .unwrap();
 
         let all = store.sensor_ticks(None, 10).unwrap();
@@ -2809,6 +2815,7 @@ mod tests {
         assert_eq!(watch[0].error.as_deref(), Some("boom"));
         assert_eq!(watch[1].outcome, SensorOutcome::Fired);
         assert_eq!(watch[1].launched, 2);
+        assert_eq!((watch[1].skipped, watch[1].duration_ms), (1, 12));
         assert_eq!(store.sensor_ticks(None, 1).unwrap().len(), 1);
 
         store.prune_sensor_ticks(1).unwrap();

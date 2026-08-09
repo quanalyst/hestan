@@ -248,7 +248,11 @@ firing stricter.
 
 every evaluation of an unpaused sensor lands in `sensor_ticks`: outcome
 (`fired | error | skipped`), how many runs launched, how many keyed requests
-were skipped, the error message if any.
+were skipped, how long it took in milliseconds, the error message if any.
+those four are what answer "is this sensor healthy" without reading the log —
+a sensor whose duration is climbing is a sensor about to hit its timeout, and
+`launched: 0, skipped: 3` is a different fact from launching nothing. the
+sensors table shows them all against each sensor's last tick.
 `GET /api/sensors/ticks?sensor=&limit=` reads it newest-first; at boot the
 table is pruned to the newest 5000, the same policy as schedule ticks.
 
