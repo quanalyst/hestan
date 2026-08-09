@@ -15,6 +15,9 @@ assets:
 http-source:
     cargo run --example http_source --features http
 
+ui-test:
+    cd ui && npm test
+
 ui-dev:
     cd ui && npm run dev
 

@@ -44,6 +44,8 @@ jobs:
         working-directory: ui
       - run: npm run lint
         working-directory: ui
+      - run: npm test
+        working-directory: ui
       - run: npm run build
         working-directory: ui
       # the binary embeds ui/dist, so a stale committed bundle ships silently

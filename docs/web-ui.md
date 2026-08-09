@@ -280,8 +280,13 @@ json: numbers right-aligned and tabular in whatever unit they were reported
 in (`1,240`, `1.2 GB`, `3.4s`), urls as links, a reported run id or asset
 name as a link into this ui, paths monospace with the basename emphasised,
 tables as small scrolling tables that say so when they were truncated at the
-source, text inline, markdown and json in a muted preformatted block.
-markdown is shown as source; hestan carries no markdown parser.
+source, text inline, json in a muted preformatted block, and markdown
+rendered — headings, bold, italic, code, fenced blocks, lists, links and
+rules, with everything outside that
+[documented subset](metadata.md#the-markdown-subset) left as the literal text
+it was written as. the renderer parses to react elements and never to html, so
+markup in a metadata value is text on the page rather than markup in the dom,
+and a link is only ever made for an `http(s)` target.
 
 the gantt chart plots each op run against elapsed time from the first op's
 start, with duration labels at the bar ends and a glyph in place of a bar for

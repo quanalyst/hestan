@@ -40,13 +40,14 @@ cargo test
 cargo test --features http
 ```
 
-ci additionally rebuilds `ui/dist` and fails on a diff, so a stale committed
-bundle can't ship.
+ci additionally runs the ui's own gates — `npm run lint`, `npm test` and
+`npm run build` — and fails on a `ui/dist` diff, so a stale committed bundle
+can't ship.
 
 the other justfile recipes: `just demo` (the demo on :4000), `just assets`
 (the assets example on :4002), `just http-source`, `just ui-dev` (vite dev
-server), `just ui-build` (rebuild `ui/dist` and touch `src/server.rs`),
-`just build`.
+server), `just ui-test` (the markdown suite), `just ui-build` (rebuild
+`ui/dist` and touch `src/server.rs`), `just build`.
 
 ## The ui loop
 
@@ -104,3 +105,10 @@ typed io, params rejection, op state, cancellation, failure hooks.
 http retry policy, fan-out, and `bearer_env`; `tests/notify.rs` does the
 same for the webhook and slack hooks. both only exist under
 `--features http`.
+
+the ui has one suite of its own, `ui/test/markdown.test.tsx`, run with
+`npm test` (or `just ui-test`): the [markdown
+subset](metadata.md#the-markdown-subset) construct by construct, and the
+injection cases asserted against the exact string react renders. it needs no
+test framework and no browser — vite bundles it for node with the same config
+the app is built with, and `node:test` runs it.

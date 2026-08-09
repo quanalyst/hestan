@@ -969,6 +969,68 @@ button.text-btn.active {
   font-weight: 400;
 }
 
+/* rendered markdown: the same ink as everything else, one step smaller, and
+   nothing that could be mistaken for the page's own headings */
+.meta-md {
+  flex: 1;
+  min-width: 0;
+}
+
+.md {
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+
+.md > *:first-child {
+  margin-top: 0;
+}
+
+.md > *:last-child {
+  margin-bottom: 0;
+}
+
+.md p {
+  margin: 0 0 6px;
+}
+
+.md-h {
+  margin: 10px 0 4px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--ink2);
+}
+
+.md-list {
+  margin: 0 0 6px;
+  padding-left: 18px;
+}
+
+.md-lang {
+  font-size: 10px;
+}
+
+.md-code {
+  margin: 0 0 6px;
+  padding: 6px 8px;
+  max-height: 200px;
+  overflow: auto;
+  border-left: 2px solid var(--hairline);
+  background: var(--wash);
+  white-space: pre-wrap;
+  color: var(--ink2);
+}
+
+.md-code-span {
+  padding: 0 3px;
+  background: var(--wash);
+}
+
+.md-rule {
+  margin: 8px 0;
+  border: 0;
+  border-top: 1px solid var(--hairline);
+}
+
 .meta-table-note {
   padding-top: 2px;
   font-size: 10px;

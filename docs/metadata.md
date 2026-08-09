@@ -30,7 +30,7 @@ without anything reading the value having to guess.
 | `Float(f64)` | `{"float": 0.5}` | `0.5`, tabular |
 | `Text(String)` | `{"text": "…"}` | inline text |
 | `Url(String)` | `{"url": "…"}` | a link, new tab |
-| `Markdown(String)` | `{"markdown": "…"}` | source |
+| `Markdown(String)` | `{"markdown": "…"}` | [a rendered subset](#the-markdown-subset) |
 | `Json(Value)` | `{"json": …}` | a preformatted block |
 | `Table(MetaTable)` | `{"table": {…}}` | a small table |
 | `Bytes(u64)` | `{"bytes": 1288490188}` | `1.2 GB` |
@@ -108,6 +108,55 @@ exactly what they meant then; this phase added tags beside them rather than
 changing any. there is a test with a phase-12 row in it that fails if that
 ever stops being true.
 
+## The markdown subset
+
+`Meta::Markdown` is rendered, by a parser in the ui that is about 180 lines
+long and takes no dependency. It renders **exactly** the following and
+nothing else:
+
+| construct | written | notes |
+| --- | --- | --- |
+| heading | `# h` … `###### h` | `#` becomes an `h3` and the rest shift with it, clamped at `h6`; the page already owns `h1` and `h2`. a hash with no space after it is not a heading |
+| paragraph | any other run of lines | soft-wrapped lines are joined with a space, blank lines separate paragraphs |
+| bold | `**b**` | nests |
+| italic | `*i*` | `_i_` is **not** italic — it is text |
+| code span | `` `c` `` | nothing inside one is a construct |
+| code block | ```` ```lang ```` … ```` ``` ```` | the info string is shown above the block; an unclosed fence runs to the end of the source |
+| unordered list | `- a`, `* a`, `+ a` | one run of items is one list |
+| ordered list | `1. a`, `2) a` | the numbers are not renumbered or read; switching between bullets and numbers starts a second list |
+| link | `[text](https://…)` | see below |
+| horizontal rule | `---`, `***`, `___` | three or more, alone on the line |
+
+**everything else is the literal text it was written as.** no tables, no
+blockquotes, no images, no reference links, no footnotes, no setext headings,
+no html, no nested lists, no line-break-on-two-spaces. `> quoted` renders as
+`> quoted`; `**unclosed` renders as `**unclosed`; `<img src=x onerror=...>`
+renders as those characters. The subset is small because the point of it is
+the paragraph after next.
+
+### Links
+
+a link is made **only** for an `http://` or `https://` target, and it opens
+in a new tab with `rel="noreferrer"`. anything else — `javascript:`, `data:`,
+a protocol-relative `//host`, a path, an empty target — is not a link at all,
+and the construct stays the text it was written as, so what it pointed at is
+visible rather than silently dropped.
+
+### Why it cannot inject
+
+the parser produces **data** — a tree of `{kind: "text" | "code" | "strong" |
+"em" | "link" | …}` nodes — and the renderer turns that data into react
+elements. no html string is built anywhere in the path, and nothing in the ui
+uses `dangerouslySetInnerHTML`, which the test suite asserts by scanning the
+source. so markup in a metadata value is a text child that react escapes, and
+the only href that can exist is one the http check above approved. this is
+injection being impossible by construction rather than by remembering to
+escape — the version worth shipping.
+
+`npm test` in `ui/` runs it: every construct above, a nesting case, and the
+two attacks (`<img src=x onerror=...>`, `[x](javascript:alert(1))`) asserted
+against the exact string react renders.
+
 ## Staged like state
 
 `ctx.meta` buffers per attempt, exactly like
@@ -159,6 +208,7 @@ metadata for an identical value is still fresh.
 - the run page renders the selected op's metadata by type: numbers
   right-aligned and tabular in their unit, urls as links, runs and assets as
   links into the ui, paths monospace, tables as tables, text inline, markdown
-  and json in a muted preformatted block.
+  rendered as [the subset above](#the-markdown-subset), json in a muted
+  preformatted block.
 - the asset detail panel renders each build's metadata under its history
   entry, the same way.

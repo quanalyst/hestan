@@ -1,4 +1,5 @@
 import { Link } from "react-router-dom";
+import Markdown from "./Markdown";
 import type { MetaTable, MetaValue, Metadata } from "./types";
 import { fmtDataSize, fmtDuration, shortId } from "./util";
 
@@ -57,7 +58,7 @@ function PathView({ path }: { path: string }) {
 
 // metadata is typed at the source, so it renders by type rather than as json:
 // numbers as numbers in their unit, a url as a link, a run or asset reference
-// as a link into this ui, markdown and json as source
+// as a link into this ui, markdown rendered, json as source
 function MetaValueView({ value }: { value: MetaValue }) {
   if ("int" in value || "float" in value || "count" in value) {
     const n = "int" in value ? value.int : "float" in value ? value.float : value.count;
@@ -99,8 +100,14 @@ function MetaValueView({ value }: { value: MetaValue }) {
   if ("text" in value) {
     return <span className="meta-val">{value.text}</span>;
   }
-  const source = "markdown" in value ? value.markdown : JSON.stringify(value.json, null, 2);
-  return <pre className="mono muted meta-block">{source}</pre>;
+  if ("markdown" in value) {
+    return (
+      <div className="meta-md">
+        <Markdown source={value.markdown} />
+      </div>
+    );
+  }
+  return <pre className="mono muted meta-block">{JSON.stringify(value.json, null, 2)}</pre>;
 }
 
 export default function MetaList({ metadata }: { metadata: Metadata }) {

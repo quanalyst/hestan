@@ -4,7 +4,7 @@ import globals from "globals";
 import tseslint from "typescript-eslint";
 
 export default tseslint.config(
-  { ignores: ["dist"] },
+  { ignores: ["dist", ".test-build"] },
   {
     files: ["**/*.{ts,tsx}"],
     extends: [js.configs.recommended, tseslint.configs.recommended],
@@ -15,4 +15,6 @@ export default tseslint.config(
       "react-hooks/exhaustive-deps": "error",
     },
   },
+  // the markdown test runs under node, not in a browser
+  { files: ["test/**/*.{ts,tsx}"], languageOptions: { globals: globals.node } },
 );

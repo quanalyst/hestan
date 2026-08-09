@@ -1,5 +1,6 @@
 /target
 ui/node_modules
+ui/.test-build
 *.db
 *.db-shm
 *.db-wal
