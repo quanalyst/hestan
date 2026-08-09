@@ -2,7 +2,8 @@ import { useEffect, useState } from "react";
 import { Link } from "react-router-dom";
 import { get, usePoll } from "./api";
 import MetaList from "./MetaList";
-import type { AssetSummary, MaterializationEntry } from "./types";
+import { GlyphShape } from "./StatusGlyph";
+import type { AssetCheckResult, AssetSummary, MaterializationEntry } from "./types";
 import { relTime, shortId } from "./util";
 
 // enough hex to tell fingerprints apart at a glance; the title carries the rest
@@ -16,6 +17,7 @@ export default function AssetPanel({
   onClose: () => void;
 }) {
   const [history, setHistory] = useState<MaterializationEntry[] | null>(null);
+  const [checks, setChecks] = useState<AssetCheckResult[]>([]);
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
@@ -29,14 +31,22 @@ export default function AssetPanel({
   // this starts over rather than showing the previous asset's history
   usePoll(
     () => {
-      get<{ materializations: MaterializationEntry[] }>(
-        `/api/assets/${encodeURIComponent(asset.name)}/history`,
-      )
+      const name = encodeURIComponent(asset.name);
+      get<{ materializations: MaterializationEntry[] }>(`/api/assets/${name}/history`)
         .then((r) => setHistory(r.materializations))
         .catch(() => setHistory([]));
+      get<{ checks: AssetCheckResult[] }>(`/api/assets/${name}/checks`)
+        .then((r) => setChecks(r.checks))
+        .catch(() => {});
     },
     5000,
     [asset.name],
+  );
+
+  // the api hands back every check's results newest first, mixed together, so
+  // the first row for a name is that check's latest
+  const latestChecks = checks.filter(
+    (c, i) => checks.findIndex((d) => d.check === c.check) === i,
   );
 
   return (
@@ -64,6 +74,31 @@ export default function AssetPanel({
           <span className="mono">{asset.stale ? "stale" : "fresh"}</span>
         </div>
       </div>
+
+      {latestChecks.length > 0 && (
+        <>
+          <div className="sub-label">checks</div>
+          {latestChecks.map((c) => (
+            <div key={c.check} className="mat-entry">
+              <div className="mat-row">
+                <span className="mat-mark" aria-hidden="true">
+                  <svg className="glyph" width={12} height={12} viewBox="-6 -6 12 12">
+                    <GlyphShape status={c.status === "passed" ? "success" : "failed"} />
+                  </svg>
+                </span>
+                <span className="mono mat-fp">{c.check}</span>
+                {/* severity only earns a word when it changes what a failure did */}
+                {c.severity === "warn" && <span className="muted">warn</span>}
+                <span className="muted mat-when" title={c.checked_at}>
+                  {relTime(c.checked_at)}
+                </span>
+              </div>
+              {c.message && <div className="muted check-msg">{c.message}</div>}
+              {c.metadata && <MetaList metadata={c.metadata} />}
+            </div>
+          ))}
+        </>
+      )}
 
       <div className="sub-label">materializations</div>
       {history === null ? (

@@ -169,14 +169,15 @@ adds `runs.error`; version 7 adds `schedules.params`, the params a cron fire
 launches with ([scheduling](scheduling.md)) — schedules declared before it
 default to `{}`, which is what they always fired with; version 8 rebuilds
 `asset_materializations` as append-only [history](assets.md), adds
-`op_runs.metadata` and adds the `asset_checks` table. an older file at any
+`op_runs.metadata` ([metadata](metadata.md)) and adds the `asset_checks`
+table ([checks](assets.md#asset-checks)). an older file at any
 version opens straight into v8, rows intact — the v8 rebuild copies every
 keyed materialization across, where it becomes that asset's first history
 entry and stays its current one. every pending step
 and the version stamp run in one transaction
 (sqlite DDL is transactional), so a crash or failure mid-migration leaves
 the file exactly as it was found, never half-migrated. a database stamped
-with a version newer than the build refuses to open (`db schema v8 is newer
+with a version newer than the build refuses to open (`db schema v9 is newer
 than this build`) instead of quietly writing an older stamp over it.
 
 one wrinkle: databases written before the migration mechanism existed carry
@@ -212,10 +213,11 @@ point at a run retention has since deleted.
 three logs are trimmed at every startup whether retention is configured or
 not, because all three grow with time rather than with what you keep.
 `schedule_ticks` and `sensor_ticks` are each capped at their newest 5000
-rows. `asset_materializations` is capped *per asset* at its newest 200
-entries, or whatever `Hestan::asset_history(n)` says; an asset's newest entry
-is never trimmed at any `n`, since that one is current state rather than
-history ([assets](assets.md)).
+rows. `asset_materializations` is capped *per asset*, and `asset_checks` per
+`(asset, check)`, at the newest 200 each — or whatever
+`Hestan::asset_history(n)` says. the newest row of either is never trimmed at
+any `n`: an asset's latest materialization is its current state and a check's
+latest result is what the asset summary counts ([assets](assets.md)).
 
 ## What's stored and what stays in memory
 
@@ -251,7 +253,10 @@ runs come and go; these rows persist until overwritten.
 is append-only, and an asset's *newest* row is its current state rather than
 its only one. each is written inside the asset op just before it reports
 success — the mirror image of the op-state order, with the same
-at-least-once outcome ([assets](assets.md)).
+at-least-once outcome ([assets](assets.md)). `asset_checks` is append-only
+the same way, written inside the check's own op before it decides whether to
+fail, so a failing error check records its verdict as well as failing the
+run.
 
 writes are ordered for readers. a run row is created in one transaction with
 its `pending` op runs and its `run_queued` event, so a visible run always has

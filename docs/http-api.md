@@ -29,6 +29,7 @@ failures. timestamps are rfc3339 strings in utc.
 | GET | `/api/assets` | every asset with lineage and staleness |
 | POST | `/api/assets/{name}/build` | build one asset (and stale ancestors) |
 | GET | `/api/assets/{name}/history` | one asset's recent materializations |
+| GET | `/api/assets/{name}/checks` | one asset's recent check results |
 | POST | `/api/assets/build` | build everything stale as one run |
 | GET | `/api/sensors` | every sensor with cursor and last tick |
 | POST | `/api/sensors/state` | pause or resume a sensor |
@@ -342,7 +343,8 @@ startup's sweep marks failed.
   { "name": "doc_stats", "kind": "derived", "deps": ["docs_dir"], "auto": false,
     "fingerprint": "3bffef12...", "built_at": "2026-08-08T11:01:36Z",
     "run_id": "019fe109-...", "stale": true,
-    "reasons": [ { "dep": "docs_dir", "had": "14a61f3c...", "now": "9c01d2aa..." } ] }
+    "reasons": [ { "dep": "docs_dir", "had": "14a61f3c...", "now": "9c01d2aa..." } ],
+    "checks": { "passed": 1, "failed": 0, "last_run_at": "2026-08-08T11:01:36Z" } }
 ] }
 ```
 
@@ -351,7 +353,11 @@ materialization: all null before the first one, and `run_id` is always null
 on sources (probes write their rows outside any run). `reasons` carries the
 staleness evidence per dep, the fingerprint consumed (`had`) against the
 dep's current one (`now`); equal values mean the dep is itself stale and
-this asset is stale transitively. the semantics are in [assets](assets.md).
+this asset is stale transitively. `checks` counts the latest result per
+[check](assets.md#asset-checks) name; both zero with a null timestamp means
+nothing has ever been recorded for this asset, which reads the same whether
+no check is declared or none has run yet. the semantics are in
+[assets](assets.md).
 
 `POST /api/assets/{name}/build` builds a stale asset: its stale ancestors
 plus the target as one run, 202 `{"run_id": "..."}`. a fresh target answers
@@ -370,6 +376,24 @@ ungated, and both rebuild every derived asset.
 `POST /api/assets/build` builds everything stale in one plan and one run:
 202 `{"run_ids": ["..."]}`, 200 `{"up_to_date": true}` when the whole
 graph is fresh, and the same 409 while a build is active.
+
+`GET /api/assets/{name}/checks?limit=` returns that asset's recent check
+results, newest first, every check on the asset mixed together — the first
+row for a name is that check's latest (same `limit` clamps, same 404):
+
+```json
+{ "checks": [
+  { "id": 88, "asset": "doc_stats", "check": "no_empty_docs",
+    "run_id": "019fe109-...", "status": "passed", "severity": "error",
+    "message": null, "metadata": { "checked": {"int": 18} },
+    "checked_at": "2026-08-08T11:01:36Z" }
+] }
+```
+
+`status` is `passed | failed` and `severity` is `warn | error`. a `failed`
+row with severity `warn` belongs to a run that succeeded: the check failed,
+the op did not. `run_id` always names the run whose build was checked — a
+check only ever runs inside one.
 
 `GET /api/assets/{name}/history?limit=` returns that asset's
 materializations, newest first (`limit` default 20, clamped to 1..=200):

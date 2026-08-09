@@ -919,6 +919,12 @@ button.text-btn.active {
   margin: 0 0 6px 16px;
 }
 
+.check-msg {
+  margin-left: 16px;
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+
 .mat-row {
   display: flex;
   align-items: baseline;

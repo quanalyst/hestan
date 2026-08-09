@@ -19,7 +19,7 @@ use crate::asset::{
 use crate::error::Error;
 use crate::executor::{CancelOutcome, Runner};
 use crate::job::Job;
-use crate::model::{OpRun, OpStatus, RunStatus, ScheduleRow, Trigger};
+use crate::model::{AssetCheckRow, CheckStatus, OpRun, OpStatus, RunStatus, ScheduleRow, Trigger};
 use crate::schedule;
 
 static UI_DIST: Dir<'static> = include_dir!("$CARGO_MANIFEST_DIR/ui/dist");
@@ -58,6 +58,7 @@ pub(crate) fn router(state: AppState) -> Router {
         .route("/api/assets/build", post(build_all_assets))
         .route("/api/assets/{name}/build", post(build_one_asset))
         .route("/api/assets/{name}/history", get(asset_history))
+        .route("/api/assets/{name}/checks", get(asset_checks))
         .route("/api/sensors", get(list_sensors))
         .route("/api/sensors/state", post(set_sensor_state))
         .route("/api/sensors/ticks", get(sensor_ticks))
@@ -405,6 +406,7 @@ async fn cancel_run(
 async fn list_assets(State(st): State<AppState>) -> Result<Json<Value>, ApiError> {
     let mats = mats_map(st.runner.store()).map_err(internal)?;
     let stale = staleness(&st.assets, &mats);
+    let latest_checks = st.runner.store().latest_asset_checks().map_err(internal)?;
     let assets: Vec<Value> = st
         .assets
         .topo()
@@ -426,6 +428,7 @@ async fn list_assets(State(st): State<AppState>) -> Result<Json<Value>, ApiError
                 "run_id": mat.and_then(|m| m.run_id.clone()),
                 "stale": s.stale,
                 "reasons": reasons,
+                "checks": check_summary(&latest_checks, &meta.name),
             })
         })
         .collect();
@@ -469,6 +472,42 @@ async fn asset_history(
         })
         .collect();
     Ok(Json(json!({ "materializations": materializations })))
+}
+
+// every check's recent results, newest first, all checks on the asset mixed
+// together — the first row per name is that check's latest
+async fn asset_checks(
+    State(st): State<AppState>,
+    Path(name): Path<String>,
+    q: Result<Query<HistoryQuery>, QueryRejection>,
+) -> Result<Json<Value>, ApiError> {
+    let Query(q) = q.map_err(bad_query)?;
+    if st.assets.get(&name).is_none() {
+        return Err(err(StatusCode::NOT_FOUND, format!("unknown asset: {name}")));
+    }
+    let limit = q.limit.unwrap_or(20).clamp(1, 200);
+    let checks = st
+        .runner
+        .store()
+        .asset_checks(&name, limit)
+        .map_err(internal)?;
+    Ok(Json(json!({ "checks": checks })))
+}
+
+/// what an asset's checks currently say, from the latest result per name.
+/// zero and zero means no check has ever recorded anything — which reads the
+/// same whether none are declared or none have run yet.
+fn check_summary(latest: &[AssetCheckRow], asset: &str) -> Value {
+    let mine = latest.iter().filter(|c| c.asset == asset);
+    let (mut passed, mut failed, mut last) = (0, 0, None);
+    for row in mine {
+        match row.status {
+            CheckStatus::Passed => passed += 1,
+            CheckStatus::Failed => failed += 1,
+        }
+        last = last.max(Some(row.checked_at));
+    }
+    json!({ "passed": passed, "failed": failed, "last_run_at": last })
 }
 
 // one build at a time: overlapping builds record lineage that never happened
@@ -1989,7 +2028,7 @@ mod tests {
         })
         .from(&stats)
         .auto();
-        let registry = Arc::new(AssetRegistry::new(vec![docs, stats, totals]).unwrap());
+        let registry = Arc::new(AssetRegistry::new(vec![docs, stats, totals], Vec::new()).unwrap());
         let runner = Runner::new(
             [registry.lower_job().unwrap()],
             Store::open(":memory:").unwrap(),
@@ -2112,6 +2151,93 @@ mod tests {
         }
 
         let (status, Json(body)) = asset_history(
+            State(st),
+            Path("nope".into()),
+            Ok(Query(HistoryQuery { limit: None })),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body["error"], "unknown asset: nope");
+    }
+
+    #[tokio::test]
+    async fn checks_endpoint_and_asset_summary_counts() {
+        // one asset with a passing and a failing check, one with none
+        let docs = crate::Asset::source("docs");
+        let stats = crate::Asset::new("stats", |_| async { Ok(json!({"files": 2})) }).from(&docs);
+        let totals = crate::Asset::new("totals", |_| async { Ok(json!(null)) }).from(&stats);
+        let checks = vec![
+            crate::AssetCheck::new("has_files", "stats", |_, v: Value| async move {
+                let n = v["files"].as_u64().unwrap_or(0);
+                Ok(crate::CheckResult::pass().meta("files", n as i64))
+            }),
+            crate::AssetCheck::new("many_files", "stats", |_, _| async {
+                Ok(crate::CheckResult::fail("only 2"))
+            })
+            .severity(crate::Severity::Warn),
+        ];
+        let registry = Arc::new(AssetRegistry::new(vec![docs, stats, totals], checks).unwrap());
+        let runner = Runner::new(
+            [registry.lower_job().unwrap()],
+            Store::open(":memory:").unwrap(),
+        );
+        let st = AppState {
+            jobs: Arc::new(runner.jobs().clone()),
+            runner,
+            assets: registry,
+            sensors: Arc::new(Vec::new()),
+        };
+        st.runner
+            .store()
+            .record_materialization("docs", "d1", &json!({}), None, None, None)
+            .unwrap();
+
+        let (status, Json(body)) = build_all_assets(State(st.clone())).await.unwrap();
+        assert_eq!(status, StatusCode::ACCEPTED);
+        wait_success(&st, body["run_ids"][0].as_str().unwrap()).await;
+
+        let Json(body) = list_assets(State(st.clone())).await.unwrap();
+        let assets = body["assets"].as_array().unwrap();
+        let stats = assets.iter().find(|a| a["name"] == "stats").unwrap();
+        assert_eq!(stats["checks"]["passed"], json!(1));
+        assert_eq!(stats["checks"]["failed"], json!(1));
+        assert!(stats["checks"]["last_run_at"].is_string());
+        // an asset nobody checks reads as zero and zero, with no timestamp
+        let totals = assets.iter().find(|a| a["name"] == "totals").unwrap();
+        assert_eq!(
+            totals["checks"],
+            json!({"passed": 0, "failed": 0, "last_run_at": null})
+        );
+
+        let Json(body) = asset_checks(
+            State(st.clone()),
+            Path("stats".into()),
+            Ok(Query(HistoryQuery { limit: None })),
+        )
+        .await
+        .unwrap();
+        let rows = body["checks"].as_array().unwrap();
+        assert_eq!(rows.len(), 2);
+        let passed = rows.iter().find(|c| c["check"] == "has_files").unwrap();
+        assert_eq!(passed["status"], "passed");
+        assert_eq!(passed["severity"], "error");
+        assert_eq!(passed["metadata"], json!({"files": {"int": 2}}));
+        let failed = rows.iter().find(|c| c["check"] == "many_files").unwrap();
+        assert_eq!(failed["status"], "failed");
+        assert_eq!(failed["severity"], "warn");
+        assert_eq!(failed["message"], "only 2");
+
+        // same clamps as history, and the same 404
+        let Json(body) = asset_checks(
+            State(st.clone()),
+            Path("stats".into()),
+            Ok(Query(HistoryQuery { limit: Some(0) })),
+        )
+        .await
+        .unwrap();
+        assert_eq!(body["checks"].as_array().unwrap().len(), 1);
+        let (status, Json(body)) = asset_checks(
             State(st),
             Path("nope".into()),
             Ok(Query(HistoryQuery { limit: None })),

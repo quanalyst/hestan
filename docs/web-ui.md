@@ -99,15 +99,19 @@ the assets page shows everything registered through `Hestan::assets`,
 polling every 5s. it opens with the asset dag in the same layout as job
 graphs: a fresh asset wears the solid disc, a stale one the hollow ring,
 with the word under the name; source assets (external data with a probe
-instead of a body) additionally carry a muted `source` marker. nodes here
-aren't clickable; the table below holds the detail.
+instead of a body) additionally carry a muted `source` marker. clicking a
+node — or a table row — opens the detail panel below.
 
 the table lists assets in dependency order: name, kind, deps, the current
 fingerprint as a 12-character prefix (hover for the full hash; an em dash
-for an asset never built), when it was last built, and its state. a stale
-asset says why: "dep X changed" or "N deps changed", with the recorded ->
-current short hashes per dep on hover, or "never built" when no
-materialization exists. assets declared `.auto()` carry an `auto` tag. every
+for an asset never built), when it was last built, its state, and its
+checks. a stale asset says why: "dep X changed" or "N deps changed", with
+the recorded -> current short hashes per dep on hover, or "never built" when
+no materialization exists. the checks cell uses the same shapes as
+everything else — a solid disc with "n passed" when every check passed, an ×
+with "n failed" when any did not, and nothing at all when no check has ever
+recorded anything for that asset. assets declared `.auto()` carry an `auto`
+tag. every
 derived row has a `build` action; sources have none, since the endpoint 400s
 on them. a launched build (202) navigates straight to the new run,
 while a build that finds nothing to do reports "up to date" inline. when any
@@ -117,7 +121,20 @@ every stale asset as a single run.
 asset builds are ordinary runs of the internal `assets` job, so the run
 page, gantt, cancel, and re-run all apply unchanged; the `assets` job
 appears on the jobs overview like any other job, and asset build runs carry
-the `build` trigger on the runs page.
+the `build` trigger on the runs page. checks are ops of that same job, so
+they appear in its dag and gantt as `check:{asset}:{check}` nodes.
+
+### The asset panel
+
+clicking an asset opens a drawer on the right, the same one job pages use
+for ops (escape or × closes it). it carries the asset's kind, deps and
+state, then each check's latest result — status shape, the check name, a
+`warn` marker when a failure there would not fail the run, its message and
+its metadata — then the recent materializations: a `•` in the left gutter
+for the entries whose fingerprint actually moved, the short fingerprint,
+when it happened, and a link to the run that built it (or `probe` for a
+source row, which no run wrote). anything a build reported with `ctx.meta`
+sits under its entry, rendered by type.
 
 ### Sensors
 
@@ -177,7 +194,12 @@ label. clicking a node filters the log below to that op; on a terminal run
 the selection also offers "re-run from here", with the same counts, which
 re-runs that op and everything downstream whatever their last status was.
 ops a subset run never contained read "not in run" and carry no glyph, which
-is how a resumed run shows what it reused.
+is how a resumed run shows what it reused. under the graph, the selected op's
+output shows on one line, and whatever it reported with `ctx.meta`
+([metadata](metadata.md)) below it — rendered by type rather than as raw
+json: numbers right-aligned and tabular, urls as links, text inline,
+markdown and json in a muted preformatted block. markdown is shown as
+source; hestan carries no markdown parser.
 
 the gantt chart plots each op run against elapsed time from the first op's
 start, with duration labels at the bar ends and a glyph in place of a bar for

@@ -264,6 +264,46 @@ pub struct Materialization {
     pub metadata: Option<Value>,
 }
 
+/// what a failing [`AssetCheck`](crate::AssetCheck) costs. `Error` — the
+/// default — fails the check's op, and so the run that produced the asset;
+/// `Warn` records the failure and lets the run carry on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum Severity {
+    Warn,
+    #[default]
+    Error,
+}
+str_enum!(Severity { Warn => "warn", Error => "error" });
+
+/// what a check said about the value it was handed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CheckStatus {
+    Passed,
+    Failed,
+}
+str_enum!(CheckStatus { Passed => "passed", Failed => "failed" });
+
+/// one recorded check result. `failed` with severity `warn` is a run that
+/// succeeded and a check that did not — the two are recorded separately on
+/// purpose.
+#[derive(Debug, Clone, Serialize)]
+pub struct AssetCheckRow {
+    pub id: i64,
+    pub asset: String,
+    pub check: String,
+    /// the run whose build this checked; checks only ever run inside one.
+    pub run_id: String,
+    pub status: CheckStatus,
+    pub severity: Severity,
+    pub message: Option<String>,
+    /// what the check reported with `CheckResult::meta`, tagged by type like
+    /// [op metadata](crate::Meta).
+    pub metadata: Option<Value>,
+    pub checked_at: DateTime<Utc>,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct SensorRow {
     pub name: String,

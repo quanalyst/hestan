@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use serde_json::Value;
 
-use crate::asset::{Asset, AssetRegistry, mats_map, plan_target};
+use crate::asset::{Asset, AssetCheck, AssetRegistry, mats_map, plan_target};
 use crate::error::Error;
 use crate::executor::{FailureHook, RunFailure, Runner};
 use crate::io::{Io, IoManager};
@@ -27,6 +27,7 @@ pub struct Hestan {
     jobs: Vec<Job>,
     schedules: Vec<ScheduleDef>,
     assets: Vec<Asset>,
+    checks: Vec<AssetCheck>,
     sensors: Vec<Sensor>,
     pools: Vec<(String, usize)>,
     resources: Vec<(String, ResourceFn)>,
@@ -46,6 +47,7 @@ impl Default for Hestan {
             jobs: Vec::new(),
             schedules: Vec::new(),
             assets: Vec::new(),
+            checks: Vec::new(),
             sensors: Vec::new(),
             pools: Vec::new(),
             resources: Vec::new(),
@@ -84,6 +86,16 @@ impl Hestan {
     /// name then collides ([`Error::DuplicateJob`]).
     pub fn assets(mut self, assets: impl IntoIterator<Item = Asset>) -> Self {
         self.assets.extend(assets);
+        self
+    }
+
+    /// register an [asset check](AssetCheck); stackable. it lowers into an op
+    /// of the internal `assets` job named `check:{asset}:{check}`, so it runs
+    /// as part of the build that materialized the asset. naming an unknown
+    /// asset or a source, or declaring the same check name twice on one
+    /// asset, is [`Error::Graph`] at build.
+    pub fn check(mut self, check: AssetCheck) -> Self {
+        self.checks.push(check);
         self
     }
 
@@ -242,14 +254,15 @@ impl Hestan {
         self
     }
 
-    /// keep at most `n` materializations per asset, trimmed at startup
-    /// (default 200). materialization history is append-only and grows with
+    /// keep at most `n` materializations per asset and `n` results per check,
+    /// trimmed at startup (default 200). both are append-only and grow with
     /// every build, so unlike [`retention_days`](Self::retention_days) this
     /// cap applies whether you ask for it or not.
     ///
-    /// the newest entry is never trimmed, whatever `n` says: it is the asset's
-    /// current state — what staleness compares against and what a memoized
-    /// build seeds — not history.
+    /// the newest entry is never trimmed, whatever `n` says: an asset's
+    /// newest materialization is its current state — what staleness compares
+    /// against and what a memoized build seeds — and a check's newest result
+    /// is what the asset summary counts.
     pub fn asset_history(mut self, n: usize) -> Self {
         self.asset_history = n;
         self
@@ -344,9 +357,17 @@ impl Hestan {
         // lowered only when assets exist, so the name stays free otherwise, and
         // before the duplicate check, so a user job named "assets" collides below
         let registry = if self.assets.is_empty() {
+            // a check with no assets at all can only be naming one that does
+            // not exist, and saying so beats dropping it silently
+            if let Some(check) = self.checks.first() {
+                return Err(Error::Graph(format!(
+                    "check {}: no assets are registered",
+                    check.name()
+                )));
+            }
             Arc::new(AssetRegistry::empty())
         } else {
-            let registry = Arc::new(AssetRegistry::new(self.assets)?);
+            let registry = Arc::new(AssetRegistry::new(self.assets, self.checks)?);
             jobs.push(registry.lower_job()?);
             registry
         };
@@ -407,8 +428,9 @@ impl Hestan {
         store.sync_sensors(&sensor_names)?;
         store.prune_sensor_ticks(5000)?;
         let trimmed = store.prune_materializations(self.asset_history)?;
+        let trimmed = trimmed + store.prune_asset_checks(self.asset_history)?;
         if trimmed > 0 {
-            tracing::info!("trimmed {trimmed} materializations past the history cap");
+            tracing::info!("trimmed {trimmed} asset history rows past the cap");
         }
         if let Some(days) = self.retention_days {
             let cutoff = chrono::Utc::now() - chrono::Duration::days(i64::from(days));

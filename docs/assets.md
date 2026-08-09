@@ -198,6 +198,88 @@ still does not: an asset keeps its latest value and fingerprint long after
 the run that built it is deleted, exactly as op state keeps a watermark, so a
 materialization's `run_id` can point at a run that is gone.
 
+## Asset checks
+
+a check is an assertion bound to an asset, run right after it materializes
+and handed the value it just produced.
+
+```rust
+let rows_present = AssetCheck::new("rows_present", "orders_clean", |_ctx, value: Value| async move {
+    let n = value.get("rows").and_then(Value::as_u64).unwrap_or(0);
+    if n > 0 {
+        Ok(CheckResult::pass().meta("rows", n as i64))
+    } else {
+        Ok(CheckResult::fail("no rows"))
+    }
+})
+.severity(Severity::Error);   // the default; Warn records and continues
+
+Hestan::new().assets(..).check(rows_present).serve(..).await
+```
+
+the fn is handed an owned `Value` — the asset's freshly materialized output —
+and returns a `CheckResult`: `pass()` or `fail(message)`, either with
+`.meta(name, value)` facts attached, the same
+[typed values](metadata.md) an op reports. naming an asset that is not
+registered, naming a source (a check runs on what a build *produced*, and
+sources are probed), or declaring the same check name twice on one asset are
+all build errors.
+
+### Checks are ops
+
+a check lowers into an op of the same internal `assets` job, named
+`check:{asset}:{check}`, depending on the asset's own op. it is not a second
+execution path: retries, cancellation, the gantt, the event log, `max_parallel`
+and the run status all apply to it because it is an ordinary op. it appears in
+the dag, in the run's op list, and in the gantt like anything else.
+
+that also decides what a failure costs, which is the whole of the severity
+distinction:
+
+- **`Severity::Error`** (the default) — the check op fails, so the run fails.
+- **`Severity::Warn`** — the check op *succeeds* while the recorded result is
+  `failed`. the run carries on and the failure is a fact in the check log
+  rather than in the run status.
+
+either way the result is recorded before the verdict is acted on, so a failing
+error check leaves its message and metadata behind rather than only a failed
+op.
+
+state this one plainly, because it is the consequence people expect to go the
+other way: **a failing error check does not un-materialize the asset.** the
+materialization was written inside the asset's op, which succeeded; the check
+hangs off that op rather than feeding it, so downstream assets still see the
+value and still build. what a failing error check does is fail the run that
+produced it — loudly, in the run list, through the failure hooks. if you need
+bad data to not reach downstream, that belongs in the asset's own fn, where
+returning an error stops everything below it.
+
+### Checks and memoization
+
+a check is in a build plan exactly when the asset it checks is. an asset that
+was fresh and got seeded rather than rebuilt does **not** get re-checked: it
+produced no new value this run, and its last recorded result still describes
+the value that is still current. that follows from checks being ops in the
+plan rather than a separate pass, and it means a build costs nothing for the
+parts it skipped — which is the entire point of memoized builds.
+
+the consequence to know: a check that was added, or fixed, after an asset last
+built does not run until that asset builds again. `POST /api/assets/{name}/build`
+always rebuilds its target, so that is the way to force one.
+
+### Results
+
+results land in `asset_checks`, capped per check by the same
+`Hestan::asset_history(n)` that caps materializations, and never trimmed below
+the latest one. `GET /api/assets/{name}/checks` lists them newest first, and
+each asset in `GET /api/assets` carries
+`{"passed": n, "failed": n, "last_run_at": ts}` counted from the latest result
+per check name — zero and zero when nothing has ever recorded a result, which
+reads the same whether no check is declared or none has run yet.
+
+a check whose *body* returns an error (rather than a `CheckResult`) records
+nothing: it produced no verdict, so the failed op is the whole of the record.
+
 ## The http api
 
 `GET /api/assets` returns every asset in topo order with its kind, deps,
@@ -217,6 +299,9 @@ the same 409 while a build is active.
 materializations newest first (default 20, clamped to 1..=200), each with the
 `changed` flag above and a link back to the run that built it. 404 for an
 unknown name.
+
+`GET /api/assets/{name}/checks?limit=` returns that asset's recent check
+results, same clamps and same 404.
 
 metadata an asset op reports lands on its materialization too, so history
 carries what each build said — see [metadata](metadata.md).

@@ -1,7 +1,7 @@
 use std::time::Duration;
 
 use hestan::prelude::*;
-use hestan::{Error, RunStatus, Store, Trigger};
+use hestan::{CheckStatus, Error, RunStatus, Severity, Store, Trigger};
 
 fn doc_assets() -> Vec<Asset> {
     let docs = Asset::source("docs");
@@ -137,6 +137,81 @@ async fn duplicate_sensor_names_rejected_at_build() {
         .await
         .unwrap_err();
     assert!(err.to_string().contains("duplicate sensor watch"), "{err}");
+}
+
+#[tokio::test]
+async fn checks_run_with_the_build_and_are_validated_at_build() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("hestan.db");
+    let db = db.to_str().unwrap();
+    drop(Store::open(db).unwrap());
+    rusqlite::Connection::open(db)
+        .unwrap()
+        .execute(
+            "INSERT INTO asset_materializations (asset, fingerprint, inputs, built_at)
+             VALUES ('docs', 'd1', '{}', ?1)",
+            [chrono::Utc::now().to_rfc3339()],
+        )
+        .unwrap();
+
+    let has_files = || {
+        AssetCheck::new(
+            "has_files",
+            "stats",
+            |_ctx: OpCtx, value: Value| async move {
+                let files = value["files"].as_u64().unwrap_or(0);
+                if files > 0 {
+                    Ok(CheckResult::pass().meta("files", files as i64))
+                } else {
+                    Ok(CheckResult::fail("no files"))
+                }
+            },
+        )
+    };
+
+    let run = Hestan::new()
+        .assets(doc_assets())
+        .check(has_files())
+        .db(db)
+        .build_asset("totals")
+        .await
+        .unwrap();
+    assert_eq!(run.status, RunStatus::Success);
+
+    let store = Store::open(db).unwrap();
+    let ops = store.op_runs(&run.id).unwrap();
+    let names: Vec<&str> = ops.iter().map(|o| o.op.as_str()).collect();
+    assert_eq!(names, ["check:stats:has_files", "stats", "totals"]);
+    let results = store.asset_checks("stats", 10).unwrap();
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].status, CheckStatus::Passed);
+    assert_eq!(results[0].severity, Severity::Error);
+    assert_eq!(results[0].metadata, Some(json!({"files": {"int": 3}})));
+    assert_eq!(results[0].run_id, run.id);
+
+    // a check naming an asset nobody registered is a build error
+    let err = Hestan::new()
+        .assets(doc_assets())
+        .check(AssetCheck::new("ghost", "nowhere", |_, _| async {
+            Ok(CheckResult::pass())
+        }))
+        .db(db)
+        .build_asset("totals")
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("no asset named nowhere"), "{err}");
+
+    // and so is one declared where no assets exist at all
+    let err = Hestan::new()
+        .check(has_files())
+        .db(db)
+        .build_asset("totals")
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("no assets are registered"),
+        "{err}"
+    );
 }
 
 #[tokio::test]

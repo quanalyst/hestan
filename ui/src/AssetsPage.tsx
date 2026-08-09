@@ -5,7 +5,7 @@ import AssetPanel from "./AssetPanel";
 import DagView from "./DagView";
 import { GlyphShape } from "./StatusGlyph";
 import type { Status } from "./StatusGlyph";
-import type { AssetSummary, SensorOutcome, SensorSummary } from "./types";
+import type { AssetSummary, CheckSummary, SensorOutcome, SensorSummary } from "./types";
 import { relTime } from "./util";
 
 const SENSOR_GLYPH = {
@@ -34,6 +34,22 @@ function staleTitle(a: AssetSummary): string | undefined {
   return a.reasons
     .map((r) => `${r.dep}: ${r.had ? shortHash(r.had) : "—"} -> ${r.now ? shortHash(r.now) : "—"}`)
     .join("\n");
+}
+
+// the established shape vocabulary: a solid glyph when everything passed, an
+// × when anything failed, and nothing at all when no check has ever run —
+// an asset without checks should not read as an asset with silent ones
+function Checks({ checks }: { checks: CheckSummary }) {
+  const total = checks.passed + checks.failed;
+  if (total === 0) return null;
+  return (
+    <span className="status" title={`${checks.passed}/${total} passed`}>
+      <svg className="glyph" width={12} height={12} viewBox="-6 -6 12 12" aria-hidden="true">
+        <GlyphShape status={checks.failed > 0 ? "failed" : "success"} />
+      </svg>
+      {checks.failed > 0 ? `${checks.failed} failed` : `${checks.passed} passed`}
+    </span>
+  );
 }
 
 function Freshness({ stale }: { stale: boolean }) {
@@ -166,6 +182,7 @@ export default function AssetsPage() {
                 <th>fingerprint</th>
                 <th>built</th>
                 <th>state</th>
+                <th>checks</th>
                 <th>auto</th>
                 <th />
               </tr>
@@ -194,6 +211,9 @@ export default function AssetsPage() {
                         </span>
                       )}
                     </span>
+                  </td>
+                  <td>
+                    <Checks checks={a.checks} />
                   </td>
                   <td>{a.auto && <span className="muted">auto</span>}</td>
                   <td className="row-action">

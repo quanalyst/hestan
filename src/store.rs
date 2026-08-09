@@ -8,8 +8,9 @@ use serde_json::Value;
 
 use crate::error::Error;
 use crate::model::{
-    Event, EventKind, EventLevel, Materialization, OpRun, OpStatus, Run, RunStatus, ScheduleDef,
-    ScheduleRow, SensorOutcome, SensorRow, SensorTick, Tick, TickOutcome,
+    AssetCheckRow, CheckStatus, Event, EventKind, EventLevel, Materialization, OpRun, OpStatus,
+    Run, RunStatus, ScheduleDef, ScheduleRow, SensorOutcome, SensorRow, SensorTick, Severity, Tick,
+    TickOutcome,
 };
 
 // `trigger` is a reserved word in sqlite, hence the quoted column name in
@@ -813,6 +814,81 @@ impl Store {
         Ok(removed)
     }
 
+    /// record what a check said. written inside the check's op, before it
+    /// decides whether to fail, so a failing error check leaves its verdict
+    /// behind rather than only a failed op.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn record_check(
+        &self,
+        asset: &str,
+        check: &str,
+        run_id: &str,
+        status: CheckStatus,
+        severity: Severity,
+        message: Option<&str>,
+        metadata: Option<&Value>,
+    ) -> Result<(), Error> {
+        let conn = self.0.lock().unwrap();
+        conn.execute(
+            "INSERT INTO asset_checks
+                 (asset, check_name, run_id, status, severity, message, metadata, checked_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                asset,
+                check,
+                run_id,
+                status.as_str(),
+                severity.as_str(),
+                message,
+                metadata.map(|v| v.to_string()),
+                Utc::now().to_rfc3339(),
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// one asset's recent check results, newest first, every check mixed
+    /// together — the api and the ui take the first row per name to get each
+    /// check's latest.
+    pub fn asset_checks(&self, asset: &str, limit: u32) -> Result<Vec<AssetCheckRow>, Error> {
+        let conn = self.0.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, asset, check_name, run_id, status, severity, message, metadata, checked_at
+             FROM asset_checks WHERE asset = ?1 ORDER BY id DESC LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![asset, limit], asset_check_from_row)?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    /// the latest result of every `(asset, check)` pair, ordered by both.
+    pub fn latest_asset_checks(&self) -> Result<Vec<AssetCheckRow>, Error> {
+        let conn = self.0.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, asset, check_name, run_id, status, severity, message, metadata, checked_at
+             FROM asset_checks
+             WHERE id IN (SELECT MAX(id) FROM asset_checks GROUP BY asset, check_name)
+             ORDER BY asset, check_name",
+        )?;
+        let rows = stmt.query_map([], asset_check_from_row)?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    /// trim every check to its newest `keep` results, floored at 1 like
+    /// [`prune_materializations`](Self::prune_materializations) — the latest
+    /// result is what the asset summary counts.
+    pub(crate) fn prune_asset_checks(&self, keep: usize) -> Result<usize, Error> {
+        let conn = self.0.lock().unwrap();
+        let removed = conn.execute(
+            "DELETE FROM asset_checks WHERE id NOT IN
+             (SELECT id FROM asset_checks AS newest
+              WHERE newest.asset = asset_checks.asset
+                AND newest.check_name = asset_checks.check_name
+              ORDER BY newest.id DESC LIMIT ?1)",
+            params![keep.max(1) as i64],
+        )?;
+        Ok(removed)
+    }
+
     /// make the sensors table mirror the code: insert new names, drop the
     /// rest. existing rows keep their paused flag and cursor.
     pub(crate) fn sync_sensors(&self, defined: &[String]) -> Result<(), Error> {
@@ -971,6 +1047,20 @@ fn materialization_from_row(row: &Row) -> rusqlite::Result<Materialization> {
         run_id: row.get(5)?,
         built_at: ts_col(row, 6)?,
         metadata: opt_json_col(row, 7)?,
+    })
+}
+
+fn asset_check_from_row(row: &Row) -> rusqlite::Result<AssetCheckRow> {
+    Ok(AssetCheckRow {
+        id: row.get(0)?,
+        asset: row.get(1)?,
+        check: row.get(2)?,
+        run_id: row.get(3)?,
+        status: parse_col(row, 4)?,
+        severity: parse_col(row, 5)?,
+        message: row.get(6)?,
+        metadata: opt_json_col(row, 7)?,
+        checked_at: ts_col(row, 8)?,
     })
 }
 

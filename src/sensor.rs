@@ -518,7 +518,7 @@ mod tests {
         })
         .from(&source)
         .auto();
-        Arc::new(AssetRegistry::new(vec![source, stats]).unwrap())
+        Arc::new(AssetRegistry::new(vec![source, stats], Vec::new()).unwrap())
     }
 
     fn probe_entry(reg: &AssetRegistry, asset: &str) -> SensorEntry {
@@ -593,7 +593,7 @@ mod tests {
         store.sync_sensors(&["probe:docs".into()]).unwrap();
         let source =
             Asset::source("docs").probe(|| async { Err("disk on fire".to_string().into()) });
-        let reg = Arc::new(AssetRegistry::new(vec![source]).unwrap());
+        let reg = Arc::new(AssetRegistry::new(vec![source], Vec::new()).unwrap());
         let runner = echo_runner(store.clone());
         let entry = probe_entry(&reg, "docs");
         evaluate(&entry, &runner, &reg).await;
@@ -615,7 +615,7 @@ mod tests {
         })
         .from(&a)
         .auto();
-        let reg = Arc::new(AssetRegistry::new(vec![s, a, b]).unwrap());
+        let reg = Arc::new(AssetRegistry::new(vec![s, a, b], Vec::new()).unwrap());
         let runner = Runner::new([reg.lower_job().unwrap()], store.clone());
         let entry = probe_entry(&reg, "s");
 

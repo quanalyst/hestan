@@ -101,19 +101,22 @@ impl From<Value> for Meta {
 /// object's keys come out in a stable order.
 pub(crate) type MetaBuf = Arc<Mutex<BTreeMap<String, Meta>>>;
 
-/// the staged map as it is stored, or `None` when the op said nothing —
-/// which is a null column, not an empty object.
-pub(crate) fn staged_meta(buf: &MetaBuf) -> Option<Value> {
-    let staged = buf.lock().unwrap();
-    if staged.is_empty() {
+/// a metadata map as it is stored, or `None` when it is empty — which is a
+/// null column, not an empty object.
+pub(crate) fn tagged_map(map: &BTreeMap<String, Meta>) -> Option<Value> {
+    if map.is_empty() {
         return None;
     }
     Some(Value::Object(
-        staged
-            .iter()
+        map.iter()
             .map(|(name, meta)| (name.clone(), meta.tagged()))
             .collect(),
     ))
+}
+
+/// what one attempt staged, in stored form.
+pub(crate) fn staged_meta(buf: &MetaBuf) -> Option<Value> {
+    tagged_map(&buf.lock().unwrap())
 }
 
 type OpFn = dyn Fn(OpCtx) -> BoxFuture<'static, OpResult> + Send + Sync;

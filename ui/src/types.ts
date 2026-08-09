@@ -175,6 +175,30 @@ export interface StaleReason {
   now: string | null;
 }
 
+export type CheckStatus = "passed" | "failed";
+// what a failing check costs: error fails its op and the run, warn records it
+export type Severity = "warn" | "error";
+
+// counted from the latest result per check name; both zero means no check has
+// ever recorded anything for this asset
+export interface CheckSummary {
+  passed: number;
+  failed: number;
+  last_run_at: string | null;
+}
+
+export interface AssetCheckResult {
+  id: number;
+  asset: string;
+  check: string;
+  run_id: string;
+  status: CheckStatus;
+  severity: Severity;
+  message: string | null;
+  metadata: Metadata | null;
+  checked_at: string;
+}
+
 export interface AssetSummary {
   name: string;
   kind: "source" | "derived";
@@ -185,6 +209,7 @@ export interface AssetSummary {
   run_id: string | null;
   stale: boolean;
   reasons: StaleReason[];
+  checks: CheckSummary;
 }
 
 // one entry of an asset's materialization history, newest first from the api

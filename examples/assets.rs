@@ -86,12 +86,18 @@ async fn main() -> Result<(), hestan::Error> {
             });
         }
         ctx.info(format!("measured {} files", stats.len()));
+        ctx.meta("files", stats.len() as i64);
+        ctx.meta("bytes", stats.iter().map(|s| s.bytes).sum::<u64>() as i64);
         Ok(serde_json::to_value(stats)?)
     })
     .from(&docs_dir);
 
-    let doc_totals = Asset::typed("doc_totals", |_ctx: OpCtx, input: TotalsIn| async move {
+    let doc_totals = Asset::typed("doc_totals", |ctx: OpCtx, input: TotalsIn| async move {
         let stats = input.doc_stats;
+        ctx.meta(
+            "source",
+            Meta::Url("https://github.com/quanalyst/hestan".into()),
+        );
         Ok(Totals {
             files: stats.len(),
             bytes: stats.iter().map(|s| s.bytes).sum(),
@@ -101,6 +107,40 @@ async fn main() -> Result<(), hestan::Error> {
     })
     .from(&doc_stats)
     .auto();
+
+    // every doc has content, and there are enough of them to be a doc set. the
+    // first fails the run when it breaks; the second only says so.
+    let non_empty = AssetCheck::new(
+        "no_empty_docs",
+        "doc_stats",
+        |_ctx, value: Value| async move {
+            let stats: Vec<DocStat> = serde_json::from_value(value)?;
+            let empty: Vec<&str> = stats
+                .iter()
+                .filter(|s| s.lines == 0)
+                .map(|s| s.file.as_str())
+                .collect();
+            if empty.is_empty() {
+                Ok(CheckResult::pass().meta("checked", stats.len() as i64))
+            } else {
+                Ok(CheckResult::fail(format!("empty: {}", empty.join(", "))))
+            }
+        },
+    );
+
+    let enough_docs = AssetCheck::new(
+        "enough_docs",
+        "doc_totals",
+        |_ctx, value: Value| async move {
+            let files = value["files"].as_u64().unwrap_or(0);
+            if files >= 10 {
+                Ok(CheckResult::pass().meta("files", files as i64))
+            } else {
+                Ok(CheckResult::fail(format!("only {files} docs")).meta("files", files as i64))
+            }
+        },
+    )
+    .severity(Severity::Warn);
 
     let ingest = Job::builder("ingest_marker")
         .description("ingest the marker file's real content")
@@ -134,6 +174,8 @@ async fn main() -> Result<(), hestan::Error> {
     println!("hestan assets example: http://127.0.0.1:4002");
     Hestan::new()
         .assets([docs_dir, doc_stats, doc_totals])
+        .check(non_empty)
+        .check(enough_docs)
         .job(ingest)
         .sensor(marker_watch)
         .db("assets_demo.db")

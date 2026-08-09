@@ -179,6 +179,12 @@ appears.
   leaves an entry, and every entry says whether the fingerprint actually
   moved — so "when did this last change" is a question with an answer, not
   the same question as "when was this last built"
+- asset checks are assertions bound to an asset, handed the value it just
+  produced: `AssetCheck::new("rows_present", "orders", |_, v| ..)` plus
+  `Hestan::check(..)`. they lower into ops of the same build, so retries,
+  cancellation and the gantt apply unchanged; `Severity::Error` fails the run
+  and `Severity::Warn` just records the failure. a check runs when its asset
+  rebuilds — a memoized asset is not re-checked
 - sensors poll the world on an interval and launch runs when something
   changed, with a store-backed cursor committed only on fully successful
   evaluations. probes run as internal sensors on the same loop, and both are
