@@ -28,6 +28,7 @@ failures. timestamps are rfc3339 strings in utc.
 | POST | `/api/runs/{id}/cancel` | stop a queued or running run |
 | GET | `/api/assets` | every asset with lineage and staleness |
 | POST | `/api/assets/{name}/build` | build one asset (and stale ancestors) |
+| GET | `/api/assets/{name}/history` | one asset's recent materializations |
 | POST | `/api/assets/build` | build everything stale as one run |
 | GET | `/api/sensors` | every sensor with cursor and last tick |
 | POST | `/api/sensors/state` | pause or resume a sensor |
@@ -362,6 +363,28 @@ ungated, and both rebuild every derived asset.
 `POST /api/assets/build` builds everything stale in one plan and one run:
 202 `{"run_ids": ["..."]}`, 200 `{"up_to_date": true}` when the whole
 graph is fresh, and the same 409 while a build is active.
+
+`GET /api/assets/{name}/history?limit=` returns that asset's
+materializations, newest first (`limit` default 20, clamped to 1..=200):
+
+```json
+{ "materializations": [
+  { "id": 412, "fingerprint": "9c01d2aa...", "changed": true,
+    "inputs": { "docs_dir": "14a61f3c..." },
+    "run_id": "019fe109-...", "built_at": "2026-08-08T11:01:36Z" },
+  { "id": 407, "fingerprint": "3bffef12...", "changed": false,
+    "inputs": { "docs_dir": "14a61f3c..." },
+    "run_id": "019fe0b2-...", "built_at": "2026-08-08T10:01:36Z" }
+] }
+```
+
+`changed` is true when the entry's fingerprint differs from the entry before
+it in time, which is the difference between a rebuild and a change; the
+oldest entry of all is `true`, and a page's oldest entry is compared against
+the entry just off the page rather than reported as a change. `run_id` is
+null on source rows, which probes write outside any run. no `value` here, as
+on `GET /api/assets`: these are the facts about a build, not its payload. 404
+for an unknown asset.
 
 ## Sensors
 

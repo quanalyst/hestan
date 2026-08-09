@@ -17,6 +17,10 @@ use crate::sensor::{Sensor, SensorEntry, SensorEval, run_sensors};
 use crate::server::{AppState, SensorInfo, router};
 use crate::store::Store;
 
+/// how many materializations each asset keeps unless
+/// [`asset_history`](Hestan::asset_history) says otherwise.
+const DEFAULT_ASSET_HISTORY: usize = 200;
+
 /// entry point: collect jobs, assets, sensors and schedules, then `serve` the ui
 /// or `run_once` headless.
 pub struct Hestan {
@@ -31,6 +35,7 @@ pub struct Hestan {
     db_path: String,
     hooks: Vec<FailureHook>,
     retention_days: Option<u32>,
+    asset_history: usize,
     #[cfg(feature = "http")]
     sources: Vec<crate::http::HttpSource>,
 }
@@ -49,6 +54,7 @@ impl Default for Hestan {
             db_path: "hestan.db".into(),
             hooks: Vec::new(),
             retention_days: None,
+            asset_history: DEFAULT_ASSET_HISTORY,
             #[cfg(feature = "http")]
             sources: Vec::new(),
         }
@@ -236,6 +242,19 @@ impl Hestan {
         self
     }
 
+    /// keep at most `n` materializations per asset, trimmed at startup
+    /// (default 200). materialization history is append-only and grows with
+    /// every build, so unlike [`retention_days`](Self::retention_days) this
+    /// cap applies whether you ask for it or not.
+    ///
+    /// the newest entry is never trimmed, whatever `n` says: it is the asset's
+    /// current state — what staleness compares against and what a memoized
+    /// build seeds — not history.
+    pub fn asset_history(mut self, n: usize) -> Self {
+        self.asset_history = n;
+        self
+    }
+
     /// call `hook` whenever a run finishes failed — never on success, on cancel,
     /// or for runs the startup sweep marks failed. callable multiple times.
     pub fn on_failure(mut self, hook: impl Fn(RunFailure) + Send + Sync + 'static) -> Self {
@@ -387,6 +406,10 @@ impl Hestan {
         let sensor_names: Vec<String> = sensor_entries.iter().map(|e| e.name.clone()).collect();
         store.sync_sensors(&sensor_names)?;
         store.prune_sensor_ticks(5000)?;
+        let trimmed = store.prune_materializations(self.asset_history)?;
+        if trimmed > 0 {
+            tracing::info!("trimmed {trimmed} materializations past the history cap");
+        }
         if let Some(days) = self.retention_days {
             let cutoff = chrono::Utc::now() - chrono::Duration::days(i64::from(days));
             let removed = store.prune_runs(cutoff)?;

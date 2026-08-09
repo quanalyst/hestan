@@ -125,7 +125,44 @@ const SCHEMA_V7: &str = r#"
 ALTER TABLE schedules ADD COLUMN params TEXT NOT NULL DEFAULT '{}';
 "#;
 
-const SCHEMA_VERSION: u32 = 7;
+// materializations become append-only history. the keyed table kept only the
+// latest, so "when did this asset actually change" had no answer at all; every
+// existing row carries across as that asset's first history entry. the other
+// two changes are the same phase's later parts — `op_runs.metadata` and the
+// `asset_checks` table — landed here so nothing after this migrates again.
+const SCHEMA_V8: &str = r#"
+CREATE TABLE asset_materializations_v8 (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    asset TEXT NOT NULL,
+    fingerprint TEXT NOT NULL,
+    inputs TEXT NOT NULL,
+    value TEXT,
+    run_id TEXT,
+    built_at TEXT NOT NULL,
+    metadata TEXT
+);
+INSERT INTO asset_materializations_v8 (asset, fingerprint, inputs, value, run_id, built_at)
+    SELECT asset, fingerprint, inputs, value, run_id, built_at
+    FROM asset_materializations ORDER BY asset;
+DROP TABLE asset_materializations;
+ALTER TABLE asset_materializations_v8 RENAME TO asset_materializations;
+CREATE INDEX asset_materializations_asset ON asset_materializations(asset, id DESC);
+ALTER TABLE op_runs ADD COLUMN metadata TEXT;
+CREATE TABLE asset_checks (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    asset TEXT NOT NULL,
+    check_name TEXT NOT NULL,
+    run_id TEXT NOT NULL,
+    status TEXT NOT NULL,
+    severity TEXT NOT NULL,
+    message TEXT,
+    metadata TEXT,
+    checked_at TEXT NOT NULL
+);
+CREATE INDEX asset_checks_asset ON asset_checks(asset, id DESC);
+"#;
+
+const SCHEMA_VERSION: u32 = 8;
 
 // one transaction around every pending step and the version stamp (sqlite DDL
 // is transactional), so a crash mid-migration leaves the db exactly as found
@@ -159,6 +196,9 @@ fn migrate(conn: &mut Connection) -> Result<(), Error> {
     }
     if version < 7 {
         tx.execute_batch(SCHEMA_V7)?;
+    }
+    if version < 8 {
+        tx.execute_batch(SCHEMA_V8)?;
     }
     if version != SCHEMA_VERSION {
         tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
@@ -666,8 +706,10 @@ impl Store {
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 
-    /// record an asset's current materialization, replacing any previous one.
-    pub(crate) fn upsert_materialization(
+    /// append a materialization. the table is history, so a rebuild that came
+    /// out fingerprint-identical is still an entry — that a build happened and
+    /// that it changed anything are different facts.
+    pub(crate) fn record_materialization(
         &self,
         asset: &str,
         fingerprint: &str,
@@ -678,9 +720,7 @@ impl Store {
         let conn = self.0.lock().unwrap();
         conn.execute(
             "INSERT INTO asset_materializations (asset, fingerprint, inputs, value, run_id, built_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
-             ON CONFLICT (asset) DO UPDATE SET
-                 fingerprint = ?2, inputs = ?3, value = ?4, run_id = ?5, built_at = ?6",
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             params![
                 asset,
                 fingerprint,
@@ -693,12 +733,14 @@ impl Store {
         Ok(())
     }
 
+    /// the asset's current materialization: the newest entry of its history,
+    /// which is what staleness, seeding and the assets api all read.
     pub fn materialization(&self, asset: &str) -> Result<Option<Materialization>, Error> {
         let conn = self.0.lock().unwrap();
         let row = conn
             .query_row(
-                "SELECT asset, fingerprint, inputs, value, run_id, built_at
-                 FROM asset_materializations WHERE asset = ?1",
+                "SELECT id, asset, fingerprint, inputs, value, run_id, built_at
+                 FROM asset_materializations WHERE asset = ?1 ORDER BY id DESC LIMIT 1",
                 params![asset],
                 materialization_from_row,
             )
@@ -706,14 +748,59 @@ impl Store {
         Ok(row)
     }
 
-    pub fn materializations(&self) -> Result<Vec<Materialization>, Error> {
+    /// every asset's current materialization, one row each, ordered by asset.
+    pub fn latest_materializations(&self) -> Result<Vec<Materialization>, Error> {
         let conn = self.0.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT asset, fingerprint, inputs, value, run_id, built_at
-             FROM asset_materializations ORDER BY asset",
+            "SELECT id, asset, fingerprint, inputs, value, run_id, built_at
+             FROM asset_materializations
+             WHERE id IN (SELECT MAX(id) FROM asset_materializations GROUP BY asset)
+             ORDER BY asset",
         )?;
         let rows = stmt.query_map([], materialization_from_row)?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    /// one asset's history, newest first, each entry paired with whether its
+    /// fingerprint differs from the entry before it in time — which is what
+    /// turns a list of rebuilds into a list of changes.
+    ///
+    /// the comparison runs over the whole history before the limit applies, so
+    /// the oldest entry on a page is compared against the entry just off it
+    /// rather than reported as a change it isn't. the very first entry has
+    /// nothing before it and counts as changed: nothing to something.
+    pub fn materializations(
+        &self,
+        asset: &str,
+        limit: u32,
+    ) -> Result<Vec<(Materialization, bool)>, Error> {
+        let conn = self.0.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, asset, fingerprint, inputs, value, run_id, built_at, changed FROM (
+                 SELECT id, asset, fingerprint, inputs, value, run_id, built_at,
+                        fingerprint IS NOT LAG(fingerprint) OVER (ORDER BY id) AS changed
+                 FROM asset_materializations WHERE asset = ?1
+             ) ORDER BY id DESC LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![asset, limit], |r| {
+            Ok((materialization_from_row(r)?, r.get(7)?))
+        })?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    /// trim every asset's history to its newest `keep` entries. `keep` is
+    /// floored at 1: the latest materialization is current state, not history,
+    /// and dropping it would read as an asset that has never been built.
+    pub(crate) fn prune_materializations(&self, keep: usize) -> Result<usize, Error> {
+        let conn = self.0.lock().unwrap();
+        let removed = conn.execute(
+            "DELETE FROM asset_materializations WHERE id NOT IN
+             (SELECT id FROM asset_materializations AS newest
+              WHERE newest.asset = asset_materializations.asset
+              ORDER BY newest.id DESC LIMIT ?1)",
+            params![keep.max(1) as i64],
+        )?;
+        Ok(removed)
     }
 
     /// make the sensors table mirror the code: insert new names, drop the
@@ -865,12 +952,13 @@ fn event_from_row(row: &Row) -> rusqlite::Result<Event> {
 
 fn materialization_from_row(row: &Row) -> rusqlite::Result<Materialization> {
     Ok(Materialization {
-        asset: row.get(0)?,
-        fingerprint: row.get(1)?,
-        inputs: json_col(row, 2)?,
-        value: opt_json_col(row, 3)?,
-        run_id: row.get(4)?,
-        built_at: ts_col(row, 5)?,
+        id: row.get(0)?,
+        asset: row.get(1)?,
+        fingerprint: row.get(2)?,
+        inputs: json_col(row, 3)?,
+        value: opt_json_col(row, 4)?,
+        run_id: row.get(5)?,
+        built_at: ts_col(row, 6)?,
     })
 }
 
@@ -1363,7 +1451,7 @@ mod tests {
         assert!(store.schedules().unwrap().is_empty());
         assert!(!store.set_schedule_paused("etl", "* * * * *", true).unwrap());
         assert!(store.job_states("etl").unwrap().is_empty());
-        assert!(store.materializations().unwrap().is_empty());
+        assert!(store.latest_materializations().unwrap().is_empty());
         assert!(store.sensors().unwrap().is_empty());
         assert!(store.sensor_ticks(None, 10).unwrap().is_empty());
         drop(store);
@@ -1449,14 +1537,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("future.db");
         let path = path.to_str().unwrap();
-        phase1_db(path, 8);
+        phase1_db(path, 9);
         let err = Store::open(path).err().unwrap();
-        assert_eq!(err.to_string(), "db schema v8 is newer than this build");
+        assert_eq!(err.to_string(), "db schema v9 is newer than this build");
         let conn = Connection::open(path).unwrap();
         let version: u32 = conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 8);
+        assert_eq!(version, 9);
     }
 
     #[test]
@@ -1520,9 +1608,9 @@ mod tests {
         assert_eq!(store.run("r1").unwrap().unwrap().status, RunStatus::Success);
         assert_eq!(store.schedules().unwrap().len(), 1);
         assert_eq!(store.op_state("etl", "a").unwrap(), Some(json!(7)));
-        assert!(store.materializations().unwrap().is_empty());
+        assert!(store.latest_materializations().unwrap().is_empty());
         store
-            .upsert_materialization("docs", "abc", &json!({}), None, None)
+            .record_materialization("docs", "abc", &json!({}), None, None)
             .unwrap();
         store.sync_sensors(&["watch".into()]).unwrap();
         drop(store);
@@ -1653,6 +1741,73 @@ mod tests {
     }
 
     #[test]
+    fn v7_db_migrates_to_v8_keeping_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v7.db");
+        let path = path.to_str().unwrap();
+        // every batch up to v7, stamped 7: asset_materializations is still
+        // keyed by asset, op_runs has no metadata, asset_checks does not exist
+        let conn = Connection::open(path).unwrap();
+        conn.execute_batch(PHASE1_SCHEMA).unwrap();
+        conn.execute_batch(SCHEMA_V2).unwrap();
+        conn.execute_batch(SCHEMA_V3).unwrap();
+        conn.execute_batch(SCHEMA_V4).unwrap();
+        conn.execute_batch(SCHEMA_V5).unwrap();
+        conn.execute_batch(SCHEMA_V6).unwrap();
+        conn.execute_batch(SCHEMA_V7).unwrap();
+        conn.execute(
+            "INSERT INTO asset_materializations (asset, fingerprint, inputs, value, run_id, built_at)
+             VALUES ('stats', 'f1', '{\"docs\":\"d1\"}', '{\"files\":12}', 'r1', '2026-01-01T00:00:00+00:00')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO asset_materializations (asset, fingerprint, inputs, built_at)
+             VALUES ('docs', 'd1', '{}', '2026-01-01T00:00:00+00:00')",
+            [],
+        )
+        .unwrap();
+        conn.pragma_update(None, "user_version", 7).unwrap();
+        drop(conn);
+
+        let store = Store::open(path).unwrap();
+        // the row that was current state is now the first entry of a history
+        let m = store.materialization("stats").unwrap().unwrap();
+        assert_eq!(m.fingerprint, "f1");
+        assert_eq!(m.inputs, json!({"docs": "d1"}));
+        assert_eq!(m.value, Some(json!({"files": 12})));
+        assert_eq!(m.run_id.as_deref(), Some("r1"));
+        assert_eq!(store.latest_materializations().unwrap().len(), 2);
+        let carried = store.materializations("stats", 10).unwrap();
+        assert_eq!(carried.len(), 1);
+        assert!(carried[0].1, "a carried row is that asset's first change");
+
+        // and the same asset now appends rather than replacing
+        record(&store, "stats", "f2");
+        assert_eq!(
+            store.materialization("stats").unwrap().unwrap().fingerprint,
+            "f2"
+        );
+        drop(store);
+        let store = Store::open(path).unwrap();
+        assert_eq!(store.materializations("stats", 10).unwrap().len(), 2);
+        drop(store);
+
+        // the rest of v8 is columns and a table later parts of this phase
+        // fill: they exist from this one migration on
+        let conn = Connection::open(path).unwrap();
+        assert!(table_exists(&conn, "asset_checks").unwrap());
+        let metadata_cols: u32 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('op_runs') WHERE name = 'metadata'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(metadata_cols, 1);
+    }
+
+    #[test]
     fn run_error_survives_a_later_status_write() {
         let store = Store::open(":memory:").unwrap();
         store
@@ -1691,12 +1846,12 @@ mod tests {
     }
 
     #[test]
-    fn materialization_upsert_and_read() {
+    fn materialization_records_and_latest_wins() {
         let store = Store::open(":memory:").unwrap();
         assert!(store.materialization("stats").unwrap().is_none());
 
         store
-            .upsert_materialization(
+            .record_materialization(
                 "stats",
                 "f1",
                 &json!({"docs": "d1"}),
@@ -1705,7 +1860,7 @@ mod tests {
             )
             .unwrap();
         store
-            .upsert_materialization("docs", "d1", &json!({}), None, None)
+            .record_materialization("docs", "d1", &json!({}), None, None)
             .unwrap();
 
         let m = store.materialization("stats").unwrap().unwrap();
@@ -1720,7 +1875,7 @@ mod tests {
         assert_eq!(d.run_id, None);
 
         store
-            .upsert_materialization(
+            .record_materialization(
                 "stats",
                 "f2",
                 &json!({"docs": "d2"}),
@@ -1728,12 +1883,85 @@ mod tests {
                 Some("r2"),
             )
             .unwrap();
-        let all = store.materializations().unwrap();
+        let all = store.latest_materializations().unwrap();
         assert_eq!(all.len(), 2);
         let m = store.materialization("stats").unwrap().unwrap();
         assert_eq!(m.fingerprint, "f2");
         assert_eq!(m.run_id.as_deref(), Some("r2"));
         assert!(m.built_at >= first_built);
+        // the first entry survives the second: this is history, not a slot
+        assert_eq!(store.materializations("stats", 10).unwrap().len(), 2);
+    }
+
+    fn record(store: &Store, asset: &str, fp: &str) {
+        store
+            .record_materialization(asset, fp, &json!({}), None, None)
+            .unwrap();
+    }
+
+    #[test]
+    fn history_flags_only_real_fingerprint_transitions() {
+        let store = Store::open(":memory:").unwrap();
+        assert!(store.materializations("stats", 10).unwrap().is_empty());
+
+        // built four times, moved twice
+        for fp in ["f1", "f1", "f2", "f2"] {
+            record(&store, "stats", fp);
+        }
+        record(&store, "other", "x1");
+
+        let history = store.materializations("stats", 10).unwrap();
+        let seen: Vec<(&str, bool)> = history
+            .iter()
+            .map(|(m, changed)| (m.fingerprint.as_str(), *changed))
+            .collect();
+        // newest first; the oldest entry counts as a change from nothing
+        assert_eq!(
+            seen,
+            [("f2", false), ("f2", true), ("f1", false), ("f1", true)]
+        );
+        assert!(history.windows(2).all(|w| w[0].0.id > w[1].0.id));
+
+        // a page's oldest entry is compared with the entry just off it, not
+        // reported as a change because the window cut its predecessor away
+        let page = store.materializations("stats", 3).unwrap();
+        assert_eq!(page.len(), 3);
+        assert!(!page[2].1, "the page edge invented a change");
+    }
+
+    #[test]
+    fn history_prunes_to_the_cap_and_never_drops_the_latest() {
+        let store = Store::open(":memory:").unwrap();
+        for i in 0..5 {
+            record(&store, "stats", &format!("f{i}"));
+        }
+        for i in 0..3 {
+            record(&store, "docs", &format!("d{i}"));
+        }
+
+        assert_eq!(store.prune_materializations(2).unwrap(), 4);
+        let stats: Vec<String> = store
+            .materializations("stats", 10)
+            .unwrap()
+            .into_iter()
+            .map(|(m, _)| m.fingerprint)
+            .collect();
+        assert_eq!(stats, ["f4", "f3"]);
+        assert_eq!(store.materializations("docs", 10).unwrap().len(), 2);
+        assert_eq!(
+            store.materialization("docs").unwrap().unwrap().fingerprint,
+            "d2"
+        );
+
+        // a cap of zero still leaves current state standing
+        assert_eq!(store.prune_materializations(0).unwrap(), 2);
+        assert_eq!(store.materializations("stats", 10).unwrap().len(), 1);
+        assert_eq!(
+            store.materialization("stats").unwrap().unwrap().fingerprint,
+            "f4"
+        );
+        assert_eq!(store.latest_materializations().unwrap().len(), 2);
+        assert_eq!(store.prune_materializations(1).unwrap(), 0);
     }
 
     #[test]

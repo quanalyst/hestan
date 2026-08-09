@@ -57,6 +57,7 @@ pub(crate) fn router(state: AppState) -> Router {
         .route("/api/assets", get(list_assets))
         .route("/api/assets/build", post(build_all_assets))
         .route("/api/assets/{name}/build", post(build_one_asset))
+        .route("/api/assets/{name}/history", get(asset_history))
         .route("/api/sensors", get(list_sensors))
         .route("/api/sensors/state", post(set_sensor_state))
         .route("/api/sensors/ticks", get(sensor_ticks))
@@ -429,6 +430,44 @@ async fn list_assets(State(st): State<AppState>) -> Result<Json<Value>, ApiError
         })
         .collect();
     Ok(Json(json!({ "assets": assets })))
+}
+
+#[derive(Deserialize)]
+struct HistoryQuery {
+    limit: Option<u32>,
+}
+
+// what each build recorded, newest first. no `value`: like GET /api/assets,
+// this reports the facts about a build and not its payload — the value is what
+// a memoized build seeds, and it can be arbitrarily large.
+async fn asset_history(
+    State(st): State<AppState>,
+    Path(name): Path<String>,
+    q: Result<Query<HistoryQuery>, QueryRejection>,
+) -> Result<Json<Value>, ApiError> {
+    let Query(q) = q.map_err(bad_query)?;
+    if st.assets.get(&name).is_none() {
+        return Err(err(StatusCode::NOT_FOUND, format!("unknown asset: {name}")));
+    }
+    let limit = q.limit.unwrap_or(20).clamp(1, 200);
+    let materializations: Vec<Value> = st
+        .runner
+        .store()
+        .materializations(&name, limit)
+        .map_err(internal)?
+        .into_iter()
+        .map(|(m, changed)| {
+            json!({
+                "id": m.id,
+                "fingerprint": m.fingerprint,
+                "changed": changed,
+                "inputs": m.inputs,
+                "run_id": m.run_id,
+                "built_at": m.built_at,
+            })
+        })
+        .collect();
+    Ok(Json(json!({ "materializations": materializations })))
 }
 
 // one build at a time: overlapping builds record lineage that never happened
@@ -1988,7 +2027,7 @@ mod tests {
 
         st.runner
             .store()
-            .upsert_materialization("docs", "d1", &json!({}), None, None)
+            .record_materialization("docs", "d1", &json!({}), None, None)
             .unwrap();
         let (status, Json(body)) = build_all_assets(State(st.clone())).await.unwrap();
         assert_eq!(status, StatusCode::ACCEPTED);
@@ -2005,7 +2044,7 @@ mod tests {
 
         st.runner
             .store()
-            .upsert_materialization("docs", "d2", &json!({}), None, None)
+            .record_materialization("docs", "d2", &json!({}), None, None)
             .unwrap();
         let Json(body) = list_assets(State(st)).await.unwrap();
         let stats = &body["assets"].as_array().unwrap()[1];
@@ -2013,6 +2052,65 @@ mod tests {
         assert_eq!(stats["reasons"][0]["dep"], "docs");
         assert_eq!(stats["reasons"][0]["had"], "d1");
         assert_eq!(stats["reasons"][0]["now"], "d2");
+    }
+
+    #[tokio::test]
+    async fn history_endpoint_lists_changes_newest_first() {
+        let st = asset_state();
+        let store = st.runner.store().clone();
+        for fp in ["d1", "d1", "d2"] {
+            store
+                .record_materialization("docs", fp, &json!({}), None, None)
+                .unwrap();
+        }
+
+        let Json(body) = asset_history(
+            State(st.clone()),
+            Path("docs".into()),
+            Ok(Query(HistoryQuery { limit: None })),
+        )
+        .await
+        .unwrap();
+        let rows = body["materializations"].as_array().unwrap();
+        assert_eq!(rows.len(), 3);
+        let seen: Vec<(&str, bool)> = rows
+            .iter()
+            .map(|r| {
+                (
+                    r["fingerprint"].as_str().unwrap(),
+                    r["changed"].as_bool().unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(seen, [("d2", true), ("d1", false), ("d1", true)]);
+        assert!(rows[0]["built_at"].is_string());
+        assert_eq!(rows[0]["run_id"], json!(null));
+        assert!(
+            rows[0]["value"].is_null(),
+            "history carries facts, not payloads"
+        );
+
+        // out-of-range limits clamp rather than 400
+        for (asked, want) in [(0u32, 1usize), (500, 3)] {
+            let Json(body) = asset_history(
+                State(st.clone()),
+                Path("docs".into()),
+                Ok(Query(HistoryQuery { limit: Some(asked) })),
+            )
+            .await
+            .unwrap();
+            assert_eq!(body["materializations"].as_array().unwrap().len(), want);
+        }
+
+        let (status, Json(body)) = asset_history(
+            State(st),
+            Path("nope".into()),
+            Ok(Query(HistoryQuery { limit: None })),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body["error"], "unknown asset: nope");
     }
 
     #[tokio::test]
@@ -2027,7 +2125,7 @@ mod tests {
         // the source must have probed once, or every descendant stays provably stale
         st.runner
             .store()
-            .upsert_materialization("docs", "d1", &json!({}), None, None)
+            .record_materialization("docs", "d1", &json!({}), None, None)
             .unwrap();
 
         let (status, Json(body)) = build_one_asset(State(st.clone()), Path("totals".into()))
@@ -2062,7 +2160,7 @@ mod tests {
         let st = asset_state();
         st.runner
             .store()
-            .upsert_materialization("docs", "d1", &json!({}), None, None)
+            .record_materialization("docs", "d1", &json!({}), None, None)
             .unwrap();
         // an assets run planted as live, without an executor behind it
         insert_run(&st, "b1", "assets", RunStatus::Running, json!({}));

@@ -166,10 +166,37 @@ at-least-once, the same policy (and the same reasoning) as
 [op state](state.md). a failure writing the row fails the attempt, which
 goes through the op's ordinary retry policy.
 
-the store keeps one row per asset — current state, not history. the history
-is the runs themselves: each materialization records the `run_id` that built
-it. materializations are never pruned by retention, like op state, and a
-run's deletion does not touch the rows it built.
+## Materialization history
+
+`asset_materializations` is append-only: every build adds an entry, and the
+newest entry for an asset is its current state — what staleness compares
+against, what a memoized build seeds, what `GET /api/assets` reports. nothing
+overwrites anything.
+
+that separates two facts the keyed table used to conflate. an asset that gets
+rebuilt hourly has an entry per hour; the ones where the *fingerprint moved*
+are the ones where the data actually changed. `GET /api/assets/{name}/history`
+carries `changed` on each entry for exactly that: true when its fingerprint
+differs from the entry before it in time, so a list of rebuilds reads as a
+list of changes. the oldest entry of all counts as changed — nothing to
+something — and a page's oldest entry is compared against the entry just off
+the page, not reported as a change the window invented.
+
+source assets append only when their probe sees a new fingerprint (the probe
+path skips the write otherwise), so a source's history is already nothing but
+changes. derived assets append on every build, and a run of identical
+fingerprints is the record of work that found nothing new.
+
+history grows without bound, so it is capped rather than left to. at startup
+every asset is trimmed to its newest 200 entries; `Hestan::asset_history(n)`
+sets the number. the newest entry is never trimmed whatever `n` says — it is
+current state, and losing it would read as an asset that has never been
+built. unlike `retention_days` this happens whether you ask or not.
+
+that cap is the only thing that ever removes a materialization. run retention
+still does not: an asset keeps its latest value and fingerprint long after
+the run that built it is deleted, exactly as op state keeps a watermark, so a
+materialization's `run_id` can point at a run that is gone.
 
 ## The http api
 
@@ -185,6 +212,11 @@ is active.
 `POST /api/assets/build` builds everything stale as one run: 202
 `{"run_ids": [..]}`, 200 `{"up_to_date": true}` when nothing is stale, and
 the same 409 while a build is active.
+
+`GET /api/assets/{name}/history?limit=` returns that asset's recent
+materializations newest first (default 20, clamped to 1..=200), each with the
+`changed` flag above and a link back to the run that built it. 404 for an
+unknown name.
 
 shapes and details in [http api](http-api.md); the `asset_materializations`
 table in [storage](storage.md).

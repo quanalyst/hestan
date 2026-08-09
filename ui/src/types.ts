@@ -173,6 +173,18 @@ export interface AssetSummary {
   reasons: StaleReason[];
 }
 
+// one entry of an asset's materialization history, newest first from the api
+export interface MaterializationEntry {
+  id: number;
+  fingerprint: string;
+  // this build's fingerprint differs from the one before it in time — the
+  // difference between having been rebuilt and having actually changed
+  changed: boolean;
+  inputs: Record<string, string | null>;
+  run_id: string | null;
+  built_at: string;
+}
+
 export interface SensorTick {
   id: number;
   sensor: string;

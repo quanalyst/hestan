@@ -297,7 +297,7 @@ fn wrap_op(meta: &AssetMeta) -> Op {
                 let fp = ctx.store.materialization(dep)?.map(|m| m.fingerprint);
                 inputs.insert(dep.clone(), fp.map(Value::String).unwrap_or(Value::Null));
             }
-            ctx.store.upsert_materialization(
+            ctx.store.record_materialization(
                 &name,
                 &fingerprint,
                 &Value::Object(inputs),
@@ -489,7 +489,7 @@ pub(crate) fn plan_all(
 
 pub(crate) fn mats_map(store: &Store) -> Result<HashMap<String, Materialization>, Error> {
     Ok(store
-        .materializations()?
+        .latest_materializations()?
         .into_iter()
         .map(|m| (m.asset.clone(), m))
         .collect())
@@ -520,6 +520,7 @@ mod tests {
 
     fn mat(asset: &str, fp: &str, inputs: Value, value: Option<Value>) -> Materialization {
         Materialization {
+            id: 0,
             asset: asset.into(),
             fingerprint: fp.into(),
             inputs,
@@ -790,6 +791,73 @@ mod tests {
             .unwrap()
     }
 
+    async fn build_target(reg: &AssetRegistry, runner: &Runner, target: &str) -> crate::model::Run {
+        let m = mats_map(runner.store()).unwrap();
+        let plan = plan_target(reg, &m, target).unwrap();
+        runner
+            .run_subset(
+                ASSETS_JOB,
+                plan.ops.into_iter().collect(),
+                plan.seeds,
+                json!({}),
+                Trigger::Build,
+            )
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn rebuilds_append_history_while_the_latest_still_decides_staleness() {
+        let store = Store::open(":memory:").unwrap();
+        let pinned = Arc::new(std::sync::Mutex::new("v1".to_string()));
+        let fp = pinned.clone();
+        let s = Asset::source("s");
+        let a = Asset::new("a", move |ctx: OpCtx| {
+            let fp = fp.clone();
+            async move {
+                ctx.set_fingerprint(fp.lock().unwrap().clone());
+                Ok(json!({"rows": 1}))
+            }
+        })
+        .from(&s);
+        let b = Asset::new("b", |_| async { Ok(json!("b")) }).from(&a);
+        let reg = AssetRegistry::new(vec![s, a, b]).unwrap();
+        let runner = Runner::new([reg.lower_job().unwrap()], store.clone());
+        store
+            .record_materialization("s", "s-fp", &json!({}), None, None)
+            .unwrap();
+        build_all(&reg, &runner).await;
+
+        // built twice more: once to the same fingerprint, once to a new one
+        build_target(&reg, &runner, "a").await;
+        *pinned.lock().unwrap() = "v2".to_string();
+        build_target(&reg, &runner, "a").await;
+
+        let history = store.materializations("a", 10).unwrap();
+        let seen: Vec<(&str, bool)> = history
+            .iter()
+            .map(|(m, changed)| (m.fingerprint.as_str(), *changed))
+            .collect();
+        assert_eq!(seen, [("v2", true), ("v1", false), ("v1", true)]);
+        // every entry names the run that built it, and they are distinct runs
+        assert!(history.iter().all(|(m, _)| m.run_id.is_some()));
+
+        // the latest entry is the current one, and it is the only one
+        // staleness reads: b consumed v1 and a now says v2
+        let m = mats_map(&store).unwrap();
+        assert_eq!(m["a"].fingerprint, "v2");
+        let st = staleness(&reg, &m);
+        assert!(!st["a"].stale);
+        assert_eq!(
+            st["b"].reasons,
+            vec![StaleReason {
+                dep: "a".into(),
+                had: Some("v1".into()),
+                now: Some("v2".into()),
+            }]
+        );
+    }
+
     #[tokio::test]
     async fn build_writes_materializations_with_dep_fingerprints() {
         let store = Store::open(":memory:").unwrap();
@@ -809,7 +877,7 @@ mod tests {
         let runner = Runner::new([reg.lower_job().unwrap()], store.clone());
         // the source was probed before this build
         store
-            .upsert_materialization("s", "s-fp", &json!({}), None, None)
+            .record_materialization("s", "s-fp", &json!({}), None, None)
             .unwrap();
 
         let run = build_all(&reg, &runner).await;
@@ -875,13 +943,13 @@ mod tests {
         let reg = AssetRegistry::new(vec![s, a, b]).unwrap();
         let runner = Runner::new([reg.lower_job().unwrap()], store.clone());
         store
-            .upsert_materialization("s", "s-fp", &json!({}), None, None)
+            .record_materialization("s", "s-fp", &json!({}), None, None)
             .unwrap();
         build_all(&reg, &runner).await;
 
         // poke only b stale: pretend it consumed an older a
         store
-            .upsert_materialization("b", "b-old", &json!({"a": "older"}), Some(&json!({})), None)
+            .record_materialization("b", "b-old", &json!({"a": "older"}), Some(&json!({})), None)
             .unwrap();
         let m = mats_map(&store).unwrap();
         let st = staleness(&reg, &m);

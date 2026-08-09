@@ -876,6 +876,35 @@ button.text-btn.active {
   margin: 8px 0 2px;
 }
 
+.mat-row {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  padding: 3px 0;
+  font-size: 12px;
+}
+
+/* a fixed gutter, so the changed marks read as a column down the list */
+.mat-mark {
+  flex: none;
+  width: 6px;
+  color: var(--ink);
+}
+
+.mat-fp {
+  flex: none;
+}
+
+.mat-when {
+  margin-left: auto;
+}
+
+.mat-run {
+  flex: none;
+  width: 62px;
+  text-align: right;
+}
+
 .params-block {
   width: 280px;
   text-align: left;

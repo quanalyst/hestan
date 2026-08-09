@@ -2,6 +2,12 @@
 
 ## unreleased
 
+- materialization history: `asset_materializations` is append-only (schema v8), so every build leaves an entry instead of overwriting the last one. an asset's newest entry is its current state — staleness, memoized seeding and `GET /api/assets` all read exactly what they read before, and the existing suite is the proof. every row an older database holds carries across as that asset's first entry
+- `GET /api/assets/{name}/history?limit=` (default 20, clamped 1..=200) returns those entries newest first, each with `changed`: true when its fingerprint differs from the entry before it in time. that flag is the point — a rebuild and a change are different facts, and the keyed table could not tell them apart. the oldest entry counts as changed, and a page's oldest entry is compared against the entry just off the page rather than reported as a change the window invented
+- `Store::materializations(asset, limit)` is the history read; the old no-argument `Store::materializations()` is now `latest_materializations()`, which is what it always returned
+- history is capped rather than left to grow: at startup each asset is trimmed to its newest 200 entries, `Hestan::asset_history(n)` sets the number, and the newest entry is never trimmed at any `n`. run retention still never touches materializations — a latest value outlives the run that built it, like op state
+- clicking an asset row (or its dag node) opens a detail panel listing recent materializations: relative time, short fingerprint, a mark on the ones that changed, and a link to the run
+
 - pluggable io managers: `IoManager::put` persists an op's output and returns the handle recorded in `op_runs.output`, `get` turns a handle back into the value. the default `Inline` makes an output its own handle, so it is byte-for-byte what hestan has always done; the whole existing suite is the proof
 - bundled `FileIo::new(dir)` writes `{dir}/{run_id}/{op}.json` and records `{"$io": "file", "path": ".."}` — an object rather than a bare path so anything reading the run log can tell a reference from a value. nothing is ever cleaned up: retention prunes run rows, not files
 - `Hestan::io(manager)` sets the default and `Hestan::io_named(name, manager)` plus `Op::io(name)` select one per op; naming an unregistered manager is a build error rather than a quiet fall back to the run log. `Runner::with_io` is the direct-executor form

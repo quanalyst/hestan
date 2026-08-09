@@ -9,7 +9,7 @@ scale, and it also means hestan assumes it is the only process writing (see
 
 ## Schema
 
-nine tables. `trigger` is a reserved word in sqlite, hence the quoted column
+ten tables. `trigger` is a reserved word in sqlite, hence the quoted column
 name in the schema and every statement that touches it.
 
 ```sql
@@ -36,6 +36,7 @@ CREATE TABLE op_runs (
     finished_at TEXT,
     output TEXT,
     error TEXT,
+    metadata TEXT,                      -- added in v8
     PRIMARY KEY (run_id, op)
 );
 
@@ -79,14 +80,29 @@ CREATE TABLE op_state (          -- added in v3
     PRIMARY KEY (job, op)
 );
 
-CREATE TABLE asset_materializations (  -- added in v4
-    asset TEXT PRIMARY KEY,
+CREATE TABLE asset_materializations (  -- added in v4, rebuilt in v8
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    asset TEXT NOT NULL,      -- not unique: this is append-only history
     fingerprint TEXT NOT NULL,
     inputs TEXT NOT NULL,     -- json map: dep name -> consumed fingerprint
     value TEXT,               -- null for sources
     run_id TEXT,              -- null for probe-written source rows
     built_at TEXT NOT NULL
 );
+CREATE INDEX asset_materializations_asset ON asset_materializations(asset, id DESC);
+
+CREATE TABLE asset_checks (            -- added in v8
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    asset TEXT NOT NULL,
+    check_name TEXT NOT NULL,
+    run_id TEXT NOT NULL,
+    status TEXT NOT NULL,     -- passed | failed
+    severity TEXT NOT NULL,   -- warn | error
+    message TEXT,
+    metadata TEXT,
+    checked_at TEXT NOT NULL
+);
+CREATE INDEX asset_checks_asset ON asset_checks(asset, id DESC);
 
 CREATE TABLE sensors (                 -- added in v4
     name TEXT NOT NULL PRIMARY KEY,
@@ -151,8 +167,12 @@ adds `op_state`; version 4 adds `asset_materializations`, `sensors`, and
 [resume](concepts.md#resume) follows back to the run it continued; version 6
 adds `runs.error`; version 7 adds `schedules.params`, the params a cron fire
 launches with ([scheduling](scheduling.md)) — schedules declared before it
-default to `{}`, which is what they always fired with. an older file at any
-version opens straight into v7, rows intact. every pending step
+default to `{}`, which is what they always fired with; version 8 rebuilds
+`asset_materializations` as append-only [history](assets.md), adds
+`op_runs.metadata` and adds the `asset_checks` table. an older file at any
+version opens straight into v8, rows intact — the v8 rebuild copies every
+keyed materialization across, where it becomes that asset's first history
+entry and stays its current one. every pending step
 and the version stamp run in one transaction
 (sqlite DDL is transactional), so a crash or failure mid-migration leaves
 the file exactly as it was found, never half-migrated. a database stamped
@@ -185,13 +205,17 @@ failed, or canceled) created more than `n` days ago are deleted together
 with their op runs and events, all in one transaction. active runs are never
 pruned, whatever their age. neither is `op_state` — watermarks outlive their
 runs, so a job that fires rarely keeps its cursor even after every run that
-wrote it is gone. `asset_materializations` and `sensors` follow the same
-rule: current state keyed by name, never pruned. an asset keeps its latest
-value and fingerprint after the run that built it is retired, so a
-materialization's `run_id` can point at a run retention has since deleted.
-tick logs are the exception either way: `schedule_ticks` and `sensor_ticks`
-are each trimmed to their newest 5000 rows at every startup, retention
-configured or not.
+wrote it is gone. an asset's latest materialization is the same: it survives
+the run that built it being retired, so a materialization's `run_id` can
+point at a run retention has since deleted.
+
+three logs are trimmed at every startup whether retention is configured or
+not, because all three grow with time rather than with what you keep.
+`schedule_ticks` and `sensor_ticks` are each capped at their newest 5000
+rows. `asset_materializations` is capped *per asset* at its newest 200
+entries, or whatever `Hestan::asset_history(n)` says; an asset's newest entry
+is never trimmed at any `n`, since that one is current state rather than
+history ([assets](assets.md)).
 
 ## What's stored and what stays in memory
 
@@ -214,18 +238,20 @@ it carries them — but it does read them back on a resume, which is where a
 pruned run breaks a chain (`get` is asked for a value the manager may no
 longer have; `FileIo` cleans up nothing, so this is on you to sweep).
 
-three tables are keyed by names instead of run ids and hold current state
+two tables are keyed by names instead of run ids and hold current state
 rather than history. `op_state`: one json value per `(job, op)`, upserted
 when an op that called `ctx.set_state` succeeds — the success row commits
 first, the state second, so a crash between the two re-runs from the old
 value rather than skipping a window (the reasoning is in
-[op state](state.md)). `asset_materializations`: one row per asset, its
-latest value and fingerprint, written inside the asset op just before it
-reports success, which is the mirror image of that order with the same
-at-least-once outcome ([assets](assets.md)). `sensors`: one cursor per
-sensor, committed only after a fully successful evaluation
-([sensors](sensors.md)). runs and op runs come and go; these rows persist
-until overwritten.
+[op state](state.md)). `sensors`: one cursor per sensor, committed only
+after a fully successful evaluation ([sensors](sensors.md)). runs and op
+runs come and go; these rows persist until overwritten.
+
+`asset_materializations` is the third of that family and the odd one out: it
+is append-only, and an asset's *newest* row is its current state rather than
+its only one. each is written inside the asset op just before it reports
+success — the mirror image of the op-state order, with the same
+at-least-once outcome ([assets](assets.md)).
 
 writes are ordered for readers. a run row is created in one transaction with
 its `pending` op runs and its `run_queued` event, so a visible run always has

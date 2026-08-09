@@ -170,6 +170,10 @@ appears.
   of recomputing them. source assets stand for external data and carry a
   cheap fingerprint probe; `.auto()` assets rebuild themselves when a probe
   upstream makes them stale
+- materializations are append-only history, capped per asset: each build
+  leaves an entry, and every entry says whether the fingerprint actually
+  moved — so "when did this last change" is a question with an answer, not
+  the same question as "when was this last built"
 - sensors poll the world on an interval and launch runs when something
   changed, with a store-backed cursor committed only on fully successful
   evaluations. probes run as internal sensors on the same loop, and both are

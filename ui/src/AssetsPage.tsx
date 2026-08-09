@@ -1,6 +1,7 @@
 import { useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { get, post, usePoll } from "./api";
+import AssetPanel from "./AssetPanel";
 import DagView from "./DagView";
 import { GlyphShape } from "./StatusGlyph";
 import type { Status } from "./StatusGlyph";
@@ -55,6 +56,7 @@ export default function AssetsPage() {
   const [busyAsset, setBusyAsset] = useState<string | null>(null);
   const [rowMsg, setRowMsg] = useState<{ asset: string; msg: string } | null>(null);
   const [sensorErr, setSensorErr] = useState<string | null>(null);
+  const [sel, setSel] = useState<string | null>(null);
 
   usePoll(
     () => {
@@ -118,6 +120,7 @@ export default function AssetsPage() {
   if (!assets) return <p className="muted">loading…</p>;
 
   const anyStale = assets.some((a) => a.stale);
+  const selected = assets.find((a) => a.name === sel) ?? null;
   const staleness = Object.fromEntries(
     assets.map((a) => [a.name, a.stale ? "stale" : "fresh"] as const),
   );
@@ -149,10 +152,12 @@ export default function AssetsPage() {
               note: a.kind === "source" ? "source" : undefined,
             }))}
             statuses={staleness}
+            selected={sel}
+            onSelect={(name) => setSel((prev) => (prev === name ? null : name))}
           />
 
           <h2>assets</h2>
-          <table className="plain-rows">
+          <table>
             <thead>
               <tr>
                 <th>name</th>
@@ -167,7 +172,10 @@ export default function AssetsPage() {
             </thead>
             <tbody>
               {assets.map((a) => (
-                <tr key={a.name}>
+                <tr
+                  key={a.name}
+                  onClick={() => setSel((prev) => (prev === a.name ? null : a.name))}
+                >
                   <td>{a.name}</td>
                   <td className="muted">{a.kind}</td>
                   <td className="muted">{a.deps.length === 0 ? "—" : a.deps.join(", ")}</td>
@@ -194,7 +202,10 @@ export default function AssetsPage() {
                       <button
                         className="text-btn"
                         disabled={busyAsset === a.name}
-                        onClick={() => buildOne(a.name)}
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          buildOne(a.name);
+                        }}
                       >
                         build
                       </button>
@@ -261,6 +272,8 @@ export default function AssetsPage() {
           {sensorErr && <p className="muted">sensor update failed: {sensorErr}</p>}
         </>
       )}
+
+      {selected && <AssetPanel key={selected.name} asset={selected} onClose={() => setSel(null)} />}
     </>
   );
 }

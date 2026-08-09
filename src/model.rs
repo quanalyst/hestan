@@ -242,10 +242,14 @@ pub struct Tick {
     pub error: Option<String>,
 }
 
-/// an asset's current materialization. `inputs` maps each dep name to the
-/// fingerprint this asset consumed; source rows carry no value and no run.
+/// one entry of an asset's materialization history, newest of which is its
+/// current state. `inputs` maps each dep name to the fingerprint this asset
+/// consumed; source rows carry no value and no run.
 #[derive(Debug, Clone, Serialize)]
 pub struct Materialization {
+    /// monotonic within the table, so ordering by it is ordering by time even
+    /// when two builds land in the same millisecond.
+    pub id: i64,
     pub asset: String,
     pub fingerprint: String,
     pub inputs: Value,
