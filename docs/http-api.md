@@ -16,6 +16,9 @@ failures. timestamps are rfc3339 strings in utc.
 | GET | `/api/jobs` | all job summaries, sorted by name |
 | GET | `/api/jobs/{name}` | one job summary |
 | POST | `/api/jobs/{name}/runs` | launch a run |
+| GET | `/api/jobs/{name}/presets` | the job's stored parameter sets |
+| PUT | `/api/jobs/{name}/presets/{preset}` | store one, validated first |
+| DELETE | `/api/jobs/{name}/presets/{preset}` | drop one |
 | POST | `/api/jobs/{name}/validate_params` | check params without launching |
 | GET | `/api/jobs/{name}/op_stats` | per-op aggregates over recent runs |
 | GET | `/api/jobs/{name}/state` | the job's committed op state |
@@ -124,6 +127,34 @@ id is immediately queryable. a body that isn't `{"params": ...}`-shaped is a
 400 (`invalid body: ...`), params rejected by an op's `.params::<P>()` are a
 400 (`invalid params for op fetch: ...`) with nothing written, and an unknown
 job is a 404.
+
+`{"preset": "nightly"}` launches with a stored [preset](#presets)'s params
+instead, which is an alternative to `params` rather than a base for it:
+naming both is a 400 (`params and preset are alternatives; name one`) and a
+name nothing is stored under is a 404, in both cases with nothing launched.
+
+## Presets
+
+`GET /api/jobs/{name}/presets` returns the job's stored
+[parameter sets](launching.md#presets), sorted by name; 404 for an unknown
+job, `{"presets": []}` when it has none:
+
+```json
+{ "presets": [
+  { "job": "orders_etl", "name": "nightly", "params": {"days": 1},
+    "created_at": "2026-08-07T12:00:00+00:00" }
+] }
+```
+
+`PUT /api/jobs/{name}/presets/{preset}` with `{"params": {...}}` stores one,
+replacing whatever was under that name — `200 {"ok": true}`. the params run
+the same check `validate_params` does *before* anything is written, so a
+preset that could never launch is a 400 (`invalid params for op fetch: ...`)
+and no row appears. an empty body means `{}`, which is what a launch would
+use. `created_at` survives a rewrite.
+
+`DELETE /api/jobs/{name}/presets/{preset}` returns `200 {"deleted": true}`, or
+404 when there is no such preset. both take a 404 for an unknown job.
 
 ## Validating params
 

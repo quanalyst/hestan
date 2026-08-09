@@ -6,7 +6,7 @@ use axum::extract::rejection::QueryRejection;
 use axum::extract::{Path, Query, State};
 use axum::http::{Method, StatusCode, Uri, header};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{get, post, put};
 use axum::{Json, Router};
 use chrono::{DateTime, Duration, Utc};
 use include_dir::{Dir, include_dir};
@@ -55,6 +55,11 @@ pub(crate) fn router(state: AppState) -> Router {
         .route("/api/jobs", get(list_jobs))
         .route("/api/jobs/{name}", get(get_job))
         .route("/api/jobs/{name}/runs", post(launch_run))
+        .route("/api/jobs/{name}/presets", get(list_presets))
+        .route(
+            "/api/jobs/{name}/presets/{preset}",
+            put(put_preset).delete(delete_preset),
+        )
         .route("/api/jobs/{name}/validate_params", post(validate_params))
         .route("/api/jobs/{name}/op_stats", get(op_stats))
         .route("/api/jobs/{name}/state", get(job_state))
@@ -282,9 +287,28 @@ async fn get_job(
     Ok(Json(job_summary(job, &st).map_err(internal)?))
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Default)]
 struct LaunchBody {
     params: Option<Value>,
+    /// launch with a stored [preset](crate::Preset)'s params instead of
+    /// inline ones; naming both is a 400.
+    preset: Option<String>,
+}
+
+/// a body that carries nothing but `params` — validation and preset writes.
+/// an empty body means `{}`, which is what a launch would use.
+#[derive(Deserialize, Default)]
+struct ParamsBody {
+    params: Option<Value>,
+}
+
+fn params_body(body: &Bytes) -> Result<Value, ApiError> {
+    if body.is_empty() {
+        return Ok(json!({}));
+    }
+    let parsed: ParamsBody = serde_json::from_slice(body)
+        .map_err(|e| err(StatusCode::BAD_REQUEST, format!("invalid body: {e}")))?;
+    Ok(parsed.params.unwrap_or_else(|| json!({})))
 }
 
 async fn launch_run(
@@ -292,18 +316,101 @@ async fn launch_run(
     Path(name): Path<String>,
     body: Bytes,
 ) -> Result<(StatusCode, Json<Value>), ApiError> {
-    let params = if body.is_empty() {
-        json!({})
+    let body: LaunchBody = if body.is_empty() {
+        LaunchBody::default()
     } else {
-        let parsed: LaunchBody = serde_json::from_slice(&body)
-            .map_err(|e| err(StatusCode::BAD_REQUEST, format!("invalid body: {e}")))?;
-        parsed.params.unwrap_or_else(|| json!({}))
+        serde_json::from_slice(&body)
+            .map_err(|e| err(StatusCode::BAD_REQUEST, format!("invalid body: {e}")))?
+    };
+    let params = match body.preset {
+        None => body.params.unwrap_or_else(|| json!({})),
+        Some(preset) => {
+            // two answers to "what params" is one too many; refuse rather than
+            // pick, since which one won would only ever be learned by accident
+            if body.params.is_some() {
+                return Err(err(
+                    StatusCode::BAD_REQUEST,
+                    "params and preset are alternatives; name one",
+                ));
+            }
+            if !st.jobs.contains_key(&name) {
+                return Err(err(StatusCode::NOT_FOUND, format!("unknown job: {name}")));
+            }
+            st.runner
+                .store()
+                .preset(&name, &preset)
+                .map_err(internal)?
+                .ok_or_else(|| {
+                    err(
+                        StatusCode::NOT_FOUND,
+                        format!("unknown preset: {preset} on job {name}"),
+                    )
+                })?
+                .params
+        }
     };
     match st.runner.launch(&name, params, Trigger::Manual) {
         Ok(run_id) => Ok((StatusCode::ACCEPTED, Json(json!({ "run_id": run_id })))),
         Err(e @ Error::UnknownJob(_)) => Err(err(StatusCode::NOT_FOUND, e.to_string())),
         Err(e @ Error::InvalidParams { .. }) => Err(err(StatusCode::BAD_REQUEST, e.to_string())),
         Err(e) => Err(internal(e)),
+    }
+}
+
+async fn list_presets(
+    State(st): State<AppState>,
+    Path(name): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    if !st.jobs.contains_key(&name) {
+        return Err(err(StatusCode::NOT_FOUND, format!("unknown job: {name}")));
+    }
+    let presets = st.runner.store().presets(&name).map_err(internal)?;
+    Ok(Json(json!({ "presets": presets })))
+}
+
+// validated before it is stored: a preset that cannot launch is not worth
+// keeping, and finding that out at 2am is the whole thing presets exist to avoid
+async fn put_preset(
+    State(st): State<AppState>,
+    Path((name, preset)): Path<(String, String)>,
+    body: Bytes,
+) -> Result<Json<Value>, ApiError> {
+    let job = st
+        .jobs
+        .get(&name)
+        .ok_or_else(|| err(StatusCode::NOT_FOUND, format!("unknown job: {name}")))?;
+    let params = params_body(&body)?;
+    if let Some((op, reason)) = job.params_error(&params) {
+        return Err(err(
+            StatusCode::BAD_REQUEST,
+            Error::InvalidParams { op, reason }.to_string(),
+        ));
+    }
+    st.runner
+        .store()
+        .put_preset(&name, &preset, &params)
+        .map_err(internal)?;
+    Ok(Json(json!({ "ok": true })))
+}
+
+async fn delete_preset(
+    State(st): State<AppState>,
+    Path((name, preset)): Path<(String, String)>,
+) -> Result<Json<Value>, ApiError> {
+    if !st.jobs.contains_key(&name) {
+        return Err(err(StatusCode::NOT_FOUND, format!("unknown job: {name}")));
+    }
+    match st
+        .runner
+        .store()
+        .delete_preset(&name, &preset)
+        .map_err(internal)?
+    {
+        true => Ok(Json(json!({ "deleted": true }))),
+        false => Err(err(
+            StatusCode::NOT_FOUND,
+            format!("unknown preset: {preset} on job {name}"),
+        )),
     }
 }
 
@@ -318,13 +425,7 @@ async fn validate_params(
         .jobs
         .get(&name)
         .ok_or_else(|| err(StatusCode::NOT_FOUND, format!("unknown job: {name}")))?;
-    let params = if body.is_empty() {
-        json!({})
-    } else {
-        let parsed: LaunchBody = serde_json::from_slice(&body)
-            .map_err(|e| err(StatusCode::BAD_REQUEST, format!("invalid body: {e}")))?;
-        parsed.params.unwrap_or_else(|| json!({}))
-    };
+    let params = params_body(&body)?;
     match job.params_error(&params) {
         None => Ok(Json(json!({ "ok": true }))),
         Some((op, reason)) => Err(err(
@@ -1647,6 +1748,191 @@ mod tests {
                 .unwrap_err();
         assert_eq!(status, StatusCode::NOT_FOUND);
         assert_eq!(body["error"], "unknown job: nope");
+    }
+
+    // a job whose op refuses anything but {"days": <number>}
+    fn windowed_job(name: &str) -> Job {
+        #[derive(Deserialize)]
+        #[allow(dead_code)]
+        struct Window {
+            days: u32,
+        }
+        Job::builder(name)
+            .op(Op::new("render", |ctx| async move { Ok(ctx.params().clone()) }).params::<Window>())
+            .build()
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn presets_are_written_listed_and_deleted() {
+        let st = state(vec![windowed_job("report")]);
+        let Json(body) = list_presets(State(st.clone()), Path("report".into()))
+            .await
+            .unwrap();
+        assert_eq!(body["presets"], json!([]));
+
+        let Json(body) = put_preset(
+            State(st.clone()),
+            Path(("report".into(), "nightly".into())),
+            raw(r#"{"params": {"days": 1}}"#),
+        )
+        .await
+        .unwrap();
+        assert_eq!(body, json!({"ok": true}));
+
+        let Json(body) = list_presets(State(st.clone()), Path("report".into()))
+            .await
+            .unwrap();
+        let presets = body["presets"].as_array().unwrap();
+        assert_eq!(presets.len(), 1);
+        assert_eq!(presets[0]["name"], "nightly");
+        assert_eq!(presets[0]["params"], json!({"days": 1}));
+        assert!(presets[0]["created_at"].is_string());
+
+        let Json(body) =
+            delete_preset(State(st.clone()), Path(("report".into(), "nightly".into())))
+                .await
+                .unwrap();
+        assert_eq!(body, json!({"deleted": true}));
+        let (status, Json(body)) =
+            delete_preset(State(st.clone()), Path(("report".into(), "nightly".into())))
+                .await
+                .unwrap_err();
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body["error"], "unknown preset: nightly on job report");
+
+        // every one of the three refuses a job it does not have
+        for status in [
+            list_presets(State(st.clone()), Path("nope".into()))
+                .await
+                .unwrap_err()
+                .0,
+            put_preset(
+                State(st.clone()),
+                Path(("nope".into(), "p".into())),
+                raw(r#"{"params": {}}"#),
+            )
+            .await
+            .unwrap_err()
+            .0,
+            delete_preset(State(st), Path(("nope".into(), "p".into())))
+                .await
+                .unwrap_err()
+                .0,
+        ] {
+            assert_eq!(status, StatusCode::NOT_FOUND);
+        }
+    }
+
+    // a preset that cannot launch is not worth storing
+    #[tokio::test]
+    async fn an_invalid_preset_is_refused_before_it_is_stored() {
+        let st = state(vec![windowed_job("report")]);
+        let (status, Json(body)) = put_preset(
+            State(st.clone()),
+            Path(("report".into(), "broken".into())),
+            raw(r#"{"params": {"days": "many"}}"#),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(
+            body["error"]
+                .as_str()
+                .unwrap()
+                .starts_with("invalid params for op render:"),
+            "{body}"
+        );
+        assert!(st.runner.store().presets("report").unwrap().is_empty());
+
+        // an empty body is {}, which this op also refuses
+        let (status, _) = put_preset(
+            State(st.clone()),
+            Path(("report".into(), "empty".into())),
+            raw(""),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(st.runner.store().presets("report").unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn launching_by_preset_name_uses_its_params() {
+        let st = state(vec![windowed_job("report")]);
+        st.runner
+            .store()
+            .put_preset("report", "nightly", &json!({"days": 7}))
+            .unwrap();
+
+        let (status, Json(body)) = launch_run(
+            State(st.clone()),
+            Path("report".into()),
+            raw(r#"{"preset": "nightly"}"#),
+        )
+        .await
+        .unwrap();
+        assert_eq!(status, StatusCode::ACCEPTED);
+        let id = body["run_id"].as_str().unwrap();
+        let run = st.runner.store().run(id).unwrap().unwrap();
+        assert_eq!(run.params, json!({"days": 7}));
+
+        // a name nothing was stored under is a 404, and launches nothing
+        let (status, Json(body)) = launch_run(
+            State(st.clone()),
+            Path("report".into()),
+            raw(r#"{"preset": "ghost"}"#),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body["error"], "unknown preset: ghost on job report");
+        assert_eq!(
+            st.runner
+                .store()
+                .runs(None, None, None, None, 10)
+                .unwrap()
+                .len(),
+            1
+        );
+
+        let (status, _) = launch_run(
+            State(st),
+            Path("nope".into()),
+            raw(r#"{"preset": "nightly"}"#),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn a_launch_naming_both_params_and_a_preset_is_a_400() {
+        let st = state(vec![windowed_job("report")]);
+        st.runner
+            .store()
+            .put_preset("report", "nightly", &json!({"days": 7}))
+            .unwrap();
+
+        let (status, Json(body)) = launch_run(
+            State(st.clone()),
+            Path("report".into()),
+            raw(r#"{"preset": "nightly", "params": {"days": 1}}"#),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            body["error"],
+            "params and preset are alternatives; name one"
+        );
+        assert!(
+            st.runner
+                .store()
+                .runs(None, None, None, None, 10)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     // names and types, never values: a resource is usually a client holding

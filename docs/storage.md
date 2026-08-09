@@ -9,7 +9,7 @@ scale, and it also means hestan assumes it is the only process writing (see
 
 ## Schema
 
-thirteen tables. `trigger` is a reserved word in sqlite, hence the quoted
+fourteen tables. `trigger` is a reserved word in sqlite, hence the quoted
 column name in the schema and every statement that touches it.
 
 ```sql
@@ -24,7 +24,8 @@ CREATE TABLE runs (
     finished_at TEXT,
     resumed_from TEXT,                  -- added in v5
     error TEXT,                         -- added in v6
-    scheduled_for TEXT                  -- added in v10
+    scheduled_for TEXT,                 -- added in v10
+    tags TEXT                           -- added in v12
 );
 CREATE INDEX runs_job_created ON runs(job, created_at DESC);
 
@@ -151,7 +152,24 @@ CREATE TABLE sensor_run_keys (         -- added in v11
     launched_at TEXT NOT NULL,
     PRIMARY KEY (sensor, run_key)
 );
+
+CREATE TABLE presets (                  -- added in v12
+    job TEXT NOT NULL,
+    name TEXT NOT NULL,
+    params TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (job, name)
+);
 ```
+
+`presets` holds named parameter sets ([launching](launching.md#presets)).
+they are runtime data, not part of a job definition: `Hestan::preset` seeds
+one at build with an upsert and the launchpad writes others beside it, so the
+table is the only place the two can meet. that is also why nothing sweeps it —
+unlike `schedules`, which mirrors the code exactly, a preset whose declaration
+was deleted stays until somebody deletes the preset. `created_at` survives a
+rewrite, so it means when the preset first appeared rather than when the
+process last booted.
 
 `sensor_run_keys` is what makes a keyed sensor request
 [effectively-once](sensors.md#run-keys). the row is inserted in the same
@@ -221,8 +239,11 @@ and `schedules.catchup` ([catch-up](scheduling.md#missed-fire-catch-up)) and
 for; version 11 adds the `sensor_run_keys` table
 ([run keys](sensors.md#run-keys)) plus `sensor_ticks.skipped` and
 `sensor_ticks.duration_ms`, which existing ticks read as 0 — they were never
-measured, and 0 is the only honest thing to say about that. an older file at
-any version opens straight into v11, rows intact — the v8 rebuild copies
+measured, and 0 is the only honest thing to say about that; version 12 adds
+the `presets` table and `runs.tags`, the flat `{"k": "v"}` map a run carries
+([tags](launching.md#run-tags)) — null on every run written before it and on
+every run launched without any, which reads back as `{}`. an older file at
+any version opens straight into v12, rows intact — the v8 rebuild copies
 every keyed materialization across, where it becomes that asset's first
 history entry and stays its current one, and v9 leaves every existing row
 with a null partition, which is exactly what an unpartitioned asset is. every
@@ -230,7 +251,7 @@ pending step
 and the version stamp run in one transaction
 (sqlite DDL is transactional), so a crash or failure mid-migration leaves
 the file exactly as it was found, never half-migrated. a database stamped
-with a version newer than the build refuses to open (`db schema v12 is newer
+with a version newer than the build refuses to open (`db schema v13 is newer
 than this build`) instead of quietly writing an older stamp over it.
 
 one wrinkle: databases written before the migration mechanism existed carry

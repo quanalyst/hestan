@@ -1,6 +1,6 @@
-import { useState } from "react";
+import { useCallback, useState } from "react";
 import { Link, useNavigate, useParams } from "react-router-dom";
-import { get, HttpError, post, usePoll } from "./api";
+import { del, get, HttpError, post, put, usePoll } from "./api";
 import DagView from "./DagView";
 import DurationBars from "./DurationBars";
 import OpInspector from "./OpInspector";
@@ -8,7 +8,16 @@ import StatusDot from "./StatusDot";
 import { GlyphShape } from "./StatusGlyph";
 import type { Status } from "./StatusGlyph";
 import TimelinePlot, { futureWindowSecs } from "./TimelinePlot";
-import type { JobState, JobSummary, OpStat, Run, Tick, TickOutcome, UpcomingSchedule } from "./types";
+import type {
+  JobState,
+  JobSummary,
+  OpStat,
+  Preset,
+  Run,
+  Tick,
+  TickOutcome,
+  UpcomingSchedule,
+} from "./types";
 import { durationMs, fmtDuration, opBadge, relTime, shortId, untilTime } from "./util";
 
 const STATS_RUNS = 50;
@@ -77,12 +86,23 @@ function JobView({ name }: { name: string }) {
   const [opSel, setOpSel] = useState<string | null>(null);
   const [paramsOpen, setParamsOpen] = useState(false);
   const [paramsText, setParamsText] = useState(() => loadParams(name));
+  const [presets, setPresets] = useState<Preset[]>([]);
+  const [presetName, setPresetName] = useState("");
+  const [presetError, setPresetError] = useState<string | null>(null);
   const [launching, setLaunching] = useState(false);
   const [launchError, setLaunchError] = useState<string | null>(null);
   const [paramsError, setParamsError] = useState<string | null>(null);
   const [schedError, setSchedError] = useState<string | null>(null);
   const [missing, setMissing] = useState(false);
   const enc = encodeURIComponent(name);
+
+  const loadPresets = useCallback(
+    () =>
+      get<{ presets: Preset[] }>(`/api/jobs/${enc}/presets`)
+        .then((r) => setPresets(r.presets))
+        .catch(() => {}),
+    [enc],
+  );
 
   usePoll(
     () => {
@@ -103,9 +123,10 @@ function JobView({ name }: { name: string }) {
       get<{ states: JobState[] }>(`/api/jobs/${enc}/state`)
         .then((r) => setStates(r.states))
         .catch(() => {});
+      void loadPresets();
     },
     missing ? null : 5000,
-    [name, missing],
+    [name, missing, loadPresets],
   );
 
   // wider fetch for the timeline; the recent-runs table keeps its own latest-50
@@ -165,6 +186,45 @@ function JobView({ name }: { name: string }) {
     }
   };
 
+  // picking a preset fills the editor rather than launching: the whole point
+  // of a stored one is that it is a starting point you can still edit
+  const fillFrom = (picked: string) => {
+    const p = presets.find((x) => x.name === picked);
+    if (!p) return;
+    setPresetName(p.name);
+    setParamsText(JSON.stringify(p.params, null, 2));
+    setParamsError(null);
+    setPresetError(null);
+    setParamsOpen(true);
+  };
+
+  const savePreset = async () => {
+    const preset = presetName.trim();
+    if (!preset || !paramsValid) return;
+    setPresetError(null);
+    try {
+      const text = paramsText.trim();
+      await put<{ ok: boolean }>(`/api/jobs/${enc}/presets/${encodeURIComponent(preset)}`, {
+        params: text ? JSON.parse(text) : {},
+      });
+      await loadPresets();
+    } catch (e) {
+      setPresetError(e instanceof Error ? e.message : String(e));
+    }
+  };
+
+  const deletePreset = async () => {
+    const preset = presetName.trim();
+    setPresetError(null);
+    try {
+      await del<{ deleted: boolean }>(`/api/jobs/${enc}/presets/${encodeURIComponent(preset)}`);
+      setPresetName("");
+      await loadPresets();
+    } catch (e) {
+      setPresetError(e instanceof Error ? e.message : String(e));
+    }
+  };
+
   const setPaused = async (expr: string, paused: boolean) => {
     setSchedError(null);
     const flip = (j: JobSummary | null, p: boolean) =>
@@ -200,9 +260,25 @@ function JobView({ name }: { name: string }) {
           {policy && <p className="muted">{policy}</p>}
         </div>
         <div className="run-actions">
-          <button onClick={launch} disabled={launching || !paramsValid}>
-            launch run
-          </button>
+          <div className="run-side">
+            {presets.length > 0 && (
+              <select
+                className="preset-select"
+                value={presets.some((p) => p.name === presetName) ? presetName : ""}
+                onChange={(e) => fillFrom(e.target.value)}
+              >
+                <option value="">preset…</option>
+                {presets.map((p) => (
+                  <option key={p.name} value={p.name}>
+                    {p.name}
+                  </option>
+                ))}
+              </select>
+            )}
+            <button onClick={launch} disabled={launching || !paramsValid}>
+              launch run
+            </button>
+          </div>
           <button
             className={paramsOpen ? "text-btn active" : "text-btn"}
             onClick={() => setParamsOpen((o) => !o)}
@@ -229,6 +305,30 @@ function JobView({ name }: { name: string }) {
               />
               {!paramsValid && <p className="muted params-hint">invalid json</p>}
               {paramsValid && paramsError && <p className="muted params-hint">{paramsError}</p>}
+              <div className="preset-row">
+                <input
+                  className="filter-input"
+                  value={presetName}
+                  placeholder="preset name"
+                  onChange={(e) => {
+                    setPresetName(e.target.value);
+                    setPresetError(null);
+                  }}
+                />
+                <button
+                  className="text-btn"
+                  onClick={savePreset}
+                  disabled={!presetName.trim() || !paramsValid}
+                >
+                  save
+                </button>
+                {presets.some((p) => p.name === presetName.trim()) && (
+                  <button className="text-btn" onClick={deletePreset}>
+                    delete
+                  </button>
+                )}
+              </div>
+              {presetError && <p className="muted params-hint">{presetError}</p>}
             </div>
           )}
           {!paramsValid && !paramsOpen && <p className="muted">saved params are invalid json — open params to fix</p>}

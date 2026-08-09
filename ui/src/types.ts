@@ -103,6 +103,15 @@ export interface JobSummary {
   freshness: Freshness | null;
 }
 
+// a named parameter set stored against a job: declared with Hestan::preset or
+// saved from the launchpad, and the same thing either way
+export interface Preset {
+  job: string;
+  name: string;
+  params: unknown;
+  created_at: string;
+}
+
 export interface UpcomingSchedule {
   job: string;
   expr: string;

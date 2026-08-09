@@ -9,7 +9,7 @@ use serde_json::Value;
 use crate::error::Error;
 use crate::model::{
     AssetCheckRow, Backfill, BackfillStatus, CheckStatus, Event, EventKind, EventLevel,
-    FreshnessRow, Materialization, OpRun, OpStatus, Run, RunCursor, RunStatus, ScheduleRow,
+    FreshnessRow, Materialization, OpRun, OpStatus, Preset, Run, RunCursor, RunStatus, ScheduleRow,
     SensorOutcome, SensorRow, SensorTick, Severity, Tick, TickOutcome,
 };
 use crate::schedule::Schedule;
@@ -233,7 +233,25 @@ ALTER TABLE sensor_ticks ADD COLUMN skipped INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE sensor_ticks ADD COLUMN duration_ms INTEGER NOT NULL DEFAULT 0;
 "#;
 
-const SCHEMA_VERSION: u32 = 11;
+// named parameter sets, plus `runs.tags` for the part that follows, landed
+// here so nothing after this migrates again. presets are runtime data and not
+// part of a job definition: `Hestan::preset` seeds one at build and the
+// launchpad writes others beside it, so the table is the only place both can
+// meet. tags are a flat `{"k": "v"}` map, null on every run written before
+// this and on every run that carries none — which is not the same as `{}` on
+// the wire, but is the same thing to read.
+const SCHEMA_V12: &str = r#"
+CREATE TABLE presets (
+    job TEXT NOT NULL,
+    name TEXT NOT NULL,
+    params TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (job, name)
+);
+ALTER TABLE runs ADD COLUMN tags TEXT;
+"#;
+
+const SCHEMA_VERSION: u32 = 12;
 
 // one transaction around every pending step and the version stamp (sqlite DDL
 // is transactional), so a crash mid-migration leaves the db exactly as found
@@ -279,6 +297,9 @@ fn migrate(conn: &mut Connection) -> Result<(), Error> {
     }
     if version < 11 {
         tx.execute_batch(SCHEMA_V11)?;
+    }
+    if version < 12 {
+        tx.execute_batch(SCHEMA_V12)?;
     }
     if version != SCHEMA_VERSION {
         tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
@@ -709,6 +730,55 @@ impl Store {
         )?;
         let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, ts_col(r, 2)?)))?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    /// every [preset](Preset) stored for `job`, by name.
+    pub fn presets(&self, job: &str) -> Result<Vec<Preset>, Error> {
+        let conn = self.0.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT job, name, params, created_at FROM presets WHERE job = ?1 ORDER BY name",
+        )?;
+        let rows = stmt.query_map(params![job], preset_from_row)?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    pub fn preset(&self, job: &str, name: &str) -> Result<Option<Preset>, Error> {
+        let conn = self.0.lock().unwrap();
+        let row = conn
+            .query_row(
+                "SELECT job, name, params, created_at FROM presets WHERE job = ?1 AND name = ?2",
+                params![job, name],
+                preset_from_row,
+            )
+            .optional()?;
+        Ok(row)
+    }
+
+    /// store `params` under `(job, name)`, replacing whatever was there.
+    ///
+    /// an upsert rather than an insert because a declared preset is seeded on
+    /// every start: the code that declares one owns its params, and a preset
+    /// the launchpad made under another name is nobody else's business.
+    /// `created_at` survives the rewrite, so a preset's age means when it first
+    /// appeared rather than when the process last booted.
+    pub fn put_preset(&self, job: &str, name: &str, params: &Value) -> Result<(), Error> {
+        let conn = self.0.lock().unwrap();
+        conn.execute(
+            "INSERT INTO presets (job, name, params, created_at) VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT (job, name) DO UPDATE SET params = excluded.params",
+            params![job, name, params.to_string(), Utc::now().to_rfc3339()],
+        )?;
+        Ok(())
+    }
+
+    /// returns false when there was no such preset.
+    pub fn delete_preset(&self, job: &str, name: &str) -> Result<bool, Error> {
+        let conn = self.0.lock().unwrap();
+        let n = conn.execute(
+            "DELETE FROM presets WHERE job = ?1 AND name = ?2",
+            params![job, name],
+        )?;
+        Ok(n > 0)
     }
 
     pub(crate) fn prune_ticks(&self, keep: usize) -> Result<(), Error> {
@@ -1520,6 +1590,15 @@ fn op_run_from_row(row: &Row) -> rusqlite::Result<OpRun> {
     })
 }
 
+fn preset_from_row(row: &Row) -> rusqlite::Result<Preset> {
+    Ok(Preset {
+        job: row.get(0)?,
+        name: row.get(1)?,
+        params: json_col(row, 2)?,
+        created_at: ts_col(row, 3)?,
+    })
+}
+
 fn event_from_row(row: &Row) -> rusqlite::Result<Event> {
     Ok(Event {
         seq: row.get(0)?,
@@ -2164,14 +2243,96 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("future.db");
         let path = path.to_str().unwrap();
-        phase1_db(path, 12);
+        phase1_db(path, 13);
         let err = Store::open(path).err().unwrap();
-        assert_eq!(err.to_string(), "db schema v12 is newer than this build");
+        assert_eq!(err.to_string(), "db schema v13 is newer than this build");
         let conn = Connection::open(path).unwrap();
         let version: u32 = conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 12);
+        assert_eq!(version, 13);
+    }
+
+    #[test]
+    fn v11_db_migrates_to_v12_keeping_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v11.db");
+        let path = path.to_str().unwrap();
+        // every batch up to v11, stamped 11: no presets table, no runs.tags
+        let conn = Connection::open(path).unwrap();
+        for batch in [
+            PHASE1_SCHEMA,
+            SCHEMA_V2,
+            SCHEMA_V3,
+            SCHEMA_V4,
+            SCHEMA_V5,
+            SCHEMA_V6,
+            SCHEMA_V7,
+            SCHEMA_V8,
+            SCHEMA_V9,
+            SCHEMA_V10,
+            SCHEMA_V11,
+        ] {
+            conn.execute_batch(batch).unwrap();
+        }
+        conn.pragma_update(None, "user_version", 11).unwrap();
+        drop(conn);
+
+        // the run planted by the phase-1 batch reads back, and presets start empty
+        let store = Store::open(path).unwrap();
+        assert_eq!(store.run("r1").unwrap().unwrap().status, RunStatus::Success);
+        assert!(store.presets("etl").unwrap().is_empty());
+        store
+            .put_preset("etl", "nightly", &json!({"days": 7}))
+            .unwrap();
+        drop(store);
+        let store = Store::open(path).unwrap();
+        assert_eq!(store.presets("etl").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn presets_are_stored_upserted_and_deleted_per_job() {
+        let store = Store::open(":memory:").unwrap();
+        assert!(store.presets("etl").unwrap().is_empty());
+        assert!(store.preset("etl", "nightly").unwrap().is_none());
+
+        store
+            .put_preset("etl", "nightly", &json!({"days": 7}))
+            .unwrap();
+        store
+            .put_preset("etl", "backfill", &json!({"days": 90}))
+            .unwrap();
+        // another job's preset of the same name is a different preset
+        store
+            .put_preset("other", "nightly", &json!({"days": 1}))
+            .unwrap();
+
+        let all = store.presets("etl").unwrap();
+        assert_eq!(
+            all.iter().map(|p| p.name.as_str()).collect::<Vec<_>>(),
+            ["backfill", "nightly"],
+            "presets come back sorted by name"
+        );
+        assert_eq!(all[1].params, json!({"days": 7}));
+        assert_eq!(
+            store.preset("other", "nightly").unwrap().unwrap().params,
+            json!({"days": 1})
+        );
+
+        // a rewrite replaces the params and keeps the age
+        let first = store.preset("etl", "nightly").unwrap().unwrap().created_at;
+        store
+            .put_preset("etl", "nightly", &json!({"days": 14}))
+            .unwrap();
+        let again = store.preset("etl", "nightly").unwrap().unwrap();
+        assert_eq!(again.params, json!({"days": 14}));
+        assert_eq!(again.created_at, first);
+        assert_eq!(store.presets("etl").unwrap().len(), 2);
+
+        assert!(store.delete_preset("etl", "nightly").unwrap());
+        assert!(!store.delete_preset("etl", "nightly").unwrap());
+        assert!(store.preset("etl", "nightly").unwrap().is_none());
+        assert!(store.preset("other", "nightly").unwrap().is_some());
     }
 
     #[test]

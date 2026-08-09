@@ -993,6 +993,28 @@ textarea.params-input::placeholder {
   font-size: 12px;
 }
 
+/* saving and deleting live with the editor, since what they store is what is in it */
+.preset-row {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  margin-top: 6px;
+}
+
+.preset-row input.filter-input {
+  width: 100%;
+}
+
+select.preset-select {
+  padding: 3px 8px;
+  border: 1px solid var(--hairline);
+  border-radius: 3px;
+  background: var(--surface);
+  color: var(--muted);
+  font: inherit;
+  font-size: 12px;
+}
+
 .live-row {
   display: flex;
   align-items: center;

@@ -27,6 +27,7 @@ const DEFAULT_ASSET_HISTORY: usize = 200;
 pub struct Hestan {
     jobs: Vec<Job>,
     schedules: Vec<Schedule>,
+    presets: Vec<(String, String, Value)>,
     assets: Vec<Asset>,
     multis: Vec<MultiAsset>,
     checks: Vec<AssetCheck>,
@@ -50,6 +51,7 @@ impl Default for Hestan {
         Hestan {
             jobs: Vec::new(),
             schedules: Vec::new(),
+            presets: Vec::new(),
             assets: Vec::new(),
             multis: Vec::new(),
             checks: Vec::new(),
@@ -276,6 +278,34 @@ impl Hestan {
         self.add_schedule(Schedule::new(job, cron_expr).tz(tz).params(params))
     }
 
+    /// declare a named parameter set for `job`, seeded into the store at
+    /// build. stackable.
+    ///
+    /// ```no_run
+    /// # use hestan::Hestan;
+    /// # use serde_json::json;
+    /// Hestan::new().preset("orders_etl", "nightly", json!({"region": "eu", "days": 1}));
+    /// ```
+    ///
+    /// presets are runtime data — the launchpad saves and deletes them too —
+    /// so a declared one is an **upsert**: it refreshes on every start, and a
+    /// preset made in the ui under another name is left alone. dropping the
+    /// declaration therefore leaves the stored preset behind; delete it from
+    /// the ui or with [`Store::delete_preset`](crate::Store::delete_preset).
+    ///
+    /// the params go through the job's op validators at build, exactly as a
+    /// [schedule's](Self::schedule_with) do, so a preset that could never
+    /// launch is [`Error::InvalidParams`] at startup rather than a 400 at 2am.
+    pub fn preset(
+        mut self,
+        job: impl Into<String>,
+        name: impl Into<String>,
+        params: Value,
+    ) -> Self {
+        self.presets.push((job.into(), name.into(), params));
+        self
+    }
+
     /// register an http source: build lowers it into a job named after the
     /// source, plus a schedule if `cron` was set.
     #[cfg(feature = "http")]
@@ -481,6 +511,19 @@ impl Hestan {
                     .with_catchup(s.catchup),
             );
         }
+        // and the same validators over declared presets: a preset that cannot
+        // launch is not worth storing, wherever it was declared
+        for (job, name, params) in &self.presets {
+            let Some(defined) = jobs.iter().find(|j| j.name() == job) else {
+                return Err(Error::UnknownJob(job.clone()));
+            };
+            if let Some((op, reason)) = defined.params_error(params) {
+                return Err(Error::InvalidParams {
+                    op,
+                    reason: format!("preset {name} on job {job}: {reason}"),
+                });
+            }
+        }
 
         let mut sensor_entries: Vec<SensorEntry> =
             self.sensors.into_iter().map(SensorEntry::user).collect();
@@ -509,6 +552,11 @@ impl Hestan {
         let store = Store::open(&self.db_path)?;
         store.fail_interrupted()?;
         store.sync_schedules(&schedules)?;
+        // seeded, not synced: the launchpad's presets share the table, so
+        // there is nothing here to sweep away
+        for (job, name, params) in &self.presets {
+            store.put_preset(job, name, params)?;
+        }
         store.prune_ticks(5000)?;
         let sensor_names: Vec<String> = sensor_entries.iter().map(|e| e.name.clone()).collect();
         store.sync_sensors(&sensor_names)?;
@@ -653,6 +701,89 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(run.status, RunStatus::Success);
+    }
+
+    // the same reasoning as a schedule's params, in the same place
+    #[tokio::test]
+    async fn declared_preset_params_are_validated_at_build() {
+        let good = json!({"days": 7});
+        let err = Hestan::new()
+            .job(windowed("report"))
+            .preset("report", "nightly", json!({"days": "many"}))
+            .db(":memory:")
+            .run_once("report", good.clone())
+            .await
+            .err()
+            .unwrap();
+        assert!(
+            matches!(err, Error::InvalidParams { ref op, .. } if op == "render"),
+            "{err}"
+        );
+        assert!(
+            err.to_string().contains("preset nightly on job report"),
+            "{err}"
+        );
+
+        let err = Hestan::new()
+            .job(windowed("report"))
+            .preset("ghost", "nightly", good.clone())
+            .db(":memory:")
+            .run_once("report", good.clone())
+            .await
+            .err()
+            .unwrap();
+        assert!(
+            matches!(err, Error::UnknownJob(ref j) if j == "ghost"),
+            "{err}"
+        );
+
+        let run = Hestan::new()
+            .job(windowed("report"))
+            .preset("report", "nightly", good.clone())
+            .db(":memory:")
+            .run_once("report", good)
+            .await
+            .unwrap();
+        assert_eq!(run.status, RunStatus::Success);
+    }
+
+    // a declared preset is seeded on every start; one made in the ui beside it
+    // is nobody else's business
+    #[tokio::test]
+    async fn a_declared_preset_upserts_without_clobbering_a_ui_made_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hestan.db");
+        let path = path.to_str().unwrap().to_string();
+        let boot = |days: u32| {
+            Hestan::new()
+                .job(windowed("report"))
+                .preset("report", "nightly", json!({"days": days}))
+                .db(path.clone())
+        };
+
+        boot(1)
+            .run_once("report", json!({"days": 1}))
+            .await
+            .unwrap();
+        let store = Store::open(&path).unwrap();
+        store
+            .put_preset("report", "by_hand", &json!({"days": 30}))
+            .unwrap();
+        drop(store);
+
+        // the declaration moved; the hand-made one did not
+        boot(7)
+            .run_once("report", json!({"days": 1}))
+            .await
+            .unwrap();
+        let store = Store::open(&path).unwrap();
+        let presets = store.presets("report").unwrap();
+        assert_eq!(
+            presets.iter().map(|p| p.name.as_str()).collect::<Vec<_>>(),
+            ["by_hand", "nightly"]
+        );
+        assert_eq!(presets[0].params, json!({"days": 30}));
+        assert_eq!(presets[1].params, json!({"days": 7}));
     }
 
     #[tokio::test]

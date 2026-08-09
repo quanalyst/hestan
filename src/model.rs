@@ -320,6 +320,20 @@ pub struct Run {
     pub scheduled_for: Option<DateTime<Utc>>,
 }
 
+/// a named parameter set stored against one job: what
+/// [`Hestan::preset`](crate::Hestan::preset) declares and what the launchpad
+/// saves. runtime data rather than part of the job definition — the ui creates
+/// and deletes them, and a declared one is only ever seeded — so it lives in
+/// the store beside the run log rather than on [`Job`](crate::Job).
+#[derive(Debug, Clone, Serialize)]
+pub struct Preset {
+    pub job: String,
+    pub name: String,
+    pub params: Value,
+    /// when the preset was first stored; a rewrite keeps it.
+    pub created_at: DateTime<Utc>,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct OpRun {
     pub run_id: String,

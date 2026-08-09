@@ -13,6 +13,7 @@
 - [scheduling](scheduling.md) — cron syntax, timezones, the durable cursor, missed-fire catch-up, pause/resume, ticks, and the scheduler loop.
 - [http sources](http-sources.md) — declarative REST pulls: the full `HttpSource` builder, fan-out, retry policy.
 - [notifications](notifications.md) — hooks: `on_failure`/`RunFailure`, `on_late`/`LateEvent`, the webhook and slack helpers.
+- [launching](launching.md) — presets, params schemas, run tags, subset launches, and cloning a past run.
 - [web ui](web-ui.md) — page-by-page tour of the embedded ui and how it draws status.
 - [http api](http-api.md) — every endpoint, parameter, response shape, and error code.
 - [storage](storage.md) — the sqlite schema, migrations, and crash recovery.

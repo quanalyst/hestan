@@ -230,7 +230,8 @@ the details live in [docs/](docs/README.md):
 [assets](docs/assets.md), [freshness](docs/freshness.md),
 [sensors](docs/sensors.md),
 [scheduling](docs/scheduling.md), [http sources](docs/http-sources.md),
-[notifications](docs/notifications.md), [the web ui](docs/web-ui.md),
+[notifications](docs/notifications.md), [launching](docs/launching.md),
+[the web ui](docs/web-ui.md),
 [the http api](docs/http-api.md), [storage](docs/storage.md),
 [embedding](docs/embedding.md), and [development](docs/development.md).
 release notes are in [CHANGELOG.md](CHANGELOG.md).

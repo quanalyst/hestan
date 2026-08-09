@@ -27,14 +27,27 @@ export async function get<T>(path: string): Promise<T> {
   return res.json() as Promise<T>;
 }
 
-export async function post<T>(path: string, body?: unknown): Promise<T> {
+async function send<T>(method: string, path: string, body: string | undefined): Promise<T> {
   const res = await fetch(path, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify(body ?? {}),
+    method,
+    headers: body === undefined ? undefined : { "content-type": "application/json" },
+    body,
   });
   if (!res.ok) throw new HttpError(res.status, path, await detail(res));
   return res.json() as Promise<T>;
+}
+
+export function post<T>(path: string, body?: unknown): Promise<T> {
+  return send<T>("POST", path, JSON.stringify(body ?? {}));
+}
+
+export function put<T>(path: string, body?: unknown): Promise<T> {
+  return send<T>("PUT", path, JSON.stringify(body ?? {}));
+}
+
+// no body at all: what a delete carries is its path
+export function del<T>(path: string): Promise<T> {
+  return send<T>("DELETE", path, undefined);
 }
 
 // immediate first call, then every `ms`; null calls once and does not repeat.

@@ -70,6 +70,14 @@ any op declares `.params::<P>()` the type name is shown above the editor; a
 launch the server rejects (a 400 from params validation) surfaces the
 server's message inline, and nothing is recorded.
 
+a job with stored [presets](launching.md#presets) shows a dropdown beside the
+launch button. picking one fills the editor rather than launching — the point
+of a stored parameter set is that it is a starting point you can still edit.
+inside the editor block, a name field with **save** stores whatever is in the
+editor under that name, and **delete** appears once the name matches a preset
+that exists. a preset the server refuses (it would not launch) reports inline
+and is not stored.
+
 the graph section draws the dag, columns laid out by longest dependency path.
 clicking a node opens the op inspector: deps and dependents, the retry
 budget, any per-attempt `timeout`, the [concurrency pool](concepts.md#concurrency-pools)

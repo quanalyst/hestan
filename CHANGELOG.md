@@ -2,6 +2,13 @@
 
 ## unreleased
 
+- **named parameter presets.** `Hestan::preset("orders_etl", "nightly", json!({..}))` declares one and the launchpad saves one, and both write the same row: `GET/PUT/DELETE /api/jobs/{name}/presets[/{preset}]`, plus `POST /api/jobs/{name}/runs {"preset": "nightly"}` to launch by name. what you want at 2am is "launch the one that works", not to retype json into a textarea
+- a declared preset is an **upsert**, not a sync. the code that declares one owns its params so a redeploy lands on the next start, and a preset saved in the ui beside it is left alone — which also means dropping the declaration leaves the row, since presets are runtime data and nothing sweeps them
+- validated **before** they are stored, at the endpoint and at build: declared presets go through the job's op validators exactly as a schedule's params do, and a preset that could never launch is a startup error or a 400 rather than a surprise the night you reach for it. naming both `preset` and `params` on a launch is a 400 — two answers to "what params" is one too many
+- the job page gains a preset dropdown beside the launch button. picking one fills the editor rather than launching, since the point of a stored set is that it is a starting point you can still edit; the editor block gains a name field with save and delete
+- new page: [docs/launching.md](docs/launching.md) — presets, params schemas, run tags, subset launches and cloning
+- schema v12: the `presets` table, plus `runs.tags` for the part that follows
+
 - **run keys make a sensor launch effectively-once.** `RunRequest::new("publish").params(..).key("2026-08-09")` launches at most once per key, ever, for that sensor: the loop skips a claimed key rather than launching it, and the tick counts it under `skipped`. sensors are at-least-once by design — a partial launch failure replays the whole batch and so does a failed cursor write — which is defensible, but it put deduplication on every caller
 - the key is claimed **in the same transaction that creates the run**, not before it and not with a delete on the failure path. a key recorded for a run that never launched drops that work forever and nobody notices, which is strictly worse than the duplicate a key exists to prevent; insert-then-delete leaves exactly that window open and a transaction does not. tested on the failure path, not only the happy one
 - effectively-once **per sensor**: keys are scoped to the name that used them, two sensors may use the same string for different things, and a keyless request is unchanged at-least-once. keys are never collected on their own — a daily-keyed sensor writes a row a day — so `retention_days(n)` prunes them on the same cutoff it prunes runs on
