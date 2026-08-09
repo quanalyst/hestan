@@ -1,7 +1,38 @@
 import { Link } from "react-router-dom";
 import Markdown from "./Markdown";
-import type { MetaTable, MetaValue, Metadata } from "./types";
+import type { Deltas, MetaDelta, MetaTable, MetaValue, Metadata } from "./types";
 import { fmtDataSize, fmtDuration, shortId } from "./util";
+
+// a real minus sign, and a sign on every delta: the monochrome ui has no
+// colour to carry direction, and colour alone would not carry it anyway
+const signed = (n: number, body: string) => (n === 0 ? "±" : n < 0 ? "−" : "+") + body;
+
+const absolute = (value: MetaValue, delta: number): string => {
+  if ("bytes" in value) return signed(delta, fmtDataSize(Math.abs(delta)));
+  if ("duration_secs" in value) return signed(delta, fmtDuration(Math.abs(delta) * 1000));
+  return signed(delta, Math.abs(delta).toLocaleString());
+};
+
+const percent = (pct: number): string => signed(pct, `${Math.abs(pct)}%`);
+
+// a size or a duration reads as a percentage — nobody wants "+48,000,000
+// bytes" — and a count reads as itself, since "+37" is the fact and "+3%" is
+// a derivation of it. whichever is not shown is on the hover
+function DeltaView({ value, delta }: { value: MetaValue; delta: MetaDelta }) {
+  const wantsPercent = "bytes" in value || "duration_secs" in value;
+  const usePercent = wantsPercent && delta.delta_pct !== null;
+  const shown = usePercent ? percent(delta.delta_pct!) : absolute(value, delta.delta);
+  const other = usePercent
+    ? absolute(value, delta.delta)
+    : delta.delta_pct === null
+      ? undefined
+      : percent(delta.delta_pct);
+  return (
+    <span className="mono muted meta-delta" title={other}>
+      {shown}
+    </span>
+  );
+}
 
 // a cell prints as itself when it is a string and as its json otherwise; a
 // null cell is the gap the source padded a short row with
@@ -110,7 +141,13 @@ function MetaValueView({ value }: { value: MetaValue }) {
   return <pre className="mono muted meta-block">{JSON.stringify(value.json, null, 2)}</pre>;
 }
 
-export default function MetaList({ metadata }: { metadata: Metadata }) {
+export default function MetaList({
+  metadata,
+  deltas = {},
+}: {
+  metadata: Metadata;
+  deltas?: Deltas;
+}) {
   const entries = Object.entries(metadata);
   if (entries.length === 0) return null;
   return (
@@ -119,6 +156,9 @@ export default function MetaList({ metadata }: { metadata: Metadata }) {
         <div key={name} className="meta-row">
           <span className="meta-name">{name}</span>
           <MetaValueView value={value} />
+          {/* a key with nothing to compare against shows nothing at all,
+              which is a different claim from having not moved */}
+          {deltas[name] && <DeltaView value={value} delta={deltas[name]} />}
         </div>
       ))}
     </div>

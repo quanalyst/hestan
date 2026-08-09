@@ -41,9 +41,9 @@ pub use io::{FileIo, Inline, IoKey, IoManager, IoResult};
 pub use job::{Graph, GraphBuilder, Job, JobBuilder};
 pub use model::{
     AssetCheckRow, Backfill, BackfillStatus, Catchup, CheckStatus, Event, EventKind, EventLevel,
-    Freshness, FreshnessRow, Materialization, OpRun, OpStatus, Overlap, Preset, Reclaim, Role, Run,
-    RunStatus, RunTags, ScheduleRow, SensorOutcome, SensorRow, SensorTick, Severity, Tick,
-    TickOutcome, Trigger, When,
+    Freshness, FreshnessRow, HistoryEntry, Materialization, OpRun, OpStatus, Overlap, Preset,
+    Reclaim, Role, Run, RunStatus, RunTags, ScheduleRow, SensorOutcome, SensorRow, SensorTick,
+    Severity, Tick, TickOutcome, Trigger, When,
 };
 pub use op::{InputError, META_TABLE_ROWS, Meta, MetaColumn, MetaTable, Op, OpCtx, OpResult};
 pub use partition::Partitions;

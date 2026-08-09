@@ -27,6 +27,7 @@ use crate::model::{
     AssetCheckRow, CheckStatus, Freshness, OpRun, OpStatus, RunStatus, RunTags, ScheduleRow,
     Trigger,
 };
+use crate::op;
 use crate::schedule;
 use crate::sensor::SensorState;
 
@@ -776,16 +777,19 @@ async fn asset_history(
         .materializations(&name, q.partition.as_deref(), limit)
         .map_err(internal)?
         .into_iter()
-        .map(|(m, changed)| {
+        .map(|e| {
             json!({
-                "id": m.id,
-                "partition": m.partition,
-                "fingerprint": m.fingerprint,
-                "changed": changed,
-                "inputs": m.inputs,
-                "run_id": m.run_id,
-                "built_at": m.built_at,
-                "metadata": m.metadata,
+                "id": e.mat.id,
+                "partition": e.mat.partition,
+                "fingerprint": e.mat.fingerprint,
+                "changed": e.changed,
+                "inputs": e.mat.inputs,
+                "run_id": e.mat.run_id,
+                "built_at": e.mat.built_at,
+                "metadata": e.mat.metadata,
+                // what moved since the build before this one, computed here
+                // so a row never costs the ui a second request
+                "deltas": op::deltas(e.mat.metadata.as_ref(), e.previous_metadata.as_ref()),
             })
         })
         .collect();
@@ -1445,6 +1449,29 @@ async fn get_run(
         .map_err(internal)?
         .ok_or_else(|| err(StatusCode::NOT_FOUND, format!("unknown run: {id}")))?;
     let ops = store.op_runs(&id).map_err(internal)?;
+    // what each op reported the last time this job ran it, so every row can
+    // say what moved without the ui going and fetching the history itself
+    let previous = store
+        .previous_op_metadata(&run.job, run.created_at, &run.id)
+        .map_err(internal)?;
+    let ops: Vec<Value> = ops
+        .iter()
+        .map(|o| {
+            json!({
+                "run_id": o.run_id,
+                "op": o.op,
+                "status": o.status,
+                "attempts": o.attempts,
+                "started_at": o.started_at,
+                "finished_at": o.finished_at,
+                "output": o.output,
+                "metadata": o.metadata,
+                "deltas": op::deltas(o.metadata.as_ref(), previous.get(&o.op)),
+                "error": o.error,
+                "pid": o.pid,
+            })
+        })
+        .collect();
     Ok(Json(json!({ "run": run, "ops": ops })))
 }
 
@@ -1493,7 +1520,7 @@ async fn static_ui(method: Method, uri: Uri) -> Response {
 mod tests {
     use super::*;
     use crate::model::{Run, RunStatus};
-    use crate::op::{Op, OpCtx};
+    use crate::op::{Meta, Op, OpCtx};
     use crate::schedule::Schedule;
     use crate::store::Store;
 
@@ -2673,6 +2700,136 @@ mod tests {
             .map(|o| o["op"].as_str().unwrap())
             .collect();
         assert_eq!(names, ["pages", "process[0]", "process[1]"]);
+    }
+
+    // a job whose op reports a row count taken from the run's params, so
+    // successive runs report successive numbers
+    fn counting_job() -> Job {
+        Job::builder("counter")
+            .op(Op::new("load", |ctx| async move {
+                let rows = ctx.params()["rows"].as_i64().unwrap_or(0);
+                ctx.meta("rows", Meta::count(rows as u64));
+                ctx.meta("note", "unchanged");
+                Ok(json!(rows))
+            }))
+            .build()
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_run_op_row_carries_what_moved_since_the_last_run_of_that_op() {
+        let st = state(vec![counting_job()]);
+        let deltas_of = |body: &Value| body["ops"][0]["deltas"].clone();
+
+        // the first run of all has nothing to compare against, and says so by
+        // reporting no delta rather than a zero
+        let first = st
+            .runner
+            .run("counter", json!({"rows": 1_203}), Trigger::Manual)
+            .await
+            .unwrap();
+        let Json(body) = get_run(State(st.clone()), Path(first.id)).await.unwrap();
+        assert_eq!(body["ops"][0]["metadata"]["rows"], json!({"count": 1_203}));
+        assert_eq!(deltas_of(&body), json!({}));
+
+        let second = st
+            .runner
+            .run("counter", json!({"rows": 1_240}), Trigger::Manual)
+            .await
+            .unwrap();
+        let Json(body) = get_run(State(st.clone()), Path(second.id.clone()))
+            .await
+            .unwrap();
+        // the number that moved, and nothing about the text that did not
+        assert_eq!(
+            deltas_of(&body),
+            json!({"rows": {"delta": 37, "delta_pct": 3.08}})
+        );
+
+        // the row is otherwise exactly what it was: deltas sit beside the
+        // fields the ui already reads
+        let row = &body["ops"][0];
+        assert_eq!(row["op"], "load");
+        assert_eq!(row["status"], "success");
+        assert_eq!(row["output"], json!(1_240));
+        assert_eq!(row["error"], json!(null));
+        assert_eq!(row["pid"], json!(null));
+
+        // asking again gets the same answer: a run's deltas are against the
+        // run before it, not against whatever ran most recently
+        let third = st
+            .runner
+            .run("counter", json!({"rows": 1_000}), Trigger::Manual)
+            .await
+            .unwrap();
+        let Json(body) = get_run(State(st.clone()), Path(second.id)).await.unwrap();
+        assert_eq!(
+            deltas_of(&body),
+            json!({"rows": {"delta": 37, "delta_pct": 3.08}})
+        );
+        let Json(body) = get_run(State(st), Path(third.id)).await.unwrap();
+        assert_eq!(
+            deltas_of(&body),
+            json!({"rows": {"delta": -240, "delta_pct": -19.35}})
+        );
+    }
+
+    #[tokio::test]
+    async fn history_entries_carry_deltas_against_the_previous_build() {
+        let st = asset_state();
+        let store = st.runner.store().clone();
+        let meta =
+            |rows: i64, note: &str| json!({ "rows": {"count": rows}, "note": {"text": note} });
+        for (rows, note) in [(100, "a"), (150, "b"), (150, "b")] {
+            store
+                .record_materialization(
+                    "docs",
+                    None,
+                    "d1",
+                    &json!({}),
+                    None,
+                    None,
+                    Some(&meta(rows, note)),
+                )
+                .unwrap();
+        }
+        // and a build that reported the key as something else entirely
+        store
+            .record_materialization(
+                "docs",
+                None,
+                "d1",
+                &json!({}),
+                None,
+                None,
+                Some(&json!({"rows": {"text": "lots"}})),
+            )
+            .unwrap();
+
+        let Json(body) = asset_history(
+            State(st),
+            Path("docs".into()),
+            Ok(Query(HistoryQuery {
+                limit: None,
+                partition: None,
+            })),
+        )
+        .await
+        .unwrap();
+        let rows = body["materializations"].as_array().unwrap();
+        let seen: Vec<&Value> = rows.iter().map(|r| &r["deltas"]).collect();
+        assert_eq!(
+            seen,
+            [
+                // a type change is not a delta of any size
+                &json!({}),
+                // built again, reporting the same number
+                &json!({"rows": {"delta": 0, "delta_pct": 0}}),
+                &json!({"rows": {"delta": 50, "delta_pct": 50}}),
+                // the first build of all
+                &json!({}),
+            ]
+        );
     }
 
     #[tokio::test]

@@ -226,13 +226,15 @@ function RunView({ id }: { id: string }) {
 
   const dur = durationMs(run);
   const statuses: Record<string, OpStatus> = Object.fromEntries(ops.map((o) => [o.op, o.status]));
+  const selectedOp = opSel === null ? undefined : ops.find((o) => o.op === opSel);
   // an io handle points at where the value lives; anything else is the value
-  const selectedOutput = outputLine(ops.find((o) => o.op === opSel)?.output);
-  // what the op said about what it produced, rendered by type below the output
-  const selectedMeta = (opSel && ops.find((o) => o.op === opSel)?.metadata) || null;
+  const selectedOutput = outputLine(selectedOp?.output);
+  // what the op said about what it produced, rendered by type below the
+  // output, with what each number did since the last run of this op beside it
+  const selectedMeta = selectedOp?.metadata ?? null;
   // an isolated op carries the process it is running in, and only while it is:
   // the terminal write hands the pid back
-  const selectedPid = (opSel && ops.find((o) => o.op === opSel)?.pid) || null;
+  const selectedPid = selectedOp?.pid ?? null;
   const instances = fanOut(job, ops);
   const expanded = expansions(events);
   // a subset run (memoized asset build) writes no op_runs row for what it
@@ -387,7 +389,7 @@ function RunView({ id }: { id: string }) {
 
       {selectedMeta && (
         <div className="dag-action">
-          <MetaList metadata={selectedMeta} />
+          <MetaList metadata={selectedMeta} deltas={selectedOp?.deltas} />
         </div>
       )}
 

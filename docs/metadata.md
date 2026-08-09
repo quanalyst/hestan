@@ -157,6 +157,50 @@ escape — the version worth shipping.
 two attacks (`<img src=x onerror=...>`, `[x](javascript:alert(1))`) asserted
 against the exact string react renders.
 
+## Deltas
+
+what a build reported is worth less than what *changed*. hestan has
+materialization history and op-run history, so the api computes it: beside
+every numeric metadata value, what it did since the last time.
+
+```json
+{ "metadata": { "rows": {"count": 1240}, "size": {"bytes": 1152000000} },
+  "deltas":   { "rows": {"delta": 37, "delta_pct": 3.08},
+                "size": {"delta": -48000000, "delta_pct": -4} } }
+```
+
+**what it is compared against.** for an op run, the same op of the newest
+earlier run of that job; for a materialization, the previous build of that
+same `(asset, partition)`. an op run that reported no metadata at all is
+skipped rather than ending the search — a failed op records none, and one bad
+run between two good ones should not erase the comparison between them.
+
+**the rule.** `delta` is always the absolute change. `delta_pct` is reported
+only when the previous value was **100 or more in absolute value**: under a
+hundred, one unit is more than one percent, so the percentage says less than
+the number it came from and rounds to noise. that also disposes of a previous
+value of zero, which is the division that would otherwise have gone wrong.
+percentages are rounded to two decimals; whole numbers stay whole in the json.
+
+**what has no delta.** a key that is new, a key the previous build did not
+report, and a key that was something other than a number last time. those are
+absent from `deltas` entirely rather than carrying a zero: "did not move" and
+"nothing to compare against" are different facts, and only one of them is
+information. the [numeric types](#units-are-display-types-over-one-number) all
+compare against each other, so an op that starts reporting a size as
+`Meta::bytes` instead of `Meta::Int` keeps its history.
+
+**it is computed server-side**, in the run and history endpoints, so
+rendering a row never costs the ui a second request — and the number the ui
+prints is the number the api computed, not one the ui derived.
+
+**the ui shows one of the two.** a size or a duration reads as the percentage
+(`1.2 GB −4%`), a count or a plain number as itself (`1,240 +37`), and
+whichever is not shown is on the hover. the delta is muted, sits after the
+value, and always carries a sign — `+`, `−`, or `±` for a value that was
+measured and did not move. no colour: the ui is monochrome, and colour alone
+would be the wrong way to say it anyway.
+
 ## Staged like state
 
 `ctx.meta` buffers per attempt, exactly like
@@ -203,8 +247,8 @@ metadata for an identical value is still fresh.
 ## Where it shows up
 
 - `GET /api/runs/{id}` — each op row has `metadata`, null when the op
-  reported none.
-- `GET /api/assets/{name}/history` — each entry has `metadata`.
+  reported none, and `deltas` beside it.
+- `GET /api/assets/{name}/history` — each entry has `metadata` and `deltas`.
 - the run page renders the selected op's metadata by type: numbers
   right-aligned and tabular in their unit, urls as links, runs and assets as
   links into the ui, paths monospace, tables as tables, text inline, markdown

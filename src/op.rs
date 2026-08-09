@@ -371,6 +371,59 @@ impl From<Duration> for Meta {
     }
 }
 
+/// how large the previous value has to be before a percentage is reported
+/// beside the absolute change. under a hundred, one unit is more than one
+/// percent, so the percentage says less than the number it is derived from
+/// and rounds to noise; at a hundred and above it is the more useful of the
+/// two for a size or a duration.
+pub(crate) const DELTA_PCT_FLOOR: f64 = 100.0;
+
+/// the number a stored tagged value carries, if it is one of the numeric
+/// types. the store keeps json, so everything computing over metadata after
+/// the fact comes in through here.
+fn numeric(tagged: &Value) -> Option<f64> {
+    Meta::from_tagged(tagged)?.as_f64()
+}
+
+/// a whole number stays whole in the json: `37`, not `37.0`.
+fn number(n: f64) -> Value {
+    if n.fract() == 0.0 && n.abs() < 9e15 {
+        json!(n as i64)
+    } else {
+        json!((n * 100.0).round() / 100.0)
+    }
+}
+
+/// what changed, key by key, between one stored metadata map and the one the
+/// build before it reported:
+///
+/// ```json
+/// { "rows": {"delta": 37, "delta_pct": 3.08}, "size": {"delta": -48000000, "delta_pct": -4.0} }
+/// ```
+///
+/// a key appears only when **both** maps carry it as one of the numeric types
+/// — a key that is new, dropped, or whose type changed has no delta rather
+/// than a fake zero — and `delta_pct` is null under [`DELTA_PCT_FLOOR`].
+/// always an object, `{}` when nothing changed measurably, so the shape does
+/// not depend on the data.
+pub(crate) fn deltas(current: Option<&Value>, previous: Option<&Value>) -> Value {
+    let mut out = serde_json::Map::new();
+    if let (Some(Value::Object(current)), Some(Value::Object(previous))) = (current, previous) {
+        for (name, value) in current {
+            let (Some(now), Some(was)) = (numeric(value), previous.get(name).and_then(numeric))
+            else {
+                continue;
+            };
+            let pct = (was.abs() >= DELTA_PCT_FLOOR).then(|| number((now - was) / was * 100.0));
+            out.insert(
+                name.clone(),
+                json!({ "delta": number(now - was), "delta_pct": pct }),
+            );
+        }
+    }
+    Value::Object(out)
+}
+
 /// one attempt's staged metadata, keyed by name. a `BTreeMap` so the stored
 /// object's keys come out in a stable order.
 pub(crate) type MetaBuf = Arc<Mutex<BTreeMap<String, Meta>>>;
@@ -1680,6 +1733,95 @@ mod tests {
         ] {
             assert_eq!(meta.as_f64(), None, "{meta:?} reported a number");
         }
+    }
+
+    fn delta_of(now: Value, was: Value) -> Value {
+        deltas(Some(&json!({ "k": now })), Some(&json!({ "k": was })))
+    }
+
+    #[test]
+    fn a_delta_is_absolute_always_and_a_percentage_when_one_means_something() {
+        // a whole number stays whole, and the percentage rounds to two places
+        assert_eq!(
+            delta_of(json!({"count": 1_240}), json!({"count": 1_203})),
+            json!({"k": {"delta": 37, "delta_pct": 3.08}})
+        );
+        assert_eq!(
+            delta_of(
+                json!({"bytes": 1_152_000_000}),
+                json!({"bytes": 1_200_000_000})
+            ),
+            json!({"k": {"delta": -48_000_000, "delta_pct": -4}})
+        );
+        assert_eq!(
+            delta_of(json!({"float": 1.25}), json!({"float": 1.0})),
+            json!({"k": {"delta": 0.25, "delta_pct": null}})
+        );
+    }
+
+    // the rule, at the value it turns on: under a hundred one unit is more
+    // than a percent, so the percentage would say less than the number does
+    #[test]
+    fn the_percentage_rule_has_one_boundary() {
+        assert_eq!(
+            delta_of(json!({"int": 110}), json!({"int": 99})),
+            json!({"k": {"delta": 11, "delta_pct": null}})
+        );
+        assert_eq!(
+            delta_of(json!({"int": 110}), json!({"int": 100})),
+            json!({"k": {"delta": 10, "delta_pct": 10}})
+        );
+        // it is the size of the previous value, whichever way it points
+        assert_eq!(
+            delta_of(json!({"int": -50}), json!({"int": -100})),
+            json!({"k": {"delta": 50, "delta_pct": -50}})
+        );
+        // and zero can never have one, which is also the division that would
+        // have gone wrong
+        assert_eq!(
+            delta_of(json!({"count": 5}), json!({"count": 0})),
+            json!({"k": {"delta": 5, "delta_pct": null}})
+        );
+    }
+
+    #[test]
+    fn a_key_with_nothing_to_compare_against_gets_no_delta() {
+        let now = json!({
+            "rows": {"count": 10},
+            "fresh": {"count": 1},
+            "note": {"text": "hi"},
+            "was_text": {"count": 4},
+        });
+        let was = json!({
+            "rows": {"count": 4},
+            "gone": {"count": 9},
+            "note": {"text": "there"},
+            "was_text": {"text": "4"},
+        });
+        // only the key that was a number both times, and no fake zero for the
+        // ones that were not
+        assert_eq!(
+            deltas(Some(&now), Some(&was)),
+            json!({"rows": {"delta": 6, "delta_pct": null}})
+        );
+        // nothing before it at all: the first build of anything
+        assert_eq!(deltas(Some(&now), None), json!({}));
+        assert_eq!(deltas(None, Some(&was)), json!({}));
+        assert_eq!(deltas(None, None), json!({}));
+    }
+
+    // the units are display types over one number, so a build that started
+    // reporting bytes as bytes still compares against the int it used to be
+    #[test]
+    fn a_delta_crosses_the_numeric_types() {
+        assert_eq!(
+            delta_of(json!({"bytes": 300}), json!({"int": 200})),
+            json!({"k": {"delta": 100, "delta_pct": 50}})
+        );
+        assert_eq!(
+            delta_of(json!({"duration_secs": 3.5}), json!({"duration_secs": 3.0})),
+            json!({"k": {"delta": 0.5, "delta_pct": null}})
+        );
     }
 
     #[test]

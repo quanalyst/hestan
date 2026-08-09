@@ -184,7 +184,7 @@ for the entries whose fingerprint actually moved, the short fingerprint,
 when it happened, and a link to the run that built it (or `probe` for a
 source row, which no run wrote). anything a build reported with `ctx.meta`
 sits under its entry, rendered by type exactly as the run page renders an
-op's.
+op's — deltas included, against the previous build of that same partition.
 
 the panel's selection lives in the url — `/assets?asset=orders` opens that
 asset with its panel already open, which is what a `Meta::asset_ref` links to
@@ -287,6 +287,15 @@ rules, with everything outside that
 it was written as. the renderer parses to react elements and never to html, so
 markup in a metadata value is text on the page rather than markup in the dom,
 and a link is only ever made for an `http(s)` target.
+
+every number carries what it did since the last run of that op, muted and
+after the value: `1,240 +37` for a count, `1.2 GB −4%` for a size or a
+duration, with the other form on the hover and `±0` for something that was
+measured and did not move. the sign does the work rather than colour — the ui
+is monochrome — and a key with nothing to compare against shows nothing at
+all, which is a different claim from having not moved. the
+[delta rule](metadata.md#deltas) is computed by the api, so the page never
+fetches history to draw a row.
 
 the gantt chart plots each op run against elapsed time from the first op's
 start, with duration labels at the bar ends and a glyph in place of a bar for

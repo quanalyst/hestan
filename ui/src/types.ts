@@ -240,6 +240,19 @@ export type MetaValue =
 
 export type Metadata = Record<string, MetaValue>;
 
+// what a numeric metadata value did since the build before it: the absolute
+// change, and the percentage when the previous value was big enough for one
+// to mean anything (null under 100). computed server-side, so a row never
+// costs a request to render
+export interface MetaDelta {
+  delta: number;
+  delta_pct: number | null;
+}
+
+// keyed by metadata name. a key that is new, gone, or was something other
+// than a number last time is simply absent: no delta rather than a fake zero
+export type Deltas = Record<string, MetaDelta>;
+
 export interface OpRun {
   run_id: string;
   op: string;
@@ -250,6 +263,8 @@ export interface OpRun {
   output: unknown;
   // what the attempt that succeeded reported; null when it reported nothing
   metadata: Metadata | null;
+  // what moved since the previous run of this job's op
+  deltas: Deltas;
   error: string | null;
   // the child process an isolated op is running in right now; null once it has
   // finished, and for every op that runs in the orchestrator itself
@@ -405,6 +420,8 @@ export interface MaterializationEntry {
   built_at: string;
   // what the op that built it reported, the same map as its op run's
   metadata: Metadata | null;
+  // what moved since the previous build of this asset (and this partition)
+  deltas: Deltas;
 }
 
 export interface SensorTick {

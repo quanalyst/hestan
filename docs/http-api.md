@@ -392,6 +392,7 @@ needed to see a fan-out:
   "finished_at": "2026-08-07T12:00:03Z",
   "output": { "orders": 4, "revenue": 171.65, "enriched": 6 },
   "metadata": { "rows": {"int": 1234}, "source": {"url": "https://example.test/orders"} },
+  "deltas": { "rows": {"delta": 37, "delta_pct": 3.08} },
   "error": null,
   "pid": null
 }
@@ -405,6 +406,15 @@ tags are `int`, `float`, `text`, `url`, `markdown`, `json`, `table`, `bytes`,
 value as it is rather than guess, and no tag ever changes meaning. only the
 attempt that succeeded contributes: a failed attempt's metadata is discarded.
 see [metadata](metadata.md).
+
+`deltas` is what each **numeric** metadata value did since the newest earlier
+run of the same op of the same job, keyed by the same names: `delta` always,
+`delta_pct` only when the previous value was 100 or more in absolute value. a
+key that is new, that the previous run did not report, or that was not a
+number then is **absent** rather than carrying a zero, and the object is `{}`
+when nothing has a delta. it is computed here rather than in the client, so
+rendering a row costs no second request. see
+[deltas](metadata.md#deltas).
 
 a `table` carries its own shape, capped at 100 rows where it was built:
 
@@ -627,11 +637,12 @@ materializations, newest first (`limit` default 20, clamped to 1..=200):
   { "id": 412, "fingerprint": "9c01d2aa...", "changed": true,
     "inputs": { "docs_dir": "14a61f3c..." },
     "run_id": "019fe109-...", "built_at": "2026-08-08T11:01:36Z",
-    "metadata": { "files": {"int": 18} } },
+    "metadata": { "files": {"int": 18} },
+    "deltas": { "files": {"delta": 2, "delta_pct": null} } },
   { "id": 407, "fingerprint": "3bffef12...", "changed": false,
     "inputs": { "docs_dir": "14a61f3c..." },
     "run_id": "019fe0b2-...", "built_at": "2026-08-08T10:01:36Z",
-    "metadata": null }
+    "metadata": null, "deltas": {} }
 ] }
 ```
 
@@ -642,7 +653,9 @@ the entry just off the page rather than reported as a change. `run_id` is
 null on source rows, which probes write outside any run. no `value` here, as
 on `GET /api/assets`: these are the facts about a build, not its payload.
 `metadata` is what the op that built it reported, the same map its op run
-carries ([metadata](metadata.md)). 404 for an unknown asset.
+carries ([metadata](metadata.md)), and `deltas` is what each of its numbers
+did since the previous build **of that same partition** — the same shape and
+the same rule as on a run's op rows. 404 for an unknown asset.
 
 `history` and `checks` both take `partition=` to narrow to one key of a
 partitioned asset; without it they interleave every key by time, and each row

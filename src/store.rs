@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -11,8 +11,9 @@ use crate::error::Error;
 use crate::executor::{Blocked, InFlight, Limits, QUEUE_SCAN, Queued};
 use crate::model::{
     AssetCheckRow, Backfill, BackfillStatus, CheckStatus, Event, EventKind, EventLevel,
-    FreshnessRow, Materialization, OpRun, OpStatus, Preset, Reclaim, Run, RunCursor, RunStatus,
-    RunTags, ScheduleRow, SensorOutcome, SensorRow, SensorTick, Severity, Tick, TickOutcome,
+    FreshnessRow, HistoryEntry, Materialization, OpRun, OpStatus, Preset, Reclaim, Run, RunCursor,
+    RunStatus, RunTags, ScheduleRow, SensorOutcome, SensorRow, SensorTick, Severity, Tick,
+    TickOutcome,
 };
 use crate::schedule::Schedule;
 
@@ -1479,6 +1480,40 @@ impl Store {
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 
+    /// what each of `job`'s ops last reported, from the newest run before the
+    /// one named — the map a run's [deltas](crate::Meta) are computed against.
+    /// keyed by op name, so a fan-out instance (`fetch[0]`) compares against
+    /// the same instance of the previous run.
+    ///
+    /// rows with no metadata at all are skipped rather than ending the search:
+    /// a failed op records none, and one bad run between two good ones should
+    /// not erase the comparison between them. the ordering is `(created_at,
+    /// id)` and so is the cursor, so a run sharing a creation instant with
+    /// this one is still strictly before it.
+    pub fn previous_op_metadata(
+        &self,
+        job: &str,
+        before: DateTime<Utc>,
+        run_id: &str,
+    ) -> Result<HashMap<String, Value>, Error> {
+        let conn = self.0.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT op, metadata FROM (
+                 SELECT o.op AS op, o.metadata AS metadata,
+                        ROW_NUMBER() OVER (
+                            PARTITION BY o.op ORDER BY r.created_at DESC, r.id DESC
+                        ) AS rn
+                 FROM op_runs o JOIN runs r ON r.id = o.run_id
+                 WHERE r.job = ?1 AND o.metadata IS NOT NULL
+                   AND (r.created_at < ?2 OR (r.created_at = ?2 AND r.id < ?3))
+             ) WHERE rn = 1",
+        )?;
+        let rows = stmt.query_map(params![job, before.to_rfc3339(), run_id], |r| {
+            Ok((r.get(0)?, json_col(r, 1)?))
+        })?;
+        Ok(rows.collect::<Result<HashMap<_, _>, _>>()?)
+    }
+
     /// the state an op's last successful run committed, if any.
     pub fn op_state(&self, job: &str, op: &str) -> Result<Option<Value>, Error> {
         let conn = self.0.lock().unwrap();
@@ -1596,13 +1631,15 @@ impl Store {
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 
-    /// one asset's history, newest first, each entry paired with whether its
+    /// one asset's history, newest first, each entry carrying whether its
     /// fingerprint differs from the entry before it in time — which is what
-    /// turns a list of rebuilds into a list of changes. `partition` narrows it
-    /// to one key; `None` is every key of the asset, interleaved by time.
+    /// turns a list of rebuilds into a list of changes — and what that entry
+    /// reported, which is what the deltas beside its numbers are against.
+    /// `partition` narrows it to one key; `None` is every key of the asset,
+    /// interleaved by time.
     ///
-    /// the comparison runs over the whole history before the limit applies, so
-    /// the oldest entry on a page is compared against the entry just off it
+    /// both comparisons run over the whole history before the limit applies,
+    /// so the oldest entry on a page is compared against the entry just off it
     /// rather than reported as a change it isn't. the very first entry has
     /// nothing before it and counts as changed: nothing to something.
     pub fn materializations(
@@ -1610,24 +1647,30 @@ impl Store {
         asset: &str,
         partition: Option<&str>,
         limit: u32,
-    ) -> Result<Vec<(Materialization, bool)>, Error> {
+    ) -> Result<Vec<HistoryEntry>, Error> {
         let conn = self.0.lock().unwrap();
-        // the change flag is per partition: one key's rebuild says nothing
-        // about whether another key's fingerprint moved
+        // both look one row back within the partition: one key's rebuild says
+        // nothing about whether another key's fingerprint or row count moved
         let mut stmt = conn.prepare(
             "SELECT id, asset, partition, fingerprint, inputs, value, run_id, built_at,
-                    metadata, changed FROM (
+                    metadata, changed, previous_metadata FROM (
                  SELECT id, asset, partition, fingerprint, inputs, value, run_id, built_at,
                         metadata,
                         fingerprint IS NOT
                             LAG(fingerprint) OVER (PARTITION BY partition ORDER BY id)
-                            AS changed
+                            AS changed,
+                        LAG(metadata) OVER (PARTITION BY partition ORDER BY id)
+                            AS previous_metadata
                  FROM asset_materializations
                  WHERE asset = ?1 AND (?2 IS NULL OR partition IS ?2)
              ) ORDER BY id DESC LIMIT ?3",
         )?;
         let rows = stmt.query_map(params![asset, partition, limit], |r| {
-            Ok((materialization_from_row(r)?, r.get(9)?))
+            Ok(HistoryEntry {
+                mat: materialization_from_row(r)?,
+                changed: r.get(9)?,
+                previous_metadata: opt_json_col(r, 10)?,
+            })
         })?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
@@ -3311,7 +3354,10 @@ mod tests {
         assert_eq!(store.latest_materializations().unwrap().len(), 2);
         let carried = store.materializations("stats", None, 10).unwrap();
         assert_eq!(carried.len(), 1);
-        assert!(carried[0].1, "a carried row is that asset's first change");
+        assert!(
+            carried[0].changed,
+            "a carried row is that asset's first change"
+        );
 
         // and the same asset now appends rather than replacing
         record(&store, "stats", "f2");
@@ -3533,20 +3579,119 @@ mod tests {
         let history = store.materializations("stats", None, 10).unwrap();
         let seen: Vec<(&str, bool)> = history
             .iter()
-            .map(|(m, changed)| (m.fingerprint.as_str(), *changed))
+            .map(|e| (e.mat.fingerprint.as_str(), e.changed))
             .collect();
         // newest first; the oldest entry counts as a change from nothing
         assert_eq!(
             seen,
             [("f2", false), ("f2", true), ("f1", false), ("f1", true)]
         );
-        assert!(history.windows(2).all(|w| w[0].0.id > w[1].0.id));
+        assert!(history.windows(2).all(|w| w[0].mat.id > w[1].mat.id));
 
         // a page's oldest entry is compared with the entry just off it, not
         // reported as a change because the window cut its predecessor away
         let page = store.materializations("stats", None, 3).unwrap();
         assert_eq!(page.len(), 3);
-        assert!(!page[2].1, "the page edge invented a change");
+        assert!(!page[2].changed, "the page edge invented a change");
+    }
+
+    #[test]
+    fn history_carries_what_the_build_before_it_reported() {
+        let store = Store::open(":memory:").unwrap();
+        let meta = |rows: i64| json!({ "rows": { "count": rows } });
+        for (key, rows) in [(None, 10), (Some("k"), 400), (None, 14), (None, 21)] {
+            store
+                .record_materialization(
+                    "stats",
+                    key,
+                    "f",
+                    &json!({}),
+                    None,
+                    None,
+                    Some(&meta(rows)),
+                )
+                .unwrap();
+        }
+
+        let history = store.materializations("stats", None, 10).unwrap();
+        let seen: Vec<(Value, Option<Value>)> = history
+            .iter()
+            .map(|e| (e.mat.metadata.clone().unwrap(), e.previous_metadata.clone()))
+            .collect();
+        // each entry against the build before it *of its own partition*: the
+        // 400 belongs to key k and is nobody else's predecessor
+        assert_eq!(
+            seen,
+            [
+                (meta(21), Some(meta(14))),
+                (meta(14), Some(meta(10))),
+                (meta(400), None),
+                (meta(10), None),
+            ]
+        );
+
+        // and a page's oldest entry still sees the entry just off it
+        let page = store.materializations("stats", None, 1).unwrap();
+        assert_eq!(page[0].previous_metadata, Some(meta(14)));
+    }
+
+    #[test]
+    fn the_previous_metadata_of_an_op_skips_the_runs_that_reported_none() {
+        let store = Store::open(":memory:").unwrap();
+        let at = |n: i64| Utc.timestamp_opt(1_700_000_000 + n, 0).unwrap();
+        let meta = |rows: i64| json!({ "rows": { "int": rows } });
+        for (i, reported) in [Some(3), Some(5), None, None].into_iter().enumerate() {
+            let id = format!("r{i}");
+            let run = mk_run(&id, "etl", at(i as i64));
+            store
+                .create_run(&run, &["load".into(), "quiet".into()])
+                .unwrap();
+            store
+                .op_finished(
+                    &id,
+                    "load",
+                    OpStatus::Success,
+                    None,
+                    reported.map(meta).as_ref(),
+                    None,
+                )
+                .unwrap();
+        }
+        // another job's op of the same name says nothing about this one
+        let other = mk_run("x", "elsewhere", at(9));
+        store.create_run(&other, &["load".into()]).unwrap();
+        store
+            .op_finished("x", "load", OpStatus::Success, None, Some(&meta(999)), None)
+            .unwrap();
+
+        let now = mk_run("r9", "etl", at(9));
+        store.create_run(&now, &["load".into()]).unwrap();
+        let previous = store
+            .previous_op_metadata("etl", now.created_at, &now.id)
+            .unwrap();
+        // the last two runs recorded nothing, which is not the same as
+        // recording that there was nothing to say
+        assert_eq!(previous.get("load"), Some(&meta(5)));
+        // an op that has never reported anything has no entry at all
+        assert_eq!(previous.get("quiet"), None);
+
+        // strictly before, by (created_at, id): a run does not compare
+        // against itself, and the first run of all has nothing behind it
+        let r0 = store.run("r0").unwrap().unwrap();
+        assert!(
+            store
+                .previous_op_metadata("etl", r0.created_at, &r0.id)
+                .unwrap()
+                .is_empty()
+        );
+        let r1 = store.run("r1").unwrap().unwrap();
+        assert_eq!(
+            store
+                .previous_op_metadata("etl", r1.created_at, &r1.id)
+                .unwrap()
+                .get("load"),
+            Some(&meta(3))
+        );
     }
 
     #[test]
@@ -3564,7 +3709,7 @@ mod tests {
             .materializations("stats", None, 10)
             .unwrap()
             .into_iter()
-            .map(|(m, _)| m.fingerprint)
+            .map(|e| e.mat.fingerprint)
             .collect();
         assert_eq!(stats, ["f4", "f3"]);
         assert_eq!(store.materializations("docs", None, 10).unwrap().len(), 2);

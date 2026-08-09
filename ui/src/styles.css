@@ -907,6 +907,15 @@ button.text-btn.active {
   overflow-wrap: anywhere;
 }
 
+/* a fixed column at the right end, so the numbers above it still line up as
+   a column whether or not a row has one */
+.meta-delta {
+  flex: none;
+  min-width: 58px;
+  text-align: right;
+  font-size: 11px;
+}
+
 .meta-block {
   margin: 0;
   max-height: 140px;

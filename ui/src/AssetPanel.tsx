@@ -152,7 +152,7 @@ export default function AssetPanel({
               )}
             </div>
             {/* what that build reported, in the same gutter as the marker */}
-            {m.metadata && <MetaList metadata={m.metadata} />}
+            {m.metadata && <MetaList metadata={m.metadata} deltas={m.deltas} />}
           </div>
         ))
       )}

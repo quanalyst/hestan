@@ -1896,11 +1896,11 @@ mod tests {
         let history = store.materializations("a", None, 10).unwrap();
         let seen: Vec<(&str, bool)> = history
             .iter()
-            .map(|(m, changed)| (m.fingerprint.as_str(), *changed))
+            .map(|e| (e.mat.fingerprint.as_str(), e.changed))
             .collect();
         assert_eq!(seen, [("v2", true), ("v1", false), ("v1", true)]);
         // every entry names the run that built it, and they are distinct runs
-        assert!(history.iter().all(|(m, _)| m.run_id.is_some()));
+        assert!(history.iter().all(|e| e.mat.run_id.is_some()));
 
         // the latest entry is the current one, and it is the only one
         // staleness reads: b consumed v1 and a now says v2
@@ -2834,7 +2834,7 @@ mod tests {
         assert_eq!(history.len(), 2);
         // same value twice, so the second build is not a change
         assert_eq!(
-            history.iter().map(|(_, c)| *c).collect::<Vec<bool>>(),
+            history.iter().map(|e| e.changed).collect::<Vec<bool>>(),
             [false, true]
         );
         assert!(

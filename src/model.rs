@@ -502,6 +502,20 @@ pub struct Materialization {
     pub metadata: Option<Value>,
 }
 
+/// one entry of an asset's history as
+/// [`Store::materializations`](crate::Store::materializations) reads it: the
+/// build, and the two things only its neighbours can say about it.
+#[derive(Debug, Clone)]
+pub struct HistoryEntry {
+    pub mat: Materialization,
+    /// this build's fingerprint differs from the one before it in time, which
+    /// is the difference between having been rebuilt and having changed.
+    pub changed: bool,
+    /// what the build before it reported, for the same `(asset, partition)` —
+    /// what the deltas beside this entry's numbers are computed against.
+    pub previous_metadata: Option<Value>,
+}
+
 /// what a failing [`AssetCheck`](crate::AssetCheck) costs. `Error` — the
 /// default — fails the check's op, and so the run that produced the asset;
 /// `Warn` records the failure and lets the run carry on.
