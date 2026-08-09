@@ -68,3 +68,9 @@ required-features = ["http"]
 [[test]]
 name = "isolation"
 harness = false
+
+# and the queue's workers are this same binary started with a role, for the same
+# reason: one image, one registry, several processes
+[[test]]
+name = "queue"
+harness = false

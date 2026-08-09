@@ -41,7 +41,7 @@ pub use io::{FileIo, Inline, IoKey, IoManager, IoResult};
 pub use job::{Graph, GraphBuilder, Job, JobBuilder};
 pub use model::{
     AssetCheckRow, Backfill, BackfillStatus, Catchup, CheckStatus, Event, EventKind, EventLevel,
-    Freshness, FreshnessRow, Materialization, OpRun, OpStatus, Overlap, Preset, Reclaim, Run,
+    Freshness, FreshnessRow, Materialization, OpRun, OpStatus, Overlap, Preset, Reclaim, Role, Run,
     RunStatus, RunTags, ScheduleRow, SensorOutcome, SensorRow, SensorTick, Severity, Tick,
     TickOutcome, Trigger, When,
 };

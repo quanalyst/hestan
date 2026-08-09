@@ -1,4 +1,12 @@
-//! isolated ops: one attempt, one child process.
+//! isolated ops: one attempt, one **op subprocess**.
+//!
+//! an op subprocess is not a [queue worker](crate::Hestan::work), and the two
+//! are worth keeping apart in your head because both spawn processes and both
+//! used to be called workers. an op subprocess runs **one op of one run and
+//! exits**; it claims nothing, owns nothing, and its parent holds the retry
+//! policy, the pool permit and the clock. a queue worker is a **long-lived
+//! process that claims whole runs** off the queue and executes them. a queue
+//! worker spawns op subprocesses, exactly as any other hestan process does.
 //!
 //! the child is this same binary re-executed with two environment variables
 //! set. it rebuilds the same jobs because it runs the same `main`, and it
@@ -33,10 +41,10 @@ use crate::op::{self, Cancel, Op, OpCtx};
 use crate::resource::Resources;
 use crate::store::Store;
 
-/// the run a worker child is part of.
-pub(crate) const RUN_VAR: &str = "HESTAN_WORKER_RUN";
-/// the one op of it the child is there to run.
-pub(crate) const OP_VAR: &str = "HESTAN_WORKER_OP";
+/// the run an op subprocess is part of.
+pub(crate) const RUN_VAR: &str = "HESTAN_ISOLATED_RUN";
+/// the one op of it the subprocess is there to run.
+pub(crate) const OP_VAR: &str = "HESTAN_ISOLATED_OP";
 
 /// what the environment is asking this process to be.
 pub(crate) struct Request {
@@ -44,19 +52,20 @@ pub(crate) struct Request {
     pub(crate) op: String,
 }
 
-/// the worker request in this process's environment, if there is one.
+/// the op-subprocess request in this process's environment, if there is one.
 ///
-/// `serve`, `run_once` and `build_asset` ask this before they do anything else
-/// at all: a worker child that reached ordinary boot behaviour would run
-/// `fail_interrupted` and mark its own parent's in-flight runs as interrupted,
-/// mid-run.
+/// every entry point asks this before it does anything else at all — `serve`,
+/// `work`, `run_once`, `build_asset`. an op subprocess that reached ordinary
+/// boot behaviour would sync schedules, sweep, bind a listener and start
+/// claiming runs off the queue, none of which is its business: it is here to
+/// run one op.
 pub(crate) fn requested() -> Option<Request> {
     let run_id = std::env::var(RUN_VAR).ok()?;
     let op = std::env::var(OP_VAR).ok()?;
     (!run_id.is_empty() && !op.is_empty()).then_some(Request { run_id, op })
 }
 
-/// what a worker process did, which is what its exit code says.
+/// what an op subprocess did, which is what its exit code says.
 pub(crate) enum Worked {
     Success,
     Failed,
@@ -105,7 +114,7 @@ pub(crate) async fn attempt(
         Ok(child) => child,
         Err(e) => {
             return Ended::Failed(format!(
-                "could not start a worker process ({}): {e}",
+                "could not start an op subprocess ({}): {e}",
                 exe.display()
             ));
         }
@@ -142,7 +151,7 @@ pub(crate) async fn attempt(
     };
     let status = match exited {
         Ok(status) => status,
-        Err(e) => return Ended::Failed(format!("could not wait for the worker process: {e}")),
+        Err(e) => return Ended::Failed(format!("could not wait for the op subprocess: {e}")),
     };
     recorded(store, run_id, name).unwrap_or_else(|| Ended::Failed(no_result(op, &status)))
 }
@@ -157,7 +166,7 @@ fn recorded(store: &Store, run_id: &str, name: &str) -> Option<Ended> {
         Ok(row) => row?,
         Err(e) => {
             return Some(Ended::Failed(format!(
-                "could not read back what the worker process recorded: {e}"
+                "could not read back what the op subprocess recorded: {e}"
             )));
         }
     };
@@ -167,7 +176,7 @@ fn recorded(store: &Store, run_id: &str, name: &str) -> Option<Ended> {
             // unreachable: the child writes the status and the output in one
             // statement. saying so beats seeding downstream with nothing
             None => Some(Ended::Failed(
-                "the worker process recorded success without an output".to_string(),
+                "the op subprocess recorded success without an output".to_string(),
             )),
         },
         OpStatus::Failed => {
@@ -304,9 +313,9 @@ fn signal_name(sig: i32) -> &'static str {
 ///
 /// there is nothing here about being a subprocess: it loads what the op needs
 /// out of the store, calls the body once, and writes the result back. the
-/// parent owns the retry policy, the pool permit and the clock, so a worker
-/// runs one attempt and stops.
-pub(crate) async fn work(
+/// parent owns the retry policy, the pool permit and the clock, so an op
+/// subprocess runs one attempt and stops.
+pub(crate) async fn run_one_op(
     req: &Request,
     jobs: &[Job],
     store: &Store,
@@ -326,9 +335,9 @@ pub(crate) async fn work(
             run.job, req.op, req.run_id
         ))
     })?;
-    // a worker exists to contain an isolated op. anything else reaching here
-    // means parent and child disagree about the job, which is the one thing
-    // that must not pass quietly
+    // an op subprocess exists to contain an isolated op. anything else reaching
+    // here means parent and child disagree about the job, which is the one
+    // thing that must not pass quietly
     if !op.is_isolated() {
         return Err(Error::Graph(format!(
             "job {}: op {} is not .isolated() in this binary",

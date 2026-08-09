@@ -363,6 +363,48 @@ pub enum Reclaim {
 }
 str_enum!(Reclaim { Fail => "fail", Requeue => "requeue" });
 
+/// what a process does about the queue: decide what goes on it, take things
+/// off it, or both.
+///
+/// the split exists because the two halves have opposite multiplicities.
+/// **exactly one** process should own the schedules, the sensors, the freshness
+/// checks and the backfill chunking — those are decisions, and two processes
+/// deciding independently is two of every scheduled run. **any number** of
+/// processes may execute, which is the entire point of a claimable queue.
+///
+/// this is not [isolation](crate::Op::isolated), which is a different mechanism
+/// that also spawns processes: an op subprocess runs one op and exits, and a
+/// queue worker is a long-lived process that claims whole runs. a queue worker
+/// spawns op subprocesses like any other hestan process does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum Role {
+    /// decide and execute: one process doing everything, which is the default
+    /// and is right until it is not.
+    #[default]
+    All,
+    /// decide only. schedules, sensors, freshness and backfill chunking run
+    /// here; runs are enqueued and left for a worker.
+    Scheduler,
+    /// execute only. claims queued runs and runs them, and fires no schedule,
+    /// evaluates no sensor and chunks no backfill.
+    Worker,
+}
+str_enum!(Role { All => "all", Scheduler => "scheduler", Worker => "worker" });
+
+impl Role {
+    /// whether this process claims runs off the queue and executes them.
+    pub fn executes(&self) -> bool {
+        matches!(self, Role::All | Role::Worker)
+    }
+
+    /// whether this process owns the schedules, sensors, freshness checks and
+    /// backfill chunking — the loops that decide what runs.
+    pub fn decides(&self) -> bool {
+        matches!(self, Role::All | Role::Scheduler)
+    }
+}
+
 /// a named parameter set stored against one job: what
 /// [`Hestan::preset`](crate::Hestan::preset) declares and what the launchpad
 /// saves. runtime data rather than part of the job definition — the ui creates

@@ -13,7 +13,7 @@ use crate::executor::{FailureHook, Limits, RunFailure, Runner};
 use crate::freshness::{self, LateEvent, LateHook};
 use crate::io::{Io, IoManager};
 use crate::job::Job;
-use crate::model::{Reclaim, Run, RunTags, Trigger};
+use crate::model::{Reclaim, Role, Run, RunTags, Trigger};
 use crate::resource::{self, Resource, ResourceCtx, ResourceFn};
 use crate::schedule::{self, Schedule, ScheduleEntry};
 use crate::sensor::{RunStatusSensor, Sensor, SensorEntry, run_sensors};
@@ -46,6 +46,8 @@ pub struct Hestan {
     limits: Limits,
     priority: i64,
     reclaim: Reclaim,
+    role: Role,
+    slots: usize,
     retention_days: Option<u32>,
     asset_history: usize,
     #[cfg(feature = "http")]
@@ -74,6 +76,8 @@ impl Default for Hestan {
             limits: Limits::new(),
             priority: 0,
             reclaim: Reclaim::default(),
+            role: Role::default(),
+            slots: usize::MAX,
             retention_days: None,
             asset_history: DEFAULT_ASSET_HISTORY,
             #[cfg(feature = "http")]
@@ -196,6 +200,43 @@ impl Hestan {
     /// behind it is worse than starting things slightly out of turn.
     pub fn priority(mut self, n: i64) -> Self {
         self.priority = n;
+        self
+    }
+
+    /// what this process does about the queue: [`Role::All`] (the default,
+    /// and one process doing everything), [`Role::Scheduler`] (fires schedules
+    /// and sensors, executes nothing) or [`Role::Worker`] (executes, decides
+    /// nothing).
+    ///
+    /// **exactly one process** in a deployment should be `All` or `Scheduler`.
+    /// schedules, sensors, freshness checks and backfill chunking are
+    /// decisions, and two processes making them independently is two of every
+    /// scheduled run — the store has no lock that would stop it. any number of
+    /// processes may be `Worker`; that is what the queue is for.
+    ///
+    /// [`work`](Self::work) is `role(Role::Worker)` with the address made
+    /// optional, and is the shorter way to say the common thing.
+    ///
+    /// [`run_once`](Self::run_once) and [`build_asset`](Self::build_asset)
+    /// ignore this: a headless one-shot has to execute its own run or it would
+    /// return nothing.
+    pub fn role(mut self, role: Role) -> Self {
+        self.role = role;
+        self
+    }
+
+    /// how many runs **this process** will execute at once; unlimited unless
+    /// set, which is right for a single process and wrong for a worker beside
+    /// another.
+    ///
+    /// [`max_concurrent_runs`](Self::max_concurrent_runs) says how much work
+    /// the deployment does at once and lives in the store, shared. this says
+    /// how much of it lands here, and lives in this process. a worker with four
+    /// slots claims at most four runs however long the queue is, which is what
+    /// leaves the rest for the worker beside it — and what bounds what one
+    /// container has to hold.
+    pub fn slots(mut self, n: usize) -> Self {
+        self.slots = n.max(1);
         self
     }
 
@@ -466,13 +507,15 @@ impl Hestan {
         self
     }
 
+    /// run one job to completion and return it, with no ui and no loops. the
+    /// [role](Self::role) does not apply: a one-shot executes its own run.
     pub async fn run_once(self, job: &str, params: Value) -> Result<Run, Error> {
-        // the worker guard, first: see `serve`
+        // the op-subprocess guard, first: see `up`
         #[cfg(unix)]
         if let Some(req) = crate::isolate::requested() {
-            self.work(req).await
+            self.run_op_subprocess(req).await
         }
-        let built = self.build().await?;
+        let built = self.role(Role::All).build().await?;
         built.runner.run(job, params, Trigger::Manual).await
     }
 
@@ -480,12 +523,12 @@ impl Hestan {
     /// its stale ancestors plus the target, which always rebuilds. check
     /// `GET /api/assets` first if you only want to build when stale.
     pub async fn build_asset(self, name: &str) -> Result<Run, Error> {
-        // the worker guard, first: see `serve`
+        // the op-subprocess guard, first: see `up`
         #[cfg(unix)]
         if let Some(req) = crate::isolate::requested() {
-            self.work(req).await
+            self.run_op_subprocess(req).await
         }
-        let built = self.build().await?;
+        let built = self.role(Role::All).build().await?;
         let mats = mats_map(built.runner.store())?;
         let plan = plan_target(&built.registry, &mats, name)?;
         built
@@ -501,22 +544,56 @@ impl Hestan {
             .await
     }
 
+    /// run the ui and whatever loops this process's [role](Self::role) owns.
+    /// the default role is [`Role::All`] — one process doing everything, which
+    /// is right until it is not.
     pub async fn serve(self, addr: impl Into<SocketAddr>) -> Result<(), Error> {
+        let addr = addr.into();
+        self.up(Some(addr)).await
+    }
+
+    /// [`serve`](Self::serve) as a **queue worker**: it claims queued runs and
+    /// executes them, and fires no schedule, evaluates no sensor, checks no
+    /// freshness policy and chunks no backfill. exactly one process in a
+    /// deployment should own those, and `Hestan::serve` under
+    /// [`Role::Scheduler`] is that process.
+    ///
+    /// `addr` is optional because a worker has nothing to show: with `None` it
+    /// binds no socket at all. give it one and you get the same ui, which is
+    /// worth having for `/api/health` — that is where a worker says which runs
+    /// it is holding.
+    ///
+    /// this is [`role(Role::Worker)`](Self::role) with the addresses made
+    /// optional, exactly as [`schedule`](Self::schedule) is
+    /// [`add_schedule`](Self::add_schedule) with the defaults filled in.
+    ///
+    /// **not** [`Op::isolated`](crate::Op::isolated), which also spawns
+    /// processes: that spawns one op subprocess which runs a single op and
+    /// exits. this is a long-lived process that claims whole runs — and it
+    /// spawns op subprocesses itself, like any other hestan process.
+    pub async fn work(self, addr: Option<SocketAddr>) -> Result<(), Error> {
+        self.role(Role::Worker).up(addr).await
+    }
+
+    async fn up(self, addr: Option<SocketAddr>) -> Result<(), Error> {
         // before the address, before the store, before anything: this process
-        // may be a worker child of a hestan already running against this
-        // database, and every line of boot behaviour below assumes it owns the
-        // place. `fail_interrupted` alone would mark its own parent's in-flight
-        // runs as interrupted, mid-run. `work` never returns.
+        // may be an op subprocess of a hestan already running against this
+        // database, and every line of boot behaviour below assumes otherwise —
+        // it would sweep, sync schedules, bind a listener and start claiming
+        // runs, when it is here to run one op. `run_op_subprocess` never
+        // returns.
         #[cfg(unix)]
         if let Some(req) = crate::isolate::requested() {
-            self.work(req).await
+            self.run_op_subprocess(req).await
         }
-        let addr = addr.into();
+        let role = self.role;
         let built = self.build().await?;
         // bind before spawning the loops: a bind failure must not leave detached
         // tasks firing jobs into a server that never started
-        let listener = tokio::net::TcpListener::bind(addr).await?;
-        let scheduler = tokio::spawn(schedule::run_scheduler(built.entries, built.runner.clone()));
+        let listener = match addr {
+            Some(addr) => Some(tokio::net::TcpListener::bind(addr).await?),
+            None => None,
+        };
         let sensor_infos: Vec<SensorInfo> = built
             .sensor_entries
             .iter()
@@ -527,53 +604,78 @@ impl Hestan {
                 state: e.state.clone(),
             })
             .collect();
-        let sensors = tokio::spawn(run_sensors(
-            built.sensor_entries,
+        let mut loops = Vec::new();
+        if role.decides() {
+            loops.push(tokio::spawn(schedule::run_scheduler(
+                built.entries,
+                built.runner.clone(),
+            )));
+            loops.push(tokio::spawn(run_sensors(
+                built.sensor_entries,
+                built.runner.clone(),
+                built.registry.clone(),
+            )));
+            // the chunker: it launches each backfill's next range as the last
+            // one finishes, so a long backfill never fires every partition at
+            // once
+            loops.push(tokio::spawn(crate::backfill::run_backfills(
+                built.runner.clone(),
+                built.registry.clone(),
+            )));
+            loops.push(tokio::spawn(freshness::run_checker(
+                built.runner.clone(),
+                built.registry.clone(),
+                Arc::new(built.late_hooks),
+            )));
+        }
+        if role.executes() {
+            // the dispatcher: the queue's own loop. every launch pokes it and
+            // every run that finishes pokes it, so what this covers is the two
+            // things no local poke can — a run another process enqueued, and a
+            // limit that changed under a queue nobody is touching
+            loops.push(tokio::spawn(crate::executor::run_dispatcher(
+                built.runner.clone(),
+            )));
+        }
+        // the lease loop runs whatever the role is: a process holding nothing
+        // still notices a claimer that went away, and a deployment where only
+        // the dead process could have noticed would never notice
+        loops.push(tokio::spawn(crate::executor::run_leases(
             built.runner.clone(),
-            built.registry.clone(),
-        ));
-        // the chunker: it launches each backfill's next range as the last one
-        // finishes, so a long backfill never fires every partition at once
-        let backfills = tokio::spawn(crate::backfill::run_backfills(
-            built.runner.clone(),
-            built.registry.clone(),
-        ));
-        // the dispatcher: the queue's own loop. every launch pokes it and
-        // every run that finishes pokes it, so what this covers is the two
-        // things no local poke can — a run another process enqueued, and a
-        // limit that changed under a queue nobody is touching
-        let dispatcher = tokio::spawn(crate::executor::run_dispatcher(built.runner.clone()));
-        // the lease loop: this process saying it is still here, and noticing
-        // when another one stops saying it
-        let leases = tokio::spawn(crate::executor::run_leases(built.runner.clone()));
-        let checker = tokio::spawn(freshness::run_checker(
-            built.runner.clone(),
-            built.registry.clone(),
-            Arc::new(built.late_hooks),
-        ));
+        )));
+        let instance = built.runner.instance().to_string();
         let state = AppState {
             jobs: Arc::new(built.runner.jobs().clone()),
             runner: built.runner,
             assets: built.registry,
             sensors: Arc::new(sensor_infos),
         };
-        tracing::info!("hestan ui on http://{addr}");
-        let served = axum::serve(listener, router(state)).await;
-        scheduler.abort();
-        sensors.abort();
-        backfills.abort();
-        dispatcher.abort();
-        leases.abort();
-        checker.abort();
+        let served = match listener {
+            Some(listener) => {
+                let addr = addr.expect("a listener came from an address");
+                tracing::info!("hestan {role} {instance} on http://{addr}");
+                axum::serve(listener, router(state)).await
+            }
+            // a worker with no socket: the loops are the process, and there is
+            // nothing to serve them to
+            None => {
+                tracing::info!("hestan {role} {instance}, no listener");
+                std::future::pending().await
+            }
+        };
+        for handle in loops {
+            handle.abort();
+        }
         served?;
         Ok(())
     }
 
     /// the jobs this process runs, with http sources and assets lowered in.
     ///
-    /// the server path and the [worker](Self::work) path both go through here,
-    /// which is what makes "the child rebuilds the same registry" true rather
-    /// than hopeful: there is one lowering, and both processes run it.
+    /// the server path and the [op-subprocess](Self::run_op_subprocess) path
+    /// both go through here, which is what makes "the subprocess rebuilds the
+    /// same registry" true rather than hopeful: there is one lowering, and both
+    /// processes run it.
     fn lower(&mut self) -> Result<(Vec<Job>, Arc<AssetRegistry>), Error> {
         let mut jobs = std::mem::take(&mut self.jobs);
         #[cfg(feature = "http")]
@@ -622,25 +724,27 @@ impl Hestan {
         Ok((jobs, registry))
     }
 
-    /// the worker path: build the same registry the server path would, run one
-    /// op of one run, and exit — 0 for a success, 1 for anything else.
+    /// the op-subprocess path: build the same registry the server path would,
+    /// run one op of one run, and exit — 0 for a success, 1 for anything else.
     ///
     /// what is *not* here is the point of it. no `fail_interrupted`, no
     /// schedule sync, no tick prune, no retention sweep, no scheduler, sensor,
-    /// freshness or backfill loop, and no listener: every one of those assumes
-    /// this process owns the database, and a worker child owns nothing. it
-    /// opens the store, reads what its op was handed, runs it, and writes the
-    /// result back.
+    /// freshness or backfill loop, no dispatcher and no listener: this process
+    /// claims nothing and owns nothing. it opens the store, reads what its op
+    /// was handed, runs it, and writes the result back.
+    ///
+    /// not to be confused with [`work`](Self::work), the queue worker, which
+    /// is long-lived and claims whole runs.
     #[cfg(unix)]
-    async fn work(mut self, req: crate::isolate::Request) -> ! {
-        let code = match self.worked(req).await {
+    async fn run_op_subprocess(mut self, req: crate::isolate::Request) -> ! {
+        let code = match self.ran_op_subprocess(req).await {
             Ok(crate::isolate::Worked::Success) => 0,
             Ok(crate::isolate::Worked::Failed) => 1,
             // printed rather than traced: a worker whose store or registry is
             // wrong cannot record anything anywhere, and its stderr is its
             // parent's stderr
             Err(e) => {
-                eprintln!("hestan worker: {e}");
+                eprintln!("hestan op subprocess: {e}");
                 1
             }
         };
@@ -648,7 +752,7 @@ impl Hestan {
     }
 
     #[cfg(unix)]
-    async fn worked(
+    async fn ran_op_subprocess(
         &mut self,
         req: crate::isolate::Request,
     ) -> Result<crate::isolate::Worked, Error> {
@@ -656,7 +760,7 @@ impl Hestan {
         let resources = resource::build(std::mem::take(&mut self.resources)).await?;
         let store = Store::open(&self.db_path)?;
         let io = Io::new(self.io_default.take(), std::mem::take(&mut self.io_named));
-        crate::isolate::work(&req, &jobs, &store, &io, &resources).await
+        crate::isolate::run_one_op(&req, &jobs, &store, &io, &resources).await
     }
 
     async fn build(mut self) -> Result<Built, Error> {
@@ -754,7 +858,8 @@ impl Hestan {
         let runner = Runner::with_resources(jobs, store, self.hooks, self.pools, resources, io)?
             .with_run_tags(self.run_tags)
             .with_limits(self.limits, self.priority)
-            .with_reclaim(self.reclaim);
+            .with_reclaim(self.reclaim)
+            .with_role(self.role, self.slots);
         Ok(Built {
             runner,
             entries,
@@ -1003,13 +1108,12 @@ mod tests {
         assert_eq!(tags["kind"], "smoke");
     }
 
-    // the whole point of the worker guard: a child process must not run one
-    // line of boot behaviour. `fail_interrupted` assumes the last process died,
-    // so a worker that reached it would mark its own parent's in-flight runs as
-    // interrupted, mid-run.
+    // the whole point of the op-subprocess guard: a subprocess must not run one
+    // line of boot behaviour. it would sweep, sync schedules, and start
+    // claiming runs off the queue, when it is here to run one op of one run.
     #[cfg(unix)]
     #[tokio::test]
-    async fn a_worker_start_does_not_touch_the_runs_it_finds() {
+    async fn an_op_subprocess_does_not_touch_the_runs_it_finds() {
         use crate::model::{OpStatus, RunTags};
         use crate::op::Op;
 
@@ -1021,8 +1125,8 @@ mod tests {
             .build()
             .unwrap();
 
-        // a queued run for the worker, and one belonging to nobody it knows —
-        // which is exactly the shape of a parent's in-flight run
+        // a queued run for the op subprocess, and one belonging to nobody it
+        // knows — which is exactly the shape of a parent's in-flight run
         let store = Store::open(&path).unwrap();
         let planted = |id: &str| Run {
             id: id.to_string(),
@@ -1055,7 +1159,7 @@ mod tests {
             op: "quick".into(),
         };
         let mut app = Hestan::new().job(job).db(path.clone());
-        let worked = app.worked(req).await.unwrap();
+        let worked = app.ran_op_subprocess(req).await.unwrap();
         assert!(matches!(worked, crate::isolate::Worked::Success));
 
         let store = Store::open(&path).unwrap();
@@ -1077,8 +1181,8 @@ mod tests {
                 .status,
             OpStatus::Pending
         );
-        // including the run the worker did work for: its own status is its
-        // parent's business, not a worker's
+        // including the run it did the work for: that run's own status is its
+        // claimer's business, not an op subprocess's
         assert_eq!(
             store.run("mine").unwrap().unwrap().status,
             RunStatus::Queued
@@ -1087,7 +1191,7 @@ mod tests {
             let events = store.events(id, 0).unwrap();
             assert!(
                 !events.iter().any(|e| e.message.contains("interrupted")),
-                "worker announced an interruption on {id}: {:?}",
+                "an op subprocess announced an interruption on {id}: {:?}",
                 events.iter().map(|e| &e.message).collect::<Vec<_>>()
             );
         }

@@ -14,7 +14,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use hestan::prelude::*;
 use hestan::{OpRun, Runner, Store, Trigger};
 
-/// where every process in this test — the parent and each worker child it
+/// where every process in this test — the parent and each op subprocess it
 /// spawns — finds the run log. a deployment's `main` reads this out of its own
 /// config; a test has to hand it to its children somehow, and the environment
 /// is what children inherit.
@@ -25,12 +25,13 @@ fn main() {
         .enable_all()
         .build()
         .unwrap();
-    // a worker child lands here: same builder, same jobs, same database, and
-    // `serve` hands it to the worker path before it binds or recovers anything
-    if std::env::var_os("HESTAN_WORKER_RUN").is_some() {
-        let db = std::env::var(DB).expect("a worker child inherits the test database path");
+    // an op subprocess lands here: same builder, same jobs, same database, and
+    // `serve` hands it to the op-subprocess path before it binds, recovers or
+    // claims anything
+    if std::env::var_os("HESTAN_ISOLATED_RUN").is_some() {
+        let db = std::env::var(DB).expect("an op subprocess inherits the test database path");
         let _ = rt.block_on(app(&db).serve(([127, 0, 0, 1], 0)));
-        unreachable!("the worker guard exits the process before serve gets an address");
+        unreachable!("the op-subprocess guard exits before serve gets an address");
     }
 
     let dir = tempfile::tempdir().unwrap();
@@ -108,8 +109,8 @@ fn jobs() -> Vec<Job> {
             .op(Op::new("local", |ctx: OpCtx| async move { timed(&ctx).await }).pool("solo"))
             .build()
             .unwrap(),
-        // a child running beside one of its parent's own ops, which it must
-        // leave entirely alone
+        // an op subprocess running beside one of its parent's own ops, which it
+        // must leave entirely alone
         Job::builder("guarded")
             .op(Op::new("nap_local", |_| async {
                 tokio::time::sleep(Duration::from_millis(1_200)).await;
@@ -231,7 +232,7 @@ async fn cases(db: &str) {
     )
     .await;
     case(
-        "a_worker_child_leaves_its_parents_run_alone",
+        "an_op_subprocess_leaves_its_parents_run_alone",
         the_parents_run_is_untouched(&runner),
     )
     .await;
@@ -362,7 +363,7 @@ async fn the_parents_run_is_untouched(runner: &Runner) {
         .run("guarded", json!({}), Trigger::Manual)
         .await
         .unwrap();
-    // a child that reached boot recovery would have failed this very run,
+    // a subprocess that reached boot recovery would have failed this very run,
     // announced it, and skipped the op still napping beside it
     assert_eq!(run.status, RunStatus::Success, "{:?}", run.error);
     assert_eq!(run.error, None);
@@ -376,7 +377,7 @@ async fn the_parents_run_is_untouched(runner: &Runner) {
         .collect();
     assert!(
         announced.is_empty(),
-        "a worker child ran boot recovery on its own parent: {announced:?}"
+        "an op subprocess ran boot recovery on its own parent: {announced:?}"
     );
 }
 

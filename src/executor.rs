@@ -15,7 +15,7 @@ use crate::graph;
 use crate::io::{Io, IoKey, IoManager};
 use crate::job::Job;
 use crate::model::{
-    EventKind, EventLevel, OpRun, OpStatus, Reclaim, Run, RunStatus, RunTags, Trigger, When,
+    EventKind, EventLevel, OpRun, OpStatus, Reclaim, Role, Run, RunStatus, RunTags, Trigger, When,
     new_run_id,
 };
 use crate::op::{self, Cancel, MetaBuf, Op, OpCtx};
@@ -400,6 +400,10 @@ pub struct Runner {
     priority: i64,
     // what happens to a run whose claimer went quiet
     reclaim: Reclaim,
+    // what this process does about the queue at all
+    role: Role,
+    // how many runs this process will execute at once, whatever the queue holds
+    slots: usize,
     // one dispatch pass at a time in this process: two passes counting the same
     // free slot would both fill it
     dispatching: Arc<Mutex<()>>,
@@ -443,6 +447,8 @@ impl Runner {
             limits: Arc::new(Mutex::new(Limits::new())),
             priority: 0,
             reclaim: Reclaim::default(),
+            role: Role::default(),
+            slots: usize::MAX,
             dispatching: Arc::new(Mutex::new(())),
             settled: Arc::new(Notify::new()),
         }
@@ -476,6 +482,21 @@ impl Runner {
             priority,
             ..self
         }
+    }
+
+    /// what this process does about the queue, and how many runs it will
+    /// execute at once. `Hestan::role` and `Hestan::slots` are the way in.
+    pub fn with_role(self, role: Role, slots: usize) -> Runner {
+        Runner {
+            role,
+            slots: slots.max(1),
+            ..self
+        }
+    }
+
+    /// what this process does about the queue.
+    pub fn role(&self) -> Role {
+        self.role
     }
 
     /// what happens to a run this deployment loses track of.
@@ -793,6 +814,11 @@ impl Runner {
     /// executing rather than against a snapshot taken before this pass started
     /// filling it.
     pub(crate) fn dispatch(&self) {
+        // a process that does not execute has no business claiming: it enqueues
+        // and leaves the queue for whoever does
+        if !self.role.executes() {
+            return;
+        }
         // one pass at a time in this process: two passes counting the same free
         // slot would both fill it. across processes the store's claim does it,
         // which is the only place it can be done
@@ -800,6 +826,12 @@ impl Runner {
         let limits = self.limits.lock().unwrap().clone();
         let defined: HashSet<String> = self.jobs.keys().cloned().collect();
         loop {
+            // a worker takes what it can run, not what it can see. without this
+            // the first process to look claims the whole queue and the worker
+            // beside it has nothing to do
+            if self.active.lock().unwrap().len() >= self.slots {
+                return;
+            }
             match self
                 .store
                 .claim_next(self.claimer, LEASE, &limits, &defined)
@@ -3456,6 +3488,61 @@ mod tests {
                 .any(|e| e.message.contains("requeued for another claimer"))
         );
         assert_eq!(wait_terminal(&runner, "stalled").await, RunStatus::Success);
+    }
+
+    // ------------------------------------------------------------- the roles
+
+    // the split, in one process: what a scheduler leaves behind is a row, and
+    // what a worker does with it is everything else
+    #[tokio::test]
+    async fn a_scheduler_enqueues_and_a_worker_executes() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_, store) = file_store(&dir);
+        let scheduler =
+            Runner::new([sleepy_job("etl", 1)], store.clone()).with_role(Role::Scheduler, 1);
+
+        let id = scheduler.launch("etl", json!({}), Trigger::Manual).unwrap();
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        let queued = store.run(&id).unwrap().unwrap();
+        assert_eq!(
+            queued.status,
+            RunStatus::Queued,
+            "a scheduler executed a run"
+        );
+        assert_eq!(queued.claimed_by, None);
+        assert_eq!(scheduler.queue_depth().unwrap(), 1);
+
+        let worker = Runner::new([sleepy_job("etl", 1)], store.clone()).with_role(Role::Worker, 4);
+        worker.dispatch();
+        assert_eq!(wait_terminal(&worker, &id).await, RunStatus::Success);
+        assert_eq!(
+            store.run(&id).unwrap().unwrap().claimed_by.as_deref(),
+            Some(worker.instance())
+        );
+    }
+
+    // a worker takes what it can run rather than what it can see, which is the
+    // whole of why two of them share a queue instead of the first one taking it
+    #[tokio::test]
+    async fn slots_cap_what_one_process_claims_however_long_the_queue_is() {
+        let gate = Arc::new(AtomicBool::new(false));
+        let started = Arc::new(Mutex::new(Vec::new()));
+        let runner = Runner::new(
+            [gated("etl", gate.clone(), started.clone())],
+            Store::open(":memory:").unwrap(),
+        )
+        .with_role(Role::Worker, 2);
+
+        for n in ["a", "b", "c", "d", "e"] {
+            runner.launch("etl", who(n), Trigger::Manual).unwrap();
+        }
+        until("the slots filled", || order(&started).len() == 2).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(order(&started).len(), 2, "a worker claimed past its slots");
+        assert_eq!(runner.queue_depth().unwrap(), 3);
+
+        gate.store(true, Ordering::SeqCst);
+        until("the queue drained", || order(&started).len() == 5).await;
     }
 
     // a subset launch's seeds belong to an earlier run and live nowhere on this
