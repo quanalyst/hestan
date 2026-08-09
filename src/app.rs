@@ -2,6 +2,7 @@ use std::any::Any;
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use serde_json::Value;
 
@@ -16,6 +17,7 @@ use crate::job::Job;
 use crate::logs;
 use crate::model::{Reclaim, Role, Run, RunTags, Trigger};
 use crate::resource::{self, Resource, ResourceCtx, ResourceFn};
+use crate::retention::{self, Retention};
 use crate::schedule::{self, Schedule, ScheduleEntry};
 use crate::sensor::{RunStatusSensor, Sensor, SensorEntry, run_sensors};
 use crate::server::{AppState, SensorInfo, router};
@@ -49,7 +51,8 @@ pub struct Hestan {
     reclaim: Reclaim,
     role: Role,
     slots: usize,
-    retention_days: Option<u32>,
+    retention: Retention,
+    retention_every: Duration,
     asset_history: usize,
     log_bytes: u64,
     log_line_cap: u64,
@@ -81,7 +84,8 @@ impl Default for Hestan {
             reclaim: Reclaim::default(),
             role: Role::default(),
             slots: usize::MAX,
-            retention_days: None,
+            retention: Retention::default(),
+            retention_every: retention::DEFAULT_INTERVAL,
             asset_history: DEFAULT_ASSET_HISTORY,
             log_bytes: logs::DEFAULT_BYTES,
             log_line_cap: logs::DEFAULT_LINES,
@@ -489,12 +493,42 @@ impl Hestan {
         self
     }
 
-    /// at startup, delete terminal runs older than `days` days with their op runs,
-    /// events and captured output, plus [sensor run keys](crate::RunRequest::key)
+    /// how much history to keep, for every job that does not
+    /// [say otherwise](crate::JobBuilder::retention). the default keeps
+    /// everything.
+    ///
+    /// ```no_run
+    /// # use hestan::{Hestan, Retention};
+    /// Hestan::new().retention(Retention::days(30).keep_last(20).failed_days(90));
+    /// ```
+    ///
+    /// a sweep runs at startup and every
+    /// [`retention_interval`](Self::retention_interval) after it, in whichever
+    /// process [decides](crate::Role) — a worker must never prune, since the
+    /// history it would be deleting belongs to runs it does not own.
+    pub fn retention(mut self, retention: Retention) -> Self {
+        self.retention = retention;
+        self
+    }
+
+    /// delete terminal runs older than `days` days with their op runs, events
+    /// and captured output, plus [sensor run keys](crate::RunRequest::key)
     /// claimed before the same cutoff. active runs and op state survive; the
     /// default keeps everything, run keys included.
-    pub fn retention_days(mut self, days: u32) -> Self {
-        self.retention_days = Some(days);
+    ///
+    /// [`retention(Retention::days(days))`](Self::retention) said the short
+    /// way, and the short way is still right for the common case.
+    pub fn retention_days(self, days: u32) -> Self {
+        self.retention(Retention::days(days))
+    }
+
+    /// how often the retention sweep comes round; default one hour.
+    ///
+    /// it also runs at startup, which is all it ever used to do — and a server
+    /// that stays up for three months is exactly the deployment a retention
+    /// policy is for.
+    pub fn retention_interval(mut self, every: Duration) -> Self {
+        self.retention_every = every;
         self
     }
 
@@ -660,6 +694,12 @@ impl Hestan {
                 built.runner.clone(),
                 built.registry.clone(),
                 Arc::new(built.late_hooks),
+            )));
+            // the sweeper: what a policy set at boot means three months later
+            loops.push(tokio::spawn(retention::run_sweeper(
+                built.runner.clone(),
+                built.retention,
+                built.retention_every,
             )));
         }
         if role.executes() {
@@ -868,27 +908,12 @@ impl Hestan {
         for (job, name, params) in &self.presets {
             store.put_preset(job, name, params)?;
         }
-        store.prune_ticks(5000)?;
         let sensor_names: Vec<String> = sensor_entries.iter().map(|e| e.name.clone()).collect();
         store.sync_sensors(&sensor_names)?;
-        store.prune_sensor_ticks(5000)?;
         let trimmed = store.prune_materializations(self.asset_history)?;
         let trimmed = trimmed + store.prune_asset_checks(self.asset_history)?;
         if trimmed > 0 {
             tracing::info!("trimmed {trimmed} asset history rows past the cap");
-        }
-        if let Some(days) = self.retention_days {
-            let cutoff = chrono::Utc::now() - chrono::Duration::days(i64::from(days));
-            let removed = store.prune_runs(cutoff)?;
-            if removed > 0 {
-                tracing::info!("retention: removed {removed} runs older than {days} days");
-            }
-            // sensor run keys are never collected on their own: a sensor keyed
-            // by the day would keep a row per day for as long as the file lives
-            let keys = store.prune_sensor_run_keys(cutoff)?;
-            if keys > 0 {
-                tracing::info!("retention: removed {keys} sensor run keys older than {days} days");
-            }
         }
         let io = Io::new(self.io_default, self.io_named);
         let runner = Runner::with_resources(jobs, store, self.hooks, self.pools, resources, io)?
@@ -896,12 +921,17 @@ impl Hestan {
             .with_limits(self.limits, self.priority)
             .with_reclaim(self.reclaim)
             .with_role(self.role, self.slots);
+        // before anything new launches, and before the loop that takes it from
+        // here: a process that runs for an hour and exits should still tidy up
+        retention::sweep(&runner, &self.retention, chrono::Utc::now());
         Ok(Built {
             runner,
             entries,
             registry,
             sensor_entries,
             late_hooks: self.late_hooks,
+            retention: self.retention,
+            retention_every: self.retention_every,
         })
     }
 }
@@ -912,6 +942,8 @@ struct Built {
     registry: Arc<AssetRegistry>,
     sensor_entries: Vec<SensorEntry>,
     late_hooks: Vec<LateHook>,
+    retention: Retention,
+    retention_every: Duration,
 }
 
 #[cfg(test)]

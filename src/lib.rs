@@ -28,6 +28,7 @@ pub mod notify;
 mod op;
 mod partition;
 mod resource;
+mod retention;
 mod schedule;
 mod sensor;
 mod server;
@@ -55,6 +56,7 @@ pub use model::{
 pub use op::{InputError, META_TABLE_ROWS, Meta, MetaColumn, MetaTable, Op, OpCtx, OpResult};
 pub use partition::Partitions;
 pub use resource::ResourceCtx;
+pub use retention::Retention;
 pub use schedule::Schedule;
 pub use sensor::{RunRequest, RunStatusSensor, RunSummary, Sensor, SensorCtx};
 pub use store::Store;

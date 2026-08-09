@@ -17,6 +17,7 @@ use crate::model::{
     Severity, Tick, TickOutcome,
 };
 use crate::op;
+use crate::retention::Retention;
 use crate::schedule::Schedule;
 
 // `trigger` is a reserved word in sqlite, hence the quoted column name in
@@ -1338,35 +1339,77 @@ impl Store {
         Ok(())
     }
 
-    /// delete terminal runs created before `older_than`, with their op_runs,
-    /// events and captured output. active runs survive at any age — a
-    /// [reclaimed](Reclaim) run goes back to `queued` rather than terminal, so
-    /// what its first claimer captured is still there when the second one
-    /// finishes it — and op_state is never touched.
-    pub(crate) fn prune_runs(&self, older_than: DateTime<Utc>) -> Result<usize, Error> {
+    /// every job with a run in the log, however long ago and whether or not
+    /// this process still defines it.
+    ///
+    /// the recursive form is a loose index scan: each step is a seek into
+    /// `runs_job_created` for the next job name up, so this costs one seek per
+    /// *job* rather than one visit per run. `SELECT DISTINCT job` reads the
+    /// same answer off the same index by walking every entry in it, which on a
+    /// table with a year of runs in it is the sweep's whole cost.
+    pub(crate) fn run_jobs(&self) -> Result<Vec<String>, Error> {
+        let conn = self.0.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "WITH RECURSIVE names(job) AS (
+                 SELECT MIN(job) FROM runs
+                 UNION ALL
+                 SELECT (SELECT MIN(job) FROM runs WHERE job > names.job)
+                 FROM names WHERE job IS NOT NULL)
+             SELECT job FROM names WHERE job IS NOT NULL",
+        )?;
+        let rows = stmt.query_map([], |r| r.get(0))?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    /// delete what one job's [policy](Retention) says it may no longer keep,
+    /// with each run's op_runs, events and captured output.
+    ///
+    /// non-terminal runs survive at any age. a queued run older than the cutoff
+    /// is a queue problem and not a retention one, and a [reclaimed](Reclaim)
+    /// run is back on the queue rather than terminal, so what its first claimer
+    /// captured is still there when the second one finishes it. `op_state` is
+    /// never touched — a watermark outlives every run that wrote it.
+    ///
+    /// one transaction per job rather than one for the sweep: a run and its
+    /// children still go together, and a database with fifty jobs in it does
+    /// not hold the write lock for the length of all fifty.
+    pub(crate) fn prune_job_runs(
+        &self,
+        job: &str,
+        policy: &Retention,
+        now: DateTime<Utc>,
+    ) -> Result<usize, Error> {
+        let cutoffs = policy.cutoffs(now);
+        if !cutoffs.any() {
+            return Ok(0);
+        }
+        // a null cutoff is no age policy at all: every comparison against it is
+        // null, so nothing matches, which is the direction an absent setting
+        // has to mean. `keep_last` holds the newest finished runs back from
+        // whatever the age rule says — a run goes only when both would take it
+        const DOOMED: &str = "SELECT id FROM runs
+             WHERE job = ?1 AND status IN ('success', 'failed', 'canceled')
+               AND created_at < CASE status WHEN 'success' THEN ?2 ELSE ?3 END
+               AND id NOT IN (
+                   SELECT id FROM runs
+                   WHERE job = ?1 AND status IN ('success', 'failed', 'canceled')
+                   ORDER BY created_at DESC LIMIT ?4)";
         let mut conn = self.0.lock().unwrap();
         let tx = conn.transaction()?;
-        let cutoff = older_than.to_rfc3339();
-        const DOOMED: &str = "SELECT id FROM runs
-             WHERE status IN ('success', 'failed', 'canceled') AND created_at < ?1";
+        let args = params![
+            job,
+            cutoffs.success.map(|t| t.to_rfc3339()),
+            cutoffs.failed.map(|t| t.to_rfc3339()),
+            cutoffs.keep_last,
+        ];
         // children first: the transaction should make it moot, the order makes it true anyway
-        tx.execute(
-            &format!("DELETE FROM op_runs WHERE run_id IN ({DOOMED})"),
-            params![cutoff],
-        )?;
-        tx.execute(
-            &format!("DELETE FROM events WHERE run_id IN ({DOOMED})"),
-            params![cutoff],
-        )?;
-        tx.execute(
-            &format!("DELETE FROM op_logs WHERE run_id IN ({DOOMED})"),
-            params![cutoff],
-        )?;
-        let removed = tx.execute(
-            "DELETE FROM runs
-             WHERE status IN ('success', 'failed', 'canceled') AND created_at < ?1",
-            params![cutoff],
-        )?;
+        for table in ["op_runs", "events", "op_logs"] {
+            tx.execute(
+                &format!("DELETE FROM {table} WHERE run_id IN ({DOOMED})"),
+                args,
+            )?;
+        }
+        let removed = tx.execute(&format!("DELETE FROM runs WHERE id IN ({DOOMED})"), args)?;
         tx.commit()?;
         Ok(removed)
     }
@@ -2763,6 +2806,18 @@ mod tests {
         assert!(store.recent_op_runs("nope", 5).unwrap().is_empty());
     }
 
+    /// the whole-store sweep, for cases that are about one policy rather than
+    /// about which job got which. `retention::sweep` is the same walk with the
+    /// per-job overrides resolved.
+    fn prune(store: &Store, policy: &Retention) -> usize {
+        store
+            .run_jobs()
+            .unwrap()
+            .iter()
+            .map(|job| store.prune_job_runs(job, policy, Utc::now()).unwrap())
+            .sum()
+    }
+
     #[test]
     fn prune_runs_cascades_and_keeps_the_rest() {
         let store = Store::open(":memory:").unwrap();
@@ -2791,8 +2846,7 @@ mod tests {
             .set_op_state("etl", "a", &json!({"cursor": 9}))
             .unwrap();
 
-        let cutoff = Utc::now() - chrono::Duration::days(7);
-        assert_eq!(store.prune_runs(cutoff).unwrap(), 3);
+        assert_eq!(prune(&store, &Retention::days(7)), 3);
 
         for id in ["os", "of", "oc"] {
             assert!(store.run(id).unwrap().is_none());
@@ -2815,7 +2869,131 @@ mod tests {
             Some(json!({"cursor": 9}))
         );
 
-        assert_eq!(store.prune_runs(cutoff).unwrap(), 0);
+        assert_eq!(prune(&store, &Retention::days(7)), 0);
+    }
+
+    // the conservative direction, at the boundary and from both sides: a run
+    // is deleted only when the age rule and keep_last would both take it
+    #[test]
+    fn keep_last_and_the_age_cutoff_each_hold_a_run_the_other_would_delete() {
+        let store = Store::open(":memory:").unwrap();
+        for (id, age) in [("oldest", 30), ("older", 20), ("old", 10), ("new", 1)] {
+            let at = Utc::now() - chrono::Duration::days(age);
+            store
+                .create_run(&mk_run(id, "etl", at), &["a".into()])
+                .unwrap();
+            store.run_finished(id, RunStatus::Success, None).unwrap();
+        }
+
+        // keep_last holds two runs past an age cutoff that would take three
+        assert_eq!(prune(&store, &Retention::days(7).keep_last(3)), 1);
+        assert!(store.run("oldest").unwrap().is_none());
+        assert!(store.run("older").unwrap().is_some(), "keep_last let it go");
+
+        // and the age cutoff holds a run keep_last would drop: two of the three
+        // left are inside 15 days, and keep_last(1) does not reach them
+        assert_eq!(prune(&store, &Retention::days(15).keep_last(1)), 1);
+        assert!(store.run("older").unwrap().is_none());
+        assert!(
+            store.run("old").unwrap().is_some(),
+            "the age cutoff let it go"
+        );
+        assert!(store.run("new").unwrap().is_some());
+
+        // keep_last on its own is a protection, not a policy: with no age rule
+        // to hold anything back from, it deletes nothing at all
+        assert_eq!(prune(&store, &Retention::default().keep_last(1)), 0);
+        assert_eq!(
+            store.runs(None, None, None, None, None, 10).unwrap().len(),
+            2
+        );
+    }
+
+    #[test]
+    fn failed_days_keeps_a_failure_and_drops_a_success_of_the_same_age() {
+        let store = Store::open(":memory:").unwrap();
+        let old = Utc::now() - chrono::Duration::days(30);
+        for (id, status) in [
+            ("won", RunStatus::Success),
+            ("lost", RunStatus::Failed),
+            ("stopped", RunStatus::Canceled),
+        ] {
+            store
+                .create_run(&mk_run(id, "etl", old), &["a".into()])
+                .unwrap();
+            store.run_finished(id, status, None).unwrap();
+        }
+
+        assert_eq!(prune(&store, &Retention::days(7).failed_days(90)), 1);
+        assert!(store.run("won").unwrap().is_none());
+        // a cancel is not a success either: what you keep longer is what went
+        // wrong, and someone stopping a run is a thing that went wrong
+        assert!(store.run("lost").unwrap().is_some());
+        assert!(store.run("stopped").unwrap().is_some());
+
+        assert_eq!(prune(&store, &Retention::days(7).failed_days(14)), 2);
+    }
+
+    // a queued run older than the cutoff is a queue problem, not a retention
+    // one, and deleting it would take work nobody has done yet
+    #[test]
+    fn retention_never_takes_a_run_that_has_not_finished() {
+        let store = Store::open(":memory:").unwrap();
+        let old = Utc::now() - chrono::Duration::days(400);
+        for id in ["waiting", "working"] {
+            store
+                .create_run(&mk_run(id, "etl", old), &["a".into()])
+                .unwrap();
+        }
+        store.run_started("working").unwrap();
+
+        assert_eq!(prune(&store, &Retention::days(1).keep_last(0)), 0);
+        assert_eq!(
+            store.run("waiting").unwrap().unwrap().status,
+            RunStatus::Queued
+        );
+        assert_eq!(
+            store.run("working").unwrap().unwrap().status,
+            RunStatus::Running
+        );
+    }
+
+    // what makes the sweep affordable on a table with a year of runs in it:
+    // both halves are index seeks, and neither reads a run it is not about
+    #[test]
+    fn the_sweep_reaches_its_rows_through_the_index() {
+        let store = Store::open(":memory:").unwrap();
+        let conn = store.0.lock().unwrap();
+        let plan = |sql: &str| -> String {
+            let mut stmt = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
+            let rows = stmt
+                .query_map([], |r| r.get::<_, String>(3))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            rows.join(" | ")
+        };
+
+        // the jobs walk seeks once per job rather than reading every run
+        let jobs = plan(
+            "WITH RECURSIVE names(job) AS (
+                 SELECT MIN(job) FROM runs
+                 UNION ALL
+                 SELECT (SELECT MIN(job) FROM runs WHERE job > names.job)
+                 FROM names WHERE job IS NOT NULL)
+             SELECT job FROM names WHERE job IS NOT NULL",
+        );
+        assert!(jobs.contains("runs_job_created"), "{jobs}");
+        assert!(!jobs.contains("SCAN runs"), "{jobs}");
+
+        // and so does the walk to the doomed rows of one job
+        let doomed = plan(
+            "SELECT id FROM runs
+             WHERE job = 'etl' AND status IN ('success', 'failed', 'canceled')
+               AND created_at < '2026-01-01T00:00:00Z'",
+        );
+        assert!(doomed.contains("runs_job_created"), "{doomed}");
+        assert!(!doomed.contains("SCAN runs"), "{doomed}");
     }
 
     #[test]
@@ -2884,12 +3062,7 @@ mod tests {
             "half done",
         );
 
-        assert_eq!(
-            store
-                .prune_runs(Utc::now() - chrono::Duration::days(7))
-                .unwrap(),
-            1
-        );
+        assert_eq!(prune(&store, &Retention::days(7)), 1);
         assert!(
             store.op_logs("gone", None, 0, 100).unwrap().is_empty(),
             "orphan op_logs outlived their run"

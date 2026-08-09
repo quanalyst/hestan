@@ -7,6 +7,7 @@ use crate::error::Error;
 use crate::graph;
 use crate::model::Overlap;
 use crate::op::Op;
+use crate::retention::Retention;
 
 /// a validated dag of ops, built via [`Job::builder`].
 #[derive(Clone, Debug)]
@@ -19,6 +20,7 @@ pub struct Job {
     max_concurrent_runs: Option<usize>,
     overlap: Overlap,
     fresh_within: Option<Duration>,
+    retention: Option<Retention>,
     // every op's declared params schema merged into one, computed at build so
     // a disagreement between two ops is a build error rather than a summary
     // that quietly picks a winner
@@ -41,6 +43,7 @@ impl Job {
             max_concurrent_runs: None,
             overlap: Overlap::default(),
             fresh_within: None,
+            retention: None,
             error: None,
         }
     }
@@ -81,6 +84,13 @@ impl Job {
     /// `overdue` heuristic in charge.
     pub fn fresh_within(&self) -> Option<Duration> {
         self.fresh_within
+    }
+
+    /// how much of this job's history is kept, from
+    /// [`JobBuilder::retention`]. `None` leaves it to
+    /// [`Hestan::retention`](crate::Hestan::retention).
+    pub fn retention(&self) -> Option<Retention> {
+        self.retention
     }
 
     /// one object schema for the whole job's params: the
@@ -165,6 +175,7 @@ impl Job {
             max_concurrent_runs: None,
             overlap: Overlap::default(),
             fresh_within: None,
+            retention: None,
             params_schema,
             external,
         })
@@ -762,6 +773,7 @@ pub struct JobBuilder {
     max_concurrent_runs: Option<usize>,
     overlap: Overlap,
     fresh_within: Option<Duration>,
+    retention: Option<Retention>,
     error: Option<String>,
 }
 
@@ -844,6 +856,22 @@ impl JobBuilder {
         self
     }
 
+    /// how much of this job's history to keep, instead of whatever
+    /// [`Hestan::retention`](crate::Hestan::retention) says for everything
+    /// else. this is the whole policy for this job, not an addition to the
+    /// global one: an archive job that keeps a year says so here and is not
+    /// also subject to the fortnight the rest of the deployment runs on.
+    ///
+    /// ```no_run
+    /// # use hestan::{Job, Retention};
+    /// Job::builder("audit_export").retention(Retention::days(365).keep_last(50))
+    /// # ;
+    /// ```
+    pub fn retention(mut self, r: Retention) -> Self {
+        self.retention = Some(r);
+        self
+    }
+
     /// flattens any [`graph`](Self::graph) instances into ordinary ops, then
     /// validates the dag; fails on duplicate ops, unknown deps, or cycles.
     pub fn build(self) -> Result<Job, Error> {
@@ -869,6 +897,7 @@ impl JobBuilder {
             max_concurrent_runs: self.max_concurrent_runs,
             overlap: self.overlap,
             fresh_within: self.fresh_within,
+            retention: self.retention,
             params_schema,
             external: Vec::new(),
         })
