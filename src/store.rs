@@ -1465,6 +1465,15 @@ impl Store {
         Ok(())
     }
 
+    /// drop a table, so that every read touching it fails. a test proving a
+    /// control-plane read fails closed has no other way to break one.
+    #[cfg(test)]
+    pub(crate) fn drop_table(&self, name: &str) -> Result<(), Error> {
+        let conn = self.0.lock().unwrap();
+        conn.execute_batch(&format!("DROP TABLE {name}"))?;
+        Ok(())
+    }
+
     pub(crate) fn prune_sensor_ticks(&self, keep: usize) -> Result<(), Error> {
         let conn = self.0.lock().unwrap();
         conn.execute(

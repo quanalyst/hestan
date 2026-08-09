@@ -198,6 +198,15 @@ the old row (and its paused flag) is deleted, so the edited schedule comes
 back unpaused. editing only the timezone updates the existing row in place
 and preserves the flag.
 
+**the flag fails closed.** if the read that determines pause state fails, the
+pass fires nothing and moves no cursor, rather than treating an unreadable flag
+as unpaused. that is the only direction it can fail in: a missed occurrence is
+recoverable — the next pass's catch-up sees it, and honours the flag it can
+read by then — where a launch nobody asked for is not. the pass logs a warning
+and retries a second later. sensors do the same thing with theirs
+([sensors](sensors.md#pausing-ticks-sync)); launching itself is deliberately
+still at-least-once, and this is about the administrative switch only.
+
 ## Ticks
 
 every actual fire lands in a tick log: the `(job, expr)` pair, the instant

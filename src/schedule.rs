@@ -17,6 +17,10 @@ use crate::store::Store;
 /// least" rather than counted exactly.
 const MAX_MISSED_SCAN: usize = 10_000;
 
+/// how long a pass waits before trying the paused flag again, after a read of
+/// it failed. the pass fired nothing, so this is the whole cost of the retry.
+const CONTROL_READ_RETRY: Duration = Duration::from_secs(1);
+
 /// one schedule as the code declares it: which job, which cron expression, and
 /// the three things that used to be positional arguments.
 ///
@@ -177,15 +181,21 @@ pub(crate) fn upcoming_fires(
 
 /// the stored side of every schedule, keyed by `(job, expr)`: pause state and
 /// cursor, both of which can change under a running process.
-fn rows(store: &Store) -> HashMap<(String, String), ScheduleRow> {
+///
+/// `None` when the read failed. it used to be an empty map, which read as "no
+/// schedule is paused" — an administrative stop that fails open. the caller
+/// stops the pass instead: a missed occurrence is recoverable, since catch-up
+/// sees it on the next pass, and a launch nobody asked for is not.
+fn rows(store: &Store) -> Option<HashMap<(String, String), ScheduleRow>> {
     match store.schedules() {
-        Ok(rows) => rows
-            .into_iter()
-            .map(|r| ((r.job.clone(), r.expr.clone()), r))
-            .collect(),
+        Ok(rows) => Some(
+            rows.into_iter()
+                .map(|r| ((r.job.clone(), r.expr.clone()), r))
+                .collect(),
+        ),
         Err(e) => {
-            tracing::warn!("schedule read failed: {e}");
-            HashMap::new()
+            tracing::warn!("schedule read failed, holding every schedule this pass: {e}");
+            None
         }
     }
 }
@@ -378,7 +388,12 @@ pub(crate) async fn run_scheduler(mut entries: Vec<ScheduleEntry>, runner: Runne
     }
     loop {
         let now = Utc::now();
-        let stored = rows(runner.store());
+        // fail closed: a pass that cannot read the paused flag fires nothing
+        // and moves no cursor, rather than treating unknown as unpaused
+        let Some(stored) = rows(runner.store()) else {
+            tokio::time::sleep(CONTROL_READ_RETRY).await;
+            continue;
+        };
         // downtime first, then the backlog it may have just added to: both are
         // the same mechanism, and both are on disk before anything launches
         for entry in &entries {
@@ -431,7 +446,13 @@ pub(crate) async fn run_scheduler(mut entries: Vec<ScheduleEntry>, runner: Runne
             }
         }
         let now = Utc::now();
-        let stored = rows(runner.store());
+        // same again for the fires this pass is about to make: an occurrence
+        // left un-accounted for is one the next pass's catch-up will see, and
+        // catch-up honours the paused flag it can read by then
+        let Some(stored) = rows(runner.store()) else {
+            tokio::time::sleep(CONTROL_READ_RETRY).await;
+            continue;
+        };
         // two schedules on the same job sharing a tick fire one run, not two
         let mut fired: HashSet<String> = HashSet::new();
         for (t, job, expr, params) in fires {
@@ -527,6 +548,10 @@ mod tests {
     use chrono::Timelike;
     use serde_json::json;
     use std::sync::{Arc, Mutex};
+
+    fn stored(store: &Store) -> HashMap<(String, String), ScheduleRow> {
+        rows(store).expect("the schedules table is readable")
+    }
 
     fn echo_params_job(name: &str, seen: Arc<Mutex<Vec<serde_json::Value>>>) -> Job {
         Job::builder(name)
@@ -743,7 +768,7 @@ mod tests {
         let (_, now) = down_for(&store, 3, Catchup::Skip);
         let entry = hourly_entry("etl", Catchup::Skip);
 
-        catch_up(&entry, &runner, rows(&store).get(&entry.key()), now);
+        catch_up(&entry, &runner, stored(&store).get(&entry.key()), now);
 
         assert!(store.runs(None, None, None, None, 10).unwrap().is_empty());
         assert!(store.ticks(Some("etl"), 10).unwrap().is_empty());
@@ -753,7 +778,7 @@ mod tests {
         assert_eq!(cursor_of(&store), Some(now - chrono::Duration::minutes(30)));
 
         // and a second pass has nothing left to find
-        catch_up(&entry, &runner, rows(&store).get(&entry.key()), now);
+        catch_up(&entry, &runner, stored(&store).get(&entry.key()), now);
         assert!(store.runs(None, None, None, None, 10).unwrap().is_empty());
     }
 
@@ -764,7 +789,7 @@ mod tests {
         let (_, now) = down_for(&store, 3, Catchup::One);
         let entry = hourly_entry("etl", Catchup::One);
 
-        catch_up(&entry, &runner, rows(&store).get(&entry.key()), now);
+        catch_up(&entry, &runner, stored(&store).get(&entry.key()), now);
 
         let ten = now - chrono::Duration::minutes(30);
         let runs = store.runs(None, None, None, None, 10).unwrap();
@@ -786,7 +811,7 @@ mod tests {
         let entry = hourly_entry("etl", Catchup::All { limit: 10 });
         let at = |h: i64| now - chrono::Duration::minutes(30) - chrono::Duration::hours(h);
 
-        catch_up(&entry, &runner, rows(&store).get(&entry.key()), now);
+        catch_up(&entry, &runner, stored(&store).get(&entry.key()), now);
         // one launches now, the rest are on disk as held fires: catch-up
         // queues a backlog, it never starts three runs of one job at once
         let ticks = ticks_oldest_first(&store);
@@ -808,7 +833,7 @@ mod tests {
             drain_pending(
                 &[hourly_entry("etl", Catchup::All { limit: 10 })],
                 &runner,
-                &rows(&store),
+                &stored(&store),
             );
         }
         wait_idle(&store, "etl").await;
@@ -831,7 +856,7 @@ mod tests {
         let entry = hourly_entry("etl", Catchup::All { limit: 2 });
         let at = |h: i64| now - chrono::Duration::minutes(30) - chrono::Duration::hours(h);
 
-        catch_up(&entry, &runner, rows(&store).get(&entry.key()), now);
+        catch_up(&entry, &runner, stored(&store).get(&entry.key()), now);
 
         let ticks = ticks_oldest_first(&store);
         // six missed, two allowed: the four oldest are dropped, and the drop
@@ -871,7 +896,7 @@ mod tests {
         let (_, now) = down_for(&store, 1, Catchup::One);
         let entry = hourly_entry("etl", Catchup::One);
 
-        catch_up(&entry, &runner, rows(&store).get(&entry.key()), now);
+        catch_up(&entry, &runner, stored(&store).get(&entry.key()), now);
         wait_idle(&store, "etl").await;
 
         // the run launched at 10:30 for the 10:00 hour, and the op is told so:
@@ -911,7 +936,7 @@ mod tests {
             .unwrap();
         let entry = hourly_entry("etl", Catchup::One);
         let runner = crate::Runner::new([nap_job("etl", 5, Overlap::Queue)], store.clone());
-        catch_up(&entry, &runner, rows(&store).get(&entry.key()), now);
+        catch_up(&entry, &runner, stored(&store).get(&entry.key()), now);
         store
             .record_tick("etl", HOURLY, held, TickOutcome::Deferred, None, None)
             .unwrap();
@@ -936,13 +961,13 @@ mod tests {
         assert_eq!(cursor_of(&store), cursor, "the sync must not reset it");
 
         let entry = hourly_entry("etl", Catchup::One);
-        catch_up(&entry, &runner, rows(&store).get(&entry.key()), now);
+        catch_up(&entry, &runner, stored(&store).get(&entry.key()), now);
         assert!(
             store.runs(Some("etl"), None, None, None, 10).unwrap().len() <= 1,
             "the cursor already accounted for those occurrences"
         );
 
-        drain_pending(&[entry], &runner, &rows(&store));
+        drain_pending(&[entry], &runner, &stored(&store));
         wait_idle(&store, "etl").await;
         let held_run = store
             .runs(None, None, None, None, 10)
@@ -964,7 +989,7 @@ mod tests {
         store.set_schedule_paused("etl", HOURLY, true).unwrap();
         let entry = hourly_entry("etl", Catchup::All { limit: 10 });
 
-        catch_up(&entry, &runner, rows(&store).get(&entry.key()), now);
+        catch_up(&entry, &runner, stored(&store).get(&entry.key()), now);
 
         // pause means stop, including the catch-up: resuming must not fire a
         // week of backlog at whatever the schedule was paused for
@@ -1092,5 +1117,26 @@ mod tests {
             first,
             Some(Utc.with_ymd_and_hms(2026, 11, 1, 5, 30, 0).unwrap())
         );
+    }
+
+    #[tokio::test]
+    async fn an_unreadable_paused_flag_holds_every_schedule() {
+        let store = Store::open(":memory:").unwrap();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let runner = crate::Runner::new([echo_params_job("etl", seen.clone())], store.clone());
+        let entry = parse("etl", "* * * * * *", "UTC").unwrap();
+        // the paused flag lives in this table, so nothing can be read about it
+        store.drop_table("schedules").unwrap();
+
+        let sched = tokio::spawn(run_scheduler(vec![entry], runner));
+        tokio::time::sleep(Duration::from_millis(1800)).await;
+        sched.abort();
+
+        assert!(
+            store.runs(None, None, None, None, 10).unwrap().is_empty(),
+            "a paused flag nobody could read let a schedule fire"
+        );
+        assert!(seen.lock().unwrap().is_empty());
+        assert!(store.ticks(Some("etl"), 10).unwrap().is_empty());
     }
 }

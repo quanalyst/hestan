@@ -627,12 +627,16 @@ fn note_skipped_tick(runner: &Runner, name: &str) {
     }
 }
 
+/// whether the sensor is administratively stopped. a read that fails counts as
+/// paused: it used to count as running, which is a control-plane switch that
+/// fails open — the one direction it must not fail in. a turn not taken is
+/// recoverable, and a launch nobody asked for is not.
 fn sensor_paused(runner: &Runner, name: &str) -> bool {
     match runner.store().sensors() {
         Ok(rows) => rows.into_iter().any(|r| r.name == name && r.paused),
         Err(e) => {
-            tracing::warn!(sensor = %name, "sensor read failed: {e}");
-            false
+            tracing::warn!(sensor = %name, "sensor read failed, holding this turn: {e}");
+            true
         }
     }
 }
@@ -2206,5 +2210,42 @@ mod tests {
         let ticks = store.sensor_ticks(Some("broken"), 20).unwrap();
         assert_eq!(ticks.len() as u32, calls);
         assert!(ticks.iter().all(|t| t.outcome == SensorOutcome::Error));
+    }
+
+    #[tokio::test]
+    async fn an_unreadable_paused_flag_holds_the_sensor() {
+        let store = Store::open(":memory:").unwrap();
+        store.sync_sensors(&["watch".into()]).unwrap();
+        let runner = echo_runner(store.clone());
+        let calls = Arc::new(AtomicU32::new(0));
+        let counter = calls.clone();
+        let entry = SensorEntry::user(Sensor::new(
+            "watch",
+            Duration::from_millis(20),
+            move |_ctx: SensorCtx| {
+                let calls = counter.clone();
+                async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    Ok(vec![RunRequest::new("etl")])
+                }
+            },
+        ));
+        // the paused flag lives in this table, so nothing can be read about it
+        store.drop_table("sensors").unwrap();
+
+        let handle = tokio::spawn(run_sensors(
+            vec![entry],
+            runner,
+            Arc::new(AssetRegistry::empty()),
+        ));
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        handle.abort();
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "a paused flag nobody could read let the sensor fire"
+        );
+        assert!(store.runs(None, None, None, None, 10).unwrap().is_empty());
+        assert!(store.sensor_ticks(Some("watch"), 10).unwrap().is_empty());
     }
 }

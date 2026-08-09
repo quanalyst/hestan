@@ -238,6 +238,14 @@ unknown name). a paused sensor is not evaluated: no tick, no cursor
 movement. its schedule keeps ticking over regardless, so resuming picks up
 at the next interval rather than with a burst of catch-ups.
 
+**the flag fails closed.** a read of it that fails counts as paused, and the
+turn is held. it used to count as running, which is an administrative stop
+failing open — the one direction it must not fail in. a turn not taken is
+recoverable; a launch nobody asked for is not. schedules do the same with
+theirs ([scheduling](scheduling.md#pause-and-resume)). launching itself is
+deliberately still at-least-once: this is about the switch, not about making
+firing stricter.
+
 every evaluation of an unpaused sensor lands in `sensor_ticks`: outcome
 (`fired | error | skipped`), how many runs launched, how many keyed requests
 were skipped, the error message if any.
