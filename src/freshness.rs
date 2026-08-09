@@ -277,7 +277,7 @@ mod tests {
         };
         store.create_run(&run, &[]).unwrap();
         store
-            .run_finished(&run.id, RunStatus::Success, None, Utc::now())
+            .run_finished(&run.id, RunStatus::Success, None, Utc::now(), None)
             .unwrap();
         store.backdate_run(&run.id, at).unwrap();
     }

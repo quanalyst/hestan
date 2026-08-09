@@ -5,7 +5,7 @@ use std::time::Duration;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::executor::panic_payload;
+use crate::executor::{Runner, note, panic_payload};
 use crate::model::{OpStatus, RunStatus, Trigger};
 
 /// what an [`on_run_finished`](crate::Hestan::on_run_finished) hook receives:
@@ -151,6 +151,132 @@ pub(crate) fn fire_hooks<E: Clone + Send + 'static>(
     }
 }
 
+/// how often the delivery loop looks for work. a notification that waited five
+/// seconds is still an alert; polling harder would only cost reads against a
+/// table that is nearly always empty.
+const DELIVER_EVERY: Duration = Duration::from_secs(5);
+
+/// how many rows one pass takes. a cap rather than a preference: a hook that
+/// posts to a slow endpoint would otherwise hold the loop for as long as the
+/// backlog is, and the next pass is five seconds away.
+const DELIVER_BATCH: u32 = 50;
+
+/// how many attempts a notification gets before hestan stops trying.
+///
+/// with the growth below that is somewhere over two hours of retrying, which
+/// covers a restart of whatever is on the other end and does not cover a url
+/// that was wrong when it was typed. past it the row stays, failed, with the
+/// error that stopped it: giving up **loudly** is the whole difference from
+/// the best-effort dispatch this exists beside.
+const MAX_ATTEMPTS: u32 = 8;
+
+/// the first retry gap, doubled per attempt up to [`RETRY_MAX`] with full
+/// jitter — the same pacing an op's retries use, for the same reason: a
+/// hundred notifications for the same outage must not retry in lockstep.
+const RETRY_BASE: Duration = Duration::from_secs(10);
+const RETRY_MAX: Duration = Duration::from_secs(30 * 60);
+
+/// deliver whatever is due, and return how many rows were settled either way.
+///
+/// **at-least-once.** a crash between a hook returning and the row being
+/// marked delivered re-delivers on the next pass, because the alternative is
+/// marking first and losing the delivery instead — and of the two, a receiver
+/// seeing an alert twice is the one you can do something about. exactly-once
+/// needs the receiver's cooperation and hestan does not pretend to have it.
+pub(crate) async fn deliver_once(runner: &Runner, now: DateTime<Utc>) -> usize {
+    let store = runner.store();
+    let due = match store.due_notifications(now, DELIVER_BATCH) {
+        Ok(due) => due,
+        Err(e) => {
+            tracing::warn!("reading due notifications failed: {e}");
+            return 0;
+        }
+    };
+    let mut settled = 0;
+    for row in due {
+        let event: RunEvent = match serde_json::from_value(row.payload.clone()) {
+            Ok(event) => event,
+            // nothing will ever parse this, so retrying is a loop rather than
+            // a hope: give up on it now, with the reason on the row
+            Err(e) => {
+                let why = format!("payload is not a run event: {e}");
+                tracing::warn!(notification = row.id, "{why}");
+                note(store.delivery_failed(row.id, row.attempts, None, &why));
+                continue;
+            }
+        };
+        let hooks = runner.run_hooks(&event.job);
+        match deliver(&hooks, event).await {
+            Ok(()) => {
+                note(store.delivered(row.id, Utc::now()).map(|_| ()));
+                settled += 1;
+            }
+            Err(why) => {
+                let attempts = row.attempts + 1;
+                let next = (attempts < MAX_ATTEMPTS).then(|| {
+                    now + chrono::Duration::from_std(crate::backoff::jittered_exponential(
+                        RETRY_BASE,
+                        attempts - 1,
+                        RETRY_MAX,
+                    ))
+                    .unwrap_or(chrono::Duration::zero())
+                });
+                if next.is_none() {
+                    tracing::warn!(
+                        notification = row.id,
+                        "giving up after {attempts} attempts: {why}"
+                    );
+                }
+                note(store.delivery_failed(row.id, attempts, next, &why));
+                settled += 1;
+            }
+        }
+    }
+    settled
+}
+
+/// hand one event to every hook and wait for all of them.
+///
+/// waited on, unlike the best-effort dispatch: the loop has to know whether
+/// this row is delivered, and a hook that panics is how it is told the answer
+/// is no. one failure fails the row, so the hooks that did work will see the
+/// event again on the retry — which is what at-least-once means and why it is
+/// written down where the api is.
+async fn deliver(hooks: &[RunHook], event: RunEvent) -> Result<(), String> {
+    for hook in hooks {
+        let hook = hook.clone();
+        let event = event.clone();
+        // spawn_blocking for the same reason the other dispatch uses it: a
+        // hook is allowed to block outright, and doing that on an async worker
+        // would pin it
+        let ran = tokio::task::spawn_blocking(move || {
+            std::panic::catch_unwind(AssertUnwindSafe(|| hook(event)))
+        })
+        .await;
+        match ran {
+            Ok(Ok(())) => {}
+            Ok(Err(panic)) => {
+                return Err(panic_payload(panic.as_ref())
+                    .unwrap_or("hook panicked")
+                    .to_string());
+            }
+            Err(e) => return Err(format!("delivery task failed: {e}")),
+        }
+    }
+    Ok(())
+}
+
+/// the delivery loop: its own task, so nothing it waits on is anything a run
+/// waits on.
+pub(crate) async fn run_delivery(runner: Runner) {
+    let mut ticker = tokio::time::interval(DELIVER_EVERY);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        ticker.tick().await;
+        deliver_once(&runner, Utc::now()).await;
+    }
+}
+
 /// a duration on the wire is seconds. a float, because plenty of ops finish
 /// inside one and an integer would report every one of them as zero.
 mod maybe_secs {
@@ -192,7 +318,183 @@ mod secs {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::{DeliveryState, Run, RunTags};
+    use crate::store::Store;
+    use serde_json::json;
     use std::sync::Mutex;
+
+    /// a failed run with its notification, written the way the executor writes
+    /// them: one transaction, one row each.
+    fn plant(store: &Store, run_id: &str) {
+        let now = Utc::now();
+        store
+            .create_run(
+                &Run {
+                    id: run_id.to_string(),
+                    job: "etl".into(),
+                    status: RunStatus::Queued,
+                    trigger: Trigger::Schedule,
+                    params: json!({}),
+                    created_at: now,
+                    started_at: Some(now),
+                    finished_at: None,
+                    error: None,
+                    resumed_from: None,
+                    scheduled_for: None,
+                    tags: RunTags::new(),
+                    priority: 0,
+                    claimed_by: None,
+                    claimed_at: None,
+                    lease_until: None,
+                },
+                &["load".to_string()],
+            )
+            .unwrap();
+        let payload = serde_json::to_value(RunEvent {
+            run_id: run_id.to_string(),
+            job: "etl".into(),
+            trigger: Trigger::Schedule,
+            status: RunStatus::Failed,
+            failed_op: Some("load".into()),
+            error: Some("no good".into()),
+            started_at: Some(now),
+            finished_at: now,
+            duration: Some(Duration::from_secs(1)),
+        })
+        .unwrap();
+        store
+            .run_finished(run_id, RunStatus::Failed, None, now, Some(&payload))
+            .unwrap();
+    }
+
+    fn collector() -> (Arc<Mutex<Vec<RunEvent>>>, RunHook) {
+        let seen: Arc<Mutex<Vec<RunEvent>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = seen.clone();
+        (seen, Arc::new(move |e| sink.lock().unwrap().push(e)))
+    }
+
+    fn runner(store: Store, hook: RunHook) -> Runner {
+        Runner::new(Vec::new(), store)
+            .with_hooks(vec![hook], Vec::new())
+            .with_durable_notifications()
+    }
+
+    // the hole the whole part closes: the process that decided to send the
+    // alert did not survive to send it, and the next one does
+    #[tokio::test]
+    async fn a_notification_survives_a_restart_and_the_next_process_delivers_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hestan.db");
+        let path = path.to_str().unwrap();
+
+        // one process writes the run and dies with the alert unsent
+        let first = Store::open(path).unwrap();
+        plant(&first, "r1");
+        drop(first);
+
+        let (seen, hook) = collector();
+        let next = runner(Store::open(path).unwrap(), hook);
+        assert_eq!(deliver_once(&next, Utc::now()).await, 1);
+
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].run_id, "r1");
+        assert_eq!(seen[0].status, RunStatus::Failed);
+        assert_eq!(seen[0].failed_op.as_deref(), Some("load"));
+        assert_eq!(seen[0].error.as_deref(), Some("no good"));
+        assert_eq!(seen[0].duration, Some(Duration::from_secs(1)));
+        let rows = next.store().notifications(None, 10).unwrap();
+        assert_eq!(rows[0].state, DeliveryState::Delivered);
+    }
+
+    #[tokio::test]
+    async fn delivery_marks_exactly_once_in_the_happy_path() {
+        let store = Store::open(":memory:").unwrap();
+        plant(&store, "r1");
+        let (seen, hook) = collector();
+        let runner = runner(store, hook);
+
+        assert_eq!(deliver_once(&runner, Utc::now()).await, 1);
+        // nothing is due any more, so a second pass finds nothing to do
+        assert_eq!(deliver_once(&runner, Utc::now()).await, 0);
+        assert_eq!(seen.lock().unwrap().len(), 1);
+    }
+
+    // at-least-once, exercised rather than asserted: a crash between the hook
+    // returning and the mark landing re-delivers, and a hook has to be able to
+    // see the same event twice
+    #[tokio::test]
+    async fn a_crash_before_the_mark_delivers_the_same_event_again() {
+        let store = Store::open(":memory:").unwrap();
+        plant(&store, "r1");
+        let (seen, hook) = collector();
+        let runner = runner(store.clone(), hook);
+
+        deliver_once(&runner, Utc::now()).await;
+        let id = store.notifications(None, 10).unwrap()[0].id;
+        store.undeliver(id, Utc::now()).unwrap();
+
+        assert_eq!(deliver_once(&runner, Utc::now()).await, 1);
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 2, "the redelivery never happened");
+        assert_eq!(seen[0], seen[1]);
+        // and the second one settles it, so it does not go round forever
+        assert_eq!(
+            store.notifications(None, 10).unwrap()[0].state,
+            DeliveryState::Delivered
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failing_hook_retries_and_gives_up_loudly() {
+        let store = Store::open(":memory:").unwrap();
+        plant(&store, "r1");
+        let tries = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let counter = tries.clone();
+        let hook: RunHook = Arc::new(move |_| {
+            counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            panic!("the endpoint is down");
+        });
+        let runner = runner(store.clone(), hook);
+
+        // far enough forward each pass that whatever backoff was set is due
+        let mut now = Utc::now();
+        for attempt in 1..=MAX_ATTEMPTS {
+            assert_eq!(deliver_once(&runner, now).await, 1);
+            let row = &store.notifications(None, 10).unwrap()[0];
+            assert_eq!(row.attempts, attempt);
+            assert_eq!(row.last_error.as_deref(), Some("the endpoint is down"));
+            assert_eq!(
+                row.state,
+                if attempt < MAX_ATTEMPTS {
+                    DeliveryState::Pending
+                } else {
+                    DeliveryState::Failed
+                }
+            );
+            now += chrono::Duration::hours(2);
+        }
+
+        // given up on, and out of the loop's way rather than retried forever
+        assert_eq!(
+            tries.load(std::sync::atomic::Ordering::SeqCst),
+            MAX_ATTEMPTS
+        );
+        assert_eq!(deliver_once(&runner, now).await, 0);
+        assert_eq!(
+            tries.load(std::sync::atomic::Ordering::SeqCst),
+            MAX_ATTEMPTS
+        );
+        // and it stays visible, with what stopped it
+        let failed = store
+            .notifications(Some(DeliveryState::Failed), 10)
+            .unwrap();
+        assert_eq!(failed.len(), 1);
+        assert_eq!(
+            failed[0].last_error.as_deref(),
+            Some("the endpoint is down")
+        );
+    }
 
     fn event(status: RunStatus) -> RunEvent {
         RunEvent {

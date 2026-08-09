@@ -405,6 +405,44 @@ impl Role {
     }
 }
 
+/// where one [durable notification](crate::Hestan::durable_notifications) has
+/// got to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DeliveryState {
+    /// undelivered and due again; every row starts here.
+    Pending,
+    /// given up on after its attempts ran out, with `last_error` saying why.
+    /// nothing will retry it, which is the point of saying so out loud rather
+    /// than dropping it.
+    Failed,
+    Delivered,
+}
+str_enum!(DeliveryState {
+    Pending => "pending",
+    Failed => "failed",
+    Delivered => "delivered",
+});
+
+/// one queued notification: an event that has to reach a hook even if the
+/// process that recorded it does not survive to send it.
+#[derive(Debug, Clone, Serialize)]
+pub struct Notification {
+    pub id: i64,
+    /// which event shape `payload` holds; `run` today.
+    pub kind: String,
+    /// the event itself, as the hook will receive it.
+    pub payload: Value,
+    pub created_at: DateTime<Utc>,
+    pub attempts: u32,
+    /// when it is next due; `None` once nothing will try again.
+    pub next_attempt_at: Option<DateTime<Utc>>,
+    pub delivered_at: Option<DateTime<Utc>>,
+    /// what the last failed attempt said.
+    pub last_error: Option<String>,
+    pub state: DeliveryState,
+}
+
 /// a named parameter set stored against one job: what
 /// [`Hestan::preset`](crate::Hestan::preset) declares and what the launchpad
 /// saves. runtime data rather than part of the job definition — the ui creates

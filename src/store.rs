@@ -11,10 +11,10 @@ use crate::error::Error;
 use crate::executor::{Blocked, InFlight, Limits, QUEUE_SCAN, Queued};
 use crate::logs::{Attempt, Source};
 use crate::model::{
-    AssetCheckRow, Backfill, BackfillStatus, CheckStatus, Event, EventKind, EventLevel,
-    FreshnessRow, HistoryEntry, Materialization, MetaPoint, OpLog, OpRun, OpStatus, Preset,
-    Reclaim, Run, RunCursor, RunStatus, RunTags, ScheduleRow, SensorOutcome, SensorRow, SensorTick,
-    Severity, Tick, TickOutcome,
+    AssetCheckRow, Backfill, BackfillStatus, CheckStatus, DeliveryState, Event, EventKind,
+    EventLevel, FreshnessRow, HistoryEntry, Materialization, MetaPoint, Notification, OpLog, OpRun,
+    OpStatus, Preset, Reclaim, Run, RunCursor, RunStatus, RunTags, ScheduleRow, SensorOutcome,
+    SensorRow, SensorTick, Severity, Tick, TickOutcome,
 };
 use crate::op;
 use crate::retention::Retention;
@@ -329,7 +329,42 @@ CREATE TABLE op_logs (
 CREATE INDEX op_logs_run ON op_logs(run_id, op, id);
 "#;
 
-const SCHEMA_VERSION: u32 = 15;
+// notifications that have to survive the process that decided to send them.
+// opt-in with `Hestan::durable_notifications`, so on most databases this table
+// stays empty — an embedder using a hook to bump a metric wants a callback,
+// not a table and a delivery loop.
+//
+// the row is written in the same transaction as the run's terminal row, which
+// is the whole point: written after it, a crash in between loses the alert
+// about the failure the alert existed to report, and nothing anywhere records
+// that it should have been sent.
+//
+// `next_attempt_at` is when this row is next due and is what says which of the
+// three states it is in: set and undelivered is pending, **null** and
+// undelivered is given up on, and a delivery time is a delivery. so a row is
+// inserted due now rather than null, and the give-up clears it — which also
+// keeps a permanently failing notification out of the scan while leaving it
+// visible, with the error that stopped it.
+//
+// the partial index is the scan the delivery loop runs and nothing else: the
+// pending rows are a handful and the delivered ones are the table.
+const SCHEMA_V16: &str = r#"
+CREATE TABLE notifications (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    kind TEXT NOT NULL,
+    payload TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    attempts INTEGER NOT NULL DEFAULT 0,
+    next_attempt_at TEXT,
+    delivered_at TEXT,
+    last_error TEXT
+);
+CREATE INDEX notifications_due ON notifications(next_attempt_at)
+    WHERE delivered_at IS NULL;
+CREATE INDEX notifications_delivered ON notifications(delivered_at);
+"#;
+
+const SCHEMA_VERSION: u32 = 16;
 
 // one transaction around every pending step and the version stamp (sqlite DDL
 // is transactional), so a crash mid-migration leaves the db exactly as found
@@ -388,6 +423,9 @@ fn migrate(conn: &mut Connection) -> Result<(), Error> {
     if version < 15 {
         tx.execute_batch(SCHEMA_V15)?;
     }
+    if version < 16 {
+        tx.execute_batch(SCHEMA_V16)?;
+    }
     if version != SCHEMA_VERSION {
         tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     }
@@ -420,6 +458,15 @@ pub(crate) struct RunKey<'a> {
 /// two of them drifting apart is a real way to spend an afternoon.
 const RUN_COLS: &str = r#"id, job, status, "trigger", params, created_at, started_at, finished_at,
     resumed_from, error, scheduled_for, tags, priority, claimed_by, claimed_at, lease_until"#;
+
+/// every column [`notification_from_row`] reads, in the order it reads them.
+const NOTIFICATION_COLS: &str =
+    "id, kind, payload, created_at, attempts, next_attempt_at, delivered_at, last_error";
+
+/// what `notifications.kind` says about a row whose payload is a
+/// [`RunEvent`](crate::RunEvent). the column is there so a second event shape
+/// can join the table without a migration; today there is one.
+const RUN_NOTIFICATION: &str = "run";
 
 /// how long a write waits for another connection to let go of the file before
 /// giving up. an [isolated op](crate::Op::isolated) means two processes write
@@ -836,20 +883,31 @@ impl Store {
     /// by a process that vanished did not finish, and a row that says otherwise
     /// is what the next resume would build on. returns `(run id, the claimer
     /// that went away)` for each.
-    pub(crate) fn reclaim_expired(&self, policy: Reclaim) -> Result<Vec<(String, String)>, Error> {
+    /// `note` is asked for the [durable notification](Self::run_finished) each
+    /// failed run owes, and is handed the row as this transaction leaves it —
+    /// so a reclaimed run's alert is written with its terminal status exactly
+    /// as an ordinary one's is, rather than a statement later.
+    pub(crate) fn reclaim_expired(
+        &self,
+        policy: Reclaim,
+        note: impl Fn(&Run) -> Option<Value>,
+    ) -> Result<Vec<Run>, Error> {
         let mut conn = self.0.lock().unwrap();
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        let now = Utc::now().to_rfc3339();
-        let expired: Vec<(String, String)> = {
-            let mut stmt = tx.prepare(
-                "SELECT id, claimed_by FROM runs
+        let at = Utc::now();
+        let now = at.to_rfc3339();
+        let mut expired: Vec<Run> = {
+            let mut stmt = tx.prepare(&format!(
+                "SELECT {RUN_COLS} FROM runs
                  WHERE claimed_by IS NOT NULL AND status IN ('queued', 'running')
-                   AND (lease_until IS NULL OR lease_until < ?1)",
-            )?;
-            let rows = stmt.query_map(params![now], |r| Ok((r.get(0)?, r.get(1)?)))?;
+                   AND (lease_until IS NULL OR lease_until < ?1)"
+            ))?;
+            let rows = stmt.query_map(params![now], run_from_row)?;
             rows.collect::<Result<Vec<_>, _>>()?
         };
-        for (id, claimer) in &expired {
+        for run in &mut expired {
+            let id = run.id.clone();
+            let claimer = run.claimed_by.clone().unwrap_or_default();
             let why = format!("claimer went away: {claimer} stopped renewing its lease");
             tx.execute(
                 "UPDATE op_runs SET
@@ -873,21 +931,36 @@ impl Store {
                 params![id, level.as_str(), kind.as_str(), message, now],
             )?;
             match policy {
-                Reclaim::Fail => tx.execute(
-                    "UPDATE runs SET status = 'failed', finished_at = ?2, lease_until = NULL,
-                         error = COALESCE(error, ?3)
-                     WHERE id = ?1",
-                    params![id, now, why],
-                )?,
+                Reclaim::Fail => {
+                    tx.execute(
+                        "UPDATE runs SET status = 'failed', finished_at = ?2, lease_until = NULL,
+                             error = COALESCE(error, ?3)
+                         WHERE id = ?1",
+                        params![id, now, why],
+                    )?;
+                    run.status = RunStatus::Failed;
+                    run.finished_at = Some(at);
+                    run.lease_until = None;
+                    run.error.get_or_insert(why);
+                    if let Some(payload) = note(run) {
+                        queue_note(&tx, &payload, at)?;
+                    }
+                }
                 // back to exactly what an unclaimed queued run is: no owner, no
                 // lease, and no start time it turned out not to have had
-                Reclaim::Requeue => tx.execute(
-                    "UPDATE runs SET status = 'queued', claimed_by = NULL, claimed_at = NULL,
-                         lease_until = NULL, started_at = NULL
-                     WHERE id = ?1",
-                    params![id],
-                )?,
-            };
+                Reclaim::Requeue => {
+                    tx.execute(
+                        "UPDATE runs SET status = 'queued', claimed_by = NULL, claimed_at = NULL,
+                             lease_until = NULL, started_at = NULL
+                         WHERE id = ?1",
+                        params![id],
+                    )?;
+                    run.status = RunStatus::Queued;
+                    run.claimed_at = None;
+                    run.lease_until = None;
+                    run.started_at = None;
+                }
+            }
         }
         tx.commit()?;
         Ok(expired)
@@ -961,23 +1034,132 @@ impl Store {
 
     /// `error` is the run's own failure summary: the first op that terminally
     /// failed, named. `None` leaves any existing value alone.
+    ///
+    /// `note` is the [durable notification](Self::queue_notification) this
+    /// run's terminal event owes, and it goes in **this** transaction. that is
+    /// the whole of what durable delivery buys: written afterwards, a crash in
+    /// the gap leaves a failed run nothing ever alerted about and no record
+    /// that anything should have. `None` is every process that did not ask for
+    /// durable notifications, which is the default.
     pub(crate) fn run_finished(
         &self,
         id: &str,
         status: RunStatus,
         error: Option<&str>,
         at: DateTime<Utc>,
+        note: Option<&Value>,
     ) -> Result<(), Error> {
-        let conn = self.0.lock().unwrap();
+        let mut conn = self.0.lock().unwrap();
+        let tx = conn.transaction()?;
         // and the lease with it: there is nothing left to renew, and a run that
         // is over must never look reclaimable
-        conn.execute(
+        tx.execute(
             "UPDATE runs SET status = ?1, finished_at = ?2, error = COALESCE(?3, error),
                  lease_until = NULL
              WHERE id = ?4",
             params![status.as_str(), at.to_rfc3339(), error, id],
         )?;
+        if let Some(note) = note {
+            queue_note(&tx, note, at)?;
+        }
+        tx.commit()?;
         Ok(())
+    }
+
+    /// the undelivered notifications due at `now`, oldest first.
+    pub(crate) fn due_notifications(
+        &self,
+        now: DateTime<Utc>,
+        limit: u32,
+    ) -> Result<Vec<Notification>, Error> {
+        let conn = self.0.lock().unwrap();
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {NOTIFICATION_COLS} FROM notifications
+             WHERE delivered_at IS NULL AND next_attempt_at <= ?1
+             ORDER BY id LIMIT ?2"
+        ))?;
+        let rows = stmt.query_map(params![now.to_rfc3339(), limit], notification_from_row)?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    /// what `state` covers, newest first. `None` is all of them.
+    pub fn notifications(
+        &self,
+        state: Option<DeliveryState>,
+        limit: u32,
+    ) -> Result<Vec<Notification>, Error> {
+        let filter = match state {
+            None => "1 = 1",
+            Some(DeliveryState::Delivered) => "delivered_at IS NOT NULL",
+            Some(DeliveryState::Pending) => "delivered_at IS NULL AND next_attempt_at IS NOT NULL",
+            Some(DeliveryState::Failed) => "delivered_at IS NULL AND next_attempt_at IS NULL",
+        };
+        let conn = self.0.lock().unwrap();
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {NOTIFICATION_COLS} FROM notifications
+             WHERE {filter} ORDER BY id DESC LIMIT ?1"
+        ))?;
+        let rows = stmt.query_map(params![limit], notification_from_row)?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    /// mark one delivered. guarded on it not already being so, which is what
+    /// makes a second delivery loop unable to claim the same row twice —
+    /// though it says nothing about the *hook* having run twice, and hestan
+    /// promises at-least-once and no more.
+    pub(crate) fn delivered(&self, id: i64, at: DateTime<Utc>) -> Result<bool, Error> {
+        let conn = self.0.lock().unwrap();
+        let marked = conn.execute(
+            "UPDATE notifications SET delivered_at = ?1, last_error = NULL
+             WHERE id = ?2 AND delivered_at IS NULL",
+            params![at.to_rfc3339(), id],
+        )?;
+        Ok(marked > 0)
+    }
+
+    /// record a failed attempt. `next` of `None` is giving up: the row leaves
+    /// the due scan and stays visible as failed, carrying the error that
+    /// stopped it.
+    pub(crate) fn delivery_failed(
+        &self,
+        id: i64,
+        attempts: u32,
+        next: Option<DateTime<Utc>>,
+        error: &str,
+    ) -> Result<(), Error> {
+        let conn = self.0.lock().unwrap();
+        conn.execute(
+            "UPDATE notifications SET attempts = ?1, next_attempt_at = ?2, last_error = ?3
+             WHERE id = ?4",
+            params![attempts, next.map(|t| t.to_rfc3339()), error, id],
+        )?;
+        Ok(())
+    }
+
+    /// put a delivered notification back where a crash between the hook
+    /// returning and the mark landing would have left it. tests only: this is
+    /// the one thing a process cannot do to itself honestly.
+    #[cfg(test)]
+    pub(crate) fn undeliver(&self, id: i64, due: DateTime<Utc>) -> Result<(), Error> {
+        let conn = self.0.lock().unwrap();
+        conn.execute(
+            "UPDATE notifications SET delivered_at = NULL, next_attempt_at = ?1 WHERE id = ?2",
+            params![due.to_rfc3339(), id],
+        )?;
+        Ok(())
+    }
+
+    /// drop delivered notifications older than `older_than`. undelivered ones
+    /// stay whatever their age — an alert nobody received is not history, it is
+    /// something outstanding, and a sweep that quietly cleared it would be the
+    /// same loss this table exists to prevent.
+    pub(crate) fn prune_notifications(&self, older_than: DateTime<Utc>) -> Result<usize, Error> {
+        let conn = self.0.lock().unwrap();
+        let removed = conn.execute(
+            "DELETE FROM notifications WHERE delivered_at IS NOT NULL AND delivered_at < ?1",
+            params![older_than.to_rfc3339()],
+        )?;
+        Ok(removed)
     }
 
     pub(crate) fn op_started(&self, run_id: &str, op: &str, attempts: u32) -> Result<(), Error> {
@@ -2379,6 +2561,39 @@ fn op_run_from_row(row: &Row) -> rusqlite::Result<OpRun> {
     })
 }
 
+fn notification_from_row(row: &Row) -> rusqlite::Result<Notification> {
+    let next_attempt_at = opt_ts_col(row, 5)?;
+    let delivered_at = opt_ts_col(row, 6)?;
+    Ok(Notification {
+        id: row.get(0)?,
+        kind: row.get(1)?,
+        payload: json_col(row, 2)?,
+        created_at: ts_col(row, 3)?,
+        attempts: row.get(4)?,
+        // the state is these two columns and nothing else, worked out here so
+        // the api and the delivery loop cannot come to different conclusions
+        state: match (&delivered_at, &next_attempt_at) {
+            (Some(_), _) => DeliveryState::Delivered,
+            (None, Some(_)) => DeliveryState::Pending,
+            (None, None) => DeliveryState::Failed,
+        },
+        next_attempt_at,
+        delivered_at,
+        last_error: row.get(7)?,
+    })
+}
+
+/// insert one notification, due immediately. inside whatever transaction the
+/// caller is already in — that is the only way it is worth anything.
+fn queue_note(tx: &Connection, payload: &Value, at: DateTime<Utc>) -> Result<(), Error> {
+    tx.execute(
+        "INSERT INTO notifications (kind, payload, created_at, next_attempt_at)
+         VALUES (?1, ?2, ?3, ?3)",
+        params![RUN_NOTIFICATION, payload.to_string(), at.to_rfc3339()],
+    )?;
+    Ok(())
+}
+
 fn preset_from_row(row: &Row) -> rusqlite::Result<Preset> {
     Ok(Preset {
         job: row.get(0)?,
@@ -2602,7 +2817,7 @@ mod tests {
             .op_finished("r1", "b", OpStatus::Failed, None, None, Some("boom"))
             .unwrap();
         store
-            .run_finished("r1", RunStatus::Failed, None, Utc::now())
+            .run_finished("r1", RunStatus::Failed, None, Utc::now(), None)
             .unwrap();
 
         let got = store.run("r1").unwrap().unwrap();
@@ -2835,7 +3050,9 @@ mod tests {
             store
                 .create_run(&mk_run(id, "etl", old), &["a".into()])
                 .unwrap();
-            store.run_finished(id, status, None, Utc::now()).unwrap();
+            store
+                .run_finished(id, status, None, Utc::now(), None)
+                .unwrap();
         }
         store
             .create_run(&mk_run("live", "etl", old), &["a".into()])
@@ -2845,7 +3062,7 @@ mod tests {
             .create_run(&mk_run("young", "etl", Utc::now()), &["a".into()])
             .unwrap();
         store
-            .run_finished("young", RunStatus::Success, None, Utc::now())
+            .run_finished("young", RunStatus::Success, None, Utc::now(), None)
             .unwrap();
         store
             .set_op_state("etl", "a", &json!({"cursor": 9}))
@@ -2888,7 +3105,7 @@ mod tests {
                 .create_run(&mk_run(id, "etl", at), &["a".into()])
                 .unwrap();
             store
-                .run_finished(id, RunStatus::Success, None, Utc::now())
+                .run_finished(id, RunStatus::Success, None, Utc::now(), None)
                 .unwrap();
         }
 
@@ -2928,7 +3145,9 @@ mod tests {
             store
                 .create_run(&mk_run(id, "etl", old), &["a".into()])
                 .unwrap();
-            store.run_finished(id, status, None, Utc::now()).unwrap();
+            store
+                .run_finished(id, status, None, Utc::now(), None)
+                .unwrap();
         }
 
         assert_eq!(prune(&store, &Retention::days(7).failed_days(90)), 1);
@@ -2963,6 +3182,137 @@ mod tests {
             store.run("working").unwrap().unwrap().status,
             RunStatus::Running
         );
+    }
+
+    // the point of the whole part: written after the terminal row, a crash in
+    // between loses the alert about the failure the alert existed to report.
+    // one transaction is the only thing that rules it out, so the case makes
+    // the insert fail and asserts the run row went back with it
+    #[test]
+    fn a_notification_and_its_run_row_land_together_or_not_at_all() {
+        let store = Store::open(":memory:").unwrap();
+        let note = json!({"run_id": "r1", "job": "etl", "status": "failed"});
+        for id in ["r1", "r2"] {
+            store
+                .create_run(&mk_run(id, "etl", Utc::now()), &["a".into()])
+                .unwrap();
+            store.run_started(id, Utc::now()).unwrap();
+        }
+
+        store
+            .run_finished(
+                "r1",
+                RunStatus::Failed,
+                Some("boom"),
+                Utc::now(),
+                Some(&note),
+            )
+            .unwrap();
+        assert_eq!(store.run("r1").unwrap().unwrap().status, RunStatus::Failed);
+        assert_eq!(store.notifications(None, 10).unwrap().len(), 1);
+
+        // and now with the insert refused, which is a crash between the two as
+        // far as the transaction is concerned
+        store
+            .0
+            .lock()
+            .unwrap()
+            .execute_batch(
+                "CREATE TRIGGER refuse BEFORE INSERT ON notifications
+                 BEGIN SELECT RAISE(ABORT, 'no'); END",
+            )
+            .unwrap();
+        let err = store
+            .run_finished(
+                "r2",
+                RunStatus::Failed,
+                Some("boom"),
+                Utc::now(),
+                Some(&note),
+            )
+            .unwrap_err();
+        assert!(err.to_string().contains("no"), "{err}");
+        // neither half landed: the run is still running and there is still one
+        // notification, not two
+        assert_eq!(store.run("r2").unwrap().unwrap().status, RunStatus::Running);
+        assert_eq!(store.run("r2").unwrap().unwrap().error, None);
+        assert_eq!(store.notifications(None, 10).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_notifications_state_is_its_two_timestamps() {
+        let store = Store::open(":memory:").unwrap();
+        let note = json!({"run_id": "r1"});
+        for id in ["r1", "r2", "r3"] {
+            store
+                .create_run(&mk_run(id, "etl", Utc::now()), &["a".into()])
+                .unwrap();
+            store
+                .run_finished(id, RunStatus::Failed, None, Utc::now(), Some(&note))
+                .unwrap();
+        }
+        let queued = store.notifications(None, 10).unwrap();
+        assert_eq!(queued.len(), 3);
+        assert!(queued.iter().all(|n| n.state == DeliveryState::Pending));
+        assert!(queued.iter().all(|n| n.next_attempt_at.is_some()));
+        assert_eq!(queued[0].kind, "run");
+        assert_eq!(queued[0].payload, note);
+
+        // ids descend, so the last row written is first
+        let (delivered, given_up) = (queued[0].id, queued[1].id);
+        assert!(store.delivered(delivered, Utc::now()).unwrap());
+        // a second mark finds nothing: two loops cannot both claim one row
+        assert!(!store.delivered(delivered, Utc::now()).unwrap());
+        store
+            .delivery_failed(given_up, 8, None, "connection refused")
+            .unwrap();
+
+        let of = |state| store.notifications(Some(state), 10).unwrap();
+        assert_eq!(of(DeliveryState::Delivered).len(), 1);
+        assert_eq!(of(DeliveryState::Delivered)[0].id, delivered);
+        let failed = of(DeliveryState::Failed);
+        assert_eq!(failed.len(), 1);
+        assert_eq!(failed[0].last_error.as_deref(), Some("connection refused"));
+        assert_eq!(failed[0].attempts, 8);
+        assert_eq!(of(DeliveryState::Pending).len(), 1);
+
+        // and a given-up row is out of the delivery loop's way for good
+        let due = store.due_notifications(Utc::now(), 10).unwrap();
+        assert_eq!(due.len(), 1);
+        assert_eq!(due[0].id, queued[2].id);
+    }
+
+    #[test]
+    fn retention_takes_delivered_notifications_and_leaves_the_rest() {
+        let store = Store::open(":memory:").unwrap();
+        let old = Utc::now() - chrono::Duration::days(30);
+        let note = json!({"run_id": "r1"});
+        for id in ["sent", "waiting", "given-up"] {
+            store
+                .create_run(&mk_run(id, "etl", old), &["a".into()])
+                .unwrap();
+            store
+                .run_finished(id, RunStatus::Failed, None, old, Some(&note))
+                .unwrap();
+        }
+        let rows = store.notifications(None, 10).unwrap();
+        store.delivered(rows[2].id, old).unwrap();
+        store
+            .delivery_failed(rows[0].id, 8, None, "gave up")
+            .unwrap();
+
+        assert_eq!(
+            store
+                .prune_notifications(Utc::now() - chrono::Duration::days(7))
+                .unwrap(),
+            1
+        );
+        let left = store.notifications(None, 10).unwrap();
+        // an alert nobody received is not history however old it is: it is
+        // something outstanding, and a sweep that cleared it would be the
+        // same loss this table exists to prevent
+        assert_eq!(left.len(), 2);
+        assert!(left.iter().all(|n| n.delivered_at.is_none()));
     }
 
     // what makes the sweep affordable on a table with a year of runs in it:
@@ -3050,7 +3400,7 @@ mod tests {
                 .create_run(&mk_run(id, "etl", created), &["a".into()])
                 .unwrap();
             store
-                .run_finished(id, RunStatus::Success, None, Utc::now())
+                .run_finished(id, RunStatus::Success, None, Utc::now(), None)
                 .unwrap();
             budget.line(
                 &store,
@@ -3091,7 +3441,7 @@ mod tests {
         store.run_started("r1", Utc::now()).unwrap();
         assert!(store.has_active_run("etl").unwrap());
         store
-            .run_finished("r1", RunStatus::Failed, None, Utc::now())
+            .run_finished("r1", RunStatus::Failed, None, Utc::now(), None)
             .unwrap();
         assert!(!store.has_active_run("etl").unwrap());
     }
@@ -3115,7 +3465,7 @@ mod tests {
             .op_finished("done", "a", OpStatus::Success, None, None, None)
             .unwrap();
         store
-            .run_finished("done", RunStatus::Success, None, Utc::now())
+            .run_finished("done", RunStatus::Success, None, Utc::now(), None)
             .unwrap();
 
         store.fail_interrupted().unwrap();
@@ -3281,14 +3631,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("future.db");
         let path = path.to_str().unwrap();
-        phase1_db(path, 16);
+        phase1_db(path, 17);
         let err = Store::open(path).err().unwrap();
-        assert_eq!(err.to_string(), "db schema v16 is newer than this build");
+        assert_eq!(err.to_string(), "db schema v17 is newer than this build");
         let conn = Connection::open(path).unwrap();
         let version: u32 = conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 16);
+        assert_eq!(version, 17);
     }
 
     #[test]
@@ -3334,6 +3684,62 @@ mod tests {
         let rows = store.op_logs("r1", None, 0, 100).unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].message, "after the migration");
+    }
+
+    #[test]
+    fn v15_db_migrates_to_v16_keeping_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v15.db");
+        let path = path.to_str().unwrap();
+        // every batch up to v15, stamped 15: a run log with nowhere to write
+        // down an alert it owes
+        let conn = Connection::open(path).unwrap();
+        for batch in [
+            PHASE1_SCHEMA,
+            SCHEMA_V2,
+            SCHEMA_V3,
+            SCHEMA_V4,
+            SCHEMA_V5,
+            SCHEMA_V6,
+            SCHEMA_V7,
+            SCHEMA_V8,
+            SCHEMA_V9,
+            SCHEMA_V10,
+            SCHEMA_V11,
+            SCHEMA_V12,
+            SCHEMA_V13,
+            SCHEMA_V14,
+            SCHEMA_V15,
+        ] {
+            conn.execute_batch(batch).unwrap();
+        }
+        conn.pragma_update(None, "user_version", 15).unwrap();
+        drop(conn);
+
+        let store = Store::open(path).unwrap();
+        assert_eq!(store.run("r1").unwrap().unwrap().status, RunStatus::Success);
+        // an older file has no notifications and owes none: the table is
+        // empty rather than backfilled with alerts nobody is waiting for
+        assert!(store.notifications(None, 100).unwrap().is_empty());
+
+        store
+            .create_run(&mk_run("r2", "etl", Utc::now()), &["a".into()])
+            .unwrap();
+        store
+            .run_finished(
+                "r2",
+                RunStatus::Failed,
+                None,
+                Utc::now(),
+                Some(&json!({"run_id": "r2"})),
+            )
+            .unwrap();
+        drop(store);
+        let store = Store::open(path).unwrap();
+        let rows = store.notifications(None, 100).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].state, DeliveryState::Pending);
+        assert_eq!(rows[0].payload, json!({"run_id": "r2"}));
     }
 
     #[test]
@@ -3762,6 +4168,7 @@ mod tests {
                 RunStatus::Failed,
                 Some("op a failed: boom"),
                 Utc::now(),
+                None,
             )
             .unwrap();
         drop(store);
@@ -3978,11 +4385,12 @@ mod tests {
                 RunStatus::Failed,
                 Some("op a failed: boom"),
                 Utc::now(),
+                None,
             )
             .unwrap();
         // None must not blank an error a caller already recorded
         store
-            .run_finished("r1", RunStatus::Failed, None, Utc::now())
+            .run_finished("r1", RunStatus::Failed, None, Utc::now(), None)
             .unwrap();
         assert_eq!(
             store.run("r1").unwrap().unwrap().error.as_deref(),

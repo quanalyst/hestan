@@ -5,9 +5,9 @@ use std::time::Duration;
 
 use hestan::prelude::*;
 use hestan::{
-    CancelOutcome, Error, EventKind, FailureHook, FileIo, Graph, IoKey, IoManager, IoResult, Meta,
-    OpEvent, OpHook, OpStatus, Run, RunEvent, RunFailure, RunHook, RunStatus, Runner, Store,
-    Trigger, When,
+    CancelOutcome, DeliveryState, Error, EventKind, FailureHook, FileIo, Graph, IoKey, IoManager,
+    IoResult, Meta, OpEvent, OpHook, OpStatus, Run, RunEvent, RunFailure, RunHook, RunStatus,
+    Runner, Store, Trigger, When,
 };
 use serde::{Deserialize, Serialize};
 
@@ -1038,6 +1038,42 @@ async fn ops_skipped_by_a_rule_reach_no_op_hook() {
         ["boom", "cleanup"],
         "a skipped op reported an attempt"
     );
+}
+
+// the whole path, from the builder knob to the hook: the event is a row
+// written with the run's terminal row, and the delivery loop is what calls the
+// hook. a `:memory:` store would be a conversation with itself
+#[tokio::test]
+async fn a_durable_notification_is_a_row_first_and_a_hook_after() {
+    let (seen, hook) = run_events();
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("hestan.db");
+    let job = Job::builder("brittle")
+        .op(Op::new("boom", |_| async { Err("no good".into()) }))
+        .build()
+        .unwrap();
+
+    let run = Hestan::new()
+        .job(job)
+        .db(db.to_str().unwrap())
+        .durable_notifications()
+        .on_run_finished(move |e| hook(e))
+        .run_once("brittle", json!({}))
+        .await
+        .unwrap();
+    assert_eq!(run.status, RunStatus::Failed);
+
+    let seen = seen.lock().unwrap();
+    assert_eq!(seen.len(), 1);
+    assert_eq!(seen[0].run_id, run.id);
+    assert_eq!(seen[0].failed_op.as_deref(), Some("boom"));
+
+    let store = Store::open(db.to_str().unwrap()).unwrap();
+    let rows = store.notifications(None, 10).unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].state, DeliveryState::Delivered);
+    assert_eq!(rows[0].payload["run_id"], json!(run.id));
+    assert_eq!(rows[0].payload["status"], json!("failed"));
 }
 
 #[tokio::test]

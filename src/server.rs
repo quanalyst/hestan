@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::str::FromStr;
 use std::sync::Arc;
 
 use axum::body::Bytes;
@@ -24,8 +25,8 @@ use crate::freshness::{self, asset_freshness};
 use crate::graph;
 use crate::job::Job;
 use crate::model::{
-    AssetCheckRow, CheckStatus, Freshness, MetaPoint, OpRun, OpStatus, RunStatus, RunTags,
-    ScheduleRow, Trigger,
+    AssetCheckRow, CheckStatus, DeliveryState, Freshness, MetaPoint, OpRun, OpStatus, RunStatus,
+    RunTags, ScheduleRow, Trigger,
 };
 use crate::op;
 use crate::schedule;
@@ -116,6 +117,7 @@ pub(crate) fn router(state: AppState) -> Router {
         .route("/api/schedules/ticks", get(schedule_ticks))
         .route("/api/schedules/upcoming", get(upcoming_schedules))
         .route("/api/late", get(list_late))
+        .route("/api/notifications", get(list_notifications))
         .fallback(static_ui)
         .with_state(state)
 }
@@ -1339,6 +1341,32 @@ async fn upcoming_schedules(
         })
         .collect();
     Ok(Json(json!({ "upcoming": upcoming })))
+}
+
+#[derive(Deserialize)]
+struct NotificationsQuery {
+    state: Option<String>,
+    limit: Option<u32>,
+}
+
+// an alert nobody received should be visible in the ui the alert was about,
+// which is the whole reason this is an endpoint and not a log line
+async fn list_notifications(
+    State(st): State<AppState>,
+    q: Result<Query<NotificationsQuery>, QueryRejection>,
+) -> Result<Json<Value>, ApiError> {
+    let Query(q) = q.map_err(bad_query)?;
+    let state = match q.state.as_deref().filter(|s| !s.is_empty()) {
+        None => None,
+        Some(s) => Some(DeliveryState::from_str(s).map_err(|e| err(StatusCode::BAD_REQUEST, e))?),
+    };
+    let limit = q.limit.unwrap_or(50).clamp(1, 500);
+    let notifications = st
+        .runner
+        .store()
+        .notifications(state, limit)
+        .map_err(internal)?;
+    Ok(Json(json!({ "notifications": notifications })))
 }
 
 // everything a declared policy currently calls late, jobs then assets, in the
@@ -3386,7 +3414,7 @@ mod tests {
 
         st.runner
             .store()
-            .run_finished("r1", RunStatus::Failed, None, Utc::now())
+            .run_finished("r1", RunStatus::Failed, None, Utc::now(), None)
             .unwrap();
         let (status, Json(body)) = retry_run(State(st.clone()), Path("r1".into()))
             .await
@@ -3769,6 +3797,56 @@ mod tests {
         assert_eq!(late["late"][0]["kind"], json!("job"));
         assert_eq!(late["late"][0]["name"], json!("etl"));
         assert_eq!(late["late"][0]["late_by_secs"], json!(1800));
+    }
+
+    #[tokio::test]
+    async fn notifications_list_by_state() {
+        let st = state(vec![echo_job("etl")]);
+        let store = st.runner.store();
+        let note = json!({"run_id": "r1", "job": "etl", "status": "failed"});
+        for id in ["sent", "waiting"] {
+            insert_run(&st, id, "etl", RunStatus::Running, json!({}));
+            store
+                .run_finished(id, RunStatus::Failed, None, Utc::now(), Some(&note))
+                .unwrap();
+        }
+        let rows = store.notifications(None, 10).unwrap();
+        store.delivered(rows[1].id, Utc::now()).unwrap();
+
+        let get = async |q: &str| {
+            let (status, body, _) = request(
+                router(st.clone()),
+                Method::GET,
+                &format!("/api/notifications{q}"),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK);
+            body.unwrap()["notifications"].clone()
+        };
+        assert_eq!(get("").await.as_array().unwrap().len(), 2);
+        let pending = get("?state=pending").await;
+        assert_eq!(pending.as_array().unwrap().len(), 1);
+        assert_eq!(pending[0]["state"], json!("pending"));
+        assert_eq!(pending[0]["kind"], json!("run"));
+        assert_eq!(pending[0]["payload"]["run_id"], json!("r1"));
+        assert_eq!(pending[0]["attempts"], json!(0));
+        assert_eq!(get("?state=delivered").await.as_array().unwrap().len(), 1);
+        assert_eq!(get("?state=failed").await.as_array().unwrap().len(), 0);
+
+        // a state that is not one of the three is a 400, not every row
+        let (status, body, _) = request(
+            router(st.clone()),
+            Method::GET,
+            "/api/notifications?state=lost",
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(
+            body.unwrap()["error"]
+                .as_str()
+                .unwrap()
+                .contains("DeliveryState")
+        );
     }
 
     #[test]
@@ -4375,7 +4453,7 @@ mod tests {
 
         st.runner
             .store()
-            .run_finished("b1", RunStatus::Success, None, Utc::now())
+            .run_finished("b1", RunStatus::Success, None, Utc::now(), None)
             .unwrap();
         let (status, _) = build_one_asset(State(st.clone()), Path("totals".into()), Bytes::new())
             .await

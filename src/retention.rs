@@ -149,6 +149,14 @@ pub(crate) fn sweep(runner: &Runner, policy: &Retention, now: DateTime<Utc>) {
             Err(e) => tracing::warn!("retention: sensor run keys: {e}"),
             Ok(_) => {}
         }
+        // delivered notifications only. one that never got through is not
+        // history, it is something outstanding, and it stays until somebody
+        // has seen it
+        match store.prune_notifications(cutoff) {
+            Ok(n) if n > 0 => tracing::info!("retention: removed {n} delivered notifications"),
+            Err(e) => tracing::warn!("retention: notifications: {e}"),
+            Ok(_) => {}
+        }
     }
 }
 
@@ -212,7 +220,7 @@ mod tests {
             )
             .unwrap();
         store
-            .run_finished(id, RunStatus::Success, None, Utc::now())
+            .run_finished(id, RunStatus::Success, None, Utc::now(), None)
             .unwrap();
     }
 

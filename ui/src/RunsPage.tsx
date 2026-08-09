@@ -3,7 +3,7 @@ import type { MouseEvent as ReactMouseEvent } from "react";
 import { Link, useNavigate, useSearchParams } from "react-router-dom";
 import { get, HttpError, post, usePoll } from "./api";
 import StatusDot from "./StatusDot";
-import type { QueueView, Run } from "./types";
+import type { Notification, QueueView, Run } from "./types";
 import { durationMs, fmtDuration, isTerminal, relTime, shortId } from "./util";
 
 const PAGE = 100;
@@ -56,6 +56,49 @@ function TagChips({ tags }: { tags: Record<string, string> }) {
   );
 }
 
+// an alert nobody received, shown where the runs it is about are. only the
+// undelivered ones: a delivered notification is not news, and the whole point
+// of writing them down was that a lost one leaves a trace somebody can find
+function Undelivered({ rows }: { rows: Notification[] }) {
+  const nav = useNavigate();
+  if (rows.length === 0) return null;
+  return (
+    <>
+      <h2>
+        undelivered notifications
+        <span className="secondary"> — {rows.length}</span>
+      </h2>
+      <table>
+        <thead>
+          <tr>
+            <th>state</th>
+            <th>run</th>
+            <th>job</th>
+            <th className="num">attempts</th>
+            <th>last error</th>
+            <th>queued</th>
+          </tr>
+        </thead>
+        <tbody>
+          {rows.map((n) => (
+            <tr
+              key={n.id}
+              onClick={() => n.payload.run_id && nav(`/runs/${n.payload.run_id}`)}
+            >
+              <td>{n.state}</td>
+              <td className="mono">{n.payload.run_id ? shortId(n.payload.run_id) : "—"}</td>
+              <td>{n.payload.job ?? "—"}</td>
+              <td className="num">{n.attempts}</td>
+              <td className="muted">{n.last_error ?? (n.attempts === 0 ? "not tried yet" : "")}</td>
+              <td className="muted">{relTime(n.created_at)}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </>
+  );
+}
+
 export default function RunsPage() {
   const nav = useNavigate();
   const [search] = useSearchParams();
@@ -76,6 +119,7 @@ export default function RunsPage() {
   const [tagQ, setTagQ] = useState("");
   const [tagErr, setTagErr] = useState<string | null>(null);
   const [queue, setQueue] = useState<QueueView | null>(null);
+  const [undelivered, setUndelivered] = useState<Notification[]>([]);
   const [busyId, setBusyId] = useState<string | null>(null);
   const [rowErr, setRowErr] = useState<{ id: string; msg: string } | null>(null);
   const [now, setNow] = useState(() => Date.now());
@@ -125,6 +169,23 @@ export default function RunsPage() {
         .then(setQueue)
         // a queue that cannot be read is not a queue of nothing; leave the last
         // answer up rather than claiming it drained
+        .catch(() => {});
+    },
+    5000,
+    [],
+  );
+
+  usePoll(
+    () => {
+      // given up on first: those are the ones nobody will retry
+      Promise.all(
+        (["failed", "pending"] as const).map((state) =>
+          get<{ notifications: Notification[] }>(`/api/notifications?state=${state}&limit=20`),
+        ),
+      )
+        .then(([failed, pending]) => setUndelivered([...failed.notifications, ...pending.notifications]))
+        // the table is empty on a build with no durable notifications, which is
+        // most of them; a read that failed says nothing about that
         .catch(() => {});
     },
     5000,
@@ -224,6 +285,9 @@ export default function RunsPage() {
         )}
       </h1>
       {tagErr && <p className="muted">{tagErr}</p>}
+      {/* above the runs, and outside the filters: an alert that never arrived
+          is not something to go looking for */}
+      <Undelivered rows={undelivered} />
       {runs.length === 0 ? (
         <p className="muted">
           {tagQ ? `no runs tagged ${tagQ}` : "no runs yet — launch one from a job page"}

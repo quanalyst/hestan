@@ -362,6 +362,9 @@ pub struct Runner {
     priority: i64,
     // what happens to a run whose claimer went quiet
     reclaim: Reclaim,
+    // whether a run's terminal event is written down and delivered by a loop
+    // rather than handed straight to the hooks
+    durable: bool,
     // what this process does about the queue at all
     role: Role,
     // how many runs this process will execute at once, whatever the queue holds
@@ -417,6 +420,7 @@ impl Runner {
             limits: Arc::new(Mutex::new(Limits::new())),
             priority: 0,
             reclaim: Reclaim::default(),
+            durable: false,
             role: Role::default(),
             slots: usize::MAX,
             dispatching: Arc::new(Mutex::new(())),
@@ -443,7 +447,7 @@ impl Runner {
 
     /// every run hook one run's terminal event goes to: this process's, then
     /// its job's own.
-    fn run_hooks(&self, job: &str) -> Vec<RunHook> {
+    pub(crate) fn run_hooks(&self, job: &str) -> Vec<RunHook> {
         let mut hooks = self.hooks.run.clone();
         if let Some(job) = self.jobs.get(job) {
             hooks.extend(job.hooks().run.iter().cloned());
@@ -507,6 +511,22 @@ impl Runner {
     /// `Hestan::reclaim` is the way in.
     pub fn with_reclaim(self, reclaim: Reclaim) -> Runner {
         Runner { reclaim, ..self }
+    }
+
+    /// write each run's terminal event down instead of handing it straight to
+    /// the hooks, for a [delivery loop](crate::Hestan::durable_notifications)
+    /// to deliver. off by default and meant to stay that way for anything
+    /// whose hook is a metric rather than a page.
+    pub fn with_durable_notifications(self) -> Runner {
+        Runner {
+            durable: true,
+            ..self
+        }
+    }
+
+    /// whether this runner writes its terminal events down.
+    pub(crate) fn durable(&self) -> bool {
+        self.durable
     }
 
     /// what the dispatcher is enforcing right now.
@@ -907,7 +927,10 @@ impl Runner {
         if let Err(e) = self.store.renew_leases(self.claimer, LEASE) {
             tracing::warn!("lease renewal failed: {e}");
         }
-        let taken = match self.store.reclaim_expired(self.reclaim) {
+        let durable = self.durable;
+        let taken = match self.store.reclaim_expired(self.reclaim, |run| {
+            durable.then(|| serde_json::to_value(reclaimed(run)).expect("a run event is json"))
+        }) {
             Ok(taken) => taken,
             Err(e) => {
                 tracing::warn!("reclaim failed: {e}");
@@ -917,10 +940,11 @@ impl Runner {
         if taken.is_empty() {
             return;
         }
-        for (run_id, claimer) in &taken {
+        for run in &taken {
             tracing::warn!(
-                run = %run_id,
-                "reclaimed from {claimer}, which stopped renewing its lease: {}",
+                run = %run.id,
+                "reclaimed from {}, which stopped renewing its lease: {}",
+                run.claimed_by.as_deref().unwrap_or("an unknown claimer"),
                 match self.reclaim {
                     Reclaim::Fail => "failed",
                     Reclaim::Requeue => "requeued",
@@ -928,28 +952,10 @@ impl Runner {
             );
             // a stall is exactly the thing an on-call hook exists to hear
             // about, and `Fail` is the default because surfacing one beats
-            // repeating half its side effects in silence
-            if self.reclaim == Reclaim::Fail
-                && let Ok(Some(run)) = self.store.run(run_id)
-            {
-                let finished_at = run.finished_at.unwrap_or_else(Utc::now);
-                fire_hooks(
-                    &self.run_hooks(&run.job),
-                    RunEvent {
-                        run_id: run.id,
-                        job: run.job,
-                        trigger: run.trigger,
-                        status: RunStatus::Failed,
-                        // no op failed: the process holding the run stopped
-                        // saying it was there, which is not any op's doing
-                        failed_op: None,
-                        error: run.error,
-                        started_at: run.started_at,
-                        finished_at,
-                        duration: run.started_at.and_then(|s| (finished_at - s).to_std().ok()),
-                    },
-                    "run",
-                );
+            // repeating half its side effects in silence. durable, the row the
+            // reclaim wrote is what carries it, and the delivery loop sends it
+            if self.reclaim == Reclaim::Fail && !durable {
+                fire_hooks(&self.run_hooks(&run.job), reclaimed(run), "run");
             }
         }
         self.settled.notify_waiters();
@@ -1507,6 +1513,27 @@ fn fold_instances(
         folded.push((parent, OpStatus::Success, Some(Value::Array(collected))));
     }
     folded
+}
+
+/// the terminal event of a run whose claimer went away, from the row the
+/// reclaim left behind.
+///
+/// no `failed_op`: nothing this run did failed. the process holding it stopped
+/// saying it was there, which is not any op's doing and should not be reported
+/// as one.
+fn reclaimed(run: &Run) -> RunEvent {
+    let finished_at = run.finished_at.unwrap_or_else(Utc::now);
+    RunEvent {
+        run_id: run.id.clone(),
+        job: run.job.clone(),
+        trigger: run.trigger,
+        status: RunStatus::Failed,
+        failed_op: None,
+        error: run.error.clone(),
+        started_at: run.started_at,
+        finished_at,
+        duration: run.started_at.and_then(|s| (finished_at - s).to_std().ok()),
+    }
 }
 
 /// the loop `serve` runs: [`Runner::heartbeat`] every [`HEARTBEAT`], forever.
@@ -2167,36 +2194,47 @@ async fn execute(
         .map(|(op, msg)| format!("op {op} failed: {msg}"));
     // event first: anyone who reads a terminal status must also see this line
     note(store.append_event(&run_id, None, level, kind, msg, None));
+
+    // every terminal status fires, and the status says which — a hook that
+    // only wants failures is what `on_failure` still is. the boot sweep does
+    // not come through here, so a restart after a crash replays nothing
     let finished_at = Utc::now();
-    note(store.run_finished(&run_id, status, error.as_deref(), finished_at));
+    let (failed_op, op_error) = match first_failure {
+        Some((op, msg)) => (Some(op), Some(msg)),
+        None => (None, None),
+    };
+    let event = RunEvent {
+        run_id: run_id.clone(),
+        job: job.name().to_string(),
+        trigger,
+        status,
+        failed_op,
+        error: op_error,
+        started_at: Some(started_at),
+        finished_at,
+        duration: (finished_at - started_at).to_std().ok(),
+    };
+    // durable: the event goes into the terminal transaction and the delivery
+    // loop takes it from there, so nothing fires twice
+    let queued = runner
+        .durable
+        .then(|| serde_json::to_value(&event).expect("a run event is json"));
+    note(store.run_finished(
+        &run_id,
+        status,
+        error.as_deref(),
+        finished_at,
+        queued.as_ref(),
+    ));
     runner.active.lock().unwrap().remove(&run_id);
     // this run's slot is free: wake anything waiting on it, then go and see
     // what the queue can start in its place
     runner.settled.notify_waiters();
     runner.dispatch();
 
-    // every terminal status fires, and the status says which — a hook that
-    // only wants failures is what `on_failure` still is. the boot sweep does
-    // not come through here, so a restart after a crash replays nothing
-    let (failed_op, error) = match first_failure {
-        Some((op, msg)) => (Some(op), Some(msg)),
-        None => (None, None),
-    };
-    fire_hooks(
-        &runner.run_hooks(job.name()),
-        RunEvent {
-            run_id,
-            job: job.name().to_string(),
-            trigger,
-            status,
-            failed_op,
-            error,
-            started_at: Some(started_at),
-            finished_at,
-            duration: (finished_at - started_at).to_std().ok(),
-        },
-        "run",
-    );
+    if queued.is_none() {
+        fire_hooks(&runner.run_hooks(job.name()), event, "run");
+    }
 }
 
 /// what the run records on the row of an op it is handing to a child: the

@@ -12,7 +12,7 @@ use crate::asset::{
 use crate::error::Error;
 use crate::executor::{Limits, Runner};
 use crate::freshness::{self, LateEvent, LateHook};
-use crate::hooks::{FailureHook, OpEvent, OpHook, RunEvent, RunFailure, RunHook};
+use crate::hooks::{self, FailureHook, OpEvent, OpHook, RunEvent, RunFailure, RunHook};
 use crate::io::{Io, IoManager};
 use crate::job::Job;
 use crate::logs;
@@ -56,6 +56,7 @@ pub struct Hestan {
     slots: usize,
     retention: Retention,
     retention_every: Duration,
+    durable: bool,
     asset_history: usize,
     log_bytes: u64,
     log_line_cap: u64,
@@ -91,6 +92,7 @@ impl Default for Hestan {
             slots: usize::MAX,
             retention: Retention::default(),
             retention_every: retention::DEFAULT_INTERVAL,
+            durable: false,
             asset_history: DEFAULT_ASSET_HISTORY,
             log_bytes: logs::DEFAULT_BYTES,
             log_line_cap: logs::DEFAULT_LINES,
@@ -527,6 +529,38 @@ impl Hestan {
         self.retention(Retention::days(days))
     }
 
+    /// write every run's terminal event to the database inside the same
+    /// transaction as the run's terminal row, and deliver it from a loop that
+    /// retries and gives up loudly.
+    ///
+    /// **off by default, and meant to stay off for most people.** an embedder
+    /// whose hook bumps a counter or writes a line wants a callback, not a
+    /// table and a delivery loop; the ordinary dispatch is a `spawn_blocking`
+    /// call and costs nothing. this is for the hook whose job is to tell a
+    /// human, where losing one is the failure mode that matters — without it,
+    /// a process that dies between a run failing and the hook running has
+    /// nothing anywhere recording that an alert was owed.
+    ///
+    /// **delivery is at-least-once.** a crash between a hook returning and the
+    /// row being marked delivered re-delivers on the next pass, so a hook must
+    /// tolerate seeing the same event twice — key on `run_id` if that matters.
+    /// exactly-once needs the receiver's cooperation and hestan will not
+    /// pretend otherwise.
+    ///
+    /// a hook that panics is a failed delivery, retried on the same backoff an
+    /// op's retries use and given up on after eight attempts, leaving the row
+    /// visible as `failed` with its last error — on `GET /api/notifications`
+    /// and on the runs page. the loop belongs to the process that
+    /// [decides](crate::Role), so register the hooks there.
+    ///
+    /// covers run events. op hooks and [`on_late`](Self::on_late) stay
+    /// in-process: they fire per attempt and per poll, and a table of them is
+    /// a different bargain than the one this makes.
+    pub fn durable_notifications(mut self) -> Self {
+        self.durable = true;
+        self
+    }
+
     /// how often the retention sweep comes round; default one hour.
     ///
     /// it also runs at startup, which is all it ever used to do — and a server
@@ -630,7 +664,9 @@ impl Hestan {
             self.run_op_subprocess(req).await
         }
         let built = self.role(Role::All).build().await?;
-        built.runner.run(job, params, Trigger::Manual).await
+        let run = built.runner.run(job, params, Trigger::Manual).await;
+        delivered(&built.runner).await;
+        run
     }
 
     /// materialize `name` headless, like [`run_once`](Self::run_once): one run of
@@ -645,7 +681,7 @@ impl Hestan {
         let built = self.role(Role::All).build().await?;
         let mats = mats_map(built.runner.store())?;
         let plan = plan_target(&built.registry, &mats, name)?;
-        built
+        let run = built
             .runner
             .run_subset(
                 crate::asset::ASSETS_JOB,
@@ -655,7 +691,9 @@ impl Hestan {
                 Trigger::Build,
                 asset_tag(name),
             )
-            .await
+            .await;
+        delivered(&built.runner).await;
+        run
     }
 
     /// run the ui and whatever loops this process's [role](Self::role) owns.
@@ -747,6 +785,12 @@ impl Hestan {
                 built.retention,
                 built.retention_every,
             )));
+            // and the deliverer, if anything is writing rows for it. one
+            // process delivers, for the same reason one process decides: two
+            // of them would send every alert twice
+            if built.runner.durable() {
+                loops.push(tokio::spawn(hooks::run_delivery(built.runner.clone())));
+            }
         }
         if role.executes() {
             // the dispatcher: the queue's own loop. every launch pokes it and
@@ -962,12 +1006,16 @@ impl Hestan {
             tracing::info!("trimmed {trimmed} asset history rows past the cap");
         }
         let io = Io::new(self.io_default, self.io_named);
-        let runner = Runner::with_resources(jobs, store, self.hooks, self.pools, resources, io)?
-            .with_hooks(self.run_hooks, self.op_hooks)
-            .with_run_tags(self.run_tags)
-            .with_limits(self.limits, self.priority)
-            .with_reclaim(self.reclaim)
-            .with_role(self.role, self.slots);
+        let mut runner =
+            Runner::with_resources(jobs, store, self.hooks, self.pools, resources, io)?
+                .with_hooks(self.run_hooks, self.op_hooks)
+                .with_run_tags(self.run_tags)
+                .with_limits(self.limits, self.priority)
+                .with_reclaim(self.reclaim)
+                .with_role(self.role, self.slots);
+        if self.durable {
+            runner = runner.with_durable_notifications();
+        }
         // before anything new launches, and before the loop that takes it from
         // here: a process that runs for an hour and exits should still tidy up
         retention::sweep(&runner, &self.retention, chrono::Utc::now());
@@ -980,6 +1028,15 @@ impl Hestan {
             retention: self.retention,
             retention_every: self.retention_every,
         })
+    }
+}
+
+/// deliver what a headless one-shot just wrote down, since nothing else will:
+/// there is no loop in this process and it is about to exit. a no-op unless
+/// [`durable_notifications`](Hestan::durable_notifications) is on.
+async fn delivered(runner: &Runner) {
+    if runner.durable() {
+        hooks::deliver_once(runner, chrono::Utc::now()).await;
     }
 }
 

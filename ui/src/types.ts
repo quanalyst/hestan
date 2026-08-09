@@ -487,3 +487,21 @@ export interface SensorSummary {
   consecutive_failures: number;
   last_tick: SensorTick | null;
 }
+
+// where one durable notification got to. pending is undelivered and due
+// again; failed is given up on after its attempts ran out, and is the state
+// somebody has to look at
+export type DeliveryState = "pending" | "failed" | "delivered";
+
+export interface Notification {
+  id: number;
+  // which event shape the payload holds; "run" today
+  kind: string;
+  payload: { run_id?: string; job?: string; status?: RunStatus };
+  created_at: string;
+  attempts: number;
+  next_attempt_at: string | null;
+  delivered_at: string | null;
+  last_error: string | null;
+  state: DeliveryState;
+}

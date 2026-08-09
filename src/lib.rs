@@ -48,10 +48,10 @@ pub use http::HttpSource;
 pub use io::{FileIo, Inline, IoKey, IoManager, IoResult};
 pub use job::{Graph, GraphBuilder, Job, JobBuilder};
 pub use model::{
-    AssetCheckRow, Backfill, BackfillStatus, Catchup, CheckStatus, Event, EventKind, EventLevel,
-    Freshness, FreshnessRow, HistoryEntry, LogStream, Materialization, MetaPoint, OpLog, OpRun,
-    OpStatus, Overlap, Preset, Reclaim, Role, Run, RunStatus, RunTags, ScheduleRow, SensorOutcome,
-    SensorRow, SensorTick, Severity, Tick, TickOutcome, Trigger, When,
+    AssetCheckRow, Backfill, BackfillStatus, Catchup, CheckStatus, DeliveryState, Event, EventKind,
+    EventLevel, Freshness, FreshnessRow, HistoryEntry, LogStream, Materialization, MetaPoint,
+    Notification, OpLog, OpRun, OpStatus, Overlap, Preset, Reclaim, Role, Run, RunStatus, RunTags,
+    ScheduleRow, SensorOutcome, SensorRow, SensorTick, Severity, Tick, TickOutcome, Trigger, When,
 };
 pub use op::{InputError, META_TABLE_ROWS, Meta, MetaColumn, MetaTable, Op, OpCtx, OpResult};
 pub use partition::Partitions;
