@@ -521,7 +521,9 @@ unknown name.
 results, same clamps and same 404.
 
 metadata an asset op reports lands on its materialization too, so history
-carries what each build said — see [metadata](metadata.md).
+carries what each build said — with [deltas](metadata.md#deltas) against the
+build before it, and `GET /api/assets/{name}/metadata/{key}` for one numeric
+key across recent builds. see [metadata](metadata.md).
 
 shapes and details in [http api](http-api.md); the `asset_materializations`
 table in [storage](storage.md).

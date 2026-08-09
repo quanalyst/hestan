@@ -505,6 +505,7 @@ function JobView({ name }: { name: string }) {
       {opSel && (
         <OpInspector
           ops={job.ops}
+          job={name}
           name={opSel}
           pools={job.pools}
           stat={stats?.find((s) => s.op === opSel)}

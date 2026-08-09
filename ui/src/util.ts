@@ -1,4 +1,4 @@
-import type { OpSummary, RunStatus, When } from "./types";
+import type { Metadata, OpSummary, RunStatus, When } from "./types";
 
 const OUTPUT_CAP = 160;
 
@@ -63,6 +63,17 @@ export function fmtDataSize(bytes: number): string {
     }
   }
   return `${Math.round(bytes)} B`;
+}
+
+// the five tags the api computes deltas and trends over: everything else is
+// not a number and has neither
+const NUMERIC_META = ["int", "float", "bytes", "duration_secs", "count"] as const;
+
+export function numericMetaKeys(metadata: Metadata | null): string[] {
+  if (!metadata) return [];
+  return Object.entries(metadata)
+    .filter(([, value]) => NUMERIC_META.some((tag) => tag in value))
+    .map(([name]) => name);
 }
 
 export function isTerminal(status: RunStatus): boolean {

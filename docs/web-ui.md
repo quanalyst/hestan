@@ -98,7 +98,8 @@ budget, any per-attempt `timeout`, the [concurrency pool](concepts.md#concurrenc
 the op draws from with that pool's process-wide limit, an `isolated` line for
 an op that runs in [its own process](isolation.md) with whatever memory and
 cpu limits that process carries, declared
-params/input/output types, and history over the last 50
+params/input/output types, the newest facts the op reported with `ctx.meta`
+(with the same sparklines the asset panel draws), and history over the last 50
 runs: average and p95 duration, failure count, a duration trend, and the most
 recent error verbatim. when the op has committed watermark state via
 `ctx.set_state` ([op state](state.md)), a state line shows the value as json
@@ -185,6 +186,10 @@ when it happened, and a link to the run that built it (or `probe` for a
 source row, which no run wrote). anything a build reported with `ctx.meta`
 sits under its entry, rendered by type exactly as the run page renders an
 op's — deltas included, against the previous build of that same partition.
+under the newest entry's numbers, each numeric key gets a
+[sparkline](metadata.md#trends) of its recent builds, oldest on the left, once
+there are three or more points; two points are a delta, which the row already
+says, and one is the value itself.
 
 the panel's selection lives in the url — `/assets?asset=orders` opens that
 asset with its panel already open, which is what a `Meta::asset_ref` links to

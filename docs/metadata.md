@@ -201,6 +201,33 @@ value, and always carries a sign — `+`, `−`, or `±` for a value that was
 measured and did not move. no colour: the ui is monochrome, and colour alone
 would be the wrong way to say it anyway.
 
+## Trends
+
+a delta is one step back. the endpoints below are the rest of the line:
+
+```
+GET /api/assets/{name}/metadata/{key}?limit=&partition=
+GET /api/jobs/{name}/ops/{op}/metadata/{key}?limit=
+```
+
+```json
+{ "asset": "doc_stats", "key": "files",
+  "points": [ {"at": "2026-08-08T10:01:36Z", "value": 16, "run_id": "019fe0b2-…"},
+              {"at": "2026-08-08T11:01:36Z", "value": 18, "run_id": "019fe109-…"} ] }
+```
+
+**oldest first**, so the last point is the current value and the series reads
+left to right the way it is drawn. `limit` (default 20, clamped to 1..=200) is
+how many **builds or runs** are read, not how many points come back: a build
+that did not report the key, or reported it as something that is not a number,
+contributes nothing rather than a gap or a zero. `partition` narrows an asset
+to one key; without it every key's builds interleave by time, which is a trend
+of the asset rather than of any one partition.
+
+the ui draws it as a sparkline under the value, in the asset panel and the op
+inspector, **only once there are three or more points**. two points are a
+delta, which the row already says, and one is the value itself.
+
 ## Staged like state
 
 `ctx.meta` buffers per attempt, exactly like
@@ -249,10 +276,15 @@ metadata for an identical value is still fresh.
 - `GET /api/runs/{id}` — each op row has `metadata`, null when the op
   reported none, and `deltas` beside it.
 - `GET /api/assets/{name}/history` — each entry has `metadata` and `deltas`.
+- `GET /api/assets/{name}/metadata/{key}` and
+  `GET /api/jobs/{name}/ops/{op}/metadata/{key}` — one numeric key over
+  recent history.
 - the run page renders the selected op's metadata by type: numbers
   right-aligned and tabular in their unit, urls as links, runs and assets as
   links into the ui, paths monospace, tables as tables, text inline, markdown
   rendered as [the subset above](#the-markdown-subset), json in a muted
   preformatted block.
 - the asset detail panel renders each build's metadata under its history
-  entry, the same way.
+  entry, the same way, with a sparkline under the newest one's numbers.
+- the op inspector on the job page shows the newest facts that op reported
+  across the window it is already summarising, with the same sparklines.

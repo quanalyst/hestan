@@ -1,7 +1,12 @@
 import { Link } from "react-router-dom";
 import Markdown from "./Markdown";
-import type { Deltas, MetaDelta, MetaTable, MetaValue, Metadata } from "./types";
+import MicroBars from "./MicroBars";
+import type { Deltas, MetaDelta, MetaPoint, MetaTable, MetaValue, Metadata, Trends } from "./types";
 import { fmtDataSize, fmtDuration, shortId } from "./util";
+
+// three points is the fewest that can show a direction; two is a delta, which
+// the row already carries, and one is the value itself
+const TREND_MIN = 3;
 
 // a real minus sign, and a sign on every delta: the monochrome ui has no
 // colour to carry direction, and colour alone would not carry it anyway
@@ -141,26 +146,45 @@ function MetaValueView({ value }: { value: MetaValue }) {
   return <pre className="mono muted meta-block">{JSON.stringify(value.json, null, 2)}</pre>;
 }
 
+// the same bars the job page draws durations with, over one key's recent
+// values, oldest on the left. every point is a build that happened, so they
+// are all "success" bars: this is a shape, not a status
+const trendBars = (points: MetaPoint[]) =>
+  points.map((p, i) => ({ id: `${i}`, value: p.value, status: "success" as const }));
+
 export default function MetaList({
   metadata,
   deltas = {},
+  trends = {},
 }: {
   metadata: Metadata;
   deltas?: Deltas;
+  trends?: Trends;
 }) {
   const entries = Object.entries(metadata);
   if (entries.length === 0) return null;
   return (
     <div className="meta-list">
-      {entries.map(([name, value]) => (
-        <div key={name} className="meta-row">
-          <span className="meta-name">{name}</span>
-          <MetaValueView value={value} />
-          {/* a key with nothing to compare against shows nothing at all,
-              which is a different claim from having not moved */}
-          {deltas[name] && <DeltaView value={value} delta={deltas[name]} />}
-        </div>
-      ))}
+      {entries.map(([name, value]) => {
+        const trend = trends[name] ?? [];
+        return (
+          <div key={name} className="meta-entry">
+            <div className="meta-row">
+              <span className="meta-name">{name}</span>
+              <MetaValueView value={value} />
+              {/* a key with nothing to compare against shows nothing at all,
+                  which is a different claim from having not moved */}
+              {deltas[name] && <DeltaView value={value} delta={deltas[name]} />}
+            </div>
+            {/* fewer than three points is not a trend, so it draws nothing */}
+            {trend.length >= TREND_MIN && (
+              <div className="meta-trend" title={`last ${trend.length} builds`}>
+                <MicroBars bars={trendBars(trend)} />
+              </div>
+            )}
+          </div>
+        );
+      })}
     </div>
   );
 }

@@ -1,8 +1,10 @@
-import { useEffect } from "react";
+import { useEffect, useState } from "react";
+import { get } from "./api";
+import MetaList from "./MetaList";
 import MicroBars from "./MicroBars";
 import type { MicroBar } from "./MicroBars";
-import type { JobPool, JobState, OpStat, OpSummary } from "./types";
-import { fmtBytes, fmtDuration, relTime } from "./util";
+import type { JobPool, JobState, MetaPoint, OpStat, OpSummary, Trends } from "./types";
+import { fmtBytes, fmtDuration, numericMetaKeys, relTime } from "./util";
 
 const TITLE_CAP = 2000;
 
@@ -14,6 +16,7 @@ const statBars = (stat: OpStat): MicroBar[] =>
 
 export default function OpInspector({
   ops,
+  job,
   name,
   pools = [],
   stat,
@@ -21,12 +24,15 @@ export default function OpInspector({
   onClose,
 }: {
   ops: OpSummary[];
+  job: string;
   name: string;
   pools?: JobPool[];
   stat?: OpStat;
   state?: JobState;
   onClose: () => void;
 }) {
+  const [trends, setTrends] = useState<Trends>({});
+
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if (e.key === "Escape") onClose();
@@ -34,6 +40,32 @@ export default function OpInspector({
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
   }, [onClose]);
+
+  // one series per numeric key this op last reported, for the sparkline under
+  // its value: refetched when the keys change or a run lands, rather than on
+  // every poll of the stats
+  const keys = numericMetaKeys(stat?.metadata ?? null).join(",");
+  const newest = stat?.recent[0]?.run_id ?? null;
+  useEffect(() => {
+    if (keys === "") {
+      setTrends({});
+      return;
+    }
+    let live = true;
+    const path = `/api/jobs/${encodeURIComponent(job)}/ops/${encodeURIComponent(name)}`;
+    Promise.all(
+      keys.split(",").map((key) =>
+        get<{ points: MetaPoint[] }>(`${path}/metadata/${encodeURIComponent(key)}`)
+          .then((r) => [key, r.points] as const)
+          .catch(() => [key, []] as const),
+      ),
+    ).then((series) => {
+      if (live) setTrends(Object.fromEntries(series));
+    });
+    return () => {
+      live = false;
+    };
+  }, [job, name, keys, newest]);
 
   const op = ops.find((o) => o.name === name);
   if (!op) return null;
@@ -166,6 +198,13 @@ export default function OpInspector({
             {stateClipped ? stateJson.slice(0, 119) + "…" : stateJson}
           </div>
           <div className="op-stat-line muted">updated {relTime(state.updated_at)}</div>
+        </>
+      )}
+
+      {stat?.metadata && (
+        <>
+          <div className="sub-label">metadata</div>
+          <MetaList metadata={stat.metadata} trends={trends} />
         </>
       )}
 

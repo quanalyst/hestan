@@ -11,10 +11,11 @@ use crate::error::Error;
 use crate::executor::{Blocked, InFlight, Limits, QUEUE_SCAN, Queued};
 use crate::model::{
     AssetCheckRow, Backfill, BackfillStatus, CheckStatus, Event, EventKind, EventLevel,
-    FreshnessRow, HistoryEntry, Materialization, OpRun, OpStatus, Preset, Reclaim, Run, RunCursor,
-    RunStatus, RunTags, ScheduleRow, SensorOutcome, SensorRow, SensorTick, Severity, Tick,
-    TickOutcome,
+    FreshnessRow, HistoryEntry, Materialization, MetaPoint, OpRun, OpStatus, Preset, Reclaim, Run,
+    RunCursor, RunStatus, RunTags, ScheduleRow, SensorOutcome, SensorRow, SensorTick, Severity,
+    Tick, TickOutcome,
 };
+use crate::op;
 use crate::schedule::Schedule;
 
 // `trigger` is a reserved word in sqlite, hence the quoted column name in
@@ -1512,6 +1513,79 @@ impl Store {
             Ok((r.get(0)?, json_col(r, 1)?))
         })?;
         Ok(rows.collect::<Result<HashMap<_, _>, _>>()?)
+    }
+
+    /// what a numeric metadata key was across `job`'s recent runs of one op,
+    /// oldest first — the trend the op inspector draws.
+    ///
+    /// `limit` is how many **runs** are read, not how many points come back:
+    /// a run that reported nothing, or reported `key` as something that is
+    /// not a number, contributes no point rather than a gap or a zero.
+    pub fn op_metadata_series(
+        &self,
+        job: &str,
+        op: &str,
+        key: &str,
+        limit: u32,
+    ) -> Result<Vec<MetaPoint>, Error> {
+        let conn = self.0.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT o.run_id, o.metadata, COALESCE(o.finished_at, r.created_at)
+             FROM op_runs o JOIN runs r ON r.id = o.run_id
+             WHERE r.job = ?1 AND o.op = ?2 AND o.metadata IS NOT NULL
+             ORDER BY r.created_at DESC, r.id DESC LIMIT ?3",
+        )?;
+        let rows = stmt.query_map(params![job, op, limit], |r| {
+            Ok((json_col(r, 1)?, ts_col(r, 2)?, r.get::<_, String>(0)?))
+        })?;
+        let mut points = Vec::new();
+        for row in rows {
+            let (metadata, at, run_id) = row?;
+            if let Some(value) = op::numeric_key(&metadata, key) {
+                points.push(MetaPoint {
+                    at,
+                    value,
+                    run_id: Some(run_id),
+                });
+            }
+        }
+        points.reverse();
+        Ok(points)
+    }
+
+    /// the same for one asset's recent builds, oldest first. `partition`
+    /// narrows it to one key of a [partitioned asset](crate::Partitions);
+    /// without it the builds of every key interleave by time, which is a
+    /// trend of the asset rather than of any one key.
+    pub fn asset_metadata_series(
+        &self,
+        asset: &str,
+        partition: Option<&str>,
+        key: &str,
+        limit: u32,
+    ) -> Result<Vec<MetaPoint>, Error> {
+        let conn = self.0.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT run_id, metadata, built_at FROM asset_materializations
+             WHERE asset = ?1 AND (?2 IS NULL OR partition IS ?2) AND metadata IS NOT NULL
+             ORDER BY id DESC LIMIT ?3",
+        )?;
+        let rows = stmt.query_map(params![asset, partition, limit], |r| {
+            Ok((
+                json_col(r, 1)?,
+                ts_col(r, 2)?,
+                r.get::<_, Option<String>>(0)?,
+            ))
+        })?;
+        let mut points = Vec::new();
+        for row in rows {
+            let (metadata, at, run_id) = row?;
+            if let Some(value) = op::numeric_key(&metadata, key) {
+                points.push(MetaPoint { at, value, run_id });
+            }
+        }
+        points.reverse();
+        Ok(points)
     }
 
     /// the state an op's last successful run committed, if any.

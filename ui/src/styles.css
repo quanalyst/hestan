@@ -1045,6 +1045,20 @@ button.text-btn.active {
   font-size: 10px;
 }
 
+/* the sparkline sits under the value it belongs to, right-aligned with the
+   number rather than with the name */
+.meta-trend {
+  display: flex;
+  justify-content: flex-end;
+  padding: 0 0 4px;
+}
+
+/* the panel's own sparkline spacing does not apply to one that is part of a
+   metadata row */
+.op-panel .meta-trend .spark {
+  margin: 0;
+}
+
 .mat-entry .meta-list {
   margin: 0 0 6px 16px;
 }

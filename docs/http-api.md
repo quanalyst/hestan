@@ -21,6 +21,7 @@ failures. timestamps are rfc3339 strings in utc.
 | DELETE | `/api/jobs/{name}/presets/{preset}` | drop one |
 | POST | `/api/jobs/{name}/validate_params` | check params without launching |
 | GET | `/api/jobs/{name}/op_stats` | per-op aggregates over recent runs |
+| GET | `/api/jobs/{name}/ops/{op}/metadata/{key}` | one numeric metadata key over recent runs |
 | GET | `/api/jobs/{name}/state` | the job's committed op state |
 | GET | `/api/runs` | run list with filters and paging |
 | GET | `/api/runs/{id}` | one run plus its op runs |
@@ -35,6 +36,7 @@ failures. timestamps are rfc3339 strings in utc.
 | GET | `/api/assets` | every asset with lineage and staleness |
 | POST | `/api/assets/{name}/build` | build one asset (and stale ancestors) |
 | GET | `/api/assets/{name}/history` | one asset's recent materializations |
+| GET | `/api/assets/{name}/metadata/{key}` | one numeric metadata key over recent builds |
 | GET | `/api/assets/{name}/checks` | one asset's recent check results |
 | POST | `/api/assets/build` | build everything stale as one run |
 | GET | `/api/sensors` | every sensor with cursor and last tick |
@@ -273,7 +275,8 @@ appears, in declared order, even with no history:
       "avg_ms": 412.5,
       "p95_ms": 890.0,
       "last_error": "timeout",
-      "recent": [ { "run_id": "...", "status": "success", "ms": 401.0 } ]
+      "recent": [ { "run_id": "...", "status": "success", "ms": 401.0 } ],
+      "metadata": { "rows": {"count": 1240} }
     }
   ]
 }
@@ -283,6 +286,27 @@ durations come from op runs with both timestamps; `avg_ms` is null with no
 samples and `p95_ms` (nearest-rank) is null under two. `last_error` is the
 newest non-null error in the window. `recent` holds at most the 20 newest
 samples, newest first; `ms` is null for ops that never started (skipped).
+`metadata` is the newest facts the op reported inside the window, null if it
+reported none — no deltas here, since what one build did against the one
+before it belongs on that run's page.
+
+`GET /api/jobs/{name}/ops/{op}/metadata/{key}?limit=` is one numeric metadata
+key of one op across that job's recent runs, oldest first:
+
+```json
+{ "job": "orders_etl", "op": "aggregate", "key": "rows",
+  "points": [ {"at": "2026-08-08T10:01:36Z", "value": 1203, "run_id": "019fe0b2-…"},
+              {"at": "2026-08-08T11:01:36Z", "value": 1240, "run_id": "019fe109-…"} ] }
+```
+
+`limit` (default 20, clamped to 1..=200) is how many **runs** are read, not
+how many points come back: a run that did not report the key, or reported it
+as something that is not a number, contributes nothing rather than a gap or a
+zero. an unknown job or an unknown op is a 404; a key nobody ever reported is
+an empty `points`, since "never reported" is a fact about the data and not a
+bad request. `GET /api/assets/{name}/metadata/{key}` is the same over one
+asset's builds and additionally takes `partition=`. see
+[trends](metadata.md#trends).
 
 ## Op state
 

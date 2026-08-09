@@ -4,8 +4,14 @@ import { get, usePoll } from "./api";
 import MetaList from "./MetaList";
 import PartitionGrid from "./PartitionGrid";
 import { GlyphShape } from "./StatusGlyph";
-import type { AssetCheckResult, AssetSummary, MaterializationEntry } from "./types";
-import { relTime, shortId } from "./util";
+import type {
+  AssetCheckResult,
+  AssetSummary,
+  MaterializationEntry,
+  MetaPoint,
+  Trends,
+} from "./types";
+import { numericMetaKeys, relTime, shortId } from "./util";
 
 // enough hex to tell fingerprints apart at a glance; the title carries the rest
 const shortHash = (fp: string) => fp.slice(0, 12);
@@ -19,6 +25,7 @@ export default function AssetPanel({
 }) {
   const [history, setHistory] = useState<MaterializationEntry[] | null>(null);
   const [checks, setChecks] = useState<AssetCheckResult[]>([]);
+  const [trends, setTrends] = useState<Trends>({});
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
@@ -43,6 +50,33 @@ export default function AssetPanel({
     5000,
     [asset.name],
   );
+
+  // one series per numeric key of the newest build, for the sparkline under
+  // its value: refetched when the keys change or a build lands, rather than
+  // on every poll of the history
+  const latest = history?.[0] ?? null;
+  const keys = numericMetaKeys(latest?.metadata ?? null).join(",");
+  const newest = latest?.id ?? null;
+  useEffect(() => {
+    if (keys === "") {
+      setTrends({});
+      return;
+    }
+    let live = true;
+    const name = encodeURIComponent(asset.name);
+    Promise.all(
+      keys.split(",").map((key) =>
+        get<{ points: MetaPoint[] }>(`/api/assets/${name}/metadata/${encodeURIComponent(key)}`)
+          .then((r) => [key, r.points] as const)
+          .catch(() => [key, []] as const),
+      ),
+    ).then((series) => {
+      if (live) setTrends(Object.fromEntries(series));
+    });
+    return () => {
+      live = false;
+    };
+  }, [asset.name, keys, newest]);
 
   // the api hands back every check's results newest first, mixed together, so
   // the first row for a name is that check's latest
@@ -129,7 +163,7 @@ export default function AssetPanel({
       ) : history.length === 0 ? (
         <p className="muted">never built</p>
       ) : (
-        history.map((m) => (
+        history.map((m, i) => (
           <div key={m.id} className="mat-entry">
             <div className="mat-row">
               {/* the marker is the point: a rebuild and a change are different facts */}
@@ -152,7 +186,11 @@ export default function AssetPanel({
               )}
             </div>
             {/* what that build reported, in the same gutter as the marker */}
-            {m.metadata && <MetaList metadata={m.metadata} deltas={m.deltas} />}
+            {/* the trend belongs to the current value, so it is drawn under
+                the newest entry rather than repeated down the history */}
+            {m.metadata && (
+              <MetaList metadata={m.metadata} deltas={m.deltas} trends={i === 0 ? trends : {}} />
+            )}
           </div>
         ))
       )}

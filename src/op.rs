@@ -385,8 +385,14 @@ fn numeric(tagged: &Value) -> Option<f64> {
     Meta::from_tagged(tagged)?.as_f64()
 }
 
+/// one key of a stored metadata map, as a number; `None` when the map does
+/// not carry it or carries it as something that is not one.
+pub(crate) fn numeric_key(metadata: &Value, key: &str) -> Option<f64> {
+    numeric(metadata.get(key)?)
+}
+
 /// a whole number stays whole in the json: `37`, not `37.0`.
-fn number(n: f64) -> Value {
+pub(crate) fn number(n: f64) -> Value {
     if n.fract() == 0.0 && n.abs() < 9e15 {
         json!(n as i64)
     } else {

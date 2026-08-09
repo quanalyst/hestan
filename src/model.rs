@@ -502,6 +502,15 @@ pub struct Materialization {
     pub metadata: Option<Value>,
 }
 
+/// one point of a numeric metadata key's trend: what it was, and when. `run_id`
+/// is null on a materialization a probe wrote outside any run.
+#[derive(Debug, Clone, Serialize)]
+pub struct MetaPoint {
+    pub at: DateTime<Utc>,
+    pub value: f64,
+    pub run_id: Option<String>,
+}
+
 /// one entry of an asset's history as
 /// [`Store::materializations`](crate::Store::materializations) reads it: the
 /// build, and the two things only its neighbours can say about it.

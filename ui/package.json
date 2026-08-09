@@ -7,7 +7,7 @@
     "dev": "vite",
     "build": "tsc -b && vite build",
     "lint": "eslint .",
-    "test": "vite build --ssr test/markdown.test.tsx --outDir .test-build --logLevel warn && node .test-build/markdown.test.js",
+    "test": "vite build --ssr test/all.test.ts --outDir .test-build --logLevel warn && node .test-build/all.test.js",
     "preview": "vite preview"
   },
   "dependencies": {

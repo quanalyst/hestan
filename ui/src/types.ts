@@ -253,6 +253,17 @@ export interface MetaDelta {
 // than a number last time is simply absent: no delta rather than a fake zero
 export type Deltas = Record<string, MetaDelta>;
 
+// one point of a numeric metadata key's trend, oldest first from the api.
+// run_id is null on a materialization a probe wrote outside any run
+export interface MetaPoint {
+  at: string;
+  value: number;
+  run_id: string | null;
+}
+
+// keyed by metadata name, for the keys a trend was fetched for
+export type Trends = Record<string, MetaPoint[]>;
+
 export interface OpRun {
   run_id: string;
   op: string;
@@ -296,6 +307,8 @@ export interface OpStat {
   p95_ms: number | null;
   last_error: string | null;
   recent: OpStatSample[];
+  // the newest facts this op reported in the window; null if it reported none
+  metadata: Metadata | null;
 }
 
 export interface JobState {

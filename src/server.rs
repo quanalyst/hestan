@@ -24,8 +24,8 @@ use crate::freshness::{self, asset_freshness};
 use crate::graph;
 use crate::job::Job;
 use crate::model::{
-    AssetCheckRow, CheckStatus, Freshness, OpRun, OpStatus, RunStatus, RunTags, ScheduleRow,
-    Trigger,
+    AssetCheckRow, CheckStatus, Freshness, MetaPoint, OpRun, OpStatus, RunStatus, RunTags,
+    ScheduleRow, Trigger,
 };
 use crate::op;
 use crate::schedule;
@@ -69,6 +69,10 @@ pub(crate) fn router(state: AppState) -> Router {
         )
         .route("/api/jobs/{name}/validate_params", post(validate_params))
         .route("/api/jobs/{name}/op_stats", get(op_stats))
+        .route(
+            "/api/jobs/{name}/ops/{op}/metadata/{key}",
+            get(op_metadata_series),
+        )
         .route("/api/jobs/{name}/state", get(job_state))
         .route("/api/runs", get(list_runs))
         .route("/api/runs/{id}", get(get_run))
@@ -84,6 +88,10 @@ pub(crate) fn router(state: AppState) -> Router {
         .route("/api/assets/build", post(build_all_assets))
         .route("/api/assets/{name}/build", post(build_one_asset))
         .route("/api/assets/{name}/history", get(asset_history))
+        .route(
+            "/api/assets/{name}/metadata/{key}",
+            get(asset_metadata_series),
+        )
         .route("/api/assets/{name}/partitions", get(asset_partitions))
         .route("/api/assets/{name}/checks", get(asset_checks))
         .route("/api/assets/{name}/backfill", post(start_backfill))
@@ -555,6 +563,10 @@ fn op_stat(op: &str, rows: &[&OpRun]) -> Value {
         "p95_ms": p95,
         "last_error": last_error,
         "recent": recent,
+        // the newest facts this op reported in the window, so the inspector
+        // has something to hang a trend under. no deltas here: what one build
+        // did against the one before it belongs on that run's page
+        "metadata": rows.iter().find_map(|r| r.metadata.clone()),
     })
 }
 
@@ -794,6 +806,95 @@ async fn asset_history(
         })
         .collect();
     Ok(Json(json!({ "materializations": materializations })))
+}
+
+#[derive(Deserialize)]
+struct SeriesQuery {
+    limit: Option<u32>,
+    partition: Option<String>,
+}
+
+// how many builds or runs back a trend reaches by default, and at most
+const SERIES_DEFAULT: u32 = 20;
+const SERIES_MAX: u32 = 200;
+
+// one numeric metadata key over recent history, oldest first — the sparkline
+// under the value. entries that did not report the key, or reported it as
+// something that is not a number, are skipped rather than drawn as zero.
+async fn asset_metadata_series(
+    State(st): State<AppState>,
+    Path((name, key)): Path<(String, String)>,
+    q: Result<Query<SeriesQuery>, QueryRejection>,
+) -> Result<Json<Value>, ApiError> {
+    let Query(q) = q.map_err(bad_query)?;
+    if st.assets.get(&name).is_none() {
+        return Err(err(StatusCode::NOT_FOUND, format!("unknown asset: {name}")));
+    }
+    let points = st
+        .runner
+        .store()
+        .asset_metadata_series(
+            &name,
+            q.partition.as_deref(),
+            &key,
+            q.limit.unwrap_or(SERIES_DEFAULT).clamp(1, SERIES_MAX),
+        )
+        .map_err(internal)?;
+    Ok(Json(json!({
+        "asset": name,
+        "key": key,
+        "points": series_json(&points),
+    })))
+}
+
+async fn op_metadata_series(
+    State(st): State<AppState>,
+    Path((name, op_name, key)): Path<(String, String, String)>,
+    q: Result<Query<SeriesQuery>, QueryRejection>,
+) -> Result<Json<Value>, ApiError> {
+    let Query(q) = q.map_err(bad_query)?;
+    let job = st
+        .jobs
+        .get(&name)
+        .ok_or_else(|| err(StatusCode::NOT_FOUND, format!("unknown job: {name}")))?;
+    // an op of a mapped op's fan-out is named `{op}[i]` and has no entry of
+    // its own, so the check is on the prefix the job does declare
+    let declared = job.ops().iter().any(|o| {
+        o.name() == op_name
+            || op_name
+                .strip_suffix(']')
+                .is_some_and(|s| s.starts_with(o.name()))
+    });
+    if !declared {
+        return Err(err(
+            StatusCode::NOT_FOUND,
+            format!("unknown op: {name}.{op_name}"),
+        ));
+    }
+    let points = st
+        .runner
+        .store()
+        .op_metadata_series(
+            &name,
+            &op_name,
+            &key,
+            q.limit.unwrap_or(SERIES_DEFAULT).clamp(1, SERIES_MAX),
+        )
+        .map_err(internal)?;
+    Ok(Json(json!({
+        "job": name,
+        "op": op_name,
+        "key": key,
+        "points": series_json(&points),
+    })))
+}
+
+// whole numbers stay whole, exactly as they do in a delta
+fn series_json(points: &[MetaPoint]) -> Vec<Value> {
+    points
+        .iter()
+        .map(|p| json!({ "at": p.at, "value": op::number(p.value), "run_id": p.run_id }))
+        .collect()
 }
 
 // one row per key of a partitioned asset, newest key first: what it is, what
@@ -1826,10 +1927,12 @@ mod tests {
         store
             .op_finished("r0", "b", OpStatus::Success, None, None, None)
             .unwrap();
-        // the two newer runs failed at a, skipping b (never started)
+        // the two newer runs failed at a, skipping b (never started). the
+        // first of them still reported facts before it failed
         for (id, msg) in [("r1", "db locked"), ("r2", "timeout")] {
+            let meta = (id == "r1").then(|| json!({"rows": {"count": 4}}));
             store
-                .op_finished(id, "a", OpStatus::Failed, None, None, Some(msg))
+                .op_finished(id, "a", OpStatus::Failed, None, meta.as_ref(), Some(msg))
                 .unwrap();
             store
                 .op_finished(id, "b", OpStatus::Skipped, None, None, None)
@@ -1861,6 +1964,10 @@ mod tests {
             .collect();
         assert_eq!(recent, ["r2", "r1", "r0"]);
         assert!(a["avg_ms"].is_number() && a["p95_ms"].is_number());
+        // the newest facts the op reported in the window, which is what the
+        // inspector draws a trend under; an op that reported none has null
+        assert_eq!(a["metadata"], json!({"rows": {"count": 4}}));
+        assert_eq!(ops[1]["metadata"], json!(null));
 
         let b = &ops[1];
         assert_eq!(b["runs"], 3);
@@ -2772,6 +2879,117 @@ mod tests {
             deltas_of(&body),
             json!({"rows": {"delta": -240, "delta_pct": -19.35}})
         );
+    }
+
+    #[tokio::test]
+    async fn a_metadata_series_is_in_order_and_skips_what_is_not_a_number() {
+        let st = state(vec![counting_job()]);
+        for rows in [10, 20, 15] {
+            st.runner
+                .run("counter", json!({"rows": rows}), Trigger::Manual)
+                .await
+                .unwrap();
+        }
+        let series = |key: &str| {
+            let (st, key) = (st.clone(), key.to_string());
+            async move {
+                let Json(body) = op_metadata_series(
+                    State(st),
+                    Path(("counter".into(), "load".into(), key)),
+                    Ok(Query(SeriesQuery {
+                        limit: None,
+                        partition: None,
+                    })),
+                )
+                .await
+                .unwrap();
+                body
+            }
+        };
+
+        let body = series("rows").await;
+        let values: Vec<&Value> = body["points"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|p| &p["value"])
+            .collect();
+        // oldest first, newest last: the order a sparkline is drawn in
+        assert_eq!(values, [&json!(10), &json!(20), &json!(15)]);
+        let first = &body["points"][0];
+        assert!(first["at"].is_string());
+        assert!(first["run_id"].is_string());
+        assert_eq!(body["key"], "rows");
+
+        // the op reports `note` as text every run, so it has no trend at all
+        assert_eq!(series("note").await["points"], json!([]));
+        // and a key nobody ever reported is an empty series, not a 404
+        assert_eq!(series("nothing").await["points"], json!([]));
+
+        // an unknown job and an unknown op are both 404s that say which
+        for (job, op) in [("nope", "load"), ("counter", "nope")] {
+            let (status, _) = op_metadata_series(
+                State(st.clone()),
+                Path((job.into(), op.into(), "rows".into())),
+                Ok(Query(SeriesQuery {
+                    limit: None,
+                    partition: None,
+                })),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(status, StatusCode::NOT_FOUND);
+        }
+    }
+
+    #[tokio::test]
+    async fn an_asset_series_reads_its_history_and_narrows_to_a_partition() {
+        let st = asset_state();
+        let store = st.runner.store().clone();
+        for (key, files) in [
+            (None, Some(3)),
+            (Some("k"), Some(99)),
+            (None, None),
+            (None, Some(5)),
+        ] {
+            let meta = files.map(|n| json!({ "files": {"count": n} }));
+            store
+                .record_materialization("docs", key, "d1", &json!({}), None, None, meta.as_ref())
+                .unwrap();
+        }
+
+        let series = |partition: Option<&str>| {
+            let (st, partition) = (st.clone(), partition.map(str::to_string));
+            async move {
+                let Json(body) = asset_metadata_series(
+                    State(st),
+                    Path(("docs".into(), "files".into())),
+                    Ok(Query(SeriesQuery {
+                        limit: None,
+                        partition,
+                    })),
+                )
+                .await
+                .unwrap();
+                body["points"].clone()
+            }
+        };
+
+        // the build that reported nothing contributes no point, and a probe's
+        // row carries no run to link to
+        let points = series(None).await;
+        let values: Vec<&Value> = points
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|p| &p["value"])
+            .collect();
+        assert_eq!(values, [&json!(3), &json!(99), &json!(5)]);
+        assert_eq!(points[0]["run_id"], json!(null));
+
+        // one key's trend is that key's builds and nobody else's
+        assert_eq!(series(Some("k")).await[0]["value"], json!(99));
+        assert_eq!(series(Some("k")).await.as_array().unwrap().len(), 1);
     }
 
     #[tokio::test]
