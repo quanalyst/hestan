@@ -5,6 +5,10 @@ mod app;
 mod asset;
 mod backfill;
 mod backoff;
+// the tracing layer a host composes into its own subscriber. optional because
+// hestan installs no subscriber and will not make anyone depend on one
+#[cfg(feature = "capture")]
+mod capture;
 mod error;
 mod executor;
 mod freshness;
@@ -31,6 +35,8 @@ mod store;
 
 pub use app::Hestan;
 pub use asset::{Asset, AssetCheck, CheckOutcome, CheckResult, MultiAsset};
+#[cfg(feature = "capture")]
+pub use capture::{CaptureLayer, capture_layer};
 pub use error::Error;
 pub use executor::{
     Blocked, CancelOutcome, FailureHook, Limits, Queued, ResumePlan, RunFailure, Runner,

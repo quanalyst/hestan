@@ -9,6 +9,7 @@ use serde::Serialize;
 use serde_json::{Value, json};
 use tokio::sync::{Notify, Semaphore, watch};
 use tokio::task::{Id, JoinSet};
+use tracing::Instrument;
 
 use crate::error::Error;
 use crate::graph;
@@ -2510,8 +2511,20 @@ async fn run_op(
                 }
                 None => {
                     // the call sits inside the async block, so a closure that panics
-                    // before returning its future is caught by the retry policy too
-                    let call = AssertUnwindSafe(async { op.call(ctx).await }).catch_unwind();
+                    // before returning its future is caught by the retry policy too.
+                    //
+                    // the span is entered across every await of the body, and
+                    // it is the whole of how a tracing event is attributed to
+                    // an op: `capture_layer` stores events whose span context
+                    // carries these three fields and ignores everything else,
+                    // which is how a library captures its ops' logging without
+                    // touching the host application's. it costs nothing when
+                    // nothing is subscribed
+                    let span =
+                        tracing::info_span!("hestan.op", run_id = %run_id, op = %name, attempt);
+                    let call = AssertUnwindSafe(async { op.call(ctx).await })
+                        .catch_unwind()
+                        .instrument(span);
                     let caught = match op.timeout_after() {
                         None => Ok(call.await),
                         Some(limit) => match tokio::time::timeout(limit, call).await {

@@ -29,6 +29,9 @@ sha2 = "0.10"
 thiserror = "2"
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "net", "time", "sync", "macros", "process", "signal", "io-util"] }
 tracing = "0.1"
+# the `capture` feature only: the Layer trait the host composes hestan's
+# capture layer into its own subscriber with
+tracing-subscriber = { version = "0.3", optional = true, default-features = false, features = ["registry", "std"] }
 uuid = { version = "1", features = ["v7"] }
 
 # isolated ops only: kill(2), the signal names a dead child is reported with,
@@ -50,6 +53,10 @@ default = ["bundled"]
 # compiles sqlite from source; disable to link the system library
 bundled = ["rusqlite/bundled"]
 http = ["dep:reqwest"]
+# `hestan::capture_layer`, for a host that wants the tracing events its ops
+# emit on the run page. off by default: it is the host's subscriber, and
+# hestan does not install one
+capture = ["dep:tracing-subscriber"]
 
 [[example]]
 name = "http_source"
@@ -62,6 +69,13 @@ required-features = ["http"]
 [[test]]
 name = "notify"
 required-features = ["http"]
+
+# the capture layer needs a subscriber, and a subscriber in a test binary is a
+# thread-local thing every other test in that binary can invalidate — see the
+# comment at the top of the file
+[[test]]
+name = "capture"
+required-features = ["capture"]
 
 # an isolated op re-executes `current_exe()`, so this target needs a `main` of
 # its own that rebuilds the same jobs — see the comment at the top of the file

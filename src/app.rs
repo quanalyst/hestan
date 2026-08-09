@@ -470,6 +470,11 @@ impl Hestan {
     /// capture stopping is not the op failing. per attempt because a retry
     /// starts from a full budget, the failed attempt's output being the part
     /// usually worth reading.
+    ///
+    /// the limit covers every capture in this process, the `capture` feature's
+    /// [layer](crate::capture_layer) included — the host composes that with a
+    /// store handle of its own, and a cap that only reached the writers hestan
+    /// happened to build would be a cap that quietly does not hold.
     pub fn log_limit(mut self, bytes: u64) -> Self {
         self.log_bytes = bytes;
         self
@@ -788,7 +793,7 @@ impl Hestan {
         let (jobs, _) = self.lower()?;
         let resources = resource::build(std::mem::take(&mut self.resources)).await?;
         let store = Store::open(&self.db_path)?;
-        store.set_log_caps(Some(self.log_bytes), Some(self.log_line_cap));
+        logs::set_caps(Some(self.log_bytes), Some(self.log_line_cap));
         let io = Io::new(self.io_default.take(), std::mem::take(&mut self.io_named));
         crate::isolate::run_one_op(&req, &jobs, &store, &io, &resources).await
     }
@@ -855,7 +860,7 @@ impl Hestan {
         let resources = resource::build(self.resources).await?;
 
         let store = Store::open(&self.db_path)?;
-        store.set_log_caps(Some(self.log_bytes), Some(self.log_line_cap));
+        logs::set_caps(Some(self.log_bytes), Some(self.log_line_cap));
         store.fail_interrupted()?;
         store.sync_schedules(&schedules)?;
         // seeded, not synced: the launchpad's presets share the table, so

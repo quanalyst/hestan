@@ -42,41 +42,42 @@ pub(crate) const CLIPPED: &str = "… [truncated]";
 /// marker for the ui.
 pub(crate) const HESTAN: &str = "hestan";
 
-/// the caps a [`Store`] writes captured output under, shared by every clone
-/// of it and by every writer that holds one.
+/// how much one attempt may store, for this process.
 ///
-/// atomics rather than a plain pair because the store is built before the
-/// builder's limits are known and cloned everywhere immediately after, so a
-/// value set on one clone has to be the value every clone reads.
-#[derive(Debug)]
-pub(crate) struct Caps {
+/// process-wide rather than per [`Store`], and that is not laziness. the two
+/// writers reach the store by different routes: the subprocess capture uses
+/// the store the runner was built with, and the [capture
+/// layer](crate::capture_layer) uses a handle the *host* opened, before
+/// [`Hestan`](crate::Hestan) existed and possibly on another connection to
+/// the same file. a cap that lived on one of those objects would silently not
+/// apply to the other — and a limit that quietly does not hold is worse than
+/// no limit at all. one process running two hestan applications with
+/// different limits would see the last one set; nothing does that.
+static CAPS: Caps = Caps {
+    bytes: AtomicU64::new(DEFAULT_BYTES),
+    lines: AtomicU64::new(DEFAULT_LINES),
+};
+
+struct Caps {
     bytes: AtomicU64,
     lines: AtomicU64,
 }
 
-impl Default for Caps {
-    fn default() -> Caps {
-        Caps {
-            bytes: AtomicU64::new(DEFAULT_BYTES),
-            lines: AtomicU64::new(DEFAULT_LINES),
-        }
-    }
+/// the caps in force: `(bytes, lines)`.
+pub(crate) fn caps() -> (u64, u64) {
+    (
+        CAPS.bytes.load(Ordering::Relaxed),
+        CAPS.lines.load(Ordering::Relaxed),
+    )
 }
 
-impl Caps {
-    pub(crate) fn read(&self) -> (u64, u64) {
-        (
-            self.bytes.load(Ordering::Relaxed),
-            self.lines.load(Ordering::Relaxed),
-        )
+/// set either cap; `None` leaves that one alone.
+pub(crate) fn set_caps(bytes: Option<u64>, lines: Option<u64>) {
+    if let Some(bytes) = bytes {
+        CAPS.bytes.store(bytes, Ordering::Relaxed);
     }
-
-    pub(crate) fn set_bytes(&self, bytes: u64) {
-        self.bytes.store(bytes, Ordering::Relaxed);
-    }
-
-    pub(crate) fn set_lines(&self, lines: u64) {
-        self.lines.store(lines, Ordering::Relaxed);
+    if let Some(lines) = lines {
+        CAPS.lines.store(lines, Ordering::Relaxed);
     }
 }
 
@@ -132,8 +133,13 @@ impl Source<'_> {
 /// one budget per attempt, shared by everything writing for it — an isolated
 /// op's two pipes spend the same allowance, because the limit is on what the
 /// attempt produced and not on which pipe it came out of.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub(crate) struct Budget {
+    /// `(bytes, lines)`, read once when the attempt started rather than per
+    /// line: a limit changed halfway through an attempt is not a thing, and a
+    /// budget that could shrink under itself would have to decide what to do
+    /// about what it already stored.
+    caps: (u64, u64),
     bytes: u64,
     lines: u64,
     /// set by the line that hit a cap, and never unset: after it this attempt
@@ -142,8 +148,21 @@ pub(crate) struct Budget {
 }
 
 impl Budget {
+    /// a budget under this process's [caps](caps).
     pub(crate) fn new() -> Budget {
-        Budget::default()
+        Budget::under(caps())
+    }
+
+    /// a budget under caps of its own, which is how the cases here test the
+    /// cap without moving a process-wide value out from under every other
+    /// case running beside them.
+    pub(crate) fn under(caps: (u64, u64)) -> Budget {
+        Budget {
+            caps,
+            bytes: 0,
+            lines: 0,
+            spent: false,
+        }
     }
 
     /// whether this attempt has stopped storing.
@@ -153,14 +172,11 @@ impl Budget {
     }
 
     /// store one line, or store the one line that says why this was the last.
-    ///
-    /// the caps are read per line rather than held, so a store whose limits
-    /// were set after a writer was built still writes under them.
     pub(crate) fn line(&mut self, store: &Store, at: &Attempt, source: Source<'_>, message: &str) {
         if self.spent {
             return;
         }
-        let (max_bytes, max_lines) = store.log_caps();
+        let (max_bytes, max_lines) = self.caps;
         let message = clip(message);
         let cost = message.len() as u64;
         let hit = if self.lines + 1 > max_lines {
@@ -317,9 +333,8 @@ mod tests {
     #[test]
     fn the_line_cap_stops_capture_and_says_so_exactly_once() {
         let store = store();
-        store.set_log_caps(Some(1 << 20), Some(3));
         let at = Attempt::new("r1", "chatty", 1);
-        let mut budget = Budget::new();
+        let mut budget = Budget::under((1 << 20, 3));
         for i in 0..100 {
             budget.line(
                 &store,
@@ -342,9 +357,8 @@ mod tests {
     #[test]
     fn the_byte_cap_stops_capture_and_says_so_exactly_once() {
         let store = store();
-        store.set_log_caps(Some(25), None);
         let at = Attempt::new("r1", "chatty", 1);
-        let mut budget = Budget::new();
+        let mut budget = Budget::under((25, DEFAULT_LINES));
         for i in 0..100 {
             budget.line(
                 &store,
@@ -432,8 +446,7 @@ mod tests {
     #[test]
     fn each_attempt_gets_its_own_budget() {
         let store = store();
-        store.set_log_caps(None, Some(1));
-        let mut first = Budget::new();
+        let mut first = Budget::under((DEFAULT_BYTES, 1));
         first.line(
             &store,
             &Attempt::new("r1", "flaky", 1),
@@ -446,7 +459,7 @@ mod tests {
             Source::Stream(LogStream::Stdout),
             "dropped",
         );
-        let mut second = Budget::new();
+        let mut second = Budget::under((DEFAULT_BYTES, 1));
         second.line(
             &store,
             &Attempt::new("r1", "flaky", 2),

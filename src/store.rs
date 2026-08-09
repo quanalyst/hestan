@@ -9,7 +9,7 @@ use serde_json::Value;
 
 use crate::error::Error;
 use crate::executor::{Blocked, InFlight, Limits, QUEUE_SCAN, Queued};
-use crate::logs::{Attempt, Caps, Source};
+use crate::logs::{Attempt, Source};
 use crate::model::{
     AssetCheckRow, Backfill, BackfillStatus, CheckStatus, Event, EventKind, EventLevel,
     FreshnessRow, HistoryEntry, Materialization, MetaPoint, OpLog, OpRun, OpStatus, Preset,
@@ -429,12 +429,9 @@ const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 /// sqlite-backed run history. cheap to clone; safe to share across tasks.
 ///
 /// the second field is the path it was opened at, kept so a runner can tell
-/// whether a child process could open the same database. the third is how
-/// much [captured output](crate::Hestan::log_limit) one attempt may store,
-/// shared by every clone so a limit set at build applies to writers made
-/// before and after it.
+/// whether a child process could open the same database.
 #[derive(Clone)]
-pub struct Store(Arc<Mutex<Connection>>, Arc<str>, Arc<Caps>);
+pub struct Store(Arc<Mutex<Connection>>, Arc<str>);
 
 impl Store {
     /// open (and migrate) the database at `path`; `":memory:"` works too.
@@ -445,11 +442,7 @@ impl Store {
         }
         conn.busy_timeout(BUSY_TIMEOUT)?;
         migrate(&mut conn)?;
-        Ok(Store(
-            Arc::new(Mutex::new(conn)),
-            path.into(),
-            Arc::new(Caps::default()),
-        ))
+        Ok(Store(Arc::new(Mutex::new(conn)), path.into()))
     }
 
     /// whether this database lives only in this process's memory, and so
@@ -1118,22 +1111,6 @@ impl Store {
             ],
         )?;
         Ok(())
-    }
-
-    /// how much output one attempt may store: `(bytes, lines)`.
-    pub(crate) fn log_caps(&self) -> (u64, u64) {
-        self.2.read()
-    }
-
-    /// set either cap; `None` leaves that one alone. every clone of this store
-    /// reads the new value, including the ones already handed out.
-    pub(crate) fn set_log_caps(&self, bytes: Option<u64>, lines: Option<u64>) {
-        if let Some(bytes) = bytes {
-            self.2.set_bytes(bytes);
-        }
-        if let Some(lines) = lines {
-            self.2.set_lines(lines);
-        }
     }
 
     /// append one captured line. the cap lives in [`logs::Budget`], which is
