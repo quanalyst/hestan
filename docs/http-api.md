@@ -205,7 +205,8 @@ without `before` is ignored. a run:
   "started_at": "2026-08-07T12:00:00Z",
   "finished_at": "2026-08-07T12:00:03Z",
   "error": null,
-  "resumed_from": null
+  "resumed_from": null,
+  "scheduled_for": "2026-08-07T12:00:00Z"
 }
 ```
 
@@ -217,7 +218,10 @@ a failed run's `error` names the first op that terminally failed, as
 `manual | schedule | retry | resume | build | sensor`. an op run's status is
 `pending | running | success | failed | skipped | canceled`. `resumed_from`
 is the id of the run this one continued, null for every run that isn't a
-[resume](#resume).
+[resume](#resume). `scheduled_for` is the cron occurrence the run stands for —
+not the clock it started at, once a schedule is
+[catching up](scheduling.md#missed-fire-catch-up) or a held fire drains — and
+is null on a manual launch, a retry, a resume, a build or a sensor fire.
 
 `GET /api/runs/{id}` returns `{"run": ..., "ops": [...]}` (404 for an unknown
 id), the op runs sorted by op name. a [mapped op](concepts.md#dynamic-fan-out)
@@ -548,13 +552,20 @@ expression:
 { "schedules": [
   { "job": "orders_etl", "expr": "*/2 * * * *", "tz": "UTC",
     "paused": false, "params": {"region": "eu"},
+    "catchup": "all:24", "cursor": "2026-08-07T12:32:00Z",
     "next_fire": "2026-08-07T12:34:00+00:00" }
 ] }
 ```
 
 `params` is what every fire of that schedule launches with — `{}` unless the
 declaration set it with `schedule_with` / `schedule_tz_with`, and validated
-against the job's ops at startup (see [scheduling](scheduling.md)).
+against the job's ops at startup (see [scheduling](scheduling.md)). `catchup`
+is `skip` (the default), `one` or `all:<limit>`, and `cursor` is the newest
+occurrence the scheduler has accounted for — `null` until this process has seen
+the schedule once. everything strictly between the cursor and now is what
+downtime swallowed, which is what the policy applies to
+([catch-up](scheduling.md#missed-fire-catch-up)). the same two fields appear on
+each entry of a job summary's `schedules`.
 
 `POST /api/schedules/state` with `{"job": ..., "expr": ..., "paused": true}`
 flips the flag and returns `{"ok": true}`; an unregistered `(job, expr)` pair
@@ -572,10 +583,12 @@ is a 404.
 ```
 
 `outcome` is `fired` (with the launched run's id), `error` (with the launch
-failure in `error`), `skipped` (a fire dropped by the overlap policy or the
-same-instant dedupe), or `deferred` (a queue-policy fire held for an active
-run; its catch-up later records a separate `fired` tick with the same
-`scheduled_for` — see [scheduling](scheduling.md)).
+failure in `error`), `skipped` (a fire dropped by the overlap policy, the
+same-instant dedupe, or a catch-up cap — which puts its reason in `error`), or
+`deferred` (a fire held for an active run; it later records a separate `fired`
+tick with the same `scheduled_for` — see [scheduling](scheduling.md)). a
+caught-up fire is an ordinary `fired` tick whose `scheduled_for` is well before
+its `fired_at`, which is exactly what it is.
 
 `GET /api/schedules/upcoming?window=86400` projects fires for every unpaused
 schedule within the next `window` seconds (default one day, clamped to

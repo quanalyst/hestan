@@ -9,9 +9,10 @@ use serde_json::Value;
 use crate::error::Error;
 use crate::model::{
     AssetCheckRow, Backfill, BackfillStatus, CheckStatus, Event, EventKind, EventLevel,
-    FreshnessRow, Materialization, OpRun, OpStatus, Run, RunStatus, ScheduleDef, ScheduleRow,
-    SensorOutcome, SensorRow, SensorTick, Severity, Tick, TickOutcome,
+    FreshnessRow, Materialization, OpRun, OpStatus, Run, RunStatus, ScheduleRow, SensorOutcome,
+    SensorRow, SensorTick, Severity, Tick, TickOutcome,
 };
+use crate::schedule::Schedule;
 
 // `trigger` is a reserved word in sqlite, hence the quoted column name in
 // every statement that touches it.
@@ -294,8 +295,9 @@ impl Store {
         let mut conn = self.0.lock().unwrap();
         let tx = conn.transaction()?;
         tx.execute(
-            r#"INSERT INTO runs (id, job, status, "trigger", params, created_at, started_at, finished_at, error, resumed_from)
-               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)"#,
+            r#"INSERT INTO runs (id, job, status, "trigger", params, created_at, started_at,
+                                 finished_at, error, resumed_from, scheduled_for)
+               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)"#,
             params![
                 run.id,
                 run.job,
@@ -307,6 +309,7 @@ impl Store {
                 run.finished_at.map(|t| t.to_rfc3339()),
                 run.error,
                 run.resumed_from,
+                run.scheduled_for.map(|t| t.to_rfc3339()),
             ],
         )?;
         {
@@ -502,20 +505,26 @@ impl Store {
     /// make the schedules table mirror the code: insert new (job, expr) pairs,
     /// refresh tz and params on existing ones (pause state survives), drop the
     /// rest.
-    pub(crate) fn sync_schedules(&self, defined: &[ScheduleDef]) -> Result<(), Error> {
+    pub(crate) fn sync_schedules(&self, defined: &[Schedule]) -> Result<(), Error> {
         let mut conn = self.0.lock().unwrap();
         let tx = conn.transaction()?;
         {
             let mut insert = tx.prepare(
-                "INSERT OR IGNORE INTO schedules (job, expr, tz, params) VALUES (?1, ?2, ?3, ?4)",
+                "INSERT OR IGNORE INTO schedules (job, expr, tz, params, catchup)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
             )?;
+            // the cursor is deliberately not touched: it is what the scheduler
+            // knows about this pair, and a restart that rewrote it would be a
+            // restart that forgot the downtime it is meant to detect
             let mut update = tx.prepare(
-                "UPDATE schedules SET tz = ?3, params = ?4 WHERE job = ?1 AND expr = ?2",
+                "UPDATE schedules SET tz = ?3, params = ?4, catchup = ?5
+                 WHERE job = ?1 AND expr = ?2",
             )?;
-            for (job, expr, tz, declared) in defined {
-                let declared = declared.to_string();
-                insert.execute(params![job, expr, tz, declared])?;
-                update.execute(params![job, expr, tz, declared])?;
+            for s in defined {
+                let declared = s.params.to_string();
+                let catchup = s.catchup.to_string();
+                insert.execute(params![s.job, s.expr, s.tz, declared, catchup])?;
+                update.execute(params![s.job, s.expr, s.tz, declared, catchup])?;
             }
         }
         let existing: Vec<(String, String)> = {
@@ -525,7 +534,7 @@ impl Store {
         };
         let keep: HashSet<(&str, &str)> = defined
             .iter()
-            .map(|(j, e, ..)| (j.as_str(), e.as_str()))
+            .map(|s| (s.job.as_str(), s.expr.as_str()))
             .collect();
         for (job, expr) in &existing {
             if !keep.contains(&(job.as_str(), expr.as_str())) {
@@ -541,8 +550,10 @@ impl Store {
 
     pub fn schedules(&self) -> Result<Vec<ScheduleRow>, Error> {
         let conn = self.0.lock().unwrap();
-        let mut stmt =
-            conn.prepare("SELECT job, expr, tz, paused, params FROM schedules ORDER BY job, expr")?;
+        let mut stmt = conn.prepare(
+            "SELECT job, expr, tz, paused, params, catchup, cursor
+             FROM schedules ORDER BY job, expr",
+        )?;
         let rows = stmt.query_map([], |r| {
             Ok(ScheduleRow {
                 job: r.get(0)?,
@@ -550,6 +561,8 @@ impl Store {
                 tz: r.get(2)?,
                 paused: r.get(3)?,
                 params: json_col(r, 4)?,
+                catchup: parse_col(r, 5)?,
+                cursor: opt_ts_col(r, 6)?,
             })
         })?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
@@ -563,6 +576,45 @@ impl Store {
             params![job, expr, paused],
         )?;
         Ok(n > 0)
+    }
+
+    /// move a schedule's cursor to `at`, never backwards. rfc3339 utc sorts
+    /// lexicographically, so the guard is a plain string compare — and it is
+    /// what lets a held fire drain long after its occurrence without
+    /// un-accounting for everything since.
+    pub(crate) fn set_schedule_cursor(
+        &self,
+        job: &str,
+        expr: &str,
+        at: DateTime<Utc>,
+    ) -> Result<(), Error> {
+        let conn = self.0.lock().unwrap();
+        conn.execute(
+            "UPDATE schedules SET cursor = ?3
+             WHERE job = ?1 AND expr = ?2 AND (cursor IS NULL OR cursor < ?3)",
+            params![job, expr, at.to_rfc3339()],
+        )?;
+        Ok(())
+    }
+
+    /// every fire still waiting to launch, oldest occurrence first: a
+    /// `deferred` tick with no later tick for the same `(job, expr,
+    /// scheduled_for)`. the tick log *is* the queue — a fire held in memory
+    /// dies with the process, and this one does not.
+    pub(crate) fn pending_fires(&self) -> Result<Vec<(String, String, DateTime<Utc>)>, Error> {
+        let conn = self.0.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT job, expr, scheduled_for FROM schedule_ticks d
+             WHERE d.outcome = 'deferred'
+               AND NOT EXISTS (
+                   SELECT 1 FROM schedule_ticks f
+                   WHERE f.job = d.job AND f.expr = d.expr
+                     AND f.scheduled_for = d.scheduled_for AND f.id > d.id
+               )
+             ORDER BY d.scheduled_for, d.id",
+        )?;
+        let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, ts_col(r, 2)?)))?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 
     pub(crate) fn prune_ticks(&self, keep: usize) -> Result<(), Error> {
@@ -655,7 +707,7 @@ impl Store {
         let run = conn
             .query_row(
                 r#"SELECT id, job, status, "trigger", params, created_at, started_at, finished_at,
-                          resumed_from, error
+                          resumed_from, error, scheduled_for
                    FROM runs WHERE id = ?1"#,
                 params![id],
                 run_from_row,
@@ -677,7 +729,7 @@ impl Store {
         let conn = self.0.lock().unwrap();
         let mut stmt = conn.prepare(
             r#"SELECT id, job, status, "trigger", params, created_at, started_at, finished_at,
-                      resumed_from, error
+                      resumed_from, error, scheduled_for
                FROM runs
                WHERE (?1 IS NULL OR job = ?1) AND (?2 IS NULL OR created_at >= ?2)
                  AND (?3 IS NULL OR created_at < ?3
@@ -1282,6 +1334,7 @@ fn run_from_row(row: &Row) -> rusqlite::Result<Run> {
         finished_at: opt_ts_col(row, 7)?,
         resumed_from: row.get(8)?,
         error: row.get(9)?,
+        scheduled_for: opt_ts_col(row, 10)?,
     })
 }
 
@@ -1429,6 +1482,7 @@ fn opt_json_col(row: &Row, idx: usize) -> rusqlite::Result<Option<Value>> {
 mod tests {
     use super::*;
     use crate::model::Trigger;
+    use crate::schedule::Schedule;
     use chrono::TimeZone;
     use serde_json::json;
 
@@ -1444,6 +1498,7 @@ mod tests {
             finished_at: None,
             error: None,
             resumed_from: None,
+            scheduled_for: None,
         }
     }
 
@@ -2132,12 +2187,7 @@ mod tests {
         assert_eq!(rows[0].params, json!({}));
 
         store
-            .sync_schedules(&[(
-                "etl".into(),
-                "0 * * * *".into(),
-                "UTC".into(),
-                json!({"region": "eu"}),
-            )])
+            .sync_schedules(&[Schedule::new("etl", "0 * * * *").params(json!({"region": "eu"}))])
             .unwrap();
         drop(store);
         let store = Store::open(path).unwrap();
@@ -2566,18 +2616,8 @@ mod tests {
     fn schedule_sync_and_pause_roundtrip() {
         let store = Store::open(":memory:").unwrap();
         let defined = vec![
-            (
-                "etl".to_string(),
-                "0 * * * *".to_string(),
-                "UTC".to_string(),
-                json!({"full": true}),
-            ),
-            (
-                "health".to_string(),
-                "*/5 * * * *".to_string(),
-                "UTC".to_string(),
-                json!({}),
-            ),
+            Schedule::new("etl", "0 * * * *").params(json!({"full": true})),
+            Schedule::new("health", "*/5 * * * *").catchup(crate::model::Catchup::One),
         ];
         store.sync_schedules(&defined).unwrap();
         let rows = store.schedules().unwrap();
@@ -2585,23 +2625,34 @@ mod tests {
         assert!(rows.iter().all(|r| !r.paused));
         assert_eq!(rows[0].params, json!({"full": true}));
         assert_eq!(rows[1].params, json!({}));
+        assert_eq!(rows[0].catchup, crate::model::Catchup::Skip);
+        assert_eq!(rows[1].catchup, crate::model::Catchup::One);
+        assert!(rows.iter().all(|r| r.cursor.is_none()));
 
         assert!(store.set_schedule_paused("etl", "0 * * * *", true).unwrap());
         assert!(!store.set_schedule_paused("etl", "bogus", true).unwrap());
 
         // tz and params follow the declaration; the paused flag stays put
-        let defined = vec![(
-            "etl".to_string(),
-            "0 * * * *".to_string(),
-            "Europe/London".to_string(),
-            json!({"full": false}),
-        )];
+        let cursor = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+        store
+            .set_schedule_cursor("etl", "0 * * * *", cursor)
+            .unwrap();
+        let defined = vec![
+            Schedule::new("etl", "0 * * * *")
+                .tz("Europe/London")
+                .params(json!({"full": false}))
+                .catchup(crate::model::Catchup::All { limit: 6 }),
+        ];
         store.sync_schedules(&defined).unwrap();
         let rows = store.schedules().unwrap();
         assert_eq!(rows.len(), 1);
         assert!(rows[0].paused);
         assert_eq!(rows[0].tz, "Europe/London");
         assert_eq!(rows[0].params, json!({"full": false}));
+        assert_eq!(rows[0].catchup, crate::model::Catchup::All { limit: 6 });
+        // the cursor is the scheduler's, not the declaration's: a sync that
+        // reset it would be a restart that forgot the downtime it must detect
+        assert_eq!(rows[0].cursor, Some(cursor));
     }
 
     #[test]

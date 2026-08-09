@@ -15,6 +15,25 @@ a job can carry several schedules; a schedule on an unregistered job, a bad
 expression, or an unknown timezone is an error from `serve`/`run_once` — at
 startup, not at fire time. scheduled runs carry the trigger `schedule`.
 
+the surface above is the short way to say the common thing. once a schedule
+wants more than a job and an expression there is a builder, which is the same
+declaration without four positional arguments:
+
+```rust
+Hestan::new()
+    .job(etl)
+    .add_schedule(
+        Schedule::new("etl", "0 * * * *")
+            .tz("Europe/London")
+            .params(json!({"region": "eu"}))
+            .catchup(Catchup::All { limit: 24 }),
+    )
+```
+
+`schedule`, `schedule_tz`, `schedule_with` and `schedule_tz_with` all build one
+of these with the defaults filled in — utc, `{}`, `Catchup::Skip` — so nothing
+that already works changes.
+
 ## Params
 
 `schedule` and `schedule_tz` fire with params `{}`. `schedule_with` and
@@ -77,10 +96,80 @@ fires at both offsets (an hourly new york job runs 01:00 EDT *and* 01:00
 EST), while a local time that doesn't exist on spring-forward is skipped for
 that day (a daily 02:30 new york job next fires the day after).
 
+## The cursor
+
+every `(job, expression)` pair carries a **cursor**: the newest occurrence the
+scheduler has accounted for — fired, skipped, held, or deliberately dropped.
+it lives in the `schedules` table and is written after every one of those, so
+it survives a restart.
+
+it exists because of a question the scheduler could not previously answer.
+computing fires relative to *now* means downtime is invisible: a process that
+was dead from 08:00 to 10:30 comes back, asks "when is the next fire", and the
+occurrences at 08:00, 09:00 and 10:00 are simply gone. with a cursor at 07:00,
+**everything strictly after the cursor and strictly before now is the missed
+set** — knowable, enumerable, and something a policy can be applied to.
+
+the first time a process sees a schedule the cursor is `null`, and it is set to
+now rather than to the beginning of the expression's history: a schedule
+declared today has no downtime behind it, and treating its whole cron past as
+missed would fire the epoch.
+
+a schedule that is **paused** advances its cursor over the gap without firing.
+pause means stop, including the catch-up: resuming a schedule paused for a week
+must not fire a week of backlog.
+
+## Missed-fire catch-up
+
+what to do with the missed set is a per-schedule policy:
+
+```rust
+Schedule::new("hourly_rollup", "0 * * * *").catchup(Catchup::All { limit: 24 })
+```
+
+- `Catchup::Skip` (the default): advance the cursor over them and fire nothing.
+  exactly what the scheduler did before it had a cursor. no ticks either — a
+  process down for a week would otherwise write a week of skipped ticks on
+  boot.
+- `Catchup::One`: fire the most recent missed occurrence only. for a job that
+  computes current state, where the last one subsumes the rest.
+- `Catchup::All { limit }`: fire every missed occurrence, oldest first, at most
+  `limit` of them (below 1 means 1). past the cap the **oldest are dropped**,
+  and the drop is recorded — a `skipped` tick at the oldest dropped occurrence
+  whose error reads `catch-up cap 24: dropped 9 missed occurrences up to
+  2026-03-04T01:00:00Z`, plus a warning in the log. a backlog quietly losing
+  its head is the failure mode this policy exists to avoid.
+
+**caught-up fires queue; they never overlap.** the first launches immediately
+if the job is free, and the rest are held and drained one at a time as it
+frees up. that is deliberate: the overlap policy governs a live fire landing on
+a busy job, while catch-up governs occurrences the process was never there for,
+and firing 24 hours of backlog concurrently is not what anyone means by
+"catch up".
+
+## Which hour is this run for
+
+a caught-up run is useless to a data pipeline that cannot tell which logical
+time it stands for. `runs.scheduled_for` is that time — the cron occurrence,
+not the wall clock the run started at — and ops read it back:
+
+```rust
+Op::new("pull", |ctx: OpCtx| async move {
+    let hour = ctx.scheduled_for().expect("scheduled");
+    Ok(json!({ "rows": pull_orders_for(hour).await? }))
+})
+```
+
+it is set on scheduled fires, caught-up fires and held fires that later drain,
+and it is `None` on a manual launch, a retry, a resume, an asset build and a
+sensor fire — all of which stand for nothing but themselves. it is on the run
+json, and the ui shows it next to the trigger.
+
 ## The scheduler loop
 
-`serve` runs one in-process scheduler task. each iteration computes every
-schedule's next fire, sleeps until the earliest (capped at 60s so clock drift
+`serve` runs one in-process scheduler task. each iteration reconciles every
+schedule's cursor (above), drains anything waiting, computes every schedule's
+next fire, sleeps until the earliest (capped at 60s so clock drift
 self-corrects within a minute), then fires everything that has come due.
 pause state is read from the database at fire time, not at startup. two
 schedules on the same job that share a fire instant launch one run, not two —
@@ -143,14 +232,21 @@ job's overlap policy: `Job::builder(..).overlap(Overlap::...)`.
 the policy gates scheduled fires only. manual launches, the retry endpoint,
 and `run_once` are never held back.
 
-pausing a schedule also drops its waiting deferred fire (recorded as a
-`skipped` tick): pause means stop, including the catch-up. the wait itself
-lives in scheduler memory, so a process restart drops a waiting fire — but
-its `deferred` tick is already on disk, so the audit trail survives as a
-`deferred` tick with no `fired` twin, and the next cron fire proceeds
-normally. the tick log is pruned to the newest 5000 rows at startup, which
-matters under skip: a schedule that keeps firing into a long run writes one
-skipped tick per fire.
+**that pair is the queue, not a record of it.** a fire is waiting exactly when
+it has a `deferred` tick with no later tick for the same occurrence, which is a
+question the database answers — so a fire held when the process died is still
+held when it comes back, and drains then. nothing about the wait lives in
+memory. one consequence: a fire reconstructed after a restart launches with the
+schedule's *current* params, since the process that held the old ones is gone;
+within a process it still launches with the params it was held with, which are
+the same thing unless the declaration changed across the restart.
+
+pausing a schedule drops its waiting fire (recorded as a `skipped` tick), and
+so does deleting the schedule from the code — nothing else knows what params it
+should have launched with. the tick log is pruned to the newest 5000 rows at
+startup, which matters under skip (a schedule firing into a long run writes one
+skipped tick per fire) and is also the one way a held fire can be forgotten: a
+`deferred` tick pruned away is a fire nobody is waiting for any more.
 
 ## Overdue and interval_secs
 

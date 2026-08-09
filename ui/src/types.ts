@@ -53,12 +53,20 @@ export interface JobPool {
   limit: number | null;
 }
 
+// what a schedule does about occurrences that came due while nothing was
+// running: "skip" (the default), "one", or "all:<limit>"
+export type Catchup = string;
+
 export interface JobSchedule {
   expr: string;
   tz: string;
   paused: boolean;
   // what every fire of this schedule launches with, {} unless declared
   params: unknown;
+  catchup: Catchup;
+  // the newest occurrence the scheduler has accounted for; null until it has
+  // seen the schedule once
+  cursor: string | null;
   next_fire: string | null;
 }
 
@@ -112,6 +120,9 @@ export interface Run {
   // the first op that terminally failed, named; null unless the run failed
   error: string | null;
   resumed_from: string | null;
+  // the cron occurrence this run stands for, not the clock it launched at;
+  // null on a manual launch, retry, resume, build or sensor fire
+  scheduled_for: string | null;
 }
 
 // what a resume would do: ops it executes, ops it seeds from a recorded output

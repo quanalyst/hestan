@@ -83,8 +83,10 @@ committed; ops that never committed show nothing. escape closes it. when ops
 declare output types, an ops list also shows each op as
 `aggregate -> demo::Summary`.
 
-schedules appear with their expression, timezone (when not utc), and a
-countdown to the next fire, each with a pause/resume button. the toggle flips
+schedules appear with their expression, timezone (when not utc), the
+[catch-up policy](scheduling.md#missed-fire-catch-up) when it is not the
+default (hovering shows the cursor), and a countdown to the next fire, each
+with a pause/resume button. the toggle flips
 optimistically and reverts with a message if the server refuses. under the
 schedules, the last five ticks: a glyph for the outcome (solid for `fired`,
 × for `error`, dashed for `skipped`, the pending ring for a `deferred` fire

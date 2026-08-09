@@ -322,14 +322,29 @@ impl Runner {
 
     /// create the run queued and execute it on a spawned task.
     pub fn launch(&self, job: &str, params: Value, trigger: Trigger) -> Result<String, Error> {
-        let (id, fut) = self.prepare(job, None, params, trigger, None)?;
+        self.launch_at(job, params, trigger, None)
+    }
+
+    /// [`Runner::launch`] for a run that stands for a logical time: the cron
+    /// occurrence it fires for, which is not the wall clock it launched at
+    /// once a schedule is catching up or a held fire drains. the ops read it
+    /// back with [`OpCtx::scheduled_for`](crate::OpCtx::scheduled_for), and it
+    /// lands on the run row. `None` is an ordinary launch.
+    pub fn launch_at(
+        &self,
+        job: &str,
+        params: Value,
+        trigger: Trigger,
+        scheduled_for: Option<DateTime<Utc>>,
+    ) -> Result<String, Error> {
+        let (id, fut) = self.prepare(job, None, params, trigger, None, scheduled_for)?;
         tokio::spawn(fut);
         Ok(id)
     }
 
     /// like [`Runner::launch`] but awaits completion.
     pub async fn run(&self, job: &str, params: Value, trigger: Trigger) -> Result<Run, Error> {
-        let (id, fut) = self.prepare(job, None, params, trigger, None)?;
+        let (id, fut) = self.prepare(job, None, params, trigger, None, None)?;
         // spawned so that dropping this future (timeout, select) detaches the
         // run instead of aborting its ops mid-write
         let _ = tokio::spawn(fut).await;
@@ -348,7 +363,14 @@ impl Runner {
         trigger: Trigger,
         resumed_from: Option<&str>,
     ) -> Result<String, Error> {
-        let (id, fut) = self.prepare(job, Some((ops, seeded)), params, trigger, resumed_from)?;
+        let (id, fut) = self.prepare(
+            job,
+            Some((ops, seeded)),
+            params,
+            trigger,
+            resumed_from,
+            None,
+        )?;
         tokio::spawn(fut);
         Ok(id)
     }
@@ -571,7 +593,7 @@ impl Runner {
         params: Value,
         trigger: Trigger,
     ) -> Result<Run, Error> {
-        let (id, fut) = self.prepare(job, Some((ops, seeded)), params, trigger, None)?;
+        let (id, fut) = self.prepare(job, Some((ops, seeded)), params, trigger, None, None)?;
         let _ = tokio::spawn(fut).await;
         Ok(self.store.run(&id)?.expect("run row written at launch"))
     }
@@ -603,6 +625,7 @@ impl Runner {
         params: Value,
         trigger: Trigger,
         resumed_from: Option<&str>,
+        scheduled_for: Option<DateTime<Utc>>,
     ) -> Result<(String, impl Future<Output = ()> + Send + 'static), Error> {
         let job = self
             .jobs
@@ -669,6 +692,7 @@ impl Runner {
             finished_at: None,
             error: None,
             resumed_from: resumed_from.map(str::to_string),
+            scheduled_for,
         };
         // a mapped op is never a row of its own: its instances are the record,
         // and how many there are is not known until its dep has produced
@@ -694,6 +718,7 @@ impl Runner {
             run.id,
             run.params,
             trigger,
+            scheduled_for,
             self.clone(),
             cancel_rx,
             pending,
@@ -812,6 +837,7 @@ async fn execute(
     run_id: String,
     params: Value,
     trigger: Trigger,
+    scheduled_for: Option<DateTime<Utc>>,
     runner: Runner,
     mut cancel: watch::Receiver<bool>,
     pending: Vec<String>,
@@ -1112,6 +1138,7 @@ async fn execute(
                 job.name().to_string(),
                 run_id.clone(),
                 params.clone(),
+                scheduled_for,
                 Arc::new(inputs),
                 Arc::new(dep_statuses),
                 runner.resources.clone(),
@@ -1610,6 +1637,7 @@ async fn run_op(
     job: String,
     run_id: String,
     params: Value,
+    scheduled_for: Option<DateTime<Utc>>,
     inputs: Arc<HashMap<String, Value>>,
     dep_statuses: Arc<HashMap<String, OpStatus>>,
     resources: Resources,
@@ -1673,6 +1701,7 @@ async fn run_op(
             job: job.clone(),
             op: name.clone(),
             params: params.clone(),
+            scheduled_for,
             element: element.clone(),
             partition: None,
             inputs: inputs.clone(),

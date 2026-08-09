@@ -653,6 +653,9 @@ pub struct OpCtx {
     pub(crate) job: String,
     pub(crate) op: String,
     pub(crate) params: Value,
+    /// the cron occurrence this run stands for; `None` outside a scheduled or
+    /// caught-up run.
+    pub(crate) scheduled_for: Option<chrono::DateTime<chrono::Utc>>,
     /// the one array element this invocation is for, on a fan-out instance;
     /// `None` for every ordinary op.
     pub(crate) element: Option<Value>,
@@ -740,6 +743,26 @@ impl OpCtx {
 
     pub fn params(&self) -> &Value {
         &self.params
+    }
+
+    /// the logical time this run is for: the cron occurrence a scheduled fire
+    /// fired for, which is **not** the wall clock it launched at once a
+    /// schedule is [catching up](crate::Catchup) or a held fire drains. `None`
+    /// on a manual launch, a retry, a resume, a build or a sensor fire.
+    ///
+    /// this is the difference between "pull yesterday's orders" and "pull the
+    /// orders for the hour this run is standing in for":
+    ///
+    /// ```no_run
+    /// # use hestan::{Op, OpCtx};
+    /// # use serde_json::json;
+    /// Op::new("pull", |ctx: OpCtx| async move {
+    ///     let hour = ctx.scheduled_for().unwrap_or_else(chrono::Utc::now);
+    ///     Ok(json!({ "hour": hour.to_rfc3339() }))
+    /// });
+    /// ```
+    pub fn scheduled_for(&self) -> Option<chrono::DateTime<chrono::Utc>> {
+        self.scheduled_for
     }
 
     /// the run params deserialized into `P`.
@@ -989,6 +1012,7 @@ mod tests {
             op: "x".into(),
             params: json!({}),
             element: None,
+            scheduled_for: None,
             partition: None,
             inputs: Arc::new(HashMap::new()),
             dep_statuses: Arc::new(HashMap::new()),

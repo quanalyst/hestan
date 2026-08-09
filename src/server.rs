@@ -193,6 +193,8 @@ fn job_summary(job: &Job, st: &AppState) -> Result<Value, Error> {
                 "tz": s.tz,
                 "paused": s.paused,
                 "params": s.params,
+                "catchup": s.catchup,
+                "cursor": s.cursor,
                 "next_fire": next_fire(s),
             })
         })
@@ -878,6 +880,8 @@ async fn list_schedules(State(st): State<AppState>) -> Result<Json<Value>, ApiEr
                 "tz": s.tz,
                 "paused": s.paused,
                 "params": s.params,
+                "catchup": s.catchup,
+                "cursor": s.cursor,
                 "next_fire": next_fire(s),
             })
         })
@@ -1177,6 +1181,7 @@ mod tests {
     use super::*;
     use crate::model::{Run, RunStatus};
     use crate::op::{Op, OpCtx};
+    use crate::schedule::Schedule;
     use crate::store::Store;
 
     fn echo_job(name: &str) -> Job {
@@ -1211,6 +1216,7 @@ mod tests {
             finished_at: None,
             error: None,
             resumed_from: None,
+            scheduled_for: None,
         };
         st.runner.store().create_run(&run, &[]).unwrap();
         run
@@ -1232,6 +1238,7 @@ mod tests {
                 finished_at: None,
                 error: None,
                 resumed_from: None,
+                scheduled_for: None,
             };
             st.runner.store().create_run(&run, &[]).unwrap();
         }
@@ -1281,6 +1288,7 @@ mod tests {
                 finished_at: None,
                 error: None,
                 resumed_from: None,
+                scheduled_for: None,
             };
             st.runner.store().create_run(&run, &[]).unwrap();
         }
@@ -1341,6 +1349,7 @@ mod tests {
                 finished_at: None,
                 error: None,
                 resumed_from: None,
+                scheduled_for: None,
             };
             st.runner.store().create_run(&run, &[]).unwrap();
         }
@@ -1435,6 +1444,7 @@ mod tests {
                 finished_at: None,
                 error: None,
                 resumed_from: None,
+                scheduled_for: None,
             };
             store.create_run(&run, &["a".into(), "b".into()]).unwrap();
             store.op_started(&run.id, "a", 1).unwrap();
@@ -1729,12 +1739,7 @@ mod tests {
         let st = state(vec![echo_job("etl")]);
         st.runner
             .store()
-            .sync_schedules(&[(
-                "etl".to_string(),
-                "0 * * * *".to_string(),
-                "UTC".to_string(),
-                json!({"region": "eu"}),
-            )])
+            .sync_schedules(&[Schedule::new("etl", "0 * * * *").params(json!({"region": "eu"}))])
             .unwrap();
 
         let Json(body) = list_schedules(State(st.clone())).await.unwrap();
@@ -1817,18 +1822,8 @@ mod tests {
         st.runner
             .store()
             .sync_schedules(&[
-                (
-                    "etl".to_string(),
-                    "* * * * *".to_string(),
-                    "UTC".to_string(),
-                    json!({}),
-                ),
-                (
-                    "health".to_string(),
-                    "0 * * * *".to_string(),
-                    "UTC".to_string(),
-                    json!({}),
-                ),
+                Schedule::new("etl", "* * * * *"),
+                Schedule::new("health", "0 * * * *"),
             ])
             .unwrap();
         st.runner
@@ -1978,6 +1973,7 @@ mod tests {
             finished_at: None,
             error: None,
             resumed_from: None,
+            scheduled_for: None,
         };
         let ops: Vec<String> = ops.iter().map(|o| o.to_string()).collect();
         st.runner.store().create_run(&run, &ops).unwrap();
@@ -2173,12 +2169,7 @@ mod tests {
         // two fires a minute apart on jan 1, so overdue is deterministic year-round
         st.runner
             .store()
-            .sync_schedules(&[(
-                "etl".to_string(),
-                "0,1 0 1 1 *".to_string(),
-                "UTC".to_string(),
-                json!({}),
-            )])
+            .sync_schedules(&[Schedule::new("etl", "0,1 0 1 1 *")])
             .unwrap();
 
         let s = job_summary(job, &st).unwrap();
@@ -2196,6 +2187,7 @@ mod tests {
             finished_at: Some(Utc::now() - Duration::days(400)),
             error: None,
             resumed_from: None,
+            scheduled_for: None,
         };
         st.runner.store().create_run(&stale, &[]).unwrap();
         let s = job_summary(job, &st).unwrap();
@@ -2228,14 +2220,7 @@ mod tests {
             .unwrap();
         let st = state(vec![hourly, echo_job("plain")]);
         // the same schedule that makes `plain` overdue below
-        let sched = |job: &str| {
-            (
-                job.to_string(),
-                "0,1 0 1 1 *".to_string(),
-                "UTC".to_string(),
-                json!({}),
-            )
-        };
+        let sched = |job: &str| Schedule::new(job, "0,1 0 1 1 *");
         st.runner
             .store()
             .sync_schedules(&[sched("etl"), sched("plain")])
@@ -2297,6 +2282,8 @@ mod tests {
             tz: "UTC".into(),
             paused: false,
             params: json!({}),
+            catchup: crate::model::Catchup::Skip,
+            cursor: None,
         };
         // sunday noon: the weekday schedule last fired friday 09:00
         let sunday = Utc.with_ymd_and_hms(2026, 8, 9, 12, 0, 0).unwrap();

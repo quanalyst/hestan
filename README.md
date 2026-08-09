@@ -164,6 +164,14 @@ appears.
 - events are structured: each carries a `kind` (`run_queued`, `op_retry`,
   `type_check_failed`, ...) and optional json data alongside the
   human-readable message; `ctx.info/warn/error` emit `kind=log`
+- the scheduler keeps a **durable cursor** per schedule: the newest occurrence
+  it has accounted for. everything between the cursor and now is what downtime
+  swallowed, so `Catchup::{Skip, One, All { limit }}` can say what to do about
+  it — and a queue-policy fire held for a busy job is durable for the same
+  reason, since the pending queue is the tick log rather than a `HashMap`
+- a caught-up run knows which logical time it stands for: `runs.scheduled_for`
+  and `ctx.scheduled_for()`, so a pipeline can pull the data *for* the hour it
+  missed rather than for now
 - schedules are plain 5-field cron expressions (sunday is 0 or 7, as usual),
   evaluated in utc or in a named timezone via `schedule_tz`, by an in-process
   scheduler. they can be paused from the ui, the flag survives restarts, and

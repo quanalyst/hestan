@@ -281,6 +281,11 @@ function RunView({ id }: { id: string }) {
           </h1>
           <p className="muted">
             {run.trigger} · created {relTime(run.created_at)}
+            {/* the hour this run stands for, which is not when it started once
+                a schedule is catching up or a held fire drains */}
+            {run.scheduled_for && (
+              <> · for {relTime(run.scheduled_for)}</>
+            )}
             {dur !== null && <> · took {fmtDuration(dur)}</>}
             {run.resumed_from && (
               <>

@@ -11,9 +11,9 @@ use crate::executor::{FailureHook, RunFailure, Runner};
 use crate::freshness::{self, LateEvent, LateHook};
 use crate::io::{Io, IoManager};
 use crate::job::Job;
-use crate::model::{Run, ScheduleDef, Trigger};
+use crate::model::{Run, Trigger};
 use crate::resource::{self, Resource, ResourceCtx, ResourceFn};
-use crate::schedule::{self, ScheduleEntry};
+use crate::schedule::{self, Schedule, ScheduleEntry};
 use crate::sensor::{Sensor, SensorEntry, SensorEval, run_sensors};
 use crate::server::{AppState, SensorInfo, router};
 use crate::store::Store;
@@ -26,7 +26,7 @@ const DEFAULT_ASSET_HISTORY: usize = 200;
 /// or `run_once` headless.
 pub struct Hestan {
     jobs: Vec<Job>,
-    schedules: Vec<ScheduleDef>,
+    schedules: Vec<Schedule>,
     assets: Vec<Asset>,
     multis: Vec<MultiAsset>,
     checks: Vec<AssetCheck>,
@@ -202,10 +202,33 @@ impl Hestan {
         self
     }
 
+    /// register a [`Schedule`]: job, cron expression, and any of timezone,
+    /// params and [catch-up policy](crate::Catchup) that differ from the
+    /// defaults.
+    ///
+    /// ```no_run
+    /// # use hestan::{Catchup, Hestan, Schedule};
+    /// # use serde_json::json;
+    /// Hestan::new().add_schedule(
+    ///     Schedule::new("orders_etl", "0 * * * *")
+    ///         .params(json!({"region": "eu"}))
+    ///         .catchup(Catchup::All { limit: 24 }),
+    /// );
+    /// ```
+    ///
+    /// [`schedule`](Self::schedule), [`schedule_tz`](Self::schedule_tz),
+    /// [`schedule_with`](Self::schedule_with) and
+    /// [`schedule_tz_with`](Self::schedule_tz_with) are this with the defaults
+    /// filled in, and stay the short way to say the common thing.
+    pub fn add_schedule(mut self, schedule: Schedule) -> Self {
+        self.schedules.push(schedule);
+        self
+    }
+
     /// attach a 5-field cron expression to a job, evaluated in utc; fires
     /// launch with params `{}`. validated in serve/run_once.
     pub fn schedule(self, job: impl Into<String>, cron_expr: impl Into<String>) -> Self {
-        self.schedule_with(job, cron_expr, serde_json::json!({}))
+        self.add_schedule(Schedule::new(job, cron_expr))
     }
 
     /// like [`Hestan::schedule`] but evaluated in a named iana timezone.
@@ -215,7 +238,7 @@ impl Hestan {
         cron_expr: impl Into<String>,
         tz: impl Into<String>,
     ) -> Self {
-        self.schedule_tz_with(job, cron_expr, tz, serde_json::json!({}))
+        self.add_schedule(Schedule::new(job, cron_expr).tz(tz))
     }
 
     /// like [`Hestan::schedule`] with the params every fire launches with.
@@ -223,27 +246,23 @@ impl Hestan {
     /// could never launch is [`Error::InvalidParams`] at startup rather than a
     /// tick that fails forever at 3am.
     pub fn schedule_with(
-        mut self,
+        self,
         job: impl Into<String>,
         cron_expr: impl Into<String>,
         params: Value,
     ) -> Self {
-        self.schedules
-            .push((job.into(), cron_expr.into(), "UTC".into(), params));
-        self
+        self.add_schedule(Schedule::new(job, cron_expr).params(params))
     }
 
     /// [`Hestan::schedule_with`] in a named iana timezone.
     pub fn schedule_tz_with(
-        mut self,
+        self,
         job: impl Into<String>,
         cron_expr: impl Into<String>,
         tz: impl Into<String>,
         params: Value,
     ) -> Self {
-        self.schedules
-            .push((job.into(), cron_expr.into(), tz.into(), params));
-        self
+        self.add_schedule(Schedule::new(job, cron_expr).tz(tz).params(params))
     }
 
     /// register an http source: build lowers it into a job named after the
@@ -395,7 +414,7 @@ impl Hestan {
                 // dropped-cron warning would be a lie here
                 jobs.push(src.build_job(&name)?);
                 if let Some((expr, tz)) = &src.cron {
-                    schedules.push((name, expr.clone(), tz.clone(), serde_json::json!({})));
+                    schedules.push(Schedule::new(name, expr.clone()).tz(tz.clone()));
                 }
             }
             (jobs, schedules)
@@ -428,19 +447,24 @@ impl Hestan {
             }
         }
         let mut entries = Vec::new();
-        for (job, expr, tz, params) in &schedules {
+        for s in &schedules {
+            let (job, expr) = (&s.job, &s.expr);
             let Some(defined) = jobs.iter().find(|j| j.name() == job) else {
                 return Err(Error::UnknownJob(job.clone()));
             };
             // the same validators a launch runs, at startup: a schedule whose
             // params no op accepts is a build error, not a 3am tick that fails
-            if let Some((op, reason)) = defined.params_error(params) {
+            if let Some((op, reason)) = defined.params_error(&s.params) {
                 return Err(Error::InvalidParams {
                     op,
                     reason: format!("schedule {expr} on job {job}: {reason}"),
                 });
             }
-            entries.push(schedule::parse(job, expr, tz)?.with_params(params.clone()));
+            entries.push(
+                schedule::parse(job, expr, &s.tz)?
+                    .with_params(s.params.clone())
+                    .with_catchup(s.catchup),
+            );
         }
 
         let mut sensor_entries: Vec<SensorEntry> =

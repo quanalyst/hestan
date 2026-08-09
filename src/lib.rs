@@ -34,20 +34,21 @@ pub use http::HttpSource;
 pub use io::{FileIo, Inline, IoKey, IoManager, IoResult};
 pub use job::{Graph, GraphBuilder, Job, JobBuilder};
 pub use model::{
-    AssetCheckRow, Backfill, BackfillStatus, CheckStatus, Event, EventKind, EventLevel, Freshness,
-    FreshnessRow, Materialization, OpRun, OpStatus, Overlap, Run, RunStatus, ScheduleRow,
-    SensorOutcome, SensorRow, SensorTick, Severity, Tick, TickOutcome, Trigger, When,
+    AssetCheckRow, Backfill, BackfillStatus, Catchup, CheckStatus, Event, EventKind, EventLevel,
+    Freshness, FreshnessRow, Materialization, OpRun, OpStatus, Overlap, Run, RunStatus,
+    ScheduleRow, SensorOutcome, SensorRow, SensorTick, Severity, Tick, TickOutcome, Trigger, When,
 };
 pub use op::{InputError, Meta, Op, OpCtx, OpResult};
 pub use partition::Partitions;
 pub use resource::ResourceCtx;
+pub use schedule::Schedule;
 pub use sensor::{RunRequest, Sensor, SensorCtx};
 pub use store::Store;
 
 pub mod prelude {
     pub use crate::{
-        Asset, AssetCheck, CheckResult, Graph, Hestan, Job, Meta, MultiAsset, Op, OpCtx, OpResult,
-        Partitions, RunRequest, Sensor, Severity,
+        Asset, AssetCheck, Catchup, CheckResult, Graph, Hestan, Job, Meta, MultiAsset, Op, OpCtx,
+        OpResult, Partitions, RunRequest, Schedule, Sensor, Severity,
     };
     pub use serde_json::{Value, json};
 }

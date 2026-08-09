@@ -2,14 +2,80 @@ use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
 use std::time::Duration;
 
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use chrono_tz::Tz;
 use serde_json::{Value, json};
 
 use crate::error::Error;
 use crate::executor::Runner;
-use crate::model::{Overlap, TickOutcome, Trigger};
+use crate::model::{Catchup, Overlap, ScheduleRow, TickOutcome, Trigger};
 use crate::store::Store;
+
+/// how far back a catch-up scan will walk to enumerate missed occurrences. a
+/// seconds-resolution schedule down for a month is millions of them, and
+/// nothing downstream wants that list; past this the drop is reported as "at
+/// least" rather than counted exactly.
+const MAX_MISSED_SCAN: usize = 10_000;
+
+/// one schedule as the code declares it: which job, which cron expression, and
+/// the three things that used to be positional arguments.
+///
+/// ```no_run
+/// # use hestan::{Catchup, Hestan, Schedule};
+/// # use serde_json::json;
+/// Hestan::new().add_schedule(
+///     Schedule::new("orders_etl", "0 * * * *")
+///         .tz("Europe/London")
+///         .params(json!({"region": "eu"}))
+///         .catchup(Catchup::All { limit: 24 }),
+/// );
+/// ```
+///
+/// [`Hestan::schedule`](crate::Hestan::schedule) and friends are this with the
+/// common defaults filled in — utc, `{}`, [`Catchup::Skip`].
+#[derive(Debug, Clone)]
+pub struct Schedule {
+    pub(crate) job: String,
+    pub(crate) expr: String,
+    pub(crate) tz: String,
+    pub(crate) params: Value,
+    pub(crate) catchup: Catchup,
+}
+
+impl Schedule {
+    /// `cron_expr` is a 5-field crontab expression, evaluated in utc until
+    /// [`tz`](Self::tz) says otherwise.
+    pub fn new(job: impl Into<String>, cron_expr: impl Into<String>) -> Schedule {
+        Schedule {
+            job: job.into(),
+            expr: cron_expr.into(),
+            tz: "UTC".into(),
+            params: json!({}),
+            catchup: Catchup::default(),
+        }
+    }
+
+    /// evaluate the expression in a named iana timezone.
+    pub fn tz(mut self, tz: impl Into<String>) -> Schedule {
+        self.tz = tz.into();
+        self
+    }
+
+    /// what every fire launches with. validated against the job's ops at
+    /// startup, so a schedule that could never launch is an error from
+    /// `serve`/`run_once` rather than a tick that fails at 3am.
+    pub fn params(mut self, params: Value) -> Schedule {
+        self.params = params;
+        self
+    }
+
+    /// what to do with occurrences that came due while nothing was running to
+    /// fire them. [`Catchup::Skip`] by default.
+    pub fn catchup(mut self, catchup: Catchup) -> Schedule {
+        self.catchup = catchup;
+        self
+    }
+}
 
 #[derive(Debug)]
 pub(crate) struct ScheduleEntry {
@@ -19,12 +85,25 @@ pub(crate) struct ScheduleEntry {
     pub schedule: cron::Schedule,
     /// what every fire launches with; `{}` unless the declaration set it.
     pub params: Value,
+    /// what downtime does to this schedule. it comes from the declaration and
+    /// is stored for the api rather than read back from it — the row is synced
+    /// from the same value at startup, so the two cannot disagree.
+    pub catchup: Catchup,
 }
 
 impl ScheduleEntry {
     pub(crate) fn with_params(mut self, params: Value) -> ScheduleEntry {
         self.params = params;
         self
+    }
+
+    pub(crate) fn with_catchup(mut self, catchup: Catchup) -> ScheduleEntry {
+        self.catchup = catchup;
+        self
+    }
+
+    fn key(&self) -> (String, String) {
+        (self.job.clone(), self.expr.clone())
     }
 }
 
@@ -50,6 +129,7 @@ pub(crate) fn parse(job: &str, expr: &str, tz: &str) -> Result<ScheduleEntry, Er
         tz,
         schedule,
         params: json!({}),
+        catchup: Catchup::default(),
     })
 }
 
@@ -82,9 +162,9 @@ fn remap_dow(field: &str) -> String {
 
 pub(crate) fn upcoming_fires(
     entry: &ScheduleEntry,
-    now: chrono::DateTime<Utc>,
+    now: DateTime<Utc>,
     window_secs: i64,
-) -> Vec<chrono::DateTime<Utc>> {
+) -> Vec<DateTime<Utc>> {
     let end = now + chrono::Duration::seconds(window_secs);
     entry
         .schedule
@@ -95,16 +175,199 @@ pub(crate) fn upcoming_fires(
         .collect()
 }
 
-fn paused_set(store: &Store) -> HashSet<(String, String)> {
+/// the stored side of every schedule, keyed by `(job, expr)`: pause state and
+/// cursor, both of which can change under a running process.
+fn rows(store: &Store) -> HashMap<(String, String), ScheduleRow> {
     match store.schedules() {
         Ok(rows) => rows
             .into_iter()
-            .filter(|r| r.paused)
-            .map(|r| (r.job, r.expr))
+            .map(|r| ((r.job.clone(), r.expr.clone()), r))
             .collect(),
         Err(e) => {
             tracing::warn!("schedule read failed: {e}");
-            HashSet::new()
+            HashMap::new()
+        }
+    }
+}
+
+/// the most recent occurrence strictly before `now`; `None` when the schedule
+/// has not come due yet at all.
+fn last_before(entry: &ScheduleEntry, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
+    entry
+        .schedule
+        .after(&now.with_timezone(&entry.tz))
+        .next_back()
+        .map(|t| t.with_timezone(&Utc))
+}
+
+/// occurrences strictly after `cursor` and strictly before `now`, newest
+/// first, at most `MAX_MISSED_SCAN` of them — the flag says the scan hit that
+/// wall with more behind it. this is the missed set, and the cursor is the only
+/// thing that makes it knowable: without one, "what should have fired while we
+/// were down" has no answer at all.
+pub(crate) fn missed_since(
+    entry: &ScheduleEntry,
+    cursor: DateTime<Utc>,
+    now: DateTime<Utc>,
+) -> (Vec<DateTime<Utc>>, bool) {
+    let mut walk = entry.schedule.after(&now.with_timezone(&entry.tz));
+    let mut out = Vec::new();
+    while let Some(t) = walk.next_back() {
+        let t = t.with_timezone(&Utc);
+        if t <= cursor {
+            return (out, false);
+        }
+        if out.len() == MAX_MISSED_SCAN {
+            return (out, true);
+        }
+        out.push(t);
+    }
+    (out, false)
+}
+
+/// bring one schedule's cursor up to now, applying its catch-up policy to
+/// whatever it swallowed. runs on every pass, not only at boot: in steady state
+/// the loop advances the cursor as it fires, so the missed set is empty and
+/// this costs one cron walk that stops immediately.
+fn catch_up(entry: &ScheduleEntry, runner: &Runner, row: Option<&ScheduleRow>, now: DateTime<Utc>) {
+    let Some(cursor) = row.and_then(|r| r.cursor) else {
+        // first sight of this schedule: there is no downtime to reconstruct,
+        // and treating its whole cron past as missed would fire the epoch
+        advance(runner, entry, now);
+        return;
+    };
+    let Some(last) = last_before(entry, now).filter(|t| *t > cursor) else {
+        return;
+    };
+    // pause means stop, including the catch-up: a schedule paused for a week
+    // must not fire a week of backlog the moment it is resumed
+    if row.is_some_and(|r| r.paused) {
+        tracing::info!(job = %entry.job, expr = %entry.expr, "paused: cursor advanced over the gap");
+        advance(runner, entry, last);
+        return;
+    }
+    match entry.catchup {
+        Catchup::Skip => {
+            tracing::info!(job = %entry.job, expr = %entry.expr, "missed fires skipped to {last}");
+        }
+        Catchup::One => {
+            tracing::info!(job = %entry.job, expr = %entry.expr, "catching up the latest missed fire");
+            queue_fire(runner, entry, last);
+        }
+        Catchup::All { limit } => {
+            let (newest_first, truncated) = missed_since(entry, cursor, now);
+            let (fire, dropped) = newest_first.split_at(newest_first.len().min(limit.max(1)));
+            // the cap drops the oldest, and says which: a backlog quietly
+            // losing its head is the failure mode this policy exists to avoid
+            if let Some(oldest) = dropped.last() {
+                let count = match truncated {
+                    true => format!("at least {}", dropped.len()),
+                    false => dropped.len().to_string(),
+                };
+                let msg = format!(
+                    "catch-up cap {limit}: dropped {count} missed occurrences up to {}",
+                    dropped[0]
+                );
+                tracing::warn!(job = %entry.job, expr = %entry.expr, "{msg}");
+                // one skipped tick carrying the reason, at the oldest dropped
+                // occurrence: a tick per drop would bury the log it belongs in
+                if let Err(e) = runner.store().record_tick(
+                    &entry.job,
+                    &entry.expr,
+                    *oldest,
+                    TickOutcome::Skipped,
+                    None,
+                    Some(&msg),
+                ) {
+                    tracing::warn!(job = %entry.job, "tick write failed: {e}");
+                }
+            }
+            for t in fire.iter().rev() {
+                queue_fire(runner, entry, *t);
+            }
+        }
+    }
+    advance(runner, entry, last);
+}
+
+/// move the cursor to `at`. never backwards: a queued fire draining long after
+/// its occurrence must not un-account for everything since.
+fn advance(runner: &Runner, entry: &ScheduleEntry, at: DateTime<Utc>) {
+    if let Err(e) = runner
+        .store()
+        .set_schedule_cursor(&entry.job, &entry.expr, at)
+    {
+        tracing::warn!(job = %entry.job, "cursor write failed: {e}");
+    }
+}
+
+/// launch a caught-up occurrence, or record it as held when the job is busy or
+/// something older is already waiting. either way the occurrence is on disk
+/// before this returns, which is what makes a backlog survive a second restart.
+fn queue_fire(runner: &Runner, entry: &ScheduleEntry, at: DateTime<Utc>) {
+    let free = matches!(runner.store().has_active_run(&entry.job), Ok(false))
+        && !has_pending(runner, &entry.job);
+    match free {
+        true => note_tick(runner, &entry.job, &entry.expr, at, &entry.params),
+        false => note_runless_tick(runner, &entry.job, &entry.expr, at, TickOutcome::Deferred),
+    }
+}
+
+fn has_pending(runner: &Runner, job: &str) -> bool {
+    match runner.store().pending_fires() {
+        Ok(rows) => rows.iter().any(|(j, ..)| j == job),
+        Err(e) => {
+            tracing::warn!(job = %job, "pending-fire read failed: {e}");
+            true
+        }
+    }
+}
+
+/// launch whatever is waiting, oldest first and one per job. the queue is the
+/// tick log — a `deferred` tick with no later tick for the same occurrence —
+/// so a fire held when the process died is still held when it comes back.
+fn drain_pending(
+    entries: &[ScheduleEntry],
+    runner: &Runner,
+    rows: &HashMap<(String, String), ScheduleRow>,
+) {
+    let pending = match runner.store().pending_fires() {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!("pending-fire read failed: {e}");
+            return;
+        }
+    };
+    let mut launched: HashSet<&str> = HashSet::new();
+    for (job, expr, at) in &pending {
+        let Some(entry) = entries.iter().find(|e| &e.job == job && &e.expr == expr) else {
+            // the declaration is gone, so nothing can launch it with the right
+            // params; close the tick out rather than leaving it pending forever
+            tracing::info!(job = %job, expr = %expr, "held fire dropped: schedule no longer declared");
+            note_runless_tick(runner, job, expr, *at, TickOutcome::Skipped);
+            continue;
+        };
+        if rows.get(&entry.key()).is_some_and(|r| r.paused) {
+            tracing::info!(job = %job, expr = %expr, "held fire dropped: schedule paused");
+            note_runless_tick(runner, job, expr, *at, TickOutcome::Skipped);
+            continue;
+        }
+        if launched.contains(job.as_str()) {
+            continue;
+        }
+        match runner.store().has_active_run(job) {
+            Ok(false) => {
+                tracing::info!(job = %job, expr = %expr, "held fire launching");
+                note_tick(runner, job, expr, *at, &entry.params);
+                launched.insert(job.as_str());
+            }
+            Ok(true) => {
+                launched.insert(job.as_str());
+            }
+            Err(e) => {
+                tracing::warn!(job = %job, "active-run check failed: {e}");
+                launched.insert(job.as_str());
+            }
         }
     }
 }
@@ -113,37 +376,22 @@ pub(crate) async fn run_scheduler(mut entries: Vec<ScheduleEntry>, runner: Runne
     if entries.is_empty() {
         return;
     }
-    // queue-policy fires wait here until their job frees up, one per job. the
-    // params are the ones captured when the fire was held, not the ones the
-    // declaration carries by the time it launches
-    let mut deferred: HashMap<String, (String, chrono::DateTime<Utc>, Value)> = HashMap::new();
     loop {
-        let paused_now = if deferred.is_empty() {
-            HashSet::new()
-        } else {
-            paused_set(runner.store())
-        };
-        deferred.retain(|job, (expr, due, params)| {
-            if paused_now.contains(&(job.clone(), expr.clone())) {
-                tracing::info!(job = %job, expr = %expr, "deferred fire dropped: schedule paused");
-                note_runless_tick(&runner, job, expr, *due, TickOutcome::Skipped);
-                return false;
-            }
-            match runner.store().has_active_run(job) {
-                Ok(true) => true,
-                Ok(false) => {
-                    tracing::info!(job = %job, expr = %expr, "deferred fire launching");
-                    note_tick(&runner, job, expr, *due, params);
-                    false
-                }
-                Err(e) => {
-                    tracing::warn!(job = %job, "active-run check failed: {e}");
-                    true
-                }
-            }
-        });
+        let now = Utc::now();
+        let stored = rows(runner.store());
+        // downtime first, then the backlog it may have just added to: both are
+        // the same mechanism, and both are on disk before anything launches
+        for entry in &entries {
+            catch_up(entry, &runner, stored.get(&entry.key()), now);
+        }
+        drain_pending(&entries, &runner, &stored);
+        let waiting = runner
+            .store()
+            .pending_fires()
+            .map(|p| !p.is_empty())
+            .unwrap_or(false);
 
-        let mut fires: Vec<(chrono::DateTime<Utc>, String, String, Value)> = Vec::new();
+        let mut fires: Vec<(DateTime<Utc>, String, String, Value)> = Vec::new();
         entries.retain(|e| match e.schedule.upcoming(e.tz).next() {
             Some(t) => {
                 fires.push((
@@ -159,7 +407,7 @@ pub(crate) async fn run_scheduler(mut entries: Vec<ScheduleEntry>, runner: Runne
                 false
             }
         });
-        if fires.is_empty() && deferred.is_empty() {
+        if fires.is_empty() && !waiting {
             tracing::info!("all schedules exhausted, scheduler exiting");
             return;
         }
@@ -170,10 +418,10 @@ pub(crate) async fn run_scheduler(mut entries: Vec<ScheduleEntry>, runner: Runne
             .map(|earliest| (earliest - Utc::now()).to_std().unwrap_or_default())
             .unwrap_or(Duration::from_secs(60));
         // cap sleeps so clock drift self-corrects; poll faster with a fire waiting
-        let cap = if deferred.is_empty() {
-            Duration::from_secs(60)
-        } else {
+        let cap = if waiting {
             Duration::from_secs(2)
+        } else {
+            Duration::from_secs(60)
         };
         if !until.is_zero() {
             tokio::time::sleep(until.min(cap)).await;
@@ -183,20 +431,34 @@ pub(crate) async fn run_scheduler(mut entries: Vec<ScheduleEntry>, runner: Runne
             }
         }
         let now = Utc::now();
-        let paused = paused_set(runner.store());
+        let stored = rows(runner.store());
         // two schedules on the same job sharing a tick fire one run, not two
         let mut fired: HashSet<String> = HashSet::new();
         for (t, job, expr, params) in fires {
-            if t > now || paused.contains(&(job.clone(), expr.clone())) {
+            if t > now {
                 continue;
             }
+            let entry = entries
+                .iter()
+                .find(|e| e.job == job && e.expr == expr)
+                .expect("fires come from entries");
+            // the occurrence is accounted for however this pass treats it, so
+            // the next catch-up pass does not see it as swallowed by downtime
+            if stored
+                .get(&(job.clone(), expr.clone()))
+                .is_some_and(|r| r.paused)
+            {
+                advance(&runner, entry, t);
+                continue;
+            }
+            advance(&runner, entry, t);
             if !fired.insert(job.clone()) {
                 // the runner-up's fire was real; leave a tick, not silence
                 note_runless_tick(&runner, &job, &expr, t, TickOutcome::Skipped);
                 continue;
             }
-            let active = deferred.contains_key(&job)
-                || matches!(runner.store().has_active_run(&job), Ok(true) | Err(_));
+            let held = has_pending(&runner, &job);
+            let active = held || matches!(runner.store().has_active_run(&job), Ok(true) | Err(_));
             let policy = runner
                 .jobs()
                 .get(&job)
@@ -205,11 +467,9 @@ pub(crate) async fn run_scheduler(mut entries: Vec<ScheduleEntry>, runner: Runne
             if !active || policy == Overlap::Allow {
                 tracing::info!(job = %job, expr = %expr, "schedule fired");
                 note_tick(&runner, &job, &expr, t, &params);
-            } else if policy == Overlap::Queue && !deferred.contains_key(&job) {
+            } else if policy == Overlap::Queue && !held {
                 tracing::info!(job = %job, expr = %expr, "fire deferred: run still active");
-                // the wait itself lives in memory; this tick is its durable trace
                 note_runless_tick(&runner, &job, &expr, t, TickOutcome::Deferred);
-                deferred.insert(job.clone(), (expr.clone(), t, params));
             } else {
                 tracing::info!(job = %job, expr = %expr, "fire skipped: run still active");
                 note_runless_tick(&runner, &job, &expr, t, TickOutcome::Skipped);
@@ -222,7 +482,7 @@ fn note_runless_tick(
     runner: &Runner,
     job: &str,
     expr: &str,
-    due: chrono::DateTime<Utc>,
+    due: DateTime<Utc>,
     outcome: TickOutcome,
 ) {
     if let Err(e) = runner
@@ -233,8 +493,8 @@ fn note_runless_tick(
     }
 }
 
-fn note_tick(runner: &Runner, job: &str, expr: &str, due: chrono::DateTime<Utc>, params: &Value) {
-    let tick = match runner.launch(job, params.clone(), Trigger::Schedule) {
+fn note_tick(runner: &Runner, job: &str, expr: &str, due: DateTime<Utc>, params: &Value) {
+    let tick = match runner.launch_at(job, params.clone(), Trigger::Schedule, Some(due)) {
         Ok(run_id) => {
             runner
                 .store()
@@ -261,6 +521,7 @@ fn note_tick(runner: &Runner, job: &str, expr: &str, due: chrono::DateTime<Utc>,
 mod tests {
     use super::*;
     use crate::job::Job;
+    use crate::model::Tick;
     use crate::op::Op;
     use crate::store::Store;
     use chrono::Timelike;
@@ -432,6 +693,284 @@ mod tests {
             runs.len()
         );
         assert!(runs.iter().all(|r| r.params == json!({"batch": 7})));
+    }
+
+    // ---- the durable cursor -------------------------------------------
+
+    const HOURLY: &str = "0 * * * *";
+
+    fn hourly_entry(job: &str, catchup: Catchup) -> ScheduleEntry {
+        parse(job, HOURLY, "UTC").unwrap().with_catchup(catchup)
+    }
+
+    /// a store with one hourly schedule whose cursor is planted in the past —
+    /// which is exactly what a process that was down for `hours` leaves behind.
+    fn down_for(store: &Store, hours: i64, catchup: Catchup) -> (DateTime<Utc>, DateTime<Utc>) {
+        use chrono::TimeZone;
+        let now = Utc.with_ymd_and_hms(2026, 3, 4, 10, 30, 0).unwrap();
+        let cursor = now - chrono::Duration::hours(hours);
+        store
+            .sync_schedules(&[Schedule::new("etl", HOURLY).catchup(catchup)])
+            .unwrap();
+        store.set_schedule_cursor("etl", HOURLY, cursor).unwrap();
+        (cursor, now)
+    }
+
+    fn cursor_of(store: &Store) -> Option<DateTime<Utc>> {
+        store.schedules().unwrap()[0].cursor
+    }
+
+    fn ticks_oldest_first(store: &Store) -> Vec<Tick> {
+        let mut ticks = store.ticks(Some("etl"), 100).unwrap();
+        ticks.reverse();
+        ticks
+    }
+
+    async fn wait_idle(store: &Store, job: &str) {
+        for _ in 0..300 {
+            if !store.has_active_run(job).unwrap() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("{job} never went idle");
+    }
+
+    #[tokio::test]
+    async fn downtime_with_skip_fires_nothing_and_advances_the_cursor() {
+        let store = Store::open(":memory:").unwrap();
+        let runner = crate::Runner::new([nap_job("etl", 5, Overlap::Skip)], store.clone());
+        let (_, now) = down_for(&store, 3, Catchup::Skip);
+        let entry = hourly_entry("etl", Catchup::Skip);
+
+        catch_up(&entry, &runner, rows(&store).get(&entry.key()), now);
+
+        assert!(store.runs(None, None, None, None, 10).unwrap().is_empty());
+        assert!(store.ticks(Some("etl"), 10).unwrap().is_empty());
+        // 07:30 to 10:30 swallowed 08:00, 09:00 and 10:00; the cursor now says
+        // so, which is the whole point — without it the next boot would have
+        // no idea any of them existed
+        assert_eq!(cursor_of(&store), Some(now - chrono::Duration::minutes(30)));
+
+        // and a second pass has nothing left to find
+        catch_up(&entry, &runner, rows(&store).get(&entry.key()), now);
+        assert!(store.runs(None, None, None, None, 10).unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn downtime_with_one_fires_only_the_latest_missed() {
+        let store = Store::open(":memory:").unwrap();
+        let runner = crate::Runner::new([nap_job("etl", 5, Overlap::Skip)], store.clone());
+        let (_, now) = down_for(&store, 3, Catchup::One);
+        let entry = hourly_entry("etl", Catchup::One);
+
+        catch_up(&entry, &runner, rows(&store).get(&entry.key()), now);
+
+        let ten = now - chrono::Duration::minutes(30);
+        let runs = store.runs(None, None, None, None, 10).unwrap();
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].scheduled_for, Some(ten));
+        assert_eq!(runs[0].trigger, Trigger::Schedule);
+        let ticks = ticks_oldest_first(&store);
+        assert_eq!(ticks.len(), 1);
+        assert_eq!(ticks[0].outcome, TickOutcome::Fired);
+        assert_eq!(ticks[0].scheduled_for, ten);
+        assert_eq!(cursor_of(&store), Some(ten));
+    }
+
+    #[tokio::test]
+    async fn downtime_with_all_fires_each_missed_occurrence_oldest_first() {
+        let store = Store::open(":memory:").unwrap();
+        let runner = crate::Runner::new([nap_job("etl", 5, Overlap::Skip)], store.clone());
+        let (_, now) = down_for(&store, 3, Catchup::All { limit: 10 });
+        let entry = hourly_entry("etl", Catchup::All { limit: 10 });
+        let at = |h: i64| now - chrono::Duration::minutes(30) - chrono::Duration::hours(h);
+
+        catch_up(&entry, &runner, rows(&store).get(&entry.key()), now);
+        // one launches now, the rest are on disk as held fires: catch-up
+        // queues a backlog, it never starts three runs of one job at once
+        let ticks = ticks_oldest_first(&store);
+        assert_eq!(ticks[0].outcome, TickOutcome::Fired);
+        assert_eq!(ticks[0].scheduled_for, at(2));
+        assert_eq!(
+            ticks[1..]
+                .iter()
+                .map(|t| (t.outcome, t.scheduled_for))
+                .collect::<Vec<_>>(),
+            [
+                (TickOutcome::Deferred, at(1)),
+                (TickOutcome::Deferred, at(0))
+            ]
+        );
+
+        for _ in 0..2 {
+            wait_idle(&store, "etl").await;
+            drain_pending(
+                &[hourly_entry("etl", Catchup::All { limit: 10 })],
+                &runner,
+                &rows(&store),
+            );
+        }
+        wait_idle(&store, "etl").await;
+
+        let mut runs = store.runs(None, None, None, None, 10).unwrap();
+        runs.sort_by_key(|r| r.created_at);
+        assert_eq!(
+            runs.iter().map(|r| r.scheduled_for).collect::<Vec<_>>(),
+            [Some(at(2)), Some(at(1)), Some(at(0))],
+            "a backlog runs oldest first, one at a time"
+        );
+        assert_eq!(cursor_of(&store), Some(at(0)));
+    }
+
+    #[tokio::test]
+    async fn catchup_all_drops_the_oldest_past_the_cap_and_says_which() {
+        let store = Store::open(":memory:").unwrap();
+        let runner = crate::Runner::new([nap_job("etl", 5, Overlap::Skip)], store.clone());
+        let (_, now) = down_for(&store, 6, Catchup::All { limit: 2 });
+        let entry = hourly_entry("etl", Catchup::All { limit: 2 });
+        let at = |h: i64| now - chrono::Duration::minutes(30) - chrono::Duration::hours(h);
+
+        catch_up(&entry, &runner, rows(&store).get(&entry.key()), now);
+
+        let ticks = ticks_oldest_first(&store);
+        // six missed, two allowed: the four oldest are dropped, and the drop
+        // leaves a record rather than a silence
+        let dropped = &ticks[0];
+        assert_eq!(dropped.outcome, TickOutcome::Skipped);
+        assert_eq!(dropped.scheduled_for, at(5));
+        let msg = dropped.error.as_deref().unwrap();
+        assert!(msg.contains("catch-up cap 2"), "{msg}");
+        assert!(msg.contains("dropped 4 missed occurrences"), "{msg}");
+        assert_eq!(
+            ticks[1..]
+                .iter()
+                .map(|t| (t.outcome, t.scheduled_for))
+                .collect::<Vec<_>>(),
+            [(TickOutcome::Fired, at(1)), (TickOutcome::Deferred, at(0))]
+        );
+        assert_eq!(cursor_of(&store), Some(at(0)));
+    }
+
+    #[tokio::test]
+    async fn a_caught_up_run_knows_the_hour_it_is_for() {
+        let store = Store::open(":memory:").unwrap();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let sink = seen.clone();
+        let job = Job::builder("etl")
+            .op(Op::new("pull", move |ctx: crate::op::OpCtx| {
+                let sink = sink.clone();
+                async move {
+                    sink.lock().unwrap().push(ctx.scheduled_for());
+                    Ok(json!(null))
+                }
+            }))
+            .build()
+            .unwrap();
+        let runner = crate::Runner::new([job], store.clone());
+        let (_, now) = down_for(&store, 1, Catchup::One);
+        let entry = hourly_entry("etl", Catchup::One);
+
+        catch_up(&entry, &runner, rows(&store).get(&entry.key()), now);
+        wait_idle(&store, "etl").await;
+
+        // the run launched at 10:30 for the 10:00 hour, and the op is told so:
+        // a catch-up that could not say which hour it was for would be no use
+        // to anything that pulls data *for* an hour
+        let ten = now - chrono::Duration::minutes(30);
+        assert_eq!(*seen.lock().unwrap(), [Some(ten)]);
+        let runs = store.runs(None, None, None, None, 10).unwrap();
+        assert_eq!(runs[0].scheduled_for, Some(ten));
+        assert_eq!(
+            serde_json::to_value(&runs[0]).unwrap()["scheduled_for"],
+            json!(ten)
+        );
+
+        // a manual launch stands for nothing but itself
+        runner.run("etl", json!({}), Trigger::Manual).await.unwrap();
+        assert_eq!(*seen.lock().unwrap(), [Some(ten), None]);
+    }
+
+    #[tokio::test]
+    async fn the_cursor_and_a_held_fire_both_survive_a_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hestan.db");
+        let path = path.to_str().unwrap().to_string();
+        use chrono::TimeZone;
+        let now = Utc.with_ymd_and_hms(2026, 3, 4, 10, 30, 0).unwrap();
+        let held = Utc.with_ymd_and_hms(2026, 3, 4, 9, 0, 0).unwrap();
+
+        // process one: a cursor written by a catch-up, and a fire held because
+        // the job was busy. both go to disk and the process then dies
+        let store = Store::open(&path).unwrap();
+        store
+            .sync_schedules(&[Schedule::new("etl", HOURLY).catchup(Catchup::One)])
+            .unwrap();
+        store
+            .set_schedule_cursor("etl", HOURLY, now - chrono::Duration::hours(3))
+            .unwrap();
+        let entry = hourly_entry("etl", Catchup::One);
+        let runner = crate::Runner::new([nap_job("etl", 5, Overlap::Queue)], store.clone());
+        catch_up(&entry, &runner, rows(&store).get(&entry.key()), now);
+        store
+            .record_tick("etl", HOURLY, held, TickOutcome::Deferred, None, None)
+            .unwrap();
+        let cursor = cursor_of(&store);
+        assert_eq!(cursor, Some(now - chrono::Duration::minutes(30)));
+        assert_eq!(
+            store.pending_fires().unwrap(),
+            [("etl".to_string(), HOURLY.to_string(), held)]
+        );
+        drop(runner);
+        drop(store);
+
+        // process two: nothing in memory, everything read back off disk
+        let store = Store::open(&path).unwrap();
+        // the boot sweep a real restart runs, so the run process one left
+        // mid-flight is not mistaken for one still going
+        store.fail_interrupted().unwrap();
+        let runner = crate::Runner::new([nap_job("etl", 5, Overlap::Queue)], store.clone());
+        store
+            .sync_schedules(&[Schedule::new("etl", HOURLY).catchup(Catchup::One)])
+            .unwrap();
+        assert_eq!(cursor_of(&store), cursor, "the sync must not reset it");
+
+        let entry = hourly_entry("etl", Catchup::One);
+        catch_up(&entry, &runner, rows(&store).get(&entry.key()), now);
+        assert!(
+            store.runs(Some("etl"), None, None, None, 10).unwrap().len() <= 1,
+            "the cursor already accounted for those occurrences"
+        );
+
+        drain_pending(&[entry], &runner, &rows(&store));
+        wait_idle(&store, "etl").await;
+        let held_run = store
+            .runs(None, None, None, None, 10)
+            .unwrap()
+            .into_iter()
+            .find(|r| r.scheduled_for == Some(held));
+        assert!(
+            held_run.is_some(),
+            "a queue-policy fire held before the restart was lost with the process"
+        );
+        assert!(store.pending_fires().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn pausing_advances_the_cursor_without_firing() {
+        let store = Store::open(":memory:").unwrap();
+        let runner = crate::Runner::new([nap_job("etl", 5, Overlap::Skip)], store.clone());
+        let (_, now) = down_for(&store, 4, Catchup::All { limit: 10 });
+        store.set_schedule_paused("etl", HOURLY, true).unwrap();
+        let entry = hourly_entry("etl", Catchup::All { limit: 10 });
+
+        catch_up(&entry, &runner, rows(&store).get(&entry.key()), now);
+
+        // pause means stop, including the catch-up: resuming must not fire a
+        // week of backlog at whatever the schedule was paused for
+        assert!(store.runs(None, None, None, None, 10).unwrap().is_empty());
+        assert!(store.ticks(Some("etl"), 10).unwrap().is_empty());
+        assert_eq!(cursor_of(&store), Some(now - chrono::Duration::minutes(30)));
     }
 
     #[test]

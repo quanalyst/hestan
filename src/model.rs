@@ -243,6 +243,60 @@ pub enum Overlap {
 }
 str_enum!(Overlap { Allow => "allow", Skip => "skip", Queue => "queue" });
 
+/// what a schedule does about occurrences that came due while nothing was
+/// running to fire them — a restart, a crash, a deploy. the scheduler's
+/// [cursor](crate::Schedule::catchup) is what makes the missed set knowable at
+/// all; this decides what to do with it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Catchup {
+    /// advance the cursor over them and fire nothing. the default, and what
+    /// the scheduler did before it had a cursor.
+    #[default]
+    Skip,
+    /// fire the most recent missed occurrence only. for a job that computes
+    /// current state, where the last one subsumes the rest.
+    One,
+    /// fire every missed occurrence, oldest first, at most `limit` of them.
+    /// for a job that does work *for* a logical time — read
+    /// [`ctx.scheduled_for`](crate::OpCtx::scheduled_for) — where each hour is
+    /// its own hour and skipping one leaves a hole. past the cap the oldest are
+    /// dropped, loudly.
+    All { limit: usize },
+}
+
+impl std::fmt::Display for Catchup {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Catchup::Skip => f.write_str("skip"),
+            Catchup::One => f.write_str("one"),
+            Catchup::All { limit } => write!(f, "all:{limit}"),
+        }
+    }
+}
+
+// one text form everywhere: the stored column, the api, and the ui all read
+// `skip`, `one` or `all:24` rather than three shapes of the same thing
+impl std::str::FromStr for Catchup {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "skip" => Ok(Catchup::Skip),
+            "one" => Ok(Catchup::One),
+            other => other
+                .strip_prefix("all:")
+                .and_then(|n| n.parse().ok())
+                .map(|limit| Catchup::All { limit })
+                .ok_or_else(|| format!("unknown Catchup: {other}")),
+        }
+    }
+}
+
+impl Serialize for Catchup {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.collect_str(self)
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct Run {
     pub id: String,
@@ -259,6 +313,11 @@ pub struct Run {
     /// the run this one resumed, for a run launched by
     /// [`Runner::resume_from`](crate::Runner::resume_from); `None` otherwise.
     pub resumed_from: Option<String>,
+    /// the occurrence this run stands for, on a scheduled or caught-up run:
+    /// the logical time, not the wall clock it launched at. `None` on a manual
+    /// launch, a retry, a resume, a build or a sensor fire, which represent
+    /// nothing but themselves.
+    pub scheduled_for: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -297,11 +356,14 @@ pub struct ScheduleRow {
     /// the params every fire of this schedule launches with, `{}` unless the
     /// declaration set them.
     pub params: Value,
+    /// what to do with occurrences that came due while nothing was running.
+    pub catchup: Catchup,
+    /// the newest occurrence the scheduler has accounted for — fired, skipped,
+    /// held or deliberately dropped. `None` until this process has seen the
+    /// schedule once; everything strictly after it and strictly before now is
+    /// what downtime swallowed.
+    pub cursor: Option<DateTime<Utc>>,
 }
-
-/// one schedule as the code declares it — job, cron expression, timezone,
-/// params — which is what a sync writes over the stored rows.
-pub(crate) type ScheduleDef = (String, String, String, Value);
 
 #[derive(Debug, Clone, Serialize)]
 pub struct Tick {

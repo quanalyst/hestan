@@ -666,6 +666,7 @@ mod tests {
             finished_at: None,
             error: None,
             resumed_from: None,
+            scheduled_for: None,
         };
         store.create_run(&active, &[]).unwrap();
         evaluate(&entry, &runner, &reg).await;

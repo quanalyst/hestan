@@ -278,6 +278,12 @@ function JobView({ name }: { name: string }) {
             <div key={s.expr} className="sched-row">
               <span className="mono">{s.expr}</span>
               {s.tz !== "UTC" && <span className="muted">{s.tz}</span>}
+              {/* only what departs from the default, like the tz above */}
+              {s.catchup !== "skip" && (
+                <span className="muted" title={s.cursor ? `cursor ${s.cursor}` : "no cursor yet"}>
+                  catch up {s.catchup}
+                </span>
+              )}
               {params && (
                 <span className="mono muted" title={params}>
                   {params.length > SCHED_PARAMS_CAP ? params.slice(0, SCHED_PARAMS_CAP - 1) + "…" : params}
