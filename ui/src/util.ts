@@ -25,9 +25,25 @@ export function outputLine(output: unknown): string | null {
   return json.length > OUTPUT_CAP ? json.slice(0, OUTPUT_CAP - 1) + "…" : json;
 }
 
-// a dag node's muted suffix: an instance count, a trigger rule, or both
+// a dag node's muted suffix: an instance count, a trigger rule, whether the op
+// runs in a process of its own, or any combination of them
 export function opBadge(op: OpSummary, count?: string | null): string | undefined {
-  return [count, whenLabel(op.when)].filter(Boolean).join(" ") || undefined;
+  return (
+    [count, whenLabel(op.when), op.isolated ? "isolated" : null].filter(Boolean).join(" ") ||
+    undefined
+  );
+}
+
+// a byte cap the way it was written down, rather than as the number of bytes
+export function fmtBytes(bytes: number): string {
+  for (const [unit, size] of [
+    ["GiB", 1024 ** 3],
+    ["MiB", 1024 ** 2],
+    ["KiB", 1024],
+  ] as const) {
+    if (bytes >= size) return `${Math.round(bytes / size)} ${unit}`;
+  }
+  return `${bytes} B`;
 }
 
 export function isTerminal(status: RunStatus): boolean {

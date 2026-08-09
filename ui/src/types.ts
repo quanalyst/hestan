@@ -59,6 +59,11 @@ export interface OpSummary {
   // the dep this op fans out over, one instance per array element; null for
   // every ordinary op
   mapped_over: string | null;
+  // whether this op's body runs in a child process of its own, and what that
+  // process is allowed to spend; both limits are null unless declared
+  isolated: boolean;
+  memory_limit_bytes: number | null;
+  cpu_limit_secs: number | null;
   input_type: string | null;
   output_type: string | null;
   params_type: string | null;
@@ -187,6 +192,9 @@ export interface OpRun {
   // what the attempt that succeeded reported; null when it reported nothing
   metadata: Metadata | null;
   error: string | null;
+  // the child process an isolated op is running in right now; null once it has
+  // finished, and for every op that runs in the orchestrator itself
+  pid: number | null;
 }
 
 export interface RunEvent {

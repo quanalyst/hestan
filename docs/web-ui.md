@@ -95,7 +95,9 @@ beside the button rather than being second-guessed locally
 ([subset launches](launching.md#launching-a-subset-of-ops)). clicking a node
 also opens the op inspector: deps and dependents, the retry
 budget, any per-attempt `timeout`, the [concurrency pool](concepts.md#concurrency-pools)
-the op draws from with that pool's process-wide limit, declared
+the op draws from with that pool's process-wide limit, an `isolated` line for
+an op that runs in [its own process](isolation.md) with whatever memory and
+cpu limits that process carries, declared
 params/input/output types, and history over the last 50
 runs: average and p95 duration, failure count, a duration trend, and the most
 recent error verbatim. when the op has committed watermark state via
@@ -252,7 +254,10 @@ label. clicking a node filters the log below to that op; on a terminal run
 the selection also offers "re-run from here", with the same counts, which
 re-runs that op and everything downstream whatever their last status was.
 ops a subset run never contained read "not in run" and carry no glyph, which
-is how a resumed run shows what it reused. under the graph, the selected op's
+is how a resumed run shows what it reused. an [isolated op](isolation.md)
+carries an `isolated` marker on its node, and while it is running the selected
+op shows the process id it is running in — which is what to reach for when the
+question is what to look at in `top`. under the graph, the selected op's
 output shows on one line, and whatever it reported with `ctx.meta`
 ([metadata](metadata.md)) below it — rendered by type rather than as raw
 json: numbers right-aligned and tabular, urls as links, text inline,

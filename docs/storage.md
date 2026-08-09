@@ -4,8 +4,14 @@ everything lands in one sqlite file — no extra services. `Store::open(path)`
 opens (and migrates) it; `":memory:"` gives a throwaway store for tests. file
 databases run in WAL mode. the store is a single rusqlite connection behind a
 mutex, cloneable and shareable across tasks; one writer is plenty at this
-scale, and it also means hestan assumes it is the only process writing (see
-[embedding](embedding.md)).
+scale, and it also means hestan assumes it is the one *orchestrator* writing
+(see [embedding](embedding.md)).
+
+there is one other writer, and it is hestan's own: an [isolated
+op](isolation.md) runs in a child process that opens this same file and
+records its result through it. every connection therefore carries a
+five-second `busy_timeout`, so two processes writing at the same instant wait
+for each other instead of the second one failing outright.
 
 ## Schema
 
@@ -39,6 +45,8 @@ CREATE TABLE op_runs (
     output TEXT,
     error TEXT,
     metadata TEXT,                      -- added in v8
+    pid INTEGER,                        -- added in v13
+    inputs TEXT,                        -- added in v13
     PRIMARY KEY (run_id, op)
 );
 
@@ -242,8 +250,10 @@ for; version 11 adds the `sensor_run_keys` table
 measured, and 0 is the only honest thing to say about that; version 12 adds
 the `presets` table and `runs.tags`, the flat `{"k": "v"}` map a run carries
 ([tags](launching.md#run-tags)) — null on every run written before it and on
-every run launched without any, which reads back as `{}`. an older file at
-any version opens straight into v12, rows intact — the v8 rebuild copies
+every run launched without any, which reads back as `{}`; version 13 adds
+`op_runs.pid` and `op_runs.inputs`, both for [isolated ops](isolation.md) and
+both null for every op that runs in this process. an older file at
+any version opens straight into v13, rows intact — the v8 rebuild copies
 every keyed materialization across, where it becomes that asset's first
 history entry and stays its current one, and v9 leaves every existing row
 with a null partition, which is exactly what an unpartitioned asset is. every
@@ -251,7 +261,7 @@ pending step
 and the version stamp run in one transaction
 (sqlite DDL is transactional), so a crash or failure mid-migration leaves
 the file exactly as it was found, never half-migrated. a database stamped
-with a version newer than the build refuses to open (`db schema v13 is newer
+with a version newer than the build refuses to open (`db schema v14 is newer
 than this build`) instead of quietly writing an older stamp over it.
 
 one wrinkle: databases written before the migration mechanism existed carry
@@ -263,7 +273,8 @@ the v1 tables at `user_version` 0. open detects that case (version 0 with a
 ## Crash recovery
 
 `serve` and `run_once` sweep the database at startup, before anything new
-launches. any run still `queued` or `running` was left behind by a dead
+launches (a [worker child](isolation.md) does not — it owns nothing, and the
+sweep would mark its own parent's in-flight runs as interrupted). any run still `queued` or `running` was left behind by a dead
 process; its `running` op runs become `failed` with error
 `interrupted: process exited`, its `pending` op runs become `skipped`, a
 `run_failed` event (`run interrupted: process exited`) is appended, and the

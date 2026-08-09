@@ -230,6 +230,9 @@ function RunView({ id }: { id: string }) {
   const selectedOutput = outputLine(ops.find((o) => o.op === opSel)?.output);
   // what the op said about what it produced, rendered by type below the output
   const selectedMeta = (opSel && ops.find((o) => o.op === opSel)?.metadata) || null;
+  // an isolated op carries the process it is running in, and only while it is:
+  // the terminal write hands the pid back
+  const selectedPid = (opSel && ops.find((o) => o.op === opSel)?.pid) || null;
   const instances = fanOut(job, ops);
   const expanded = expansions(events);
   // a subset run (memoized asset build) writes no op_runs row for what it
@@ -368,6 +371,12 @@ function RunView({ id }: { id: string }) {
             </span>
           ))}
         </div>
+      )}
+
+      {selectedPid !== null && (
+        <p className="muted dag-action">
+          isolated · running in process <span className="mono">{selectedPid}</span>
+        </p>
       )}
 
       {opSel && selectedOutput !== null && (

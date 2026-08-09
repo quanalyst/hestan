@@ -62,6 +62,9 @@ summary or a 404. the shape:
       "timeout_secs": 30.0,
       "pool": "orders_api",
       "io": null,
+      "isolated": false,
+      "memory_limit_bytes": null,
+      "cpu_limit_secs": null,
       "mapped_over": null,
       "input_type": null,
       "output_type": null,
@@ -99,7 +102,11 @@ the process default. `when` is the op's
 [trigger rule](concepts.md#trigger-rules) — `all_succeeded` (the default),
 `any_failed` or `always`. `requires` lists the
 [resources](concepts.md#resources) the op declared with `Op::requires`.
-`mapped_over` is the dep an
+`isolated` says whether the op's body runs in a child process of its own
+([isolation](isolation.md)), with `memory_limit_bytes` and `cpu_limit_secs`
+the caps that child applies to itself — both null unless declared, and
+declaring either without `isolated` is a build error rather than a limit
+nothing enforces. `mapped_over` is the dep an
 [`Op::mapped`](concepts.md#dynamic-fan-out) fans out over, null for every
 ordinary op. an op's `params_schema` is whatever it declared with
 [`Op::params_schema`](launching.md#params-schemas), verbatim, and the job's is
@@ -312,7 +319,8 @@ needed to see a fan-out:
   "finished_at": "2026-08-07T12:00:03Z",
   "output": { "orders": 4, "revenue": 171.65, "enriched": 6 },
   "metadata": { "rows": {"int": 1234}, "source": {"url": "https://example.test/orders"} },
-  "error": null
+  "error": null,
+  "pid": null
 }
 ```
 
@@ -321,6 +329,11 @@ name — `int`, `float`, `text`, `url`, `markdown`, `json` — and `null` when
 it reported nothing, which is not the same as `{}`. only the attempt that
 succeeded contributes: a failed attempt's metadata is discarded. see
 [metadata](metadata.md).
+
+`pid` is the child process an [isolated op](isolation.md) is running in right
+now. it is null for every op that runs in the orchestrator itself, and null
+again the moment an isolated one finishes: the field says what is running
+where, and a pid outliving its process would answer that wrongly.
 
 ## Events
 

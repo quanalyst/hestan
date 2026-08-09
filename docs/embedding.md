@@ -96,11 +96,15 @@ has it open.
 
 ## Single-process assumptions
 
-one hestan process per database. the store is a single connection behind a
+one hestan *orchestrator* per database. the store is a single connection behind a
 mutex — one writer, by design — and the scheduler runs in-process with no
 coordination: two processes sharing a file would each fire every schedule
 (double runs), and each startup sweep would mark the *other* process's live
-runs as interrupted. within one process, a job slower than its own cron
+runs as interrupted. the one exception is hestan's own: an [isolated
+op](isolation.md) runs in a child process that opens the same file, and that
+child takes the worker path — no scheduler, no sweep, no loops of any kind —
+precisely so neither of those two things happens. within one process, a job
+slower than its own cron
 interval is handled by its overlap policy (skip by default — see
 [scheduling](scheduling.md)); manual launches are never gated, so those can
 still overlap a running job.

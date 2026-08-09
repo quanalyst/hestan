@@ -2,7 +2,7 @@ import { useEffect } from "react";
 import MicroBars from "./MicroBars";
 import type { MicroBar } from "./MicroBars";
 import type { JobPool, JobState, OpStat, OpSummary } from "./types";
-import { fmtDuration, relTime } from "./util";
+import { fmtBytes, fmtDuration, relTime } from "./util";
 
 const TITLE_CAP = 2000;
 
@@ -115,6 +115,21 @@ export default function OpInspector({
             <span className="mono">
               {op.pool}
               {poolLimit !== null && ` · ${poolLimit} at once`}
+            </span>
+          </div>
+        )}
+        {/* the limits belong to the child, so they only ever appear with it */}
+        {op.isolated && (
+          <div className="op-line">
+            <span className="op-line-label">isolated</span>
+            <span className="mono">
+              {[
+                "own process",
+                op.memory_limit_bytes === null ? null : fmtBytes(op.memory_limit_bytes),
+                op.cpu_limit_secs === null ? null : `${fmtDuration(op.cpu_limit_secs * 1000)} cpu`,
+              ]
+                .filter(Boolean)
+                .join(" · ")}
             </span>
           </div>
         )}

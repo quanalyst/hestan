@@ -147,6 +147,17 @@ appears.
   `ctx.is_cancelled()` — the only way blocking work ever stops early. an op
   that stops is recorded as stopped; one that never comes back is recorded as
   exactly that, with no invented finish time
+- `Op::isolated()` runs one op's body in a child process — this same binary,
+  re-executed, so there is no runtime to load and no code to re-import. it
+  contains what in-process cannot: an op that segfaults or aborts fails that
+  op instead of taking hestan down, and the parent records the signal that
+  killed it. it also makes stopping real — for an isolated op, cancellation
+  and timeouts are SIGTERM, three seconds, then SIGKILL, rather than a request
+  blocking work can ignore. per op rather than per job, so the one risky
+  parser is contained while the other forty stay in-process and free.
+  `.memory_limit(bytes)` and `.cpu_limit(d)` cap the child with `setrlimit`;
+  the store is the only channel between the two processes, and unix-only is a
+  build error rather than a silent fallback
 - ops can carry persisted state: `ctx.set_state` stages a watermark that
   commits only when the attempt succeeds, so the next run picks up where the
   last successful one left off
@@ -226,6 +237,7 @@ the details live in [docs/](docs/README.md):
 [concepts](docs/concepts.md) (execution semantics),
 [typed io](docs/typed-io.md), [resources](docs/resources.md),
 [io managers](docs/io-managers.md), [op state](docs/state.md),
+[isolation](docs/isolation.md),
 [metadata](docs/metadata.md),
 [assets](docs/assets.md), [freshness](docs/freshness.md),
 [sensors](docs/sensors.md),

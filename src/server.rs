@@ -173,6 +173,11 @@ fn job_summary(job: &Job, st: &AppState) -> Result<Value, Error> {
                 "timeout_secs": op.timeout_after().map(|d| d.as_secs_f64()),
                 "pool": op.pool_name(),
                 "io": op.io_name(),
+                // where this op's body runs, and what it is allowed to spend
+                // there — null limits on every op that runs in this process
+                "isolated": op.is_isolated(),
+                "memory_limit_bytes": op.declared_memory_limit(),
+                "cpu_limit_secs": op.declared_cpu_limit().map(|d| d.as_secs_f64()),
                 "mapped_over": op.mapped_over(),
                 "input_type": op.input_type(),
                 "output_type": op.output_type(),
@@ -1886,6 +1891,30 @@ mod tests {
             .op(Op::new("render", |ctx| async move { Ok(ctx.params().clone()) }).params::<Window>())
             .build()
             .unwrap()
+    }
+
+    // where an op runs, and what it may spend there, are facts about the job
+    // that only the summary can carry
+    #[tokio::test]
+    async fn isolation_and_its_limits_reach_the_job_summary() {
+        let job = Job::builder("risky")
+            .op(Op::new("parse", |_| async { Ok(json!(null)) })
+                .isolated()
+                .memory_limit(512 * 1024 * 1024)
+                .cpu_limit(Duration::seconds(30).to_std().unwrap()))
+            .op(Op::new("here", |_| async { Ok(json!(null)) }).after(["parse"]))
+            .build()
+            .unwrap();
+        let st = state(vec![job]);
+
+        let Json(body) = get_job(State(st), Path("risky".into())).await.unwrap();
+        assert_eq!(body["ops"][0]["isolated"], json!(true));
+        assert_eq!(body["ops"][0]["memory_limit_bytes"], json!(536_870_912u64));
+        assert_eq!(body["ops"][0]["cpu_limit_secs"], json!(30.0));
+        // an ordinary op says so, with no limits to report
+        assert_eq!(body["ops"][1]["isolated"], json!(false));
+        assert_eq!(body["ops"][1]["memory_limit_bytes"], json!(null));
+        assert_eq!(body["ops"][1]["cpu_limit_secs"], json!(null));
     }
 
     #[tokio::test]
