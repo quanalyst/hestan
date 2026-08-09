@@ -1,4 +1,5 @@
 use std::panic::AssertUnwindSafe;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -8,6 +9,7 @@ use futures::future::BoxFuture;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
+use tokio::sync::Semaphore;
 use tokio::time::Instant;
 
 use crate::asset::{
@@ -85,6 +87,7 @@ type SensorFn = dyn Fn(
 pub struct Sensor {
     name: String,
     every: Duration,
+    timeout: Duration,
     f: Arc<SensorFn>,
 }
 
@@ -99,8 +102,26 @@ impl Sensor {
         Sensor {
             name: name.into(),
             every,
+            timeout: DEFAULT_SENSOR_TIMEOUT,
             f: Arc::new(move |ctx| Box::pin(f(ctx))),
         }
+    }
+
+    /// how long one evaluation may take before the loop gives up on it
+    /// (default 60s). on expiry the evaluation is abandoned, the tick records
+    /// the timeout as an error, and the staged cursor is not committed.
+    ///
+    /// abandoning is not stopping, and this is the same limit ops have. an
+    /// `.await` inside the closure is where an abandoned evaluation actually
+    /// goes away; a closure doing blocking work between await points cannot be
+    /// dropped at all, so it keeps its thread until that work returns — and if
+    /// it does return, late, what it returns still counts. nothing else can
+    /// have run in the meantime: the loop never evaluates a sensor whose
+    /// previous evaluation is still going. [`SensorCtx::is_cancelled`] is the
+    /// cooperative half.
+    pub fn timeout(mut self, timeout: Duration) -> Sensor {
+        self.timeout = timeout;
+        self
     }
 
     pub fn name(&self) -> &str {
@@ -112,6 +133,17 @@ impl Sensor {
 /// that was paused for a week has a backlog, and draining it a page at a time
 /// keeps one tick from launching thousands of runs at once.
 const RUN_SENSOR_PAGE: u32 = 200;
+
+/// how long one evaluation may take before the loop abandons it, unless the
+/// sensor asked for something else. probes get the same one and have no way to
+/// change it: a fingerprint that takes a minute is a broken probe.
+pub(crate) const DEFAULT_SENSOR_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// how many sensors evaluate at once. the loop evaluated in sequence before
+/// this, so one slow closure delayed every sensor and every probe behind it;
+/// the bound is here because the alternative — every due sensor at once — is
+/// how a hundred entries become a hundred concurrent api calls.
+const MAX_CONCURRENT_EVALS: usize = 8;
 
 /// what a [`RunStatusSensor`] closure is handed about a run that just
 /// finished. deliberately a small public struct and not the internal `Run`:
@@ -182,6 +214,7 @@ type RunSensorFn = dyn Fn(
 pub struct RunStatusSensor {
     name: String,
     every: Duration,
+    timeout: Duration,
     statuses: Vec<RunStatus>,
     job: Option<String>,
     f: Arc<RunSensorFn>,
@@ -201,6 +234,7 @@ impl RunStatusSensor {
         RunStatusSensor {
             name: name.into(),
             every: Duration::from_secs(15),
+            timeout: DEFAULT_SENSOR_TIMEOUT,
             statuses: vec![RunStatus::Success],
             job: None,
             f: Arc::new(move |ctx, run| Box::pin(f(ctx, run))),
@@ -229,6 +263,15 @@ impl RunStatusSensor {
         self
     }
 
+    /// how long one evaluation may take before the loop gives up on it
+    /// (default 60s), with the same meaning and the same limits as
+    /// [`Sensor::timeout`]. one evaluation here is a whole page of runs, not
+    /// one call of the closure.
+    pub fn timeout(mut self, timeout: Duration) -> RunStatusSensor {
+        self.timeout = timeout;
+        self
+    }
+
     /// the name it is registered under, `run:{name}`.
     pub fn sensor_name(&self) -> String {
         format!("run:{}", self.name)
@@ -241,12 +284,50 @@ impl RunStatusSensor {
 pub struct SensorCtx {
     cursor: Option<Value>,
     new_cursor: Arc<Mutex<Option<Value>>>,
+    deadline: Instant,
 }
 
 impl SensorCtx {
+    fn new(
+        cursor: Option<Value>,
+        new_cursor: Arc<Mutex<Option<Value>>>,
+        deadline: Instant,
+    ) -> SensorCtx {
+        SensorCtx {
+            cursor,
+            new_cursor,
+            deadline,
+        }
+    }
+
     /// the cursor the last fully-successful evaluation committed.
     pub fn cursor(&self) -> Option<&Value> {
         self.cursor.as_ref()
+    }
+
+    /// true once this evaluation's [timeout](Sensor::timeout) has passed. cheap
+    /// enough to call in a loop — it reads the clock and allocates nothing.
+    ///
+    /// an async closure does not need this: it is dropped at its next await
+    /// point. blocking work cannot be dropped at all, so polling this is the
+    /// only way it ever stops early, exactly as with
+    /// [`OpCtx::is_cancelled`](crate::OpCtx::is_cancelled):
+    ///
+    /// ```no_run
+    /// # use hestan::{RunRequest, Sensor, SensorCtx};
+    /// # use std::time::Duration;
+    /// Sensor::new("crunch", Duration::from_secs(60), |ctx: SensorCtx| async move {
+    ///     for chunk in 0..1_000 {
+    ///         if ctx.is_cancelled() {
+    ///             return Err("evaluation timed out".into());
+    ///         }
+    ///         # let _ = chunk;
+    ///     }
+    ///     Ok(Vec::<RunRequest>::new())
+    /// });
+    /// ```
+    pub fn is_cancelled(&self) -> bool {
+        Instant::now() >= self.deadline
     }
 
     /// [`cursor`](Self::cursor) deserialized into `T`; `Ok(None)` when no
@@ -286,7 +367,11 @@ pub(crate) enum SensorEval {
 pub(crate) struct SensorEntry {
     pub name: String,
     pub every: Duration,
+    pub timeout: Duration,
     pub eval: SensorEval,
+    /// when it is next due and whether an evaluation of it is still going.
+    /// shared, because evaluations run on tasks of their own now.
+    pub state: Arc<SensorState>,
 }
 
 impl SensorEntry {
@@ -294,7 +379,9 @@ impl SensorEntry {
         SensorEntry {
             name: sensor.name,
             every: sensor.every,
+            timeout: sensor.timeout,
             eval: SensorEval::User(sensor.f),
+            state: SensorState::new(),
         }
     }
 
@@ -302,11 +389,28 @@ impl SensorEntry {
         SensorEntry {
             name: sensor.sensor_name(),
             every: sensor.every,
+            timeout: sensor.timeout,
             eval: SensorEval::Runs {
                 statuses: sensor.statuses,
                 job: sensor.job,
                 f: sensor.f,
             },
+            state: SensorState::new(),
+        }
+    }
+
+    /// the entry a probed source asset becomes. probes carry the default
+    /// timeout: there is no declaration to hang another one on.
+    pub(crate) fn probe(asset: &str, probe: Arc<ProbeFn>, every: Duration) -> SensorEntry {
+        SensorEntry {
+            name: format!("probe:{asset}"),
+            every,
+            timeout: DEFAULT_SENSOR_TIMEOUT,
+            eval: SensorEval::Probe {
+                asset: asset.to_string(),
+                probe,
+            },
+            state: SensorState::new(),
         }
     }
 
@@ -323,8 +427,82 @@ impl SensorEntry {
     }
 }
 
+/// one sensor's place in the loop, shared with the task that evaluates it.
+pub(crate) struct SensorState(Mutex<StateInner>);
+
+struct StateInner {
+    due: Instant,
+    /// an evaluation of this sensor is under way — waiting for a permit
+    /// counts, because it is going to run
+    running: bool,
+    /// a skip has already been recorded for this stall, so the ones after it
+    /// are log lines. a sensor wedged for an hour must not bury every other
+    /// sensor's tick history under its own
+    stalled: bool,
+}
+
+/// what the loop decided to do with a sensor that came due.
+enum Claim {
+    Go,
+    /// the previous evaluation is still going. skip this turn rather than
+    /// queue it: a queued second evaluation could commit a cursor over a newer
+    /// one, and a backlog of them is not what "every 5 seconds" asked for.
+    Stalled {
+        first: bool,
+    },
+}
+
+impl SensorState {
+    pub(crate) fn new() -> Arc<SensorState> {
+        Arc::new(SensorState(Mutex::new(StateInner {
+            due: Instant::now(),
+            running: false,
+            stalled: false,
+        })))
+    }
+
+    pub(crate) fn due(&self) -> Instant {
+        self.0.lock().unwrap().due
+    }
+
+    /// push the next evaluation out by `every` without evaluating: what a
+    /// paused sensor does, so its schedule keeps ticking over rather than
+    /// coming due the instant it resumes.
+    fn defer(&self, every: Duration) {
+        self.0.lock().unwrap().due = Instant::now() + every;
+    }
+
+    fn claim(&self, every: Duration) -> Claim {
+        let mut inner = self.0.lock().unwrap();
+        // tentative: the evaluation resets it when it ends, so in the ordinary
+        // case the gap still counts from the end of the last evaluation
+        inner.due = Instant::now() + every;
+        if inner.running {
+            let first = !inner.stalled;
+            inner.stalled = true;
+            return Claim::Stalled { first };
+        }
+        inner.running = true;
+        Claim::Go
+    }
+
+    fn release(&self, every: Duration) {
+        let mut inner = self.0.lock().unwrap();
+        inner.running = false;
+        inner.stalled = false;
+        inner.due = Instant::now() + every;
+    }
+}
+
 /// the sensor loop: every entry evaluates at startup, then on its own interval.
 /// paused entries are skipped without a tick and keep their schedule.
+///
+/// due entries evaluate on tasks of their own, at most [`MAX_CONCURRENT_EVALS`]
+/// at a time, so one slow closure no longer delays every sensor behind it. two
+/// evaluations of the *same* sensor never overlap: the loop skips a sensor
+/// whose previous evaluation is still going rather than queueing another,
+/// which is what keeps a slow evaluation from committing its cursor over a
+/// newer one.
 pub(crate) async fn run_sensors(
     entries: Vec<SensorEntry>,
     runner: Runner,
@@ -333,20 +511,60 @@ pub(crate) async fn run_sensors(
     if entries.is_empty() {
         return;
     }
-    let mut due: Vec<Instant> = vec![Instant::now(); entries.len()];
+    let entries: Vec<Arc<SensorEntry>> = entries.into_iter().map(Arc::new).collect();
+    let limit = Arc::new(Semaphore::new(MAX_CONCURRENT_EVALS));
     loop {
-        let (i, &at) = due
+        let (i, at) = entries
             .iter()
             .enumerate()
-            .min_by_key(|(_, t)| **t)
+            .map(|(i, e)| (i, e.state.due()))
+            .min_by_key(|(_, t)| *t)
             .expect("entries is non-empty");
         tokio::time::sleep_until(at).await;
-        let entry = &entries[i];
-        if !sensor_paused(&runner, &entry.name) {
-            evaluate(entry, &runner, &registry).await;
+        let entry = entries[i].clone();
+        // an evaluation that finished while the loop slept may have moved this
+        // one out from under it
+        if entry.state.due() > Instant::now() {
+            continue;
         }
-        // next due counts from evaluation end, so a slow closure never stacks
-        due[i] = Instant::now() + entry.every;
+        if sensor_paused(&runner, &entry.name) {
+            entry.state.defer(entry.every);
+            continue;
+        }
+        if let Claim::Stalled { first } = entry.state.claim(entry.every) {
+            tracing::warn!(sensor = %entry.name, "still evaluating: this turn skipped");
+            if first {
+                note_skipped_tick(&runner, &entry.name);
+            }
+            continue;
+        }
+        let (runner, registry, limit) = (runner.clone(), registry.clone(), limit.clone());
+        tokio::spawn(async move {
+            // the bound is on evaluating, not on dispatching: a task waiting
+            // here already holds its sensor, which is what stops a second
+            // evaluation of it starting behind this one
+            let _permit = limit
+                .acquire()
+                .await
+                .expect("the semaphore is never closed");
+            evaluate(&entry, &runner, &registry).await;
+            entry.state.release(entry.every);
+        });
+    }
+}
+
+/// record the turn a sensor was too busy to take. one per stall, not one per
+/// turn: the sensor's own tick is still coming, and burying it under skips
+/// would be worse than saying nothing.
+fn note_skipped_tick(runner: &Runner, name: &str) {
+    if let Err(e) = runner.store().record_sensor_tick(
+        name,
+        SensorOutcome::Skipped,
+        0,
+        0,
+        Some("previous evaluation still running"),
+    ) {
+        tracing::warn!(sensor = %name, "tick write failed: {e}");
     }
 }
 
@@ -362,25 +580,66 @@ fn sensor_paused(runner: &Runner, name: &str) -> bool {
 
 /// what one evaluation did, beside how it ended: runs it launched, and keyed
 /// requests it skipped because the key was already claimed.
+///
+/// shared with the evaluation rather than returned from it, so a tick can
+/// still say what an evaluation managed to launch before it was abandoned at
+/// its timeout.
 #[derive(Default)]
 struct Counts {
-    launched: u32,
-    skipped: u32,
+    launched: AtomicU32,
+    skipped: AtomicU32,
+}
+
+impl Counts {
+    fn record(&self, fired: Fired) {
+        let counter = match fired {
+            Fired::Launched => &self.launched,
+            Fired::Skipped => &self.skipped,
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
 }
 
 async fn evaluate(entry: &SensorEntry, runner: &Runner, registry: &AssetRegistry) {
-    let (outcome, counts, error) = match &entry.eval {
-        SensorEval::User(f) => evaluate_user(&entry.name, f, runner).await,
-        SensorEval::Probe { asset, probe } => evaluate_probe(asset, probe, runner, registry).await,
-        SensorEval::Runs { statuses, job, f } => {
-            evaluate_runs(&entry.name, statuses, job.as_deref(), f, runner).await
+    let counts = Counts::default();
+    let deadline = Instant::now() + entry.timeout;
+    let eval = async {
+        match &entry.eval {
+            SensorEval::User(f) => evaluate_user(&entry.name, f, runner, &counts, deadline).await,
+            SensorEval::Probe { asset, probe } => {
+                evaluate_probe(asset, probe, runner, registry, &counts).await
+            }
+            SensorEval::Runs { statuses, job, f } => {
+                evaluate_runs(
+                    &entry.name,
+                    statuses,
+                    job.as_deref(),
+                    f,
+                    runner,
+                    &counts,
+                    deadline,
+                )
+                .await
+            }
+        }
+    };
+    // abandoning is not stopping: the evaluation goes away at its next await
+    // point, and a closure blocking between them keeps its thread until it
+    // returns. what is guaranteed is that nothing it does after this counts —
+    // the cursor is not committed and the tick is already written
+    let (outcome, error) = match tokio::time::timeout_at(deadline, eval).await {
+        Ok(done) => done,
+        Err(_) => {
+            let msg = format!("evaluation timed out after {:?}", entry.timeout);
+            tracing::warn!(sensor = %entry.name, "{msg}");
+            (SensorOutcome::Error, Some(msg))
         }
     };
     if let Err(e) = runner.store().record_sensor_tick(
         &entry.name,
         outcome,
-        counts.launched,
-        counts.skipped,
+        counts.launched.load(Ordering::Relaxed),
+        counts.skipped.load(Ordering::Relaxed),
         error.as_deref(),
     ) {
         tracing::warn!(sensor = %entry.name, "tick write failed: {e}");
@@ -436,7 +695,9 @@ async fn evaluate_user(
     name: &str,
     f: &Arc<SensorFn>,
     runner: &Runner,
-) -> (SensorOutcome, Counts, Option<String>) {
+    counts: &Counts,
+    deadline: Instant,
+) -> (SensorOutcome, Option<String>) {
     let cursor = match runner.store().sensors() {
         Ok(rows) => rows
             .into_iter()
@@ -449,10 +710,7 @@ async fn evaluate_user(
         }
     };
     let new_cursor = Arc::new(Mutex::new(None));
-    let ctx = SensorCtx {
-        cursor,
-        new_cursor: new_cursor.clone(),
-    };
+    let ctx = SensorCtx::new(cursor, new_cursor.clone(), deadline);
     // a panicking closure is an evaluation error, not a dead sensor loop
     let result = match AssertUnwindSafe(async { f(ctx).await })
         .catch_unwind()
@@ -469,18 +727,16 @@ async fn evaluate_user(
         Ok(r) => r,
         Err(msg) => {
             tracing::warn!(sensor = %name, "evaluation failed: {msg}");
-            return (SensorOutcome::Error, Counts::default(), Some(msg));
+            return (SensorOutcome::Error, Some(msg));
         }
     };
-    let mut counts = Counts::default();
     for req in requests {
         match launch_request(name, req, runner) {
-            Ok(Fired::Launched) => counts.launched += 1,
-            Ok(Fired::Skipped) => counts.skipped += 1,
+            Ok(fired) => counts.record(fired),
             // a launch failure fails the evaluation: the cursor stays put
             Err(msg) => {
                 tracing::warn!(sensor = %name, "{msg}");
-                return (SensorOutcome::Error, counts, Some(msg));
+                return (SensorOutcome::Error, Some(msg));
             }
         }
     }
@@ -491,11 +747,10 @@ async fn evaluate_user(
         tracing::warn!(sensor = %name, "cursor write failed: {e}");
         return (
             SensorOutcome::Error,
-            counts,
             Some(format!("cursor write failed: {e}")),
         );
     }
-    (SensorOutcome::Fired, counts, None)
+    (SensorOutcome::Fired, None)
 }
 
 /// one run-status evaluation: read the terminal runs past the cursor, hand each
@@ -510,16 +765,19 @@ async fn evaluate_user(
 /// that could lose an event would be worse than one that repeats it. a request
 /// carrying a [run key](RunRequest::key) is the way out of the replay: the
 /// second sight of it is skipped rather than launched.
+#[allow(clippy::too_many_arguments)]
 async fn evaluate_runs(
     name: &str,
     statuses: &[RunStatus],
     job: Option<&str>,
     f: &Arc<RunSensorFn>,
     runner: &Runner,
-) -> (SensorOutcome, Counts, Option<String>) {
+    counts: &Counts,
+    deadline: Instant,
+) -> (SensorOutcome, Option<String>) {
     let stored = match sensor_cursor(runner, name) {
         Ok(c) => c,
-        Err(msg) => return (SensorOutcome::Error, Counts::default(), Some(msg)),
+        Err(msg) => return (SensorOutcome::Error, Some(msg)),
     };
     let cursor: Option<RunCursor> = match &stored {
         Some(v) => match serde_json::from_value(v.clone()) {
@@ -537,8 +795,8 @@ async fn evaluate_runs(
         // a new run sensor starts from now: it chains what happens next, not
         // the run log it was added to
         return match seed_cursor(runner, name, job) {
-            Ok(()) => (SensorOutcome::Fired, Counts::default(), None),
-            Err(msg) => (SensorOutcome::Error, Counts::default(), Some(msg)),
+            Ok(()) => (SensorOutcome::Fired, None),
+            Err(msg) => (SensorOutcome::Error, Some(msg)),
         };
     };
     let runs = match runner
@@ -546,21 +804,17 @@ async fn evaluate_runs(
         .terminal_runs_after(job, Some(&cursor), RUN_SENSOR_PAGE)
     {
         Ok(r) => r,
-        Err(e) => return (SensorOutcome::Error, Counts::default(), Some(e.to_string())),
+        Err(e) => return (SensorOutcome::Error, Some(e.to_string())),
     };
     let Some(last) = runs.last() else {
-        return (SensorOutcome::Fired, Counts::default(), None);
+        return (SensorOutcome::Fired, None);
     };
     let seen = RunCursor {
         finished_at: last.finished_at.expect("terminal runs carry a finish time"),
         id: last.id.clone(),
     };
-    let mut counts = Counts::default();
     for run in runs.iter().filter(|r| statuses.contains(&r.status)) {
-        let ctx = SensorCtx {
-            cursor: stored.clone(),
-            new_cursor: Arc::new(Mutex::new(None)),
-        };
+        let ctx = SensorCtx::new(stored.clone(), Arc::new(Mutex::new(None)), deadline);
         let summary = RunSummary::from(run);
         let result = match AssertUnwindSafe(async { f(ctx, summary).await })
             .catch_unwind()
@@ -577,16 +831,15 @@ async fn evaluate_runs(
             Ok(r) => r,
             Err(msg) => {
                 tracing::warn!(sensor = %name, run = %run.id, "evaluation failed: {msg}");
-                return (SensorOutcome::Error, counts, Some(msg));
+                return (SensorOutcome::Error, Some(msg));
             }
         };
         for req in requests {
             match launch_request(name, req, runner) {
-                Ok(Fired::Launched) => counts.launched += 1,
-                Ok(Fired::Skipped) => counts.skipped += 1,
+                Ok(fired) => counts.record(fired),
                 Err(msg) => {
                     tracing::warn!(sensor = %name, "{msg}");
-                    return (SensorOutcome::Error, counts, Some(msg));
+                    return (SensorOutcome::Error, Some(msg));
                 }
             }
         }
@@ -596,11 +849,10 @@ async fn evaluate_runs(
         tracing::warn!(sensor = %name, "cursor write failed: {e}");
         return (
             SensorOutcome::Error,
-            counts,
             Some(format!("cursor write failed: {e}")),
         );
     }
-    (SensorOutcome::Fired, counts, None)
+    (SensorOutcome::Fired, None)
 }
 
 fn sensor_cursor(runner: &Runner, name: &str) -> Result<Option<Value>, String> {
@@ -638,24 +890,25 @@ async fn evaluate_probe(
     probe: &Arc<ProbeFn>,
     runner: &Runner,
     registry: &AssetRegistry,
-) -> (SensorOutcome, Counts, Option<String>) {
+    counts: &Counts,
+) -> (SensorOutcome, Option<String>) {
     let fingerprint = match AssertUnwindSafe(async { probe().await })
         .catch_unwind()
         .await
     {
         Ok(Ok(fp)) => fp,
-        Ok(Err(e)) => return (SensorOutcome::Error, Counts::default(), Some(e.to_string())),
+        Ok(Err(e)) => return (SensorOutcome::Error, Some(e.to_string())),
         Err(panic) => {
             let msg = match panic_payload(panic.as_ref()) {
                 Some(s) => format!("probe panicked: {s}"),
                 None => "probe panicked".to_string(),
             };
-            return (SensorOutcome::Error, Counts::default(), Some(msg));
+            return (SensorOutcome::Error, Some(msg));
         }
     };
     let current = match runner.store().materialization(asset, None) {
         Ok(m) => m.map(|m| m.fingerprint),
-        Err(e) => return (SensorOutcome::Error, Counts::default(), Some(e.to_string())),
+        Err(e) => return (SensorOutcome::Error, Some(e.to_string())),
     };
     if current.as_deref() != Some(fingerprint.as_str()) {
         tracing::info!(asset = %asset, "probe saw a new fingerprint");
@@ -668,21 +921,17 @@ async fn evaluate_probe(
             None,
             None,
         ) {
-            return (SensorOutcome::Error, Counts::default(), Some(e.to_string()));
+            return (SensorOutcome::Error, Some(e.to_string()));
         }
     }
     // changed or not: the fingerprint commits before any launch, so re-deriving
     // every tick is what heals a launch that failed after the commit
     match launch_stale_auto(asset, runner, registry) {
-        Ok(launched) => (
-            SensorOutcome::Fired,
-            Counts {
-                launched,
-                skipped: 0,
-            },
-            None,
-        ),
-        Err(msg) => (SensorOutcome::Error, Counts::default(), Some(msg)),
+        Ok(launched) => {
+            counts.launched.fetch_add(launched, Ordering::Relaxed);
+            (SensorOutcome::Fired, None)
+        }
+        Err(msg) => (SensorOutcome::Error, Some(msg)),
     }
 }
 
@@ -925,14 +1174,7 @@ mod tests {
 
     fn probe_entry(reg: &AssetRegistry, asset: &str) -> SensorEntry {
         let probe = reg.get(asset).unwrap().probe.clone().unwrap();
-        SensorEntry {
-            name: format!("probe:{asset}"),
-            every: Duration::from_secs(3600),
-            eval: SensorEval::Probe {
-                asset: asset.into(),
-                probe,
-            },
-        }
+        SensorEntry::probe(asset, probe, Duration::from_secs(3600))
     }
 
     #[tokio::test]
@@ -1603,5 +1845,220 @@ mod tests {
         let ticks = store.sensor_ticks(Some("run:chain"), 10).unwrap();
         assert_eq!((ticks[0].launched, ticks[0].skipped), (1, 1));
         assert_eq!(cursor_of(&store, "run:chain").unwrap()["id"], json!(second));
+    }
+
+    // ---- timeouts and concurrency --------------------------------------
+
+    /// a sensor that counts its calls, sleeps `takes`, and launches nothing.
+    fn slow_entry(name: &str, every: Duration, takes: Duration, calls: Arc<AtomicU32>) -> Sensor {
+        Sensor::new(name, every, move |_ctx: SensorCtx| {
+            let calls = calls.clone();
+            async move {
+                calls.fetch_add(1, Ordering::SeqCst);
+                tokio::time::sleep(takes).await;
+                Ok(vec![])
+            }
+        })
+    }
+
+    #[tokio::test]
+    async fn a_slow_sensor_does_not_delay_a_fast_one() {
+        let store = Store::open(":memory:").unwrap();
+        store.sync_sensors(&["slow".into(), "fast".into()]).unwrap();
+        let runner = echo_runner(store.clone());
+        let (slow_calls, fast_calls) = (Arc::new(AtomicU32::new(0)), Arc::new(AtomicU32::new(0)));
+        let entries = vec![
+            SensorEntry::user(slow_entry(
+                "slow",
+                Duration::from_secs(3600),
+                Duration::from_millis(400),
+                slow_calls.clone(),
+            )),
+            SensorEntry::user(slow_entry(
+                "fast",
+                Duration::from_millis(20),
+                Duration::ZERO,
+                fast_calls.clone(),
+            )),
+        ];
+        let handle = tokio::spawn(run_sensors(
+            entries,
+            runner,
+            Arc::new(AssetRegistry::empty()),
+        ));
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        handle.abort();
+        assert_eq!(slow_calls.load(Ordering::SeqCst), 1);
+        // in sequence the fast sensor would have got exactly zero turns while
+        // the slow one held the loop
+        assert!(
+            fast_calls.load(Ordering::SeqCst) >= 4,
+            "the fast sensor ran {} times behind a slow one",
+            fast_calls.load(Ordering::SeqCst)
+        );
+        assert!(
+            store.sensor_ticks(Some("slow"), 10).unwrap().is_empty(),
+            "the slow evaluation ticked before it finished"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_sensor_still_evaluating_is_skipped_rather_than_evaluated_twice() {
+        let store = Store::open(":memory:").unwrap();
+        store.sync_sensors(&["slow".into()]).unwrap();
+        let runner = echo_runner(store.clone());
+        let calls = Arc::new(AtomicU32::new(0));
+        let entry = SensorEntry::user(slow_entry(
+            "slow",
+            Duration::from_millis(20),
+            Duration::from_millis(300),
+            calls.clone(),
+        ));
+        let handle = tokio::spawn(run_sensors(
+            vec![entry],
+            runner,
+            Arc::new(AssetRegistry::empty()),
+        ));
+
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "a second evaluation started while the first was still going"
+        );
+        // one skip per stall, not one per turn: seven turns came due here
+        let ticks = store.sensor_ticks(Some("slow"), 10).unwrap();
+        assert_eq!(ticks.len(), 1);
+        assert_eq!(ticks[0].outcome, SensorOutcome::Skipped);
+        assert_eq!(
+            ticks[0].error.as_deref(),
+            Some("previous evaluation still running")
+        );
+
+        // and once it finishes, the sensor evaluates again normally
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        handle.abort();
+        let ticks = store.sensor_ticks(Some("slow"), 10).unwrap();
+        assert!(calls.load(Ordering::SeqCst) >= 2);
+        assert!(ticks.iter().any(|t| t.outcome == SensorOutcome::Fired));
+    }
+
+    #[tokio::test]
+    async fn no_more_than_the_bound_evaluate_at_once() {
+        let store = Store::open(":memory:").unwrap();
+        let names: Vec<String> = (0..20).map(|i| format!("s{i}")).collect();
+        store.sync_sensors(&names).unwrap();
+        let runner = echo_runner(store.clone());
+        let live = Arc::new(AtomicU32::new(0));
+        let peak = Arc::new(AtomicU32::new(0));
+        let entries: Vec<SensorEntry> = names
+            .iter()
+            .map(|name| {
+                let (live, peak) = (live.clone(), peak.clone());
+                SensorEntry::user(Sensor::new(
+                    name,
+                    Duration::from_secs(3600),
+                    move |_ctx: SensorCtx| {
+                        let (live, peak) = (live.clone(), peak.clone());
+                        async move {
+                            let now = live.fetch_add(1, Ordering::SeqCst) + 1;
+                            peak.fetch_max(now, Ordering::SeqCst);
+                            tokio::time::sleep(Duration::from_millis(60)).await;
+                            live.fetch_sub(1, Ordering::SeqCst);
+                            Ok(vec![])
+                        }
+                    },
+                ))
+            })
+            .collect();
+        let handle = tokio::spawn(run_sensors(
+            entries,
+            runner,
+            Arc::new(AssetRegistry::empty()),
+        ));
+
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        handle.abort();
+        let peak = peak.load(Ordering::SeqCst) as usize;
+        assert_eq!(peak, MAX_CONCURRENT_EVALS, "the bound did not hold");
+        // and all twenty still got their turn, a permit at a time
+        assert_eq!(store.sensor_ticks(None, 50).unwrap().len(), 20);
+    }
+
+    #[tokio::test]
+    async fn a_timed_out_evaluation_errors_and_leaves_the_cursor_alone() {
+        let store = Store::open(":memory:").unwrap();
+        store.sync_sensors(&["stuck".into()]).unwrap();
+        let runner = echo_runner(store.clone());
+        let entry = SensorEntry::user(
+            Sensor::new(
+                "stuck",
+                Duration::from_secs(3600),
+                |ctx: SensorCtx| async move {
+                    ctx.set_cursor(json!("moved"));
+                    tokio::time::sleep(Duration::from_secs(30)).await;
+                    Ok(vec![RunRequest::new("etl")])
+                },
+            )
+            .timeout(Duration::from_millis(50)),
+        );
+        evaluate(&entry, &runner, &AssetRegistry::empty()).await;
+
+        let ticks = store.sensor_ticks(Some("stuck"), 10).unwrap();
+        assert_eq!(ticks[0].outcome, SensorOutcome::Error);
+        assert!(
+            ticks[0].error.as_deref().unwrap().contains("timed out"),
+            "{:?}",
+            ticks[0].error
+        );
+        assert_eq!(cursor_of(&store, "stuck"), None);
+        assert!(store.runs(None, None, None, None, 10).unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_cooperative_sensor_can_see_its_deadline_pass() {
+        let store = Store::open(":memory:").unwrap();
+        store.sync_sensors(&["chunks".into()]).unwrap();
+        let runner = echo_runner(store.clone());
+        let chunks = Arc::new(AtomicU32::new(0));
+        let counter = chunks.clone();
+        // the shape a blocking closure has: work in chunks, checking between
+        // them. blocking work cannot be abandoned, so this is the only way it
+        // ever stops — and stopping is the closure's own decision to make
+        let entry = SensorEntry::user(
+            Sensor::new(
+                "chunks",
+                Duration::from_secs(3600),
+                move |ctx: SensorCtx| {
+                    let chunks = counter.clone();
+                    async move {
+                        ctx.set_cursor(json!("done"));
+                        for _ in 0..1000 {
+                            if ctx.is_cancelled() {
+                                return Err("evaluation timed out".into());
+                            }
+                            chunks.fetch_add(1, Ordering::SeqCst);
+                            std::thread::sleep(Duration::from_millis(2));
+                        }
+                        Ok(vec![])
+                    }
+                },
+            )
+            .timeout(Duration::from_millis(60)),
+        );
+        evaluate(&entry, &runner, &AssetRegistry::empty()).await;
+
+        assert!(
+            chunks.load(Ordering::SeqCst) < 1000,
+            "the closure never saw its deadline"
+        );
+        let ticks = store.sensor_ticks(Some("chunks"), 10).unwrap();
+        assert_eq!(ticks[0].outcome, SensorOutcome::Error);
+        assert_eq!(
+            cursor_of(&store, "chunks"),
+            None,
+            "a cursor staged past the deadline was committed"
+        );
     }
 }

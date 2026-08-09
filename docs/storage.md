@@ -137,7 +137,7 @@ CREATE TABLE sensor_ticks (            -- added in v4
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     sensor TEXT NOT NULL,
     evaluated_at TEXT NOT NULL,
-    outcome TEXT NOT NULL,    -- fired | error
+    outcome TEXT NOT NULL,    -- fired | error | skipped
     launched INTEGER NOT NULL DEFAULT 0,
     skipped INTEGER NOT NULL DEFAULT 0,      -- added in v11: keyed duplicates
     duration_ms INTEGER NOT NULL DEFAULT 0,  -- added in v11

@@ -497,14 +497,20 @@ pub struct SensorRow {
 }
 
 /// how a sensor evaluation ended: `fired` means the closure returned and every
-/// requested run launched, possibly zero of them.
+/// requested run launched, possibly zero of them. `skipped` is a turn the loop
+/// did not evaluate at all, because the previous evaluation was still going.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum SensorOutcome {
     Fired,
     Error,
+    Skipped,
 }
-str_enum!(SensorOutcome { Fired => "fired", Error => "error" });
+str_enum!(SensorOutcome {
+    Fired => "fired",
+    Error => "error",
+    Skipped => "skipped",
+});
 
 #[derive(Debug, Clone, Serialize)]
 pub struct SensorTick {

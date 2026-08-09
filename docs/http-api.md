@@ -549,8 +549,10 @@ are skipped without ticks and resume on their normal interval.
 `GET /api/sensors/ticks?sensor=&limit=` returns evaluation history, newest
 first (`limit` defaults to 20, clamps to 1..=200; empty `sensor` means
 all). `outcome` is `fired` (the evaluation completed; `launched` says how
-many runs it asked for, usually 0) or `error` (with the message in
-`error`; the cursor was not moved). `skipped` counts the requests whose
+many runs it asked for, usually 0), `error` (with the message in
+`error`; the cursor was not moved), or `skipped` (the turn the loop did not
+take because the previous evaluation was still running — one per stall, not
+one per turn). `skipped` counts the requests whose
 [run key](sensors.md#run-keys) was already claimed, so they were not launched
 a second time — a keyed sensor in its steady state reports
 `launched: 0, skipped: n`, which is not the same fact as launching nothing.

@@ -14,7 +14,7 @@ use crate::job::Job;
 use crate::model::{Run, Trigger};
 use crate::resource::{self, Resource, ResourceCtx, ResourceFn};
 use crate::schedule::{self, Schedule, ScheduleEntry};
-use crate::sensor::{RunStatusSensor, Sensor, SensorEntry, SensorEval, run_sensors};
+use crate::sensor::{RunStatusSensor, Sensor, SensorEntry, run_sensors};
 use crate::server::{AppState, SensorInfo, router};
 use crate::store::Store;
 
@@ -486,14 +486,11 @@ impl Hestan {
         sensor_entries.extend(self.run_sensors.into_iter().map(SensorEntry::runs));
         for meta in registry.topo() {
             if let Some(probe) = &meta.probe {
-                sensor_entries.push(SensorEntry {
-                    name: format!("probe:{}", meta.name),
-                    every: meta.probe_every,
-                    eval: SensorEval::Probe {
-                        asset: meta.name.clone(),
-                        probe: probe.clone(),
-                    },
-                });
+                sensor_entries.push(SensorEntry::probe(
+                    &meta.name,
+                    probe.clone(),
+                    meta.probe_every,
+                ));
             }
         }
         let mut sensor_names = HashSet::new();

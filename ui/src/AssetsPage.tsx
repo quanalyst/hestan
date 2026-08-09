@@ -18,6 +18,7 @@ import { relTime } from "./util";
 const SENSOR_GLYPH = {
   fired: "success",
   error: "failed",
+  skipped: "skipped",
 } as const satisfies Record<SensorOutcome, Status>;
 
 // a backfill's states map onto the run states they are made of

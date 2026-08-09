@@ -21,8 +21,9 @@ export type EventKind =
 
 export type TickOutcome = "fired" | "error" | "skipped" | "deferred";
 
-// narrower than TickOutcome: skipped/deferred are schedule ideas, not sensor ones
-export type SensorOutcome = "fired" | "error";
+// narrower than TickOutcome: deferred is a schedule idea. skipped is a turn
+// the loop did not take, because the previous evaluation was still running
+export type SensorOutcome = "fired" | "error" | "skipped";
 
 // an op's trigger rule: what its deps must have done for it to run at all
 export type When = "all_succeeded" | "any_failed" | "always";

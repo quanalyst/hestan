@@ -203,6 +203,10 @@ appears.
   which turns at-least-once into effectively-once per sensor. the key is
   claimed in the same transaction that creates the run, so it can never name a
   run that did not launch
+- due sensors evaluate concurrently, bounded, each under a timeout, so one
+  slow closure cannot delay the rest. two evaluations of the same sensor never
+  overlap: the loop skips a sensor that is still busy rather than queueing
+  behind it
 - freshness policies are declarations, not guesses: `fresh_within(d)` on a job
   or an asset says how old its latest success may get, and past that it is
   `late` — per key on a partitioned asset, so one late partition carries the

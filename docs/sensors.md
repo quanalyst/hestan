@@ -25,9 +25,9 @@ Hestan::new().sensor(marker_watch) // stackable
 `serve` runs one loop for every registered sensor (probes included, below):
 each entry evaluates once at startup, then on its own interval, and the loop
 always sleeps until the earliest due entry. `every` is the gap between
-evaluations, so a slow closure pushes its own next due time back rather than
-stacking. `run_once` and `build_asset` are headless and run no sensor loop,
-same as schedules.
+evaluations, counted from the end of the last one, so a slow closure pushes its
+own next due time back rather than stacking. `run_once` and `build_asset` are
+headless and run no sensor loop, same as schedules.
 
 ## Evaluation, exactly
 
@@ -84,6 +84,48 @@ day for as long as the database exists.
 [`retention_days(n)`](storage.md#retention) prunes them on the same cutoff it
 prunes runs on; without it they accumulate. that is deliberate — a key deleted
 early is a duplicate launch, so nothing throws one away by default.
+
+## Timeouts and concurrency
+
+due sensors evaluate **on tasks of their own**, at most 8 at a time. in
+sequence, one closure blocking on a dead endpoint delayed every sensor and
+every probe behind it, which is the failure mode where a fifteen-second
+sensor quietly becomes a fifteen-minute one. the bound is there because the
+alternative — every due entry at once — is how a hundred sensors become a
+hundred concurrent api calls.
+
+**two evaluations of the same sensor never overlap.** a sensor whose previous
+evaluation is still going is skipped for that turn, not queued behind it: a
+queued second evaluation could commit a cursor over a newer one, and a backlog
+of them is not what `every` asked for. the skip lands as a `skipped` tick —
+once per stall, not once per turn, so a sensor wedged for an hour cannot bury
+every other sensor's history under its own.
+
+each evaluation has a **timeout**, 60s unless `Sensor::timeout(d)` (or
+`RunStatusSensor::timeout(d)`) says otherwise; probes get the same 60s and no
+way to change it, because a fingerprint that takes a minute is a broken probe.
+on expiry the evaluation is abandoned, the tick records the timeout as an
+error, and the staged cursor is not committed.
+
+abandoning is not stopping, and this is exactly the limit ops have. an `.await`
+inside the closure is where an abandoned evaluation actually goes away; a
+closure doing blocking work between await points cannot be dropped at all, so
+it keeps its thread until that work returns — and if it does return, late, what
+it returns still counts. nothing else can have run in the meantime, because the
+sensor was held. `ctx.is_cancelled()` is the cooperative half, true once the
+deadline has passed:
+
+```rust
+Sensor::new("crunch", Duration::from_secs(60), |ctx| async move {
+    for chunk in chunks {
+        if ctx.is_cancelled() {
+            return Err("evaluation timed out".into());
+        }
+        crunch(chunk);            // blocking, so nothing can drop this future
+    }
+    Ok(Vec::new())
+})
+```
 
 ## Probes are sensors
 
@@ -177,8 +219,8 @@ movement. its schedule keeps ticking over regardless, so resuming picks up
 at the next interval rather than with a burst of catch-ups.
 
 every evaluation of an unpaused sensor lands in `sensor_ticks`: outcome
-(`fired | error`), how many runs launched, how many keyed requests were
-skipped, the error message if any.
+(`fired | error | skipped`), how many runs launched, how many keyed requests
+were skipped, the error message if any.
 `GET /api/sensors/ticks?sensor=&limit=` reads it newest-first; at boot the
 table is pruned to the newest 5000, the same policy as schedule ticks.
 
