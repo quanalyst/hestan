@@ -200,6 +200,8 @@ pub struct Op {
     output_type: Option<&'static str>,
     params_type: Option<&'static str>,
     params_check: Option<Arc<ParamsCheck>>,
+    // a json schema for the launchpad to read; never consulted by the check
+    params_schema: Option<Value>,
     // built by `mapped`, so `over` missing is a build error rather than an op
     // that silently runs once over nothing
     mapped: bool,
@@ -231,6 +233,7 @@ impl Op {
             output_type: None,
             params_type: None,
             params_check: None,
+            params_schema: None,
             mapped: false,
             over: None,
             labeled: false,
@@ -264,6 +267,7 @@ impl Op {
             output_type: Some(std::any::type_name::<O>()),
             params_type: None,
             params_check: None,
+            params_schema: None,
             mapped: false,
             over: None,
             labeled: false,
@@ -436,6 +440,36 @@ impl Op {
         self
     }
 
+    /// a json schema for this op's params, carried through to the api so the
+    /// launchpad can list the fields instead of showing an empty textarea and
+    /// a type name.
+    ///
+    /// **it is a ui aid, not a second validator.** the authority is and stays
+    /// the serde round-trip [`params`](Self::params) installs: every launch
+    /// deserializes into `P`, so a schema that disagrees with `P` cannot admit
+    /// anything `P` refuses — it can only describe it wrongly, which is a bad
+    /// legend rather than a hole. nothing here is ever checked against the
+    /// params.
+    ///
+    /// hestan takes no schemars dependency; the value is whatever you hand it,
+    /// and `schemars::schema_for!(P)` produces exactly this in one line:
+    ///
+    /// ```ignore
+    /// Op::new("fetch", body)
+    ///     .params::<Fetch>()
+    ///     .params_schema(serde_json::to_value(schemars::schema_for!(Fetch))?)
+    /// ```
+    ///
+    /// only `properties`, `required` and `$defs`/`definitions` are read, to
+    /// merge every op's schema into one for the job — see
+    /// [`Job::params_schema`](crate::Job::params_schema). the rest is passed
+    /// through untouched. the schema must be a json object, and two ops giving
+    /// one property name different shapes is a build error.
+    pub fn params_schema(mut self, schema: Value) -> Op {
+        self.params_schema = Some(schema);
+        self
+    }
+
     /// extra attempts after the first (default 0).
     pub fn retries(mut self, n: u32) -> Op {
         self.retries = n;
@@ -576,6 +610,12 @@ impl Op {
 
     pub fn params_type(&self) -> Option<&'static str> {
         self.params_type
+    }
+
+    /// the schema this op declared with [`params_schema`](Self::params_schema),
+    /// exactly as it was handed over.
+    pub fn declared_params_schema(&self) -> Option<&Value> {
+        self.params_schema.as_ref()
     }
 
     /// the dep this op fans out over, from [`over`](Self::over). `Some` only

@@ -64,9 +64,14 @@ summary or a 404. the shape:
       "mapped_over": null,
       "input_type": null,
       "output_type": null,
-      "params_type": "demo::FetchParams"
+      "params_type": "demo::FetchParams",
+      "params_schema": { "type": "object",
+                         "properties": { "days": {"type": "integer"} } }
     }
   ],
+  "params_schema": { "type": "object",
+                     "properties": { "days": {"type": "integer"} },
+                     "required": ["days"] },
   "schedules": [
     { "expr": "*/2 * * * *", "tz": "UTC", "paused": false,
       "params": {}, "next_fire": "2026-08-07T12:34:00+00:00" }
@@ -95,7 +100,12 @@ the process default. `when` is the op's
 [resources](concepts.md#resources) the op declared with `Op::requires`.
 `mapped_over` is the dep an
 [`Op::mapped`](concepts.md#dynamic-fan-out) fans out over, null for every
-ordinary op. `interval_secs` is the gap between the next two fires, minimized across the
+ordinary op. an op's `params_schema` is whatever it declared with
+[`Op::params_schema`](launching.md#params-schemas), verbatim, and the job's is
+every op's merged into one — both null when nothing declared one. it is a
+legend for the launchpad and never a validator: what a launch is judged
+against is the ops' declared params types, so a schema that disagrees with one
+cannot widen what launches. `interval_secs` is the gap between the next two fires, minimized across the
 job's unpaused schedules (`null` without one); `overdue` is true when the
 previous scheduled fire is more than half an interval past and no successful
 run has finished since it (see [scheduling](scheduling.md)). `freshness` is

@@ -14,6 +14,7 @@ import type {
   OpStat,
   Preset,
   Run,
+  SchemaField,
   Tick,
   TickOutcome,
   UpcomingSchedule,
@@ -56,6 +57,31 @@ function validJson(text: string): boolean {
   } catch {
     return false;
   }
+}
+
+// what a schema field is called in the legend. json schema can say far more
+// than one word, and one word is what a legend has room for
+function fieldType(f: SchemaField): string {
+  if (typeof f.type === "string") return f.type;
+  if (Array.isArray(f.type)) return f.type.join(" | ");
+  if (typeof f.$ref === "string") return f.$ref.slice(f.$ref.lastIndexOf("/") + 1);
+  if (Array.isArray(f.enum)) return "enum";
+  return "—";
+}
+
+// keys the editor holds that the schema has never heard of: a typo, or a
+// schema that has not caught up. worth pointing at, never worth refusing —
+// the schema does not decide what launches
+function unknownKeys(text: string, known: Record<string, SchemaField>): string[] {
+  if (!text.trim()) return [];
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    return [];
+  }
+  if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) return [];
+  return Object.keys(parsed).filter((k) => !(k in known));
 }
 
 // a schedule's params next to its expression: short mono json, full on hover
@@ -242,6 +268,9 @@ function JobView({ name }: { name: string }) {
   if (!job) return <p className="muted">loading…</p>;
 
   const paramTypes = [...new Set(job.ops.map((o) => o.params_type).filter((t): t is string => t !== null))];
+  const fields = job.params_schema?.properties ?? {};
+  const required = new Set(job.params_schema?.required ?? []);
+  const strangers = unknownKeys(paramsText, fields);
   // only what departs from the defaults, as with a schedule's tz
   const policy = [
     job.max_parallel === null ? null : `max_parallel ${job.max_parallel}`,
@@ -305,6 +334,30 @@ function JobView({ name }: { name: string }) {
               />
               {!paramsValid && <p className="muted params-hint">invalid json</p>}
               {paramsValid && paramsError && <p className="muted params-hint">{paramsError}</p>}
+              {/* a legend for the json above, not a replacement for it: the
+                  schema says what the fields are, the editor still says what
+                  they are set to */}
+              {Object.keys(fields).length > 0 && (
+                <div className="params-fields">
+                  {Object.entries(fields).map(([field, shape]) => (
+                    <div key={field} className="params-field">
+                      <span className="mono">{field}</span>
+                      <span className="muted">{fieldType(shape)}</span>
+                      {required.has(field) && <span className="muted">required</span>}
+                      {shape.description && (
+                        <span className="muted params-desc" title={shape.description}>
+                          {shape.description}
+                        </span>
+                      )}
+                    </div>
+                  ))}
+                </div>
+              )}
+              {strangers.length > 0 && (
+                <p className="muted params-hint">
+                  not in the schema: <span className="mono">{strangers.join(", ")}</span>
+                </p>
+              )}
               <div className="preset-row">
                 <input
                   className="filter-input"

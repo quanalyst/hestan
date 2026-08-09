@@ -173,6 +173,7 @@ fn job_summary(job: &Job, st: &AppState) -> Result<Value, Error> {
                 "input_type": op.input_type(),
                 "output_type": op.output_type(),
                 "params_type": op.params_type(),
+                "params_schema": op.declared_params_schema(),
             })
         })
         .collect();
@@ -238,6 +239,7 @@ fn job_summary(job: &Job, st: &AppState) -> Result<Value, Error> {
         "name": job.name(),
         "description": job.description(),
         "ops": ops,
+        "params_schema": job.params_schema(),
         "schedules": schedules,
         "max_parallel": job.max_parallel(),
         "pools": pools,
@@ -1750,17 +1752,130 @@ mod tests {
         assert_eq!(body["error"], "unknown job: nope");
     }
 
+    #[derive(Deserialize)]
+    #[allow(dead_code)]
+    struct Window {
+        days: u32,
+    }
+
     // a job whose op refuses anything but {"days": <number>}
     fn windowed_job(name: &str) -> Job {
-        #[derive(Deserialize)]
-        #[allow(dead_code)]
-        struct Window {
-            days: u32,
-        }
         Job::builder(name)
             .op(Op::new("render", |ctx| async move { Ok(ctx.params().clone()) }).params::<Window>())
             .build()
             .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_declared_params_schema_reaches_the_api_merged_and_per_op() {
+        let schema = json!({
+            "type": "object",
+            "properties": { "days": { "type": "integer", "description": "how far back" } },
+            "required": ["days"]
+        });
+        let job = Job::builder("report")
+            .op(
+                Op::new("render", |ctx| async move { Ok(ctx.params().clone()) })
+                    .params::<Window>()
+                    .params_schema(schema.clone()),
+            )
+            .op(Op::new("notify", |_| async { Ok(json!(null)) }).after(["render"]))
+            .build()
+            .unwrap();
+        let st = state(vec![job, echo_job("plain")]);
+
+        let Json(body) = get_job(State(st.clone()), Path("report".into()))
+            .await
+            .unwrap();
+        assert_eq!(body["params_schema"], schema);
+        assert_eq!(body["ops"][0]["params_schema"], schema);
+        // an op that declared nothing says so, next to its null params_type
+        assert_eq!(body["ops"][1]["params_schema"], json!(null));
+        assert_eq!(body["ops"][1]["params_type"], json!(null));
+
+        // and a job nobody described behaves exactly as it did before schemas
+        let Json(body) = get_job(State(st), Path("plain".into())).await.unwrap();
+        assert_eq!(body["params_schema"], json!(null));
+        assert_eq!(body["ops"][0]["params_schema"], json!(null));
+    }
+
+    // the schema describes the params; the declared type decides them. one
+    // that disagrees is a bad legend, never a wider gate
+    #[tokio::test]
+    async fn a_schema_that_contradicts_the_type_cannot_admit_bad_params() {
+        let lying = json!({
+            "type": "object",
+            "properties": { "days": { "type": "string" } },
+            "required": ["days", "region"]
+        });
+        let job = Job::builder("report")
+            .op(
+                Op::new("render", |ctx| async move { Ok(ctx.params().clone()) })
+                    .params::<Window>()
+                    .params_schema(lying.clone()),
+            )
+            .build()
+            .unwrap();
+        let st = state(vec![job]);
+
+        // reported as declared, wrong and all — the api does not correct it
+        let Json(body) = get_job(State(st.clone()), Path("report".into()))
+            .await
+            .unwrap();
+        assert_eq!(body["params_schema"], lying);
+
+        // what the schema describes and the type refuses is still refused
+        let (status, Json(body)) = launch_run(
+            State(st.clone()),
+            Path("report".into()),
+            raw(r#"{"params": {"days": "seven", "region": "eu"}}"#),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(
+            body["error"]
+                .as_str()
+                .unwrap()
+                .starts_with("invalid params for op render:"),
+            "{body}"
+        );
+        let (status, _) = validate_params(
+            State(st.clone()),
+            Path("report".into()),
+            raw(r#"{"params": {"days": "seven", "region": "eu"}}"#),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        // a preset the schema would accept is refused before it is stored, too
+        let (status, _) = put_preset(
+            State(st.clone()),
+            Path(("report".into(), "lying".into())),
+            raw(r#"{"params": {"days": "seven", "region": "eu"}}"#),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+
+        // and what the type accepts launches, whatever the schema claims to
+        // require and whatever type it claims the field has
+        let (status, _) = launch_run(
+            State(st.clone()),
+            Path("report".into()),
+            raw(r#"{"params": {"days": 7}}"#),
+        )
+        .await
+        .unwrap();
+        assert_eq!(status, StatusCode::ACCEPTED);
+        let Json(body) = validate_params(
+            State(st),
+            Path("report".into()),
+            raw(r#"{"params": {"days": 7}}"#),
+        )
+        .await
+        .unwrap();
+        assert_eq!(body, json!({"ok": true}));
     }
 
     #[tokio::test]

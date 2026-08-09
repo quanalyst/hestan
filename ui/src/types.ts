@@ -28,6 +28,22 @@ export type SensorOutcome = "fired" | "error" | "skipped";
 // an op's trigger rule: what its deps must have done for it to run at all
 export type When = "all_succeeded" | "any_failed" | "always";
 
+// one field of a params schema. json schema says far more than this; these are
+// the keys the launchpad's legend reads, and everything else is passed through
+export interface SchemaField {
+  type?: string | string[];
+  description?: string;
+  $ref?: string;
+  enum?: unknown[];
+}
+
+// a json schema for the params editor to read. a legend, never a validator:
+// what a launch is actually judged against is the ops' declared params types
+export interface ParamsSchema {
+  properties?: Record<string, SchemaField>;
+  required?: string[];
+}
+
 export interface OpSummary {
   name: string;
   deps: string[];
@@ -46,6 +62,8 @@ export interface OpSummary {
   input_type: string | null;
   output_type: string | null;
   params_type: string | null;
+  // what this op declared with Op::params_schema, verbatim; null for most ops
+  params_schema: ParamsSchema | null;
 }
 
 // a named concurrency limit shared process-wide, not per job
@@ -92,6 +110,8 @@ export interface JobSummary {
   name: string;
   description: string | null;
   ops: OpSummary[];
+  // every op's schema merged into one; null when no op declared any
+  params_schema: ParamsSchema | null;
   schedules: JobSchedule[];
   last_run: Run | null;
   max_parallel: number | null;

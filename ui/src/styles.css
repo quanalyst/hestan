@@ -993,6 +993,27 @@ textarea.params-input::placeholder {
   font-size: 12px;
 }
 
+/* the schema as a legend under the editor: one line a field */
+.params-fields {
+  margin-top: 6px;
+  border-top: 1px solid var(--hairline);
+}
+
+.params-field {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  padding: 3px 0;
+  font-size: 12px;
+}
+
+.params-desc {
+  overflow: hidden;
+  flex: 1;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
 /* saving and deleting live with the editor, since what they store is what is in it */
 .preset-row {
   display: flex;

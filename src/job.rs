@@ -1,7 +1,7 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::time::Duration;
 
-use serde_json::Value;
+use serde_json::{Value, json};
 
 use crate::error::Error;
 use crate::graph;
@@ -18,6 +18,10 @@ pub struct Job {
     max_parallel: Option<usize>,
     overlap: Overlap,
     fresh_within: Option<Duration>,
+    // every op's declared params schema merged into one, computed at build so
+    // a disagreement between two ops is a build error rather than a summary
+    // that quietly picks a winner
+    params_schema: Option<Value>,
     // dep names satisfied from outside the job: no ops, absent from `order`,
     // seeded at launch with the value declared here — null for an asset
     // source, `[]` for the partition keys a partitioned asset fans out over,
@@ -68,6 +72,21 @@ impl Job {
     /// `overdue` heuristic in charge.
     pub fn fresh_within(&self) -> Option<Duration> {
         self.fresh_within
+    }
+
+    /// one object schema for the whole job's params: the
+    /// [schemas](crate::Op::params_schema) its ops declared, merged. `None`
+    /// when no op declared one, which is every job that has not opted in.
+    ///
+    /// a launch's params go to every op that will run, so the fields the
+    /// launchpad should list are the union of what the ops describe — merged
+    /// once at build rather than per request, since a disagreement between two
+    /// ops is a mistake to report, not a request to answer.
+    ///
+    /// this describes params; it never judges them. `params_error` is still
+    /// the only thing that refuses a launch.
+    pub fn params_schema(&self) -> Option<&Value> {
+        self.params_schema.as_ref()
     }
 
     /// the first op that refuses `params`, with its reason — the same check a
@@ -126,6 +145,7 @@ impl Job {
             .filter(|n| !external.iter().any(|(e, _)| e == n))
             .collect();
         validate_mapped(&name, &ops)?;
+        let params_schema = merge_params_schemas(&name, &ops)?;
         Ok(Job {
             name,
             description,
@@ -134,9 +154,133 @@ impl Job {
             max_parallel: None,
             overlap: Overlap::default(),
             fresh_within: None,
+            params_schema,
             external,
         })
     }
+}
+
+/// merge one op's named sub-map of a params schema into `into`, refusing a
+/// name two ops give different shapes.
+///
+/// that clash is the one thing a merge cannot paper over: picking a winner
+/// would describe a field in terms half the job disagrees with, and the point
+/// of the schema is that the description is trustworthy. everything else — a
+/// name only one op knows, or two ops agreeing — merges silently.
+fn merge_named<'a>(
+    job: &str,
+    op: &'a str,
+    key: &str,
+    what: &str,
+    schema: &'a serde_json::Map<String, Value>,
+    into: &mut BTreeMap<&'a str, (&'a str, &'a Value)>,
+) -> Result<(), Error> {
+    let Some(from) = schema.get(key) else {
+        return Ok(());
+    };
+    let Some(from) = from.as_object() else {
+        return Err(Error::Graph(format!(
+            "job {job}: op {op} declares a params schema whose {key} is not an object"
+        )));
+    };
+    for (name, shape) in from {
+        match into.get(name.as_str()) {
+            Some(&(owner, seen)) if seen != shape => {
+                return Err(Error::Graph(format!(
+                    "job {job}: ops {owner} and {op} both declare the params schema {what} \
+                     {name}, with different shapes"
+                )));
+            }
+            Some(_) => {}
+            None => {
+                into.insert(name, (op, shape));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// every op's [declared schema](Op::params_schema) merged into one object
+/// schema for the job; `None` when none declared one.
+///
+/// only `properties`, `required` and `$defs`/`definitions` are read. the last
+/// two are what a derived schema puts nested types under and points `$ref` at,
+/// so dropping them would leave dangling references in the merged result;
+/// both spellings are carried, each under its own key, since a `$ref` names one
+/// or the other and not both.
+fn merge_params_schemas(job: &str, ops: &[Op]) -> Result<Option<Value>, Error> {
+    let mut properties = BTreeMap::new();
+    let mut defs = BTreeMap::new();
+    let mut definitions = BTreeMap::new();
+    let mut required: BTreeSet<&str> = BTreeSet::new();
+    let mut declared = false;
+    for op in ops {
+        let Some(schema) = op.declared_params_schema() else {
+            continue;
+        };
+        let Some(schema) = schema.as_object() else {
+            return Err(Error::Graph(format!(
+                "job {job}: op {} declares a params schema that is not a json object",
+                op.name()
+            )));
+        };
+        declared = true;
+        let name = op.name();
+        merge_named(job, name, "properties", "property", schema, &mut properties)?;
+        merge_named(job, name, "$defs", "$defs entry", schema, &mut defs)?;
+        merge_named(
+            job,
+            name,
+            "definitions",
+            "definitions entry",
+            schema,
+            &mut definitions,
+        )?;
+        match schema.get("required") {
+            None => {}
+            Some(Value::Array(names)) => {
+                for n in names {
+                    let Some(n) = n.as_str() else {
+                        return Err(Error::Graph(format!(
+                            "job {job}: op {name} declares a params schema whose required list \
+                             holds something that is not a field name"
+                        )));
+                    };
+                    required.insert(n);
+                }
+            }
+            Some(_) => {
+                return Err(Error::Graph(format!(
+                    "job {job}: op {name} declares a params schema whose required is not an array"
+                )));
+            }
+        }
+    }
+    if !declared {
+        return Ok(None);
+    }
+    let owned = |map: BTreeMap<&str, (&str, &Value)>| -> Value {
+        Value::Object(
+            map.into_iter()
+                .map(|(name, (_, shape))| (name.to_string(), shape.clone()))
+                .collect(),
+        )
+    };
+    let mut merged = serde_json::Map::new();
+    merged.insert("type".into(), json!("object"));
+    merged.insert("properties".into(), owned(properties));
+    // a field one op requires is required of the launch, since the params go
+    // to every op that runs
+    if !required.is_empty() {
+        merged.insert("required".into(), json!(required));
+    }
+    if !defs.is_empty() {
+        merged.insert("$defs".into(), owned(defs));
+    }
+    if !definitions.is_empty() {
+        merged.insert("definitions".into(), owned(definitions));
+    }
+    Ok(Some(Value::Object(merged)))
 }
 
 // a mapped op needs exactly one array to expand over, and its instances are
@@ -644,6 +788,7 @@ impl JobBuilder {
         let order = graph::topo_order(&pairs)
             .map_err(|e| Error::Graph(format!("job {}: {e}", self.name)))?;
         validate_mapped(&self.name, &ops)?;
+        let params_schema = merge_params_schemas(&self.name, &ops)?;
         Ok(Job {
             name: self.name,
             description: self.description,
@@ -652,6 +797,7 @@ impl JobBuilder {
             max_parallel: self.max_parallel,
             overlap: self.overlap,
             fresh_within: self.fresh_within,
+            params_schema,
             external: Vec::new(),
         })
     }
@@ -960,6 +1106,101 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("does not follow a graph instance"), "{err}");
+    }
+
+    // the launch's params go to every op that runs, so the job's schema is the
+    // union of what its ops describe
+    #[test]
+    fn declared_params_schemas_merge_into_one_object_schema() {
+        let job = Job::builder("report")
+            .op(op("fetch").params_schema(json!({
+                "type": "object",
+                "properties": { "region": { "type": "string" } },
+                "required": ["region"],
+                "$defs": { "Region": { "type": "string" } }
+            })))
+            .op(op("render").after(["fetch"]).params_schema(json!({
+                "type": "object",
+                // region again, identically: agreement is not a conflict
+                "properties": {
+                    "region": { "type": "string" },
+                    "days": { "type": "integer", "description": "how far back" }
+                }
+            })))
+            .op(op("notify").after(["render"]))
+            .build()
+            .unwrap();
+
+        assert_eq!(
+            job.params_schema().unwrap(),
+            &json!({
+                "type": "object",
+                "properties": {
+                    "days": { "type": "integer", "description": "how far back" },
+                    "region": { "type": "string" }
+                },
+                "required": ["region"],
+                "$defs": { "Region": { "type": "string" } }
+            })
+        );
+        // the ops keep what each of them declared, merged or not
+        assert!(job.op("fetch").unwrap().declared_params_schema().is_some());
+        assert!(job.op("notify").unwrap().declared_params_schema().is_none());
+
+        // a job nobody described has no schema at all, not an empty one
+        let plain = Job::builder("plain").op(op("a")).build().unwrap();
+        assert!(plain.params_schema().is_none());
+    }
+
+    #[test]
+    fn conflicting_params_schemas_fail_the_build_naming_both_ops() {
+        let clash = |a: Value, b: Value| {
+            build_err(
+                Job::builder("report")
+                    .op(op("fetch").params_schema(a))
+                    .op(op("render").after(["fetch"]).params_schema(b)),
+            )
+        };
+
+        let err = clash(
+            json!({"properties": { "days": { "type": "integer" } }}),
+            json!({"properties": { "days": { "type": "string" } }}),
+        );
+        assert!(
+            err.contains("ops fetch and render both declare the params schema property days"),
+            "{err}"
+        );
+
+        // the same rule over the nested-type maps a $ref points at
+        let err = clash(
+            json!({"$defs": { "Window": { "type": "integer" } }}),
+            json!({"$defs": { "Window": { "type": "string" } }}),
+        );
+        assert!(err.contains("$defs entry Window"), "{err}");
+        let err = clash(
+            json!({"definitions": { "Window": { "type": "integer" } }}),
+            json!({"definitions": { "Window": { "type": "string" } }}),
+        );
+        assert!(err.contains("definitions entry Window"), "{err}");
+
+        // and a schema that is not a schema is caught where it is declared
+        let err = build_err(Job::builder("report").op(op("fetch").params_schema(json!("days"))));
+        assert!(
+            err.contains("op fetch declares a params schema that is not"),
+            "{err}"
+        );
+        let err = build_err(
+            Job::builder("report").op(op("fetch").params_schema(json!({"properties": []}))),
+        );
+        assert!(err.contains("whose properties is not an object"), "{err}");
+        let err = build_err(
+            Job::builder("report").op(op("fetch").params_schema(json!({"required": "days"}))),
+        );
+        assert!(err.contains("whose required is not an array"), "{err}");
+        let err = build_err(
+            Job::builder("report").op(op("fetch").params_schema(json!({"required": [7]}))),
+        );
+        assert!(err.contains("not a field name"), "{err}");
     }
 
     // a job with no instances must come out exactly as it went in

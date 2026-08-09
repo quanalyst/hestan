@@ -78,6 +78,12 @@ editor under that name, and **delete** appears once the name matches a preset
 that exists. a preset the server refuses (it would not launch) reports inline
 and is not stored.
 
+when the job declares a [params schema](launching.md#params-schemas) the block
+also lists its fields under the editor — name, type, `required`, and the
+description the schema carries — and calls out keys the editor holds that the
+schema does not know. that is a legend, not a form builder: the json is still
+what launches, and the schema never refuses anything.
+
 the graph section draws the dag, columns laid out by longest dependency path.
 clicking a node opens the op inspector: deps and dependents, the retry
 budget, any per-attempt `timeout`, the [concurrency pool](concepts.md#concurrency-pools)
