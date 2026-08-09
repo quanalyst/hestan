@@ -7,7 +7,7 @@ and no sidecar process.
 
 ```toml
 [dependencies]
-hestan = "0.1.0-alpha.1"
+hestan = "0.1.0-alpha.2"
 tokio = { version = "1", features = ["full"] }
 ```
 
@@ -16,7 +16,7 @@ the changelog before bumping. to track the repo instead — a tag:
 
 ```toml
 [dependencies]
-hestan = { git = "https://github.com/quanalyst/hestan", tag = "v0.1.0-alpha.1" }
+hestan = { git = "https://github.com/quanalyst/hestan", tag = "v0.1.0-alpha.2" }
 ```
 
 or a sibling checkout, for hacking on both at once:

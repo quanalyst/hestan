@@ -5,7 +5,7 @@ scheduled REST poll you'd otherwise hand-write, as one block. it lives behind
 the `http` cargo feature:
 
 ```toml
-hestan = { version = "0.1.0-alpha.1", features = ["http"] }
+hestan = { version = "0.1.0-alpha.2", features = ["http"] }
 ```
 
 the one-block form registers a job named after the source, plus a schedule

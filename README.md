@@ -9,10 +9,10 @@ to it, so there is nothing to deploy alongside it.
 
 ## Alpha
 
-this is `0.1.0-alpha.1`, the first public release. under 0.x the api changes
-without a deprecation cycle, so read the changelog before bumping. it has not
-been run in production, and the gaps that are known are listed under
-[not here yet](#not-here-yet).
+this is `0.1.0-alpha.2`. under 0.x the api changes without a deprecation cycle,
+so read the changelog before bumping — `Store` is public and a postgres backend
+will reshape it. it has not been run in production, and the gaps that are known
+are listed under [not here yet](#not-here-yet).
 
 the ui and json api have no authentication. bind them to loopback — see
 [SECURITY.md](SECURITY.md).
@@ -21,7 +21,7 @@ the ui and json api have no authentication. bind them to loopback — see
 
 ```toml
 [dependencies]
-hestan = "0.1.0-alpha.1"
+hestan = "0.1.0-alpha.2"
 tokio = { version = "1", features = ["full"] }
 ```
 
@@ -73,7 +73,7 @@ Hestan::new()
 ```
 
 ```toml
-hestan = { version = "0.1.0-alpha.1", features = ["http"] }
+hestan = { version = "0.1.0-alpha.2", features = ["http"] }
 ```
 
 transport errors, 429s, and 5xx responses are retried with capped exponential
@@ -312,7 +312,7 @@ release notes are in [CHANGELOG.md](CHANGELOG.md).
 
 ```toml
 [dependencies]
-hestan = "0.1.0-alpha.1"
+hestan = "0.1.0-alpha.2"
 ```
 
 the binary is yours: define jobs, then `Hestan::new()...serve(addr)`, or
