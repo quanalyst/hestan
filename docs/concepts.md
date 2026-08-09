@@ -114,7 +114,8 @@ any other failure. without one, a hung op runs forever: it holds its
 [`Overlap::Skip`](scheduling.md) never fires again. the clock starts when the
 op starts running, so time spent waiting for a pool permit is not counted
 against it. expiry also trips `ctx.is_cancelled()` — see
-[cancellation](#cancellation) for what that does and does not stop.
+[cancellation](#cancellation) for what that does and does not stop, and
+[isolation](isolation.md) for the op that it stops for real.
 
 a run is `failed` if any op finished `failed`, otherwise `success` — unless
 it was canceled, which wins over both. a failed run carries an `error` of its
@@ -268,6 +269,12 @@ canceled op mid-backoff doesn't linger.
 
 what actually stops, and what hestan claims about it, depends on the op:
 
+- an **[isolated op](isolation.md)** is stopped, full stop. its body runs in a
+  child process, so cancelling sends that process SIGTERM, waits three
+  seconds, and then SIGKILLs it. nothing in the op gets a say. this is the
+  only kind of op hestan can make that promise about, and it is the reason
+  `.isolated()` exists — everything below is what cancellation means when the
+  work shares this process.
 - an **async op** is dropped at its next await point. that is real
   cancellation, and it is what "canceled" means on its op run row. it can
   also `select!` on `ctx.cancelled()` to unwind on purpose.
@@ -296,8 +303,10 @@ what actually stops, and what hestan claims about it, depends on the op:
   records say the run did. hestan cannot stop it and does not pretend to.
 
 so cancellation is honest about what it observed rather than about what it
-asked for. after aborting, the run waits up to a three-second grace period
-for its ops to actually come back:
+asked for. the run aborts every in-process op — isolated ops are left alone,
+because each is busy killing its own child and a dropped task could not — and
+then waits a three-second grace period for its ops to come back, doubled while
+an isolated op is spending a grace of its own inside it:
 
 - an op that comes back in time is recorded as whatever really happened. one
   that finished in the instant between the cancel request and the abort keeps
@@ -316,6 +325,32 @@ this: the op's own task is awaiting the join handle, so it aborts and comes
 back promptly while the closure keeps going. that is exactly why polling
 `is_cancelled()` is the contract rather than a suggestion — hestan can hand
 the closure the signal, but it cannot see whether the closure heeded it.
+
+### the isolated contrast
+
+the same op, `.isolated()`, is a different story end to end, because there is
+a process to point a signal at:
+
+|                          | in-process                            | [isolated](isolation.md)          |
+| ------------------------ | ------------------------------------- | --------------------------------- |
+| cancel reaches the op as | a dropped future, or a polled flag    | SIGTERM, then SIGKILL             |
+| an op that ignores it    | runs to completion, uncontained       | is killed after three seconds     |
+| `Op::timeout` expiring   | the same request, with the same holes | the same kill                     |
+| the row's `finished_at`  | absent when nothing was observed      | set, because the process is gone  |
+
+the op run row is where the difference shows. an in-process op that never
+came back is recorded canceled with **no finish time**, and an error saying
+hestan asked and did not see it stop. an isolated op is recorded canceled
+**with** one, and an error saying which of the two signals ended it —
+`canceled: it stopped when asked` or `canceled: it ignored SIGTERM for 3s and
+was killed`. the second row is a fact; the first is a request. that is worth
+knowing before you write a blocking op that matters.
+
+the timeout story is the same story: `Op::timeout` on an in-process op trips
+`ctx.is_cancelled()` and hopes, while on an isolated op it kills the process
+and reports `timed out after 30s: it ignored SIGTERM for 3s and was killed`.
+the attempt then retries like any other failure — a timeout is a failed
+attempt, not a canceled run.
 
 `cancel` reports what it did: `Requested` (signal sent), `AlreadyFinished`
 (terminal already, or a run left over from before a restart), `Unknown` (no

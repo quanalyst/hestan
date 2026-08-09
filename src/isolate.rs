@@ -78,6 +78,12 @@ pub(crate) async fn attempt(
     store: &Store,
     cancel: &watch::Receiver<bool>,
 ) -> Ended {
+    // this op may have spent the last minute waiting for a pool permit, and the
+    // run may have been canceled in it. starting a process now would be work
+    // nobody is waiting for
+    if *cancel.borrow() {
+        return Ended::Killed("canceled before its process started".to_string());
+    }
     // written before the child exists, because the child reads its inputs
     // rather than being told them
     if let Err(e) = store.set_op_inputs(run_id, name, invocation) {

@@ -118,7 +118,37 @@ fn jobs() -> Vec<Job> {
             .op(Op::new("quick", |_| async { Ok(json!("done")) }).isolated())
             .build()
             .unwrap(),
+        // work that cannot be asked to stop: it never awaits, never polls the
+        // cancellation flag, and holds its thread until it is killed
+        Job::builder("stubborn")
+            .op(Op::new("grind", |_| async { deaf_to_signals().await }).isolated())
+            .build()
+            .unwrap(),
+        // the same work under a timeout, beside an ordinary op that must be
+        // left to finish
+        Job::builder("impatient")
+            .op(Op::new("grind", |_| async { deaf_to_signals().await })
+                .isolated()
+                .timeout(Duration::from_millis(300)))
+            .op(Op::new("beside_it", |_| async {
+                tokio::time::sleep(Duration::from_millis(900)).await;
+                Ok(json!("finished anyway"))
+            }))
+            .build()
+            .unwrap(),
     ]
+}
+
+/// blocking work that ignores every request to stop: no await point to drop it
+/// at, and nothing polling `ctx.is_cancelled()`. in-process this runs to the
+/// end whatever the run log says; isolated, it is killed.
+async fn deaf_to_signals() -> hestan::OpResult {
+    tokio::task::spawn_blocking(|| {
+        std::thread::sleep(Duration::from_secs(120));
+        Ok(json!("nobody should ever see this"))
+    })
+    .await
+    .unwrap()
 }
 
 /// the file the flaky op's first attempt leaves behind. beside the database,
@@ -176,6 +206,16 @@ async fn cases(db: &str) {
     case(
         "a_worker_child_leaves_its_parents_run_alone",
         the_parents_run_is_untouched(&runner),
+    )
+    .await;
+    case(
+        "cancelling_a_run_kills_an_isolated_op_that_will_not_stop",
+        a_cancel_kills(&runner),
+    )
+    .await;
+    case(
+        "a_timeout_kills_an_isolated_op_and_leaves_its_siblings_alone",
+        a_timeout_kills(&runner),
     )
     .await;
 }
@@ -303,7 +343,71 @@ async fn the_parents_run_is_untouched(runner: &Runner) {
     );
 }
 
+async fn a_cancel_kills(runner: &Runner) {
+    let id = runner
+        .launch("stubborn", json!({}), Trigger::Manual)
+        .unwrap();
+    let pid = wait_for_pid(runner, &id, "grind").await;
+    assert!(alive(pid), "the child was not running to begin with");
+
+    assert_eq!(
+        runner.cancel(&id).unwrap(),
+        hestan::CancelOutcome::Requested
+    );
+    let run = wait_terminal(runner, &id).await;
+    assert_eq!(run.status, RunStatus::Canceled);
+
+    // the point of the whole feature: work that ignores every request to stop
+    // is gone anyway, and hestan knows it is
+    assert!(
+        !alive(pid),
+        "process {pid} survived the cancellation of run {id}"
+    );
+    let row = runner.store().op_run(&id, "grind").unwrap().unwrap();
+    assert_eq!(row.status, hestan::OpStatus::Canceled);
+    assert!(
+        row.finished_at.is_some(),
+        "a killed op has a finish time, because this one was watched to stop"
+    );
+    let err = row.error.clone().unwrap();
+    assert!(
+        err.contains("canceled: it ignored SIGTERM") && err.contains("was killed"),
+        "the row does not say how it stopped: {err}"
+    );
+    assert_eq!(row.pid, None);
+}
+
+async fn a_timeout_kills(runner: &Runner) {
+    let id = runner
+        .launch("impatient", json!({}), Trigger::Manual)
+        .unwrap();
+    let pid = wait_for_pid(runner, &id, "grind").await;
+    let run = wait_terminal(runner, &id).await;
+    assert_eq!(run.status, RunStatus::Failed);
+
+    assert!(!alive(pid), "process {pid} outlived its op's timeout");
+    let rows = runner.store().op_runs(&id).unwrap();
+    let err = row(&rows, "grind").error.clone().unwrap();
+    assert!(
+        err.contains("timed out after 300ms") && err.contains("was killed"),
+        "the timeout did not say what it did: {err}"
+    );
+    // one op's process dying is one op's problem: the run failed, and the op
+    // running beside it still finished
+    assert_eq!(
+        row(&rows, "beside_it").output,
+        Some(json!("finished anyway"))
+    );
+}
+
 // ---------------------------------------------------------------- the harness
+
+/// whether a process still exists. a reaped child is gone; an unreaped one is
+/// a zombie and still answers, which is why the parent reaps what it kills.
+fn alive(pid: libc::pid_t) -> bool {
+    // SAFETY: signal 0 sends nothing and only asks whether the pid is there
+    unsafe { libc::kill(pid, 0) == 0 }
+}
 
 async fn case(name: &str, body: impl Future<Output = ()>) {
     let started = Instant::now();

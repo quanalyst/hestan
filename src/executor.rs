@@ -1025,6 +1025,11 @@ async fn execute(
     let mut tasks: JoinSet<OpOutcome> = JoinSet::new();
     // JoinError only carries the task id, so remember which op each task is
     let mut names: HashMap<Id, String> = HashMap::new();
+    // one handle per in-flight in-process op, and deliberately not one per
+    // isolated op: a cancel aborts the first kind, because being dropped is the
+    // only way they stop, and leaves the second kind alone, because an isolated
+    // op stops by killing its own child and needs to be alive to do it
+    let mut abortable: HashMap<Id, tokio::task::AbortHandle> = HashMap::new();
     // fan-out state: what each instance is for, and where its output belongs
     let mut instances: HashMap<String, Instance> = HashMap::new();
     let mut fanouts: HashMap<String, Fanout> = HashMap::new();
@@ -1263,7 +1268,8 @@ async fn execute(
                     dep_statuses.entry(seen).or_insert(*s);
                 }
             }
-            let invocation = op.is_isolated().then(|| invocation(held, dep_json));
+            let op_isolated = op.is_isolated();
+            let invocation = op_isolated.then(|| invocation(held, dep_json));
             // an input hestan cannot fetch is this op's failure, recorded the
             // same way a failing body would be, rather than an op that runs
             // believing its dep produced nothing
@@ -1311,6 +1317,9 @@ async fn execute(
                 runner.pools.clone(),
                 cancel.clone(),
             ));
+            if !op_isolated {
+                abortable.insert(handle.id(), handle.clone());
+            }
             names.insert(handle.id(), name);
         }
 
@@ -1328,6 +1337,7 @@ async fn execute(
         match joined {
             Ok((id, (name, outcome))) => {
                 names.remove(&id);
+                abortable.remove(&id);
                 // an isolated op's child already did all of this for itself,
                 // which is why `Recorded` only has a handle to hand over
                 let persisted = match outcome {
@@ -1433,6 +1443,7 @@ async fn execute(
             }
             Err(join_err) => {
                 let name = names.remove(&join_err.id()).expect("spawned with id");
+                abortable.remove(&join_err.id());
                 let msg = format!("op panicked: {join_err}");
                 // run_op never got to report, so emit the terminal event here
                 note(store.append_event(
@@ -1465,11 +1476,24 @@ async fn execute(
 
     if canceled {
         // abort lands at an op's next await point; an op that never awaits, and
-        // blocking work an op spawned, never land at all
-        tasks.abort_all();
+        // blocking work an op spawned, never land at all.
+        //
+        // isolated ops are not aborted: each is watching this same signal and
+        // stopping its own child — SIGTERM, a grace, then a kill — and a task
+        // dropped mid-sequence would kill the process outright instead. so they
+        // are given room to do it, and the wait below is doubled to cover the
+        // grace they are spending inside it.
+        let waiting_on_a_child = !names.is_empty() && names.len() > abortable.len();
+        for handle in abortable.values() {
+            handle.abort();
+        }
         // a bounded grace period, so an op that really does stop is recorded as
         // whatever it really did rather than guessed at
-        let deadline = tokio::time::Instant::now() + CANCEL_GRACE;
+        let grace = match waiting_on_a_child {
+            true => CANCEL_GRACE * 2,
+            false => CANCEL_GRACE,
+        };
+        let deadline = tokio::time::Instant::now() + grace;
         loop {
             let joined = match tokio::time::timeout_at(deadline, tasks.join_next_with_id()).await {
                 Ok(Some(joined)) => joined,
@@ -1566,7 +1590,7 @@ async fn execute(
         let mut unstopped: Vec<String> = names.drain().map(|(_, name)| name).collect();
         unstopped.sort();
         for name in unstopped {
-            op_unstopped(&store, &run_id, &name);
+            op_unstopped(&store, &run_id, &name, grace);
         }
         for name in pending.drain(..) {
             op_canceled(&store, &run_id, &name);
@@ -1815,9 +1839,9 @@ fn op_killed(store: &Store, run_id: &str, name: &str, msg: &str) {
 
 // canceled, but only the request is a fact: the op never joined, so it gets no
 // finish time and an error that says exactly that
-fn op_unstopped(store: &Store, run_id: &str, name: &str) {
+fn op_unstopped(store: &Store, run_id: &str, name: &str, grace: Duration) {
     let msg = format!(
-        "cancellation requested; this op was not observed to stop within {CANCEL_GRACE:?} \
+        "cancellation requested; this op was not observed to stop within {grace:?} \
          and may still be running (blocking work stops only if it polls ctx.is_cancelled())"
     );
     note(store.append_event(
@@ -2023,7 +2047,22 @@ async fn run_op(
         if !retrying {
             return (name, Outcome::Failed(msg));
         }
-        tokio::time::sleep(op.delay(attempt)).await;
+        // an in-process op's retry sleep dies with the abort a cancel sends.
+        // an isolated op is not aborted — it is trusted to stop its own child —
+        // so it watches for the cancel itself rather than making a canceled run
+        // wait out a backoff nobody wants the end of
+        let waited = tokio::time::sleep(op.delay(attempt));
+        if op.is_isolated() {
+            tokio::pin!(waited);
+            tokio::select! {
+                () = &mut waited => {}
+                () = op::flipped(cancel.clone()) => {
+                    return (name, Outcome::Killed("canceled while waiting to retry".to_string()));
+                }
+            }
+        } else {
+            waited.await;
+        }
         attempt += 1;
         // a fresh attempt of an isolated op is a fresh child process
         note(store.op_started(&run_id, &name, attempt));
