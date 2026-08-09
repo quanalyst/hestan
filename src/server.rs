@@ -36,6 +36,14 @@ static UI_DIST: Dir<'static> = include_dir!("$CARGO_MANIFEST_DIR/ui/dist");
 /// how much of the queue `GET /api/queue` shows.
 const QUEUE_PAGE: u32 = 200;
 
+/// how many captured lines `GET /api/runs/{id}/logs` returns by default, and
+/// the most it will return however large a `limit` asks for.
+const LOG_PAGE: u32 = 500;
+const LOG_PAGE_MAX: u32 = 2_000;
+
+/// how many lines the plain-text download stops at.
+const LOG_DOWNLOAD: u32 = 100_000;
+
 pub(crate) struct SensorInfo {
     pub name: String,
     pub every: std::time::Duration,
@@ -77,6 +85,8 @@ pub(crate) fn router(state: AppState) -> Router {
         .route("/api/runs", get(list_runs))
         .route("/api/runs/{id}", get(get_run))
         .route("/api/runs/{id}/events", get(run_events))
+        .route("/api/runs/{id}/logs", get(run_logs))
+        .route("/api/runs/{id}/logs/download", get(download_logs))
         .route("/api/runs/{id}/retry", post(retry_run))
         .route("/api/runs/{id}/resume", post(resume_run))
         .route("/api/runs/{id}/resume_preview", get(resume_preview))
@@ -1594,6 +1604,80 @@ async fn run_events(
         .ok_or_else(|| err(StatusCode::NOT_FOUND, format!("unknown run: {id}")))?;
     let events = store.events(&id, q.after.unwrap_or(0)).map_err(internal)?;
     Ok(Json(json!({ "events": events })))
+}
+
+#[derive(Deserialize)]
+struct LogsQuery {
+    op: Option<String>,
+    after: Option<i64>,
+    limit: Option<u32>,
+}
+
+/// one page of what a run's ops printed, cursored on `id` exactly as
+/// [`run_events`] is on `seq`.
+async fn run_logs(
+    State(st): State<AppState>,
+    Path(id): Path<String>,
+    q: Result<Query<LogsQuery>, QueryRejection>,
+) -> Result<Json<Value>, ApiError> {
+    let Query(q) = q.map_err(bad_query)?;
+    let store = st.runner.store();
+    store
+        .run(&id)
+        .map_err(internal)?
+        .ok_or_else(|| err(StatusCode::NOT_FOUND, format!("unknown run: {id}")))?;
+    let limit = q.limit.unwrap_or(LOG_PAGE).clamp(1, LOG_PAGE_MAX);
+    let logs = store
+        .op_logs(&id, q.op.as_deref(), q.after.unwrap_or(0), limit)
+        .map_err(internal)?;
+    Ok(Json(json!({ "logs": logs })))
+}
+
+/// the whole of a run's captured output as text, because at some point
+/// everyone wants to grep it.
+///
+/// bounded by [`LOG_DOWNLOAD`] rows and says so on the last line if it hit
+/// that: the store's own [cap](crate::Hestan::log_limit) is per attempt, so a
+/// run of five hundred chatty ops is still a file worth not building in
+/// memory by accident.
+async fn download_logs(
+    State(st): State<AppState>,
+    Path(id): Path<String>,
+    q: Result<Query<LogsQuery>, QueryRejection>,
+) -> Result<Response, ApiError> {
+    let Query(q) = q.map_err(bad_query)?;
+    let store = st.runner.store();
+    store
+        .run(&id)
+        .map_err(internal)?
+        .ok_or_else(|| err(StatusCode::NOT_FOUND, format!("unknown run: {id}")))?;
+    let logs = store
+        .op_logs(&id, q.op.as_deref(), 0, LOG_DOWNLOAD + 1)
+        .map_err(internal)?;
+    let mut body = String::new();
+    for line in logs.iter().take(LOG_DOWNLOAD as usize) {
+        // one line per line, fixed leading columns: what a grep wants is the
+        // timestamp, the op and the attempt in front of the text every time
+        let source = match (line.stream, line.level) {
+            (Some(stream), _) => stream.to_string(),
+            (None, Some(level)) => level.to_string(),
+            (None, None) => "-".to_string(),
+        };
+        body.push_str(&format!(
+            "{} {} #{} {} {}\n",
+            line.at.to_rfc3339(),
+            line.op,
+            line.attempt,
+            source,
+            line.message
+        ));
+    }
+    if logs.len() > LOG_DOWNLOAD as usize {
+        body.push_str(&format!(
+            "-- truncated: this download stops at {LOG_DOWNLOAD} lines\n"
+        ));
+    }
+    Ok(([(header::CONTENT_TYPE, "text/plain; charset=utf-8")], body).into_response())
 }
 
 // unmatched paths fall back to index.html for client-side routing; /api and non-GET must not
@@ -3721,6 +3805,13 @@ mod tests {
         method: Method,
         path: &str,
     ) -> (StatusCode, Option<Value>, String) {
+        let (status, body, content_type) = request_text(app, method, path).await;
+        (status, serde_json::from_str(&body).ok(), content_type)
+    }
+
+    /// the body as it came, for the endpoints that answer in something other
+    /// than json.
+    async fn request_text(app: Router, method: Method, path: &str) -> (StatusCode, String, String) {
         use tower::util::ServiceExt;
         let req = axum::http::Request::builder()
             .method(method)
@@ -3738,7 +3829,11 @@ mod tests {
         let body = axum::body::to_bytes(resp.into_body(), 1 << 20)
             .await
             .unwrap();
-        (status, serde_json::from_slice(&body).ok(), content_type)
+        (
+            status,
+            String::from_utf8_lossy(&body).into_owned(),
+            content_type,
+        )
     }
 
     // source -> derived -> derived(auto): enough graph for every endpoint shape
@@ -4407,11 +4502,120 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn captured_output_pages_by_op_and_by_cursor() {
+        let st = state(vec![echo_job("etl")]);
+        insert_run(&st, "r1", "etl", RunStatus::Running, json!({}));
+        let store = st.runner.store();
+        let mut budget = crate::logs::Budget::new();
+        for op in ["load", "clean"] {
+            for i in 0..3 {
+                budget.line(
+                    store,
+                    &crate::logs::Attempt::new("r1", op, 1),
+                    crate::logs::Source::Stream(crate::model::LogStream::Stderr),
+                    &format!("{op} {i}"),
+                );
+            }
+        }
+
+        let (status, body, _) = request(router(st.clone()), Method::GET, "/api/runs/r1/logs").await;
+        assert_eq!(status, StatusCode::OK);
+        let logs = body.unwrap();
+        let logs = logs["logs"].as_array().unwrap();
+        assert_eq!(logs.len(), 6);
+        assert_eq!(logs[0]["message"], "load 0");
+        assert_eq!(logs[0]["stream"], "stderr");
+        assert_eq!(logs[0]["attempt"], 1);
+        assert!(logs[0]["level"].is_null());
+
+        let (_, body, _) = request(
+            router(st.clone()),
+            Method::GET,
+            "/api/runs/r1/logs?op=clean&limit=2",
+        )
+        .await;
+        let body = body.unwrap();
+        let page = body["logs"].as_array().unwrap();
+        assert_eq!(page.len(), 2);
+        assert_eq!(page[0]["message"], "clean 0");
+        let after = page[1]["id"].as_i64().unwrap();
+
+        let (_, body, _) = request(
+            router(st.clone()),
+            Method::GET,
+            &format!("/api/runs/r1/logs?op=clean&after={after}"),
+        )
+        .await;
+        let body = body.unwrap();
+        let rest = body["logs"].as_array().unwrap();
+        assert_eq!(rest.len(), 1);
+        assert_eq!(rest[0]["message"], "clean 2");
+
+        // a limit past the clamp is the clamp, not an error
+        let (status, _, _) = request(
+            router(st.clone()),
+            Method::GET,
+            "/api/runs/r1/logs?limit=999999",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, body, _) = request(router(st), Method::GET, "/api/runs/nope/logs").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body.unwrap()["error"], "unknown run: nope");
+    }
+
+    #[tokio::test]
+    async fn the_log_download_is_plain_text_a_line_at_a_time() {
+        let st = state(vec![echo_job("etl")]);
+        insert_run(&st, "r1", "etl", RunStatus::Success, json!({}));
+        let store = st.runner.store();
+        let mut budget = crate::logs::Budget::new();
+        budget.line(
+            store,
+            &crate::logs::Attempt::new("r1", "load", 1),
+            crate::logs::Source::Stream(crate::model::LogStream::Stdout),
+            "connecting",
+        );
+        budget.line(
+            store,
+            &crate::logs::Attempt::new("r1", "load", 2),
+            crate::logs::Source::Event {
+                level: crate::model::EventLevel::Warn,
+                target: "orders::load",
+            },
+            "retrying",
+        );
+
+        let (status, body, content_type) = request_text(
+            router(st.clone()),
+            Method::GET,
+            "/api/runs/r1/logs/download",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(content_type.starts_with("text/plain"), "{content_type}");
+        let lines: Vec<&str> = body.lines().collect();
+        assert_eq!(lines.len(), 2);
+        assert!(
+            lines[0].contains("load #1 stdout connecting"),
+            "{}",
+            lines[0]
+        );
+        // a tracing event has no stream, so the column carries its level
+        assert!(lines[1].contains("load #2 warn retrying"), "{}", lines[1]);
+
+        let (status, _, _) =
+            request_text(router(st), Method::GET, "/api/runs/nope/logs/download").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
     async fn bad_query_params_are_json_400() {
         let st = state(vec![echo_job("etl")]);
         for path in [
             "/api/runs?limit=abc",
             "/api/runs/r1/events?after=abc",
+            "/api/runs/r1/logs?after=abc",
             "/api/jobs/etl/op_stats?runs=abc",
             "/api/schedules/ticks?limit=abc",
             "/api/schedules/upcoming?window=abc",

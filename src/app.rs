@@ -13,6 +13,7 @@ use crate::executor::{FailureHook, Limits, RunFailure, Runner};
 use crate::freshness::{self, LateEvent, LateHook};
 use crate::io::{Io, IoManager};
 use crate::job::Job;
+use crate::logs;
 use crate::model::{Reclaim, Role, Run, RunTags, Trigger};
 use crate::resource::{self, Resource, ResourceCtx, ResourceFn};
 use crate::schedule::{self, Schedule, ScheduleEntry};
@@ -50,6 +51,8 @@ pub struct Hestan {
     slots: usize,
     retention_days: Option<u32>,
     asset_history: usize,
+    log_bytes: u64,
+    log_line_cap: u64,
     #[cfg(feature = "http")]
     sources: Vec<crate::http::HttpSource>,
 }
@@ -80,6 +83,8 @@ impl Default for Hestan {
             slots: usize::MAX,
             retention_days: None,
             asset_history: DEFAULT_ASSET_HISTORY,
+            log_bytes: logs::DEFAULT_BYTES,
+            log_line_cap: logs::DEFAULT_LINES,
             #[cfg(feature = "http")]
             sources: Vec::new(),
         }
@@ -455,10 +460,34 @@ impl Hestan {
         self
     }
 
-    /// at startup, delete terminal runs older than `days` days with their op runs
-    /// and events, plus [sensor run keys](crate::RunRequest::key) claimed before
-    /// the same cutoff. active runs and op state survive; the default keeps
-    /// everything, run keys included.
+    /// how many bytes of [captured output](crate::Op::isolated) one *attempt*
+    /// of one op may store before capture stops for it; default 1 MiB.
+    ///
+    /// a cap rather than a preference: an op in a `println!` loop would
+    /// otherwise fill the disk the run log lives on, and a run log that ran
+    /// out of room is a run log that records nothing at all. past the cap one
+    /// line says what was dropped and why, and the attempt goes on running —
+    /// capture stopping is not the op failing. per attempt because a retry
+    /// starts from a full budget, the failed attempt's output being the part
+    /// usually worth reading.
+    pub fn log_limit(mut self, bytes: u64) -> Self {
+        self.log_bytes = bytes;
+        self
+    }
+
+    /// how many lines of captured output one attempt may store; default
+    /// 10,000. the other half of [`log_limit`](Self::log_limit) — a million
+    /// empty lines are under any byte cap worth setting and are still a
+    /// million rows.
+    pub fn log_lines(mut self, lines: u64) -> Self {
+        self.log_line_cap = lines;
+        self
+    }
+
+    /// at startup, delete terminal runs older than `days` days with their op runs,
+    /// events and captured output, plus [sensor run keys](crate::RunRequest::key)
+    /// claimed before the same cutoff. active runs and op state survive; the
+    /// default keeps everything, run keys included.
     pub fn retention_days(mut self, days: u32) -> Self {
         self.retention_days = Some(days);
         self
@@ -759,6 +788,7 @@ impl Hestan {
         let (jobs, _) = self.lower()?;
         let resources = resource::build(std::mem::take(&mut self.resources)).await?;
         let store = Store::open(&self.db_path)?;
+        store.set_log_caps(Some(self.log_bytes), Some(self.log_line_cap));
         let io = Io::new(self.io_default.take(), std::mem::take(&mut self.io_named));
         crate::isolate::run_one_op(&req, &jobs, &store, &io, &resources).await
     }
@@ -825,6 +855,7 @@ impl Hestan {
         let resources = resource::build(self.resources).await?;
 
         let store = Store::open(&self.db_path)?;
+        store.set_log_caps(Some(self.log_bytes), Some(self.log_line_cap));
         store.fail_interrupted()?;
         store.sync_schedules(&schedules)?;
         // seeded, not synced: the launchpad's presets share the table, so

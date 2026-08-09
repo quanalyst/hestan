@@ -9,11 +9,12 @@ use serde_json::Value;
 
 use crate::error::Error;
 use crate::executor::{Blocked, InFlight, Limits, QUEUE_SCAN, Queued};
+use crate::logs::{Attempt, Caps, Source};
 use crate::model::{
     AssetCheckRow, Backfill, BackfillStatus, CheckStatus, Event, EventKind, EventLevel,
-    FreshnessRow, HistoryEntry, Materialization, MetaPoint, OpRun, OpStatus, Preset, Reclaim, Run,
-    RunCursor, RunStatus, RunTags, ScheduleRow, SensorOutcome, SensorRow, SensorTick, Severity,
-    Tick, TickOutcome,
+    FreshnessRow, HistoryEntry, Materialization, MetaPoint, OpLog, OpRun, OpStatus, Preset,
+    Reclaim, Run, RunCursor, RunStatus, RunTags, ScheduleRow, SensorOutcome, SensorRow, SensorTick,
+    Severity, Tick, TickOutcome,
 };
 use crate::op;
 use crate::schedule::Schedule;
@@ -296,7 +297,38 @@ ALTER TABLE runs ADD COLUMN plan TEXT;
 CREATE INDEX runs_queue ON runs(status, claimed_by, priority DESC, created_at);
 "#;
 
-const SCHEMA_VERSION: u32 = 14;
+// what an op printed, as opposed to what it said with `ctx.info`. the run log
+// is hestan's channel and this table is the op's own, which is why it is a
+// table rather than more `events`: a chatty op would otherwise bury the eight
+// lines that describe what the run did.
+//
+// exactly one half of the middle three columns is filled per row and which
+// half says where the line came from. `stream` is `stdout`/`stderr` and the
+// other two null for an [isolated op](crate::Op::isolated)'s subprocess
+// capture — a pipe has no levels and no targets. `level` and `target` are set
+// and `stream` null for a tracing event captured by the `capture` feature's
+// layer — an event was never on a pipe. `attempt` is which attempt of the op
+// produced it, because the output of the attempt that failed and the output of
+// the retry that worked are different things.
+//
+// the index is the cursor: `(run_id, op, id)` serves both the whole run and
+// one op of it, in insertion order, which is the order the lines were read in.
+const SCHEMA_V15: &str = r#"
+CREATE TABLE op_logs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id TEXT NOT NULL,
+    op TEXT NOT NULL,
+    attempt INTEGER NOT NULL,
+    at TEXT NOT NULL,
+    stream TEXT,
+    level TEXT,
+    target TEXT,
+    message TEXT NOT NULL
+);
+CREATE INDEX op_logs_run ON op_logs(run_id, op, id);
+"#;
+
+const SCHEMA_VERSION: u32 = 15;
 
 // one transaction around every pending step and the version stamp (sqlite DDL
 // is transactional), so a crash mid-migration leaves the db exactly as found
@@ -352,6 +384,9 @@ fn migrate(conn: &mut Connection) -> Result<(), Error> {
     if version < 14 {
         tx.execute_batch(SCHEMA_V14)?;
     }
+    if version < 15 {
+        tx.execute_batch(SCHEMA_V15)?;
+    }
     if version != SCHEMA_VERSION {
         tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     }
@@ -394,9 +429,12 @@ const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 /// sqlite-backed run history. cheap to clone; safe to share across tasks.
 ///
 /// the second field is the path it was opened at, kept so a runner can tell
-/// whether a child process could open the same database.
+/// whether a child process could open the same database. the third is how
+/// much [captured output](crate::Hestan::log_limit) one attempt may store,
+/// shared by every clone so a limit set at build applies to writers made
+/// before and after it.
 #[derive(Clone)]
-pub struct Store(Arc<Mutex<Connection>>, Arc<str>);
+pub struct Store(Arc<Mutex<Connection>>, Arc<str>, Arc<Caps>);
 
 impl Store {
     /// open (and migrate) the database at `path`; `":memory:"` works too.
@@ -407,7 +445,11 @@ impl Store {
         }
         conn.busy_timeout(BUSY_TIMEOUT)?;
         migrate(&mut conn)?;
-        Ok(Store(Arc::new(Mutex::new(conn)), path.into()))
+        Ok(Store(
+            Arc::new(Mutex::new(conn)),
+            path.into(),
+            Arc::new(Caps::default()),
+        ))
     }
 
     /// whether this database lives only in this process's memory, and so
@@ -1078,6 +1120,73 @@ impl Store {
         Ok(())
     }
 
+    /// how much output one attempt may store: `(bytes, lines)`.
+    pub(crate) fn log_caps(&self) -> (u64, u64) {
+        self.2.read()
+    }
+
+    /// set either cap; `None` leaves that one alone. every clone of this store
+    /// reads the new value, including the ones already handed out.
+    pub(crate) fn set_log_caps(&self, bytes: Option<u64>, lines: Option<u64>) {
+        if let Some(bytes) = bytes {
+            self.2.set_bytes(bytes);
+        }
+        if let Some(lines) = lines {
+            self.2.set_lines(lines);
+        }
+    }
+
+    /// append one captured line. the cap lives in [`logs::Budget`], which is
+    /// the only thing that calls this — writing here directly would be a way
+    /// to fill a disk.
+    pub(crate) fn append_op_log(
+        &self,
+        at: &Attempt,
+        source: Source<'_>,
+        message: &str,
+    ) -> Result<(), Error> {
+        let (stream, level, target) = source.columns();
+        let conn = self.0.lock().unwrap();
+        conn.execute(
+            "INSERT INTO op_logs (run_id, op, attempt, at, stream, level, target, message)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                at.run_id,
+                at.op,
+                at.attempt,
+                Utc::now().to_rfc3339(),
+                stream,
+                level,
+                target,
+                message
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// captured output for one run, oldest first, after cursor `after`.
+    ///
+    /// `op` narrows to one op, `limit` bounds the page. cursored on `id` like
+    /// [`events`](Self::events) is on `seq`: ids only go up, so the last one a
+    /// caller saw is the whole of what it has to remember.
+    pub fn op_logs(
+        &self,
+        run_id: &str,
+        op: Option<&str>,
+        after: i64,
+        limit: u32,
+    ) -> Result<Vec<OpLog>, Error> {
+        let conn = self.0.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, run_id, op, attempt, at, stream, level, target, message
+             FROM op_logs
+             WHERE run_id = ?1 AND (?2 IS NULL OR op = ?2) AND id > ?3
+             ORDER BY id LIMIT ?4",
+        )?;
+        let rows = stmt.query_map(params![run_id, op, after, limit], op_log_from_row)?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
     /// make the schedules table mirror the code: insert new (job, expr) pairs,
     /// refresh tz and params on existing ones (pause state survives), drop the
     /// rest.
@@ -1252,8 +1361,11 @@ impl Store {
         Ok(())
     }
 
-    /// delete terminal runs created before `older_than`, with their op_runs and
-    /// events. active runs survive at any age, and op_state is never touched.
+    /// delete terminal runs created before `older_than`, with their op_runs,
+    /// events and captured output. active runs survive at any age — a
+    /// [reclaimed](Reclaim) run goes back to `queued` rather than terminal, so
+    /// what its first claimer captured is still there when the second one
+    /// finishes it — and op_state is never touched.
     pub(crate) fn prune_runs(&self, older_than: DateTime<Utc>) -> Result<usize, Error> {
         let mut conn = self.0.lock().unwrap();
         let tx = conn.transaction()?;
@@ -1267,6 +1379,10 @@ impl Store {
         )?;
         tx.execute(
             &format!("DELETE FROM events WHERE run_id IN ({DOOMED})"),
+            params![cutoff],
+        )?;
+        tx.execute(
+            &format!("DELETE FROM op_logs WHERE run_id IN ({DOOMED})"),
             params![cutoff],
         )?;
         let removed = tx.execute(
@@ -2262,6 +2378,20 @@ fn event_from_row(row: &Row) -> rusqlite::Result<Event> {
     })
 }
 
+fn op_log_from_row(row: &Row) -> rusqlite::Result<OpLog> {
+    Ok(OpLog {
+        id: row.get(0)?,
+        run_id: row.get(1)?,
+        op: row.get(2)?,
+        attempt: row.get(3)?,
+        at: ts_col(row, 4)?,
+        stream: opt_parse_col(row, 5)?,
+        level: opt_parse_col(row, 6)?,
+        target: row.get(7)?,
+        message: row.get(8)?,
+    })
+}
+
 fn materialization_from_row(row: &Row) -> rusqlite::Result<Materialization> {
     Ok(Materialization {
         id: row.get(0)?,
@@ -2345,6 +2475,13 @@ fn parse_col<T: FromStr<Err = String>>(row: &Row, idx: usize) -> rusqlite::Resul
     row.get::<_, String>(idx)?
         .parse()
         .map_err(|e: String| conv_err(idx, e))
+}
+
+fn opt_parse_col<T: FromStr<Err = String>>(row: &Row, idx: usize) -> rusqlite::Result<Option<T>> {
+    match row.get::<_, Option<String>>(idx)? {
+        Some(s) => s.parse().map(Some).map_err(|e: String| conv_err(idx, e)),
+        None => Ok(None),
+    }
 }
 
 fn ts_col(row: &Row, idx: usize) -> rusqlite::Result<DateTime<Utc>> {
@@ -2705,6 +2842,86 @@ mod tests {
     }
 
     #[test]
+    fn the_log_cursor_pages_and_narrows_to_one_op() {
+        let store = Store::open(":memory:").unwrap();
+        let mut budget = crate::logs::Budget::new();
+        for op in ["load", "clean"] {
+            for i in 0..5 {
+                budget.line(
+                    &store,
+                    &crate::logs::Attempt::new("r1", op, 1),
+                    crate::logs::Source::Stream(crate::model::LogStream::Stdout),
+                    &format!("{op} {i}"),
+                );
+            }
+        }
+
+        let first = store.op_logs("r1", None, 0, 4).unwrap();
+        assert_eq!(first.len(), 4);
+        assert_eq!(first[0].message, "load 0");
+        let next = store.op_logs("r1", None, first[3].id, 4).unwrap();
+        assert_eq!(next[0].message, "load 4");
+        // the cursor is the id, so the pages meet exactly once
+        let rest = store.op_logs("r1", None, next[3].id, 100).unwrap();
+        assert_eq!(rest.len(), 2);
+        assert_eq!(rest[1].message, "clean 4");
+
+        let one = store.op_logs("r1", Some("clean"), 0, 100).unwrap();
+        assert_eq!(one.len(), 5);
+        assert!(one.iter().all(|l| l.op == "clean"));
+        assert!(
+            store
+                .op_logs("r1", Some("nope"), 0, 100)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(store.op_logs("other", None, 0, 100).unwrap().is_empty());
+    }
+
+    #[test]
+    fn retention_takes_captured_output_with_its_run() {
+        let store = Store::open(":memory:").unwrap();
+        let old = Utc::now() - chrono::Duration::days(10);
+        let mut budget = crate::logs::Budget::new();
+        for (id, created) in [("gone", old), ("kept", Utc::now())] {
+            store
+                .create_run(&mk_run(id, "etl", created), &["a".into()])
+                .unwrap();
+            store.run_finished(id, RunStatus::Success, None).unwrap();
+            budget.line(
+                &store,
+                &crate::logs::Attempt::new(id, "a", 1),
+                crate::logs::Source::Stream(crate::model::LogStream::Stdout),
+                "printed something",
+            );
+        }
+        // and a run that is only halfway: a reclaim puts one back on the queue,
+        // and the second claimer's page must still carry the first's output
+        store
+            .create_run(&mk_run("live", "etl", old), &["a".into()])
+            .unwrap();
+        budget.line(
+            &store,
+            &crate::logs::Attempt::new("live", "a", 1),
+            crate::logs::Source::Stream(crate::model::LogStream::Stdout),
+            "half done",
+        );
+
+        assert_eq!(
+            store
+                .prune_runs(Utc::now() - chrono::Duration::days(7))
+                .unwrap(),
+            1
+        );
+        assert!(
+            store.op_logs("gone", None, 0, 100).unwrap().is_empty(),
+            "orphan op_logs outlived their run"
+        );
+        assert_eq!(store.op_logs("kept", None, 0, 100).unwrap().len(), 1);
+        assert_eq!(store.op_logs("live", None, 0, 100).unwrap().len(), 1);
+    }
+
+    #[test]
     fn active_run_check_tracks_lifecycle() {
         let store = Store::open(":memory:").unwrap();
         assert!(!store.has_active_run("etl").unwrap());
@@ -2903,14 +3120,59 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("future.db");
         let path = path.to_str().unwrap();
-        phase1_db(path, 15);
+        phase1_db(path, 16);
         let err = Store::open(path).err().unwrap();
-        assert_eq!(err.to_string(), "db schema v15 is newer than this build");
+        assert_eq!(err.to_string(), "db schema v16 is newer than this build");
         let conn = Connection::open(path).unwrap();
         let version: u32 = conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 15);
+        assert_eq!(version, 16);
+    }
+
+    #[test]
+    fn v14_db_migrates_to_v15_keeping_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v14.db");
+        let path = path.to_str().unwrap();
+        // every batch up to v14, stamped 14: runs and events, and nowhere at
+        // all for what an op printed
+        let conn = Connection::open(path).unwrap();
+        for batch in [
+            PHASE1_SCHEMA,
+            SCHEMA_V2,
+            SCHEMA_V3,
+            SCHEMA_V4,
+            SCHEMA_V5,
+            SCHEMA_V6,
+            SCHEMA_V7,
+            SCHEMA_V8,
+            SCHEMA_V9,
+            SCHEMA_V10,
+            SCHEMA_V11,
+            SCHEMA_V12,
+            SCHEMA_V13,
+            SCHEMA_V14,
+        ] {
+            conn.execute_batch(batch).unwrap();
+        }
+        conn.pragma_update(None, "user_version", 14).unwrap();
+        drop(conn);
+
+        let store = Store::open(path).unwrap();
+        assert_eq!(store.run("r1").unwrap().unwrap().status, RunStatus::Success);
+        assert!(store.op_logs("r1", None, 0, 100).unwrap().is_empty());
+        crate::logs::Budget::new().line(
+            &store,
+            &crate::logs::Attempt::new("r1", "a", 1),
+            crate::logs::Source::Stream(crate::model::LogStream::Stdout),
+            "after the migration",
+        );
+        drop(store);
+        let store = Store::open(path).unwrap();
+        let rows = store.op_logs("r1", None, 0, 100).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].message, "after the migration");
     }
 
     #[test]

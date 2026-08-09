@@ -450,6 +450,38 @@ pub struct Event {
     pub ts: DateTime<Utc>,
 }
 
+/// which pipe of an [isolated op](crate::Op::isolated)'s process a captured
+/// line came out of.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LogStream {
+    Stdout,
+    Stderr,
+}
+str_enum!(LogStream { Stdout => "stdout", Stderr => "stderr" });
+
+/// one line of what an op produced, as opposed to what it
+/// [said](crate::OpCtx::info).
+///
+/// two mechanisms write these rows and each fills one half of the middle
+/// three columns. an isolated op's [subprocess capture](crate::Op::isolated)
+/// carries a `stream` and no `level` or `target`: a pipe has no levels. the
+/// `capture` feature's tracing layer carries a `level` and a `target` and no
+/// `stream`: an event was never on a pipe. see `docs/logs.md`.
+#[derive(Debug, Clone, Serialize)]
+pub struct OpLog {
+    pub id: i64,
+    pub run_id: String,
+    pub op: String,
+    /// which attempt of that op produced it, counting from 1.
+    pub attempt: u32,
+    pub at: DateTime<Utc>,
+    pub stream: Option<LogStream>,
+    pub level: Option<EventLevel>,
+    pub target: Option<String>,
+    pub message: String,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct ScheduleRow {
     pub job: String,

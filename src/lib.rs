@@ -17,6 +17,7 @@ mod io;
 #[cfg(unix)]
 mod isolate;
 mod job;
+mod logs;
 mod model;
 #[cfg(feature = "http")]
 pub mod notify;
@@ -41,9 +42,9 @@ pub use io::{FileIo, Inline, IoKey, IoManager, IoResult};
 pub use job::{Graph, GraphBuilder, Job, JobBuilder};
 pub use model::{
     AssetCheckRow, Backfill, BackfillStatus, Catchup, CheckStatus, Event, EventKind, EventLevel,
-    Freshness, FreshnessRow, HistoryEntry, Materialization, MetaPoint, OpRun, OpStatus, Overlap,
-    Preset, Reclaim, Role, Run, RunStatus, RunTags, ScheduleRow, SensorOutcome, SensorRow,
-    SensorTick, Severity, Tick, TickOutcome, Trigger, When,
+    Freshness, FreshnessRow, HistoryEntry, LogStream, Materialization, MetaPoint, OpLog, OpRun,
+    OpStatus, Overlap, Preset, Reclaim, Role, Run, RunStatus, RunTags, ScheduleRow, SensorOutcome,
+    SensorRow, SensorTick, Severity, Tick, TickOutcome, Trigger, When,
 };
 pub use op::{InputError, META_TABLE_ROWS, Meta, MetaColumn, MetaTable, Op, OpCtx, OpResult};
 pub use partition::Partitions;
