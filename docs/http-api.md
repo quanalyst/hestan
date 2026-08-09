@@ -11,7 +11,7 @@ failures. timestamps are rfc3339 strings in utc.
 
 | method | path | purpose |
 | --- | --- | --- |
-| GET | `/api/health` | liveness; `{"ok": true}` |
+| GET | `/api/health` | liveness, this process's instance id, and what it is holding |
 | GET | `/api/resources` | registered resources: names and types |
 | GET | `/api/jobs` | all job summaries, sorted by name |
 | GET | `/api/jobs/{name}` | one job summary |
@@ -30,6 +30,8 @@ failures. timestamps are rfc3339 strings in utc.
 | GET | `/api/runs/{id}/resume_preview` | what a resume would do |
 | GET | `/api/runs/{id}/clone` | a past run's params and tags, to launch again |
 | POST | `/api/runs/{id}/cancel` | stop a queued or running run |
+| GET | `/api/queue` | what is waiting, in order, and what blocks each |
+| POST | `/api/runs/{id}/priority` | move a queued run up or down the queue |
 | GET | `/api/assets` | every asset with lineage and staleness |
 | POST | `/api/assets/{name}/build` | build one asset (and stale ancestors) |
 | GET | `/api/assets/{name}/history` | one asset's recent materializations |
@@ -124,6 +126,59 @@ false: the policy is the answer then. the type fields
 are `std::any::type_name` strings from [typed io](typed-io.md), `null` for
 untyped ops.
 
+## Health and the queue
+
+`GET /api/health` says who this process is. `instance` is the eight-hex-digit
+id it claims runs under — the value a run row's `claimed_by` carries — and
+`holding` lists the runs it is executing right now. Pointed at each process in
+a [split deployment](scaling.md#roles) in turn, that answers "which worker has
+my run" and "which one has gone quiet".
+
+```json
+{"ok": true, "instance": "3f2a91cc", "holding": ["0192...", "0192..."]}
+```
+
+`GET /api/queue` is the queue itself: runs nobody has claimed, in the order a
+dispatcher will take them.
+
+```json
+{
+  "depth": 12,
+  "queued": [
+    {
+      "run": {"id": "0192...", "job": "orders_etl", "priority": 5, "claimed_by": null, "...": "..."},
+      "position": 1,
+      "blocked_by": {"scope": "tag", "reason": "2 runs tagged env:prod are already executing, which is the limit"}
+    }
+  ],
+  "limits": {
+    "global": 8,
+    "jobs": [{"job": "orders_etl", "limit": 2}],
+    "tags": [{"key": "env", "value": "prod", "limit": 2}]
+  }
+}
+```
+
+`depth` counts every unclaimed queued run; `queued` is capped at 200, because
+a queue ten thousand deep is a fact about the deployment rather than a list
+anybody reads to the end. `blocked_by` is `null` on a run the next dispatch
+pass will start, and its `scope` is `global`, `job`, `tag` or `undefined` —
+the last meaning no process here defines that run's job.
+
+The walk is the dispatcher's own, dry: a run that would start counts against
+the limits for everything behind it, so this is what the next pass will
+actually do rather than a per-run guess that would call the whole queue
+unblocked.
+
+`POST /api/runs/{id}/priority` with `{"priority": 5}` moves a queued run.
+Higher goes first, ties by creation time. 404 for an unknown run, and **409
+once something has claimed it** — by then the priority has been spent, and
+saying so beats a 200 that changed nothing.
+
+Note that priority is a preference and not an order: the dispatcher skips a
+run a limit blocks and starts the next one that fits. See
+[scaling](scaling.md#priority).
+
 ## Resources
 
 `GET /api/resources` lists the [resources](resources.md) this process built,
@@ -140,8 +195,10 @@ holding credentials, so there is nothing here to leak.
 
 `POST /api/jobs/{name}/runs` with body `{"params": {...}}`. the body is
 optional — empty body, or a body without `params`, launches with `{}`. on
-success: `202 {"run_id": "..."}`; the run executes in the background and the
-id is immediately queryable. a body that isn't `{"params": ...}`-shaped is a
+success: `202 {"run_id": "..."}`; the run is [queued](scaling.md) and the id is
+immediately queryable. 202 has always meant accepted rather than started, and
+now it means it precisely: with no limits declared the run starts in the same
+instant, and with limits declared it starts when there is room. a body that isn't `{"params": ...}`-shaped is a
 400 (`invalid body: ...`), params rejected by an op's `.params::<P>()` are a
 400 (`invalid params for op fetch: ...`) with nothing written, and an unknown
 job is a 404.
@@ -154,6 +211,10 @@ name nothing is stored under is a 404, in both cases with nothing launched.
 `{"tags": {"kind": "smoke"}}` [tags](launching.md#run-tags) the run: a flat
 string-to-string map that lands on the run row and comes back on every run
 object. `Hestan::run_tags` defaults merge underneath it, per-launch winning.
+
+`{"priority": 5}` puts the run higher up the [queue](scaling.md#priority) than
+the process default; higher goes first, ties by creation time, negatives are
+legal. it combines with everything else here.
 
 `{"ops": ["clean", "publish"]}` runs only those ops and everything downstream
 of them, [seeding nothing](launching.md#launching-a-subset-of-ops). their own
@@ -271,7 +332,11 @@ so a value may hold one; anything that is not a `key:value` pair is a 400
   "error": null,
   "resumed_from": null,
   "scheduled_for": "2026-08-07T12:00:00Z",
-  "tags": { "kind": "backfill", "backfill": "41" }
+  "tags": { "kind": "backfill", "backfill": "41" },
+  "priority": 0,
+  "claimed_by": "3f2a91cc",
+  "claimed_at": "2026-08-07T12:00:00Z",
+  "lease_until": null
 }
 ```
 
@@ -290,6 +355,14 @@ is null on a manual launch, a retry, a resume, a build or a sensor fire.
 `tags` is the run's [tag map](launching.md#run-tags), `{}` when it carries
 none — set at launch, defaulted with `Hestan::run_tags`, and set automatically
 on sensor, backfill and single-asset build runs.
+
+the last four are the [queue's](scaling.md). `priority` is where the run sits
+while it waits, higher first. `claimed_by` is the instance id of the process
+executing it — **null on a queued run nobody has taken yet, which is what
+being on the queue is** — with `claimed_at` beside it. `lease_until` is how
+long that claim is believed for, renewed on a heartbeat while the run is going
+and null once it is over. runs written before the queue existed read back as
+priority 0 and unclaimed.
 
 `GET /api/runs/{id}/clone` returns what a run was launched with, for the
 launchpad to open prefilled ([cloning](launching.md#cloning-a-past-run)):

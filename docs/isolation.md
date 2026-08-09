@@ -40,28 +40,40 @@ isolation here is a property of the op. one risky parser is contained while
 the other forty ops in the same job stay in-process and free. that is possible
 because the child is not a runtime being loaded — it is this binary, again.
 
-## The child is your binary
+## An op subprocess is not a queue worker
+
+Both spawn processes, so it is worth saying which is which before anything
+else. What this page is about is an **op subprocess**: started by
+`Op::isolated()`, per attempt, it runs one op of one run and exits, and it
+claims nothing and owns nothing. A [queue worker](scaling.md#roles) is the
+other thing — a long-lived process you start, which claims whole runs off the
+queue and executes them, and which spawns op subprocesses itself like any
+other hestan process. Containment is the point of one; throughput is the point
+of the other.
+
+## The subprocess is your binary
 
 the parent spawns `std::env::current_exe()` with two environment variables
 set:
 
 ```
-HESTAN_WORKER_RUN=019...    the run
-HESTAN_WORKER_OP=parse      the one op of it to run
+HESTAN_ISOLATED_RUN=019...    the run
+HESTAN_ISOLATED_OP=parse      the one op of it to run
 ```
 
-`serve`, `run_once` and `build_asset` check for those **before anything else
-they do**, and take the worker path instead of the server path. so the child
-rebuilds the same jobs, resources and io managers as its parent for one
-reason: it runs the same `main`. nothing describes the registry to it.
+`serve`, `work`, `run_once` and `build_asset` check for those **before
+anything else they do**, and take the op-subprocess path rather than starting
+up. so the child rebuilds the same jobs, resources and io managers as its
+parent for one reason: it runs the same `main`. nothing describes the registry
+to it.
 
 that is a real constraint, and it is worth stating plainly:
 
 - **the binary must build the same registry on re-exec.** any ordinary `main`
   does. a `main` that registers different jobs depending on argv, or reads a
-  different database out of a flag the parent did not pass on, cannot host a
-  worker — the child will not find its op, and the parent will record that the
-  op exited with a status and no result.
+  different database out of a flag the parent did not pass on, cannot host an
+  op subprocess — the child will not find its op, and the parent will record
+  that the op exited with a status and no result.
 - **the database must be reachable by path.** the child opens it by the path
   your builder names. `":memory:"` is private to one connection, so an
   isolated op against an in-memory store is a build error rather than a
@@ -235,6 +247,8 @@ library, or blocks in a way you cannot interrupt. leave the other forty alone.
 - **not for assets.** the same reasoning: an asset op is built by the asset
   lowering, and a [partitioned asset](assets.md) expands through the same
   fan-out machinery.
-- **one op per child.** a child runs one attempt of one op and exits. there is
-  no worker pool and no reuse, which is what keeps the failure model simple:
-  the process that ran the op is the process that died.
+- **one op per subprocess.** it runs one attempt of one op and exits. there is
+  no pool and no reuse, which is what keeps the failure model simple: the
+  process that ran the op is the process that died. a
+  [queue worker](scaling.md) is the long-lived process, and it is a different
+  mechanism for a different problem.

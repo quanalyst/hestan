@@ -241,6 +241,15 @@ job's overlap policy: `Job::builder(..).overlap(Overlap::...)`.
 the policy gates scheduled fires only. manual launches, the retry endpoint,
 and `run_once` are never held back.
 
+"active" means the job has a run **outstanding** — queued or running, claimed
+or not — and not "a run is executing this second". the distinction only came
+up once the [queue](scaling.md) made a queued run something that can sit there
+for a while, and outstanding is the answer overlap wants: a job held back by a
+concurrency limit would otherwise collect a fire every minute behind the run
+it is waiting on, which is the pile-up `Skip` exists to prevent. a
+[concurrency limit](scaling.md#limits-are-not-overlap-policies) is the other
+question and counts the other set.
+
 **that pair is the queue, not a record of it.** a fire is waiting exactly when
 it has a `deferred` tick with no later tick for the same occurrence, which is a
 question the database answers — so a fire held when the process died is still

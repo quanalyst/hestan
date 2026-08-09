@@ -1,7 +1,9 @@
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
+use hestan::Role;
 use hestan::prelude::*;
 use serde::{Deserialize, Serialize};
 
@@ -134,14 +136,40 @@ async fn main() -> Result<(), hestan::Error> {
         .after(["ping"]))
         .build()?;
 
-    println!("hestan demo ui: http://127.0.0.1:4000");
-    Hestan::new()
+    // the same registry whatever this process is here to do — which is the
+    // constraint a split deployment is under, so the demo is under it too. see
+    // docs/scaling.md and the compose file beside it.
+    let app = Hestan::new()
         .job(orders)
         .job(health)
         .pool("warehouse", 1)
         .schedule("orders_etl", "*/2 * * * *")
         .schedule("warehouse_healthcheck", "*/5 * * * *")
-        .db("demo.db")
-        .serve(([127, 0, 0, 1], 4000))
-        .await
+        .max_concurrent_runs(env_num("HESTAN_MAX_CONCURRENT_RUNS").unwrap_or(4))
+        .slots(env_num("HESTAN_SLOTS").unwrap_or(2))
+        .db(env("HESTAN_DB").unwrap_or_else(|| "demo.db".into()));
+
+    let addr: SocketAddr = env("HESTAN_ADDR")
+        .unwrap_or_else(|| "127.0.0.1:4000".into())
+        .parse()
+        .expect("HESTAN_ADDR is host:port");
+    match env("HESTAN_ROLE").as_deref() {
+        // a worker still serves the ui here, because /api/health is where it
+        // says which runs it is holding
+        Some("worker") => app.work(Some(addr)).await,
+        Some("scheduler") => app.role(Role::Scheduler).serve(addr).await,
+        Some(other) => panic!("HESTAN_ROLE is scheduler, worker or unset, not {other}"),
+        None => {
+            println!("hestan demo ui: http://{addr}");
+            app.serve(addr).await
+        }
+    }
+}
+
+fn env(key: &str) -> Option<String> {
+    std::env::var(key).ok().filter(|v| !v.is_empty())
+}
+
+fn env_num(key: &str) -> Option<usize> {
+    env(key).map(|v| v.parse().unwrap_or_else(|_| panic!("{key} is a number")))
 }

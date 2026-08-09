@@ -7,11 +7,18 @@ mutex, cloneable and shareable across tasks; one writer is plenty at this
 scale, and it also means hestan assumes it is the one *orchestrator* writing
 (see [embedding](embedding.md)).
 
-there is one other writer, and it is hestan's own: an [isolated
-op](isolation.md) runs in a child process that opens this same file and
-records its result through it. every connection therefore carries a
-five-second `busy_timeout`, so two processes writing at the same instant wait
-for each other instead of the second one failing outright.
+there are other writers, and they are hestan's own. an [isolated
+op](isolation.md) runs in an op subprocess that opens this same file and
+records its result through it, and a [queue worker](scaling.md) is a whole
+second orchestrator process pulling runs off the same tables. every connection
+therefore carries a five-second `busy_timeout`, so two processes writing at
+the same instant wait for each other instead of the second one failing
+outright; the claim that decides who executes a run is a compare-and-set in an
+immediate transaction, so it does not depend on timing at all.
+
+that is multi-process on one host. it is not multi-node: sqlite is not
+reachable over a network, and [scaling](scaling.md) says so plainly rather
+than shipping a config that would corrupt.
 
 ## Schema
 
@@ -31,9 +38,15 @@ CREATE TABLE runs (
     resumed_from TEXT,                  -- added in v5
     error TEXT,                         -- added in v6
     scheduled_for TEXT,                 -- added in v10
-    tags TEXT                           -- added in v12
+    tags TEXT,                          -- added in v12
+    priority INTEGER NOT NULL DEFAULT 0,-- added in v14
+    claimed_by TEXT,                    -- added in v14
+    claimed_at TEXT,                    -- added in v14
+    lease_until TEXT,                   -- added in v14
+    plan TEXT                           -- added in v14
 );
 CREATE INDEX runs_job_created ON runs(job, created_at DESC);
+CREATE INDEX runs_queue ON runs(status, claimed_by, priority DESC, created_at);
 
 CREATE TABLE op_runs (
     run_id TEXT NOT NULL,
@@ -252,8 +265,16 @@ the `presets` table and `runs.tags`, the flat `{"k": "v"}` map a run carries
 ([tags](launching.md#run-tags)) — null on every run written before it and on
 every run launched without any, which reads back as `{}`; version 13 adds
 `op_runs.pid` and `op_runs.inputs`, both for [isolated ops](isolation.md) and
-both null for every op that runs in this process. an older file at
-any version opens straight into v13, rows intact — the v8 rebuild copies
+both null for every op that runs in this process; version 14 adds the
+[queue](scaling.md) columns to `runs` — `priority`, `claimed_by`,
+`claimed_at`, `lease_until` and `plan` — plus the `runs_queue` index. every
+run written before it reads back as priority 0 and unclaimed, which is what a
+run that finished before there was a queue is. `plan` is what a launch decided
+the run would execute (`{"ops": [...], "seeds": {...}}`) and is null for a run
+of the whole job, which is most of them: it exists because a resume's reused
+outputs and an asset build's memoized seeds live in the launching process's
+memory, and whoever claims the run may not be that process. an older file at
+any version opens straight into v14, rows intact — the v8 rebuild copies
 every keyed materialization across, where it becomes that asset's first
 history entry and stays its current one, and v9 leaves every existing row
 with a null partition, which is exactly what an unpartitioned asset is. every
@@ -261,7 +282,7 @@ pending step
 and the version stamp run in one transaction
 (sqlite DDL is transactional), so a crash or failure mid-migration leaves
 the file exactly as it was found, never half-migrated. a database stamped
-with a version newer than the build refuses to open (`db schema v14 is newer
+with a version newer than the build refuses to open (`db schema v15 is newer
 than this build`) instead of quietly writing an older stamp over it.
 
 one wrinkle: databases written before the migration mechanism existed carry
@@ -272,15 +293,31 @@ the v1 tables at `user_version` 0. open detects that case (version 0 with a
 
 ## Crash recovery
 
-`serve` and `run_once` sweep the database at startup, before anything new
-launches (a [worker child](isolation.md) does not — it owns nothing, and the
-sweep would mark its own parent's in-flight runs as interrupted). any run still `queued` or `running` was left behind by a dead
-process; its `running` op runs become `failed` with error
+`serve`, `work` and `run_once` sweep the database at startup, before anything
+new launches (an [op subprocess](isolation.md) does not — it owns nothing and
+is here to run one op). the sweep is **lease-aware**, and that is the whole of
+how several processes share one file safely:
+
+- **claimed, lease still good** — somebody is executing it and it is not this
+  process. left entirely alone.
+- **claimed, lease expired** — its claimer stopped renewing. swept.
+- **`running` with no claim** — written before the queue existed, by a process
+  that is gone. swept.
+- **`queued` with no claim** — not a casualty, [the queue](scaling.md). left
+  for a dispatcher to claim.
+
+a swept run's `running` op runs become `failed` with error
 `interrupted: process exited`, its `pending` op runs become `skipped`, a
 `run_failed` event (`run interrupted: process exited`) is appended, and the
 run itself is marked `failed` with a finish time and that same message as its
 `error`. terminal runs are untouched. constructing a `Runner` directly skips the sweep — it belongs to
 process startup, not to the executor.
+
+the sweep only catches a claimer that was already gone when this process
+started. one that dies while everything is up is caught by the same test on a
+loop: every process renews the leases it holds every 15 seconds and takes back
+anything nobody has renewed for 60, failing it or requeueing it per
+[`Reclaim`](scaling.md#claims-and-leases).
 
 ## Retention
 

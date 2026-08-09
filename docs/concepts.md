@@ -552,11 +552,20 @@ let run = runner.run("etl", json!({}), Trigger::Manual).await?;  // await the re
 ```
 
 `launch` creates the run row (status `queued`, with its `run_queued` event in
-the same transaction), spawns execution, and returns the run id immediately.
-`run` does the same and then awaits completion, returning the final `Run`.
-execution is spawned onto the runtime rather than driven by the returned
-future, so dropping that future (a timeout, a `select!` losing) detaches the
-run: it finishes in the background instead of being aborted mid-write.
+the same transaction), pokes the [dispatcher](../docs/scaling.md), and returns
+the run id immediately. `run` does the same and then awaits completion,
+returning the final `Run`. execution is spawned onto the runtime rather than
+driven by the returned future, so dropping that future (a timeout, a `select!`
+losing) detaches the run: it finishes in the background instead of being
+aborted mid-write.
+
+**`queued` is a real state now, not a millisecond on the way to `running`.**
+launching is a request to run rather than a start: the dispatcher decides when
+it starts, and it starts as soon as no [limit](scaling.md#limits) says
+otherwise — which, with no limits declared, is the same instant, and is why
+nothing above reads any differently than it did. with limits declared the run
+waits on the queue, and `run` waits with it. the queue is the `runs` table, so
+a run enqueued by one process can be executed by [another](scaling.md#roles).
 
 both validate params before the run row is written. if any op declared
 `.params::<P>()` and the given params don't deserialize, the launch fails with

@@ -200,6 +200,17 @@ zero launches. runs a sensor launches carry the `sensor` trigger.
 
 ## Runs page
 
+when the [queue](scaling.md) has anything on it, a "queued" section leads the
+page: how many are waiting, and then each waiting run in the order a
+dispatcher will take them — position, run, job, priority, and **what is
+holding it back** in words (`2 runs tagged env:prod are already executing,
+which is the limit`). a run the next pass will start says "starting now"
+instead. each row has a bump button, which puts that run one above whatever is
+currently at the head — at 3am what somebody wants is *this run next*, not a
+number to type. it polls every 5s alongside the run list, and the section is
+absent entirely when nothing is queued, which is the normal state of a
+deployment with no limits declared.
+
 if anything is queued or running, a "running now" section lists it with a
 live elapsed clock (ticking every second; the ticker only runs while
 something is active). below that, filters: status, trigger (manual,

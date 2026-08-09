@@ -166,12 +166,28 @@ appears.
   and committed with the op's terminal write, so a failed attempt's numbers
   never get recorded. an asset op's metadata lands on its materialization
   too, so the history says what each build reported
+- launching is a request rather than a start: a launch writes a **queued** run
+  and a dispatcher starts it as soon as no limit says otherwise — with no
+  limits declared, the same instant. `Hestan::max_concurrent_runs(n)` caps the
+  deployment, `JobBuilder::max_concurrent_runs(n)` one job, and
+  `Hestan::tag_limit("env", "prod", 2)` whatever carries a tag, with
+  `{"priority": n}` deciding what goes first. the queue is the `runs` table, so
+  it survives a restart and something else can pull from it
+- **that something else is `Hestan::work(addr)`**: a worker process that claims
+  queued runs and executes them, and fires no schedule and evaluates no sensor.
+  `Hestan::role(Role::Scheduler)` is the other half — one process owns the
+  decisions, any number execute. claiming is a compare-and-set with a renewed
+  lease, so exactly one claimer wins a run and a claimer that dies loses it
+  rather than stranding it. `Dockerfile` and `docker-compose.yml` run one
+  scheduler and two workers against a shared volume; multi-node needs a store
+  every host can reach, and [scaling](docs/scaling.md) says so plainly
 - every run, op attempt, output, and log event lands in a sqlite file (WAL,
   one connection behind a mutex — plenty at this scale) with no extra services
   and optional retention (`retention_days(n)` prunes terminal runs older than
   n days at startup; the default keeps everything). the schema migrates
-  itself forward via `PRAGMA user_version`, and runs that a dead process left
-  behind are marked failed on the next start
+  itself forward via `PRAGMA user_version`, and runs whose claimer went away
+  are marked failed on the next start — while a run another process is holding
+  a live lease on is left exactly alone
 - events are structured: each carries a `kind` (`run_queued`, `op_retry`,
   `type_check_failed`, ...) and optional json data alongside the
   human-readable message; `ctx.info/warn/error` emit `kind=log`
@@ -230,6 +246,23 @@ appears.
 - the web ui is a prebuilt react bundle embedded in the binary; it polls the
   json api under `/api`
 
+## More than one process
+
+the demo is one process because that is right until it is not. when it is not:
+
+```
+docker compose up --build      # one scheduler, two workers, one run log
+open http://localhost:4000
+```
+
+`Dockerfile` and `docker-compose.yml` are at the repo root, and it is one
+image — a scheduler and its workers must build the same registry, so they
+differ only by `HESTAN_ROLE`. [docs/scaling.md](docs/scaling.md) has the whole
+of it, including the two limits worth knowing before you plan around them:
+this is multi-process on one host rather than multi-node, because sqlite is
+not reachable over a network, and a postgres backend is the next piece of
+work.
+
 ## Docs
 
 the details live in [docs/](docs/README.md):
@@ -245,7 +278,8 @@ the details live in [docs/](docs/README.md):
 [notifications](docs/notifications.md), [launching](docs/launching.md),
 [the web ui](docs/web-ui.md),
 [the http api](docs/http-api.md), [storage](docs/storage.md),
-[embedding](docs/embedding.md), and [development](docs/development.md).
+[scaling](docs/scaling.md), [embedding](docs/embedding.md), and
+[development](docs/development.md).
 release notes are in [CHANGELOG.md](CHANGELOG.md).
 
 ## Using it from your project
@@ -266,9 +300,8 @@ the binary is yours: define jobs, then `Hestan::new()...serve(addr)`, or
 
 ## Not here yet
 
-- [ ] max concurrent runs per job (overlap policies gate scheduled fires
-      only; concurrency pools cap ops across runs, not the runs themselves)
-- [ ] postgres store
+- [ ] postgres store — and with it multi-node. the queue, claims, leases and
+      roles are already backend-agnostic; sqlite is what keeps them to one host
 - [ ] post/body http sources
 - [ ] incremental cursors for http sources
 - [ ] paired-param fan-out
