@@ -5,6 +5,7 @@ use serde_json::{Value, json};
 
 use crate::error::Error;
 use crate::graph;
+use crate::hooks::{Hooks, OpEvent, RunEvent};
 use crate::model::Overlap;
 use crate::op::Op;
 use crate::retention::Retention;
@@ -21,6 +22,7 @@ pub struct Job {
     overlap: Overlap,
     fresh_within: Option<Duration>,
     retention: Option<Retention>,
+    hooks: Hooks,
     // every op's declared params schema merged into one, computed at build so
     // a disagreement between two ops is a build error rather than a summary
     // that quietly picks a winner
@@ -44,6 +46,7 @@ impl Job {
             overlap: Overlap::default(),
             fresh_within: None,
             retention: None,
+            hooks: Hooks::default(),
             error: None,
         }
     }
@@ -91,6 +94,12 @@ impl Job {
     /// [`Hestan::retention`](crate::Hestan::retention).
     pub fn retention(&self) -> Option<Retention> {
         self.retention
+    }
+
+    /// what this job registered for itself, on top of whatever the process
+    /// registered for every job.
+    pub(crate) fn hooks(&self) -> &Hooks {
+        &self.hooks
     }
 
     /// one object schema for the whole job's params: the
@@ -176,6 +185,7 @@ impl Job {
             overlap: Overlap::default(),
             fresh_within: None,
             retention: None,
+            hooks: Hooks::default(),
             params_schema,
             external,
         })
@@ -774,6 +784,7 @@ pub struct JobBuilder {
     overlap: Overlap,
     fresh_within: Option<Duration>,
     retention: Option<Retention>,
+    hooks: Hooks,
     error: Option<String>,
 }
 
@@ -872,6 +883,37 @@ impl JobBuilder {
         self
     }
 
+    /// call `hook` whenever a run **of this job** reaches a terminal status,
+    /// beside anything [`Hestan::on_run_finished`](crate::Hestan::on_run_finished)
+    /// registered for every job. stackable.
+    ///
+    /// scoping is the point: an alert can cover the nightly production job
+    /// without covering every backfill and every ad-hoc re-run beside it, and
+    /// a hook that had to filter by job name would have to be kept in step
+    /// with the job list by hand.
+    ///
+    /// ```no_run
+    /// # use hestan::{Job, RunEvent, RunStatus};
+    /// Job::builder("orders_etl").on_run_finished(|e: RunEvent| {
+    ///     if e.status == RunStatus::Failed {
+    ///         eprintln!("prod is down: {:?}", e.error)
+    ///     }
+    /// })
+    /// # ;
+    /// ```
+    pub fn on_run_finished(mut self, hook: impl Fn(RunEvent) + Send + Sync + 'static) -> Self {
+        self.hooks.run.push(std::sync::Arc::new(hook));
+        self
+    }
+
+    /// call `hook` whenever an attempt of one of this job's ops ends.
+    /// [`Hestan::on_op_finished`](crate::Hestan::on_op_finished) scoped to one
+    /// job, and stackable the same way.
+    pub fn on_op_finished(mut self, hook: impl Fn(OpEvent) + Send + Sync + 'static) -> Self {
+        self.hooks.op.push(std::sync::Arc::new(hook));
+        self
+    }
+
     /// flattens any [`graph`](Self::graph) instances into ordinary ops, then
     /// validates the dag; fails on duplicate ops, unknown deps, or cycles.
     pub fn build(self) -> Result<Job, Error> {
@@ -898,6 +940,7 @@ impl JobBuilder {
             overlap: self.overlap,
             fresh_within: self.fresh_within,
             retention: self.retention,
+            hooks: self.hooks,
             params_schema,
             external: Vec::new(),
         })

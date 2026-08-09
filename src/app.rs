@@ -10,8 +10,9 @@ use crate::asset::{
     Asset, AssetCheck, AssetRegistry, MultiAsset, asset_tag, mats_map, plan_target,
 };
 use crate::error::Error;
-use crate::executor::{FailureHook, Limits, RunFailure, Runner};
+use crate::executor::{Limits, Runner};
 use crate::freshness::{self, LateEvent, LateHook};
+use crate::hooks::{FailureHook, OpEvent, OpHook, RunEvent, RunFailure, RunHook};
 use crate::io::{Io, IoManager};
 use crate::job::Job;
 use crate::logs;
@@ -45,6 +46,8 @@ pub struct Hestan {
     io_named: HashMap<String, Arc<dyn IoManager>>,
     db_path: String,
     hooks: Vec<FailureHook>,
+    run_hooks: Vec<RunHook>,
+    op_hooks: Vec<OpHook>,
     late_hooks: Vec<LateHook>,
     limits: Limits,
     priority: i64,
@@ -78,6 +81,8 @@ impl Default for Hestan {
             io_named: HashMap::new(),
             db_path: "hestan.db".into(),
             hooks: Vec::new(),
+            run_hooks: Vec::new(),
+            op_hooks: Vec::new(),
             late_hooks: Vec::new(),
             limits: Limits::new(),
             priority: 0,
@@ -548,8 +553,49 @@ impl Hestan {
 
     /// call `hook` whenever a run finishes failed — never on success, on cancel,
     /// or for runs the startup sweep marks failed. callable multiple times.
+    ///
+    /// [`on_run_finished`](Self::on_run_finished) is this without the filter,
+    /// and is the one to reach for in new code: it fires for every terminal
+    /// status and says which on the event. this is the same hook with
+    /// `status == Failed` applied for you, and is not going anywhere.
     pub fn on_failure(mut self, hook: impl Fn(RunFailure) + Send + Sync + 'static) -> Self {
         self.hooks.push(Arc::new(hook));
+        self
+    }
+
+    /// call `hook` whenever a run reaches a terminal status — succeeded,
+    /// failed or canceled alike, with [`status`](RunEvent::status) saying
+    /// which. callable multiple times, and dispatched exactly like
+    /// [`on_failure`](Self::on_failure), so a hook may block.
+    ///
+    /// ```no_run
+    /// # use hestan::{Hestan, RunEvent};
+    /// Hestan::new().on_run_finished(|e: RunEvent| {
+    ///     println!("{} {} in {:?}", e.job, e.status.as_str(), e.duration)
+    /// });
+    /// ```
+    ///
+    /// a run the boot sweep marked failed does not fire: nothing executed it,
+    /// and a restart after a crash should not replay a morning of old failures
+    /// into an alert channel. [`JobBuilder::on_run_finished`] is the same hook
+    /// scoped to one job.
+    pub fn on_run_finished(mut self, hook: impl Fn(RunEvent) + Send + Sync + 'static) -> Self {
+        self.run_hooks.push(Arc::new(hook));
+        self
+    }
+
+    /// call `hook` whenever one **attempt** of one op ends, whatever the run
+    /// it belongs to goes on to do. callable multiple times.
+    ///
+    /// per attempt rather than per op, because an op that failed twice and
+    /// worked on the third try is three facts and only the hook knows which of
+    /// them it wanted — [`attempt`](OpEvent::attempt) and
+    /// [`status`](OpEvent::status) are how it says so. an op skipped by its
+    /// [trigger rule](crate::When) produces nothing: there was no attempt.
+    ///
+    /// [`JobBuilder::on_op_finished`] is the same hook scoped to one job.
+    pub fn on_op_finished(mut self, hook: impl Fn(OpEvent) + Send + Sync + 'static) -> Self {
+        self.op_hooks.push(Arc::new(hook));
         self
     }
 
@@ -917,6 +963,7 @@ impl Hestan {
         }
         let io = Io::new(self.io_default, self.io_named);
         let runner = Runner::with_resources(jobs, store, self.hooks, self.pools, resources, io)?
+            .with_hooks(self.run_hooks, self.op_hooks)
             .with_run_tags(self.run_tags)
             .with_limits(self.limits, self.priority)
             .with_reclaim(self.reclaim)

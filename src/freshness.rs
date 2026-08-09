@@ -7,7 +7,8 @@ use serde::{Serialize, Serializer};
 
 use crate::asset::{AssetMeta, AssetRegistry, Mats, mats_map};
 use crate::error::Error;
-use crate::executor::{Runner, fire_hooks};
+use crate::executor::Runner;
+use crate::hooks::fire_hooks;
 use crate::model::Freshness;
 
 /// how often the checker re-evaluates every declared policy. a policy is a
@@ -276,7 +277,7 @@ mod tests {
         };
         store.create_run(&run, &[]).unwrap();
         store
-            .run_finished(&run.id, RunStatus::Success, None)
+            .run_finished(&run.id, RunStatus::Success, None, Utc::now())
             .unwrap();
         store.backdate_run(&run.id, at).unwrap();
     }

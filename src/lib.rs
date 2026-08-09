@@ -13,6 +13,7 @@ mod error;
 mod executor;
 mod freshness;
 mod graph;
+mod hooks;
 #[cfg(feature = "http")]
 mod http;
 mod io;
@@ -39,10 +40,9 @@ pub use asset::{Asset, AssetCheck, CheckOutcome, CheckResult, MultiAsset};
 #[cfg(feature = "capture")]
 pub use capture::{CaptureLayer, capture_layer};
 pub use error::Error;
-pub use executor::{
-    Blocked, CancelOutcome, FailureHook, Limits, Queued, ResumePlan, RunFailure, Runner,
-};
+pub use executor::{Blocked, CancelOutcome, Limits, Queued, ResumePlan, Runner};
 pub use freshness::{LateEvent, LateHook, LateKind};
+pub use hooks::{FailureHook, OpEvent, OpHook, RunEvent, RunFailure, RunHook};
 #[cfg(feature = "http")]
 pub use http::HttpSource;
 pub use io::{FileIo, Inline, IoKey, IoManager, IoResult};

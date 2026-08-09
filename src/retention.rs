@@ -211,7 +211,9 @@ mod tests {
                 &["noop".to_string()],
             )
             .unwrap();
-        store.run_finished(id, RunStatus::Success, None).unwrap();
+        store
+            .run_finished(id, RunStatus::Success, None, Utc::now())
+            .unwrap();
     }
 
     fn ids(store: &Store) -> Vec<String> {

@@ -948,11 +948,13 @@ impl Store {
         Ok(true)
     }
 
-    pub(crate) fn run_started(&self, id: &str) -> Result<(), Error> {
+    /// `at` is passed in rather than read here so the row and the event the
+    /// executor hands its hooks carry the same instant.
+    pub(crate) fn run_started(&self, id: &str, at: DateTime<Utc>) -> Result<(), Error> {
         let conn = self.0.lock().unwrap();
         conn.execute(
             "UPDATE runs SET status = ?1, started_at = ?2 WHERE id = ?3",
-            params![RunStatus::Running.as_str(), Utc::now().to_rfc3339(), id],
+            params![RunStatus::Running.as_str(), at.to_rfc3339(), id],
         )?;
         Ok(())
     }
@@ -964,6 +966,7 @@ impl Store {
         id: &str,
         status: RunStatus,
         error: Option<&str>,
+        at: DateTime<Utc>,
     ) -> Result<(), Error> {
         let conn = self.0.lock().unwrap();
         // and the lease with it: there is nothing left to renew, and a run that
@@ -972,7 +975,7 @@ impl Store {
             "UPDATE runs SET status = ?1, finished_at = ?2, error = COALESCE(?3, error),
                  lease_until = NULL
              WHERE id = ?4",
-            params![status.as_str(), Utc::now().to_rfc3339(), error, id],
+            params![status.as_str(), at.to_rfc3339(), error, id],
         )?;
         Ok(())
     }
@@ -2581,7 +2584,7 @@ mod tests {
                 .all(|o| o.status == OpStatus::Pending && o.attempts == 0)
         );
 
-        store.run_started("r1").unwrap();
+        store.run_started("r1", Utc::now()).unwrap();
         store.op_started("r1", "a", 1).unwrap();
         let first_start = store.op_runs("r1").unwrap()[0].started_at.unwrap();
         store.op_started("r1", "a", 2).unwrap();
@@ -2598,7 +2601,9 @@ mod tests {
         store
             .op_finished("r1", "b", OpStatus::Failed, None, None, Some("boom"))
             .unwrap();
-        store.run_finished("r1", RunStatus::Failed, None).unwrap();
+        store
+            .run_finished("r1", RunStatus::Failed, None, Utc::now())
+            .unwrap();
 
         let got = store.run("r1").unwrap().unwrap();
         assert_eq!(got.status, RunStatus::Failed);
@@ -2830,17 +2835,17 @@ mod tests {
             store
                 .create_run(&mk_run(id, "etl", old), &["a".into()])
                 .unwrap();
-            store.run_finished(id, status, None).unwrap();
+            store.run_finished(id, status, None, Utc::now()).unwrap();
         }
         store
             .create_run(&mk_run("live", "etl", old), &["a".into()])
             .unwrap();
-        store.run_started("live").unwrap();
+        store.run_started("live", Utc::now()).unwrap();
         store
             .create_run(&mk_run("young", "etl", Utc::now()), &["a".into()])
             .unwrap();
         store
-            .run_finished("young", RunStatus::Success, None)
+            .run_finished("young", RunStatus::Success, None, Utc::now())
             .unwrap();
         store
             .set_op_state("etl", "a", &json!({"cursor": 9}))
@@ -2882,7 +2887,9 @@ mod tests {
             store
                 .create_run(&mk_run(id, "etl", at), &["a".into()])
                 .unwrap();
-            store.run_finished(id, RunStatus::Success, None).unwrap();
+            store
+                .run_finished(id, RunStatus::Success, None, Utc::now())
+                .unwrap();
         }
 
         // keep_last holds two runs past an age cutoff that would take three
@@ -2921,7 +2928,7 @@ mod tests {
             store
                 .create_run(&mk_run(id, "etl", old), &["a".into()])
                 .unwrap();
-            store.run_finished(id, status, None).unwrap();
+            store.run_finished(id, status, None, Utc::now()).unwrap();
         }
 
         assert_eq!(prune(&store, &Retention::days(7).failed_days(90)), 1);
@@ -2945,7 +2952,7 @@ mod tests {
                 .create_run(&mk_run(id, "etl", old), &["a".into()])
                 .unwrap();
         }
-        store.run_started("working").unwrap();
+        store.run_started("working", Utc::now()).unwrap();
 
         assert_eq!(prune(&store, &Retention::days(1).keep_last(0)), 0);
         assert_eq!(
@@ -3042,7 +3049,9 @@ mod tests {
             store
                 .create_run(&mk_run(id, "etl", created), &["a".into()])
                 .unwrap();
-            store.run_finished(id, RunStatus::Success, None).unwrap();
+            store
+                .run_finished(id, RunStatus::Success, None, Utc::now())
+                .unwrap();
             budget.line(
                 &store,
                 &crate::logs::Attempt::new(id, "a", 1),
@@ -3079,9 +3088,11 @@ mod tests {
             .create_run(&mk_run("r1", "etl", Utc::now()), &["a".into()])
             .unwrap();
         assert!(store.has_active_run("etl").unwrap());
-        store.run_started("r1").unwrap();
+        store.run_started("r1", Utc::now()).unwrap();
         assert!(store.has_active_run("etl").unwrap());
-        store.run_finished("r1", RunStatus::Failed, None).unwrap();
+        store
+            .run_finished("r1", RunStatus::Failed, None, Utc::now())
+            .unwrap();
         assert!(!store.has_active_run("etl").unwrap());
     }
 
@@ -3094,17 +3105,17 @@ mod tests {
                 &["a".into(), "b".into()],
             )
             .unwrap();
-        store.run_started("dead").unwrap();
+        store.run_started("dead", Utc::now()).unwrap();
         store.op_started("dead", "a", 1).unwrap();
 
         let done = mk_run("done", "etl", Utc::now());
         store.create_run(&done, &["a".into()]).unwrap();
-        store.run_started("done").unwrap();
+        store.run_started("done", Utc::now()).unwrap();
         store
             .op_finished("done", "a", OpStatus::Success, None, None, None)
             .unwrap();
         store
-            .run_finished("done", RunStatus::Success, None)
+            .run_finished("done", RunStatus::Success, None, Utc::now())
             .unwrap();
 
         store.fail_interrupted().unwrap();
@@ -3746,7 +3757,12 @@ mod tests {
             .create_run(&mk_run("r2", "etl", Utc::now()), &["a".into()])
             .unwrap();
         store
-            .run_finished("r2", RunStatus::Failed, Some("op a failed: boom"))
+            .run_finished(
+                "r2",
+                RunStatus::Failed,
+                Some("op a failed: boom"),
+                Utc::now(),
+            )
             .unwrap();
         drop(store);
         let store = Store::open(path).unwrap();
@@ -3957,10 +3973,17 @@ mod tests {
             .create_run(&mk_run("r1", "etl", Utc::now()), &["a".into()])
             .unwrap();
         store
-            .run_finished("r1", RunStatus::Failed, Some("op a failed: boom"))
+            .run_finished(
+                "r1",
+                RunStatus::Failed,
+                Some("op a failed: boom"),
+                Utc::now(),
+            )
             .unwrap();
         // None must not blank an error a caller already recorded
-        store.run_finished("r1", RunStatus::Failed, None).unwrap();
+        store
+            .run_finished("r1", RunStatus::Failed, None, Utc::now())
+            .unwrap();
         assert_eq!(
             store.run("r1").unwrap().unwrap().error.as_deref(),
             Some("op a failed: boom")

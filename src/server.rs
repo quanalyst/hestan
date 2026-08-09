@@ -3370,7 +3370,7 @@ mod tests {
         assert_eq!(status, StatusCode::CONFLICT);
         assert_eq!(body["error"], "run still active: r1");
 
-        st.runner.store().run_started("r1").unwrap();
+        st.runner.store().run_started("r1", Utc::now()).unwrap();
         let (status, Json(body)) = retry_run(State(st.clone()), Path("r1".into()))
             .await
             .unwrap_err();
@@ -3386,7 +3386,7 @@ mod tests {
 
         st.runner
             .store()
-            .run_finished("r1", RunStatus::Failed, None)
+            .run_finished("r1", RunStatus::Failed, None, Utc::now())
             .unwrap();
         let (status, Json(body)) = retry_run(State(st.clone()), Path("r1".into()))
             .await
@@ -4375,7 +4375,7 @@ mod tests {
 
         st.runner
             .store()
-            .run_finished("b1", RunStatus::Success, None)
+            .run_finished("b1", RunStatus::Success, None, Utc::now())
             .unwrap();
         let (status, _) = build_one_asset(State(st.clone()), Path("totals".into()), Bytes::new())
             .await

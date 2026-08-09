@@ -5,7 +5,6 @@ use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use futures::FutureExt;
-use serde::Serialize;
 use serde_json::{Value, json};
 use tokio::sync::{Notify, Semaphore, watch};
 use tokio::task::{Id, JoinSet};
@@ -13,6 +12,7 @@ use tracing::Instrument;
 
 use crate::error::Error;
 use crate::graph;
+use crate::hooks::{FailureHook, Hooks, OpEvent, OpHook, RunEvent, RunHook, fire_hooks};
 use crate::io::{Io, IoKey, IoManager};
 use crate::job::Job;
 use crate::model::{
@@ -257,47 +257,6 @@ pub enum CancelOutcome {
     Unknown,
 }
 
-/// what a failure hook receives when a run finishes failed.
-#[derive(Debug, Clone, Serialize)]
-pub struct RunFailure {
-    pub run_id: String,
-    pub job: String,
-    pub trigger: Trigger,
-    /// the first op that terminally failed this run.
-    pub failed_op: Option<String>,
-    /// that op's error message.
-    pub error: Option<String>,
-    pub finished_at: DateTime<Utc>,
-}
-
-/// a callback invoked on its own task when a run finishes failed.
-pub type FailureHook = Arc<dyn Fn(RunFailure) + Send + Sync>;
-
-/// hand `event` to every hook, each on its own blocking task.
-///
-/// spawn_blocking, not spawn: a hook that blocks outright — a sync http post,
-/// a database write, a sleep — would otherwise pin an async worker and hang
-/// runtime shutdown. a panicking hook is caught and logged rather than taken
-/// out on the others. `what` names the hook family in that warning.
-pub(crate) fn fire_hooks<E: Clone + Send + 'static>(
-    hooks: &[Arc<dyn Fn(E) + Send + Sync>],
-    event: E,
-    what: &'static str,
-) {
-    for hook in hooks {
-        let hook = hook.clone();
-        let event = event.clone();
-        tokio::task::spawn_blocking(move || {
-            if let Err(panic) = std::panic::catch_unwind(AssertUnwindSafe(|| hook(event))) {
-                match panic_payload(panic.as_ref()) {
-                    Some(s) => tracing::warn!("{what} hook panicked: {s}"),
-                    None => tracing::warn!("{what} hook panicked"),
-                }
-            }
-        });
-    }
-}
-
 /// what a resume would do, from [`Runner::resume_plan`]. both lists are in the
 /// job's topological order, and together they cover every op the job has
 /// except ones that neither re-run nor have an output worth reusing.
@@ -385,7 +344,9 @@ pub struct Runner {
     store: Store,
     // one watch sender per in-flight run; cancel() flips it to true
     active: Arc<Mutex<HashMap<String, watch::Sender<bool>>>>,
-    hooks: Arc<Vec<FailureHook>>,
+    // what this process registered for every job, beside whatever each job
+    // registered for itself
+    hooks: Arc<Hooks>,
     pools: Pools,
     resources: Resources,
     io: Io,
@@ -421,6 +382,11 @@ impl Runner {
     /// like [`Runner::new`] with failure hooks attached: each is invoked on
     /// its own task whenever a run finishes failed. canceled runs don't fire.
     ///
+    /// these are [run hooks](crate::RunHook) that filter on the status rather
+    /// than a mechanism of their own — see
+    /// [`with_hooks`](Runner::with_hooks), which is how the wider events get
+    /// in.
+    ///
     /// no pools are declared, so an op that names one fails at run time; use
     /// [`Runner::with_pools`] (or `Hestan::pool`) when any op does.
     pub fn with_failure_hooks(
@@ -439,7 +405,10 @@ impl Runner {
             jobs: Arc::new(map),
             store,
             active: Arc::new(Mutex::new(HashMap::new())),
-            hooks: Arc::new(hooks),
+            hooks: Arc::new(Hooks {
+                run: hooks.into_iter().map(crate::hooks::as_run_hook).collect(),
+                op: Vec::new(),
+            }),
             pools: Arc::new(HashMap::new()),
             resources: resource::none(),
             io: Io::default(),
@@ -453,6 +422,40 @@ impl Runner {
             dispatching: Arc::new(Mutex::new(())),
             settled: Arc::new(Notify::new()),
         }
+    }
+
+    /// the hooks every job's events reach, on top of any a
+    /// [job registered for itself](crate::JobBuilder::on_run_finished).
+    /// `Hestan::on_run_finished` and `Hestan::on_op_finished` are the way in.
+    ///
+    /// a hook registered here with
+    /// [`with_failure_hooks`](Runner::with_failure_hooks) keeps whatever it
+    /// had: the two go to the same place and this adds to it.
+    pub fn with_hooks(self, run: Vec<RunHook>, op: Vec<OpHook>) -> Runner {
+        let mut hooks = Hooks::clone(&self.hooks);
+        hooks.run.extend(run);
+        hooks.op.extend(op);
+        Runner {
+            hooks: Arc::new(hooks),
+            ..self
+        }
+    }
+
+    /// every run hook one run's terminal event goes to: this process's, then
+    /// its job's own.
+    fn run_hooks(&self, job: &str) -> Vec<RunHook> {
+        let mut hooks = self.hooks.run.clone();
+        if let Some(job) = self.jobs.get(job) {
+            hooks.extend(job.hooks().run.iter().cloned());
+        }
+        hooks
+    }
+
+    /// every op hook one run's attempts go to, in the same order.
+    fn op_hooks(&self, job: &Job) -> Vec<OpHook> {
+        let mut hooks = self.hooks.op.clone();
+        hooks.extend(job.hooks().op.iter().cloned());
+        hooks
     }
 
     /// tag every run this runner launches with `tags`, under whatever the
@@ -929,17 +932,23 @@ impl Runner {
             if self.reclaim == Reclaim::Fail
                 && let Ok(Some(run)) = self.store.run(run_id)
             {
+                let finished_at = run.finished_at.unwrap_or_else(Utc::now);
                 fire_hooks(
-                    &self.hooks,
-                    RunFailure {
+                    &self.run_hooks(&run.job),
+                    RunEvent {
                         run_id: run.id,
                         job: run.job,
                         trigger: run.trigger,
+                        status: RunStatus::Failed,
+                        // no op failed: the process holding the run stopped
+                        // saying it was there, which is not any op's doing
                         failed_op: None,
                         error: run.error,
-                        finished_at: run.finished_at.unwrap_or_else(Utc::now),
+                        started_at: run.started_at,
+                        finished_at,
+                        duration: run.started_at.and_then(|s| (finished_at - s).to_std().ok()),
                     },
-                    "failure",
+                    "run",
                 );
             }
         }
@@ -1533,7 +1542,8 @@ async fn execute(
     seeded: HashMap<String, Value>,
 ) {
     let store = runner.store.clone();
-    note(store.run_started(&run_id));
+    let started_at = Utc::now();
+    note(store.run_started(&run_id, started_at));
     note(store.append_event(
         &run_id,
         None,
@@ -1542,6 +1552,9 @@ async fn execute(
         "run started",
         None,
     ));
+    // resolved once per run rather than per op: the set cannot change under a
+    // run, and every attempt would otherwise rebuild it
+    let op_hooks = Arc::new(runner.op_hooks(&job));
 
     let pairs = job.dep_pairs();
     let cap = job.max_parallel().unwrap_or(usize::MAX).max(1);
@@ -1851,6 +1864,7 @@ async fn execute(
                 runner.resources.clone(),
                 store.clone(),
                 runner.pools.clone(),
+                op_hooks.clone(),
                 cancel.clone(),
             ));
             if !op_isolated {
@@ -2153,29 +2167,36 @@ async fn execute(
         .map(|(op, msg)| format!("op {op} failed: {msg}"));
     // event first: anyone who reads a terminal status must also see this line
     note(store.append_event(&run_id, None, level, kind, msg, None));
-    note(store.run_finished(&run_id, status, error.as_deref()));
+    let finished_at = Utc::now();
+    note(store.run_finished(&run_id, status, error.as_deref(), finished_at));
     runner.active.lock().unwrap().remove(&run_id);
     // this run's slot is free: wake anything waiting on it, then go and see
     // what the queue can start in its place
     runner.settled.notify_waiters();
     runner.dispatch();
 
-    // canceled runs stay quiet, and the boot sweep never comes through here
-    if status == RunStatus::Failed {
-        let (failed_op, error) = match first_failure {
-            Some((op, msg)) => (Some(op), Some(msg)),
-            None => (None, None),
-        };
-        let failure = RunFailure {
+    // every terminal status fires, and the status says which — a hook that
+    // only wants failures is what `on_failure` still is. the boot sweep does
+    // not come through here, so a restart after a crash replays nothing
+    let (failed_op, error) = match first_failure {
+        Some((op, msg)) => (Some(op), Some(msg)),
+        None => (None, None),
+    };
+    fire_hooks(
+        &runner.run_hooks(job.name()),
+        RunEvent {
             run_id,
             job: job.name().to_string(),
             trigger,
+            status,
             failed_op,
             error,
-            finished_at: Utc::now(),
-        };
-        fire_hooks(&runner.hooks, failure, "failure");
-    }
+            started_at: Some(started_at),
+            finished_at,
+            duration: (finished_at - started_at).to_std().ok(),
+        },
+        "run",
+    );
 }
 
 /// what the run records on the row of an op it is handing to a child: the
@@ -2414,6 +2435,7 @@ async fn run_op(
     resources: Resources,
     store: Store,
     pools: Pools,
+    hooks: Arc<Vec<OpHook>>,
     cancel: watch::Receiver<bool>,
 ) -> OpOutcome {
     // loaded once, before attempt 1: every retry sees the same starting state
@@ -2485,6 +2507,9 @@ async fn run_op(
             new_per_asset: Arc::new(Mutex::new(BTreeMap::new())),
             store: store.clone(),
         };
+        // this attempt's own start, which on a retry is later than the one on
+        // the op run row: that column keeps the first attempt's
+        let began = Utc::now();
         // the permit is scoped to this block, so a retry sleep never sits on
         // the resource it backed off from — and an isolated op holds it for as
         // long as its child runs, since the child is the work
@@ -2550,6 +2575,26 @@ async fn run_op(
                 }
             }
         };
+        // one event per attempt however it went, and before the retry policy
+        // has had its say: three attempts of an op that worked on the third is
+        // three facts, and a hook that wants the last one filters on `status`
+        let told = |status, error: Option<&str>| {
+            fire_hooks(
+                &hooks,
+                OpEvent {
+                    run_id: run_id.clone(),
+                    job: job.clone(),
+                    op: name.clone(),
+                    attempt,
+                    status,
+                    error: error.map(str::to_string),
+                    started_at: began,
+                    finished_at: Utc::now(),
+                    duration: (Utc::now() - began).to_std().unwrap_or_default(),
+                },
+                "op",
+            );
+        };
         let msg = match ended {
             Ended::Value(output) => {
                 let data = op.output_type().map(|t| json!({ "output_type": t }));
@@ -2561,6 +2606,7 @@ async fn run_op(
                     "finished",
                     data.as_ref(),
                 ));
+                told(OpStatus::Success, None);
                 return (
                     name,
                     Outcome::Produced {
@@ -2572,9 +2618,18 @@ async fn run_op(
             }
             // the child recorded its own success, event and all: nothing this
             // process staged applies, because nothing here ran the body
-            Ended::Handle(handle) => return (name, Outcome::Recorded(handle)),
-            Ended::Killed(msg) => return (name, Outcome::Killed(msg)),
-            Ended::Failed(msg) => msg,
+            Ended::Handle(handle) => {
+                told(OpStatus::Success, None);
+                return (name, Outcome::Recorded(handle));
+            }
+            Ended::Killed(msg) => {
+                told(OpStatus::Canceled, Some(&msg));
+                return (name, Outcome::Killed(msg));
+            }
+            Ended::Failed(msg) => {
+                told(OpStatus::Failed, Some(&msg));
+                msg
+            }
         };
         // retries are extra attempts after the first
         let retrying = attempt <= op.max_retries();
@@ -3352,7 +3407,7 @@ mod tests {
             )
             .unwrap();
         for id in ["live", "stranded"] {
-            store.run_started(id).unwrap();
+            store.run_started(id, Utc::now()).unwrap();
             store.op_started(id, "work", 1).unwrap();
         }
 
@@ -3452,7 +3507,7 @@ mod tests {
                 Some(Utc::now() - chrono::Duration::seconds(90)),
             )
             .unwrap();
-        store.run_started("stalled").unwrap();
+        store.run_started("stalled", Utc::now()).unwrap();
         store.op_started("stalled", "work", 1).unwrap();
         let runner = Runner::new([sleepy_job("etl", 30_000)], store.clone());
 
@@ -3481,7 +3536,7 @@ mod tests {
                 Some(Utc::now() - chrono::Duration::seconds(90)),
             )
             .unwrap();
-        store.run_started("stalled").unwrap();
+        store.run_started("stalled", Utc::now()).unwrap();
         let runner =
             Runner::new([sleepy_job("etl", 1)], store.clone()).with_reclaim(Reclaim::Requeue);
 

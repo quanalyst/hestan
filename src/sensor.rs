@@ -1458,7 +1458,7 @@ mod tests {
 
         // the next tick sees an unchanged fingerprint and still catches up
         store
-            .run_finished("active", RunStatus::Success, None)
+            .run_finished("active", RunStatus::Success, None, Utc::now())
             .unwrap();
         evaluate(&entry, &runner, &reg).await;
         let ticks = store.sensor_ticks(Some("probe:docs"), 10).unwrap();

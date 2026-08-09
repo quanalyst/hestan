@@ -6,7 +6,8 @@ use std::time::Duration;
 use hestan::prelude::*;
 use hestan::{
     CancelOutcome, Error, EventKind, FailureHook, FileIo, Graph, IoKey, IoManager, IoResult, Meta,
-    OpStatus, Run, RunFailure, RunStatus, Runner, Store, Trigger, When,
+    OpEvent, OpHook, OpStatus, Run, RunEvent, RunFailure, RunHook, RunStatus, Runner, Store,
+    Trigger, When,
 };
 use serde::{Deserialize, Serialize};
 
@@ -802,6 +803,241 @@ async fn no_hook_on_success_or_cancel() {
 
     tokio::time::sleep(Duration::from_millis(50)).await;
     assert!(seen.lock().unwrap().is_empty());
+}
+
+fn run_events() -> (Arc<Mutex<Vec<RunEvent>>>, RunHook) {
+    let seen: Arc<Mutex<Vec<RunEvent>>> = Arc::new(Mutex::new(Vec::new()));
+    let sink = seen.clone();
+    let hook: RunHook = Arc::new(move |e| sink.lock().unwrap().push(e));
+    (seen, hook)
+}
+
+fn op_events() -> (Arc<Mutex<Vec<OpEvent>>>, OpHook) {
+    let seen: Arc<Mutex<Vec<OpEvent>>> = Arc::new(Mutex::new(Vec::new()));
+    let sink = seen.clone();
+    let hook: OpHook = Arc::new(move |e| sink.lock().unwrap().push(e));
+    (seen, hook)
+}
+
+#[tokio::test]
+async fn every_terminal_status_reaches_the_run_hook_exactly_once() {
+    let (seen, hook) = run_events();
+    let quick = Job::builder("quick")
+        .op(Op::new("noop", |_| async { Ok(json!(null)) }))
+        .build()
+        .unwrap();
+    let brittle = Job::builder("brittle")
+        .op(Op::new("boom", |_| async { Err("no good".into()) }))
+        .build()
+        .unwrap();
+    let slow = Job::builder("slow")
+        .op(Op::new("nap", |_| async {
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            Ok(json!(null))
+        }))
+        .build()
+        .unwrap();
+    let runner = Runner::new([quick, brittle, slow], Store::open(":memory:").unwrap())
+        .with_hooks(vec![hook], Vec::new());
+
+    runner
+        .run("quick", json!({}), Trigger::Manual)
+        .await
+        .unwrap();
+    runner
+        .run("brittle", json!({}), Trigger::Schedule)
+        .await
+        .unwrap();
+    let id = runner.launch("slow", json!({}), Trigger::Manual).unwrap();
+    assert_eq!(runner.cancel(&id).unwrap(), CancelOutcome::Requested);
+    {
+        let (runner, id) = (runner.clone(), id.clone());
+        wait_until(move || runner.store().run(&id).unwrap().unwrap().status == RunStatus::Canceled)
+            .await;
+    }
+
+    {
+        let seen = seen.clone();
+        wait_until(move || seen.lock().unwrap().len() == 3).await;
+    }
+    // and give a stray fourth time to show itself
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let seen = seen.lock().unwrap();
+    assert_eq!(seen.len(), 3);
+    // by status rather than by arrival: each hook is its own blocking task and
+    // three of them are in no particular order
+    let of = |status| seen.iter().find(|e| e.status == status).expect("one each");
+
+    let succeeded = of(RunStatus::Success);
+    assert_eq!(succeeded.job, "quick");
+    assert_eq!(succeeded.failed_op, None);
+    assert_eq!(succeeded.error, None);
+    assert!(succeeded.started_at.is_some());
+    assert!(succeeded.duration.is_some());
+
+    let failed = of(RunStatus::Failed);
+    assert_eq!(failed.trigger, Trigger::Schedule);
+    assert_eq!(failed.failed_op.as_deref(), Some("boom"));
+    assert_eq!(failed.error.as_deref(), Some("no good"));
+
+    // a cancel is news too, and the status is what says so: `on_failure` is
+    // the hook that stays quiet about one
+    assert_eq!(of(RunStatus::Canceled).run_id, id);
+}
+
+#[tokio::test]
+async fn an_op_hook_fires_per_attempt_with_the_attempt_number() {
+    let (seen, hook) = op_events();
+    let tries = Arc::new(AtomicU32::new(0));
+    let counter = tries.clone();
+    let job = Job::builder("flaky")
+        .op(Op::new("wobble", move |_| {
+            let counter = counter.clone();
+            async move {
+                if counter.fetch_add(1, Ordering::SeqCst) < 2 {
+                    return Err("not yet".into());
+                }
+                Ok(json!("finally"))
+            }
+        })
+        .retries(2)
+        .retry_delay(Duration::from_millis(1)))
+        .build()
+        .unwrap();
+    let runner =
+        Runner::new([job], Store::open(":memory:").unwrap()).with_hooks(Vec::new(), vec![hook]);
+
+    let run = runner
+        .run("flaky", json!({}), Trigger::Manual)
+        .await
+        .unwrap();
+    assert_eq!(run.status, RunStatus::Success);
+
+    {
+        let seen = seen.clone();
+        wait_until(move || seen.lock().unwrap().len() == 3).await;
+    }
+    // by attempt rather than by arrival: each hook is its own blocking task
+    let mut seen = seen.lock().unwrap().clone();
+    seen.sort_by_key(|e| e.attempt);
+    // one per attempt, and the failed ones are not swallowed by the retry
+    // that made up for them: three attempts is three facts
+    let shape: Vec<(u32, OpStatus)> = seen.iter().map(|e| (e.attempt, e.status)).collect();
+    assert_eq!(
+        shape,
+        [
+            (1, OpStatus::Failed),
+            (2, OpStatus::Failed),
+            (3, OpStatus::Success)
+        ]
+    );
+    assert_eq!(seen[0].error.as_deref(), Some("not yet"));
+    assert_eq!(seen[2].error, None);
+    assert_eq!(seen[2].op, "wobble");
+    assert_eq!(seen[2].job, "flaky");
+    assert_eq!(seen[2].run_id, run.id);
+    // each attempt is timed on its own, so the retry's start is after the
+    // first attempt's finish rather than the row's `started_at`
+    assert!(seen[1].started_at >= seen[0].finished_at);
+}
+
+// the point of per-job scoping: an alert covers prod without covering every
+// backfill beside it, and without a hook that has to keep a job list by hand
+#[tokio::test]
+async fn a_job_scoped_hook_never_sees_another_jobs_runs() {
+    let (runs, run_hook) = run_events();
+    let (ops, op_hook) = op_events();
+    let watched = Job::builder("prod")
+        .on_run_finished(move |e| run_hook(e))
+        .on_op_finished(move |e| op_hook(e))
+        .op(Op::new("load", |_| async { Ok(json!(null)) }))
+        .build()
+        .unwrap();
+    let other = Job::builder("backfill")
+        .op(Op::new("load", |_| async { Ok(json!(null)) }))
+        .build()
+        .unwrap();
+    let runner = Runner::new([watched, other], Store::open(":memory:").unwrap());
+
+    runner
+        .run("backfill", json!({}), Trigger::Manual)
+        .await
+        .unwrap();
+    let run = runner
+        .run("prod", json!({}), Trigger::Manual)
+        .await
+        .unwrap();
+
+    {
+        let runs = runs.clone();
+        wait_until(move || runs.lock().unwrap().len() == 1).await;
+    }
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let runs = runs.lock().unwrap();
+    assert_eq!(runs.len(), 1, "a job-scoped hook saw another job's run");
+    assert_eq!(runs[0].run_id, run.id);
+    assert_eq!(runs[0].job, "prod");
+    let ops = ops.lock().unwrap();
+    assert_eq!(ops.len(), 1);
+    assert_eq!(ops[0].job, "prod");
+}
+
+#[tokio::test]
+async fn a_panicking_op_hook_leaves_the_run_alone() {
+    let (seen, hook) = op_events();
+    let job = Job::builder("etl")
+        .op(Op::new("load", |_| async { Ok(json!("done")) }))
+        .build()
+        .unwrap();
+    let runner = Runner::new([job], Store::open(":memory:").unwrap())
+        .with_hooks(Vec::new(), vec![Arc::new(|_| panic!("bad hook")), hook]);
+
+    let run = runner.run("etl", json!({}), Trigger::Manual).await.unwrap();
+    assert_eq!(run.status, RunStatus::Success);
+    // and the hook beside the panicking one still ran
+    wait_until(move || seen.lock().unwrap().len() == 1).await;
+}
+
+// there was no attempt, so there is nothing to report about one
+#[tokio::test]
+async fn ops_skipped_by_a_rule_reach_no_op_hook() {
+    let (seen, hook) = op_events();
+    let job = Job::builder("etl")
+        .op(Op::new("boom", |_| async { Err("no good".into()) }))
+        .op(Op::new("downstream", |_| async { Ok(json!(null)) }).after(["boom"]))
+        .op(Op::new("cleanup", |_| async { Ok(json!(null)) })
+            .after(["boom"])
+            .when(When::AnyFailed))
+        .build()
+        .unwrap();
+    let runner =
+        Runner::new([job], Store::open(":memory:").unwrap()).with_hooks(Vec::new(), vec![hook]);
+
+    let run = runner.run("etl", json!({}), Trigger::Manual).await.unwrap();
+    assert_eq!(run.status, RunStatus::Failed);
+    assert_eq!(
+        runner
+            .store()
+            .op_run(&run.id, "downstream")
+            .unwrap()
+            .unwrap()
+            .status,
+        OpStatus::Skipped
+    );
+
+    {
+        let seen = seen.clone();
+        wait_until(move || seen.lock().unwrap().len() == 2).await;
+    }
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let seen = seen.lock().unwrap();
+    let mut named: Vec<&str> = seen.iter().map(|e| e.op.as_str()).collect();
+    named.sort();
+    assert_eq!(
+        named,
+        ["boom", "cleanup"],
+        "a skipped op reported an attempt"
+    );
 }
 
 #[tokio::test]
