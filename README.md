@@ -189,8 +189,14 @@ appears.
   changed, with a store-backed cursor committed only on fully successful
   evaluations. probes run as internal sensors on the same loop, and both are
   pausable with tick history
-- `on_failure` hooks fire for every failed run, with ready-made webhook and
-  slack helpers behind the `http` feature; the failed run row carries the same
+- freshness policies are declarations, not guesses: `fresh_within(d)` on a job
+  or an asset says how old its latest success may get, and past that it is
+  `late` — per key on a partitioned asset, so one late partition carries the
+  asset. a declared policy replaces the cron-derived `overdue` heuristic
+- `on_failure` hooks fire for every failed run, `on_late` hooks fire when
+  something crosses into late — once per crossing, not per poll, and the state
+  survives restarts. ready-made webhook and slack helpers behind the `http`
+  feature serve both; the failed run row carries the same
   `op {name} failed: {message}` summary for anything reading history instead
 - the web ui is a prebuilt react bundle embedded in the binary; it polls the
   json api under `/api`
@@ -203,7 +209,8 @@ the details live in [docs/](docs/README.md):
 [typed io](docs/typed-io.md), [resources](docs/resources.md),
 [io managers](docs/io-managers.md), [op state](docs/state.md),
 [metadata](docs/metadata.md),
-[assets](docs/assets.md), [sensors](docs/sensors.md),
+[assets](docs/assets.md), [freshness](docs/freshness.md),
+[sensors](docs/sensors.md),
 [scheduling](docs/scheduling.md), [http sources](docs/http-sources.md),
 [notifications](docs/notifications.md), [the web ui](docs/web-ui.md),
 [the http api](docs/http-api.md), [storage](docs/storage.md),

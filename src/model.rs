@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -161,6 +163,74 @@ str_enum!(When {
     AnyFailed => "any_failed",
     Always => "always",
 });
+
+/// what a declared freshness policy says right now —
+/// [`Asset::fresh_within`](crate::Asset::fresh_within) or
+/// [`JobBuilder::fresh_within`](crate::JobBuilder::fresh_within) read against
+/// the latest success. computed at read time; nothing caches it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Freshness {
+    /// a success inside the window the policy allows.
+    Fresh,
+    /// the window closed `by` ago.
+    Late { by: Duration },
+    /// nothing has ever succeeded, so there is no age to measure. deliberately
+    /// not late: a policy caps how old a success may get, and this has none.
+    Never,
+}
+
+impl Freshness {
+    /// `fresh` / `late` / `never`, which is what the api reports.
+    pub fn status(&self) -> &'static str {
+        match self {
+            Freshness::Fresh => "fresh",
+            Freshness::Late { .. } => "late",
+            Freshness::Never => "never",
+        }
+    }
+
+    /// how far past the deadline, on a late one; `None` otherwise.
+    pub fn late_by(&self) -> Option<Duration> {
+        match self {
+            Freshness::Late { by } => Some(*by),
+            _ => None,
+        }
+    }
+
+    pub fn is_late(&self) -> bool {
+        matches!(self, Freshness::Late { .. })
+    }
+
+    /// the verdict a `within` policy reaches about `last_success` at `now`.
+    pub(crate) fn of(
+        last_success: Option<DateTime<Utc>>,
+        within: Duration,
+        now: DateTime<Utc>,
+    ) -> Freshness {
+        let Some(last) = last_success else {
+            return Freshness::Never;
+        };
+        let window = chrono::Duration::from_std(within).unwrap_or(chrono::Duration::MAX);
+        let deadline = last + window;
+        match (now - deadline).to_std() {
+            // to_std fails on a negative span, which is exactly "not yet due"
+            Ok(by) if !by.is_zero() => Freshness::Late { by },
+            _ => Freshness::Fresh,
+        }
+    }
+}
+
+/// what the last freshness check concluded about one job or asset, kept so a
+/// transition fires its hook once rather than once per poll.
+#[derive(Debug, Clone, Serialize)]
+pub struct FreshnessRow {
+    /// `job` or `asset`.
+    pub kind: String,
+    pub name: String,
+    pub late: bool,
+    /// when it went late; `None` while it is not.
+    pub since: Option<DateTime<Utc>>,
+}
 
 /// what a schedule does when it fires while the job still has an active run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]

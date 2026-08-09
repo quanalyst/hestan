@@ -53,7 +53,10 @@ the jobs table shows each job's description, op count, schedule expressions
 runs in the window (hatched bars are failures), and the last run's status
 glyph with a relative time. a job whose previous scheduled fire is more than
 half an interval in the past, with no successful run finishing since,
-carries an `overdue` tag; [scheduling](scheduling.md) has the exact rule.
+carries an `overdue` tag; [scheduling](scheduling.md) has the exact rule. a
+job or asset past its declared [freshness policy](freshness.md) carries a
+`late` tag instead — a different claim, and the one that wins where both could
+apply — and the statline counts everything currently late.
 rows click through to the job page. the page polls jobs every 5s, window
 runs every 10s, and upcoming fires every 30s.
 

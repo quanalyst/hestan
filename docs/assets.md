@@ -166,6 +166,23 @@ stale and the asset is stale transitively. an asset that has never
 materialized is stale with an empty reasons list — nothing was recorded to
 compare against.
 
+## Freshness policies
+
+staleness answers "did a dep move". it does not answer "when did this last get
+built at all", which is the question that matters for anything on a clock:
+
+```rust
+Asset::new("report", build).fresh_within(Duration::from_secs(3600))
+```
+
+past that window the asset is **late**, `GET /api/assets` says so in its
+`freshness` field, the ui tags it, and `Hestan::on_late` alerts on the
+crossing. on a partitioned asset the policy applies per key and the asset is
+late as soon as any one key is. stale and late are independent: an asset can
+be fresh and stale (a dep changed a minute ago) or late and not stale (nothing
+moved upstream, and nothing rebuilt it either). the whole of it is in
+[freshness](freshness.md).
+
 ## Partitioned assets
 
 an asset can be materialized once per key instead of once:

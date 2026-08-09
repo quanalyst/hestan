@@ -62,6 +62,23 @@ export interface JobSchedule {
   next_fire: string | null;
 }
 
+// a declared freshness policy's verdict: fresh inside the window, late past
+// it, never when nothing has ever succeeded. null when nothing was declared
+export interface Freshness {
+  status: "fresh" | "late" | "never";
+  late_by_secs: number | null;
+  last_success: string | null;
+}
+
+// one currently-late thing from GET /api/late, in the shape on_late hands its
+// hooks
+export interface LateEntry {
+  kind: "job" | "asset";
+  name: string;
+  late_by_secs: number | null;
+  last_success: string | null;
+}
+
 export interface JobSummary {
   name: string;
   description: string | null;
@@ -71,7 +88,10 @@ export interface JobSummary {
   max_parallel: number | null;
   pools: JobPool[];
   overlap: "allow" | "skip" | "queue";
+  // the cron-derived heuristic, and always false once a policy is declared:
+  // freshness is the answer then
   overdue: boolean;
+  freshness: Freshness | null;
 }
 
 export interface UpcomingSchedule {
@@ -218,6 +238,9 @@ export interface AssetSummary {
   stale: boolean;
   reasons: StaleReason[];
   checks: CheckSummary;
+  // stale and late are different claims: stale means a dep moved, late means
+  // time passed. null unless a policy was declared
+  freshness: Freshness | null;
 }
 
 export interface PartitionCounts {

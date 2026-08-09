@@ -51,22 +51,54 @@ restart after a crash does not replay old failures into your alert channel.
 every other failed run fires, whatever its trigger — a failed asset build
 reaches the hooks exactly like a failed etl.
 
+## Late alerts
+
+`on_late` is the other hook, and it works the same way: it fires when a job or
+asset with a declared [freshness policy](freshness.md) crosses from fresh to
+late.
+
+```rust
+Hestan::new()
+    .job(Job::builder("etl").fresh_within(Duration::from_secs(86_400)).op(pull).build()?)
+    .on_late(|e: LateEvent| eprintln!("{} {} is {:?} late", e.kind.as_str(), e.name, e.late_by))
+```
+
+| field | what it holds |
+| --- | --- |
+| `kind` | `job` or `asset` |
+| `name` | the job or asset name |
+| `late_by` | how far past the policy's deadline, at the crossing |
+| `last_success` | the success the deadline was measured from |
+
+the dispatch is the same one `on_failure` uses — one blocking task per hook,
+panics caught and logged — and the difference that matters is *when*: a
+failure is an event, so every one of them fires, while lateness is a state, so
+only the **crossing** fires. something late for a week alerts once, across
+restarts, and going fresh again re-arms the next one. [freshness](freshness.md)
+has the rest.
+
 ## Http helpers
 
-with the `http` feature, `hestan::notify` ships two ready-made hooks:
+with the `http` feature, `hestan::notify` ships two ready-made hooks, and both
+serve either kind of alert:
 
 ```rust
 Hestan::new()
     .on_failure(hestan::notify::webhook("https://ops.example/hestan"))
     .on_failure(hestan::notify::slack(slack_webhook_url))
+    .on_late(hestan::notify::slack(slack_webhook_url))
 ```
 
-`webhook(url)` POSTs the whole `RunFailure` as json. `slack(url)` posts the
-incoming-webhook shape
-`{"text": "job {job} failed at {failed_op}: {error} ({run_id})"}`. they
+`webhook(url)` POSTs the whole event as json. `slack(url)` posts the
+incoming-webhook shape `{"text": <one-line summary>}` —
+`job {job} failed at {failed_op}: {error} ({run_id})` for a failure,
+`{kind} {name} is {n}m late (last success {t})` for a late one. which event a
+helper is built for is inferred from the hook it is handed to; the trait
+behind that is `notify::Alert`, and implementing it on your own type is not a
+thing this crate needs you to do. they
 share one reqwest client with a 10s timeout that does not follow redirects —
 following one would replay the POST as a bodyless GET at whatever the
 `Location` header said — and delivery is best-effort: a non-2xx response
 (3xx included) or a network error is logged via `tracing` and never retried.
-if the channel must not drop messages, write a hook that hands the
-`RunFailure` to your own queue instead.
+if the channel must not drop messages, write a hook that hands the event to
+your own queue instead.

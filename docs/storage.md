@@ -9,8 +9,8 @@ scale, and it also means hestan assumes it is the only process writing (see
 
 ## Schema
 
-twelve tables. `trigger` is a reserved word in sqlite, hence the quoted column
-name in the schema and every statement that touches it.
+thirteen tables. `trigger` is a reserved word in sqlite, hence the quoted
+column name in the schema and every statement that touches it.
 
 ```sql
 CREATE TABLE runs (
@@ -23,7 +23,8 @@ CREATE TABLE runs (
     started_at TEXT,
     finished_at TEXT,
     resumed_from TEXT,                  -- added in v5
-    error TEXT                          -- added in v6
+    error TEXT,                         -- added in v6
+    scheduled_for TEXT                  -- added in v10
 );
 CREATE INDEX runs_job_created ON runs(job, created_at DESC);
 
@@ -58,6 +59,8 @@ CREATE TABLE schedules (
     tz TEXT NOT NULL DEFAULT 'UTC',
     paused INTEGER NOT NULL DEFAULT 0,
     params TEXT NOT NULL DEFAULT '{}',  -- added in v7
+    cursor TEXT,                        -- added in v10
+    catchup TEXT NOT NULL DEFAULT 'skip', -- added in v10
     PRIMARY KEY (job, expr)
 );
 
@@ -192,8 +195,11 @@ default to `{}`, which is what they always fired with; version 8 rebuilds
 table ([checks](assets.md#asset-checks)); version 9 adds `partition` to
 `asset_materializations` and `asset_checks` and re-keys every latest lookup
 per `(asset, partition)` ([partitions](assets.md#partitioned-assets)), and
-adds the `backfills` table ([backfills](assets.md#backfills)). an older file
-at any version opens straight into v9, rows intact — the v8 rebuild copies
+adds the `backfills` table ([backfills](assets.md#backfills)); version 10
+adds the `freshness_state` table ([freshness](freshness.md)), `schedules.cursor`
+and `schedules.catchup` ([catch-up](scheduling.md#missed-fire-catch-up)) and
+`runs.scheduled_for`, the logical time a scheduled or caught-up run stands
+for. an older file at any version opens straight into v10, rows intact — the v8 rebuild copies
 every keyed materialization across, where it becomes that asset's first
 history entry and stays its current one, and v9 leaves every existing row
 with a null partition, which is exactly what an unpartitioned asset is. every
@@ -201,7 +207,7 @@ pending step
 and the version stamp run in one transaction
 (sqlite DDL is transactional), so a crash or failure mid-migration leaves
 the file exactly as it was found, never half-migrated. a database stamped
-with a version newer than the build refuses to open (`db schema v10 is newer
+with a version newer than the build refuses to open (`db schema v11 is newer
 than this build`) instead of quietly writing an older stamp over it.
 
 one wrinkle: databases written before the migration mechanism existed carry

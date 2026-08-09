@@ -9,8 +9,8 @@ use serde_json::Value;
 use crate::error::Error;
 use crate::model::{
     AssetCheckRow, Backfill, BackfillStatus, CheckStatus, Event, EventKind, EventLevel,
-    Materialization, OpRun, OpStatus, Run, RunStatus, ScheduleDef, ScheduleRow, SensorOutcome,
-    SensorRow, SensorTick, Severity, Tick, TickOutcome,
+    FreshnessRow, Materialization, OpRun, OpStatus, Run, RunStatus, ScheduleDef, ScheduleRow,
+    SensorOutcome, SensorRow, SensorTick, Severity, Tick, TickOutcome,
 };
 
 // `trigger` is a reserved word in sqlite, hence the quoted column name in
@@ -192,7 +192,28 @@ CREATE TABLE backfills (
 CREATE INDEX backfills_asset ON backfills(asset, id DESC);
 "#;
 
-const SCHEMA_VERSION: u32 = 9;
+// the whole phase's schema, landed at once so nothing after this migrates
+// again. `freshness_state` remembers what the last freshness check concluded,
+// so a job late for a week alerts once rather than every minute across every
+// restart. the `schedules` columns are the scheduler's durable cursor and its
+// catch-up policy, and `runs.scheduled_for` is the logical time a scheduled or
+// caught-up run stands for — null on a manual launch, which represents nothing
+// but itself. run-status sensors need no table of their own: they are entries
+// of `sensors` like every other sensor, and the cursor column is already there.
+const SCHEMA_V10: &str = r#"
+CREATE TABLE freshness_state (
+    kind TEXT NOT NULL,
+    name TEXT NOT NULL,
+    late INTEGER NOT NULL,
+    since TEXT,
+    PRIMARY KEY (kind, name)
+);
+ALTER TABLE schedules ADD COLUMN cursor TEXT;
+ALTER TABLE schedules ADD COLUMN catchup TEXT NOT NULL DEFAULT 'skip';
+ALTER TABLE runs ADD COLUMN scheduled_for TEXT;
+"#;
+
+const SCHEMA_VERSION: u32 = 10;
 
 // one transaction around every pending step and the version stamp (sqlite DDL
 // is transactional), so a crash mid-migration leaves the db exactly as found
@@ -232,6 +253,9 @@ fn migrate(conn: &mut Connection) -> Result<(), Error> {
     }
     if version < 9 {
         tx.execute_batch(SCHEMA_V9)?;
+    }
+    if version < 10 {
+        tx.execute_batch(SCHEMA_V10)?;
     }
     if version != SCHEMA_VERSION {
         tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
@@ -1072,6 +1096,42 @@ impl Store {
         Ok(())
     }
 
+    /// what the last freshness check concluded about everything it has ever
+    /// seen, ordered by kind then name.
+    pub fn freshness_states(&self) -> Result<Vec<FreshnessRow>, Error> {
+        let conn = self.0.lock().unwrap();
+        let mut stmt = conn
+            .prepare("SELECT kind, name, late, since FROM freshness_state ORDER BY kind, name")?;
+        let rows = stmt.query_map([], |r| {
+            Ok(FreshnessRow {
+                kind: r.get(0)?,
+                name: r.get(1)?,
+                late: r.get(2)?,
+                since: opt_ts_col(r, 3)?,
+            })
+        })?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    /// record a crossing. `since` is when it went late and is dropped on the
+    /// way back to fresh, so a relapse is a new interval rather than the old
+    /// one resumed.
+    pub(crate) fn set_freshness_state(
+        &self,
+        kind: &str,
+        name: &str,
+        late: bool,
+        since: Option<DateTime<Utc>>,
+    ) -> Result<(), Error> {
+        let conn = self.0.lock().unwrap();
+        conn.execute(
+            "INSERT INTO freshness_state (kind, name, late, since) VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT (kind, name) DO UPDATE SET late = ?3, since = ?4",
+            params![kind, name, late, since.map(|t| t.to_rfc3339())],
+        )?;
+        Ok(())
+    }
+
     /// make the sensors table mirror the code: insert new names, drop the
     /// rest. existing rows keep their paused flag and cursor.
     pub(crate) fn sync_sensors(&self, defined: &[String]) -> Result<(), Error> {
@@ -1165,6 +1225,38 @@ impl Store {
         )?;
         let rows = stmt.query_map(params![sensor, limit], sensor_tick_from_row)?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    /// move a finished run's finish time. tests that need history older than
+    /// the test itself have no other way to make one, and freshness is entirely
+    /// about how old a success is.
+    #[cfg(test)]
+    pub(crate) fn backdate_run(&self, id: &str, finished_at: DateTime<Utc>) -> Result<(), Error> {
+        let conn = self.0.lock().unwrap();
+        conn.execute(
+            "UPDATE runs SET finished_at = ?2 WHERE id = ?1",
+            params![id, finished_at.to_rfc3339()],
+        )?;
+        Ok(())
+    }
+
+    /// [`backdate_run`](Self::backdate_run) for the newest materialization of
+    /// one `(asset, partition)` pair.
+    #[cfg(test)]
+    pub(crate) fn backdate_materialization(
+        &self,
+        asset: &str,
+        partition: Option<&str>,
+        built_at: DateTime<Utc>,
+    ) -> Result<(), Error> {
+        let conn = self.0.lock().unwrap();
+        conn.execute(
+            "UPDATE asset_materializations SET built_at = ?3
+             WHERE id = (SELECT MAX(id) FROM asset_materializations
+                         WHERE asset = ?1 AND partition IS ?2)",
+            params![asset, partition, built_at.to_rfc3339()],
+        )?;
+        Ok(())
     }
 
     pub(crate) fn prune_sensor_ticks(&self, keep: usize) -> Result<(), Error> {
@@ -1847,14 +1939,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("future.db");
         let path = path.to_str().unwrap();
-        phase1_db(path, 10);
+        phase1_db(path, 11);
         let err = Store::open(path).err().unwrap();
-        assert_eq!(err.to_string(), "db schema v10 is newer than this build");
+        assert_eq!(err.to_string(), "db schema v11 is newer than this build");
         let conn = Connection::open(path).unwrap();
         let version: u32 = conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 10);
+        assert_eq!(version, 11);
     }
 
     #[test]

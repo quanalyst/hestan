@@ -7,6 +7,7 @@ mod backfill;
 mod backoff;
 mod error;
 mod executor;
+mod freshness;
 mod graph;
 #[cfg(feature = "http")]
 mod http;
@@ -27,14 +28,15 @@ pub use app::Hestan;
 pub use asset::{Asset, AssetCheck, CheckOutcome, CheckResult, MultiAsset};
 pub use error::Error;
 pub use executor::{CancelOutcome, FailureHook, ResumePlan, RunFailure, Runner};
+pub use freshness::{LateEvent, LateHook, LateKind};
 #[cfg(feature = "http")]
 pub use http::HttpSource;
 pub use io::{FileIo, Inline, IoKey, IoManager, IoResult};
 pub use job::{Graph, GraphBuilder, Job, JobBuilder};
 pub use model::{
-    AssetCheckRow, Backfill, BackfillStatus, CheckStatus, Event, EventKind, EventLevel,
-    Materialization, OpRun, OpStatus, Overlap, Run, RunStatus, ScheduleRow, SensorOutcome,
-    SensorRow, SensorTick, Severity, Tick, TickOutcome, Trigger, When,
+    AssetCheckRow, Backfill, BackfillStatus, CheckStatus, Event, EventKind, EventLevel, Freshness,
+    FreshnessRow, Materialization, OpRun, OpStatus, Overlap, Run, RunStatus, ScheduleRow,
+    SensorOutcome, SensorRow, SensorTick, Severity, Tick, TickOutcome, Trigger, When,
 };
 pub use op::{InputError, Meta, Op, OpCtx, OpResult};
 pub use partition::Partitions;

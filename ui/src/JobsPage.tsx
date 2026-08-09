@@ -5,7 +5,7 @@ import MicroBars from "./MicroBars";
 import type { MicroBar } from "./MicroBars";
 import StatusDot from "./StatusDot";
 import TimelinePlot, { futureWindowSecs } from "./TimelinePlot";
-import type { JobSummary, Run, UpcomingSchedule } from "./types";
+import type { JobSummary, LateEntry, Run, UpcomingSchedule } from "./types";
 import { durationMs, fmtDuration, relTime } from "./util";
 
 // newest first from the api, oldest on the left in the chart
@@ -23,12 +23,16 @@ export default function JobsPage() {
   const [jobs, setJobs] = useState<JobSummary[] | null>(null);
   const [runs, setRuns] = useState<Run[] | null>(null);
   const [upcoming, setUpcoming] = useState<UpcomingSchedule[]>([]);
+  const [late, setLate] = useState<LateEntry[]>([]);
   const [windowSecs, setWindowSecs] = useState(21600);
 
   usePoll(
     () => {
       get<{ jobs: JobSummary[] }>("/api/jobs")
         .then((r) => setJobs(r.jobs))
+        .catch(() => {});
+      get<{ late: LateEntry[] }>("/api/late")
+        .then((r) => setLate(r.late))
         .catch(() => {});
     },
     5000,
@@ -104,6 +108,14 @@ export default function JobsPage() {
             <b>{running}</b> running
           </>
         )}
+        {/* a declared policy is a claim about the world, not about this
+            window, so it is counted whether anything ran in the window or not */}
+        {late.length > 0 && (
+          <>
+            {" · "}
+            <b>{late.length}</b> late
+          </>
+        )}
       </div>
 
       <TimelinePlot
@@ -136,6 +148,7 @@ export default function JobsPage() {
                     <td>
                       {job.name}
                       {job.overdue && <span className="tag">overdue</span>}
+                      {job.freshness?.status === "late" && <span className="tag">late</span>}
                     </td>
                     <td className="secondary">{job.description ?? "—"}</td>
                     <td className="num">{job.ops.length}</td>

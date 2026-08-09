@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::time::Duration;
 
 use serde_json::Value;
 
@@ -16,6 +17,7 @@ pub struct Job {
     order: Vec<String>,
     max_parallel: Option<usize>,
     overlap: Overlap,
+    fresh_within: Option<Duration>,
     // dep names satisfied from outside the job: no ops, absent from `order`,
     // seeded at launch with the value declared here — null for an asset
     // source, `[]` for the partition keys a partitioned asset fans out over,
@@ -32,6 +34,7 @@ impl Job {
             instances: Vec::new(),
             max_parallel: None,
             overlap: Overlap::default(),
+            fresh_within: None,
             error: None,
         }
     }
@@ -58,6 +61,13 @@ impl Job {
 
     pub fn overlap(&self) -> Overlap {
         self.overlap
+    }
+
+    /// how old this job's latest success may get before it counts as late,
+    /// from [`JobBuilder::fresh_within`]. `None` leaves the cron-derived
+    /// `overdue` heuristic in charge.
+    pub fn fresh_within(&self) -> Option<Duration> {
+        self.fresh_within
     }
 
     /// the first op that refuses `params`, with its reason — the same check a
@@ -123,6 +133,7 @@ impl Job {
             order,
             max_parallel: None,
             overlap: Overlap::default(),
+            fresh_within: None,
             external,
         })
     }
@@ -551,6 +562,7 @@ pub struct JobBuilder {
     instances: Vec<Instance>,
     max_parallel: Option<usize>,
     overlap: Overlap,
+    fresh_within: Option<Duration>,
     error: Option<String>,
 }
 
@@ -608,6 +620,16 @@ impl JobBuilder {
         self
     }
 
+    /// declare how old this job's latest success may get before the job is
+    /// late: `fresh_within(Duration::from_secs(86_400))` says a successful run
+    /// every day. a declared policy takes over from the cron-derived `overdue`
+    /// heuristic entirely — see [freshness](../docs/freshness.md) — and is what
+    /// `Hestan::on_late` alerts on.
+    pub fn fresh_within(mut self, d: Duration) -> Self {
+        self.fresh_within = Some(d);
+        self
+    }
+
     /// flattens any [`graph`](Self::graph) instances into ordinary ops, then
     /// validates the dag; fails on duplicate ops, unknown deps, or cycles.
     pub fn build(self) -> Result<Job, Error> {
@@ -629,6 +651,7 @@ impl JobBuilder {
             order,
             max_parallel: self.max_parallel,
             overlap: self.overlap,
+            fresh_within: self.fresh_within,
             external: Vec::new(),
         })
     }

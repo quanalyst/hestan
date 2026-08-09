@@ -1,9 +1,11 @@
 use std::sync::OnceLock;
 use std::time::Duration;
 
+use serde::Serialize;
 use serde_json::json;
 
 use crate::executor::RunFailure;
+use crate::freshness::LateEvent;
 
 fn client() -> &'static reqwest::Client {
     static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
@@ -30,34 +32,68 @@ fn post(url: String, body: serde_json::Value) {
     });
 }
 
-/// a hook that POSTs the whole [`RunFailure`] as json to `url`.
+/// what these hooks can deliver: something that serializes whole, and knows
+/// how to say itself in one line. implemented for [`RunFailure`] and
+/// [`LateEvent`], so the same two helpers serve
+/// [`on_failure`](crate::Hestan::on_failure) and
+/// [`on_late`](crate::Hestan::on_late) — the call sites are identical either
+/// way, and which one is meant is inferred from the hook it is handed to.
+pub trait Alert: Serialize {
+    /// one line, for a channel that shows text rather than json.
+    fn summary(&self) -> String;
+}
+
+impl Alert for RunFailure {
+    fn summary(&self) -> String {
+        format!(
+            "job {} failed at {}: {} ({})",
+            self.job,
+            self.failed_op.as_deref().unwrap_or("unknown op"),
+            self.error.as_deref().unwrap_or("unknown error"),
+            self.run_id
+        )
+    }
+}
+
+impl Alert for LateEvent {
+    fn summary(&self) -> String {
+        let mins = self.late_by.as_secs() / 60;
+        match self.last_success {
+            Some(t) => format!(
+                "{} {} is {mins}m late (last success {})",
+                self.kind.as_str(),
+                self.name,
+                t.to_rfc3339()
+            ),
+            None => format!("{} {} is {mins}m late", self.kind.as_str(), self.name),
+        }
+    }
+}
+
+/// a hook that POSTs the whole event as json to `url`.
 ///
 /// ```no_run
 /// # use hestan::Hestan;
-/// Hestan::new().on_failure(hestan::notify::webhook("https://ops.example/hook"));
+/// Hestan::new()
+///     .on_failure(hestan::notify::webhook("https://ops.example/hook"))
+///     .on_late(hestan::notify::webhook("https://ops.example/hook"));
 /// ```
-pub fn webhook(url: impl Into<String>) -> impl Fn(RunFailure) + Send + Sync {
+pub fn webhook<A: Alert>(url: impl Into<String>) -> impl Fn(A) + Send + Sync {
     let url = url.into();
-    move |f: RunFailure| {
+    move |a: A| {
         post(
             url.clone(),
-            serde_json::to_value(&f).expect("RunFailure is json"),
+            serde_json::to_value(&a).expect("alert is json"),
         );
     }
 }
 
-/// a hook for a slack incoming webhook: posts
-/// `{"text": "job {job} failed at {failed_op}: {error} ({run_id})"}`.
-pub fn slack(url: impl Into<String>) -> impl Fn(RunFailure) + Send + Sync {
+/// a hook for a slack incoming webhook: posts `{"text": <the alert's one-line
+/// summary>}` — `job {job} failed at {failed_op}: {error} ({run_id})` for a
+/// failure, `{kind} {name} is {n}m late (last success {t})` for a late one.
+pub fn slack<A: Alert>(url: impl Into<String>) -> impl Fn(A) + Send + Sync {
     let url = url.into();
-    move |f: RunFailure| {
-        let text = format!(
-            "job {} failed at {}: {} ({})",
-            f.job,
-            f.failed_op.as_deref().unwrap_or("unknown op"),
-            f.error.as_deref().unwrap_or("unknown error"),
-            f.run_id
-        );
-        post(url.clone(), json!({ "text": text }));
+    move |a: A| {
+        post(url.clone(), json!({ "text": a.summary() }));
     }
 }

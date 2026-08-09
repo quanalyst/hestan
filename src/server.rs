@@ -19,8 +19,11 @@ use crate::asset::{
 use crate::backfill;
 use crate::error::Error;
 use crate::executor::{CancelOutcome, Runner};
+use crate::freshness::{self, asset_freshness};
 use crate::job::Job;
-use crate::model::{AssetCheckRow, CheckStatus, OpRun, OpStatus, RunStatus, ScheduleRow, Trigger};
+use crate::model::{
+    AssetCheckRow, CheckStatus, Freshness, OpRun, OpStatus, RunStatus, ScheduleRow, Trigger,
+};
 use crate::schedule;
 
 static UI_DIST: Dir<'static> = include_dir!("$CARGO_MANIFEST_DIR/ui/dist");
@@ -72,6 +75,7 @@ pub(crate) fn router(state: AppState) -> Router {
         .route("/api/schedules/state", post(set_schedule_state))
         .route("/api/schedules/ticks", get(schedule_ticks))
         .route("/api/schedules/upcoming", get(upcoming_schedules))
+        .route("/api/late", get(list_late))
         .fallback(static_ui)
         .with_state(state)
 }
@@ -128,6 +132,15 @@ fn is_overdue(
 ) -> bool {
     now > prev + Duration::milliseconds(interval_secs * 500)
         && last_success.is_none_or(|t| t < prev)
+}
+
+/// the shape a declared policy reports as, everywhere it is reported.
+fn freshness_json(freshness: Freshness, last_success: Option<DateTime<Utc>>) -> Value {
+    json!({
+        "status": freshness.status(),
+        "late_by_secs": freshness.late_by().map(|d| d.as_secs()),
+        "last_success": last_success,
+    })
 }
 
 fn job_summary(job: &Job, st: &AppState) -> Result<Value, Error> {
@@ -191,10 +204,15 @@ fn job_summary(job: &Job, st: &AppState) -> Result<Value, Error> {
         .filter(|s| !s.paused)
         .filter_map(|s| prev_fire(s, now))
         .max();
+    let last_success = st.runner.store().last_success(job.name())?;
+    // a declared policy replaces the heuristic rather than sitting beside it:
+    // two answers to "is this job behind" is one answer too many
+    let freshness = job
+        .fresh_within()
+        .map(|within| freshness_json(Freshness::of(last_success, within, now), last_success));
     let overdue = match (prev, interval_secs) {
-        (Some(prev), Some(gap)) => {
-            is_overdue(prev, gap, st.runner.store().last_success(job.name())?, now)
-        }
+        _ if freshness.is_some() => false,
+        (Some(prev), Some(gap)) => is_overdue(prev, gap, last_success, now),
         _ => false,
     };
     let last_run = st
@@ -213,6 +231,7 @@ fn job_summary(job: &Job, st: &AppState) -> Result<Value, Error> {
         "last_run": last_run,
         "interval_secs": interval_secs,
         "overdue": overdue,
+        "freshness": freshness,
     }))
 }
 
@@ -413,6 +432,7 @@ async fn list_assets(State(st): State<AppState>) -> Result<Json<Value>, ApiError
     let mats = mats_map(st.runner.store()).map_err(internal)?;
     let stale = staleness(&st.assets, &mats);
     let latest_checks = st.runner.store().latest_asset_checks().map_err(internal)?;
+    let now = Utc::now();
     let assets: Vec<Value> = st
         .assets
         .topo()
@@ -458,6 +478,10 @@ async fn list_assets(State(st): State<AppState>) -> Result<Json<Value>, ApiError
                 "stale": s.stale,
                 "reasons": reasons,
                 "checks": check_summary(&latest_checks, &meta.name),
+                // stale and late are different claims: stale means a dep moved,
+                // late means time passed. null unless a policy was declared
+                "freshness": asset_freshness(&mats, meta, now)
+                    .map(|(f, last)| freshness_json(f, last)),
             })
         })
         .collect();
@@ -932,6 +956,26 @@ async fn upcoming_schedules(
         })
         .collect();
     Ok(Json(json!({ "upcoming": upcoming })))
+}
+
+// everything a declared policy currently calls late, jobs then assets, in the
+// shape `on_late` hands its hooks — so an alert and this list cannot disagree
+async fn list_late(State(st): State<AppState>) -> Result<Json<Value>, ApiError> {
+    let now = Utc::now();
+    let late: Vec<Value> = freshness::verdicts(&st.runner, &st.assets, now)
+        .map_err(internal)?
+        .iter()
+        .filter(|v| v.freshness.is_late())
+        .map(|v| {
+            json!({
+                "kind": v.kind.as_str(),
+                "name": v.name,
+                "late_by_secs": v.freshness.late_by().map(|d| d.as_secs()),
+                "last_success": v.last_success,
+            })
+        })
+        .collect();
+    Ok(Json(json!({ "late": late })))
 }
 
 #[derive(Deserialize)]
@@ -2171,6 +2215,77 @@ mod tests {
         let s = job_summary(job, &st).unwrap();
         assert_eq!(s["interval_secs"], json!(null));
         assert_eq!(s["overdue"], json!(false));
+    }
+
+    #[tokio::test]
+    async fn a_declared_policy_replaces_the_cron_heuristic() {
+        let hourly = Job::builder("etl")
+            .fresh_within(std::time::Duration::from_secs(3600))
+            .op(Op::new("echo", |ctx: OpCtx| async move {
+                Ok(ctx.params().clone())
+            }))
+            .build()
+            .unwrap();
+        let st = state(vec![hourly, echo_job("plain")]);
+        // the same schedule that makes `plain` overdue below
+        let sched = |job: &str| {
+            (
+                job.to_string(),
+                "0,1 0 1 1 *".to_string(),
+                "UTC".to_string(),
+                json!({}),
+            )
+        };
+        st.runner
+            .store()
+            .sync_schedules(&[sched("etl"), sched("plain")])
+            .unwrap();
+
+        let plain = job_summary(&st.jobs["plain"], &st).unwrap();
+        assert_eq!(plain["overdue"], json!(true));
+        assert_eq!(plain["freshness"], json!(null));
+
+        // the heuristic would say overdue too; the policy is asked instead, and
+        // never having succeeded is not late
+        let etl = job_summary(&st.jobs["etl"], &st).unwrap();
+        assert_eq!(etl["overdue"], json!(false), "the policy is the answer now");
+        assert_eq!(etl["freshness"]["status"], json!("never"));
+        assert_eq!(etl["freshness"]["last_success"], json!(null));
+
+        st.runner
+            .run("etl", json!({}), Trigger::Manual)
+            .await
+            .unwrap();
+        let etl = job_summary(&st.jobs["etl"], &st).unwrap();
+        assert_eq!(etl["freshness"]["status"], json!("fresh"));
+        assert_eq!(etl["freshness"]["late_by_secs"], json!(null));
+        assert_eq!(etl["overdue"], json!(false));
+
+        let (status, body, _) = request(router(st.clone()), Method::GET, "/api/late").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body.unwrap()["late"], json!([]));
+
+        // an hour and a half of nothing: the policy says late, and /api/late
+        // says the same thing in the same words
+        let id = st
+            .runner
+            .store()
+            .runs(Some("etl"), None, None, None, 1)
+            .unwrap()[0]
+            .id
+            .clone();
+        st.runner
+            .store()
+            .backdate_run(&id, Utc::now() - Duration::minutes(90))
+            .unwrap();
+        let etl = job_summary(&st.jobs["etl"], &st).unwrap();
+        assert_eq!(etl["freshness"]["status"], json!("late"));
+        assert_eq!(etl["freshness"]["late_by_secs"], json!(1800));
+        let (_, body, _) = request(router(st.clone()), Method::GET, "/api/late").await;
+        let late = body.unwrap();
+        assert_eq!(late["late"][0]["kind"], json!("job"));
+        assert_eq!(late["late"][0]["name"], json!("etl"));
+        assert_eq!(late["late"][0]["late_by_secs"], json!(1800));
     }
 
     #[test]

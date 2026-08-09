@@ -45,6 +45,7 @@ pub struct Asset {
     retries: u32,
     retry_delay: Option<Duration>,
     partitions: Option<Partitions>,
+    fresh_within: Option<Duration>,
 }
 
 impl Asset {
@@ -63,6 +64,7 @@ impl Asset {
             retries: 0,
             retry_delay: None,
             partitions: None,
+            fresh_within: None,
         }
     }
 
@@ -86,6 +88,7 @@ impl Asset {
             retries: 0,
             retry_delay: None,
             partitions: None,
+            fresh_within: None,
         }
     }
 
@@ -111,6 +114,7 @@ impl Asset {
             retries: 0,
             retry_delay: None,
             partitions: None,
+            fresh_within: None,
         }
     }
 
@@ -188,6 +192,18 @@ impl Asset {
     /// `partitioned` at all.
     pub fn partitioned(mut self, partitions: Partitions) -> Asset {
         self.partitions = Some(partitions);
+        self
+    }
+
+    /// declare how old this asset's latest materialization may get before the
+    /// asset is late: `fresh_within(Duration::from_secs(3600))` says it should
+    /// be rebuilt hourly, however that rebuild is triggered. on a [partitioned
+    /// asset](Self::partitioned) the policy applies per key, so the asset is
+    /// late as soon as any one key is — see
+    /// [freshness](../docs/freshness.md). staleness is a different question:
+    /// stale means a dep moved, late means time passed.
+    pub fn fresh_within(mut self, d: Duration) -> Asset {
+        self.fresh_within = Some(d);
         self
     }
 }
@@ -415,6 +431,9 @@ pub(crate) struct AssetMeta {
     /// the key set this asset is materialized over, one materialization per
     /// key; `None` for an unpartitioned asset, which is one of everything.
     pub partitions: Option<Partitions>,
+    /// how old the latest materialization may get before this asset is late,
+    /// from [`Asset::fresh_within`]; `None` when nothing was declared.
+    pub fresh_within: Option<Duration>,
 }
 
 /// one op of the lowered `assets` job and the assets it produces — one for a
@@ -522,6 +541,7 @@ impl AssetRegistry {
                 probe_every: a.probe_every,
                 op: (!a.source).then_some(a.name),
                 partitions: a.partitions,
+                fresh_within: a.fresh_within,
             });
         }
         for m in multis {
@@ -541,6 +561,9 @@ impl AssetRegistry {
                     probe_every: Duration::from_secs(60),
                     op: Some(m.name.clone()),
                     partitions: None,
+                    // a multi-asset produces names, not `Asset` values, so
+                    // there is nowhere to hang a policy on one of them
+                    fresh_within: None,
                 });
             }
             ops.push(OpMeta {

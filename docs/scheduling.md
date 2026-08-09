@@ -165,3 +165,8 @@ the ui tags overdue jobs in the jobs table. anchoring on the previous fire
 rather than on interval-sized windows keeps clustered schedules honest: a
 weekday-only job that succeeded friday morning is not overdue on sunday,
 because sunday's silence was on the calendar.
+
+a job that declares [`fresh_within`](freshness.md) is not asked the heuristic
+at all: `overdue` is always false there and `freshness` is the answer. the
+heuristic guesses at what a policy states outright, and reporting both would
+be two answers to one question.

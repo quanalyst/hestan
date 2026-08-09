@@ -8,6 +8,7 @@ use serde_json::Value;
 use crate::asset::{Asset, AssetCheck, AssetRegistry, MultiAsset, mats_map, plan_target};
 use crate::error::Error;
 use crate::executor::{FailureHook, RunFailure, Runner};
+use crate::freshness::{self, LateEvent, LateHook};
 use crate::io::{Io, IoManager};
 use crate::job::Job;
 use crate::model::{Run, ScheduleDef, Trigger};
@@ -36,6 +37,7 @@ pub struct Hestan {
     io_named: HashMap<String, Arc<dyn IoManager>>,
     db_path: String,
     hooks: Vec<FailureHook>,
+    late_hooks: Vec<LateHook>,
     retention_days: Option<u32>,
     asset_history: usize,
     #[cfg(feature = "http")]
@@ -57,6 +59,7 @@ impl Default for Hestan {
             io_named: HashMap::new(),
             db_path: "hestan.db".into(),
             hooks: Vec::new(),
+            late_hooks: Vec::new(),
             retention_days: None,
             asset_history: DEFAULT_ASSET_HISTORY,
             #[cfg(feature = "http")]
@@ -286,6 +289,28 @@ impl Hestan {
         self
     }
 
+    /// call `hook` whenever a job or asset with a declared freshness policy
+    /// crosses from fresh to late — [`JobBuilder::fresh_within`](crate::JobBuilder::fresh_within)
+    /// and [`Asset::fresh_within`](crate::Asset::fresh_within). callable
+    /// multiple times, dispatched exactly like [`on_failure`](Self::on_failure)
+    /// so a hook may block.
+    ///
+    /// ```no_run
+    /// # use hestan::{Hestan, LateEvent};
+    /// Hestan::new().on_late(|e: LateEvent| {
+    ///     eprintln!("{} {} is {:?} late", e.kind.as_str(), e.name, e.late_by)
+    /// });
+    /// ```
+    ///
+    /// once per crossing, not once per poll: the last-notified state lives in
+    /// the database, so something late for a week alerts once and survives a
+    /// restart without re-announcing itself. a recovery is not an alert, but it
+    /// re-arms the next one. `serve` runs the checker; `run_once` does not.
+    pub fn on_late(mut self, hook: impl Fn(LateEvent) + Send + Sync + 'static) -> Self {
+        self.late_hooks.push(Arc::new(hook));
+        self
+    }
+
     pub async fn run_once(self, job: &str, params: Value) -> Result<Run, Error> {
         let built = self.build().await?;
         built.runner.run(job, params, Trigger::Manual).await
@@ -336,6 +361,11 @@ impl Hestan {
             built.runner.clone(),
             built.registry.clone(),
         ));
+        let checker = tokio::spawn(freshness::run_checker(
+            built.runner.clone(),
+            built.registry.clone(),
+            Arc::new(built.late_hooks),
+        ));
         let state = AppState {
             jobs: Arc::new(built.runner.jobs().clone()),
             runner: built.runner,
@@ -347,6 +377,7 @@ impl Hestan {
         scheduler.abort();
         sensors.abort();
         backfills.abort();
+        checker.abort();
         served?;
         Ok(())
     }
@@ -464,6 +495,7 @@ impl Hestan {
             entries,
             registry,
             sensor_entries,
+            late_hooks: self.late_hooks,
         })
     }
 }
@@ -473,6 +505,7 @@ struct Built {
     entries: Vec<ScheduleEntry>,
     registry: Arc<AssetRegistry>,
     sensor_entries: Vec<SensorEntry>,
+    late_hooks: Vec<LateHook>,
 }
 
 #[cfg(test)]

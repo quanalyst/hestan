@@ -233,7 +233,10 @@ export default function AssetsPage() {
                   key={a.name}
                   onClick={() => setSel((prev) => (prev === a.name ? null : a.name))}
                 >
-                  <td>{a.name}</td>
+                  <td>
+                    {a.name}
+                    {a.freshness?.status === "late" && <span className="tag">late</span>}
+                  </td>
                   <td className="muted">{a.kind}</td>
                   <td className="muted">{a.deps.length === 0 ? "—" : a.deps.join(", ")}</td>
                   {/* a partitioned asset has no single fingerprint to show:

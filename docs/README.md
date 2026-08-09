@@ -8,10 +8,11 @@
 - [metadata](metadata.md) — typed facts an op attaches to what it produced: `ctx.meta`, the `Meta` variants, per-attempt staging, and where they surface.
 - [io managers](io-managers.md) — where op outputs live: the `IoManager` trait, `Inline`, `FileIo`, per-op managers, and where handles are resolved.
 - [assets](assets.md) — fingerprints, provable staleness, memoized builds, serialized builds, probes, and `.auto()`.
+- [freshness](freshness.md) — declared policies: `fresh_within`, fresh/late/never, `on_late` alerts, and how a policy relates to `overdue` and to staleness.
 - [sensors](sensors.md) — the sensor loop, cursor commit-on-success, `RunRequest`, probes-as-sensors, pausing and tick history.
 - [scheduling](scheduling.md) — cron syntax, timezones, pause/resume, ticks, and the scheduler loop.
 - [http sources](http-sources.md) — declarative REST pulls: the full `HttpSource` builder, fan-out, retry policy.
-- [notifications](notifications.md) — failure hooks: `on_failure`, `RunFailure`, the webhook and slack helpers.
+- [notifications](notifications.md) — hooks: `on_failure`/`RunFailure`, `on_late`/`LateEvent`, the webhook and slack helpers.
 - [web ui](web-ui.md) — page-by-page tour of the embedded ui and how it draws status.
 - [http api](http-api.md) — every endpoint, parameter, response shape, and error code.
 - [storage](storage.md) — the sqlite schema, migrations, and crash recovery.

@@ -73,7 +73,9 @@ summary or a 404. the shape:
   "pools": [ { "name": "orders_api", "limit": 3 } ],
   "overlap": "skip",
   "interval_secs": 120,
-  "overdue": false
+  "overdue": false,
+  "freshness": { "status": "fresh", "late_by_secs": null,
+                 "last_success": "2026-08-07T12:30:02+00:00" }
 }
 ```
 
@@ -93,7 +95,11 @@ the process default. `when` is the op's
 ordinary op. `interval_secs` is the gap between the next two fires, minimized across the
 job's unpaused schedules (`null` without one); `overdue` is true when the
 previous scheduled fire is more than half an interval past and no successful
-run has finished since it (see [scheduling](scheduling.md)). the type fields
+run has finished since it (see [scheduling](scheduling.md)). `freshness` is
+the job's declared [policy](freshness.md)'s verdict — `status` is `fresh`,
+`late` or `never`, `late_by_secs` is non-null only when late — and is `null`
+when nothing was declared. a job that declares one always reports `overdue`
+false: the policy is the answer then. the type fields
 are `std::any::type_name` strings from [typed io](typed-io.md), `null` for
 untyped ops.
 
@@ -345,7 +351,9 @@ startup's sweep marks failed.
     "fingerprint": "3bffef12...", "built_at": "2026-08-08T11:01:36Z",
     "run_id": "019fe109-...", "stale": true,
     "reasons": [ { "dep": "docs_dir", "had": "14a61f3c...", "now": "9c01d2aa..." } ],
-    "checks": { "passed": 1, "failed": 0, "last_run_at": "2026-08-08T11:01:36Z" } }
+    "checks": { "passed": 1, "failed": 0, "last_run_at": "2026-08-08T11:01:36Z" },
+    "freshness": { "status": "late", "late_by_secs": 1800,
+                   "last_success": "2026-08-08T10:01:36Z" } }
 ] }
 ```
 
@@ -359,8 +367,10 @@ dep's current one (`now`); equal values mean the dep is itself stale and
 this asset is stale transitively. `checks` counts the latest result per
 [check](assets.md#asset-checks) name; both zero with a null timestamp means
 nothing has ever been recorded for this asset, which reads the same whether
-no check is declared or none has run yet. the semantics are in
-[assets](assets.md).
+no check is declared or none has run yet. `freshness` is the asset's declared
+[policy](freshness.md)'s verdict, in the same shape jobs report, and `null`
+when nothing was declared — stale and late are separate questions and both
+are answered here. the semantics are in [assets](assets.md).
 
 `partitions` is null on an unpartitioned asset and, on a
 [partitioned](assets.md#partitioned-assets) one, replaces the single
@@ -577,6 +587,26 @@ schedule within the next `window` seconds (default one day, clamped to
     "times": ["2026-08-07T12:34:00+00:00", "2026-08-07T12:36:00+00:00"] }
 ] }
 ```
+
+## Late
+
+`GET /api/late` returns everything a declared [freshness
+policy](freshness.md) currently calls late, jobs first and then assets, each
+group by name:
+
+```json
+{ "late": [
+  { "kind": "job", "name": "orders_etl", "late_by_secs": 1800,
+    "last_success": "2026-08-07T11:00:04Z" },
+  { "kind": "asset", "name": "report", "late_by_secs": 7200,
+    "last_success": "2026-08-07T09:31:00Z" }
+] }
+```
+
+this is the same shape an `on_late` hook receives, computed the same way at
+the same moment, so the alert and the list cannot disagree. something that has
+never succeeded is `never`, not late, and does not appear here. an empty
+`late` is the normal answer.
 
 ## Everything else
 

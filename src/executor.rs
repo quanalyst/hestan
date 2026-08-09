@@ -67,6 +67,31 @@ pub struct RunFailure {
 /// a callback invoked on its own task when a run finishes failed.
 pub type FailureHook = Arc<dyn Fn(RunFailure) + Send + Sync>;
 
+/// hand `event` to every hook, each on its own blocking task.
+///
+/// spawn_blocking, not spawn: a hook that blocks outright — a sync http post,
+/// a database write, a sleep — would otherwise pin an async worker and hang
+/// runtime shutdown. a panicking hook is caught and logged rather than taken
+/// out on the others. `what` names the hook family in that warning.
+pub(crate) fn fire_hooks<E: Clone + Send + 'static>(
+    hooks: &[Arc<dyn Fn(E) + Send + Sync>],
+    event: E,
+    what: &'static str,
+) {
+    for hook in hooks {
+        let hook = hook.clone();
+        let event = event.clone();
+        tokio::task::spawn_blocking(move || {
+            if let Err(panic) = std::panic::catch_unwind(AssertUnwindSafe(|| hook(event))) {
+                match panic_payload(panic.as_ref()) {
+                    Some(s) => tracing::warn!("{what} hook panicked: {s}"),
+                    None => tracing::warn!("{what} hook panicked"),
+                }
+            }
+        });
+    }
+}
+
 /// what a resume would do, from [`Runner::resume_plan`]. both lists are in the
 /// job's topological order, and together they cover every op the job has
 /// except ones that neither re-run nor have an output worth reusing.
@@ -1384,20 +1409,7 @@ async fn execute(
             error,
             finished_at: Utc::now(),
         };
-        for hook in runner.hooks.iter() {
-            let hook = hook.clone();
-            let failure = failure.clone();
-            // spawn_blocking, not spawn: a hook that blocks would pin an async
-            // worker and hang runtime shutdown
-            tokio::task::spawn_blocking(move || {
-                if let Err(panic) = std::panic::catch_unwind(AssertUnwindSafe(|| hook(failure))) {
-                    match panic_payload(panic.as_ref()) {
-                        Some(s) => tracing::warn!("failure hook panicked: {s}"),
-                        None => tracing::warn!("failure hook panicked"),
-                    }
-                }
-            });
-        }
+        fire_hooks(&runner.hooks, failure, "failure");
     }
 }
 
