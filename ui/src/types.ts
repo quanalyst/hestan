@@ -313,6 +313,8 @@ export interface SensorTick {
   evaluated_at: string;
   outcome: SensorOutcome;
   launched: number;
+  // requests whose run key was already claimed, so they were not launched again
+  skipped: number;
   error: string | null;
 }
 

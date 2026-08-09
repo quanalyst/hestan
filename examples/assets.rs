@@ -201,10 +201,13 @@ async fn main() -> Result<(), hestan::Error> {
             return Ok(Vec::new());
         }
         ctx.set_cursor(json!(mtime));
-        Ok(vec![RunRequest {
-            job: "ingest_marker".into(),
-            params: json!({ "path": MARKER }),
-        }])
+        // the cursor already stops a second launch for the same mtime; the run
+        // key is what stops one when a replay gets past the cursor
+        Ok(vec![
+            RunRequest::new("ingest_marker")
+                .params(json!({ "path": MARKER }))
+                .key(mtime.to_string()),
+        ])
     });
 
     println!("hestan assets example: http://127.0.0.1:4002");

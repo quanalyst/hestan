@@ -513,6 +513,9 @@ pub struct SensorTick {
     pub evaluated_at: DateTime<Utc>,
     pub outcome: SensorOutcome,
     pub launched: u32,
+    /// requests this evaluation did not launch because their [run
+    /// key](crate::RunRequest::key) had already been claimed.
+    pub skipped: u32,
     pub error: Option<String>,
 }
 

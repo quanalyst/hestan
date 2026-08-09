@@ -139,9 +139,28 @@ CREATE TABLE sensor_ticks (            -- added in v4
     evaluated_at TEXT NOT NULL,
     outcome TEXT NOT NULL,    -- fired | error
     launched INTEGER NOT NULL DEFAULT 0,
+    skipped INTEGER NOT NULL DEFAULT 0,      -- added in v11: keyed duplicates
+    duration_ms INTEGER NOT NULL DEFAULT 0,  -- added in v11
     error TEXT
 );
+
+CREATE TABLE sensor_run_keys (         -- added in v11
+    sensor TEXT NOT NULL,
+    run_key TEXT NOT NULL,
+    run_id TEXT NOT NULL,
+    launched_at TEXT NOT NULL,
+    PRIMARY KEY (sensor, run_key)
+);
 ```
+
+`sensor_run_keys` is what makes a keyed sensor request
+[effectively-once](sensors.md#run-keys). the row is inserted in the same
+transaction that creates the run it names, never before and never after: a key
+recorded for a run that was never created would drop that work forever, and
+silently, which is worse than the duplicate the key exists to prevent. the
+primary key is the claim, so two evaluations racing the same key still launch
+one run. `run_id` is a record of which run took the key rather than a foreign
+key — retention deletes runs and leaves keys, which is the right way round.
 
 `runs.error` is the run's own failure summary: the first op that terminally
 failed, as `op {name} failed: {message}`, written in the same statement as
@@ -199,7 +218,11 @@ adds the `backfills` table ([backfills](assets.md#backfills)); version 10
 adds the `freshness_state` table ([freshness](freshness.md)), `schedules.cursor`
 and `schedules.catchup` ([catch-up](scheduling.md#missed-fire-catch-up)) and
 `runs.scheduled_for`, the logical time a scheduled or caught-up run stands
-for. an older file at any version opens straight into v10, rows intact — the v8 rebuild copies
+for; version 11 adds the `sensor_run_keys` table
+([run keys](sensors.md#run-keys)) plus `sensor_ticks.skipped` and
+`sensor_ticks.duration_ms`, which existing ticks read as 0 — they were never
+measured, and 0 is the only honest thing to say about that. an older file at
+any version opens straight into v11, rows intact — the v8 rebuild copies
 every keyed materialization across, where it becomes that asset's first
 history entry and stays its current one, and v9 leaves every existing row
 with a null partition, which is exactly what an unpartitioned asset is. every
@@ -207,7 +230,7 @@ pending step
 and the version stamp run in one transaction
 (sqlite DDL is transactional), so a crash or failure mid-migration leaves
 the file exactly as it was found, never half-migrated. a database stamped
-with a version newer than the build refuses to open (`db schema v11 is newer
+with a version newer than the build refuses to open (`db schema v12 is newer
 than this build`) instead of quietly writing an older stamp over it.
 
 one wrinkle: databases written before the migration mechanism existed carry

@@ -19,7 +19,7 @@ use crate::model::{
 };
 use crate::op::{self, Cancel, MetaBuf, Op, OpCtx};
 use crate::resource::{self, Resources};
-use crate::store::Store;
+use crate::store::{RunKey, Store};
 
 /// how far back a resume follows `resumed_from` links. resuming a resume is
 /// normal; a chain this long is a bug, and the walk says so instead of looping.
@@ -337,14 +337,38 @@ impl Runner {
         trigger: Trigger,
         scheduled_for: Option<DateTime<Utc>>,
     ) -> Result<String, Error> {
-        let (id, fut) = self.prepare(job, None, params, trigger, None, scheduled_for)?;
+        let (id, fut) = self
+            .prepare(job, None, params, trigger, None, scheduled_for, None)?
+            .expect("only a claimed run key skips a launch");
         tokio::spawn(fut);
         Ok(id)
     }
 
+    /// [`Runner::launch`] for a request carrying a [run
+    /// key](crate::RunRequest::key): the key is claimed in the same
+    /// transaction that creates the run, so it can never name a run that was
+    /// not created. `Ok(None)` is a key already claimed — nothing launched,
+    /// and nothing failed.
+    pub(crate) fn launch_keyed(
+        &self,
+        job: &str,
+        params: Value,
+        trigger: Trigger,
+        key: RunKey<'_>,
+    ) -> Result<Option<String>, Error> {
+        let Some((id, fut)) = self.prepare(job, None, params, trigger, None, None, Some(key))?
+        else {
+            return Ok(None);
+        };
+        tokio::spawn(fut);
+        Ok(Some(id))
+    }
+
     /// like [`Runner::launch`] but awaits completion.
     pub async fn run(&self, job: &str, params: Value, trigger: Trigger) -> Result<Run, Error> {
-        let (id, fut) = self.prepare(job, None, params, trigger, None, None)?;
+        let (id, fut) = self
+            .prepare(job, None, params, trigger, None, None, None)?
+            .expect("only a claimed run key skips a launch");
         // spawned so that dropping this future (timeout, select) detaches the
         // run instead of aborting its ops mid-write
         let _ = tokio::spawn(fut).await;
@@ -363,14 +387,17 @@ impl Runner {
         trigger: Trigger,
         resumed_from: Option<&str>,
     ) -> Result<String, Error> {
-        let (id, fut) = self.prepare(
-            job,
-            Some((ops, seeded)),
-            params,
-            trigger,
-            resumed_from,
-            None,
-        )?;
+        let (id, fut) = self
+            .prepare(
+                job,
+                Some((ops, seeded)),
+                params,
+                trigger,
+                resumed_from,
+                None,
+                None,
+            )?
+            .expect("only a claimed run key skips a launch");
         tokio::spawn(fut);
         Ok(id)
     }
@@ -593,7 +620,9 @@ impl Runner {
         params: Value,
         trigger: Trigger,
     ) -> Result<Run, Error> {
-        let (id, fut) = self.prepare(job, Some((ops, seeded)), params, trigger, None, None)?;
+        let (id, fut) = self
+            .prepare(job, Some((ops, seeded)), params, trigger, None, None, None)?
+            .expect("only a claimed run key skips a launch");
         let _ = tokio::spawn(fut).await;
         Ok(self.store.run(&id)?.expect("run row written at launch"))
     }
@@ -618,6 +647,9 @@ impl Runner {
         }
     }
 
+    /// build the run row and the future that executes it. `Ok(None)` only ever
+    /// comes back for a `key` another run already claimed.
+    #[allow(clippy::too_many_arguments)]
     fn prepare(
         &self,
         job: &str,
@@ -626,7 +658,8 @@ impl Runner {
         trigger: Trigger,
         resumed_from: Option<&str>,
         scheduled_for: Option<DateTime<Utc>>,
-    ) -> Result<(String, impl Future<Output = ()> + Send + 'static), Error> {
+        key: Option<RunKey<'_>>,
+    ) -> Result<Option<(String, impl Future<Output = ()> + Send + 'static)>, Error> {
         let job = self
             .jobs
             .get(job)
@@ -708,9 +741,18 @@ impl Runner {
             .lock()
             .unwrap()
             .insert(run.id.clone(), cancel_tx);
-        if let Err(e) = self.store.create_run(&run, &rows) {
-            self.active.lock().unwrap().remove(&run.id);
-            return Err(e);
+        match self.store.create_run_keyed(&run, &rows, key) {
+            Ok(true) => {}
+            // the key was claimed between the caller's check and this insert:
+            // no run row was written, so there is nothing to unwind but this
+            Ok(false) => {
+                self.active.lock().unwrap().remove(&run.id);
+                return Ok(None);
+            }
+            Err(e) => {
+                self.active.lock().unwrap().remove(&run.id);
+                return Err(e);
+            }
         }
         let id = run.id.clone();
         let fut = execute(
@@ -724,7 +766,7 @@ impl Runner {
             pending,
             seeded,
         );
-        Ok((id, fut))
+        Ok(Some((id, fut)))
     }
 }
 

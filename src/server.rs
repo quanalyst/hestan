@@ -2916,12 +2916,13 @@ mod tests {
             .set_sensor_cursor("watch", &json!({"mtime": 5}))
             .unwrap();
         store
-            .record_sensor_tick("watch", crate::SensorOutcome::Fired, 2, None)
+            .record_sensor_tick("watch", crate::SensorOutcome::Fired, 2, 1, None)
             .unwrap();
         store
             .record_sensor_tick(
                 "probe:docs",
                 crate::SensorOutcome::Error,
+                0,
                 0,
                 Some("no such dir"),
             )

@@ -292,7 +292,9 @@ impl Hestan {
     }
 
     /// at startup, delete terminal runs older than `days` days with their op runs
-    /// and events. active runs and op state survive; the default keeps everything.
+    /// and events, plus [sensor run keys](crate::RunRequest::key) claimed before
+    /// the same cutoff. active runs and op state survive; the default keeps
+    /// everything, run keys included.
     pub fn retention_days(mut self, days: u32) -> Self {
         self.retention_days = Some(days);
         self
@@ -523,6 +525,12 @@ impl Hestan {
             let removed = store.prune_runs(cutoff)?;
             if removed > 0 {
                 tracing::info!("retention: removed {removed} runs older than {days} days");
+            }
+            // sensor run keys are never collected on their own: a sensor keyed
+            // by the day would keep a row per day for as long as the file lives
+            let keys = store.prune_sensor_run_keys(cutoff)?;
+            if keys > 0 {
+                tracing::info!("retention: removed {keys} sensor run keys older than {days} days");
             }
         }
         let io = Io::new(self.io_default, self.io_named);

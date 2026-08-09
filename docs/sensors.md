@@ -16,7 +16,7 @@ let marker_watch = Sensor::new("marker_file", Duration::from_secs(5), |ctx| asyn
         return Ok(Vec::new()); // seen it already
     }
     ctx.set_cursor(json!(mtime));
-    Ok(vec![RunRequest { job: "ingest_marker".into(), params: json!({}) }])
+    Ok(vec![RunRequest::new("ingest_marker").key(mtime.to_string())])
 });
 
 Hestan::new().sensor(marker_watch) // stackable
@@ -52,6 +52,39 @@ evaluation committed. commit-on-success is what makes the marker example
 correct: if the launch fails, the mtime is not recorded, so the file is
 retried instead of silently dropped.
 
+## Run keys
+
+at-least-once is defensible, but it puts deduplication on every caller. a run
+key moves it into hestan:
+
+```rust
+RunRequest::new("publish").params(json!({"day": day})).key(day)
+```
+
+a keyed request launches **at most once per key, ever, for that sensor**. the
+loop reads the key before launching and skips a claimed one — the tick counts
+it under `skipped` rather than `launched` — and the key itself is written in
+the same transaction that creates the run. that is the part that matters: a key
+recorded for a run that never launched would drop that work forever and nobody
+would ever notice, which is strictly worse than the duplicate a key exists to
+prevent. insert-then-delete-on-failure has that window; one transaction does
+not. a launch that fails leaves no key, so the next evaluation asks again.
+
+so a key turns at-least-once into **effectively-once per sensor**. per sensor:
+keys are scoped to the name that used them, two sensors may use the same string
+for different things, and nothing looks across them. a keyless request is
+unchanged — at-least-once, exactly as before — which is still the right default
+for work that is naturally idempotent.
+
+pick a key that names the *work*, not the moment: the partition, the day, the
+upstream run id, the file's mtime. `"2026-08-09"` is a key; `Utc::now()` is not.
+
+**keys are never collected on their own.** a daily-keyed sensor writes a row a
+day for as long as the database exists.
+[`retention_days(n)`](storage.md#retention) prunes them on the same cutoff it
+prunes runs on; without it they accumulate. that is deliberate — a key deleted
+early is a duplicate launch, so nothing throws one away by default.
+
 ## Probes are sensors
 
 every source asset with a [probe](assets.md) becomes an internal sensor
@@ -83,7 +116,7 @@ the outside world:
 ```rust
 Hestan::new().run_sensor(
     RunStatusSensor::new("chain", |_ctx, run: RunSummary| async move {
-        Ok(vec![RunRequest { job: "publish".into(), params: json!({"from": run.id}) }])
+        Ok(vec![RunRequest::new("publish").params(json!({"from": run.id}))])
     })
     .on([RunStatus::Success])      // which terminal statuses; success by default
     .for_job("orders_etl")         // optional; every job when absent
@@ -112,7 +145,8 @@ what comes back, and commits the cursor **only after every launch succeeded**.
 that is the same at-least-once contract a user sensor has, and it has the same
 consequence: a launch that fails halfway leaves the cursor where it was, so the
 runs already handled are handed over again on the next tick. downstream work
-should tolerate a duplicate request.
+should tolerate a duplicate request — or the chain should give each request a
+[run key](#run-keys), and `.key(run.id)` is the obvious one here.
 
 the cursor covers every run *read*, not every run matched, so a filtered-out
 failure is consumed rather than re-read forever. a page is capped at 200 runs
@@ -143,7 +177,8 @@ movement. its schedule keeps ticking over regardless, so resuming picks up
 at the next interval rather than with a burst of catch-ups.
 
 every evaluation of an unpaused sensor lands in `sensor_ticks`: outcome
-(`fired | error`), how many runs launched, the error message if any.
+(`fired | error`), how many runs launched, how many keyed requests were
+skipped, the error message if any.
 `GET /api/sensors/ticks?sensor=&limit=` reads it newest-first; at boot the
 table is pruned to the newest 5000, the same policy as schedule ticks.
 

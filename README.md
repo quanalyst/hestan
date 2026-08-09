@@ -199,6 +199,10 @@ appears.
   (`RunStatusSensor::new("chain", f).on([RunStatus::Success]).for_job("etl")` —
   "when job A succeeds, run job B") are two more sources on that same loop, not
   loops of their own, so all three share pausing, cursors and tick history
+- a sensor request can carry a run key — `RunRequest::new("publish").key(day)` —
+  which turns at-least-once into effectively-once per sensor. the key is
+  claimed in the same transaction that creates the run, so it can never name a
+  run that did not launch
 - freshness policies are declarations, not guesses: `fresh_within(d)` on a job
   or an asset says how old its latest success may get, and past that it is
   `late` — per key on a partitioned asset, so one late partition carries the

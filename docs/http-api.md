@@ -527,7 +527,7 @@ sensors, then probes in asset topo order:
     "cursor": 1786186914014, "filter": null,
     "last_tick": { "id": 7, "sensor": "marker_file",
       "evaluated_at": "2026-08-08T11:02:06Z", "outcome": "fired",
-      "launched": 1, "error": null } },
+      "launched": 1, "skipped": 0, "error": null } },
   { "name": "run:chain", "every_secs": 15, "paused": false,
     "cursor": { "finished_at": "2026-08-08T11:02:04Z", "id": "0198f2a4-..." },
     "filter": { "job": "orders_etl", "statuses": ["success"] },
@@ -550,7 +550,10 @@ are skipped without ticks and resume on their normal interval.
 first (`limit` defaults to 20, clamps to 1..=200; empty `sensor` means
 all). `outcome` is `fired` (the evaluation completed; `launched` says how
 many runs it asked for, usually 0) or `error` (with the message in
-`error`; the cursor was not moved).
+`error`; the cursor was not moved). `skipped` counts the requests whose
+[run key](sensors.md#run-keys) was already claimed, so they were not launched
+a second time — a keyed sensor in its steady state reports
+`launched: 0, skipped: n`, which is not the same fact as launching nothing.
 
 ## Schedules
 

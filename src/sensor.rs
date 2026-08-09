@@ -13,14 +13,64 @@ use tokio::time::Instant;
 use crate::asset::{
     ASSETS_JOB, AssetRegistry, ProbeFn, launch_plan, mats_map, plan_targets, staleness,
 };
+use crate::error::Error;
 use crate::executor::Runner;
 use crate::model::{Run, RunCursor, RunStatus, SensorOutcome, Trigger};
 use crate::op::InputError;
+use crate::store::RunKey;
 
-/// what a sensor evaluation asks for: launch `job` with `params`.
+/// what a sensor evaluation asks for: launch `job` with `params`, at most once
+/// per [`key`](Self::key) if it names one.
+///
+/// ```no_run
+/// # use hestan::RunRequest;
+/// # use serde_json::json;
+/// RunRequest::new("publish")
+///     .params(json!({ "day": "2026-08-09" }))
+///     .key("2026-08-09");
+/// ```
 pub struct RunRequest {
     pub job: String,
     pub params: Value,
+    /// the [run key](Self::key) this request launches under; `None` is the
+    /// at-least-once default.
+    pub key: Option<String>,
+}
+
+impl RunRequest {
+    /// a request to launch `job` with params `{}` and no run key.
+    pub fn new(job: impl Into<String>) -> RunRequest {
+        RunRequest {
+            job: job.into(),
+            params: json!({}),
+            key: None,
+        }
+    }
+
+    /// what the run launches with; `{}` unless this is called.
+    pub fn params(mut self, params: Value) -> RunRequest {
+        self.params = params;
+        self
+    }
+
+    /// launch this at most once per key, ever, for this sensor.
+    ///
+    /// sensors are at-least-once by design — a partial launch failure replays
+    /// the whole batch, and so does a cursor write that failed — so a key is
+    /// what turns that into **effectively-once per sensor**: the key is
+    /// claimed in the same transaction that creates the run, and a request
+    /// naming a claimed key is skipped rather than launched. keys are scoped
+    /// to the sensor that used them, so two sensors may use the same string
+    /// and mean different things.
+    ///
+    /// keys are never collected on their own. a sensor keyed by the day keeps
+    /// a row per day for as long as the file exists unless
+    /// [`retention_days`](crate::Hestan::retention_days) is set, which prunes
+    /// them on the same cutoff as runs.
+    pub fn key(mut self, key: impl Into<String>) -> RunRequest {
+        self.key = Some(key.into());
+        self
+    }
 }
 
 type SensorFn = dyn Fn(
@@ -110,10 +160,9 @@ type RunSensorFn = dyn Fn(
 /// # use std::time::Duration;
 /// Hestan::new().run_sensor(
 ///     RunStatusSensor::new("chain", |_ctx, run: RunSummary| async move {
-///         Ok(vec![RunRequest {
-///             job: "publish".into(),
-///             params: json!({ "from": run.id }),
-///         }])
+///         Ok(vec![
+///             RunRequest::new("publish").params(json!({ "from": run.id })),
+///         ])
 ///     })
 ///     .on([RunStatus::Success])
 ///     .for_job("orders_etl")
@@ -311,20 +360,75 @@ fn sensor_paused(runner: &Runner, name: &str) -> bool {
     }
 }
 
+/// what one evaluation did, beside how it ended: runs it launched, and keyed
+/// requests it skipped because the key was already claimed.
+#[derive(Default)]
+struct Counts {
+    launched: u32,
+    skipped: u32,
+}
+
 async fn evaluate(entry: &SensorEntry, runner: &Runner, registry: &AssetRegistry) {
-    let (outcome, launched, error) = match &entry.eval {
+    let (outcome, counts, error) = match &entry.eval {
         SensorEval::User(f) => evaluate_user(&entry.name, f, runner).await,
         SensorEval::Probe { asset, probe } => evaluate_probe(asset, probe, runner, registry).await,
         SensorEval::Runs { statuses, job, f } => {
             evaluate_runs(&entry.name, statuses, job.as_deref(), f, runner).await
         }
     };
-    if let Err(e) =
-        runner
-            .store()
-            .record_sensor_tick(&entry.name, outcome, launched, error.as_deref())
-    {
+    if let Err(e) = runner.store().record_sensor_tick(
+        &entry.name,
+        outcome,
+        counts.launched,
+        counts.skipped,
+        error.as_deref(),
+    ) {
         tracing::warn!(sensor = %entry.name, "tick write failed: {e}");
+    }
+}
+
+/// what launching one request did.
+enum Fired {
+    Launched,
+    /// its run key was already claimed, so it is not launched again.
+    Skipped,
+}
+
+/// launch one request under its run key, if it has one. the error is the
+/// message that fails the whole evaluation.
+///
+/// the key is read first and claimed inside the run's own transaction, so a
+/// launch that fails leaves no key behind and a key that exists always names a
+/// run that does. a read that fails skips nothing and launches nothing: not
+/// being able to tell whether a key is claimed is not a licence to duplicate.
+fn launch_request(sensor: &str, req: RunRequest, runner: &Runner) -> Result<Fired, String> {
+    let RunRequest { job, params, key } = req;
+    let fail = |e: Error| format!("launch of job {job:?} failed: {e}");
+    let Some(key) = key.as_deref() else {
+        return match runner.launch(&job, params, Trigger::Sensor) {
+            Ok(run_id) => {
+                tracing::info!(sensor = %sensor, job = %job, run = %run_id, "sensor fired");
+                Ok(Fired::Launched)
+            }
+            Err(e) => Err(fail(e)),
+        };
+    };
+    match runner.store().run_key_claimed(sensor, key) {
+        Ok(true) => {
+            tracing::info!(sensor = %sensor, job = %job, key = %key, "run key already launched");
+            return Ok(Fired::Skipped);
+        }
+        Ok(false) => {}
+        Err(e) => return Err(format!("run key read failed: {e}")),
+    }
+    match runner.launch_keyed(&job, params, Trigger::Sensor, RunKey { sensor, key }) {
+        Ok(Some(run_id)) => {
+            tracing::info!(sensor = %sensor, job = %job, key = %key, run = %run_id, "sensor fired");
+            Ok(Fired::Launched)
+        }
+        // claimed between the read and the insert; one launch either way
+        Ok(None) => Ok(Fired::Skipped),
+        Err(e) => Err(fail(e)),
     }
 }
 
@@ -332,7 +436,7 @@ async fn evaluate_user(
     name: &str,
     f: &Arc<SensorFn>,
     runner: &Runner,
-) -> (SensorOutcome, u32, Option<String>) {
+) -> (SensorOutcome, Counts, Option<String>) {
     let cursor = match runner.store().sensors() {
         Ok(rows) => rows
             .into_iter()
@@ -365,21 +469,18 @@ async fn evaluate_user(
         Ok(r) => r,
         Err(msg) => {
             tracing::warn!(sensor = %name, "evaluation failed: {msg}");
-            return (SensorOutcome::Error, 0, Some(msg));
+            return (SensorOutcome::Error, Counts::default(), Some(msg));
         }
     };
-    let mut launched = 0u32;
+    let mut counts = Counts::default();
     for req in requests {
-        match runner.launch(&req.job, req.params, Trigger::Sensor) {
-            Ok(run_id) => {
-                tracing::info!(sensor = %name, job = %req.job, run = %run_id, "sensor fired");
-                launched += 1;
-            }
+        match launch_request(name, req, runner) {
+            Ok(Fired::Launched) => counts.launched += 1,
+            Ok(Fired::Skipped) => counts.skipped += 1,
             // a launch failure fails the evaluation: the cursor stays put
-            Err(e) => {
-                let msg = format!("launch of job {:?} failed: {e}", req.job);
+            Err(msg) => {
                 tracing::warn!(sensor = %name, "{msg}");
-                return (SensorOutcome::Error, launched, Some(msg));
+                return (SensorOutcome::Error, counts, Some(msg));
             }
         }
     }
@@ -390,11 +491,11 @@ async fn evaluate_user(
         tracing::warn!(sensor = %name, "cursor write failed: {e}");
         return (
             SensorOutcome::Error,
-            launched,
+            counts,
             Some(format!("cursor write failed: {e}")),
         );
     }
-    (SensorOutcome::Fired, launched, None)
+    (SensorOutcome::Fired, counts, None)
 }
 
 /// one run-status evaluation: read the terminal runs past the cursor, hand each
@@ -406,17 +507,19 @@ async fn evaluate_user(
 /// the end: a launch that fails halfway leaves the cursor where it was, so the
 /// runs already handled are handed over again next tick. that is the same
 /// at-least-once contract a user sensor has, for the same reason — a sensor
-/// that could lose an event would be worse than one that repeats it.
+/// that could lose an event would be worse than one that repeats it. a request
+/// carrying a [run key](RunRequest::key) is the way out of the replay: the
+/// second sight of it is skipped rather than launched.
 async fn evaluate_runs(
     name: &str,
     statuses: &[RunStatus],
     job: Option<&str>,
     f: &Arc<RunSensorFn>,
     runner: &Runner,
-) -> (SensorOutcome, u32, Option<String>) {
+) -> (SensorOutcome, Counts, Option<String>) {
     let stored = match sensor_cursor(runner, name) {
         Ok(c) => c,
-        Err(msg) => return (SensorOutcome::Error, 0, Some(msg)),
+        Err(msg) => return (SensorOutcome::Error, Counts::default(), Some(msg)),
     };
     let cursor: Option<RunCursor> = match &stored {
         Some(v) => match serde_json::from_value(v.clone()) {
@@ -434,8 +537,8 @@ async fn evaluate_runs(
         // a new run sensor starts from now: it chains what happens next, not
         // the run log it was added to
         return match seed_cursor(runner, name, job) {
-            Ok(()) => (SensorOutcome::Fired, 0, None),
-            Err(msg) => (SensorOutcome::Error, 0, Some(msg)),
+            Ok(()) => (SensorOutcome::Fired, Counts::default(), None),
+            Err(msg) => (SensorOutcome::Error, Counts::default(), Some(msg)),
         };
     };
     let runs = match runner
@@ -443,16 +546,16 @@ async fn evaluate_runs(
         .terminal_runs_after(job, Some(&cursor), RUN_SENSOR_PAGE)
     {
         Ok(r) => r,
-        Err(e) => return (SensorOutcome::Error, 0, Some(e.to_string())),
+        Err(e) => return (SensorOutcome::Error, Counts::default(), Some(e.to_string())),
     };
     let Some(last) = runs.last() else {
-        return (SensorOutcome::Fired, 0, None);
+        return (SensorOutcome::Fired, Counts::default(), None);
     };
     let seen = RunCursor {
         finished_at: last.finished_at.expect("terminal runs carry a finish time"),
         id: last.id.clone(),
     };
-    let mut launched = 0u32;
+    let mut counts = Counts::default();
     for run in runs.iter().filter(|r| statuses.contains(&r.status)) {
         let ctx = SensorCtx {
             cursor: stored.clone(),
@@ -474,19 +577,16 @@ async fn evaluate_runs(
             Ok(r) => r,
             Err(msg) => {
                 tracing::warn!(sensor = %name, run = %run.id, "evaluation failed: {msg}");
-                return (SensorOutcome::Error, launched, Some(msg));
+                return (SensorOutcome::Error, counts, Some(msg));
             }
         };
         for req in requests {
-            match runner.launch(&req.job, req.params, Trigger::Sensor) {
-                Ok(run_id) => {
-                    tracing::info!(sensor = %name, job = %req.job, run = %run_id, "sensor fired");
-                    launched += 1;
-                }
-                Err(e) => {
-                    let msg = format!("launch of job {:?} failed: {e}", req.job);
+            match launch_request(name, req, runner) {
+                Ok(Fired::Launched) => counts.launched += 1,
+                Ok(Fired::Skipped) => counts.skipped += 1,
+                Err(msg) => {
                     tracing::warn!(sensor = %name, "{msg}");
-                    return (SensorOutcome::Error, launched, Some(msg));
+                    return (SensorOutcome::Error, counts, Some(msg));
                 }
             }
         }
@@ -496,11 +596,11 @@ async fn evaluate_runs(
         tracing::warn!(sensor = %name, "cursor write failed: {e}");
         return (
             SensorOutcome::Error,
-            launched,
+            counts,
             Some(format!("cursor write failed: {e}")),
         );
     }
-    (SensorOutcome::Fired, launched, None)
+    (SensorOutcome::Fired, counts, None)
 }
 
 fn sensor_cursor(runner: &Runner, name: &str) -> Result<Option<Value>, String> {
@@ -538,24 +638,24 @@ async fn evaluate_probe(
     probe: &Arc<ProbeFn>,
     runner: &Runner,
     registry: &AssetRegistry,
-) -> (SensorOutcome, u32, Option<String>) {
+) -> (SensorOutcome, Counts, Option<String>) {
     let fingerprint = match AssertUnwindSafe(async { probe().await })
         .catch_unwind()
         .await
     {
         Ok(Ok(fp)) => fp,
-        Ok(Err(e)) => return (SensorOutcome::Error, 0, Some(e.to_string())),
+        Ok(Err(e)) => return (SensorOutcome::Error, Counts::default(), Some(e.to_string())),
         Err(panic) => {
             let msg = match panic_payload(panic.as_ref()) {
                 Some(s) => format!("probe panicked: {s}"),
                 None => "probe panicked".to_string(),
             };
-            return (SensorOutcome::Error, 0, Some(msg));
+            return (SensorOutcome::Error, Counts::default(), Some(msg));
         }
     };
     let current = match runner.store().materialization(asset, None) {
         Ok(m) => m.map(|m| m.fingerprint),
-        Err(e) => return (SensorOutcome::Error, 0, Some(e.to_string())),
+        Err(e) => return (SensorOutcome::Error, Counts::default(), Some(e.to_string())),
     };
     if current.as_deref() != Some(fingerprint.as_str()) {
         tracing::info!(asset = %asset, "probe saw a new fingerprint");
@@ -568,14 +668,21 @@ async fn evaluate_probe(
             None,
             None,
         ) {
-            return (SensorOutcome::Error, 0, Some(e.to_string()));
+            return (SensorOutcome::Error, Counts::default(), Some(e.to_string()));
         }
     }
     // changed or not: the fingerprint commits before any launch, so re-deriving
     // every tick is what heals a launch that failed after the commit
     match launch_stale_auto(asset, runner, registry) {
-        Ok(launched) => (SensorOutcome::Fired, launched, None),
-        Err(msg) => (SensorOutcome::Error, 0, Some(msg)),
+        Ok(launched) => (
+            SensorOutcome::Fired,
+            Counts {
+                launched,
+                skipped: 0,
+            },
+            None,
+        ),
+        Err(msg) => (SensorOutcome::Error, Counts::default(), Some(msg)),
     }
 }
 
@@ -674,14 +781,8 @@ mod tests {
             Duration::from_secs(3600),
             |_ctx: SensorCtx| async move {
                 Ok(vec![
-                    RunRequest {
-                        job: "etl".into(),
-                        params: json!({"shard": 1}),
-                    },
-                    RunRequest {
-                        job: "etl".into(),
-                        params: json!({"shard": 2}),
-                    },
+                    RunRequest::new("etl").params(json!({"shard": 1})),
+                    RunRequest::new("etl").params(json!({"shard": 2})),
                 ])
             },
         ));
@@ -732,10 +833,7 @@ mod tests {
                         }
                         _ => {
                             ctx.set_cursor(json!(3));
-                            Ok(vec![RunRequest {
-                                job: "ghost".into(),
-                                params: json!({}),
-                            }])
+                            Ok(vec![RunRequest::new("ghost").params(json!({}))])
                         }
                     }
                 }
@@ -771,10 +869,7 @@ mod tests {
             Duration::from_secs(3600),
             |ctx: SensorCtx| async move {
                 ctx.set_cursor(json!("seen"));
-                Ok(vec![RunRequest {
-                    job: "etl".into(),
-                    params: json!({"n": 4}),
-                }])
+                Ok(vec![RunRequest::new("etl").params(json!({"n": 4}))])
             },
         ));
         evaluate(&entry, &runner, &AssetRegistry::empty()).await;
@@ -1126,10 +1221,9 @@ mod tests {
     /// `publish` runs it launches and feed itself.
     fn publish_chain(name: &str) -> RunStatusSensor {
         RunStatusSensor::new(name, |_ctx, run: RunSummary| async move {
-            Ok(vec![RunRequest {
-                job: "publish".into(),
-                params: json!({"from": run.id, "job": run.job, "status": run.status}),
-            }])
+            Ok(vec![RunRequest::new("publish").params(
+                json!({"from": run.id, "job": run.job, "status": run.status}),
+            )])
         })
         .for_job("etl")
     }
@@ -1254,10 +1348,9 @@ mod tests {
                 if run.trigger != Trigger::Manual {
                     return Ok(vec![]);
                 }
-                Ok(vec![RunRequest {
-                    job: "publish".into(),
-                    params: json!({"echo": run.id}),
-                }])
+                Ok(vec![
+                    RunRequest::new("publish").params(json!({"echo": run.id})),
+                ])
             })
             .for_job("publish"),
         );
@@ -1298,10 +1391,7 @@ mod tests {
                         1 => "ghost",
                         _ => "publish",
                     };
-                    Ok(vec![RunRequest {
-                        job: job.into(),
-                        params: json!({"from": run.id}),
-                    }])
+                    Ok(vec![RunRequest::new(job).params(json!({"from": run.id}))])
                 }
             })
             .for_job("etl"),
@@ -1365,5 +1455,153 @@ mod tests {
         handle.abort();
         assert_eq!(published(&store).len(), 1, "resuming did not chain the run");
         assert!(store.sensor_ticks(Some("run:chain"), 20).unwrap().len() > paused_ticks);
+    }
+
+    // ---- run keys ------------------------------------------------------
+
+    /// a sensor that asks for the same two runs every evaluation: one under a
+    /// run key and one without, so a single test watches both contracts.
+    fn keyed_entry(name: &str, key: &str) -> SensorEntry {
+        let key = key.to_string();
+        SensorEntry::user(Sensor::new(
+            name,
+            Duration::from_secs(3600),
+            move |_ctx: SensorCtx| {
+                let key = key.clone();
+                async move {
+                    Ok(vec![
+                        RunRequest::new("etl")
+                            .params(json!({"kind": "keyed"}))
+                            .key(key),
+                        RunRequest::new("etl").params(json!({"kind": "keyless"})),
+                    ])
+                }
+            },
+        ))
+    }
+
+    fn launched_kinds(store: &Store) -> Vec<String> {
+        let mut runs = store.runs(None, None, None, None, 20).unwrap();
+        runs.sort_by_key(|r| r.created_at);
+        runs.iter()
+            .map(|r| r.params["kind"].as_str().unwrap_or("?").to_string())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_run_key_launches_once_while_a_keyless_request_replays() {
+        let store = Store::open(":memory:").unwrap();
+        store.sync_sensors(&["watch".into()]).unwrap();
+        let runner = echo_runner(store.clone());
+        let entry = keyed_entry("watch", "2026-08-09");
+        let reg = AssetRegistry::empty();
+
+        evaluate(&entry, &runner, &reg).await;
+        evaluate(&entry, &runner, &reg).await;
+
+        assert_eq!(launched_kinds(&store), ["keyed", "keyless", "keyless"]);
+        let ticks = store.sensor_ticks(Some("watch"), 10).unwrap();
+        assert_eq!((ticks[1].launched, ticks[1].skipped), (2, 0));
+        assert_eq!(
+            (ticks[0].launched, ticks[0].skipped),
+            (1, 1),
+            "the second evaluation should report the keyed request as skipped"
+        );
+        assert!(ticks.iter().all(|t| t.outcome == SensorOutcome::Fired));
+
+        // the key belongs to the sensor that used it, not to the process
+        assert!(store.run_key_claimed("watch", "2026-08-09").unwrap());
+        assert!(!store.run_key_claimed("other", "2026-08-09").unwrap());
+    }
+
+    #[tokio::test]
+    async fn a_failed_launch_leaves_no_run_key_behind() {
+        let store = Store::open(":memory:").unwrap();
+        store.sync_sensors(&["watch".into()]).unwrap();
+        let reg = AssetRegistry::empty();
+        let entry = SensorEntry::user(Sensor::new(
+            "watch",
+            Duration::from_secs(3600),
+            |_ctx: SensorCtx| async move {
+                Ok(vec![
+                    RunRequest::new("etl")
+                        .params(json!({"kind": "keyed"}))
+                        .key("once"),
+                ])
+            },
+        ));
+
+        // a runner that has never heard of the job: the launch fails, and a key
+        // recorded here would drop this work forever
+        let broken = Runner::new(Vec::<Job>::new(), store.clone());
+        evaluate(&entry, &broken, &reg).await;
+        let ticks = store.sensor_ticks(Some("watch"), 10).unwrap();
+        assert_eq!(ticks[0].outcome, SensorOutcome::Error);
+        assert_eq!((ticks[0].launched, ticks[0].skipped), (0, 0));
+        assert!(store.runs(None, None, None, None, 10).unwrap().is_empty());
+        assert!(
+            !store.run_key_claimed("watch", "once").unwrap(),
+            "a key outlived the launch it was supposed to record"
+        );
+
+        // so the work is still launchable, which is the whole point
+        let runner = echo_runner(store.clone());
+        evaluate(&entry, &runner, &reg).await;
+        assert_eq!(launched_kinds(&store), ["keyed"]);
+        assert!(store.run_key_claimed("watch", "once").unwrap());
+    }
+
+    #[tokio::test]
+    async fn a_replayed_batch_does_not_launch_a_keyed_request_twice() {
+        let store = Store::open(":memory:").unwrap();
+        store.sync_sensors(&["run:chain".into()]).unwrap();
+        let runner = chain_runner(store.clone());
+        let reg = AssetRegistry::empty();
+        // the same partial failure as the at-least-once test above — the second
+        // request names a job nobody registered — with each request keyed by the
+        // run that triggered it
+        let calls = Arc::new(AtomicU32::new(0));
+        let counter = calls.clone();
+        let entry = chain_entry(
+            "chain",
+            RunStatusSensor::new("chain", move |_ctx, run: RunSummary| {
+                let calls = counter.clone();
+                async move {
+                    let job = match calls.fetch_add(1, Ordering::SeqCst) {
+                        1 => "ghost",
+                        _ => "publish",
+                    };
+                    Ok(vec![
+                        RunRequest::new(job)
+                            .params(json!({"from": run.id}))
+                            .key(run.id),
+                    ])
+                }
+            })
+            .for_job("etl"),
+        );
+        evaluate(&entry, &runner, &reg).await;
+        let first = finish(&runner, "etl", json!({})).await;
+        let second = finish(&runner, "etl", json!({})).await;
+
+        evaluate(&entry, &runner, &reg).await;
+        assert_eq!(
+            store.sensor_ticks(Some("run:chain"), 10).unwrap()[0].outcome,
+            SensorOutcome::Error
+        );
+        evaluate(&entry, &runner, &reg).await;
+
+        // the replay hands the first run over again, and its key stops the
+        // second publish that at-least-once would otherwise have launched
+        assert_eq!(
+            published(&store)
+                .iter()
+                .map(|p| p["from"].clone())
+                .collect::<Vec<_>>(),
+            [json!(first), json!(second)]
+        );
+        let ticks = store.sensor_ticks(Some("run:chain"), 10).unwrap();
+        assert_eq!((ticks[0].launched, ticks[0].skipped), (1, 1));
+        assert_eq!(cursor_of(&store, "run:chain").unwrap()["id"], json!(second));
     }
 }

@@ -214,7 +214,26 @@ ALTER TABLE schedules ADD COLUMN catchup TEXT NOT NULL DEFAULT 'skip';
 ALTER TABLE runs ADD COLUMN scheduled_for TEXT;
 "#;
 
-const SCHEMA_VERSION: u32 = 10;
+// run keys, which turn a sensor's at-least-once launching into effectively-once
+// per sensor. the key is claimed in the same transaction that creates the run,
+// so a key can never name a run that was never created — a key recorded for a
+// run that did not launch drops that work forever, which is strictly worse than
+// the duplicate the key exists to prevent. the two `sensor_ticks` columns are
+// the same phase's last part — how long an evaluation took and how many keyed
+// requests it skipped — landed here so nothing after this migrates again.
+const SCHEMA_V11: &str = r#"
+CREATE TABLE sensor_run_keys (
+    sensor TEXT NOT NULL,
+    run_key TEXT NOT NULL,
+    run_id TEXT NOT NULL,
+    launched_at TEXT NOT NULL,
+    PRIMARY KEY (sensor, run_key)
+);
+ALTER TABLE sensor_ticks ADD COLUMN skipped INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE sensor_ticks ADD COLUMN duration_ms INTEGER NOT NULL DEFAULT 0;
+"#;
+
+const SCHEMA_VERSION: u32 = 11;
 
 // one transaction around every pending step and the version stamp (sqlite DDL
 // is transactional), so a crash mid-migration leaves the db exactly as found
@@ -258,6 +277,9 @@ fn migrate(conn: &mut Connection) -> Result<(), Error> {
     if version < 10 {
         tx.execute_batch(SCHEMA_V10)?;
     }
+    if version < 11 {
+        tx.execute_batch(SCHEMA_V11)?;
+    }
     if version != SCHEMA_VERSION {
         tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     }
@@ -276,6 +298,15 @@ fn table_exists(conn: &Connection, name: &str) -> Result<bool, Error> {
     Ok(found.is_some())
 }
 
+/// the key a sensor-launched run claims: at most one run per `(sensor, key)`
+/// pair, ever. [`Store::create_run_keyed`] writes it in the same transaction as
+/// the run row, which is what makes the two impossible to disagree.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct RunKey<'a> {
+    pub sensor: &'a str,
+    pub key: &'a str,
+}
+
 /// sqlite-backed run history. cheap to clone; safe to share across tasks.
 #[derive(Clone)]
 pub struct Store(Arc<Mutex<Connection>>);
@@ -291,9 +322,47 @@ impl Store {
         Ok(Store(Arc::new(Mutex::new(conn))))
     }
 
+    /// [`create_run_keyed`](Self::create_run_keyed) with no key, which is what
+    /// every launch that is not a keyed sensor request does. tests plant runs
+    /// through it; the executor calls the keyed form and passes `None`.
+    #[cfg(test)]
     pub(crate) fn create_run(&self, run: &Run, ops: &[String]) -> Result<(), Error> {
+        self.create_run_keyed(run, ops, None).map(|_| ())
+    }
+
+    /// [`create_run`](Self::create_run) with the [run key](RunKey) this run
+    /// claims, inserted in the same transaction as the run row.
+    ///
+    /// same transaction rather than insert-then-delete-on-failure, because the
+    /// two failure modes are not equally bad: a duplicate launch is a request
+    /// the caller sees twice, while a key left behind for a run that never
+    /// launched drops that work forever and nothing ever notices. only a
+    /// transaction rules the second one out — a delete on the failure path
+    /// still leaves the window where the process dies between the insert and
+    /// the launch.
+    ///
+    /// returns false when the key was already claimed: nothing is written, and
+    /// the caller launches nothing.
+    pub(crate) fn create_run_keyed(
+        &self,
+        run: &Run,
+        ops: &[String],
+        key: Option<RunKey<'_>>,
+    ) -> Result<bool, Error> {
         let mut conn = self.0.lock().unwrap();
         let tx = conn.transaction()?;
+        if let Some(k) = key {
+            let claimed = tx.execute(
+                "INSERT OR IGNORE INTO sensor_run_keys (sensor, run_key, run_id, launched_at)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![k.sensor, k.key, run.id, Utc::now().to_rfc3339()],
+            )?;
+            // dropping the transaction rolls it back, so losing the claim
+            // leaves neither a run nor a key behind
+            if claimed == 0 {
+                return Ok(false);
+            }
+        }
         tx.execute(
             r#"INSERT INTO runs (id, job, status, "trigger", params, created_at, started_at,
                                  finished_at, error, resumed_from, scheduled_for)
@@ -332,7 +401,32 @@ impl Store {
             ],
         )?;
         tx.commit()?;
-        Ok(())
+        Ok(true)
+    }
+
+    /// whether `sensor` has already launched a run under `key`.
+    pub(crate) fn run_key_claimed(&self, sensor: &str, key: &str) -> Result<bool, Error> {
+        let conn = self.0.lock().unwrap();
+        let found = conn
+            .query_row(
+                "SELECT 1 FROM sensor_run_keys WHERE sensor = ?1 AND run_key = ?2",
+                params![sensor, key],
+                |_| Ok(()),
+            )
+            .optional()?;
+        Ok(found.is_some())
+    }
+
+    /// drop run keys claimed before `older_than`. nothing collects them on
+    /// their own — a sensor keyed by the day would keep a row per day for as
+    /// long as the file exists — so they ride the retention knob.
+    pub(crate) fn prune_sensor_run_keys(&self, older_than: DateTime<Utc>) -> Result<usize, Error> {
+        let conn = self.0.lock().unwrap();
+        let removed = conn.execute(
+            "DELETE FROM sensor_run_keys WHERE launched_at < ?1",
+            params![older_than.to_rfc3339()],
+        )?;
+        Ok(removed)
     }
 
     /// add a `pending` op_runs row to a run already under way, for one
@@ -1302,22 +1396,26 @@ impl Store {
         Ok(())
     }
 
+    /// `skipped` counts the requests this evaluation did not launch because
+    /// their run key was already claimed — distinct from launching nothing.
     pub(crate) fn record_sensor_tick(
         &self,
         sensor: &str,
         outcome: SensorOutcome,
         launched: u32,
+        skipped: u32,
         error: Option<&str>,
     ) -> Result<(), Error> {
         let conn = self.0.lock().unwrap();
         conn.execute(
-            "INSERT INTO sensor_ticks (sensor, evaluated_at, outcome, launched, error)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
+            "INSERT INTO sensor_ticks (sensor, evaluated_at, outcome, launched, skipped, error)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             params![
                 sensor,
                 Utc::now().to_rfc3339(),
                 outcome.as_str(),
                 launched,
+                skipped,
                 error
             ],
         )?;
@@ -1327,7 +1425,7 @@ impl Store {
     pub fn sensor_ticks(&self, sensor: Option<&str>, limit: u32) -> Result<Vec<SensorTick>, Error> {
         let conn = self.0.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT id, sensor, evaluated_at, outcome, launched, error
+            "SELECT id, sensor, evaluated_at, outcome, launched, skipped, error
              FROM sensor_ticks WHERE (?1 IS NULL OR sensor = ?1)
              ORDER BY id DESC LIMIT ?2",
         )?;
@@ -1477,7 +1575,8 @@ fn sensor_tick_from_row(row: &Row) -> rusqlite::Result<SensorTick> {
         evaluated_at: ts_col(row, 2)?,
         outcome: parse_col(row, 3)?,
         launched: row.get(4)?,
-        error: row.get(5)?,
+        skipped: row.get(5)?,
+        error: row.get(6)?,
     })
 }
 
@@ -2050,14 +2149,90 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("future.db");
         let path = path.to_str().unwrap();
-        phase1_db(path, 11);
+        phase1_db(path, 12);
         let err = Store::open(path).err().unwrap();
-        assert_eq!(err.to_string(), "db schema v11 is newer than this build");
+        assert_eq!(err.to_string(), "db schema v12 is newer than this build");
         let conn = Connection::open(path).unwrap();
         let version: u32 = conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 11);
+        assert_eq!(version, 12);
+    }
+
+    #[test]
+    fn v10_db_migrates_to_v11_keeping_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v10.db");
+        let path = path.to_str().unwrap();
+        // every batch up to v10, stamped 10: no run keys and no tick metrics
+        let conn = Connection::open(path).unwrap();
+        for batch in [
+            PHASE1_SCHEMA,
+            SCHEMA_V2,
+            SCHEMA_V3,
+            SCHEMA_V4,
+            SCHEMA_V5,
+            SCHEMA_V6,
+            SCHEMA_V7,
+            SCHEMA_V8,
+            SCHEMA_V9,
+            SCHEMA_V10,
+        ] {
+            conn.execute_batch(batch).unwrap();
+        }
+        conn.execute(
+            "INSERT INTO sensor_ticks (sensor, evaluated_at, outcome, launched)
+             VALUES ('watch', '2026-01-01T00:00:00+00:00', 'fired', 2)",
+            [],
+        )
+        .unwrap();
+        conn.pragma_update(None, "user_version", 10).unwrap();
+        drop(conn);
+
+        // an existing tick keeps its counts and reads zero for the new ones
+        let store = Store::open(path).unwrap();
+        let ticks = store.sensor_ticks(Some("watch"), 10).unwrap();
+        assert_eq!(ticks[0].launched, 2);
+        assert_eq!(ticks[0].skipped, 0);
+        assert!(!store.run_key_claimed("watch", "2026-01-01").unwrap());
+    }
+
+    #[test]
+    fn a_run_key_is_claimed_with_its_run_or_not_at_all() {
+        let store = Store::open(":memory:").unwrap();
+        let key = RunKey {
+            sensor: "watch",
+            key: "2026-08-09",
+        };
+        assert!(
+            store
+                .create_run_keyed(&mk_run("r1", "etl", Utc::now()), &["a".into()], Some(key))
+                .unwrap()
+        );
+        assert!(store.run_key_claimed("watch", "2026-08-09").unwrap());
+        assert_eq!(store.op_runs("r1").unwrap().len(), 1);
+
+        // the same key again writes nothing at all — no run, no op rows, no
+        // second key — because the whole thing is one transaction
+        assert!(
+            !store
+                .create_run_keyed(&mk_run("r2", "etl", Utc::now()), &["a".into()], Some(key))
+                .unwrap()
+        );
+        assert!(store.run("r2").unwrap().is_none());
+        assert!(store.op_runs("r2").unwrap().is_empty());
+        // and the key means nothing to another sensor
+        assert!(!store.run_key_claimed("other", "2026-08-09").unwrap());
+
+        let day = chrono::Duration::days(1);
+        assert_eq!(store.prune_sensor_run_keys(Utc::now() - day).unwrap(), 0);
+        assert_eq!(store.prune_sensor_run_keys(Utc::now() + day).unwrap(), 1);
+        assert!(
+            !store.run_key_claimed("watch", "2026-08-09").unwrap(),
+            "retention left the key behind"
+        );
+        // pruning a key does not touch the run it launched
+        assert!(store.run("r1").unwrap().is_some());
     }
 
     #[test]
@@ -2606,13 +2781,13 @@ mod tests {
     fn sensor_ticks_record_filter_and_prune() {
         let store = Store::open(":memory:").unwrap();
         store
-            .record_sensor_tick("watch", SensorOutcome::Fired, 2, None)
+            .record_sensor_tick("watch", SensorOutcome::Fired, 2, 1, None)
             .unwrap();
         store
-            .record_sensor_tick("watch", SensorOutcome::Error, 0, Some("boom"))
+            .record_sensor_tick("watch", SensorOutcome::Error, 0, 0, Some("boom"))
             .unwrap();
         store
-            .record_sensor_tick("probe:docs", SensorOutcome::Fired, 0, None)
+            .record_sensor_tick("probe:docs", SensorOutcome::Fired, 0, 0, None)
             .unwrap();
 
         let all = store.sensor_ticks(None, 10).unwrap();
