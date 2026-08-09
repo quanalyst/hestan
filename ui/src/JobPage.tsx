@@ -12,6 +12,7 @@ import type {
   JobState,
   JobSummary,
   OpStat,
+  OpSummary,
   Preset,
   Run,
   SchemaField,
@@ -84,6 +85,22 @@ function unknownKeys(text: string, known: Record<string, SchemaField>): string[]
   return Object.keys(parsed).filter((k) => !(k in known));
 }
 
+// how many ops a "launch from here" covers, for the label only — whether the
+// selection is launchable at all is the server's to say, and it says it
+function downstreamOf(ops: OpSummary[], root: string): string[] {
+  const out = new Set<string>();
+  const stack = [root];
+  while (stack.length) {
+    const at = stack.pop()!;
+    for (const o of ops)
+      if (o.deps.includes(at) && !out.has(o.name)) {
+        out.add(o.name);
+        stack.push(o.name);
+      }
+  }
+  return [...out];
+}
+
 // a schedule's params next to its expression: short mono json, full on hover
 const SCHED_PARAMS_CAP = 44;
 
@@ -119,6 +136,7 @@ function JobView({ name }: { name: string }) {
   const [launchError, setLaunchError] = useState<string | null>(null);
   const [paramsError, setParamsError] = useState<string | null>(null);
   const [schedError, setSchedError] = useState<string | null>(null);
+  const [subsetError, setSubsetError] = useState<string | null>(null);
   const [missing, setMissing] = useState(false);
   const enc = encodeURIComponent(name);
 
@@ -194,19 +212,29 @@ function JobView({ name }: { name: string }) {
     }
   };
 
-  const launch = async () => {
+  // `ops` runs only those and everything downstream; without it the whole job
+  // runs, which is what the launch button has always done
+  const launch = async (ops?: string[]) => {
     setLaunching(true);
     setLaunchError(null);
+    setSubsetError(null);
     try {
       const text = paramsText.trim();
       saveParams(name, paramsText);
+      const body: { params?: unknown; ops?: string[] } = {};
+      if (text) body.params = JSON.parse(text);
+      if (ops) body.ops = ops;
       const r = await post<{ run_id: string }>(
         `/api/jobs/${enc}/runs`,
-        text ? { params: JSON.parse(text) } : undefined,
+        text || ops ? body : undefined,
       );
       nav(`/runs/${r.run_id}`);
     } catch (e) {
-      setLaunchError(e instanceof Error ? e.message : String(e));
+      const msg = e instanceof Error ? e.message : String(e);
+      // the server owns whether a subset is launchable, so its refusal is the
+      // message — there is no second copy of that rule here
+      if (ops) setSubsetError(msg);
+      else setLaunchError(msg);
     } finally {
       setLaunching(false);
     }
@@ -304,7 +332,7 @@ function JobView({ name }: { name: string }) {
                 ))}
               </select>
             )}
-            <button onClick={launch} disabled={launching || !paramsValid}>
+            <button onClick={() => launch()} disabled={launching || !paramsValid}>
               launch run
             </button>
           </div>
@@ -395,8 +423,20 @@ function JobView({ name }: { name: string }) {
         // makes is only known inside a run
         nodes={job.ops.map((o) => ({ ...o, badge: opBadge(o, o.mapped_over ? "×n" : null) }))}
         selected={opSel}
-        onSelect={(op) => setOpSel((prev) => (prev === op ? null : op))}
+        onSelect={(op) => {
+          setSubsetError(null);
+          setOpSel((prev) => (prev === op ? null : op));
+        }}
       />
+      {opSel && (
+        <p className="muted dag-action">
+          <button className="text-btn" onClick={() => launch([opSel])} disabled={launching}>
+            launch from {opSel}
+          </button>
+          {` · ${downstreamOf(job.ops, opSel).length + 1} ops`}
+          {subsetError && <> · {subsetError}</>}
+        </p>
+      )}
       {opSel && (
         <OpInspector
           ops={job.ops}

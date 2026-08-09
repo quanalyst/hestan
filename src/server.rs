@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use axum::body::Bytes;
@@ -21,6 +21,7 @@ use crate::backfill;
 use crate::error::Error;
 use crate::executor::{CancelOutcome, Runner};
 use crate::freshness::{self, asset_freshness};
+use crate::graph;
 use crate::job::Job;
 use crate::model::{
     AssetCheckRow, CheckStatus, Freshness, OpRun, OpStatus, RunStatus, RunTags, ScheduleRow,
@@ -299,6 +300,8 @@ struct LaunchBody {
     preset: Option<String>,
     /// a flat `{"k": "v"}` map to [tag](crate::RunTags) the run with.
     tags: Option<RunTags>,
+    /// run only these ops and everything downstream of them, seeding nothing.
+    ops: Option<Vec<String>>,
 }
 
 /// a body that carries nothing but `params` — validation and preset writes.
@@ -355,17 +358,67 @@ async fn launch_run(
                 .params
         }
     };
-    match st.runner.launch_tagged(
-        &name,
-        params,
-        Trigger::Manual,
-        body.tags.unwrap_or_default(),
-    ) {
+    let tags = body.tags.unwrap_or_default();
+    let launched = match body.ops {
+        None => st
+            .runner
+            .launch_tagged(&name, params, Trigger::Manual, tags),
+        Some(ops) => launch_subset(&st, &name, ops, params, tags)?,
+    };
+    match launched {
         Ok(run_id) => Ok((StatusCode::ACCEPTED, Json(json!({ "run_id": run_id })))),
         Err(e @ Error::UnknownJob(_)) => Err(err(StatusCode::NOT_FOUND, e.to_string())),
-        Err(e @ Error::InvalidParams { .. }) => Err(err(StatusCode::BAD_REQUEST, e.to_string())),
+        // a subset the job cannot satisfy is Error::Graph, raised by the same
+        // check asset builds and resumes go through, and it names what is
+        // missing — the request's fault, so a 400
+        Err(e @ (Error::InvalidParams { .. } | Error::Graph(_))) => {
+            Err(err(StatusCode::BAD_REQUEST, e.to_string()))
+        }
         Err(e) => Err(internal(e)),
     }
+}
+
+/// launch exactly `ops` and everything downstream of them, seeding nothing.
+///
+/// "seeding nothing" is what makes this different from a resume: an upstream
+/// left out has no recorded output to stand in for it, so it must be in the
+/// set. that rule is [`Runner::launch_subset`]'s, not this function's — the
+/// closure below only saves the caller from listing the downstream by hand,
+/// and every refusal still comes from the one place asset builds and resumes
+/// are refused.
+///
+/// the outer `Result` is a refusal about the request itself; the inner one is
+/// the launch's, handled with every other launch's.
+fn launch_subset(
+    st: &AppState,
+    name: &str,
+    ops: Vec<String>,
+    params: Value,
+    tags: RunTags,
+) -> Result<Result<String, Error>, ApiError> {
+    let job = st
+        .jobs
+        .get(name)
+        .ok_or_else(|| err(StatusCode::NOT_FOUND, format!("unknown job: {name}")))?;
+    if ops.is_empty() {
+        return Err(err(StatusCode::BAD_REQUEST, "no ops named"));
+    }
+    let pairs = job.dep_pairs();
+    let mut subset: HashSet<String> = ops.iter().cloned().collect();
+    for root in &ops {
+        subset.extend(graph::downstream(&pairs, root));
+    }
+    // the job's external names are seeded by every launch, subset or not: they
+    // are not ops and no selection can contain them
+    Ok(st.runner.launch_subset(
+        name,
+        subset,
+        job.external_seeds(),
+        params,
+        Trigger::Manual,
+        None,
+        tags,
+    ))
 }
 
 async fn list_presets(
@@ -2122,6 +2175,139 @@ mod tests {
         let colon = body["run_id"].as_str().unwrap().to_string();
         let Json(body) = ids(Some("at:12:30")).await.unwrap();
         assert_eq!(body["runs"][0]["id"], colon);
+    }
+
+    // two independent branches, a -> b -> c and d -> e: enough shape to tell
+    // "and downstream" from "and everything"
+    fn branched_job(name: &str) -> Job {
+        let op = |n: &str| Op::new(n.to_string(), |_| async { Ok(json!(null)) });
+        Job::builder(name)
+            .op(op("a"))
+            .op(op("b").after(["a"]))
+            .op(op("c").after(["b"]))
+            .op(op("d"))
+            .op(op("e").after(["d"]))
+            .build()
+            .unwrap()
+    }
+
+    // the ops a run wrote rows for, which is what it covered
+    fn covered(st: &AppState, id: &str) -> Vec<String> {
+        let mut ops: Vec<String> = st
+            .runner
+            .store()
+            .op_runs(id)
+            .unwrap()
+            .into_iter()
+            .map(|r| r.op)
+            .collect();
+        ops.sort();
+        ops
+    }
+
+    #[tokio::test]
+    async fn a_subset_launch_runs_its_ops_and_their_downstream() {
+        let st = state(vec![branched_job("etl")]);
+        let (status, Json(body)) = launch_run(
+            State(st.clone()),
+            Path("etl".into()),
+            raw(r#"{"ops": ["d"], "tags": {"kind": "partial"}}"#),
+        )
+        .await
+        .unwrap();
+        assert_eq!(status, StatusCode::ACCEPTED);
+        let id = body["run_id"].as_str().unwrap().to_string();
+
+        // the run records which ops it covered: d and everything downstream of
+        // it, and nothing else — no row at all for the other branch
+        assert_eq!(covered(&st, &id), ["d", "e"]);
+        wait_success(&st, &id).await;
+        let run = st.runner.store().run(&id).unwrap().unwrap();
+        assert_eq!(run.trigger, Trigger::Manual);
+        assert_eq!(run.tags["kind"], "partial");
+
+        // an op named with its own upstream runs from there down
+        let (_, Json(body)) = launch_run(
+            State(st.clone()),
+            Path("etl".into()),
+            raw(r#"{"ops": ["a", "b"]}"#),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            covered(&st, body["run_id"].as_str().unwrap()),
+            ["a", "b", "c"]
+        );
+
+        // and a launch that names no ops at all is still the whole job
+        let (_, Json(body)) = launch_run(State(st.clone()), Path("etl".into()), raw("{}"))
+            .await
+            .unwrap();
+        assert_eq!(
+            covered(&st, body["run_id"].as_str().unwrap()),
+            ["a", "b", "c", "d", "e"]
+        );
+    }
+
+    // seeding nothing means an upstream left out has nothing to stand in for
+    // it — the same refusal an asset build or a resume would get, from the
+    // same check, naming what is missing
+    #[tokio::test]
+    async fn an_unsatisfiable_subset_is_a_400_naming_the_missing_dep() {
+        let st = state(vec![branched_job("etl")]);
+        let (status, Json(body)) = launch_run(
+            State(st.clone()),
+            Path("etl".into()),
+            raw(r#"{"ops": ["c"]}"#),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let msg = body["error"].as_str().unwrap();
+        assert!(msg.contains("subset op c depends on b"), "{msg}");
+        assert!(
+            msg.contains("neither in the subset nor seeded"),
+            "cannot see what is missing: {msg}"
+        );
+        assert!(
+            st.runner
+                .store()
+                .runs(None, None, None, None, None, 10)
+                .unwrap()
+                .is_empty(),
+            "a refused subset left a run behind"
+        );
+
+        // an op the job does not have, from the same check
+        let (status, Json(body)) = launch_run(
+            State(st.clone()),
+            Path("etl".into()),
+            raw(r#"{"ops": ["ghost"]}"#),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(
+            body["error"]
+                .as_str()
+                .unwrap()
+                .contains("subset op ghost is not an op of the job"),
+            "{body}"
+        );
+
+        // an empty selection is a request that names nothing, not one that
+        // names everything
+        let (status, Json(body)) =
+            launch_run(State(st.clone()), Path("etl".into()), raw(r#"{"ops": []}"#))
+                .await
+                .unwrap_err();
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"], "no ops named");
+
+        let (status, _) = launch_run(State(st), Path("nope".into()), raw(r#"{"ops": ["a"]}"#))
+            .await
+            .unwrap_err();
+        assert_eq!(status, StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]

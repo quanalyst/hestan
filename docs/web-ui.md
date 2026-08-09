@@ -85,7 +85,13 @@ schema does not know. that is a legend, not a form builder: the json is still
 what launches, and the schema never refuses anything.
 
 the graph section draws the dag, columns laid out by longest dependency path.
-clicking a node opens the op inspector: deps and dependents, the retry
+clicking a node offers **launch from here** — that op and everything downstream
+of it, as one run, with the op count beside it and the params from the editor —
+which is the mirror of the run page's *re-run from here*. an op whose upstreams
+are not in that set cannot run without them, and the server's refusal appears
+beside the button rather than being second-guessed locally
+([subset launches](launching.md#launching-a-subset-of-ops)). clicking a node
+also opens the op inspector: deps and dependents, the retry
 budget, any per-attempt `timeout`, the [concurrency pool](concepts.md#concurrency-pools)
 the op draws from with that pool's process-wide limit, declared
 params/input/output types, and history over the last 50

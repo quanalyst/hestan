@@ -147,6 +147,14 @@ name nothing is stored under is a 404, in both cases with nothing launched.
 string-to-string map that lands on the run row and comes back on every run
 object. `Hestan::run_tags` defaults merge underneath it, per-launch winning.
 
+`{"ops": ["clean", "publish"]}` runs only those ops and everything downstream
+of them, [seeding nothing](launching.md#launching-a-subset-of-ops). their own
+upstreams must therefore be in the set, or the request is a 400 naming what is
+missing — the same refusal, from the same check, that an asset build or a
+resume gets. an empty list is a 400 (`no ops named`), an op the job does not
+have is a 400, and leaving `ops` out is what runs the whole job. it combines
+with `params`, `preset` and `tags`.
+
 ## Presets
 
 `GET /api/jobs/{name}/presets` returns the job's stored

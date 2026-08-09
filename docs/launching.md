@@ -162,3 +162,43 @@ runs carry `tags` in their json, `{}` when untagged. the runs page has a tag
 box beside the other filters — served, unlike the rest, since a tag the page
 never fetched cannot be filtered for client-side — and shows each run's tags as
 muted `key:value` chips.
+
+## Launching a subset of ops
+
+hestan has always been able to run part of a job — it is how an asset build and
+a [resume](concepts.md#resume) work. this exposes it:
+
+```
+POST /api/jobs/orders_etl/runs  {"ops": ["clean", "publish"]}
+```
+
+runs exactly those ops **and everything downstream of them**, seeding nothing.
+listing the downstream by hand would be tedious and easy to get wrong, so the
+request names the starting points and the closure is worked out for you.
+
+seeding nothing is what separates this from a resume. a resume has a finished
+run behind it, so an op it skips still has a recorded output to hand its
+dependents; a fresh subset launch has none. an upstream left out therefore has
+nothing to stand in for it, and the request is a **400 naming what is
+missing**:
+
+```
+{"error": "invalid job graph: job orders_etl: subset op publish depends on
+           clean, which is neither in the subset nor seeded"}
+```
+
+that refusal is not a check of its own: it is `Runner::launch_subset`'s, the
+same one an asset build and a resume go through, reported with the same words.
+there is exactly one implementation of "can this subset run".
+
+`{"ops": []}` is a 400 (`no ops named`) rather than a launch of everything — an
+empty selection names nothing, and the way to launch the whole job is to leave
+`ops` out. an op the job does not have is a 400 from the same check. `params`,
+`preset` and `tags` all work alongside `ops`, and the run is an ordinary
+`manual` one: its `op_runs` rows are the ops it covered, and the run page draws
+the rest of the dag as `not in run`.
+
+in the ui, selecting a node on the job page's dag offers **launch from here**
+with the number of ops it covers, next to the op inspector — the mirror of the
+run page's *re-run from here*. whether the selection is launchable is the
+server's answer, and a refusal appears beside the button.
