@@ -29,7 +29,10 @@ const MAX_RESUME_CHAIN: usize = 256;
 /// recording them as never observed to stop. aborting an async op lands at its
 /// next await point, which is usually immediate; blocking work cannot be
 /// aborted at all, and waiting forever for it would hang the run.
-const CANCEL_GRACE: Duration = Duration::from_secs(3);
+///
+/// an [isolated op](Op::isolated) gets the same window between its SIGTERM and
+/// its SIGKILL, so "a few seconds to wind down" means one thing across hestan.
+pub(crate) const CANCEL_GRACE: Duration = Duration::from_secs(3);
 
 /// a named concurrency limit shared by every job in the process, declared with
 /// `Hestan::pool` and taken by [`Op::pool`].
@@ -109,15 +112,40 @@ pub struct ResumePlan {
     resumed_from: String,
 }
 
-/// what one op invocation produced: its output, plus whatever the attempt
-/// that worked staged for the terminal write to commit.
-struct Produced {
-    output: Value,
-    state: Option<Value>,
-    meta: Option<Value>,
+/// how one attempt ended, before the retry policy has looked at it.
+pub(crate) enum Ended {
+    /// an in-process body returned this.
+    Value(Value),
+    /// an [isolated](Op::isolated) child recorded its own success; this is the
+    /// handle it stored the output under.
+    Handle(Value),
+    /// the attempt failed, with the message the run records.
+    Failed(String),
+    /// an isolated child was stopped for real: signalled, then killed, and
+    /// watched to die.
+    Killed(String),
 }
 
-type OpOutcome = (String, Result<Produced, String>);
+/// how one op invocation ended, as the run has to record it.
+enum Outcome {
+    /// a value the run persists and writes the terminal row for.
+    Produced {
+        output: Value,
+        state: Option<Value>,
+        meta: Option<Value>,
+    },
+    /// an isolated op whose child persisted its own output and wrote its own
+    /// terminal row: the run takes the handle and writes nothing.
+    Recorded(Value),
+    /// terminally failed, after any retries.
+    Failed(String),
+    /// an isolated op the run's cancellation killed. unlike the cooperative
+    /// path this one gets a real finish time, because for once hestan watched
+    /// the work stop.
+    Killed(String),
+}
+
+type OpOutcome = (String, Outcome);
 
 /// one instance of a mapped op, keyed in the run by its `{op}[{label}]` name —
 /// the element's index, or the element itself on an op that
@@ -278,6 +306,24 @@ impl Runner {
                     if !resources.contains_key(name) {
                         return Err(Error::Graph(format!(
                             "job {}: op {} requires resource {name}, which is not registered",
+                            job.name(),
+                            op.name()
+                        )));
+                    }
+                }
+            }
+        }
+        // an isolated op's child opens this database by path and reads the run
+        // out of it. `:memory:` is private to a connection, so the child would
+        // open an empty one and find no run at all — refused here rather than
+        // discovered as a baffling failure at 3am
+        if runner.store.is_private() {
+            for job in runner.jobs.values() {
+                for op in job.ops() {
+                    if op.is_isolated() {
+                        return Err(Error::Graph(format!(
+                            "job {}: op {} is .isolated(), which needs a database a child \
+                             process can open; \":memory:\" is private to this one",
                             job.name(),
                             op.name()
                         )));
@@ -1188,25 +1234,36 @@ async fn execute(
             let mut inputs: HashMap<String, Value> = HashMap::new();
             let mut dep_statuses: HashMap<String, OpStatus> = HashMap::new();
             let mut unresolved: Option<(String, String)> = None;
+            // an isolated op's inputs go to its child instead, as the handles
+            // and statuses this run holds — it resolves them itself, in the
+            // process that wants the bytes
+            let mut held: serde_json::Map<String, Value> = serde_json::Map::new();
+            let mut dep_json: serde_json::Map<String, Value> = serde_json::Map::new();
             for dep in op.deps() {
                 let seen = op.dep_alias(dep).to_string();
-                if let Some(held) = outputs.get(dep) {
-                    // `outputs` carries handles, so this is where a dep's
-                    // output is actually fetched back
-                    match resolve(&runner.io, &job, &run_id, dep, held) {
-                        Ok(v) => {
-                            inputs.entry(seen.clone()).or_insert(v);
+                if let Some(handle) = outputs.get(dep) {
+                    if op.is_isolated() {
+                        held.insert(dep.clone(), handle.clone());
+                    } else {
+                        // `outputs` carries handles, so this is where a dep's
+                        // output is actually fetched back
+                        match resolve(&runner.io, &job, &run_id, dep, handle) {
+                            Ok(v) => {
+                                inputs.entry(seen.clone()).or_insert(v);
+                            }
+                            Err(e) if unresolved.is_none() => {
+                                unresolved = Some((dep.clone(), e));
+                            }
+                            Err(_) => {}
                         }
-                        Err(e) if unresolved.is_none() => {
-                            unresolved = Some((dep.clone(), e));
-                        }
-                        Err(_) => {}
                     }
                 }
                 if let Some(s) = statuses.get(dep) {
+                    dep_json.insert(dep.clone(), json!(s.as_str()));
                     dep_statuses.entry(seen).or_insert(*s);
                 }
             }
+            let invocation = op.is_isolated().then(|| invocation(held, dep_json));
             // an input hestan cannot fetch is this op's failure, recorded the
             // same way a failing body would be, rather than an op that runs
             // believing its dep produced nothing
@@ -1248,6 +1305,7 @@ async fn execute(
                 scheduled_for,
                 Arc::new(inputs),
                 Arc::new(dep_statuses),
+                invocation,
                 runner.resources.clone(),
                 store.clone(),
                 runner.pools.clone(),
@@ -1268,59 +1326,62 @@ async fn execute(
             },
         };
         match joined {
-            Ok((
-                id,
-                (
-                    name,
-                    Ok(Produced {
+            Ok((id, (name, outcome))) => {
+                names.remove(&id);
+                // an isolated op's child already did all of this for itself,
+                // which is why `Recorded` only has a handle to hand over
+                let persisted = match outcome {
+                    Outcome::Recorded(handle) => Ok(handle),
+                    Outcome::Produced {
                         output,
                         state,
                         meta,
-                    }),
-                ),
-            )) => {
-                names.remove(&id);
-                // persisted before the success is recorded: a row saying
-                // success with an output that was never stored is a lie the
-                // next run would trip over
-                let unit = unit_op(&job, &instances, &name);
-                let key = io_key(&run_id, &job, &name);
-                match runner.io.manager(unit.io_name()).put(&key, output) {
-                    Ok(handle) => {
-                        note(store.op_finished(
-                            &run_id,
-                            &name,
-                            OpStatus::Success,
-                            Some(&handle),
-                            meta.as_ref(),
-                            None,
-                        ));
-                        // state second: a crash between the writes re-runs the op, never skips it
-                        if let Some(state) = state {
-                            note(store.set_op_state(job.name(), &name, &state));
+                    } => {
+                        // persisted before the success is recorded: a row
+                        // saying success with an output that was never stored
+                        // is a lie the next run would trip over
+                        let unit = unit_op(&job, &instances, &name);
+                        let key = io_key(&run_id, &job, &name);
+                        match runner.io.manager(unit.io_name()).put(&key, output) {
+                            Ok(handle) => {
+                                note(store.op_finished(
+                                    &run_id,
+                                    &name,
+                                    OpStatus::Success,
+                                    Some(&handle),
+                                    meta.as_ref(),
+                                    None,
+                                ));
+                                // state second: a crash between the writes
+                                // re-runs the op, never skips it
+                                if let Some(state) = state {
+                                    note(store.set_op_state(job.name(), &name, &state));
+                                }
+                                Ok(handle)
+                            }
+                            Err(e) => {
+                                let msg = format!("could not persist the output: {e}");
+                                note(store.append_event(
+                                    &run_id,
+                                    Some(&name),
+                                    EventLevel::Error,
+                                    EventKind::OpFailed,
+                                    &msg,
+                                    Some(&json!({ "error": &msg })),
+                                ));
+                                note(store.op_finished(
+                                    &run_id,
+                                    &name,
+                                    OpStatus::Failed,
+                                    None,
+                                    None,
+                                    Some(&msg),
+                                ));
+                                Err(msg)
+                            }
                         }
-                        collect(
-                            name,
-                            handle,
-                            &runner.io,
-                            &job,
-                            &run_id,
-                            &instances,
-                            &mut fanouts,
-                            &mut outputs,
-                            &mut statuses,
-                        );
                     }
-                    Err(e) => {
-                        let msg = format!("could not persist the output: {e}");
-                        note(store.append_event(
-                            &run_id,
-                            Some(&name),
-                            EventLevel::Error,
-                            EventKind::OpFailed,
-                            &msg,
-                            Some(&json!({ "error": &msg })),
-                        ));
+                    Outcome::Failed(msg) => {
                         note(store.op_finished(
                             &run_id,
                             &name,
@@ -1329,6 +1390,29 @@ async fn execute(
                             None,
                             Some(&msg),
                         ));
+                        Err(msg)
+                    }
+                    // only a cancel produces this, so the run is stopping:
+                    // record what was watched to happen and go drain the rest
+                    Outcome::Killed(msg) => {
+                        op_killed(&store, &run_id, &name, &msg);
+                        canceled = true;
+                        break;
+                    }
+                };
+                match persisted {
+                    Ok(handle) => collect(
+                        name,
+                        handle,
+                        &runner.io,
+                        &job,
+                        &run_id,
+                        &instances,
+                        &mut fanouts,
+                        &mut outputs,
+                        &mut statuses,
+                    ),
+                    Err(msg) => {
                         if first_failure.is_none() {
                             first_failure = Some((name.clone(), msg));
                         }
@@ -1346,25 +1430,6 @@ async fn execute(
                         );
                     }
                 }
-            }
-            Ok((id, (name, Err(msg)))) => {
-                names.remove(&id);
-                note(store.op_finished(&run_id, &name, OpStatus::Failed, None, None, Some(&msg)));
-                if first_failure.is_none() {
-                    first_failure = Some((name.clone(), msg));
-                }
-                failed = true;
-                give_up(
-                    &name,
-                    &instances,
-                    &mut fanouts,
-                    &job,
-                    &pairs,
-                    &mut pending,
-                    &mut statuses,
-                    &run_id,
-                    &store,
-                );
             }
             Err(join_err) => {
                 let name = names.remove(&join_err.id()).expect("spawned with id");
@@ -1413,38 +1478,50 @@ async fn execute(
             };
             match joined {
                 // won the race against the abort: record what really happened
-                Ok((
-                    id,
-                    (
-                        name,
-                        Ok(Produced {
+                Ok((id, (name, outcome))) => {
+                    names.remove(&id);
+                    match outcome {
+                        Outcome::Produced {
                             output,
                             state,
                             meta,
-                        }),
-                    ),
-                )) => {
-                    names.remove(&id);
-                    // won the race against the abort, so it is persisted like
-                    // any other success — or recorded failed if it cannot be
-                    let unit = unit_op(&job, &instances, &name);
-                    let key = io_key(&run_id, &job, &name);
-                    match runner.io.manager(unit.io_name()).put(&key, output) {
-                        Ok(handle) => {
-                            note(store.op_finished(
-                                &run_id,
-                                &name,
-                                OpStatus::Success,
-                                Some(&handle),
-                                meta.as_ref(),
-                                None,
-                            ));
-                            if let Some(state) = state {
-                                note(store.set_op_state(job.name(), &name, &state));
+                        } => {
+                            // won the race against the abort, so it is
+                            // persisted like any other success — or recorded
+                            // failed if it cannot be
+                            let unit = unit_op(&job, &instances, &name);
+                            let key = io_key(&run_id, &job, &name);
+                            match runner.io.manager(unit.io_name()).put(&key, output) {
+                                Ok(handle) => {
+                                    note(store.op_finished(
+                                        &run_id,
+                                        &name,
+                                        OpStatus::Success,
+                                        Some(&handle),
+                                        meta.as_ref(),
+                                        None,
+                                    ));
+                                    if let Some(state) = state {
+                                        note(store.set_op_state(job.name(), &name, &state));
+                                    }
+                                }
+                                Err(e) => {
+                                    let msg = format!("could not persist the output: {e}");
+                                    note(store.op_finished(
+                                        &run_id,
+                                        &name,
+                                        OpStatus::Failed,
+                                        None,
+                                        None,
+                                        Some(&msg),
+                                    ));
+                                }
                             }
                         }
-                        Err(e) => {
-                            let msg = format!("could not persist the output: {e}");
+                        // the child wrote its own row before the cancel reached
+                        // it; there is nothing left to record
+                        Outcome::Recorded(_) => {}
+                        Outcome::Failed(msg) => {
                             note(store.op_finished(
                                 &run_id,
                                 &name,
@@ -1454,18 +1531,8 @@ async fn execute(
                                 Some(&msg),
                             ));
                         }
+                        Outcome::Killed(msg) => op_killed(&store, &run_id, &name, &msg),
                     }
-                }
-                Ok((id, (name, Err(msg)))) => {
-                    names.remove(&id);
-                    note(store.op_finished(
-                        &run_id,
-                        &name,
-                        OpStatus::Failed,
-                        None,
-                        None,
-                        Some(&msg),
-                    ));
                 }
                 Err(join_err) if join_err.is_cancelled() => {
                     let name = names.remove(&join_err.id()).expect("spawned with id");
@@ -1545,6 +1612,20 @@ async fn execute(
         };
         fire_hooks(&runner.hooks, failure, "failure");
     }
+}
+
+/// what the run records on the row of an op it is handing to a child: the
+/// handle it holds for each dep, and what each dep did, under the job's names
+/// for them.
+///
+/// handles rather than values, so an op reading a gigabyte through a
+/// [file io manager](crate::FileIo) reads it once, in the process that wants
+/// it. seeded deps — a resume's reused output, an asset build's memoized value
+/// — are here too, and they are the reason this exists at all: everything else
+/// an op invocation needs is already a row the child can find on its own.
+/// `isolate::handed_over` is what reads it back.
+fn invocation(held: serde_json::Map<String, Value>, deps: serde_json::Map<String, Value>) -> Value {
+    json!({ "held": held, "deps": deps })
 }
 
 // an instance runs its parent's op under its own name; everything else is
@@ -1716,6 +1797,22 @@ fn op_canceled(store: &Store, run_id: &str, name: &str) {
     ));
 }
 
+/// canceled, and stopped: an [isolated](Op::isolated) op's process was
+/// signalled, killed and reaped, so this row gets a real finish time. that is
+/// the difference the subprocess buys — everywhere else hestan can only record
+/// what it asked for.
+fn op_killed(store: &Store, run_id: &str, name: &str, msg: &str) {
+    note(store.append_event(
+        run_id,
+        Some(name),
+        EventLevel::Warn,
+        EventKind::OpCanceled,
+        msg,
+        None,
+    ));
+    note(store.op_finished(run_id, name, OpStatus::Canceled, None, None, Some(msg)));
+}
+
 // canceled, but only the request is a fact: the op never joined, so it gets no
 // finish time and an error that says exactly that
 fn op_unstopped(store: &Store, run_id: &str, name: &str) {
@@ -1747,6 +1844,9 @@ async fn run_op(
     scheduled_for: Option<DateTime<Utc>>,
     inputs: Arc<HashMap<String, Value>>,
     dep_statuses: Arc<HashMap<String, OpStatus>>,
+    // what an isolated op's child is to read instead of `inputs`; `None` for
+    // every op that runs in this process
+    invocation: Option<Value>,
     resources: Resources,
     store: Store,
     pools: Pools,
@@ -1787,7 +1887,7 @@ async fn run_op(
                     &msg,
                     Some(&json!({ "error": &msg })),
                 ));
-                return (name, Err(msg));
+                return (name, Outcome::Failed(msg));
             }
         },
     };
@@ -1821,9 +1921,10 @@ async fn run_op(
             new_per_asset: Arc::new(Mutex::new(BTreeMap::new())),
             store: store.clone(),
         };
-        // Err(limit) means the attempt timed out; the permit is scoped to this
-        // block, so a retry sleep never sits on the resource it backed off from
-        let caught = {
+        // the permit is scoped to this block, so a retry sleep never sits on
+        // the resource it backed off from — and an isolated op holds it for as
+        // long as its child runs, since the child is the work
+        let ended = {
             let _permit = match &pool {
                 None => None,
                 Some((pool, sem)) => Some(match sem.clone().try_acquire_owned() {
@@ -1838,34 +1939,43 @@ async fn run_op(
                     }
                 }),
             };
-            // the call sits inside the async block, so a closure that panics before
-            // returning its future is caught by the retry policy too
-            let call = AssertUnwindSafe(async { op.call(ctx).await }).catch_unwind();
-            match op.timeout_after() {
-                None => Ok(call.await),
-                Some(limit) => match tokio::time::timeout(limit, call).await {
-                    Ok(caught) => Ok(caught),
-                    // dropping the future stops an async op here; a blocking one
-                    // only stops if it polls, so flip the flag it polls
-                    Err(_) => {
-                        let _ = expired.send(true);
-                        Err(limit)
+            match &invocation {
+                // the body runs in a child, which owns the whole of what an
+                // attempt is: its own timeout, its own kill
+                Some(invocation) => {
+                    isolated(&op, &run_id, &name, invocation, &store, &cancel).await
+                }
+                None => {
+                    // the call sits inside the async block, so a closure that panics
+                    // before returning its future is caught by the retry policy too
+                    let call = AssertUnwindSafe(async { op.call(ctx).await }).catch_unwind();
+                    let caught = match op.timeout_after() {
+                        None => Ok(call.await),
+                        Some(limit) => match tokio::time::timeout(limit, call).await {
+                            Ok(caught) => Ok(caught),
+                            // dropping the future stops an async op here; a blocking
+                            // one only stops if it polls, so flip the flag it polls
+                            Err(_) => {
+                                let _ = expired.send(true);
+                                Err(limit)
+                            }
+                        },
+                    };
+                    match caught {
+                        Ok(Ok(Ok(output))) => Ended::Value(output),
+                        Ok(Ok(Err(e))) => Ended::Failed(e.to_string()),
+                        // as_ref, not &: &Box<dyn Any> would downcast against the box
+                        Ok(Err(panic)) => Ended::Failed(match panic_payload(panic.as_ref()) {
+                            Some(s) => format!("op panicked: {s}"),
+                            None => "op panicked".to_string(),
+                        }),
+                        Err(limit) => Ended::Failed(format!("timed out after {limit:?}")),
                     }
-                },
+                }
             }
         };
-        let result = match caught {
-            Ok(Ok(Ok(output))) => Ok(output),
-            Ok(Ok(Err(e))) => Err(e.to_string()),
-            // as_ref, not &: &Box<dyn Any> would downcast against the box itself
-            Ok(Err(panic)) => Err(match panic_payload(panic.as_ref()) {
-                Some(s) => format!("op panicked: {s}"),
-                None => "op panicked".to_string(),
-            }),
-            Err(limit) => Err(format!("timed out after {limit:?}")),
-        };
-        match result {
-            Ok(output) => {
+        let msg = match ended {
+            Ended::Value(output) => {
                 let data = op.output_type().map(|t| json!({ "output_type": t }));
                 note(store.append_event(
                     &run_id,
@@ -1877,47 +1987,75 @@ async fn run_op(
                 ));
                 return (
                     name,
-                    Ok(Produced {
+                    Outcome::Produced {
                         output,
                         state: new_state.lock().unwrap().take(),
                         meta: op::staged_meta(&new_meta),
-                    }),
+                    },
                 );
             }
-            Err(msg) => {
-                // retries are extra attempts after the first
-                let retrying = attempt <= op.max_retries();
-                let kind = if retrying {
-                    EventKind::OpRetry
-                } else {
-                    EventKind::OpFailed
-                };
-                let data = if retrying {
-                    json!({ "attempt": attempt })
-                } else {
-                    json!({ "error": msg })
-                };
-                note(store.append_event(
-                    &run_id,
-                    Some(&name),
-                    EventLevel::Error,
-                    kind,
-                    &format!("attempt {attempt} failed: {msg}"),
-                    Some(&data),
-                ));
-                if retrying {
-                    tokio::time::sleep(op.delay(attempt)).await;
-                    attempt += 1;
-                    note(store.op_started(&run_id, &name, attempt));
-                } else {
-                    return (name, Err(msg));
-                }
-            }
+            // the child recorded its own success, event and all: nothing this
+            // process staged applies, because nothing here ran the body
+            Ended::Handle(handle) => return (name, Outcome::Recorded(handle)),
+            Ended::Killed(msg) => return (name, Outcome::Killed(msg)),
+            Ended::Failed(msg) => msg,
+        };
+        // retries are extra attempts after the first
+        let retrying = attempt <= op.max_retries();
+        let kind = if retrying {
+            EventKind::OpRetry
+        } else {
+            EventKind::OpFailed
+        };
+        let data = if retrying {
+            json!({ "attempt": attempt })
+        } else {
+            json!({ "error": msg })
+        };
+        note(store.append_event(
+            &run_id,
+            Some(&name),
+            EventLevel::Error,
+            kind,
+            &format!("attempt {attempt} failed: {msg}"),
+            Some(&data),
+        ));
+        if !retrying {
+            return (name, Outcome::Failed(msg));
         }
+        tokio::time::sleep(op.delay(attempt)).await;
+        attempt += 1;
+        // a fresh attempt of an isolated op is a fresh child process
+        note(store.op_started(&run_id, &name, attempt));
     }
 }
 
-fn panic_payload(panic: &(dyn std::any::Any + Send)) -> Option<&str> {
+/// run one attempt in a child process.
+///
+/// off unix there is no such thing, and the job build says so long before a run
+/// could reach this — see `validate_isolated`.
+async fn isolated(
+    op: &Op,
+    run_id: &str,
+    name: &str,
+    invocation: &Value,
+    store: &Store,
+    cancel: &watch::Receiver<bool>,
+) -> Ended {
+    #[cfg(unix)]
+    {
+        crate::isolate::attempt(op, run_id, name, invocation, store, cancel).await
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (op, run_id, invocation, store, cancel);
+        Ended::Failed(format!(
+            "op {name} is isolated, which hestan supports on unix only"
+        ))
+    }
+}
+
+pub(crate) fn panic_payload(panic: &(dyn std::any::Any + Send)) -> Option<&str> {
     panic
         .downcast_ref::<&str>()
         .copied()
@@ -1966,7 +2104,7 @@ fn skip_downstream(
     }
 }
 
-fn note(res: Result<(), Error>) {
+pub(crate) fn note(res: Result<(), Error>) {
     if let Err(e) = res {
         tracing::warn!("store write failed: {e}");
     }
@@ -2082,6 +2220,32 @@ mod tests {
             .after(["b"]))
             .build()
             .unwrap()
+    }
+
+    // the child opens the database by path, so a database with no path is one
+    // it would open empty — refused where every other undeliverable promise is
+    #[tokio::test]
+    async fn an_isolated_op_needs_a_database_a_child_could_open() {
+        let job = Job::builder("iso")
+            .op(Op::new("risky", |_| async { Ok(json!(null)) }).isolated())
+            .build()
+            .unwrap();
+        let refused = Runner::with_pools(
+            [job.clone()],
+            Store::open(":memory:").unwrap(),
+            Vec::new(),
+            [],
+        );
+        let Err(err) = refused else {
+            panic!("an isolated op was accepted against an in-memory database");
+        };
+        assert!(matches!(err, Error::Graph(_)), "{err}");
+        assert!(err.to_string().contains("private to this one"), "{err}");
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hestan.db");
+        let store = Store::open(path.to_str().unwrap()).unwrap();
+        Runner::with_pools([job], store, Vec::new(), []).expect("a file-backed store is reachable");
     }
 
     #[tokio::test]

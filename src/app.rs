@@ -401,6 +401,11 @@ impl Hestan {
     }
 
     pub async fn run_once(self, job: &str, params: Value) -> Result<Run, Error> {
+        // the worker guard, first: see `serve`
+        #[cfg(unix)]
+        if let Some(req) = crate::isolate::requested() {
+            self.work(req).await
+        }
         let built = self.build().await?;
         built.runner.run(job, params, Trigger::Manual).await
     }
@@ -409,6 +414,11 @@ impl Hestan {
     /// its stale ancestors plus the target, which always rebuilds. check
     /// `GET /api/assets` first if you only want to build when stale.
     pub async fn build_asset(self, name: &str) -> Result<Run, Error> {
+        // the worker guard, first: see `serve`
+        #[cfg(unix)]
+        if let Some(req) = crate::isolate::requested() {
+            self.work(req).await
+        }
         let built = self.build().await?;
         let mats = mats_map(built.runner.store())?;
         let plan = plan_target(&built.registry, &mats, name)?;
@@ -426,6 +436,15 @@ impl Hestan {
     }
 
     pub async fn serve(self, addr: impl Into<SocketAddr>) -> Result<(), Error> {
+        // before the address, before the store, before anything: this process
+        // may be a worker child of a hestan already running against this
+        // database, and every line of boot behaviour below assumes it owns the
+        // place. `fail_interrupted` alone would mark its own parent's in-flight
+        // runs as interrupted, mid-run. `work` never returns.
+        #[cfg(unix)]
+        if let Some(req) = crate::isolate::requested() {
+            self.work(req).await
+        }
         let addr = addr.into();
         let built = self.build().await?;
         // bind before spawning the loops: a bind failure must not leave detached
@@ -474,26 +493,27 @@ impl Hestan {
         Ok(())
     }
 
-    async fn build(self) -> Result<Built, Error> {
+    /// the jobs this process runs, with http sources and assets lowered in.
+    ///
+    /// the server path and the [worker](Self::work) path both go through here,
+    /// which is what makes "the child rebuilds the same registry" true rather
+    /// than hopeful: there is one lowering, and both processes run it.
+    fn lower(&mut self) -> Result<(Vec<Job>, Arc<AssetRegistry>), Error> {
+        let mut jobs = std::mem::take(&mut self.jobs);
         #[cfg(feature = "http")]
-        let (mut jobs, schedules) = {
-            let (mut jobs, mut schedules) = (self.jobs, self.schedules);
-            for src in &self.sources {
-                let name = src
-                    .name
-                    .clone()
-                    .ok_or_else(|| Error::Graph("http source needs a name".into()))?;
-                // build_job, not into_job: the cron is consumed below, so the
-                // dropped-cron warning would be a lie here
-                jobs.push(src.build_job(&name)?);
-                if let Some((expr, tz)) = &src.cron {
-                    schedules.push(Schedule::new(name, expr.clone()).tz(tz.clone()));
-                }
+        for src in &self.sources {
+            let name = src
+                .name
+                .clone()
+                .ok_or_else(|| Error::Graph("http source needs a name".into()))?;
+            // build_job, not into_job: the cron is consumed below, so the
+            // dropped-cron warning would be a lie here
+            jobs.push(src.build_job(&name)?);
+            if let Some((expr, tz)) = &src.cron {
+                self.schedules
+                    .push(Schedule::new(name, expr.clone()).tz(tz.clone()));
             }
-            (jobs, schedules)
-        };
-        #[cfg(not(feature = "http"))]
-        let (mut jobs, schedules) = (self.jobs, self.schedules);
+        }
 
         // lowered only when assets exist, so the name stays free otherwise, and
         // before the duplicate check, so a user job named "assets" collides below
@@ -508,7 +528,11 @@ impl Hestan {
             }
             Arc::new(AssetRegistry::empty())
         } else {
-            let registry = Arc::new(AssetRegistry::new(self.assets, self.multis, self.checks)?);
+            let registry = Arc::new(AssetRegistry::new(
+                std::mem::take(&mut self.assets),
+                std::mem::take(&mut self.multis),
+                std::mem::take(&mut self.checks),
+            )?);
             jobs.push(registry.lower_job()?);
             registry
         };
@@ -519,6 +543,49 @@ impl Hestan {
                 return Err(Error::DuplicateJob(job.name().to_string()));
             }
         }
+        Ok((jobs, registry))
+    }
+
+    /// the worker path: build the same registry the server path would, run one
+    /// op of one run, and exit — 0 for a success, 1 for anything else.
+    ///
+    /// what is *not* here is the point of it. no `fail_interrupted`, no
+    /// schedule sync, no tick prune, no retention sweep, no scheduler, sensor,
+    /// freshness or backfill loop, and no listener: every one of those assumes
+    /// this process owns the database, and a worker child owns nothing. it
+    /// opens the store, reads what its op was handed, runs it, and writes the
+    /// result back.
+    #[cfg(unix)]
+    async fn work(mut self, req: crate::isolate::Request) -> ! {
+        let code = match self.worked(req).await {
+            Ok(crate::isolate::Worked::Success) => 0,
+            Ok(crate::isolate::Worked::Failed) => 1,
+            // printed rather than traced: a worker whose store or registry is
+            // wrong cannot record anything anywhere, and its stderr is its
+            // parent's stderr
+            Err(e) => {
+                eprintln!("hestan worker: {e}");
+                1
+            }
+        };
+        std::process::exit(code)
+    }
+
+    #[cfg(unix)]
+    async fn worked(
+        &mut self,
+        req: crate::isolate::Request,
+    ) -> Result<crate::isolate::Worked, Error> {
+        let (jobs, _) = self.lower()?;
+        let resources = resource::build(std::mem::take(&mut self.resources)).await?;
+        let store = Store::open(&self.db_path)?;
+        let io = Io::new(self.io_default.take(), std::mem::take(&mut self.io_named));
+        crate::isolate::work(&req, &jobs, &store, &io, &resources).await
+    }
+
+    async fn build(mut self) -> Result<Built, Error> {
+        let (jobs, registry) = self.lower()?;
+        let schedules = std::mem::take(&mut self.schedules);
         let mut entries = Vec::new();
         for s in &schedules {
             let (job, expr) = (&s.job, &s.expr);
@@ -856,6 +923,92 @@ mod tests {
         let tags = store.run(&id).unwrap().unwrap().tags;
         assert_eq!(tags["env"], "staging");
         assert_eq!(tags["kind"], "smoke");
+    }
+
+    // the whole point of the worker guard: a child process must not run one
+    // line of boot behaviour. `fail_interrupted` assumes the last process died,
+    // so a worker that reached it would mark its own parent's in-flight runs as
+    // interrupted, mid-run.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_worker_start_does_not_touch_the_runs_it_finds() {
+        use crate::model::{OpStatus, RunTags};
+        use crate::op::Op;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hestan.db");
+        let path = path.to_str().unwrap().to_string();
+        let job = Job::builder("guarded")
+            .op(Op::new("quick", |_| async { Ok(json!({"ran": true})) }).isolated())
+            .build()
+            .unwrap();
+
+        // a queued run for the worker, and one belonging to nobody it knows —
+        // which is exactly the shape of a parent's in-flight run
+        let store = Store::open(&path).unwrap();
+        let planted = |id: &str| Run {
+            id: id.to_string(),
+            job: "guarded".into(),
+            status: RunStatus::Queued,
+            trigger: Trigger::Manual,
+            params: json!({}),
+            created_at: chrono::Utc::now(),
+            started_at: None,
+            finished_at: None,
+            error: None,
+            resumed_from: None,
+            scheduled_for: None,
+            tags: RunTags::new(),
+        };
+        store
+            .create_run(&planted("mine"), &["quick".to_string()])
+            .unwrap();
+        store
+            .create_run(&planted("someone-elses"), &["quick".to_string()])
+            .unwrap();
+        drop(store);
+
+        let req = crate::isolate::Request {
+            run_id: "mine".into(),
+            op: "quick".into(),
+        };
+        let mut app = Hestan::new().job(job).db(path.clone());
+        let worked = app.worked(req).await.unwrap();
+        assert!(matches!(worked, crate::isolate::Worked::Success));
+
+        let store = Store::open(&path).unwrap();
+        // the op it was sent for ran and recorded itself, through the ordinary
+        // paths and nothing else
+        let row = store.op_run("mine", "quick").unwrap().unwrap();
+        assert_eq!(row.status, OpStatus::Success);
+        assert_eq!(row.output, Some(json!({"ran": true})));
+        // and the run it was never asked about is untouched: not failed, not
+        // errored, and with no interruption announced in its log
+        let other = store.run("someone-elses").unwrap().unwrap();
+        assert_eq!(other.status, RunStatus::Queued, "{:?}", other.error);
+        assert_eq!(other.error, None);
+        assert_eq!(
+            store
+                .op_run("someone-elses", "quick")
+                .unwrap()
+                .unwrap()
+                .status,
+            OpStatus::Pending
+        );
+        // including the run the worker did work for: its own status is its
+        // parent's business, not a worker's
+        assert_eq!(
+            store.run("mine").unwrap().unwrap().status,
+            RunStatus::Queued
+        );
+        for id in ["mine", "someone-elses"] {
+            let events = store.events(id, 0).unwrap();
+            assert!(
+                !events.iter().any(|e| e.message.contains("interrupted")),
+                "worker announced an interruption on {id}: {:?}",
+                events.iter().map(|e| &e.message).collect::<Vec<_>>()
+            );
+        }
     }
 
     #[tokio::test]

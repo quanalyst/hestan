@@ -1,6 +1,7 @@
 use std::collections::HashSet;
 use std::str::FromStr;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use rusqlite::{Connection, OptionalExtension, Row, params};
@@ -251,7 +252,22 @@ CREATE TABLE presets (
 ALTER TABLE runs ADD COLUMN tags TEXT;
 "#;
 
-const SCHEMA_VERSION: u32 = 12;
+// what an [isolated op](crate::Op::isolated) needs the run log to carry, since
+// the run log is the only channel between the parent and the child.
+//
+// `pid` is what is running where, cleared by the terminal write: an op run row
+// is the ui's answer to "where is this happening", and a pid that outlived its
+// process would answer it wrongly. `inputs` is what the parent hands the child
+// — `{"held": {dep: handle}, "deps": {dep: status}}`, one row rather than a
+// reconstruction of the run's state, and handles rather than payloads so an
+// [io manager](crate::IoManager) still keeps the bulk out of sqlite. null for
+// every op that runs in this process, which is nearly all of them.
+const SCHEMA_V13: &str = r#"
+ALTER TABLE op_runs ADD COLUMN pid INTEGER;
+ALTER TABLE op_runs ADD COLUMN inputs TEXT;
+"#;
+
+const SCHEMA_VERSION: u32 = 13;
 
 // one transaction around every pending step and the version stamp (sqlite DDL
 // is transactional), so a crash mid-migration leaves the db exactly as found
@@ -301,6 +317,9 @@ fn migrate(conn: &mut Connection) -> Result<(), Error> {
     if version < 12 {
         tx.execute_batch(SCHEMA_V12)?;
     }
+    if version < 13 {
+        tx.execute_batch(SCHEMA_V13)?;
+    }
     if version != SCHEMA_VERSION {
         tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     }
@@ -328,9 +347,18 @@ pub(crate) struct RunKey<'a> {
     pub key: &'a str,
 }
 
+/// how long a write waits for another connection to let go of the file before
+/// giving up. an [isolated op](crate::Op::isolated) means two processes write
+/// this database at once, and sqlite's default is to fail the second one
+/// immediately — which would be a lost event, or a lost terminal row.
+const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// sqlite-backed run history. cheap to clone; safe to share across tasks.
+///
+/// the second field is the path it was opened at, kept so a runner can tell
+/// whether a child process could open the same database.
 #[derive(Clone)]
-pub struct Store(Arc<Mutex<Connection>>);
+pub struct Store(Arc<Mutex<Connection>>, Arc<str>);
 
 impl Store {
     /// open (and migrate) the database at `path`; `":memory:"` works too.
@@ -339,8 +367,16 @@ impl Store {
         if path != ":memory:" {
             conn.pragma_update(None, "journal_mode", "wal")?;
         }
+        conn.busy_timeout(BUSY_TIMEOUT)?;
         migrate(&mut conn)?;
-        Ok(Store(Arc::new(Mutex::new(conn))))
+        Ok(Store(Arc::new(Mutex::new(conn)), path.into()))
+    }
+
+    /// whether this database lives only in this process's memory, and so
+    /// cannot be reached by a child. `":memory:"` is private per connection,
+    /// which is exactly right for a test and exactly wrong for an isolated op.
+    pub(crate) fn is_private(&self) -> bool {
+        &*self.1 == ":memory:"
     }
 
     /// [`create_run_keyed`](Self::create_run_keyed) with no key, which is what
@@ -534,9 +570,13 @@ impl Store {
 
     pub(crate) fn op_started(&self, run_id: &str, op: &str, attempts: u32) -> Result<(), Error> {
         let conn = self.0.lock().unwrap();
-        // coalesce so retries keep the first attempt's start time
+        // coalesce so retries keep the first attempt's start time. the finish
+        // and the error are cleared: a fresh attempt has neither, and an
+        // isolated op's child records its failure on this row before the parent
+        // decides to retry it
         conn.execute(
-            "UPDATE op_runs SET status = ?1, attempts = ?2, started_at = COALESCE(started_at, ?3)
+            "UPDATE op_runs SET status = ?1, attempts = ?2, started_at = COALESCE(started_at, ?3),
+                 finished_at = NULL, error = NULL
              WHERE run_id = ?4 AND op = ?5",
             params![
                 OpStatus::Running.as_str(),
@@ -562,8 +602,11 @@ impl Store {
         error: Option<&str>,
     ) -> Result<(), Error> {
         let conn = self.0.lock().unwrap();
+        // pid goes with it: the row says where an op is running, and nothing is
+        // running once this write lands
         conn.execute(
-            "UPDATE op_runs SET status = ?1, finished_at = ?2, output = ?3, metadata = ?4, error = ?5
+            "UPDATE op_runs SET status = ?1, finished_at = ?2, output = ?3, metadata = ?4,
+                 error = ?5, pid = NULL
              WHERE run_id = ?6 AND op = ?7",
             params![
                 status.as_str(),
@@ -585,11 +628,55 @@ impl Store {
         let conn = self.0.lock().unwrap();
         conn.execute(
             "UPDATE op_runs SET status = ?1, finished_at = NULL, output = NULL, metadata = NULL,
-                 error = ?2
+                 error = ?2, pid = NULL
              WHERE run_id = ?3 AND op = ?4",
             params![OpStatus::Canceled.as_str(), error, run_id, op],
         )?;
         Ok(())
+    }
+
+    /// record the child process an [isolated](crate::Op::isolated) op is
+    /// running in.
+    ///
+    /// guarded on `running`, because a fast child can record its own terminal
+    /// row before the parent gets here — and a pid written onto a finished op
+    /// would name a process that no longer exists.
+    pub(crate) fn op_spawned(&self, run_id: &str, op: &str, pid: u32) -> Result<(), Error> {
+        let conn = self.0.lock().unwrap();
+        conn.execute(
+            "UPDATE op_runs SET pid = ?1 WHERE run_id = ?2 AND op = ?3 AND status = 'running'",
+            params![i64::from(pid), run_id, op],
+        )?;
+        Ok(())
+    }
+
+    /// record what an isolated op is being handed, before the child that reads
+    /// it exists. see the `op_runs.inputs` note on the v13 migration.
+    pub(crate) fn set_op_inputs(
+        &self,
+        run_id: &str,
+        op: &str,
+        inputs: &Value,
+    ) -> Result<(), Error> {
+        let conn = self.0.lock().unwrap();
+        conn.execute(
+            "UPDATE op_runs SET inputs = ?1 WHERE run_id = ?2 AND op = ?3",
+            params![inputs.to_string(), run_id, op],
+        )?;
+        Ok(())
+    }
+
+    /// what the parent recorded for this op, read by the child that runs it.
+    pub(crate) fn op_inputs(&self, run_id: &str, op: &str) -> Result<Option<Value>, Error> {
+        let conn = self.0.lock().unwrap();
+        let inputs = conn
+            .query_row(
+                "SELECT inputs FROM op_runs WHERE run_id = ?1 AND op = ?2",
+                params![run_id, op],
+                |r| opt_json_col(r, 0),
+            )
+            .optional()?;
+        Ok(inputs.flatten())
     }
 
     pub(crate) fn append_event(
@@ -986,11 +1073,28 @@ impl Store {
     pub fn op_runs(&self, run_id: &str) -> Result<Vec<OpRun>, Error> {
         let conn = self.0.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT run_id, op, status, attempts, started_at, finished_at, output, metadata, error
+            "SELECT run_id, op, status, attempts, started_at, finished_at, output, metadata, error,
+                    pid
              FROM op_runs WHERE run_id = ?1 ORDER BY op",
         )?;
         let rows = stmt.query_map(params![run_id], op_run_from_row)?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    /// one op's row. the parent of an isolated op reads back what its child
+    /// recorded through this — the whole of what a worker process reports.
+    pub fn op_run(&self, run_id: &str, op: &str) -> Result<Option<OpRun>, Error> {
+        let conn = self.0.lock().unwrap();
+        let row = conn
+            .query_row(
+                "SELECT run_id, op, status, attempts, started_at, finished_at, output, metadata,
+                        error, pid
+                 FROM op_runs WHERE run_id = ?1 AND op = ?2",
+                params![run_id, op],
+                op_run_from_row,
+            )
+            .optional()?;
+        Ok(row)
     }
 
     /// op_run rows across the job's most recent `runs` runs, newest run first.
@@ -998,7 +1102,7 @@ impl Store {
         let conn = self.0.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT o.run_id, o.op, o.status, o.attempts, o.started_at, o.finished_at, o.output,
-                    o.metadata, o.error
+                    o.metadata, o.error, o.pid
              FROM op_runs o
              JOIN (SELECT id, created_at FROM runs WHERE job = ?1
                    ORDER BY created_at DESC LIMIT ?2) r ON r.id = o.run_id
@@ -1614,6 +1718,7 @@ fn op_run_from_row(row: &Row) -> rusqlite::Result<OpRun> {
         output: opt_json_col(row, 6)?,
         metadata: opt_json_col(row, 7)?,
         error: row.get(8)?,
+        pid: row.get(9)?,
     })
 }
 
@@ -2276,14 +2381,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("future.db");
         let path = path.to_str().unwrap();
-        phase1_db(path, 13);
+        phase1_db(path, 14);
         let err = Store::open(path).err().unwrap();
-        assert_eq!(err.to_string(), "db schema v13 is newer than this build");
+        assert_eq!(err.to_string(), "db schema v14 is newer than this build");
         let conn = Connection::open(path).unwrap();
         let version: u32 = conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 13);
+        assert_eq!(version, 14);
     }
 
     #[test]
@@ -2321,6 +2426,66 @@ mod tests {
         drop(store);
         let store = Store::open(path).unwrap();
         assert_eq!(store.presets("etl").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn v12_db_migrates_to_v13_keeping_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v12.db");
+        let path = path.to_str().unwrap();
+        // every batch up to v12, stamped 12: op_runs has neither pid nor inputs
+        let conn = Connection::open(path).unwrap();
+        for batch in [
+            PHASE1_SCHEMA,
+            SCHEMA_V2,
+            SCHEMA_V3,
+            SCHEMA_V4,
+            SCHEMA_V5,
+            SCHEMA_V6,
+            SCHEMA_V7,
+            SCHEMA_V8,
+            SCHEMA_V9,
+            SCHEMA_V10,
+            SCHEMA_V11,
+            SCHEMA_V12,
+        ] {
+            conn.execute_batch(batch).unwrap();
+        }
+        conn.pragma_update(None, "user_version", 12).unwrap();
+        drop(conn);
+
+        // the op run written before the migration reads back, claiming no
+        // process and no recorded inputs — which is what every op that runs in
+        // this process says too
+        let store = Store::open(path).unwrap();
+        let row = store.op_run("r1", "a").unwrap().unwrap();
+        assert_eq!(row.status, OpStatus::Success);
+        assert_eq!(row.pid, None);
+        assert_eq!(store.op_inputs("r1", "a").unwrap(), None);
+
+        store.op_spawned("r1", "a", 4242).unwrap();
+        // guarded on `running`: a finished op cannot be given a process
+        assert_eq!(store.op_run("r1", "a").unwrap().unwrap().pid, None);
+        store.op_started("r1", "a", 2).unwrap();
+        store.op_spawned("r1", "a", 4242).unwrap();
+        assert_eq!(store.op_run("r1", "a").unwrap().unwrap().pid, Some(4242));
+
+        store
+            .set_op_inputs(
+                "r1",
+                "a",
+                &json!({"held": {"up": 1}, "deps": {"up": "success"}}),
+            )
+            .unwrap();
+        assert_eq!(
+            store.op_inputs("r1", "a").unwrap().unwrap()["deps"]["up"],
+            json!("success")
+        );
+        // and the terminal write hands the process back
+        store
+            .op_finished("r1", "a", OpStatus::Success, None, None, None)
+            .unwrap();
+        assert_eq!(store.op_run("r1", "a").unwrap().unwrap().pid, None);
     }
 
     #[test]

@@ -1,0 +1,443 @@
+//! isolated ops: one attempt, one child process.
+//!
+//! the child is this same binary re-executed with two environment variables
+//! set. it rebuilds the same jobs because it runs the same `main`, and it
+//! reads everything else out of the store — the run's params, the op's inputs,
+//! its committed state — so nothing is serialized between the two processes
+//! that was not already a row. what it produces goes back the same way: the
+//! output through its io manager, the terminal status onto its own op run row,
+//! its log lines into the run's events. there is no pipe and no protocol,
+//! which is why this costs a process spawn and nothing else.
+//!
+//! both halves live here: [`attempt`] is what the parent's executor calls
+//! instead of the op body, and [`work`] is the whole of what the child does.
+
+use std::collections::{BTreeMap, HashMap};
+use std::os::unix::process::ExitStatusExt;
+use std::panic::AssertUnwindSafe;
+use std::process::ExitStatus;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use futures::FutureExt;
+use serde_json::{Value, json};
+use tokio::process::{Child, Command};
+use tokio::sync::watch;
+
+use crate::error::Error;
+use crate::executor::{CANCEL_GRACE, Ended, note, panic_payload};
+use crate::io::{Io, IoKey};
+use crate::job::Job;
+use crate::model::{EventKind, EventLevel, OpStatus};
+use crate::op::{self, Cancel, Op, OpCtx};
+use crate::resource::Resources;
+use crate::store::Store;
+
+/// the run a worker child is part of.
+pub(crate) const RUN_VAR: &str = "HESTAN_WORKER_RUN";
+/// the one op of it the child is there to run.
+pub(crate) const OP_VAR: &str = "HESTAN_WORKER_OP";
+
+/// what the environment is asking this process to be.
+pub(crate) struct Request {
+    pub(crate) run_id: String,
+    pub(crate) op: String,
+}
+
+/// the worker request in this process's environment, if there is one.
+///
+/// `serve`, `run_once` and `build_asset` ask this before they do anything else
+/// at all: a worker child that reached ordinary boot behaviour would run
+/// `fail_interrupted` and mark its own parent's in-flight runs as interrupted,
+/// mid-run.
+pub(crate) fn requested() -> Option<Request> {
+    let run_id = std::env::var(RUN_VAR).ok()?;
+    let op = std::env::var(OP_VAR).ok()?;
+    (!run_id.is_empty() && !op.is_empty()).then_some(Request { run_id, op })
+}
+
+/// what a worker process did, which is what its exit code says.
+pub(crate) enum Worked {
+    Success,
+    Failed,
+}
+
+// ---------------------------------------------------------------- the parent
+
+/// run one attempt of `op` in a child process.
+///
+/// the parent's whole job is to start the child, watch it, and read the row it
+/// wrote. a child that exits without writing one — killed, aborted, out of
+/// memory — is recorded here instead, with what killed it, because that
+/// containment is the entire point of running it elsewhere.
+pub(crate) async fn attempt(
+    op: &Op,
+    run_id: &str,
+    name: &str,
+    invocation: &Value,
+    store: &Store,
+    cancel: &watch::Receiver<bool>,
+) -> Ended {
+    // written before the child exists, because the child reads its inputs
+    // rather than being told them
+    if let Err(e) = store.set_op_inputs(run_id, name, invocation) {
+        return Ended::Failed(format!("could not record the op's inputs: {e}"));
+    }
+    let exe = match std::env::current_exe() {
+        Ok(exe) => exe,
+        Err(e) => return Ended::Failed(format!("could not find this binary to re-execute: {e}")),
+    };
+    let mut child = match Command::new(&exe)
+        .env(RUN_VAR, run_id)
+        .env(OP_VAR, name)
+        // the backstop for the one case this function does not get to finish:
+        // the run's cancellation drain aborts this task, and a dropped child
+        // left running would be an orphan nobody is waiting for
+        .kill_on_drop(true)
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(e) => {
+            return Ended::Failed(format!(
+                "could not start a worker process ({}): {e}",
+                exe.display()
+            ));
+        }
+    };
+    let pid = child.id();
+    if let Some(pid) = pid {
+        note(store.op_spawned(run_id, name, pid));
+        note(store.append_event(
+            run_id,
+            Some(name),
+            EventLevel::Info,
+            EventKind::Log,
+            &format!("isolated: running in process {pid}"),
+            Some(&json!({ "pid": pid })),
+        ));
+    }
+
+    // three ways this ends, and only the first is the child's own doing
+    let expiry = async {
+        match op.timeout_after() {
+            Some(limit) => tokio::time::sleep(limit).await,
+            None => std::future::pending().await,
+        }
+    };
+    let stop = op::flipped(cancel.clone());
+    tokio::pin!(expiry, stop);
+    let exited = tokio::select! {
+        exited = child.wait() => exited,
+        () = &mut stop => return stopped(&mut child, pid, None).await,
+        () = &mut expiry => {
+            let limit = op.timeout_after().expect("the expiry arm cannot fire without a limit");
+            return stopped(&mut child, pid, Some(limit)).await;
+        }
+    };
+    let status = match exited {
+        Ok(status) => status,
+        Err(e) => return Ended::Failed(format!("could not wait for the worker process: {e}")),
+    };
+    recorded(store, run_id, name).unwrap_or_else(|| Ended::Failed(no_result(&status)))
+}
+
+/// what the child recorded, if it recorded anything.
+///
+/// the row comes first and the exit status second: the child is the process
+/// that ran the body, so if it got as far as writing a result, that result is
+/// what happened — however it exited afterwards.
+fn recorded(store: &Store, run_id: &str, name: &str) -> Option<Ended> {
+    let row = match store.op_run(run_id, name) {
+        Ok(row) => row?,
+        Err(e) => {
+            return Some(Ended::Failed(format!(
+                "could not read back what the worker process recorded: {e}"
+            )));
+        }
+    };
+    match row.status {
+        OpStatus::Success => match row.output {
+            Some(handle) => Some(Ended::Handle(handle)),
+            // unreachable: the child writes the status and the output in one
+            // statement. saying so beats seeding downstream with nothing
+            None => Some(Ended::Failed(
+                "the worker process recorded success without an output".to_string(),
+            )),
+        },
+        OpStatus::Failed => {
+            Some(Ended::Failed(row.error.unwrap_or_else(|| {
+                "the op failed without recording why".to_string()
+            })))
+        }
+        _ => None,
+    }
+}
+
+/// stop a child for real: SIGTERM, a short grace, then SIGKILL.
+///
+/// SIGTERM arrives inside the child as ordinary cancellation, so an op that
+/// polls `ctx.is_cancelled()` gets to stop cleanly. one that does not is
+/// killed, and that is the whole difference from the in-process path: hestan
+/// is not asking.
+async fn stopped(child: &mut Child, pid: Option<u32>, timeout: Option<Duration>) -> Ended {
+    let asked = match pid {
+        // SAFETY: kill(2) with the pid of a child this process spawned and has
+        // not reaped, so it names this child or nothing at all
+        Some(pid) => unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) == 0 },
+        None => false,
+    };
+    let went_quietly = asked
+        && tokio::time::timeout(CANCEL_GRACE, child.wait())
+            .await
+            .is_ok();
+    if !went_quietly {
+        let _ = child.start_kill();
+        // and reaped, so the pid this row carried names nothing by the time
+        // anyone reads it back
+        let _ = child.wait().await;
+    }
+    let how = match (asked, went_quietly) {
+        (true, true) => "it stopped when asked".to_string(),
+        (true, false) => format!("it ignored SIGTERM for {CANCEL_GRACE:?} and was killed"),
+        (false, _) => "it was killed".to_string(),
+    };
+    match timeout {
+        // a timeout is an ordinary attempt failure, and retries like one
+        Some(limit) => Ended::Failed(format!("timed out after {limit:?}: {how}")),
+        None => Ended::Killed(format!("canceled: {how}")),
+    }
+}
+
+/// the containment message: a child that died without recording anything.
+///
+/// this is the sentence someone reads at 3am about an op that segfaulted, so it
+/// says what happened to the process rather than that something went wrong.
+fn no_result(status: &ExitStatus) -> String {
+    match status.signal() {
+        Some(sig) => format!(
+            "op exited with signal {sig} ({}) without recording a result",
+            signal_name(sig)
+        ),
+        None => match status.code() {
+            Some(code) => format!("op exited with status {code} without recording a result"),
+            None => "op exited without recording a result".to_string(),
+        },
+    }
+}
+
+/// what a signal means to whoever is reading the run page, rather than what it
+/// is called in `signal.h`.
+fn signal_name(sig: i32) -> &'static str {
+    match sig {
+        libc::SIGABRT => "aborted",
+        libc::SIGBUS => "bus error",
+        libc::SIGFPE => "arithmetic error",
+        libc::SIGHUP => "hung up",
+        libc::SIGILL => "illegal instruction",
+        libc::SIGINT => "interrupted",
+        libc::SIGKILL => "killed",
+        libc::SIGPIPE => "broken pipe",
+        libc::SIGQUIT => "quit",
+        libc::SIGSEGV => "segmentation fault",
+        libc::SIGTERM => "terminated",
+        libc::SIGXCPU => "cpu limit exceeded",
+        libc::SIGXFSZ => "file size limit exceeded",
+        _ => "unknown",
+    }
+}
+
+// ----------------------------------------------------------------- the child
+
+/// run one op of one run in this process, and record it exactly as the
+/// in-process path would.
+///
+/// there is nothing here about being a subprocess: it loads what the op needs
+/// out of the store, calls the body once, and writes the result back. the
+/// parent owns the retry policy, the pool permit and the clock, so a worker
+/// runs one attempt and stops.
+pub(crate) async fn work(
+    req: &Request,
+    jobs: &[Job],
+    store: &Store,
+    io: &Io,
+    resources: &Resources,
+) -> Result<Worked, Error> {
+    let run = store
+        .run(&req.run_id)?
+        .ok_or_else(|| Error::UnknownRun(req.run_id.clone()))?;
+    let job = jobs
+        .iter()
+        .find(|j| j.name() == run.job)
+        .ok_or_else(|| Error::UnknownJob(run.job.clone()))?;
+    let op = job.op(&req.op).ok_or_else(|| {
+        Error::Graph(format!(
+            "job {}: no op {} — this binary does not build the registry that launched run {}",
+            run.job, req.op, req.run_id
+        ))
+    })?;
+    // a worker exists to contain an isolated op. anything else reaching here
+    // means parent and child disagree about the job, which is the one thing
+    // that must not pass quietly
+    if !op.is_isolated() {
+        return Err(Error::Graph(format!(
+            "job {}: op {} is not .isolated() in this binary",
+            run.job, req.op
+        )));
+    }
+
+    let (inputs, dep_statuses) = handed_over(op, job, io, store, &req.run_id)?;
+    let state = Arc::new(store.op_state(job.name(), &req.op)?);
+    let new_state = Arc::new(Mutex::new(None));
+    let new_meta = Arc::new(Mutex::new(BTreeMap::new()));
+    // the parent's SIGTERM lands here as ordinary cancellation, so an op that
+    // polls `ctx.is_cancelled()` stops cleanly and one that ignores it is
+    // killed a few seconds later. the attempt half never flips: the parent owns
+    // the timeout, and enforces it with the same signal
+    let (asked_to_stop, on_cancel) = watch::channel(false);
+    let (_never, on_expiry) = watch::channel(false);
+    if let Ok(mut term) = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+    {
+        tokio::spawn(async move {
+            term.recv().await;
+            let _ = asked_to_stop.send(true);
+        });
+    }
+    let ctx = OpCtx {
+        cancel: Cancel {
+            run: on_cancel,
+            attempt: on_expiry,
+        },
+        run_id: req.run_id.clone(),
+        job: run.job.clone(),
+        op: req.op.clone(),
+        params: run.params.clone(),
+        scheduled_for: run.scheduled_for,
+        // both belong to a fan-out instance, which an isolated op may not be
+        element: None,
+        partition: None,
+        inputs: Arc::new(inputs),
+        dep_statuses: Arc::new(dep_statuses),
+        resources: resources.clone(),
+        state,
+        new_state: new_state.clone(),
+        new_fingerprint: Arc::new(Mutex::new(None)),
+        new_meta: new_meta.clone(),
+        new_per_asset: Arc::new(Mutex::new(BTreeMap::new())),
+        store: store.clone(),
+    };
+
+    let called = AssertUnwindSafe(async { op.call(ctx).await })
+        .catch_unwind()
+        .await;
+    let produced = match called {
+        Ok(Ok(output)) => Ok(output),
+        Ok(Err(e)) => Err(e.to_string()),
+        Err(panic) => Err(match panic_payload(panic.as_ref()) {
+            Some(s) => format!("op panicked: {s}"),
+            None => "op panicked".to_string(),
+        }),
+    };
+    // persisted before the success is recorded, in the order the run's own task
+    // uses: a row claiming an output that was never stored is a lie the next
+    // run trips over
+    let produced = produced.and_then(|output| {
+        let key = IoKey {
+            run_id: req.run_id.clone(),
+            job: run.job.clone(),
+            op: req.op.clone(),
+        };
+        io.manager(op.io_name())
+            .put(&key, output)
+            .map_err(|e| format!("could not persist the output: {e}"))
+    });
+    match produced {
+        Ok(handle) => {
+            store.op_finished(
+                &req.run_id,
+                &req.op,
+                OpStatus::Success,
+                Some(&handle),
+                op::staged_meta(&new_meta).as_ref(),
+                None,
+            )?;
+            // state second: a crash between the writes re-runs the op, never
+            // skips it
+            if let Some(state) = new_state.lock().unwrap().take() {
+                store.set_op_state(job.name(), &req.op, &state)?;
+            }
+            let data = op.output_type().map(|t| json!({ "output_type": t }));
+            store.append_event(
+                &req.run_id,
+                Some(&req.op),
+                EventLevel::Info,
+                EventKind::OpSuccess,
+                "finished",
+                data.as_ref(),
+            )?;
+            Ok(Worked::Success)
+        }
+        // the row carries the message home; the parent decides whether this was
+        // the last attempt and writes the event that says so
+        Err(msg) => {
+            store.op_finished(
+                &req.run_id,
+                &req.op,
+                OpStatus::Failed,
+                None,
+                None,
+                Some(&msg),
+            )?;
+            Ok(Worked::Failed)
+        }
+    }
+}
+
+/// what the parent recorded on this op's row, turned back into the inputs and
+/// dep statuses an [`OpCtx`] carries. `executor::invocation` writes it.
+type HandedOver = (HashMap<String, Value>, HashMap<String, OpStatus>);
+
+fn handed_over(
+    op: &Op,
+    job: &Job,
+    io: &Io,
+    store: &Store,
+    run_id: &str,
+) -> Result<HandedOver, Error> {
+    let recorded = store
+        .op_inputs(run_id, op.name())?
+        .unwrap_or_else(|| json!({}));
+    let held = recorded.get("held").and_then(Value::as_object);
+    let deps = recorded.get("deps").and_then(Value::as_object);
+    let mut inputs = HashMap::new();
+    let mut dep_statuses = HashMap::new();
+    for dep in op.deps() {
+        // the name this body calls the dep, which differs from the job-level
+        // one only inside a flattened graph instance
+        let seen = op.dep_alias(dep).to_string();
+        if let Some(handle) = held.and_then(|h| h.get(dep)) {
+            // resolved here rather than by the parent: an op reading a gigabyte
+            // should read it in the process that wants it
+            let value = io
+                .manager(job.op(dep).and_then(Op::io_name))
+                .get(&io_key(run_id, job, dep), handle)
+                .map_err(|e| Error::Graph(format!("could not read the output of {dep}: {e}")))?;
+            inputs.insert(seen.clone(), value);
+        }
+        if let Some(status) = deps
+            .and_then(|d| d.get(dep))
+            .and_then(Value::as_str)
+            .and_then(|s| s.parse().ok())
+        {
+            dep_statuses.insert(seen, status);
+        }
+    }
+    Ok((inputs, dep_statuses))
+}
+
+fn io_key(run_id: &str, job: &Job, op: &str) -> IoKey {
+    IoKey {
+        run_id: run_id.to_string(),
+        job: job.name().to_string(),
+        op: op.to_string(),
+    }
+}

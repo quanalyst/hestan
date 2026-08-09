@@ -196,6 +196,9 @@ pub struct Op {
     retry: Retry,
     timeout: Option<Duration>,
     pool: Option<String>,
+    // run the body in a child process rather than in this one, from
+    // `isolated`. the runtime's test for one.
+    isolated: bool,
     input_type: Option<&'static str>,
     output_type: Option<&'static str>,
     params_type: Option<&'static str>,
@@ -229,6 +232,7 @@ impl Op {
             retry: DEFAULT_BACKOFF,
             timeout: None,
             pool: None,
+            isolated: false,
             input_type: None,
             output_type: None,
             params_type: None,
@@ -263,6 +267,7 @@ impl Op {
             retry: DEFAULT_BACKOFF,
             timeout: None,
             pool: None,
+            isolated: false,
             input_type: Some(std::any::type_name::<I>()),
             output_type: Some(std::any::type_name::<O>()),
             params_type: None,
@@ -519,6 +524,49 @@ impl Op {
         self
     }
 
+    /// run this op's body in a child process instead of in the orchestrator's.
+    ///
+    /// ```no_run
+    /// # use hestan::{Op, OpCtx};
+    /// # use serde_json::json;
+    /// Op::new("parse_untrusted", |_ctx: OpCtx| async { Ok(json!(null)) }).isolated();
+    /// ```
+    ///
+    /// what it buys is containment. an op that segfaults, aborts or exhausts
+    /// memory takes down the process it runs in, and in-process that process
+    /// is hestan — every other run with it. isolated, the blast radius is one
+    /// attempt: the child dies, the parent records **why** it died, and the
+    /// forty other ops carry on.
+    ///
+    /// it also makes stopping real. cancelling a run or expiring an
+    /// [`Op::timeout`] asks an in-process op to stop and cannot make it —
+    /// see the cancellation section of the concepts doc. an isolated op is
+    /// sent SIGTERM, given a few seconds, and then SIGKILLed, so for once
+    /// "canceled" is something hestan watched rather than requested.
+    ///
+    /// the child is **this same binary**, re-executed with two environment
+    /// variables set; it rebuilds the same jobs because it runs the same
+    /// `main`. that is the whole cost model — a process spawn per attempt,
+    /// milliseconds rather than the seconds an interpreter start costs — and
+    /// the whole constraint: a `main` that registers a different set of jobs
+    /// depending on argv, or that reads a different database, cannot host a
+    /// worker. nothing is passed to the child but the run id and the op name.
+    /// everything else — params, inputs, state — it reads out of the store,
+    /// and everything it produces it writes back the same way.
+    ///
+    /// an isolated op is otherwise an ordinary unit: `max_parallel`, pools,
+    /// retries (each attempt is a fresh child), [`When`] rules and the run's
+    /// cancellation all apply unchanged. it may not be
+    /// [mapped](Op::mapped) — a fan-out instance's element is the one input
+    /// that is not a row a child could read — and hestan supports it on unix
+    /// only, both refused at build rather than quietly ignored.
+    ///
+    /// see [isolation](../docs/isolation.md).
+    pub fn isolated(mut self) -> Op {
+        self.isolated = true;
+        self
+    }
+
     #[cfg(feature = "http")]
     pub(crate) fn with_output_type(mut self, t: &'static str) -> Op {
         self.output_type = Some(t);
@@ -600,6 +648,12 @@ impl Op {
         self.pool.as_deref()
     }
 
+    /// whether this op's body runs in a child process, from
+    /// [`isolated`](Self::isolated).
+    pub fn is_isolated(&self) -> bool {
+        self.isolated
+    }
+
     pub fn input_type(&self) -> Option<&'static str> {
         self.input_type
     }
@@ -656,6 +710,7 @@ impl fmt::Debug for Op {
             .field("retry", &self.retry)
             .field("timeout", &self.timeout)
             .field("pool", &self.pool)
+            .field("isolated", &self.isolated)
             .field("mapped_over", &self.over)
             .finish_non_exhaustive()
     }
@@ -672,7 +727,7 @@ pub(crate) struct Cancel {
 }
 
 // resolves the first time `rx` holds true; parks forever if it never can
-async fn flipped(mut rx: watch::Receiver<bool>) {
+pub(crate) async fn flipped(mut rx: watch::Receiver<bool>) {
     loop {
         if *rx.borrow_and_update() {
             return;

@@ -1626,6 +1626,7 @@ mod tests {
             output: None,
             metadata: None,
             error: None,
+            pid: None,
         };
 
         // durations 100..2000 step 100: avg 1050, rank ceil(0.95*20)=19 -> 1900

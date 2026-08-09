@@ -361,6 +361,10 @@ pub struct OpRun {
     /// one tagged value per name. `None` when it reported nothing.
     pub metadata: Option<Value>,
     pub error: Option<String>,
+    /// the child process an [isolated](crate::Op::isolated) op is running in.
+    /// `None` for every in-process op and for every op that has finished —
+    /// this says what is running where, not where something ran.
+    pub pid: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize)]

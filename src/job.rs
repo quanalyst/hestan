@@ -145,6 +145,7 @@ impl Job {
             .filter(|n| !external.iter().any(|(e, _)| e == n))
             .collect();
         validate_mapped(&name, &ops)?;
+        validate_isolated(&name, &ops)?;
         let params_schema = merge_params_schemas(&name, &ops)?;
         Ok(Job {
             name,
@@ -310,6 +311,35 @@ fn validate_mapped(job: &str, ops: &[Op]) -> Result<(), Error> {
                 }
             }
             (false, None) => {}
+        }
+    }
+    Ok(())
+}
+
+// what an isolated op may and may not also be. every one of these is refused
+// here rather than at run time, because each is a promise hestan would
+// otherwise have to break quietly: a limit that cannot be applied, a platform
+// with no way to kill a child, an input the child has no way to read.
+fn validate_isolated(job: &str, ops: &[Op]) -> Result<(), Error> {
+    for op in ops {
+        let name = op.name();
+        if !op.is_isolated() {
+            continue;
+        }
+        // the platform check first: off unix none of the rest matters
+        #[cfg(not(unix))]
+        return Err(Error::Graph(format!(
+            "job {job}: op {name} is .isolated(), which hestan supports on unix only \
+             (this is {}) — an isolation guarantee that quietly is not one is worse \
+             than no isolation",
+            std::env::consts::OS
+        )));
+        #[cfg(unix)]
+        if op.is_mapped() {
+            return Err(Error::Graph(format!(
+                "job {job}: op {name} is both mapped and .isolated(); a fan-out instance's \
+                 element is the one thing a child cannot read out of the store"
+            )));
         }
     }
     Ok(())
@@ -788,6 +818,7 @@ impl JobBuilder {
         let order = graph::topo_order(&pairs)
             .map_err(|e| Error::Graph(format!("job {}: {e}", self.name)))?;
         validate_mapped(&self.name, &ops)?;
+        validate_isolated(&self.name, &ops)?;
         let params_schema = merge_params_schemas(&self.name, &ops)?;
         Ok(Job {
             name: self.name,
@@ -836,6 +867,29 @@ mod tests {
             Err(e) => e.to_string(),
             Ok(_) => panic!("expected a build error"),
         }
+    }
+
+    // a fan-out instance is handed one element of an array, and an element is
+    // the one input that is nowhere a child process could read it
+    #[test]
+    fn an_isolated_op_may_not_also_fan_out() {
+        let err = build_err(
+            Job::builder("fan").op(op("pages")).op(Op::mapped(
+                "fetch",
+                |_ctx, page: u32| async move { Ok(json!(page)) },
+            )
+            .over("pages")
+            .isolated()),
+        );
+        assert!(err.contains("both mapped and .isolated()"), "{err}");
+
+        // and neither restriction touches an ordinary op beside one
+        Job::builder("fan")
+            .op(op("pages"))
+            .op(Op::mapped("fetch", |_ctx, page: u32| async move { Ok(json!(page)) }).over("pages"))
+            .op(op("upload").isolated())
+            .build()
+            .unwrap();
     }
 
     #[test]

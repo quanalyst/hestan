@@ -27,14 +27,23 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
 thiserror = "2"
-tokio = { version = "1", features = ["rt", "rt-multi-thread", "net", "time", "sync", "macros"] }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "net", "time", "sync", "macros", "process", "signal"] }
 tracing = "0.1"
 uuid = { version = "1", features = ["v7"] }
+
+# isolated ops only: kill(2), the signal names a dead child is reported with,
+# and setrlimit(2) for the memory and cpu limits
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 [dev-dependencies]
 tempfile = "3"
 tower = { version = "0.5", features = ["util"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# the isolation test watches a child process die, which is a kill(pid, 0) away
+[target.'cfg(unix)'.dev-dependencies]
+libc = "0.2"
 
 [features]
 default = ["bundled"]
@@ -53,3 +62,9 @@ required-features = ["http"]
 [[test]]
 name = "notify"
 required-features = ["http"]
+
+# an isolated op re-executes `current_exe()`, so this target needs a `main` of
+# its own that rebuilds the same jobs — see the comment at the top of the file
+[[test]]
+name = "isolation"
+harness = false

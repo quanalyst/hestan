@@ -12,6 +12,10 @@ mod graph;
 #[cfg(feature = "http")]
 mod http;
 mod io;
+// isolated ops are a unix feature and say so: `Op::isolated` off unix is a
+// build error naming the platform, not a silent in-process fallback
+#[cfg(unix)]
+mod isolate;
 mod job;
 mod model;
 #[cfg(feature = "http")]
