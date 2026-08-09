@@ -144,7 +144,7 @@ pub(crate) async fn attempt(
         Ok(status) => status,
         Err(e) => return Ended::Failed(format!("could not wait for the worker process: {e}")),
     };
-    recorded(store, run_id, name).unwrap_or_else(|| Ended::Failed(no_result(&status)))
+    recorded(store, run_id, name).unwrap_or_else(|| Ended::Failed(no_result(op, &status)))
 }
 
 /// what the child recorded, if it recorded anything.
@@ -217,18 +217,63 @@ async fn stopped(child: &mut Child, pid: Option<u32>, timeout: Option<Duration>)
 /// the containment message: a child that died without recording anything.
 ///
 /// this is the sentence someone reads at 3am about an op that segfaulted, so it
-/// says what happened to the process rather than that something went wrong.
-fn no_result(status: &ExitStatus) -> String {
-    match status.signal() {
-        Some(sig) => format!(
-            "op exited with signal {sig} ({}) without recording a result",
-            signal_name(sig)
-        ),
+/// says what happened to the process rather than that something went wrong. a
+/// declared limit is named after it, because "signal 24" is the encoding and
+/// "the cpu limit" is the fact.
+fn no_result(op: &Op, status: &ExitStatus) -> String {
+    let how = match status.signal() {
+        Some(sig) => format!("exited with signal {sig} ({})", signal_name(sig)),
         None => match status.code() {
-            Some(code) => format!("op exited with status {code} without recording a result"),
-            None => "op exited without recording a result".to_string(),
+            Some(code) => format!("exited with status {code}"),
+            None => "exited".to_string(),
         },
+    };
+    let mut msg = format!("op {how} without recording a result");
+    if let Some(limit) = limit_hit(op, status) {
+        msg.push_str("; ");
+        msg.push_str(&limit);
     }
+    msg
+}
+
+/// which declared limit explains a death like this one.
+///
+/// SIGXCPU comes from nowhere else, so a cpu limit is named as the cause. a
+/// memory limit is offered rather than asserted: an allocation past `RLIMIT_AS`
+/// aborts the process, and so does an ordinary `abort()`, and the two are the
+/// same signal.
+fn limit_hit(op: &Op, status: &ExitStatus) -> Option<String> {
+    let sig = status.signal()?;
+    match (op.declared_cpu_limit(), op.declared_memory_limit()) {
+        (Some(cpu), _) if sig == libc::SIGXCPU => {
+            Some(format!("it exceeded its cpu limit of {cpu:?}"))
+        }
+        (_, Some(bytes)) if matches!(sig, libc::SIGABRT | libc::SIGKILL | libc::SIGSEGV) => {
+            Some(format!(
+                "it was running under a memory limit of {}, which an allocation past the limit \
+                 aborts on",
+                bytes_human(bytes)
+            ))
+        }
+        // the hard limit, a second past the soft one: it was told with SIGXCPU
+        // and did not go
+        (Some(cpu), None) if sig == libc::SIGKILL => Some(format!(
+            "it was running under a cpu limit of {cpu:?}, which kills a process that ignores \
+             its SIGXCPU"
+        )),
+        _ => None,
+    }
+}
+
+/// a byte count the way a limit is written down, since `536870912` in an error
+/// message is a number someone has to go and divide.
+fn bytes_human(bytes: u64) -> String {
+    for (unit, size) in [("GiB", 1 << 30), ("MiB", 1 << 20), ("KiB", 1 << 10)] {
+        if bytes >= size {
+            return format!("{:.0} {unit}", bytes as f64 / size as f64);
+        }
+    }
+    format!("{bytes} bytes")
 }
 
 /// what a signal means to whoever is reading the run page, rather than what it
@@ -332,16 +377,24 @@ pub(crate) async fn work(
         store: store.clone(),
     };
 
-    let called = AssertUnwindSafe(async { op.call(ctx).await })
-        .catch_unwind()
-        .await;
-    let produced = match called {
-        Ok(Ok(output)) => Ok(output),
-        Ok(Err(e)) => Err(e.to_string()),
-        Err(panic) => Err(match panic_payload(panic.as_ref()) {
-            Some(s) => format!("op panicked: {s}"),
-            None => "op panicked".to_string(),
-        }),
+    // last, so what the limits cap is the body and not the loading of its
+    // inputs — and refused outright if they cannot be applied, since an op that
+    // ran uncapped believing otherwise is the one outcome worth nobody's time
+    let produced = match apply_limits(op) {
+        Err(e) => Err(e),
+        Ok(()) => {
+            let called = AssertUnwindSafe(async { op.call(ctx).await })
+                .catch_unwind()
+                .await;
+            match called {
+                Ok(Ok(output)) => Ok(output),
+                Ok(Err(e)) => Err(e.to_string()),
+                Err(panic) => Err(match panic_payload(panic.as_ref()) {
+                    Some(s) => format!("op panicked: {s}"),
+                    None => "op panicked".to_string(),
+                }),
+            }
+        }
     };
     // persisted before the success is recorded, in the order the run's own task
     // uses: a row claiming an output that was never stored is a lie the next
@@ -396,6 +449,54 @@ pub(crate) async fn work(
             Ok(Worked::Failed)
         }
     }
+}
+
+/// the [limits](crate::Op::memory_limit) this op declared, applied to this
+/// process before its body runs.
+///
+/// this is the whole reason a limit needs `.isolated()`: `setrlimit` caps a
+/// process, and in-process that process is the orchestrator. it caps this
+/// child, which is a few megabytes of hestan plus the op — near enough the op
+/// alone, and honest about not being exactly it.
+fn apply_limits(op: &Op) -> Result<(), String> {
+    if let Some(bytes) = op.declared_memory_limit() {
+        let limit = libc::rlimit {
+            rlim_cur: bytes,
+            rlim_max: bytes,
+        };
+        // SAFETY: setrlimit(2) against this process's own limits, with a fully
+        // initialized struct that outlives the call. lowering needs no
+        // privilege, so the only failures here are a value the kernel refuses.
+        if unsafe { libc::setrlimit(libc::RLIMIT_AS, &limit) } != 0 {
+            return Err(format!(
+                "could not apply the {} memory limit: {}",
+                bytes_human(bytes),
+                std::io::Error::last_os_error()
+            ));
+        }
+    }
+    if let Some(cpu) = op.declared_cpu_limit() {
+        // whole seconds are the kernel's granularity, and nothing is no limit
+        // at all, so anything under a second is one second.
+        //
+        // the hard limit sits one second above the soft one on purpose: at the
+        // soft limit the kernel sends SIGXCPU, which says what happened, and at
+        // the hard limit it sends SIGKILL, which does not. equal limits would
+        // collapse the two into the second one and lose the diagnosis.
+        let secs = cpu.as_secs().max(1);
+        let limit = libc::rlimit {
+            rlim_cur: secs,
+            rlim_max: secs + 1,
+        };
+        // SAFETY: as above, RLIMIT_CPU rather than RLIMIT_AS
+        if unsafe { libc::setrlimit(libc::RLIMIT_CPU, &limit) } != 0 {
+            return Err(format!(
+                "could not apply the {cpu:?} cpu limit: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// what the parent recorded on this op's row, turned back into the inputs and

@@ -199,6 +199,10 @@ pub struct Op {
     // run the body in a child process rather than in this one, from
     // `isolated`. the runtime's test for one.
     isolated: bool,
+    // rlimits the child applies to itself before the body runs; both need
+    // `isolated`, and the job build refuses them without it
+    memory_limit: Option<u64>,
+    cpu_limit: Option<Duration>,
     input_type: Option<&'static str>,
     output_type: Option<&'static str>,
     params_type: Option<&'static str>,
@@ -233,6 +237,8 @@ impl Op {
             timeout: None,
             pool: None,
             isolated: false,
+            memory_limit: None,
+            cpu_limit: None,
             input_type: None,
             output_type: None,
             params_type: None,
@@ -268,6 +274,8 @@ impl Op {
             timeout: None,
             pool: None,
             isolated: false,
+            memory_limit: None,
+            cpu_limit: None,
             input_type: Some(std::any::type_name::<I>()),
             output_type: Some(std::any::type_name::<O>()),
             params_type: None,
@@ -567,6 +575,57 @@ impl Op {
         self
     }
 
+    /// cap the address space of an [`isolated`](Self::isolated) op's child
+    /// process at `bytes`, so a runaway allocation is that op's failure rather
+    /// than the machine's problem.
+    ///
+    /// ```no_run
+    /// # use hestan::{Op, OpCtx};
+    /// # use serde_json::json;
+    /// Op::new("parse", |_ctx: OpCtx| async { Ok(json!(null)) })
+    ///     .isolated()
+    ///     .memory_limit(512 * 1024 * 1024);
+    /// ```
+    ///
+    /// the child applies it to itself with `setrlimit(RLIMIT_AS)` just before
+    /// the body runs. an allocation past it fails, which in rust aborts the
+    /// process, and the parent records the death naming this limit rather than
+    /// a bare signal number.
+    ///
+    /// two things it is not. it is **address space**, not resident memory:
+    /// large reservations count even untouched, which is what makes the failure
+    /// deterministic instead of a visit from the oom killer at some later
+    /// moment of the kernel's choosing. and it covers the **whole child**, not
+    /// the body alone — a few megabytes of hestan, sqlite and your process's
+    /// own startup are inside it, so leave headroom.
+    ///
+    /// without [`isolated`](Self::isolated) this is a build error: the limit
+    /// applies to a process, and in-process that process is the orchestrator.
+    pub fn memory_limit(mut self, bytes: u64) -> Op {
+        self.memory_limit = Some(bytes);
+        self
+    }
+
+    /// cap the cpu time an [`isolated`](Self::isolated) op's child process may
+    /// burn, via `setrlimit(RLIMIT_CPU)`. exceeding it arrives as SIGXCPU,
+    /// which by default ends the process, and the parent records it naming this
+    /// limit.
+    ///
+    /// this is **cpu time, not wall clock**: an op that waits an hour on a
+    /// socket has spent no cpu at all and is untouched by it, which is exactly
+    /// the difference from [`timeout`](Self::timeout). reach for this against a
+    /// spin loop or a runaway regex, and for `timeout` against something slow.
+    /// the two compose; they are measuring different things.
+    ///
+    /// the limit has one-second granularity — the kernel's, not hestan's — and
+    /// anything under a second means one. without
+    /// [`isolated`](Self::isolated) it is a build error, for the same reason a
+    /// [`memory_limit`](Self::memory_limit) is.
+    pub fn cpu_limit(mut self, d: Duration) -> Op {
+        self.cpu_limit = Some(d);
+        self
+    }
+
     #[cfg(feature = "http")]
     pub(crate) fn with_output_type(mut self, t: &'static str) -> Op {
         self.output_type = Some(t);
@@ -654,6 +713,17 @@ impl Op {
         self.isolated
     }
 
+    /// the address-space cap this op declared with
+    /// [`memory_limit`](Self::memory_limit), in bytes.
+    pub fn declared_memory_limit(&self) -> Option<u64> {
+        self.memory_limit
+    }
+
+    /// the cpu-time cap this op declared with [`cpu_limit`](Self::cpu_limit).
+    pub fn declared_cpu_limit(&self) -> Option<Duration> {
+        self.cpu_limit
+    }
+
     pub fn input_type(&self) -> Option<&'static str> {
         self.input_type
     }
@@ -711,6 +781,8 @@ impl fmt::Debug for Op {
             .field("timeout", &self.timeout)
             .field("pool", &self.pool)
             .field("isolated", &self.isolated)
+            .field("memory_limit", &self.memory_limit)
+            .field("cpu_limit", &self.cpu_limit)
             .field("mapped_over", &self.over)
             .finish_non_exhaustive()
     }

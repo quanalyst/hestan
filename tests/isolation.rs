@@ -124,6 +124,33 @@ fn jobs() -> Vec<Job> {
             .op(Op::new("grind", |_| async { deaf_to_signals().await }).isolated())
             .build()
             .unwrap(),
+        // an allocation nothing could satisfy, under a limit that makes it this
+        // op's failure rather than the machine's problem
+        Job::builder("greedy")
+            .op(Op::new("hog", |_| async {
+                let huge: Vec<u8> = vec![0; 2 * 1024 * 1024 * 1024];
+                Ok(json!(huge.len()))
+            })
+            .isolated()
+            .memory_limit(512 * 1024 * 1024))
+            .build()
+            .unwrap(),
+        // and a loop that will never stop on its own
+        Job::builder("spinner")
+            .op(Op::new("spin", |_| async {
+                tokio::task::spawn_blocking(|| -> hestan::OpResult {
+                    let mut n: u64 = 0;
+                    loop {
+                        n = std::hint::black_box(n.wrapping_mul(6_364_136_223_846_793_005) + 1);
+                    }
+                })
+                .await
+                .unwrap()
+            })
+            .isolated()
+            .cpu_limit(Duration::from_secs(1)))
+            .build()
+            .unwrap(),
         // the same work under a timeout, beside an ordinary op that must be
         // left to finish
         Job::builder("impatient")
@@ -216,6 +243,16 @@ async fn cases(db: &str) {
     case(
         "a_timeout_kills_an_isolated_op_and_leaves_its_siblings_alone",
         a_timeout_kills(&runner),
+    )
+    .await;
+    case(
+        "an_op_past_its_memory_limit_fails_naming_the_limit",
+        the_memory_limit_bites(&runner),
+    )
+    .await;
+    case(
+        "an_op_past_its_cpu_limit_fails_naming_the_limit",
+        the_cpu_limit_bites(&runner),
     )
     .await;
 }
@@ -397,6 +434,35 @@ async fn a_timeout_kills(runner: &Runner) {
     assert_eq!(
         row(&rows, "beside_it").output,
         Some(json!("finished anyway"))
+    );
+}
+
+async fn the_memory_limit_bites(runner: &Runner) {
+    let run = runner
+        .run("greedy", json!({}), Trigger::Manual)
+        .await
+        .unwrap();
+    assert_eq!(run.status, RunStatus::Failed);
+    let rows = runner.store().op_runs(&run.id).unwrap();
+    let err = row(&rows, "hog").error.clone().unwrap();
+    // the limit, not the signal it arrived as
+    assert!(
+        err.contains("memory limit of 512 MiB"),
+        "the failure does not name the limit it hit: {err}"
+    );
+}
+
+async fn the_cpu_limit_bites(runner: &Runner) {
+    let run = runner
+        .run("spinner", json!({}), Trigger::Manual)
+        .await
+        .unwrap();
+    assert_eq!(run.status, RunStatus::Failed);
+    let rows = runner.store().op_runs(&run.id).unwrap();
+    let err = row(&rows, "spin").error.clone().unwrap();
+    assert!(
+        err.contains("cpu limit of 1s"),
+        "the failure does not name the limit it hit: {err}"
     );
 }
 

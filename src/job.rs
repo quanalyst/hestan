@@ -324,6 +324,20 @@ fn validate_isolated(job: &str, ops: &[Op]) -> Result<(), Error> {
     for op in ops {
         let name = op.name();
         if !op.is_isolated() {
+            // a limit is applied to a process, and in-process that process is
+            // the orchestrator. ignoring one silently would be worse than
+            // refusing it, since the op would run believing it was capped
+            if let Some(what) = match (op.declared_memory_limit(), op.declared_cpu_limit()) {
+                (Some(_), _) => Some("memory"),
+                (_, Some(_)) => Some("cpu"),
+                _ => None,
+            } {
+                return Err(Error::Graph(format!(
+                    "job {job}: op {name} declares a {what} limit without .isolated(); \
+                     a limit is applied to a child process, and there is no child to apply \
+                     it to"
+                )));
+            }
             continue;
         }
         // the platform check first: off unix none of the rest matters
@@ -867,6 +881,26 @@ mod tests {
             Err(e) => e.to_string(),
             Ok(_) => panic!("expected a build error"),
         }
+    }
+
+    // a limit caps a process. in-process that process is the orchestrator, so
+    // there is nothing to do with the declaration but refuse it
+    #[test]
+    fn a_resource_limit_without_isolation_is_a_build_error() {
+        let err = build_err(Job::builder("capped").op(op("parse").memory_limit(512 * 1024 * 1024)));
+        assert!(err.contains("memory limit without .isolated()"), "{err}");
+
+        let err =
+            build_err(Job::builder("capped").op(op("parse").cpu_limit(Duration::from_secs(30))));
+        assert!(err.contains("cpu limit without .isolated()"), "{err}");
+
+        Job::builder("capped")
+            .op(op("parse")
+                .isolated()
+                .memory_limit(512 * 1024 * 1024)
+                .cpu_limit(Duration::from_secs(30)))
+            .build()
+            .unwrap();
     }
 
     // a fan-out instance is handed one element of an array, and an element is
