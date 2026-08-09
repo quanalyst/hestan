@@ -265,8 +265,18 @@ fn job_summary(job: &Job, st: &AppState) -> Result<Value, Error> {
     }))
 }
 
-async fn health() -> Json<Value> {
-    Json(json!({ "ok": true }))
+/// who this process is and what it is holding.
+///
+/// the instance id is what a run row's `claimed_by` carries, so this is how you
+/// tell which of three workers is executing the run you are looking at — and,
+/// pointed at each of them in turn, which one has gone quiet.
+async fn health(State(st): State<AppState>) -> Json<Value> {
+    let holding = st.runner.holding().unwrap_or_default();
+    Json(json!({
+        "ok": true,
+        "instance": st.runner.instance(),
+        "holding": holding,
+    }))
 }
 
 // names and declared types only: a resource is usually a client holding

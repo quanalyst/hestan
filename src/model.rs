@@ -346,6 +346,23 @@ pub struct Run {
     pub lease_until: Option<DateTime<Utc>>,
 }
 
+/// what happens to a run whose claimer stopped renewing its lease.
+///
+/// the default is [`Fail`](Reclaim::Fail), and the reason is that a run that
+/// died halfway may already have done half of its side effects. re-running it
+/// would do them again, quietly; failing it puts a stall in front of whoever
+/// is on call. [`Requeue`](Reclaim::Requeue) is right when the work is
+/// idempotent and available beats exact.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum Reclaim {
+    #[default]
+    Fail,
+    /// put it back on the queue for another claimer to take.
+    Requeue,
+}
+str_enum!(Reclaim { Fail => "fail", Requeue => "requeue" });
+
 /// a named parameter set stored against one job: what
 /// [`Hestan::preset`](crate::Hestan::preset) declares and what the launchpad
 /// saves. runtime data rather than part of the job definition — the ui creates

@@ -13,7 +13,7 @@ use crate::executor::{FailureHook, Limits, RunFailure, Runner};
 use crate::freshness::{self, LateEvent, LateHook};
 use crate::io::{Io, IoManager};
 use crate::job::Job;
-use crate::model::{Run, RunTags, Trigger};
+use crate::model::{Reclaim, Run, RunTags, Trigger};
 use crate::resource::{self, Resource, ResourceCtx, ResourceFn};
 use crate::schedule::{self, Schedule, ScheduleEntry};
 use crate::sensor::{RunStatusSensor, Sensor, SensorEntry, run_sensors};
@@ -45,6 +45,7 @@ pub struct Hestan {
     late_hooks: Vec<LateHook>,
     limits: Limits,
     priority: i64,
+    reclaim: Reclaim,
     retention_days: Option<u32>,
     asset_history: usize,
     #[cfg(feature = "http")]
@@ -72,6 +73,7 @@ impl Default for Hestan {
             late_hooks: Vec::new(),
             limits: Limits::new(),
             priority: 0,
+            reclaim: Reclaim::default(),
             retention_days: None,
             asset_history: DEFAULT_ASSET_HISTORY,
             #[cfg(feature = "http")]
@@ -194,6 +196,22 @@ impl Hestan {
     /// behind it is worse than starting things slightly out of turn.
     pub fn priority(mut self, n: i64) -> Self {
         self.priority = n;
+        self
+    }
+
+    /// what happens to a run whose claimer stopped saying it was there.
+    ///
+    /// every process executing a run renews its claim on a heartbeat, and a
+    /// claim nobody has renewed for a minute is taken back by whichever process
+    /// notices. the default, [`Reclaim::Fail`], fails the run and says why on
+    /// its ops; [`Reclaim::Requeue`] puts it back on the queue.
+    ///
+    /// fail is the default because a run that got halfway may have done half
+    /// its side effects, and doing them again quietly is worse than a stall
+    /// somebody has to look at. requeue is the right answer when the work is
+    /// idempotent.
+    pub fn reclaim(mut self, reclaim: Reclaim) -> Self {
+        self.reclaim = reclaim;
         self
     }
 
@@ -525,6 +543,9 @@ impl Hestan {
         // things no local poke can — a run another process enqueued, and a
         // limit that changed under a queue nobody is touching
         let dispatcher = tokio::spawn(crate::executor::run_dispatcher(built.runner.clone()));
+        // the lease loop: this process saying it is still here, and noticing
+        // when another one stops saying it
+        let leases = tokio::spawn(crate::executor::run_leases(built.runner.clone()));
         let checker = tokio::spawn(freshness::run_checker(
             built.runner.clone(),
             built.registry.clone(),
@@ -542,6 +563,7 @@ impl Hestan {
         sensors.abort();
         backfills.abort();
         dispatcher.abort();
+        leases.abort();
         checker.abort();
         served?;
         Ok(())
@@ -731,7 +753,8 @@ impl Hestan {
         let io = Io::new(self.io_default, self.io_named);
         let runner = Runner::with_resources(jobs, store, self.hooks, self.pools, resources, io)?
             .with_run_tags(self.run_tags)
-            .with_limits(self.limits, self.priority);
+            .with_limits(self.limits, self.priority)
+            .with_reclaim(self.reclaim);
         Ok(Built {
             runner,
             entries,

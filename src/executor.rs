@@ -15,7 +15,8 @@ use crate::graph;
 use crate::io::{Io, IoKey, IoManager};
 use crate::job::Job;
 use crate::model::{
-    EventKind, EventLevel, OpRun, OpStatus, Run, RunStatus, RunTags, Trigger, When, new_run_id,
+    EventKind, EventLevel, OpRun, OpStatus, Reclaim, Run, RunStatus, RunTags, Trigger, When,
+    new_run_id,
 };
 use crate::op::{self, Cancel, MetaBuf, Op, OpCtx};
 use crate::resource::{self, Resources};
@@ -33,6 +34,15 @@ const MAX_RESUME_CHAIN: usize = 256;
 /// an [isolated op](Op::isolated) gets the same window between its SIGTERM and
 /// its SIGKILL, so "a few seconds to wind down" means one thing across hestan.
 pub(crate) const CANCEL_GRACE: Duration = Duration::from_secs(3);
+
+/// how long a claim is believed for, and how often its holder says so.
+///
+/// a claimer that stops renewing loses its runs one lease after it went quiet,
+/// which is the whole of how a process that died is noticed. the gap between
+/// the two is deliberate: four heartbeats have to be missed before anything is
+/// taken, so a slow store or a paused process is not mistaken for a dead one.
+pub(crate) const LEASE: Duration = Duration::from_secs(60);
+pub(crate) const HEARTBEAT: Duration = Duration::from_secs(15);
 
 /// how often the dispatcher looks at the queue on its own.
 ///
@@ -388,6 +398,8 @@ pub struct Runner {
     limits: Arc<Mutex<Limits>>,
     // the queue position a launch that does not ask gets
     priority: i64,
+    // what happens to a run whose claimer went quiet
+    reclaim: Reclaim,
     // one dispatch pass at a time in this process: two passes counting the same
     // free slot would both fill it
     dispatching: Arc<Mutex<()>>,
@@ -430,6 +442,7 @@ impl Runner {
             claimer: instance_id(),
             limits: Arc::new(Mutex::new(Limits::new())),
             priority: 0,
+            reclaim: Reclaim::default(),
             dispatching: Arc::new(Mutex::new(())),
             settled: Arc::new(Notify::new()),
         }
@@ -463,6 +476,12 @@ impl Runner {
             priority,
             ..self
         }
+    }
+
+    /// what happens to a run this deployment loses track of.
+    /// `Hestan::reclaim` is the way in.
+    pub fn with_reclaim(self, reclaim: Reclaim) -> Runner {
+        Runner { reclaim, ..self }
     }
 
     /// what the dispatcher is enforcing right now.
@@ -781,7 +800,10 @@ impl Runner {
         let limits = self.limits.lock().unwrap().clone();
         let defined: HashSet<String> = self.jobs.keys().cloned().collect();
         loop {
-            match self.store.claim_next(self.claimer, &limits, &defined) {
+            match self
+                .store
+                .claim_next(self.claimer, LEASE, &limits, &defined)
+            {
                 Ok(Some((run, plan))) => self.start(run, plan),
                 Ok(None) => return,
                 Err(e) => {
@@ -831,6 +853,65 @@ impl Runner {
     /// how many runs are waiting on the queue, uncapped.
     pub(crate) fn queue_depth(&self) -> Result<usize, Error> {
         self.store.queue_depth()
+    }
+
+    /// the runs this process is executing, by id.
+    pub(crate) fn holding(&self) -> Result<Vec<String>, Error> {
+        self.store.held_by(self.claimer)
+    }
+
+    /// one turn of the lease loop: say this process is still here, then take
+    /// back whatever belonged to one that is not.
+    ///
+    /// both halves run everywhere, including in a process that claims nothing
+    /// of its own — noticing a dead claimer is not the executor's job in
+    /// particular, and a deployment where only the dead process could have
+    /// noticed would never notice.
+    pub(crate) fn heartbeat(&self) {
+        if let Err(e) = self.store.renew_leases(self.claimer, LEASE) {
+            tracing::warn!("lease renewal failed: {e}");
+        }
+        let taken = match self.store.reclaim_expired(self.reclaim) {
+            Ok(taken) => taken,
+            Err(e) => {
+                tracing::warn!("reclaim failed: {e}");
+                return;
+            }
+        };
+        if taken.is_empty() {
+            return;
+        }
+        for (run_id, claimer) in &taken {
+            tracing::warn!(
+                run = %run_id,
+                "reclaimed from {claimer}, which stopped renewing its lease: {}",
+                match self.reclaim {
+                    Reclaim::Fail => "failed",
+                    Reclaim::Requeue => "requeued",
+                }
+            );
+            // a stall is exactly the thing an on-call hook exists to hear
+            // about, and `Fail` is the default because surfacing one beats
+            // repeating half its side effects in silence
+            if self.reclaim == Reclaim::Fail
+                && let Ok(Some(run)) = self.store.run(run_id)
+            {
+                fire_hooks(
+                    &self.hooks,
+                    RunFailure {
+                        run_id: run.id,
+                        job: run.job,
+                        trigger: run.trigger,
+                        failed_op: None,
+                        error: run.error,
+                        finished_at: run.finished_at.unwrap_or_else(Utc::now),
+                    },
+                    "failure",
+                );
+            }
+        }
+        self.settled.notify_waiters();
+        self.dispatch();
     }
 
     /// move a queued run up or down the queue, and look at the queue again.
@@ -1384,6 +1465,16 @@ fn fold_instances(
         folded.push((parent, OpStatus::Success, Some(Value::Array(collected))));
     }
     folded
+}
+
+/// the loop `serve` runs: [`Runner::heartbeat`] every [`HEARTBEAT`], forever.
+pub(crate) async fn run_leases(runner: Runner) {
+    let mut ticker = tokio::time::interval(HEARTBEAT);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        ticker.tick().await;
+        runner.heartbeat();
+    }
 }
 
 /// the loop `serve` runs: [`Runner::dispatch`] every [`DISPATCH_POLL`], forever.
@@ -3115,6 +3206,256 @@ mod tests {
         gate.store(true, Ordering::SeqCst);
         until("the queue drained", || order(&started).len() == 3).await;
         assert_eq!(order(&started), ["a", "c", "b"]);
+    }
+
+    // ---------------------------------------------------- claims and leases
+
+    /// a queued run planted straight into a store, as a launch in some other
+    /// process would have left it.
+    fn plant_queued(store: &Store, id: &str, job: &str) {
+        let run = Run {
+            id: id.to_string(),
+            job: job.to_string(),
+            status: RunStatus::Queued,
+            trigger: Trigger::Manual,
+            params: json!({}),
+            created_at: Utc::now(),
+            started_at: None,
+            finished_at: None,
+            error: None,
+            resumed_from: None,
+            scheduled_for: None,
+            tags: RunTags::new(),
+            priority: 0,
+            claimed_by: None,
+            claimed_at: None,
+            lease_until: None,
+        };
+        store.create_run(&run, &["work".to_string()]).unwrap();
+    }
+
+    fn file_store(dir: &tempfile::TempDir) -> (String, Store) {
+        let path = dir.path().join("hestan.db").display().to_string();
+        let store = Store::open(&path).unwrap();
+        (path, store)
+    }
+
+    // the claim is a compare-and-set, so two claimers reaching for one run is
+    // not a race that has to be avoided — it is one that resolves
+    #[tokio::test]
+    async fn two_claimers_race_one_run_and_exactly_one_wins() {
+        let dir = tempfile::tempdir().unwrap();
+        let (path, store) = file_store(&dir);
+        plant_queued(&store, "contested", "etl");
+        let defined = HashSet::from(["etl".to_string()]);
+
+        let both: Vec<_> = ["alpha", "beta"]
+            .map(|claimer| {
+                let path = path.clone();
+                let defined = defined.clone();
+                tokio::task::spawn_blocking(move || {
+                    let store = Store::open(&path).unwrap();
+                    store
+                        .claim_next(claimer, LEASE, &Limits::new(), &defined)
+                        .unwrap()
+                        .map(|(run, _)| (claimer, run.id))
+                })
+            })
+            .into_iter()
+            .collect();
+        let mut won = Vec::new();
+        for handle in both {
+            if let Some(claim) = handle.await.unwrap() {
+                won.push(claim);
+            }
+        }
+
+        assert_eq!(won.len(), 1, "the same run was claimed twice: {won:?}");
+        assert_eq!(won[0].1, "contested");
+        let row = store.run("contested").unwrap().unwrap();
+        assert_eq!(row.claimed_by.as_deref(), Some(won[0].0));
+        assert!(row.lease_until.is_some());
+        // and it is off the queue for good
+        assert_eq!(store.queue_depth().unwrap(), 0);
+    }
+
+    // the review finding, asserted as the thing it is: process B booting must
+    // not touch process A's in-flight work
+    #[tokio::test]
+    async fn a_live_lease_survives_another_processs_boot_and_an_expired_one_does_not() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_, store) = file_store(&dir);
+        plant_queued(&store, "live", "etl");
+        plant_queued(&store, "stranded", "etl");
+        // both are being executed by processes that are not this one; one is
+        // still saying so, the other stopped a while ago
+        store
+            .plant_claim(
+                "live",
+                "other-process",
+                Some(Utc::now() + chrono::Duration::seconds(45)),
+            )
+            .unwrap();
+        store
+            .plant_claim(
+                "stranded",
+                "dead-process",
+                Some(Utc::now() - chrono::Duration::seconds(90)),
+            )
+            .unwrap();
+        for id in ["live", "stranded"] {
+            store.run_started(id).unwrap();
+            store.op_started(id, "work", 1).unwrap();
+        }
+
+        // this is what booting is: the sweep that used to assume it was alone
+        store.fail_interrupted().unwrap();
+
+        let live = store.run("live").unwrap().unwrap();
+        assert_eq!(
+            live.status,
+            RunStatus::Running,
+            "a boot elsewhere failed a live process's run: {:?}",
+            live.error
+        );
+        assert_eq!(live.error, None);
+        assert_eq!(live.claimed_by.as_deref(), Some("other-process"));
+        assert_eq!(
+            store.op_run("live", "work").unwrap().unwrap().status,
+            OpStatus::Running,
+            "a boot elsewhere marked a live process's op as interrupted"
+        );
+        assert!(
+            !store
+                .events("live", 0)
+                .unwrap()
+                .iter()
+                .any(|e| e.message.contains("interrupted")),
+            "a boot elsewhere announced an interruption on a live run"
+        );
+
+        // and the one whose claimer really is gone is swept, exactly as before
+        let stranded = store.run("stranded").unwrap().unwrap();
+        assert_eq!(stranded.status, RunStatus::Failed);
+        assert!(stranded.error.unwrap().contains("interrupted"));
+        assert_eq!(
+            store.op_run("stranded", "work").unwrap().unwrap().status,
+            OpStatus::Failed
+        );
+    }
+
+    // a queued run nobody has claimed is the queue, not a casualty of whatever
+    // restarted, and it has to still be there afterwards
+    #[tokio::test]
+    async fn a_boot_leaves_the_queue_where_it_found_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_, store) = file_store(&dir);
+        plant_queued(&store, "waiting", "etl");
+
+        store.fail_interrupted().unwrap();
+
+        let waiting = store.run("waiting").unwrap().unwrap();
+        assert_eq!(waiting.status, RunStatus::Queued, "{:?}", waiting.error);
+        assert_eq!(store.queue_depth().unwrap(), 1);
+        assert_eq!(
+            store.op_run("waiting", "work").unwrap().unwrap().status,
+            OpStatus::Pending
+        );
+    }
+
+    #[tokio::test]
+    async fn a_heartbeat_extends_the_lease_it_holds_and_nobody_elses() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_, store) = file_store(&dir);
+        plant_queued(&store, "mine", "etl");
+        plant_queued(&store, "theirs", "etl");
+        let runner = Runner::new([sleepy_job("etl", 30_000)], store.clone());
+        let stale = Utc::now() - chrono::Duration::seconds(5);
+        store
+            .plant_claim("mine", runner.instance(), Some(stale))
+            .unwrap();
+        store
+            .plant_claim("theirs", "somebody-else", Some(stale))
+            .unwrap();
+
+        assert_eq!(store.renew_leases(runner.instance(), LEASE).unwrap(), 1);
+        let mine = store.run("mine").unwrap().unwrap();
+        assert!(
+            mine.lease_until.unwrap() > Utc::now(),
+            "the heartbeat did not move the lease"
+        );
+        assert_eq!(
+            store.run("theirs").unwrap().unwrap().lease_until.unwrap(),
+            stale,
+            "a heartbeat renewed a claim it does not hold"
+        );
+        assert_eq!(runner.holding().unwrap(), ["mine"]);
+    }
+
+    #[tokio::test]
+    async fn an_expired_lease_is_failed_with_its_ops_saying_why() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_, store) = file_store(&dir);
+        plant_queued(&store, "stalled", "etl");
+        store
+            .plant_claim(
+                "stalled",
+                "vanished",
+                Some(Utc::now() - chrono::Duration::seconds(90)),
+            )
+            .unwrap();
+        store.run_started("stalled").unwrap();
+        store.op_started("stalled", "work", 1).unwrap();
+        let runner = Runner::new([sleepy_job("etl", 30_000)], store.clone());
+
+        runner.heartbeat();
+
+        let run = store.run("stalled").unwrap().unwrap();
+        assert_eq!(run.status, RunStatus::Failed);
+        assert!(run.error.as_ref().unwrap().contains("claimer went away"));
+        assert_eq!(run.lease_until, None);
+        let op = store.op_run("stalled", "work").unwrap().unwrap();
+        assert_eq!(op.status, OpStatus::Failed);
+        let why = op.error.unwrap();
+        assert!(why.contains("claimer went away"), "{why}");
+        assert!(why.contains("vanished"), "{why}");
+    }
+
+    #[tokio::test]
+    async fn an_expired_lease_goes_back_on_the_queue_under_requeue() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_, store) = file_store(&dir);
+        plant_queued(&store, "stalled", "etl");
+        store
+            .plant_claim(
+                "stalled",
+                "vanished",
+                Some(Utc::now() - chrono::Duration::seconds(90)),
+            )
+            .unwrap();
+        store.run_started("stalled").unwrap();
+        let runner =
+            Runner::new([sleepy_job("etl", 1)], store.clone()).with_reclaim(Reclaim::Requeue);
+
+        // heartbeat reclaims and then dispatches, so this process picks the run
+        // straight back up — which is what requeue is for
+        runner.heartbeat();
+
+        let run = store.run("stalled").unwrap().unwrap();
+        assert_ne!(run.claimed_by.as_deref(), Some("vanished"));
+        assert!(
+            matches!(run.status, RunStatus::Queued | RunStatus::Running),
+            "a requeued run went terminal: {:?}",
+            run.status
+        );
+        assert!(
+            store
+                .events("stalled", 0)
+                .unwrap()
+                .iter()
+                .any(|e| e.message.contains("requeued for another claimer"))
+        );
+        assert_eq!(wait_terminal(&runner, "stalled").await, RunStatus::Success);
     }
 
     // a subset launch's seeds belong to an earlier run and live nowhere on this

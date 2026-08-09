@@ -11,8 +11,8 @@ use crate::error::Error;
 use crate::executor::{Blocked, InFlight, Limits, QUEUE_SCAN, Queued};
 use crate::model::{
     AssetCheckRow, Backfill, BackfillStatus, CheckStatus, Event, EventKind, EventLevel,
-    FreshnessRow, Materialization, OpRun, OpStatus, Preset, Run, RunCursor, RunStatus, RunTags,
-    ScheduleRow, SensorOutcome, SensorRow, SensorTick, Severity, Tick, TickOutcome,
+    FreshnessRow, Materialization, OpRun, OpStatus, Preset, Reclaim, Run, RunCursor, RunStatus,
+    RunTags, ScheduleRow, SensorOutcome, SensorRow, SensorTick, Severity, Tick, TickOutcome,
 };
 use crate::schedule::Schedule;
 
@@ -544,24 +544,32 @@ impl Store {
     }
 
     /// which runs a boot sweep may declare dead, as a `WHERE` fragment over
-    /// `runs`.
+    /// `runs` with the current time as `?1`.
     ///
-    /// a **queued run nobody has claimed is not a casualty, it is the queue**.
-    /// before the queue was durable, a run left `queued` was one whose executing
-    /// task died with the process, so failing it was the only honest thing to
-    /// do. now it is a row waiting for a dispatcher — possibly one in another
-    /// process, right now — and failing it at boot would empty the queue every
-    /// time anything restarted.
+    /// this is where an assumption became a mechanism. boot recovery used to
+    /// assume the process starting up was the only one there had ever been, so
+    /// every non-terminal run belonged to a process that was gone and every one
+    /// of them was over. with a claimable queue that assumption is false and
+    /// destructive — a second process starting would have failed a live one's
+    /// runs, mid-run, and skipped their ops. what a run's fate turns on now is
+    /// its claim:
     ///
-    /// everything else non-terminal is still swept: a claimed run whose claimer
-    /// is not here, and a `running` run with no claim at all, which can only
-    /// have been written before the queue existed.
-    const INTERRUPTED: &'static str =
-        "status IN ('queued', 'running') AND (status = 'running' OR claimed_by IS NOT NULL)";
+    /// - **claimed, lease still good**: somebody is executing it and it is not
+    ///   this process. left entirely alone. this is the case the assumption got
+    ///   wrong.
+    /// - **claimed, lease expired**: its claimer stopped saying it was there.
+    ///   dead, and swept.
+    /// - **`running` with no claim**: written before the queue existed, by a
+    ///   process that is gone. dead, and swept.
+    /// - **`queued` with no claim**: not a casualty — the queue. left for a
+    ///   dispatcher, which is the whole point of making it durable.
+    const INTERRUPTED: &'static str = "status IN ('queued', 'running') AND (
+             (claimed_by IS NOT NULL AND (lease_until IS NULL OR lease_until < ?1))
+             OR (claimed_by IS NULL AND status = 'running'))";
 
     /// mark runs left behind by a dead process as failed; called at startup.
-    /// see [`INTERRUPTED`](Self::INTERRUPTED) for what that does and does not
-    /// cover.
+    /// lease-aware: see [`INTERRUPTED`](Self::INTERRUPTED) for what that means
+    /// and why it has to be.
     pub(crate) fn fail_interrupted(&self) -> Result<(), Error> {
         let mut conn = self.0.lock().unwrap();
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
@@ -648,6 +656,7 @@ impl Store {
     pub(crate) fn claim_next(
         &self,
         claimer: &str,
+        lease: Duration,
         limits: &Limits,
         defined: &HashSet<String>,
     ) -> Result<Option<(Run, Option<Value>)>, Error> {
@@ -656,6 +665,7 @@ impl Store {
         let counts = in_flight(&tx, limits)?;
         let candidates = queued(&tx, QUEUE_SCAN)?;
         let now = Utc::now();
+        let until = now + chrono::Duration::from_std(lease).unwrap_or(chrono::Duration::MAX);
         for (mut run, plan) in candidates {
             if !defined.contains(&run.job) {
                 continue;
@@ -664,9 +674,14 @@ impl Store {
                 continue;
             }
             let won = tx.execute(
-                "UPDATE runs SET claimed_by = ?1, claimed_at = ?2
-                 WHERE id = ?3 AND claimed_by IS NULL AND status = 'queued'",
-                params![claimer, now.to_rfc3339(), run.id.clone()],
+                "UPDATE runs SET claimed_by = ?1, claimed_at = ?2, lease_until = ?3
+                 WHERE id = ?4 AND claimed_by IS NULL AND status = 'queued'",
+                params![
+                    claimer,
+                    now.to_rfc3339(),
+                    until.to_rfc3339(),
+                    run.id.clone()
+                ],
             )?;
             if won == 0 {
                 continue;
@@ -674,6 +689,7 @@ impl Store {
             tx.commit()?;
             run.claimed_by = Some(claimer.to_string());
             run.claimed_at = Some(now);
+            run.lease_until = Some(until);
             return Ok(Some((run, plan)));
         }
         tx.commit()?;
@@ -748,6 +764,117 @@ impl Store {
             params![id, priority],
         )?;
         Ok(true)
+    }
+
+    /// say that `claimer` is still here, for every run it holds. returns how
+    /// many leases moved, which is how many runs this process is executing.
+    pub(crate) fn renew_leases(&self, claimer: &str, lease: Duration) -> Result<usize, Error> {
+        let conn = self.0.lock().unwrap();
+        let until = Utc::now() + chrono::Duration::from_std(lease).unwrap_or(chrono::Duration::MAX);
+        let n = conn.execute(
+            "UPDATE runs SET lease_until = ?2
+             WHERE claimed_by = ?1 AND status IN ('queued', 'running')",
+            params![claimer, until.to_rfc3339()],
+        )?;
+        Ok(n)
+    }
+
+    /// the runs `claimer` currently holds, so a process can say what it is
+    /// executing and anyone else can tell who holds what.
+    pub(crate) fn held_by(&self, claimer: &str) -> Result<Vec<String>, Error> {
+        let conn = self.0.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id FROM runs
+             WHERE claimed_by = ?1 AND status IN ('queued', 'running') ORDER BY created_at",
+        )?;
+        let rows = stmt.query_map(params![claimer], |r| r.get(0))?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    /// take back every run whose claimer stopped saying it was there, and
+    /// either fail it or put it back on the queue.
+    ///
+    /// its ops are marked either way, and with the reason: an op left `running`
+    /// by a process that vanished did not finish, and a row that says otherwise
+    /// is what the next resume would build on. returns `(run id, the claimer
+    /// that went away)` for each.
+    pub(crate) fn reclaim_expired(&self, policy: Reclaim) -> Result<Vec<(String, String)>, Error> {
+        let mut conn = self.0.lock().unwrap();
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let now = Utc::now().to_rfc3339();
+        let expired: Vec<(String, String)> = {
+            let mut stmt = tx.prepare(
+                "SELECT id, claimed_by FROM runs
+                 WHERE claimed_by IS NOT NULL AND status IN ('queued', 'running')
+                   AND (lease_until IS NULL OR lease_until < ?1)",
+            )?;
+            let rows = stmt.query_map(params![now], |r| Ok((r.get(0)?, r.get(1)?)))?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+        for (id, claimer) in &expired {
+            let why = format!("claimer went away: {claimer} stopped renewing its lease");
+            tx.execute(
+                "UPDATE op_runs SET
+                     status = CASE status WHEN 'running' THEN 'failed' ELSE 'skipped' END,
+                     error = CASE status WHEN 'running' THEN ?2 ELSE error END,
+                     finished_at = ?3, pid = NULL
+                 WHERE run_id = ?1 AND status IN ('pending', 'running')",
+                params![id, why, now],
+            )?;
+            let (level, kind, message) = match policy {
+                Reclaim::Fail => (EventLevel::Error, EventKind::RunFailed, why.clone()),
+                Reclaim::Requeue => (
+                    EventLevel::Warn,
+                    EventKind::Log,
+                    format!("{why}; requeued for another claimer"),
+                ),
+            };
+            tx.execute(
+                "INSERT INTO events (run_id, op, level, kind, message, ts)
+                 VALUES (?1, NULL, ?2, ?3, ?4, ?5)",
+                params![id, level.as_str(), kind.as_str(), message, now],
+            )?;
+            match policy {
+                Reclaim::Fail => tx.execute(
+                    "UPDATE runs SET status = 'failed', finished_at = ?2, lease_until = NULL,
+                         error = COALESCE(error, ?3)
+                     WHERE id = ?1",
+                    params![id, now, why],
+                )?,
+                // back to exactly what an unclaimed queued run is: no owner, no
+                // lease, and no start time it turned out not to have had
+                Reclaim::Requeue => tx.execute(
+                    "UPDATE runs SET status = 'queued', claimed_by = NULL, claimed_at = NULL,
+                         lease_until = NULL, started_at = NULL
+                     WHERE id = ?1",
+                    params![id],
+                )?,
+            };
+        }
+        tx.commit()?;
+        Ok(expired)
+    }
+
+    /// write the claim another process would have written. tests only: this is
+    /// the one thing a single process cannot do to itself honestly.
+    #[cfg(test)]
+    pub(crate) fn plant_claim(
+        &self,
+        id: &str,
+        claimer: &str,
+        lease_until: Option<DateTime<Utc>>,
+    ) -> Result<(), Error> {
+        let conn = self.0.lock().unwrap();
+        conn.execute(
+            "UPDATE runs SET claimed_by = ?2, claimed_at = ?3, lease_until = ?4 WHERE id = ?1",
+            params![
+                id,
+                claimer,
+                Utc::now().to_rfc3339(),
+                lease_until.map(|t| t.to_rfc3339())
+            ],
+        )?;
+        Ok(())
     }
 
     /// cancel a run out of the queue: only one that nobody has claimed, and

@@ -947,6 +947,10 @@ mod tests {
         let entry = hourly_entry("etl", Catchup::One);
         let runner = crate::Runner::new([nap_job("etl", 5, Overlap::Queue)], store.clone());
         catch_up(&entry, &runner, stored(&store).get(&entry.key()), now);
+        // process one's own run finishes before it dies: the boot sweep in
+        // process two respects a live claim now, and a run left mid-flight in
+        // this same process is exactly what a live claim looks like
+        wait_idle(&store, "etl").await;
         store
             .record_tick("etl", HOURLY, held, TickOutcome::Deferred, None, None)
             .unwrap();
