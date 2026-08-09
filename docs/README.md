@@ -5,6 +5,7 @@
 - [typed io](typed-io.md) — `Op::typed`, `input_as`, `.params::<P>()`, and what a type-check failure does.
 - [resources](resources.md) — values built once at startup and shared by every op: `Hestan::resource`, `ctx.resource::<T>`, `Op::requires`.
 - [op state](state.md) — persisted watermarks: `ctx.state`/`set_state`, the at-least-once commit order, the state endpoint.
+- [metadata](metadata.md) — typed facts an op attaches to what it produced: `ctx.meta`, the `Meta` variants, per-attempt staging, and where they surface.
 - [io managers](io-managers.md) — where op outputs live: the `IoManager` trait, `Inline`, `FileIo`, per-op managers, and where handles are resolved.
 - [assets](assets.md) — fingerprints, provable staleness, memoized builds, serialized builds, probes, and `.auto()`.
 - [sensors](sensors.md) — the sensor loop, cursor commit-on-success, `RunRequest`, probes-as-sensors, pausing and tick history.

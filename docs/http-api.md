@@ -227,9 +227,16 @@ needed to see a fan-out:
   "started_at": "2026-08-07T12:00:01Z",
   "finished_at": "2026-08-07T12:00:03Z",
   "output": { "orders": 4, "revenue": 171.65, "enriched": 6 },
+  "metadata": { "rows": {"int": 1234}, "source": {"url": "https://example.test/orders"} },
   "error": null
 }
 ```
+
+`metadata` is what the op reported with `ctx.meta`, one tagged value per
+name — `int`, `float`, `text`, `url`, `markdown`, `json` — and `null` when
+it reported nothing, which is not the same as `{}`. only the attempt that
+succeeded contributes: a failed attempt's metadata is discarded. see
+[metadata](metadata.md).
 
 ## Events
 
@@ -371,10 +378,12 @@ materializations, newest first (`limit` default 20, clamped to 1..=200):
 { "materializations": [
   { "id": 412, "fingerprint": "9c01d2aa...", "changed": true,
     "inputs": { "docs_dir": "14a61f3c..." },
-    "run_id": "019fe109-...", "built_at": "2026-08-08T11:01:36Z" },
+    "run_id": "019fe109-...", "built_at": "2026-08-08T11:01:36Z",
+    "metadata": { "files": {"int": 18} } },
   { "id": 407, "fingerprint": "3bffef12...", "changed": false,
     "inputs": { "docs_dir": "14a61f3c..." },
-    "run_id": "019fe0b2-...", "built_at": "2026-08-08T10:01:36Z" }
+    "run_id": "019fe0b2-...", "built_at": "2026-08-08T10:01:36Z",
+    "metadata": null }
 ] }
 ```
 
@@ -383,8 +392,9 @@ it in time, which is the difference between a rebuild and a change; the
 oldest entry of all is `true`, and a page's oldest entry is compared against
 the entry just off the page rather than reported as a change. `run_id` is
 null on source rows, which probes write outside any run. no `value` here, as
-on `GET /api/assets`: these are the facts about a build, not its payload. 404
-for an unknown asset.
+on `GET /api/assets`: these are the facts about a build, not its payload.
+`metadata` is what the op that built it reported, the same map its op run
+carries ([metadata](metadata.md)). 404 for an unknown asset.
 
 ## Sensors
 

@@ -876,6 +876,49 @@ button.text-btn.active {
   margin: 8px 0 2px;
 }
 
+.meta-list {
+  width: 100%;
+  margin: 4px 0;
+  font-size: 12px;
+}
+
+.meta-row {
+  display: flex;
+  align-items: baseline;
+  gap: 12px;
+  padding: 2px 0;
+}
+
+.meta-name {
+  flex: none;
+  min-width: 72px;
+  color: var(--muted);
+  font-size: 10px;
+  font-weight: 500;
+}
+
+/* numbers line up as a column, whatever else is in the list */
+.meta-num {
+  margin-left: auto;
+  font-variant-numeric: tabular-nums;
+}
+
+.meta-val {
+  overflow-wrap: anywhere;
+}
+
+.meta-block {
+  margin: 0;
+  max-height: 140px;
+  overflow: auto;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.mat-entry .meta-list {
+  margin: 0 0 6px 16px;
+}
+
 .mat-row {
   display: flex;
   align-items: baseline;

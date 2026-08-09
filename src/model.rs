@@ -200,6 +200,9 @@ pub struct OpRun {
     pub started_at: Option<DateTime<Utc>>,
     pub finished_at: Option<DateTime<Utc>>,
     pub output: Option<Value>,
+    /// typed facts the op reported with [`OpCtx::meta`](crate::OpCtx::meta),
+    /// one tagged value per name. `None` when it reported nothing.
+    pub metadata: Option<Value>,
     pub error: Option<String>,
 }
 
@@ -256,6 +259,9 @@ pub struct Materialization {
     pub value: Option<Value>,
     pub run_id: Option<String>,
     pub built_at: DateTime<Utc>,
+    /// what the op that built this reported with
+    /// [`OpCtx::meta`](crate::OpCtx::meta) — the same map its op run carries.
+    pub metadata: Option<Value>,
 }
 
 #[derive(Debug, Clone, Serialize)]

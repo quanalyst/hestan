@@ -17,7 +17,7 @@ use crate::job::Job;
 use crate::model::{
     EventKind, EventLevel, OpRun, OpStatus, Run, RunStatus, Trigger, When, new_run_id,
 };
-use crate::op::{Cancel, Op, OpCtx};
+use crate::op::{self, Cancel, MetaBuf, Op, OpCtx};
 use crate::resource::{self, Resources};
 use crate::store::Store;
 
@@ -84,7 +84,15 @@ pub struct ResumePlan {
     resumed_from: String,
 }
 
-type OpOutcome = (String, Result<(Value, Option<Value>), String>);
+/// what one op invocation produced: its output, plus whatever the attempt
+/// that worked staged for the terminal write to commit.
+struct Produced {
+    output: Value,
+    state: Option<Value>,
+    meta: Option<Value>,
+}
+
+type OpOutcome = (String, Result<Produced, String>);
 
 /// one instance of a mapped op, keyed in the run by its `{op}[{i}]` name.
 struct Instance {
@@ -823,7 +831,7 @@ async fn execute(
                         reason,
                         Some(&json!({ "when": op.runs_when() })),
                     ));
-                    note(store.op_finished(&run_id, &name, OpStatus::Skipped, None, None));
+                    note(store.op_finished(&run_id, &name, OpStatus::Skipped, None, None, None));
                     statuses.insert(name.clone(), OpStatus::Skipped);
                     let reason = format!("skipped: upstream {name} was skipped");
                     skip_downstream(
@@ -1010,7 +1018,7 @@ async fn execute(
                     &msg,
                     Some(&json!({ "error": &msg })),
                 ));
-                note(store.op_finished(&run_id, &name, OpStatus::Failed, None, Some(&msg)));
+                note(store.op_finished(&run_id, &name, OpStatus::Failed, None, None, Some(&msg)));
                 if first_failure.is_none() {
                     first_failure = Some((name.clone(), msg));
                 }
@@ -1057,7 +1065,17 @@ async fn execute(
             },
         };
         match joined {
-            Ok((id, (name, Ok((output, state))))) => {
+            Ok((
+                id,
+                (
+                    name,
+                    Ok(Produced {
+                        output,
+                        state,
+                        meta,
+                    }),
+                ),
+            )) => {
                 names.remove(&id);
                 // persisted before the success is recorded: a row saying
                 // success with an output that was never stored is a lie the
@@ -1071,6 +1089,7 @@ async fn execute(
                             &name,
                             OpStatus::Success,
                             Some(&handle),
+                            meta.as_ref(),
                             None,
                         ));
                         // state second: a crash between the writes re-runs the op, never skips it
@@ -1099,7 +1118,14 @@ async fn execute(
                             &msg,
                             Some(&json!({ "error": &msg })),
                         ));
-                        note(store.op_finished(&run_id, &name, OpStatus::Failed, None, Some(&msg)));
+                        note(store.op_finished(
+                            &run_id,
+                            &name,
+                            OpStatus::Failed,
+                            None,
+                            None,
+                            Some(&msg),
+                        ));
                         if first_failure.is_none() {
                             first_failure = Some((name.clone(), msg));
                         }
@@ -1120,7 +1146,7 @@ async fn execute(
             }
             Ok((id, (name, Err(msg)))) => {
                 names.remove(&id);
-                note(store.op_finished(&run_id, &name, OpStatus::Failed, None, Some(&msg)));
+                note(store.op_finished(&run_id, &name, OpStatus::Failed, None, None, Some(&msg)));
                 if first_failure.is_none() {
                     first_failure = Some((name.clone(), msg));
                 }
@@ -1149,7 +1175,7 @@ async fn execute(
                     &msg,
                     Some(&json!({ "error": msg })),
                 ));
-                note(store.op_finished(&run_id, &name, OpStatus::Failed, None, Some(&msg)));
+                note(store.op_finished(&run_id, &name, OpStatus::Failed, None, None, Some(&msg)));
                 if first_failure.is_none() {
                     first_failure = Some((name.clone(), msg));
                 }
@@ -1184,7 +1210,17 @@ async fn execute(
             };
             match joined {
                 // won the race against the abort: record what really happened
-                Ok((id, (name, Ok((output, state))))) => {
+                Ok((
+                    id,
+                    (
+                        name,
+                        Ok(Produced {
+                            output,
+                            state,
+                            meta,
+                        }),
+                    ),
+                )) => {
                     names.remove(&id);
                     // won the race against the abort, so it is persisted like
                     // any other success — or recorded failed if it cannot be
@@ -1197,6 +1233,7 @@ async fn execute(
                                 &name,
                                 OpStatus::Success,
                                 Some(&handle),
+                                meta.as_ref(),
                                 None,
                             ));
                             if let Some(state) = state {
@@ -1210,6 +1247,7 @@ async fn execute(
                                 &name,
                                 OpStatus::Failed,
                                 None,
+                                None,
                                 Some(&msg),
                             ));
                         }
@@ -1217,7 +1255,14 @@ async fn execute(
                 }
                 Ok((id, (name, Err(msg)))) => {
                     names.remove(&id);
-                    note(store.op_finished(&run_id, &name, OpStatus::Failed, None, Some(&msg)));
+                    note(store.op_finished(
+                        &run_id,
+                        &name,
+                        OpStatus::Failed,
+                        None,
+                        None,
+                        Some(&msg),
+                    ));
                 }
                 Err(join_err) if join_err.is_cancelled() => {
                     let name = names.remove(&join_err.id()).expect("spawned with id");
@@ -1234,7 +1279,14 @@ async fn execute(
                         &msg,
                         Some(&json!({ "error": msg })),
                     ));
-                    note(store.op_finished(&run_id, &name, OpStatus::Failed, None, Some(&msg)));
+                    note(store.op_finished(
+                        &run_id,
+                        &name,
+                        OpStatus::Failed,
+                        None,
+                        None,
+                        Some(&msg),
+                    ));
                 }
             }
         }
@@ -1456,7 +1508,14 @@ fn give_up(
 }
 
 fn op_canceled(store: &Store, run_id: &str, name: &str) {
-    note(store.op_finished(run_id, name, OpStatus::Canceled, None, Some("canceled")));
+    note(store.op_finished(
+        run_id,
+        name,
+        OpStatus::Canceled,
+        None,
+        None,
+        Some("canceled"),
+    ));
     note(store.append_event(
         run_id,
         Some(name),
@@ -1542,8 +1601,10 @@ async fn run_op(
         },
     };
     loop {
-        // fresh buffer per attempt: a failed attempt's staged state must not leak
+        // fresh buffers per attempt: a failed attempt's staged state and
+        // metadata must not leak into the one that works
         let new_state = Arc::new(Mutex::new(None));
+        let new_meta: MetaBuf = Arc::new(Mutex::new(BTreeMap::new()));
         // one more stop signal per attempt, flipped by this attempt's timeout;
         // the run's own cancel channel is the other half
         let (expired, on_expiry) = watch::channel(false);
@@ -1563,6 +1624,7 @@ async fn run_op(
             state: state.clone(),
             new_state: new_state.clone(),
             new_fingerprint: Arc::new(Mutex::new(None)),
+            new_meta: new_meta.clone(),
             store: store.clone(),
         };
         // Err(limit) means the attempt timed out; the permit is scoped to this
@@ -1619,8 +1681,14 @@ async fn run_op(
                     "finished",
                     data.as_ref(),
                 ));
-                let staged = new_state.lock().unwrap().take();
-                return (name, Ok((output, staged)));
+                return (
+                    name,
+                    Ok(Produced {
+                        output,
+                        state: new_state.lock().unwrap().take(),
+                        meta: op::staged_meta(&new_meta),
+                    }),
+                );
             }
             Err(msg) => {
                 // retries are extra attempts after the first
@@ -1696,7 +1764,7 @@ fn skip_downstream(
                 reason,
                 None,
             ));
-            note(store.op_finished(run_id, &name, OpStatus::Skipped, None, None));
+            note(store.op_finished(run_id, &name, OpStatus::Skipped, None, None, None));
             statuses.insert(name, OpStatus::Skipped);
         } else {
             i += 1;

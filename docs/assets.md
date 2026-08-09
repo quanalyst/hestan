@@ -218,5 +218,8 @@ materializations newest first (default 20, clamped to 1..=200), each with the
 `changed` flag above and a link back to the run that built it. 404 for an
 unknown name.
 
+metadata an asset op reports lands on its materialization too, so history
+carries what each build said — see [metadata](metadata.md).
+
 shapes and details in [http api](http-api.md); the `asset_materializations`
 table in [storage](storage.md).

@@ -259,7 +259,7 @@ async fn evaluate_probe(
         if let Err(e) =
             runner
                 .store()
-                .record_materialization(asset, &fingerprint, &json!({}), None, None)
+                .record_materialization(asset, &fingerprint, &json!({}), None, None, None)
         {
             return (SensorOutcome::Error, 0, Some(e.to_string()));
         }

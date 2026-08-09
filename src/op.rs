@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -16,6 +16,105 @@ use crate::store::Store;
 
 /// what an op body returns: json output on success, any error on failure.
 pub type OpResult = Result<Value, Box<dyn std::error::Error + Send + Sync>>;
+
+/// a typed fact an op attaches to what it produced, via [`OpCtx::meta`]. the
+/// type is not decoration: it is what lets a row count render as a number, a
+/// source as a link, and a blob as a blob, without anything downstream
+/// guessing from the value.
+///
+/// the obvious rust types convert on their own — `ctx.meta("rows", 1_234)`,
+/// `ctx.meta("note", "backfilled")` — and the rest are named:
+/// `ctx.meta("source", Meta::Url(url))`. `u64` and `usize` deliberately do
+/// not convert, since narrowing them is a lie waiting to happen; cast them
+/// yourself.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Meta {
+    Int(i64),
+    Float(f64),
+    Text(String),
+    Url(String),
+    /// markdown source. hestan stores and shows the source and does not
+    /// render it — there is no markdown parser in this crate.
+    Markdown(String),
+    Json(Value),
+}
+
+impl Meta {
+    /// the stored shape: one tagged value per name, so
+    /// `{"rows": {"int": 1234}, "source": {"url": ".."}}`. written out rather
+    /// than derived, because it is a wire format the api and the ui read.
+    fn tagged(&self) -> Value {
+        match self {
+            Meta::Int(v) => json!({ "int": v }),
+            Meta::Float(v) => json!({ "float": v }),
+            Meta::Text(v) => json!({ "text": v }),
+            Meta::Url(v) => json!({ "url": v }),
+            Meta::Markdown(v) => json!({ "markdown": v }),
+            Meta::Json(v) => json!({ "json": v }),
+        }
+    }
+}
+
+impl From<i64> for Meta {
+    fn from(v: i64) -> Meta {
+        Meta::Int(v)
+    }
+}
+
+impl From<i32> for Meta {
+    fn from(v: i32) -> Meta {
+        Meta::Int(v.into())
+    }
+}
+
+impl From<u32> for Meta {
+    fn from(v: u32) -> Meta {
+        Meta::Int(v.into())
+    }
+}
+
+impl From<f64> for Meta {
+    fn from(v: f64) -> Meta {
+        Meta::Float(v)
+    }
+}
+
+impl From<String> for Meta {
+    fn from(v: String) -> Meta {
+        Meta::Text(v)
+    }
+}
+
+impl From<&str> for Meta {
+    fn from(v: &str) -> Meta {
+        Meta::Text(v.to_string())
+    }
+}
+
+impl From<Value> for Meta {
+    fn from(v: Value) -> Meta {
+        Meta::Json(v)
+    }
+}
+
+/// one attempt's staged metadata, keyed by name. a `BTreeMap` so the stored
+/// object's keys come out in a stable order.
+pub(crate) type MetaBuf = Arc<Mutex<BTreeMap<String, Meta>>>;
+
+/// the staged map as it is stored, or `None` when the op said nothing —
+/// which is a null column, not an empty object.
+pub(crate) fn staged_meta(buf: &MetaBuf) -> Option<Value> {
+    let staged = buf.lock().unwrap();
+    if staged.is_empty() {
+        return None;
+    }
+    Some(Value::Object(
+        staged
+            .iter()
+            .map(|(name, meta)| (name.clone(), meta.tagged()))
+            .collect(),
+    ))
+}
 
 type OpFn = dyn Fn(OpCtx) -> BoxFuture<'static, OpResult> + Send + Sync;
 type ParamsCheck = dyn Fn(&Value) -> Result<(), String> + Send + Sync;
@@ -525,6 +624,7 @@ pub struct OpCtx {
     pub(crate) state: Arc<Option<Value>>,
     pub(crate) new_state: Arc<Mutex<Option<Value>>>,
     pub(crate) new_fingerprint: Arc<Mutex<Option<String>>>,
+    pub(crate) new_meta: MetaBuf,
     pub(crate) store: Store,
 }
 
@@ -688,6 +788,39 @@ impl OpCtx {
         self.new_fingerprint.lock().unwrap().take()
     }
 
+    /// attach a typed fact to what this op produced — a row count, the url it
+    /// read, a note about the shape of the data. the last call for a name
+    /// wins, and everything staged is committed with the op's terminal write:
+    ///
+    /// ```no_run
+    /// # use hestan::{Meta, Op, OpCtx};
+    /// # use serde_json::json;
+    /// Op::new("load", |ctx: OpCtx| async move {
+    ///     ctx.meta("rows", 1_234);
+    ///     ctx.meta("source", Meta::Url("https://example.test/orders".into()));
+    ///     Ok(json!({"loaded": true}))
+    /// });
+    /// ```
+    ///
+    /// buffered per attempt like [`set_state`](Self::set_state), so a failed
+    /// attempt's metadata is discarded and the retry starts from nothing. an
+    /// asset op's metadata lands on its materialization as well, so the
+    /// [history](crate::Store::materializations) carries what each build
+    /// reported.
+    pub fn meta(&self, name: impl Into<String>, value: impl Into<Meta>) {
+        self.new_meta
+            .lock()
+            .unwrap()
+            .insert(name.into(), value.into());
+    }
+
+    /// what this op has staged so far, in stored form. the asset wrapper
+    /// reads it without taking it: the same map goes on the materialization
+    /// and on the op run.
+    pub(crate) fn staged_meta(&self) -> Option<Value> {
+        staged_meta(&self.new_meta)
+    }
+
     pub fn info(&self, msg: impl AsRef<str>) {
         self.log(EventLevel::Info, msg.as_ref());
     }
@@ -759,6 +892,7 @@ mod tests {
             state: Arc::new(None),
             new_state: Arc::new(Mutex::new(None)),
             new_fingerprint: Arc::new(Mutex::new(None)),
+            new_meta: Arc::new(Mutex::new(BTreeMap::new())),
             store: Store::open(":memory:").unwrap(),
         }
     }

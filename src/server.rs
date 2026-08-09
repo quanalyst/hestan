@@ -464,6 +464,7 @@ async fn asset_history(
                 "inputs": m.inputs,
                 "run_id": m.run_id,
                 "built_at": m.built_at,
+                "metadata": m.metadata,
             })
         })
         .collect();
@@ -1090,6 +1091,7 @@ mod tests {
             started_at: Some(t0),
             finished_at: Some(t0 + Duration::milliseconds(ms)),
             output: None,
+            metadata: None,
             error: None,
         };
 
@@ -1149,19 +1151,19 @@ mod tests {
         }
         // oldest run succeeded end to end
         store
-            .op_finished("r0", "a", OpStatus::Success, None, None)
+            .op_finished("r0", "a", OpStatus::Success, None, None, None)
             .unwrap();
         store.op_started("r0", "b", 1).unwrap();
         store
-            .op_finished("r0", "b", OpStatus::Success, None, None)
+            .op_finished("r0", "b", OpStatus::Success, None, None, None)
             .unwrap();
         // the two newer runs failed at a, skipping b (never started)
         for (id, msg) in [("r1", "db locked"), ("r2", "timeout")] {
             store
-                .op_finished(id, "a", OpStatus::Failed, None, Some(msg))
+                .op_finished(id, "a", OpStatus::Failed, None, None, Some(msg))
                 .unwrap();
             store
-                .op_finished(id, "b", OpStatus::Skipped, None, None)
+                .op_finished(id, "b", OpStatus::Skipped, None, None, None)
                 .unwrap();
         }
 
@@ -1780,7 +1782,14 @@ mod tests {
         insert_run_with_ops(&st, "clean", "etl", RunStatus::Failed, &["echo"]);
         st.runner
             .store()
-            .op_finished("clean", "echo", OpStatus::Success, Some(&json!(1)), None)
+            .op_finished(
+                "clean",
+                "echo",
+                OpStatus::Success,
+                Some(&json!(1)),
+                None,
+                None,
+            )
             .unwrap();
         let (status, Json(b)) = resume(&st, "clean", "").await.unwrap_err();
         assert_eq!(status, StatusCode::BAD_REQUEST);
@@ -2027,7 +2036,7 @@ mod tests {
 
         st.runner
             .store()
-            .record_materialization("docs", "d1", &json!({}), None, None)
+            .record_materialization("docs", "d1", &json!({}), None, None, None)
             .unwrap();
         let (status, Json(body)) = build_all_assets(State(st.clone())).await.unwrap();
         assert_eq!(status, StatusCode::ACCEPTED);
@@ -2044,7 +2053,7 @@ mod tests {
 
         st.runner
             .store()
-            .record_materialization("docs", "d2", &json!({}), None, None)
+            .record_materialization("docs", "d2", &json!({}), None, None, None)
             .unwrap();
         let Json(body) = list_assets(State(st)).await.unwrap();
         let stats = &body["assets"].as_array().unwrap()[1];
@@ -2060,7 +2069,7 @@ mod tests {
         let store = st.runner.store().clone();
         for fp in ["d1", "d1", "d2"] {
             store
-                .record_materialization("docs", fp, &json!({}), None, None)
+                .record_materialization("docs", fp, &json!({}), None, None, None)
                 .unwrap();
         }
 
@@ -2125,7 +2134,7 @@ mod tests {
         // the source must have probed once, or every descendant stays provably stale
         st.runner
             .store()
-            .record_materialization("docs", "d1", &json!({}), None, None)
+            .record_materialization("docs", "d1", &json!({}), None, None, None)
             .unwrap();
 
         let (status, Json(body)) = build_one_asset(State(st.clone()), Path("totals".into()))
@@ -2160,7 +2169,7 @@ mod tests {
         let st = asset_state();
         st.runner
             .store()
-            .record_materialization("docs", "d1", &json!({}), None, None)
+            .record_materialization("docs", "d1", &json!({}), None, None, None)
             .unwrap();
         // an assets run planted as live, without an executor behind it
         insert_run(&st, "b1", "assets", RunStatus::Running, json!({}));

@@ -373,22 +373,27 @@ impl Store {
         Ok(())
     }
 
+    /// the op's terminal write. `metadata` is whatever the successful attempt
+    /// staged with `ctx.meta`, committed here so an op run never claims facts
+    /// about work that did not finish.
     pub(crate) fn op_finished(
         &self,
         run_id: &str,
         op: &str,
         status: OpStatus,
         output: Option<&Value>,
+        metadata: Option<&Value>,
         error: Option<&str>,
     ) -> Result<(), Error> {
         let conn = self.0.lock().unwrap();
         conn.execute(
-            "UPDATE op_runs SET status = ?1, finished_at = ?2, output = ?3, error = ?4
-             WHERE run_id = ?5 AND op = ?6",
+            "UPDATE op_runs SET status = ?1, finished_at = ?2, output = ?3, metadata = ?4, error = ?5
+             WHERE run_id = ?6 AND op = ?7",
             params![
                 status.as_str(),
                 Utc::now().to_rfc3339(),
                 output.map(|v| v.to_string()),
+                metadata.map(|v| v.to_string()),
                 error,
                 run_id,
                 op,
@@ -403,7 +408,8 @@ impl Store {
     pub(crate) fn op_unstopped(&self, run_id: &str, op: &str, error: &str) -> Result<(), Error> {
         let conn = self.0.lock().unwrap();
         conn.execute(
-            "UPDATE op_runs SET status = ?1, finished_at = NULL, output = NULL, error = ?2
+            "UPDATE op_runs SET status = ?1, finished_at = NULL, output = NULL, metadata = NULL,
+                 error = ?2
              WHERE run_id = ?3 AND op = ?4",
             params![OpStatus::Canceled.as_str(), error, run_id, op],
         )?;
@@ -641,7 +647,7 @@ impl Store {
     pub fn op_runs(&self, run_id: &str) -> Result<Vec<OpRun>, Error> {
         let conn = self.0.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT run_id, op, status, attempts, started_at, finished_at, output, error
+            "SELECT run_id, op, status, attempts, started_at, finished_at, output, metadata, error
              FROM op_runs WHERE run_id = ?1 ORDER BY op",
         )?;
         let rows = stmt.query_map(params![run_id], op_run_from_row)?;
@@ -652,7 +658,8 @@ impl Store {
     pub fn recent_op_runs(&self, job: &str, runs: u32) -> Result<Vec<OpRun>, Error> {
         let conn = self.0.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT o.run_id, o.op, o.status, o.attempts, o.started_at, o.finished_at, o.output, o.error
+            "SELECT o.run_id, o.op, o.status, o.attempts, o.started_at, o.finished_at, o.output,
+                    o.metadata, o.error
              FROM op_runs o
              JOIN (SELECT id, created_at FROM runs WHERE job = ?1
                    ORDER BY created_at DESC LIMIT ?2) r ON r.id = o.run_id
@@ -716,18 +723,21 @@ impl Store {
         inputs: &Value,
         value: Option<&Value>,
         run_id: Option<&str>,
+        metadata: Option<&Value>,
     ) -> Result<(), Error> {
         let conn = self.0.lock().unwrap();
         conn.execute(
-            "INSERT INTO asset_materializations (asset, fingerprint, inputs, value, run_id, built_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            "INSERT INTO asset_materializations
+                 (asset, fingerprint, inputs, value, run_id, built_at, metadata)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             params![
                 asset,
                 fingerprint,
                 inputs.to_string(),
                 value.map(|v| v.to_string()),
                 run_id,
-                Utc::now().to_rfc3339()
+                Utc::now().to_rfc3339(),
+                metadata.map(|v| v.to_string()),
             ],
         )?;
         Ok(())
@@ -739,7 +749,7 @@ impl Store {
         let conn = self.0.lock().unwrap();
         let row = conn
             .query_row(
-                "SELECT id, asset, fingerprint, inputs, value, run_id, built_at
+                "SELECT id, asset, fingerprint, inputs, value, run_id, built_at, metadata
                  FROM asset_materializations WHERE asset = ?1 ORDER BY id DESC LIMIT 1",
                 params![asset],
                 materialization_from_row,
@@ -752,7 +762,7 @@ impl Store {
     pub fn latest_materializations(&self) -> Result<Vec<Materialization>, Error> {
         let conn = self.0.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT id, asset, fingerprint, inputs, value, run_id, built_at
+            "SELECT id, asset, fingerprint, inputs, value, run_id, built_at, metadata
              FROM asset_materializations
              WHERE id IN (SELECT MAX(id) FROM asset_materializations GROUP BY asset)
              ORDER BY asset",
@@ -776,14 +786,14 @@ impl Store {
     ) -> Result<Vec<(Materialization, bool)>, Error> {
         let conn = self.0.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT id, asset, fingerprint, inputs, value, run_id, built_at, changed FROM (
-                 SELECT id, asset, fingerprint, inputs, value, run_id, built_at,
+            "SELECT id, asset, fingerprint, inputs, value, run_id, built_at, metadata, changed FROM (
+                 SELECT id, asset, fingerprint, inputs, value, run_id, built_at, metadata,
                         fingerprint IS NOT LAG(fingerprint) OVER (ORDER BY id) AS changed
                  FROM asset_materializations WHERE asset = ?1
              ) ORDER BY id DESC LIMIT ?2",
         )?;
         let rows = stmt.query_map(params![asset, limit], |r| {
-            Ok((materialization_from_row(r)?, r.get(7)?))
+            Ok((materialization_from_row(r)?, r.get(8)?))
         })?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
@@ -933,7 +943,8 @@ fn op_run_from_row(row: &Row) -> rusqlite::Result<OpRun> {
         started_at: opt_ts_col(row, 4)?,
         finished_at: opt_ts_col(row, 5)?,
         output: opt_json_col(row, 6)?,
-        error: row.get(7)?,
+        metadata: opt_json_col(row, 7)?,
+        error: row.get(8)?,
     })
 }
 
@@ -959,6 +970,7 @@ fn materialization_from_row(row: &Row) -> rusqlite::Result<Materialization> {
         value: opt_json_col(row, 4)?,
         run_id: row.get(5)?,
         built_at: ts_col(row, 6)?,
+        metadata: opt_json_col(row, 7)?,
     })
 }
 
@@ -1076,11 +1088,12 @@ mod tests {
                 "a",
                 OpStatus::Success,
                 Some(&json!({"rows": 3})),
+                Some(&json!({"rows": {"int": 3}})),
                 None,
             )
             .unwrap();
         store
-            .op_finished("r1", "b", OpStatus::Failed, None, Some("boom"))
+            .op_finished("r1", "b", OpStatus::Failed, None, None, Some("boom"))
             .unwrap();
         store.run_finished("r1", RunStatus::Failed, None).unwrap();
 
@@ -1092,8 +1105,10 @@ mod tests {
         assert_eq!(ops[0].attempts, 2);
         assert_eq!(ops[0].started_at.unwrap(), first_start);
         assert_eq!(ops[0].output, Some(json!({"rows": 3})));
+        assert_eq!(ops[0].metadata, Some(json!({"rows": {"int": 3}})));
         assert_eq!(ops[1].status, OpStatus::Failed);
         assert_eq!(ops[1].error.as_deref(), Some("boom"));
+        assert_eq!(ops[1].metadata, None, "a failure reported no facts");
     }
 
     #[test]
@@ -1368,7 +1383,7 @@ mod tests {
         store.create_run(&done, &["a".into()]).unwrap();
         store.run_started("done").unwrap();
         store
-            .op_finished("done", "a", OpStatus::Success, None, None)
+            .op_finished("done", "a", OpStatus::Success, None, None, None)
             .unwrap();
         store
             .run_finished("done", RunStatus::Success, None)
@@ -1610,7 +1625,7 @@ mod tests {
         assert_eq!(store.op_state("etl", "a").unwrap(), Some(json!(7)));
         assert!(store.latest_materializations().unwrap().is_empty());
         store
-            .record_materialization("docs", "abc", &json!({}), None, None)
+            .record_materialization("docs", "abc", &json!({}), None, None, None)
             .unwrap();
         store.sync_sensors(&["watch".into()]).unwrap();
         drop(store);
@@ -1857,10 +1872,11 @@ mod tests {
                 &json!({"docs": "d1"}),
                 Some(&json!({"files": 12})),
                 Some("r1"),
+                Some(&json!({"files": {"int": 12}})),
             )
             .unwrap();
         store
-            .record_materialization("docs", "d1", &json!({}), None, None)
+            .record_materialization("docs", "d1", &json!({}), None, None, None)
             .unwrap();
 
         let m = store.materialization("stats").unwrap().unwrap();
@@ -1881,6 +1897,7 @@ mod tests {
                 &json!({"docs": "d2"}),
                 Some(&json!({"files": 13})),
                 Some("r2"),
+                None,
             )
             .unwrap();
         let all = store.latest_materializations().unwrap();
@@ -1895,7 +1912,7 @@ mod tests {
 
     fn record(store: &Store, asset: &str, fp: &str) {
         store
-            .record_materialization(asset, fp, &json!({}), None, None)
+            .record_materialization(asset, fp, &json!({}), None, None, None)
             .unwrap();
     }
 

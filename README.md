@@ -150,6 +150,11 @@ appears.
 - ops can carry persisted state: `ctx.set_state` stages a watermark that
   commits only when the attempt succeeds, so the next run picks up where the
   last successful one left off
+- `ctx.meta("rows", 1_234)` attaches typed facts to what an op produced —
+  ints, floats, text, urls, markdown, json — staged per attempt like state
+  and committed with the op's terminal write, so a failed attempt's numbers
+  never get recorded. an asset op's metadata lands on its materialization
+  too, so the history says what each build reported
 - every run, op attempt, output, and log event lands in a sqlite file (WAL,
   one connection behind a mutex — plenty at this scale) with no extra services
   and optional retention (`retention_days(n)` prunes terminal runs older than
@@ -191,6 +196,7 @@ the details live in [docs/](docs/README.md):
 [concepts](docs/concepts.md) (execution semantics),
 [typed io](docs/typed-io.md), [resources](docs/resources.md),
 [io managers](docs/io-managers.md), [op state](docs/state.md),
+[metadata](docs/metadata.md),
 [assets](docs/assets.md), [sensors](docs/sensors.md),
 [scheduling](docs/scheduling.md), [http sources](docs/http-sources.md),
 [notifications](docs/notifications.md), [the web ui](docs/web-ui.md),

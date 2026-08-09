@@ -4,6 +4,7 @@ import { get, HttpError, post, usePoll } from "./api";
 import DagView from "./DagView";
 import type { NodeStatus } from "./DagView";
 import GanttChart from "./GanttChart";
+import MetaList from "./MetaList";
 import StatusDot from "./StatusDot";
 import { GlyphShape } from "./StatusGlyph";
 import type {
@@ -227,6 +228,8 @@ function RunView({ id }: { id: string }) {
   const statuses: Record<string, OpStatus> = Object.fromEntries(ops.map((o) => [o.op, o.status]));
   // an io handle points at where the value lives; anything else is the value
   const selectedOutput = outputLine(ops.find((o) => o.op === opSel)?.output);
+  // what the op said about what it produced, rendered by type below the output
+  const selectedMeta = (opSel && ops.find((o) => o.op === opSel)?.metadata) || null;
   const instances = fanOut(job, ops);
   const expanded = expansions(events);
   // a subset run (memoized asset build) writes no op_runs row for what it
@@ -355,6 +358,12 @@ function RunView({ id }: { id: string }) {
         <p className="muted dag-action">
           output <span className="mono">{selectedOutput}</span>
         </p>
+      )}
+
+      {selectedMeta && (
+        <div className="dag-action">
+          <MetaList metadata={selectedMeta} />
+        </div>
       )}
 
       {done && opSel && (

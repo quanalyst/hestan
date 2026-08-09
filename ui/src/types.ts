@@ -100,6 +100,18 @@ export interface ResumePreview {
   reuse: string[];
 }
 
+// a typed fact an op reported with ctx.meta, stored tagged by its type so
+// nothing downstream has to guess how to show it
+export type MetaValue =
+  | { int: number }
+  | { float: number }
+  | { text: string }
+  | { url: string }
+  | { markdown: string }
+  | { json: unknown };
+
+export type Metadata = Record<string, MetaValue>;
+
 export interface OpRun {
   run_id: string;
   op: string;
@@ -108,6 +120,8 @@ export interface OpRun {
   started_at: string | null;
   finished_at: string | null;
   output: unknown;
+  // what the attempt that succeeded reported; null when it reported nothing
+  metadata: Metadata | null;
   error: string | null;
 }
 
@@ -183,6 +197,8 @@ export interface MaterializationEntry {
   inputs: Record<string, string | null>;
   run_id: string | null;
   built_at: string;
+  // what the op that built it reported, the same map as its op run's
+  metadata: Metadata | null;
 }
 
 export interface SensorTick {

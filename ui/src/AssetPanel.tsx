@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { Link } from "react-router-dom";
 import { get, usePoll } from "./api";
+import MetaList from "./MetaList";
 import type { AssetSummary, MaterializationEntry } from "./types";
 import { relTime, shortId } from "./util";
 
@@ -71,24 +72,28 @@ export default function AssetPanel({
         <p className="muted">never built</p>
       ) : (
         history.map((m) => (
-          <div key={m.id} className="mat-row">
-            {/* the marker is the point: a rebuild and a change are different facts */}
-            <span className="mat-mark" aria-hidden="true">
-              {m.changed ? "•" : ""}
-            </span>
-            <span className="mono mat-fp" title={m.fingerprint}>
-              {shortHash(m.fingerprint)}
-            </span>
-            <span className="muted mat-when" title={m.built_at}>
-              {relTime(m.built_at)}
-            </span>
-            {m.run_id ? (
-              <Link className="mono mat-run" to={`/runs/${m.run_id}`}>
-                {shortId(m.run_id)}
-              </Link>
-            ) : (
-              <span className="muted mat-run">probe</span>
-            )}
+          <div key={m.id} className="mat-entry">
+            <div className="mat-row">
+              {/* the marker is the point: a rebuild and a change are different facts */}
+              <span className="mat-mark" aria-hidden="true">
+                {m.changed ? "•" : ""}
+              </span>
+              <span className="mono mat-fp" title={m.fingerprint}>
+                {shortHash(m.fingerprint)}
+              </span>
+              <span className="muted mat-when" title={m.built_at}>
+                {relTime(m.built_at)}
+              </span>
+              {m.run_id ? (
+                <Link className="mono mat-run" to={`/runs/${m.run_id}`}>
+                  {shortId(m.run_id)}
+                </Link>
+              ) : (
+                <span className="muted mat-run">probe</span>
+              )}
+            </div>
+            {/* what that build reported, in the same gutter as the marker */}
+            {m.metadata && <MetaList metadata={m.metadata} />}
           </div>
         ))
       )}

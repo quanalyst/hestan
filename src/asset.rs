@@ -297,12 +297,15 @@ fn wrap_op(meta: &AssetMeta) -> Op {
                 let fp = ctx.store.materialization(dep)?.map(|m| m.fingerprint);
                 inputs.insert(dep.clone(), fp.map(Value::String).unwrap_or(Value::Null));
             }
+            // read, not taken: the same map goes on this materialization and
+            // on the op run the executor writes when this op reports success
             ctx.store.record_materialization(
                 &name,
                 &fingerprint,
                 &Value::Object(inputs),
                 Some(&output),
                 Some(ctx.run_id()),
+                ctx.staged_meta().as_ref(),
             )?;
             Ok(output)
         }
@@ -527,6 +530,7 @@ mod tests {
             value,
             run_id: None,
             built_at: Utc::now(),
+            metadata: None,
         }
     }
 
@@ -824,7 +828,7 @@ mod tests {
         let reg = AssetRegistry::new(vec![s, a, b]).unwrap();
         let runner = Runner::new([reg.lower_job().unwrap()], store.clone());
         store
-            .record_materialization("s", "s-fp", &json!({}), None, None)
+            .record_materialization("s", "s-fp", &json!({}), None, None, None)
             .unwrap();
         build_all(&reg, &runner).await;
 
@@ -877,7 +881,7 @@ mod tests {
         let runner = Runner::new([reg.lower_job().unwrap()], store.clone());
         // the source was probed before this build
         store
-            .record_materialization("s", "s-fp", &json!({}), None, None)
+            .record_materialization("s", "s-fp", &json!({}), None, None, None)
             .unwrap();
 
         let run = build_all(&reg, &runner).await;
@@ -898,6 +902,40 @@ mod tests {
         let m = mats_map(&store).unwrap();
         let st = staleness(&reg, &m);
         assert!(st.values().all(|s| !s.stale));
+    }
+
+    #[tokio::test]
+    async fn asset_metadata_lands_on_both_the_op_run_and_the_materialization() {
+        use crate::op::Meta;
+
+        let store = Store::open(":memory:").unwrap();
+        let counted = Asset::new("counted", |ctx: OpCtx| async move {
+            ctx.meta("rows", 3);
+            ctx.meta("source", Meta::Url("https://example.test/rows".into()));
+            Ok(json!({"rows": 3}))
+        });
+        let quiet = Asset::new("quiet", |_| async { Ok(json!(null)) });
+        let reg = AssetRegistry::new(vec![counted, quiet]).unwrap();
+        let runner = Runner::new([reg.lower_job().unwrap()], store.clone());
+        let run = build_all(&reg, &runner).await;
+
+        let reported = json!({
+            "rows": {"int": 3},
+            "source": {"url": "https://example.test/rows"},
+        });
+        let ops = store.op_runs(&run.id).unwrap();
+        let op = ops.iter().find(|o| o.op == "counted").unwrap();
+        assert_eq!(op.metadata, Some(reported.clone()));
+        let m = store.materialization("counted").unwrap().unwrap();
+        assert_eq!(m.metadata, Some(reported));
+
+        // and an asset that reported nothing carries null in both places
+        let quiet = ops.iter().find(|o| o.op == "quiet").unwrap();
+        assert_eq!(quiet.metadata, None);
+        assert_eq!(
+            store.materialization("quiet").unwrap().unwrap().metadata,
+            None
+        );
     }
 
     #[tokio::test]
@@ -943,13 +981,20 @@ mod tests {
         let reg = AssetRegistry::new(vec![s, a, b]).unwrap();
         let runner = Runner::new([reg.lower_job().unwrap()], store.clone());
         store
-            .record_materialization("s", "s-fp", &json!({}), None, None)
+            .record_materialization("s", "s-fp", &json!({}), None, None, None)
             .unwrap();
         build_all(&reg, &runner).await;
 
         // poke only b stale: pretend it consumed an older a
         store
-            .record_materialization("b", "b-old", &json!({"a": "older"}), Some(&json!({})), None)
+            .record_materialization(
+                "b",
+                "b-old",
+                &json!({"a": "older"}),
+                Some(&json!({})),
+                None,
+                None,
+            )
             .unwrap();
         let m = mats_map(&store).unwrap();
         let st = staleness(&reg, &m);

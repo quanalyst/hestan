@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use hestan::prelude::*;
 use hestan::{
-    CancelOutcome, Error, EventKind, FailureHook, FileIo, Graph, IoKey, IoManager, IoResult,
+    CancelOutcome, Error, EventKind, FailureHook, FileIo, Graph, IoKey, IoManager, IoResult, Meta,
     OpStatus, Run, RunFailure, RunStatus, Runner, Store, Trigger, When,
 };
 use serde::{Deserialize, Serialize};
@@ -510,6 +510,83 @@ async fn failed_attempt_state_dropped_on_retry() {
     assert_eq!(calls.load(Ordering::SeqCst), 2);
     // attempt 2 succeeded without staging, so nothing was committed
     assert_eq!(runner.store().op_state("wobbly", "cursor").unwrap(), None);
+}
+
+#[tokio::test]
+async fn every_metadata_variant_round_trips_on_the_op_run() {
+    let job = Job::builder("report")
+        .op(Op::new("emit", |ctx: OpCtx| async move {
+            ctx.meta("rows", 1_234);
+            ctx.meta("ratio", 0.5);
+            ctx.meta("note", "backfilled");
+            ctx.meta("source", Meta::Url("https://example.test/orders".into()));
+            ctx.meta("summary", Meta::Markdown("# totals\n\n2 rows".into()));
+            ctx.meta("shape", json!({"cols": ["a", "b"]}));
+            // last call for a name wins, like set_state
+            ctx.meta("rows", 1_235);
+            Ok(json!(null))
+        }))
+        .op(Op::new("quiet", |_| async { Ok(json!(null)) }))
+        .build()
+        .unwrap();
+    let runner = Runner::new([job], Store::open(":memory:").unwrap());
+    let run = runner
+        .run("report", json!({}), Trigger::Manual)
+        .await
+        .unwrap();
+    assert_eq!(run.status, RunStatus::Success);
+
+    let ops = runner.store().op_runs(&run.id).unwrap();
+    let emit = ops.iter().find(|o| o.op == "emit").unwrap();
+    assert_eq!(
+        emit.metadata,
+        Some(json!({
+            "rows": {"int": 1235},
+            "ratio": {"float": 0.5},
+            "note": {"text": "backfilled"},
+            "source": {"url": "https://example.test/orders"},
+            "summary": {"markdown": "# totals\n\n2 rows"},
+            "shape": {"json": {"cols": ["a", "b"]}},
+        }))
+    );
+    // an op that reported nothing stores null, not an empty object
+    let quiet = ops.iter().find(|o| o.op == "quiet").unwrap();
+    assert_eq!(quiet.metadata, None);
+}
+
+#[tokio::test]
+async fn failed_attempt_metadata_dropped_on_retry() {
+    let calls = Arc::new(AtomicU32::new(0));
+    let counter = calls.clone();
+    let job = Job::builder("wobbly")
+        .op(Op::new("load", move |ctx: OpCtx| {
+            let calls = counter.clone();
+            async move {
+                if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                    ctx.meta("rows", 0);
+                    ctx.meta("attempt", "first");
+                    return Err("transient".into());
+                }
+                ctx.meta("rows", 12);
+                Ok(json!(null))
+            }
+        })
+        .retries(1)
+        .retry_delay(Duration::from_millis(10)))
+        .build()
+        .unwrap();
+    let runner = Runner::new([job], Store::open(":memory:").unwrap());
+    let run = runner
+        .run("wobbly", json!({}), Trigger::Manual)
+        .await
+        .unwrap();
+
+    assert_eq!(run.status, RunStatus::Success);
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    // only the attempt that worked reported anything, and `attempt` — staged
+    // by the failure and never restaged — is gone entirely
+    let ops = runner.store().op_runs(&run.id).unwrap();
+    assert_eq!(ops[0].metadata, Some(json!({"rows": {"int": 12}})));
 }
 
 #[tokio::test]
