@@ -525,12 +525,14 @@ sensors, then probes in asset topo order:
 { "sensors": [
   { "name": "marker_file", "every_secs": 5, "paused": false,
     "cursor": 1786186914014, "filter": null,
+    "next_eval": "2026-08-08T11:02:11Z", "consecutive_failures": 0,
     "last_tick": { "id": 7, "sensor": "marker_file",
       "evaluated_at": "2026-08-08T11:02:06Z", "outcome": "fired",
       "launched": 1, "skipped": 0, "error": null } },
   { "name": "run:chain", "every_secs": 15, "paused": false,
     "cursor": { "finished_at": "2026-08-08T11:02:04Z", "id": "0198f2a4-..." },
     "filter": { "job": "orders_etl", "statuses": ["success"] },
+    "next_eval": "2026-08-08T11:02:19Z", "consecutive_failures": 0,
     "last_tick": null }
 ] }
 ```
@@ -541,6 +543,11 @@ commit); for a run sensor it is the last terminal run it read, as
 every job) and the terminal statuses that fire it — and null for a user sensor
 or a probe, which watch whatever their closure looks at. `last_tick` is null
 until the sensor has evaluated once.
+
+`next_eval` is when the loop will evaluate it next, and it is further out than
+`every_secs` while the sensor is [backing off](sensors.md#failure-backoff) —
+`consecutive_failures` is what explains the gap. both live in memory, so a
+restart reports a fresh sensor with no failures behind it.
 
 `POST /api/sensors/state` with `{"name": ..., "paused": true}` flips the
 flag and returns `{"ok": true}`; an unknown name is a 404. paused sensors

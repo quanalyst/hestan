@@ -372,6 +372,7 @@ export default function AssetsPage() {
                 <th>cursor</th>
                 <th>last tick</th>
                 <th className="num">launched</th>
+                <th>next</th>
                 <th />
               </tr>
             </thead>
@@ -401,6 +402,14 @@ export default function AssetsPage() {
                       )}
                     </td>
                     <td className="num">{s.last_tick ? s.last_tick.launched : "—"}</td>
+                    <td className="muted">
+                      {relTime(s.next_eval)}
+                      {s.consecutive_failures > 0 && (
+                        <span className="tag" title={`${s.consecutive_failures} failed evaluations in a row`}>
+                          backing off
+                        </span>
+                      )}
+                    </td>
                     <td className="row-action">
                       <button className="text-btn" onClick={() => setPaused(s.name, !s.paused)}>
                         {s.paused ? "resume" : "pause"}

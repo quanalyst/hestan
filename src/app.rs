@@ -381,6 +381,7 @@ impl Hestan {
                 name: e.name.clone(),
                 every: e.every,
                 filter: e.filter(),
+                state: e.state.clone(),
             })
             .collect();
         let sensors = tokio::spawn(run_sensors(

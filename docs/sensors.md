@@ -127,6 +127,26 @@ Sensor::new("crunch", Duration::from_secs(60), |ctx| async move {
 })
 ```
 
+## Failure backoff
+
+a sensor that errors is evaluated less and less often until it stops erroring:
+the gap doubles from its own interval to a 15 minute cap, with jitter, and the
+**first success collapses it straight back**. an endpoint that has been down
+for an hour does not need polling every five seconds, and hammering it is how
+one broken sensor becomes a log flood and a rate-limit ban.
+
+the floor doubles along with the ceiling — a gap after three failures is
+somewhere in `[4×every, 8×every]`, never below — so the wait genuinely
+lengthens rather than merely lengthening on average, and the jitter is there so
+a fleet of sensors watching the same dead endpoint does not come back in
+lockstep. a sensor whose interval is already past the cap is left alone: there
+is nothing to back off to, and speeding it up would be the opposite of the
+point.
+
+backoff is per sensor and lives in memory, so a restart starts everything
+fresh. `GET /api/sensors` reports `next_eval` and `consecutive_failures`, and
+the ui tags a backing-off sensor rather than leaving it looking merely slow.
+
 ## Probes are sensors
 
 every source asset with a [probe](assets.md) becomes an internal sensor

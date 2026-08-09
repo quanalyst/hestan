@@ -332,5 +332,9 @@ export interface SensorSummary {
   paused: boolean;
   cursor: unknown;
   filter: SensorFilter | null;
+  // when the loop next evaluates it: further out than every_secs while it is
+  // backing off, which is what consecutive_failures explains
+  next_eval: string;
+  consecutive_failures: number;
   last_tick: SensorTick | null;
 }

@@ -25,6 +25,7 @@ use crate::model::{
     AssetCheckRow, CheckStatus, Freshness, OpRun, OpStatus, RunStatus, ScheduleRow, Trigger,
 };
 use crate::schedule;
+use crate::sensor::SensorState;
 
 static UI_DIST: Dir<'static> = include_dir!("$CARGO_MANIFEST_DIR/ui/dist");
 
@@ -34,6 +35,9 @@ pub(crate) struct SensorInfo {
     /// what a [run-status sensor](crate::RunStatusSensor) watches; `None` for
     /// a user sensor or a probe, which watch whatever their closure looks at.
     pub filter: Option<Value>,
+    /// shared with the sensor loop: when this one is next due, and how many
+    /// evaluations have failed in a row.
+    pub state: Arc<SensorState>,
 }
 
 #[derive(Clone)]
@@ -812,12 +816,15 @@ async fn list_sensors(State(st): State<AppState>) -> Result<Json<Value>, ApiErro
                 .sensor_ticks(Some(&info.name), 1)
                 .map(|mut t| t.pop())
                 .map_err(internal)?;
+            let (next_eval, failures) = info.state.snapshot();
             Ok(json!({
                 "name": info.name,
                 "every_secs": info.every.as_secs(),
                 "paused": row.is_some_and(|r| r.paused),
                 "cursor": row.and_then(|r| r.cursor.clone()),
                 "filter": info.filter,
+                "next_eval": next_eval.to_rfc3339(),
+                "consecutive_failures": failures,
                 "last_tick": last_tick,
             }))
         })
@@ -2853,16 +2860,19 @@ mod tests {
                     name: "watch".into(),
                     every: std::time::Duration::from_secs(30),
                     filter: None,
+                    state: SensorState::new(),
                 },
                 SensorInfo {
                     name: "probe:docs".into(),
                     every: std::time::Duration::from_secs(60),
                     filter: None,
+                    state: SensorState::new(),
                 },
                 SensorInfo {
                     name: "run:chain".into(),
                     every: std::time::Duration::from_secs(15),
                     filter: Some(json!({"job": "etl", "statuses": ["success"]})),
+                    state: SensorState::new(),
                 },
             ]),
             ..st
@@ -2881,6 +2891,9 @@ mod tests {
         assert_eq!(sensors[0]["cursor"], json!(null));
         assert_eq!(sensors[0]["last_tick"], json!(null));
         assert_eq!(sensors[0]["filter"], json!(null));
+        // nothing has failed, so the next evaluation is the plain interval away
+        assert_eq!(sensors[0]["consecutive_failures"], 0);
+        assert!(sensors[0]["next_eval"].as_str().is_some());
         assert_eq!(sensors[1]["name"], "probe:docs");
         // a run sensor is a row like any other, with what it watches shown
         assert_eq!(sensors[2]["name"], "run:chain");

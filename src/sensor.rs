@@ -15,6 +15,7 @@ use tokio::time::Instant;
 use crate::asset::{
     ASSETS_JOB, AssetRegistry, ProbeFn, launch_plan, mats_map, plan_targets, staleness,
 };
+use crate::backoff::{capped_exponential, full_jitter};
 use crate::error::Error;
 use crate::executor::Runner;
 use crate::model::{Run, RunCursor, RunStatus, SensorOutcome, Trigger};
@@ -427,11 +428,38 @@ impl SensorEntry {
     }
 }
 
-/// one sensor's place in the loop, shared with the task that evaluates it.
+/// how far apart a repeatedly failing sensor's evaluations grow. a sensor
+/// erroring every tick at full rate is how one broken endpoint becomes a log
+/// flood and a rate-limit ban.
+const BACKOFF_MAX: Duration = Duration::from_secs(15 * 60);
+
+/// how long to wait before the next evaluation, after `failures` consecutive
+/// failed ones. no failures is the sensor's own interval exactly; each failure
+/// doubles it to [`BACKOFF_MAX`], jittered over the top half of the window so
+/// a fleet of sensors watching the same broken endpoint does not come back in
+/// lockstep.
+///
+/// the floor doubles as well as the ceiling, which is what makes the gap
+/// actually lengthen rather than merely lengthen on average — and it is never
+/// shorter than the interval that was asked for, including for a sensor whose
+/// interval is already past the cap and so has nothing to back off to.
+fn next_gap(every: Duration, failures: u32) -> Duration {
+    let capped = capped_exponential(every, failures, BACKOFF_MAX);
+    let floor = (capped / 2).max(every);
+    floor + full_jitter(capped.saturating_sub(floor))
+}
+
+/// one sensor's place in the loop, shared with the task that evaluates it and
+/// with the api, which reports the next evaluation and the failure streak so a
+/// degraded sensor reads as degraded rather than as slow.
 pub(crate) struct SensorState(Mutex<StateInner>);
 
 struct StateInner {
     due: Instant,
+    /// the same instant as `due` on the wall clock, for the api. kept beside
+    /// it rather than derived: a monotonic instant has no calendar time to
+    /// convert to
+    next_eval: DateTime<Utc>,
     /// an evaluation of this sensor is under way — waiting for a permit
     /// counts, because it is going to run
     running: bool,
@@ -439,6 +467,16 @@ struct StateInner {
     /// are log lines. a sensor wedged for an hour must not bury every other
     /// sensor's tick history under its own
     stalled: bool,
+    /// evaluations that have failed in a row, reset by the first success
+    failures: u32,
+}
+
+impl StateInner {
+    fn wait(&mut self, gap: Duration) {
+        self.due = Instant::now() + gap;
+        self.next_eval =
+            Utc::now() + chrono::Duration::from_std(gap).unwrap_or(chrono::TimeDelta::MAX);
+    }
 }
 
 /// what the loop decided to do with a sensor that came due.
@@ -456,8 +494,10 @@ impl SensorState {
     pub(crate) fn new() -> Arc<SensorState> {
         Arc::new(SensorState(Mutex::new(StateInner {
             due: Instant::now(),
+            next_eval: Utc::now(),
             running: false,
             stalled: false,
+            failures: 0,
         })))
     }
 
@@ -465,18 +505,25 @@ impl SensorState {
         self.0.lock().unwrap().due
     }
 
+    /// when the sensor is next due, and how many evaluations have failed in a
+    /// row — what `GET /api/sensors` reports.
+    pub(crate) fn snapshot(&self) -> (DateTime<Utc>, u32) {
+        let inner = self.0.lock().unwrap();
+        (inner.next_eval, inner.failures)
+    }
+
     /// push the next evaluation out by `every` without evaluating: what a
     /// paused sensor does, so its schedule keeps ticking over rather than
     /// coming due the instant it resumes.
     fn defer(&self, every: Duration) {
-        self.0.lock().unwrap().due = Instant::now() + every;
+        self.0.lock().unwrap().wait(every);
     }
 
     fn claim(&self, every: Duration) -> Claim {
         let mut inner = self.0.lock().unwrap();
         // tentative: the evaluation resets it when it ends, so in the ordinary
         // case the gap still counts from the end of the last evaluation
-        inner.due = Instant::now() + every;
+        inner.wait(every);
         if inner.running {
             let first = !inner.stalled;
             inner.stalled = true;
@@ -486,11 +533,21 @@ impl SensorState {
         Claim::Go
     }
 
-    fn release(&self, every: Duration) {
+    /// hand the sensor back once its evaluation has ended. a failure lengthens
+    /// the next gap and the first success collapses it back to `every`.
+    fn release(&self, every: Duration, failed: bool) {
         let mut inner = self.0.lock().unwrap();
         inner.running = false;
         inner.stalled = false;
-        inner.due = Instant::now() + every;
+        inner.failures = match failed {
+            true => inner.failures.saturating_add(1),
+            false => 0,
+        };
+        let gap = next_gap(every, inner.failures);
+        if inner.failures > 0 {
+            tracing::debug!(failures = inner.failures, "sensor backing off for {gap:?}");
+        }
+        inner.wait(gap);
     }
 }
 
@@ -547,8 +604,10 @@ pub(crate) async fn run_sensors(
                 .acquire()
                 .await
                 .expect("the semaphore is never closed");
-            evaluate(&entry, &runner, &registry).await;
-            entry.state.release(entry.every);
+            let outcome = evaluate(&entry, &runner, &registry).await;
+            entry
+                .state
+                .release(entry.every, outcome == SensorOutcome::Error);
         });
     }
 }
@@ -600,7 +659,9 @@ impl Counts {
     }
 }
 
-async fn evaluate(entry: &SensorEntry, runner: &Runner, registry: &AssetRegistry) {
+/// evaluate one sensor and record its tick; the outcome is what the loop
+/// paces the next evaluation from.
+async fn evaluate(entry: &SensorEntry, runner: &Runner, registry: &AssetRegistry) -> SensorOutcome {
     let counts = Counts::default();
     let deadline = Instant::now() + entry.timeout;
     let eval = async {
@@ -644,6 +705,7 @@ async fn evaluate(entry: &SensorEntry, runner: &Runner, registry: &AssetRegistry
     ) {
         tracing::warn!(sensor = %entry.name, "tick write failed: {e}");
     }
+    outcome
 }
 
 /// what launching one request did.
@@ -2060,5 +2122,89 @@ mod tests {
             None,
             "a cursor staged past the deadline was committed"
         );
+    }
+
+    // ---- failure backoff -----------------------------------------------
+
+    #[test]
+    fn consecutive_failures_lengthen_the_gap_and_cap_it() {
+        let every = Duration::from_secs(10);
+        // no failures is the interval exactly: no jitter on the happy path
+        assert_eq!(next_gap(every, 0), every);
+        // the floor doubles with the ceiling, so the gap really does lengthen
+        for (failures, lo, hi) in [(1, 10, 20), (2, 20, 40), (3, 40, 80), (4, 80, 160)] {
+            let (lo, hi) = (Duration::from_secs(lo), Duration::from_secs(hi));
+            for _ in 0..32 {
+                let gap = next_gap(every, failures);
+                assert!(gap >= lo && gap <= hi, "{failures} failures gave {gap:?}");
+            }
+        }
+        // and it stops growing there rather than climbing to a day
+        for failures in [12, 40, u32::MAX] {
+            let gap = next_gap(every, failures);
+            assert!(gap >= BACKOFF_MAX / 2 && gap <= BACKOFF_MAX, "{gap:?}");
+        }
+        // a sensor whose interval already exceeds the cap has nothing to back
+        // off to, and must not be sped up instead
+        let hourly = Duration::from_secs(3600);
+        assert_eq!(next_gap(hourly, 5), hourly);
+    }
+
+    #[test]
+    fn one_success_resets_the_backoff() {
+        let state = SensorState::new();
+        let every = Duration::from_secs(10);
+        for expected in 1..=3 {
+            state.claim(every);
+            state.release(every, true);
+            assert_eq!(state.snapshot().1, expected);
+        }
+        let (before, _) = state.snapshot();
+        assert!(before >= Utc::now() + chrono::Duration::seconds(39));
+
+        state.claim(every);
+        state.release(every, false);
+        let (after, failures) = state.snapshot();
+        assert_eq!(failures, 0);
+        assert!(
+            after <= Utc::now() + chrono::Duration::seconds(11),
+            "one success did not collapse the gap back to the interval"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failing_sensor_is_evaluated_less_and_less_often() {
+        let store = Store::open(":memory:").unwrap();
+        store.sync_sensors(&["broken".into()]).unwrap();
+        let runner = echo_runner(store.clone());
+        let calls = Arc::new(AtomicU32::new(0));
+        let counter = calls.clone();
+        // every 20ms and always failing, so the gaps floor at 20, 40, 80, 160
+        // and 320ms: six evaluations at the outside in 500ms, where the
+        // interval alone would allow twenty-five
+        let entry = SensorEntry::user(Sensor::new(
+            "broken",
+            Duration::from_millis(20),
+            move |_ctx: SensorCtx| {
+                let calls = counter.clone();
+                async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    Err("endpoint is down".into())
+                }
+            },
+        ));
+        let handle = tokio::spawn(run_sensors(
+            vec![entry],
+            runner,
+            Arc::new(AssetRegistry::empty()),
+        ));
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        handle.abort();
+
+        let calls = calls.load(Ordering::SeqCst);
+        assert!((2..=6).contains(&calls), "{calls} evaluations in 500ms");
+        let ticks = store.sensor_ticks(Some("broken"), 20).unwrap();
+        assert_eq!(ticks.len() as u32, calls);
+        assert!(ticks.iter().all(|t| t.outcome == SensorOutcome::Error));
     }
 }
