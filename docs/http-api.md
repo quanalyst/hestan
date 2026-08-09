@@ -337,10 +337,11 @@ startup's sweep marks failed.
 
 ```json
 { "assets": [
-  { "name": "docs_dir", "kind": "source", "deps": [], "auto": false,
+  { "name": "docs_dir", "kind": "source", "deps": [], "auto": false, "op": null,
     "fingerprint": "14a61f3c...", "built_at": "2026-08-08T11:01:36Z",
     "run_id": null, "stale": false, "reasons": [] },
   { "name": "doc_stats", "kind": "derived", "deps": ["docs_dir"], "auto": false,
+    "op": "doc_stats",
     "fingerprint": "3bffef12...", "built_at": "2026-08-08T11:01:36Z",
     "run_id": "019fe109-...", "stale": true,
     "reasons": [ { "dep": "docs_dir", "had": "14a61f3c...", "now": "9c01d2aa..." } ],
@@ -348,8 +349,10 @@ startup's sweep marks failed.
 ] }
 ```
 
-`fingerprint`, `built_at`, and `run_id` come from the current
-materialization: all null before the first one, and `run_id` is always null
+`op` is the op that materializes the asset — its own name, unless a
+[multi-asset](assets.md#one-op-several-assets) produces it alongside others,
+and null on a source, which has no op. `fingerprint`, `built_at`, and
+`run_id` come from the current materialization: all null before the first one, and `run_id` is always null
 on sources (probes write their rows outside any run). `reasons` carries the
 staleness evidence per dep, the fingerprint consumed (`had`) against the
 dep's current one (`now`); equal values mean the dep is itself stale and

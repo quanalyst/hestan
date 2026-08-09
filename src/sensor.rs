@@ -250,17 +250,21 @@ async fn evaluate_probe(
             return (SensorOutcome::Error, 0, Some(msg));
         }
     };
-    let current = match runner.store().materialization(asset) {
+    let current = match runner.store().materialization(asset, None) {
         Ok(m) => m.map(|m| m.fingerprint),
         Err(e) => return (SensorOutcome::Error, 0, Some(e.to_string())),
     };
     if current.as_deref() != Some(fingerprint.as_str()) {
         tracing::info!(asset = %asset, "probe saw a new fingerprint");
-        if let Err(e) =
-            runner
-                .store()
-                .record_materialization(asset, &fingerprint, &json!({}), None, None, None)
-        {
+        if let Err(e) = runner.store().record_materialization(
+            asset,
+            None,
+            &fingerprint,
+            &json!({}),
+            None,
+            None,
+            None,
+        ) {
             return (SensorOutcome::Error, 0, Some(e.to_string()));
         }
     }
@@ -518,7 +522,7 @@ mod tests {
         })
         .from(&source)
         .auto();
-        Arc::new(AssetRegistry::new(vec![source, stats], Vec::new()).unwrap())
+        Arc::new(AssetRegistry::new(vec![source, stats], Vec::new(), Vec::new()).unwrap())
     }
 
     fn probe_entry(reg: &AssetRegistry, asset: &str) -> SensorEntry {
@@ -543,7 +547,7 @@ mod tests {
         let entry = probe_entry(&reg, "docs");
 
         evaluate(&entry, &runner, &reg).await;
-        let docs = store.materialization("docs").unwrap().unwrap();
+        let docs = store.materialization("docs", None).unwrap().unwrap();
         assert_eq!(docs.fingerprint, "one");
         assert_eq!(docs.value, None);
         assert_eq!(docs.run_id, None);
@@ -554,7 +558,7 @@ mod tests {
             wait_terminal(&runner, &runs[0].id).await,
             RunStatus::Success
         );
-        let stats = store.materialization("stats").unwrap().unwrap();
+        let stats = store.materialization("stats", None).unwrap().unwrap();
         assert_eq!(stats.inputs, json!({"docs": "one"}));
         let first_built = stats.built_at;
         let ticks = store.sensor_ticks(Some("probe:docs"), 10).unwrap();
@@ -563,7 +567,7 @@ mod tests {
 
         evaluate(&entry, &runner, &reg).await;
         assert_eq!(store.runs(None, None, None, None, 10).unwrap().len(), 1);
-        let docs_again = store.materialization("docs").unwrap().unwrap();
+        let docs_again = store.materialization("docs", None).unwrap().unwrap();
         assert_eq!(docs_again.built_at, docs.built_at);
         let ticks = store.sensor_ticks(Some("probe:docs"), 10).unwrap();
         assert_eq!(ticks.len(), 2);
@@ -573,7 +577,11 @@ mod tests {
         *fp.lock().unwrap() = "two".to_string();
         evaluate(&entry, &runner, &reg).await;
         assert_eq!(
-            store.materialization("docs").unwrap().unwrap().fingerprint,
+            store
+                .materialization("docs", None)
+                .unwrap()
+                .unwrap()
+                .fingerprint,
             "two"
         );
         let runs = store.runs(None, None, None, None, 10).unwrap();
@@ -582,7 +590,7 @@ mod tests {
             wait_terminal(&runner, &runs[0].id).await,
             RunStatus::Success
         );
-        let stats = store.materialization("stats").unwrap().unwrap();
+        let stats = store.materialization("stats", None).unwrap().unwrap();
         assert_eq!(stats.inputs, json!({"docs": "two"}));
         assert!(stats.built_at >= first_built);
     }
@@ -593,11 +601,11 @@ mod tests {
         store.sync_sensors(&["probe:docs".into()]).unwrap();
         let source =
             Asset::source("docs").probe(|| async { Err("disk on fire".to_string().into()) });
-        let reg = Arc::new(AssetRegistry::new(vec![source], Vec::new()).unwrap());
+        let reg = Arc::new(AssetRegistry::new(vec![source], Vec::new(), Vec::new()).unwrap());
         let runner = echo_runner(store.clone());
         let entry = probe_entry(&reg, "docs");
         evaluate(&entry, &runner, &reg).await;
-        assert!(store.materialization("docs").unwrap().is_none());
+        assert!(store.materialization("docs", None).unwrap().is_none());
         let ticks = store.sensor_ticks(Some("probe:docs"), 10).unwrap();
         assert_eq!(ticks[0].outcome, SensorOutcome::Error);
         assert_eq!(ticks[0].error.as_deref(), Some("disk on fire"));
@@ -615,7 +623,7 @@ mod tests {
         })
         .from(&a)
         .auto();
-        let reg = Arc::new(AssetRegistry::new(vec![s, a, b], Vec::new()).unwrap());
+        let reg = Arc::new(AssetRegistry::new(vec![s, a, b], Vec::new(), Vec::new()).unwrap());
         let runner = Runner::new([reg.lower_job().unwrap()], store.clone());
         let entry = probe_entry(&reg, "s");
 
@@ -632,8 +640,8 @@ mod tests {
             wait_terminal(&runner, &runs[0].id).await,
             RunStatus::Success
         );
-        let ma = store.materialization("a").unwrap().unwrap();
-        let mb = store.materialization("b").unwrap().unwrap();
+        let ma = store.materialization("a", None).unwrap().unwrap();
+        let mb = store.materialization("b", None).unwrap().unwrap();
         assert_eq!(mb.inputs, json!({"a": ma.fingerprint}));
     }
 
@@ -662,7 +670,11 @@ mod tests {
         store.create_run(&active, &[]).unwrap();
         evaluate(&entry, &runner, &reg).await;
         assert_eq!(
-            store.materialization("docs").unwrap().unwrap().fingerprint,
+            store
+                .materialization("docs", None)
+                .unwrap()
+                .unwrap()
+                .fingerprint,
             "one"
         );
         let ticks = store.sensor_ticks(Some("probe:docs"), 10).unwrap();
@@ -683,7 +695,11 @@ mod tests {
         let build = runs.iter().find(|r| r.id != "active").unwrap();
         assert_eq!(wait_terminal(&runner, &build.id).await, RunStatus::Success);
         assert_eq!(
-            store.materialization("stats").unwrap().unwrap().inputs,
+            store
+                .materialization("stats", None)
+                .unwrap()
+                .unwrap()
+                .inputs,
             json!({"docs": "one"})
         );
     }
@@ -703,7 +719,11 @@ mod tests {
         assert_eq!(ticks[0].outcome, SensorOutcome::Error);
         assert!(ticks[0].error.as_deref().unwrap().contains("stats"));
         assert_eq!(
-            store.materialization("docs").unwrap().unwrap().fingerprint,
+            store
+                .materialization("docs", None)
+                .unwrap()
+                .unwrap()
+                .fingerprint,
             "one"
         );
         assert!(store.runs(None, None, None, None, 10).unwrap().is_empty());
@@ -720,7 +740,11 @@ mod tests {
             RunStatus::Success
         );
         assert_eq!(
-            store.materialization("stats").unwrap().unwrap().inputs,
+            store
+                .materialization("stats", None)
+                .unwrap()
+                .unwrap()
+                .inputs,
             json!({"docs": "one"})
         );
     }

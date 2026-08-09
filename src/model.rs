@@ -254,6 +254,9 @@ pub struct Materialization {
     /// when two builds land in the same millisecond.
     pub id: i64,
     pub asset: String,
+    /// the key this entry is for, on a [partitioned
+    /// asset](crate::Partitions); `None` for an unpartitioned one.
+    pub partition: Option<String>,
     pub fingerprint: String,
     pub inputs: Value,
     pub value: Option<Value>,
@@ -292,6 +295,9 @@ str_enum!(CheckStatus { Passed => "passed", Failed => "failed" });
 pub struct AssetCheckRow {
     pub id: i64,
     pub asset: String,
+    /// the key that was checked, on a [partitioned
+    /// asset](crate::Partitions); `None` for an unpartitioned one.
+    pub partition: Option<String>,
     pub check: String,
     /// the run whose build this checked; checks only ever run inside one.
     pub run_id: String,

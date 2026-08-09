@@ -56,6 +56,77 @@ a source contributes no op to that job. its "value" is null everywhere — a
 derived fn whose dep is a source reads the external data itself, and the dep
 exists so staleness can flow, not to carry bytes.
 
+## One op, several assets
+
+some computations produce more than one thing. a query that splits into a
+clean table and a rejected one, an api pull that yields two resources — you
+do not want to run it twice to materialize both. `MultiAsset` is one op that
+produces several assets:
+
+```rust
+let split = MultiAsset::new("split_orders", |ctx: OpCtx| async move {
+    let rows = pull_orders().await?;
+    Ok(json!({
+        "orders_clean":    clean(&rows),
+        "orders_rejected": rejected(&rows),
+    }))
+})
+.produces(["orders_clean", "orders_rejected"])
+.from(&raw_orders);
+
+let report = Asset::new("report", |ctx| async move {
+    let rows = ctx.input("orders_clean").unwrap();   // named as the asset
+    Ok(summarize(rows))
+})
+.from_named("orders_clean");
+
+Hestan::new().assets([raw_orders, report]).multi_assets([split])
+```
+
+the body returns a json **object** whose keys are exactly the produced names.
+a key it did not return, or one nothing declared, fails the op and says which:
+the alternative is materializing a `null` nobody asked for.
+
+`MultiAsset::new` names the *op*, not an asset — nothing is ever materialized
+under `split_orders`. each produced asset gets its own materialization row, its
+own fingerprint (the content hash of that key's value) and its own history,
+and behaves like any other asset from there: deps, staleness, checks, builds,
+the api, the ui. `.from(&dep)` declares lineage once and every produced asset
+gets it, since one op reads its inputs once.
+
+the registry is asset -> op **N:1**, and the consequences are worth stating:
+
+- **staleness is per asset**, as before. the *op* is stale when any asset it
+  produces is.
+- **a plan holds the op once**, however many of its outputs are stale. asking
+  to build `orders_clean` and `orders_rejected` in one build is one run of one
+  computation, and a build of either materializes both — there is no way to
+  produce half of one op.
+- **downstream depends on the asset**, not the op: `.from_named("orders_clean")`
+  and `ctx.input("orders_clean")`. the wiring to the op that produced it is
+  hestan's problem, so an asset moving into or out of a multi-asset does not
+  change anything reading it.
+- **a fresh multi-asset is seeded whole**: a build that memoizes it seeds the
+  object its op returns, so whichever key a consumer reads is there.
+- **checks bind to a produced asset** and are handed that key's value.
+
+per-output overrides, for when the outputs do not all want the same rule:
+
+```rust
+ctx.set_fingerprint_of("orders_clean", etag);   // instead of the content hash
+ctx.meta_of("orders_clean", "rows", 1_234);     // on that materialization
+ctx.meta("pulled", 5_000);                      // on the op run: the work as a whole
+```
+
+`ctx.set_fingerprint` on a multi-asset op covers every output that did not
+stage one of its own. plain `ctx.meta` describes the computation, so it lands
+on the op run; for an op producing one asset it lands on the materialization
+too, exactly as it always has.
+
+names live in one namespace inside the lowered job, so a multi-asset called
+after an existing asset is a build error, as are two multi-assets with one
+name, one that produces nothing, and two claiming the same output.
+
 ## Fingerprints
 
 when a derived asset materializes, its fingerprint is the sha256 hex of its

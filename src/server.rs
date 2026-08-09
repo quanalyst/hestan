@@ -423,6 +423,9 @@ async fn list_assets(State(st): State<AppState>) -> Result<Json<Value>, ApiError
                 "kind": if meta.source { "source" } else { "derived" },
                 "deps": meta.deps,
                 "auto": meta.auto,
+                // the op that materializes it, which is the asset's own name
+                // unless a multi-asset produces it alongside others
+                "op": meta.op,
                 "fingerprint": mat.map(|m| m.fingerprint.clone()),
                 "built_at": mat.map(|m| m.built_at),
                 "run_id": mat.and_then(|m| m.run_id.clone()),
@@ -456,7 +459,7 @@ async fn asset_history(
     let materializations: Vec<Value> = st
         .runner
         .store()
-        .materializations(&name, limit)
+        .materializations(&name, None, limit)
         .map_err(internal)?
         .into_iter()
         .map(|(m, changed)| {
@@ -489,7 +492,7 @@ async fn asset_checks(
     let checks = st
         .runner
         .store()
-        .asset_checks(&name, limit)
+        .asset_checks(&name, None, limit)
         .map_err(internal)?;
     Ok(Json(json!({ "checks": checks })))
 }
@@ -2028,7 +2031,9 @@ mod tests {
         })
         .from(&stats)
         .auto();
-        let registry = Arc::new(AssetRegistry::new(vec![docs, stats, totals], Vec::new()).unwrap());
+        let registry = Arc::new(
+            AssetRegistry::new(vec![docs, stats, totals], Vec::new(), Vec::new()).unwrap(),
+        );
         let runner = Runner::new(
             [registry.lower_job().unwrap()],
             Store::open(":memory:").unwrap(),
@@ -2075,7 +2080,7 @@ mod tests {
 
         st.runner
             .store()
-            .record_materialization("docs", "d1", &json!({}), None, None, None)
+            .record_materialization("docs", None, "d1", &json!({}), None, None, None)
             .unwrap();
         let (status, Json(body)) = build_all_assets(State(st.clone())).await.unwrap();
         assert_eq!(status, StatusCode::ACCEPTED);
@@ -2092,7 +2097,7 @@ mod tests {
 
         st.runner
             .store()
-            .record_materialization("docs", "d2", &json!({}), None, None, None)
+            .record_materialization("docs", None, "d2", &json!({}), None, None, None)
             .unwrap();
         let Json(body) = list_assets(State(st)).await.unwrap();
         let stats = &body["assets"].as_array().unwrap()[1];
@@ -2108,7 +2113,7 @@ mod tests {
         let store = st.runner.store().clone();
         for fp in ["d1", "d1", "d2"] {
             store
-                .record_materialization("docs", fp, &json!({}), None, None, None)
+                .record_materialization("docs", None, fp, &json!({}), None, None, None)
                 .unwrap();
         }
 
@@ -2177,7 +2182,8 @@ mod tests {
             })
             .severity(crate::Severity::Warn),
         ];
-        let registry = Arc::new(AssetRegistry::new(vec![docs, stats, totals], checks).unwrap());
+        let registry =
+            Arc::new(AssetRegistry::new(vec![docs, stats, totals], Vec::new(), checks).unwrap());
         let runner = Runner::new(
             [registry.lower_job().unwrap()],
             Store::open(":memory:").unwrap(),
@@ -2190,7 +2196,7 @@ mod tests {
         };
         st.runner
             .store()
-            .record_materialization("docs", "d1", &json!({}), None, None, None)
+            .record_materialization("docs", None, "d1", &json!({}), None, None, None)
             .unwrap();
 
         let (status, Json(body)) = build_all_assets(State(st.clone())).await.unwrap();
@@ -2260,7 +2266,7 @@ mod tests {
         // the source must have probed once, or every descendant stays provably stale
         st.runner
             .store()
-            .record_materialization("docs", "d1", &json!({}), None, None, None)
+            .record_materialization("docs", None, "d1", &json!({}), None, None, None)
             .unwrap();
 
         let (status, Json(body)) = build_one_asset(State(st.clone()), Path("totals".into()))
@@ -2295,7 +2301,7 @@ mod tests {
         let st = asset_state();
         st.runner
             .store()
-            .record_materialization("docs", "d1", &json!({}), None, None, None)
+            .record_materialization("docs", None, "d1", &json!({}), None, None, None)
             .unwrap();
         // an assets run planted as live, without an executor behind it
         insert_run(&st, "b1", "assets", RunStatus::Running, json!({}));

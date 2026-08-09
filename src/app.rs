@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use serde_json::Value;
 
-use crate::asset::{Asset, AssetCheck, AssetRegistry, mats_map, plan_target};
+use crate::asset::{Asset, AssetCheck, AssetRegistry, MultiAsset, mats_map, plan_target};
 use crate::error::Error;
 use crate::executor::{FailureHook, RunFailure, Runner};
 use crate::io::{Io, IoManager};
@@ -27,6 +27,7 @@ pub struct Hestan {
     jobs: Vec<Job>,
     schedules: Vec<ScheduleDef>,
     assets: Vec<Asset>,
+    multis: Vec<MultiAsset>,
     checks: Vec<AssetCheck>,
     sensors: Vec<Sensor>,
     pools: Vec<(String, usize)>,
@@ -47,6 +48,7 @@ impl Default for Hestan {
             jobs: Vec::new(),
             schedules: Vec::new(),
             assets: Vec::new(),
+            multis: Vec::new(),
             checks: Vec::new(),
             sensors: Vec::new(),
             pools: Vec::new(),
@@ -86,6 +88,15 @@ impl Hestan {
     /// name then collides ([`Error::DuplicateJob`]).
     pub fn assets(mut self, assets: impl IntoIterator<Item = Asset>) -> Self {
         self.assets.extend(assets);
+        self
+    }
+
+    /// register [multi-assets](MultiAsset); stackable. each lowers to one op
+    /// of the same internal `assets` job and materializes every asset it
+    /// produces, which then behave exactly like assets registered with
+    /// [`assets`](Self::assets) — deps, checks, staleness, builds and all.
+    pub fn multi_assets(mut self, multis: impl IntoIterator<Item = MultiAsset>) -> Self {
+        self.multis.extend(multis);
         self
     }
 
@@ -356,7 +367,7 @@ impl Hestan {
 
         // lowered only when assets exist, so the name stays free otherwise, and
         // before the duplicate check, so a user job named "assets" collides below
-        let registry = if self.assets.is_empty() {
+        let registry = if self.assets.is_empty() && self.multis.is_empty() {
             // a check with no assets at all can only be naming one that does
             // not exist, and saying so beats dropping it silently
             if let Some(check) = self.checks.first() {
@@ -367,7 +378,7 @@ impl Hestan {
             }
             Arc::new(AssetRegistry::empty())
         } else {
-            let registry = Arc::new(AssetRegistry::new(self.assets, self.checks)?);
+            let registry = Arc::new(AssetRegistry::new(self.assets, self.multis, self.checks)?);
             jobs.push(registry.lower_job()?);
             registry
         };

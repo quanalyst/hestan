@@ -101,6 +101,18 @@ impl From<Value> for Meta {
 /// object's keys come out in a stable order.
 pub(crate) type MetaBuf = Arc<Mutex<BTreeMap<String, Meta>>>;
 
+/// what an attempt staged for one asset in particular, rather than for the op
+/// as a whole — the form a [`MultiAsset`](crate::MultiAsset) needs, since its
+/// several outputs each get their own fingerprint and their own facts.
+#[derive(Default)]
+pub(crate) struct AssetStage {
+    fingerprint: Option<String>,
+    meta: BTreeMap<String, Meta>,
+}
+
+/// one attempt's per-asset staging, keyed by asset name.
+pub(crate) type AssetBuf = Arc<Mutex<BTreeMap<String, AssetStage>>>;
+
 /// a metadata map as it is stored, or `None` when it is empty — which is a
 /// null column, not an empty object.
 pub(crate) fn tagged_map(map: &BTreeMap<String, Meta>) -> Option<Value> {
@@ -628,6 +640,9 @@ pub struct OpCtx {
     pub(crate) new_state: Arc<Mutex<Option<Value>>>,
     pub(crate) new_fingerprint: Arc<Mutex<Option<String>>>,
     pub(crate) new_meta: MetaBuf,
+    /// fingerprints and metadata staged for one named asset, for an op that
+    /// produces several.
+    pub(crate) new_per_asset: AssetBuf,
     pub(crate) store: Store,
 }
 
@@ -791,6 +806,50 @@ impl OpCtx {
         self.new_fingerprint.lock().unwrap().take()
     }
 
+    /// override the fingerprint of one asset this op produces, for a
+    /// [`MultiAsset`](crate::MultiAsset) whose outputs do not all want the
+    /// same rule. [`set_fingerprint`](Self::set_fingerprint) on such an op
+    /// covers every output that did not get one of these; on an op producing a
+    /// single asset the two say the same thing.
+    pub fn set_fingerprint_of(&self, asset: impl Into<String>, fingerprint: String) {
+        self.new_per_asset
+            .lock()
+            .unwrap()
+            .entry(asset.into())
+            .or_default()
+            .fingerprint = Some(fingerprint);
+    }
+
+    /// attach a typed fact to one asset this op produces, the per-asset form of
+    /// [`meta`](Self::meta). it lands on that asset's materialization; the
+    /// op run row still carries what plain `meta` staged, which is what an op
+    /// producing several assets reports about the work as a whole.
+    pub fn meta_of(
+        &self,
+        asset: impl Into<String>,
+        name: impl Into<String>,
+        value: impl Into<Meta>,
+    ) {
+        self.new_per_asset
+            .lock()
+            .unwrap()
+            .entry(asset.into())
+            .or_default()
+            .meta
+            .insert(name.into(), value.into());
+    }
+
+    /// what this attempt staged for `asset` in particular: its fingerprint
+    /// override and its metadata, in stored form. read, not taken, so several
+    /// produced assets can each read their own.
+    pub(crate) fn staged_for(&self, asset: &str) -> (Option<String>, Option<Value>) {
+        let staged = self.new_per_asset.lock().unwrap();
+        match staged.get(asset) {
+            None => (None, None),
+            Some(s) => (s.fingerprint.clone(), tagged_map(&s.meta)),
+        }
+    }
+
     /// attach a typed fact to what this op produced — a row count, the url it
     /// read, a note about the shape of the data. the last call for a name
     /// wins, and everything staged is committed with the op's terminal write:
@@ -896,6 +955,7 @@ mod tests {
             new_state: Arc::new(Mutex::new(None)),
             new_fingerprint: Arc::new(Mutex::new(None)),
             new_meta: Arc::new(Mutex::new(BTreeMap::new())),
+            new_per_asset: Arc::new(Mutex::new(BTreeMap::new())),
             store: Store::open(":memory:").unwrap(),
         }
     }

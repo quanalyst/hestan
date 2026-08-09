@@ -2796,7 +2796,7 @@ async fn asset_memoization_seeds_a_fresh_dep_under_file_io() {
     let store = Store::open(db.to_str().unwrap()).unwrap();
     // the materialization keeps the asset's value; the op run keeps a handle
     assert_eq!(
-        store.materialization("b").unwrap().unwrap().value,
+        store.materialization("b", None).unwrap().unwrap().value,
         Some(json!({"doubled": 6}))
     );
     let rows = store.op_runs(&run.id).unwrap();
@@ -2814,7 +2814,7 @@ async fn asset_memoization_seeds_a_fresh_dep_under_file_io() {
     assert_eq!(rows[0].op, "b");
     // and b, reading the seeded value, got the same answer as before
     assert_eq!(
-        store.materialization("b").unwrap().unwrap().value,
+        store.materialization("b", None).unwrap().unwrap().value,
         Some(json!({"doubled": 6}))
     );
 }

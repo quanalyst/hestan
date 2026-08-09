@@ -1625,6 +1625,7 @@ async fn run_op(
             new_state: new_state.clone(),
             new_fingerprint: Arc::new(Mutex::new(None)),
             new_meta: new_meta.clone(),
+            new_per_asset: Arc::new(Mutex::new(BTreeMap::new())),
             store: store.clone(),
         };
         // Err(limit) means the attempt timed out; the permit is scoped to this

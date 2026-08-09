@@ -50,12 +50,12 @@ async fn build_asset_runs_headless_like_run_once() {
     let ops = store.op_runs(&run.id).unwrap();
     let names: Vec<&str> = ops.iter().map(|o| o.op.as_str()).collect();
     assert_eq!(names, ["stats", "totals"]);
-    let stats = store.materialization("stats").unwrap().unwrap();
+    let stats = store.materialization("stats", None).unwrap().unwrap();
     assert_eq!(stats.inputs, json!({"docs": "d1"}));
-    let totals = store.materialization("totals").unwrap().unwrap();
+    let totals = store.materialization("totals", None).unwrap().unwrap();
     assert_eq!(totals.value, Some(json!({"total": 6})));
     assert_eq!(totals.run_id.as_deref(), Some(run.id.as_str()));
-    let docs = store.materialization("docs").unwrap().unwrap();
+    let docs = store.materialization("docs", None).unwrap().unwrap();
     assert_eq!(docs.value, None);
     assert_eq!(docs.run_id, None);
 
@@ -182,7 +182,7 @@ async fn checks_run_with_the_build_and_are_validated_at_build() {
     let ops = store.op_runs(&run.id).unwrap();
     let names: Vec<&str> = ops.iter().map(|o| o.op.as_str()).collect();
     assert_eq!(names, ["check:stats:has_files", "stats", "totals"]);
-    let results = store.asset_checks("stats", 10).unwrap();
+    let results = store.asset_checks("stats", None, 10).unwrap();
     assert_eq!(results.len(), 1);
     assert_eq!(results[0].status, CheckStatus::Passed);
     assert_eq!(results[0].severity, Severity::Error);
@@ -212,6 +212,65 @@ async fn checks_run_with_the_build_and_are_validated_at_build() {
         err.to_string().contains("no assets are registered"),
         "{err}"
     );
+}
+
+#[tokio::test]
+async fn a_multi_asset_materializes_its_outputs_and_feeds_one_of_them_downstream() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("hestan.db");
+    let db = db.to_str().unwrap();
+
+    let pipeline = || {
+        let split = MultiAsset::new("split_orders", |_ctx: OpCtx| async move {
+            Ok(json!({
+                "orders_clean": {"rows": 2},
+                "orders_rejected": {"rows": 1},
+            }))
+        })
+        .produces(["orders_clean", "orders_rejected"]);
+        let report = Asset::new("report", |ctx: OpCtx| async move {
+            let rows = ctx.input("orders_clean").unwrap()["rows"].as_u64().unwrap();
+            Ok(json!({"kept": rows}))
+        })
+        .from_named("orders_clean");
+        Hestan::new().assets([report]).multi_assets([split]).db(db)
+    };
+
+    let run = pipeline().build_asset("report").await.unwrap();
+    assert_eq!(run.status, RunStatus::Success);
+
+    let store = Store::open(db).unwrap();
+    // one op run for the pull, one for the report — not one per output
+    let ops = store.op_runs(&run.id).unwrap();
+    let names: Vec<&str> = ops.iter().map(|o| o.op.as_str()).collect();
+    assert_eq!(names, ["report", "split_orders"]);
+    let clean = store
+        .materialization("orders_clean", None)
+        .unwrap()
+        .unwrap();
+    assert_eq!(clean.value, Some(json!({"rows": 2})));
+    assert_eq!(
+        store
+            .materialization("orders_rejected", None)
+            .unwrap()
+            .unwrap()
+            .value,
+        Some(json!({"rows": 1}))
+    );
+    assert_eq!(
+        store
+            .materialization("report", None)
+            .unwrap()
+            .unwrap()
+            .value,
+        Some(json!({"kept": 2}))
+    );
+
+    // rebuilding the report alone seeds the pull from what it stored
+    let run = pipeline().build_asset("report").await.unwrap();
+    let ops = store.op_runs(&run.id).unwrap();
+    let names: Vec<&str> = ops.iter().map(|o| o.op.as_str()).collect();
+    assert_eq!(names, ["report"]);
 }
 
 #[tokio::test]

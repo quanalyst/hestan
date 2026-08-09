@@ -9,7 +9,7 @@ scale, and it also means hestan assumes it is the only process writing (see
 
 ## Schema
 
-ten tables. `trigger` is a reserved word in sqlite, hence the quoted column
+eleven tables. `trigger` is a reserved word in sqlite, hence the quoted column
 name in the schema and every statement that touches it.
 
 ```sql
@@ -83,17 +83,21 @@ CREATE TABLE op_state (          -- added in v3
 CREATE TABLE asset_materializations (  -- added in v4, rebuilt in v8
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     asset TEXT NOT NULL,      -- not unique: this is append-only history
+    partition TEXT,           -- added in v9; null = unpartitioned
     fingerprint TEXT NOT NULL,
     inputs TEXT NOT NULL,     -- json map: dep name -> consumed fingerprint
     value TEXT,               -- null for sources
     run_id TEXT,              -- null for probe-written source rows
-    built_at TEXT NOT NULL
+    built_at TEXT NOT NULL,
+    metadata TEXT             -- added in v8
 );
-CREATE INDEX asset_materializations_asset ON asset_materializations(asset, id DESC);
+CREATE INDEX asset_materializations_asset
+    ON asset_materializations(asset, partition, id DESC);
 
 CREATE TABLE asset_checks (            -- added in v8
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     asset TEXT NOT NULL,
+    partition TEXT,           -- added in v9; null = unpartitioned
     check_name TEXT NOT NULL,
     run_id TEXT NOT NULL,
     status TEXT NOT NULL,     -- passed | failed
@@ -102,7 +106,22 @@ CREATE TABLE asset_checks (            -- added in v8
     metadata TEXT,
     checked_at TEXT NOT NULL
 );
-CREATE INDEX asset_checks_asset ON asset_checks(asset, id DESC);
+CREATE INDEX asset_checks_asset ON asset_checks(asset, partition, id DESC);
+
+CREATE TABLE backfills (               -- added in v9
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    asset TEXT NOT NULL,
+    from_key TEXT NOT NULL,
+    to_key TEXT NOT NULL,
+    partition_keys TEXT NOT NULL,  -- json array: the keys it resolved to
+    run_ids TEXT NOT NULL DEFAULT '[]',  -- json array, one per chunk launched
+    total INTEGER NOT NULL,
+    launched INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL,
+    finished_at TEXT,
+    status TEXT NOT NULL      -- running | complete | failed | canceled
+);
+CREATE INDEX backfills_asset ON backfills(asset, id DESC);
 
 CREATE TABLE sensors (                 -- added in v4
     name TEXT NOT NULL PRIMARY KEY,
@@ -170,14 +189,19 @@ launches with ([scheduling](scheduling.md)) — schedules declared before it
 default to `{}`, which is what they always fired with; version 8 rebuilds
 `asset_materializations` as append-only [history](assets.md), adds
 `op_runs.metadata` ([metadata](metadata.md)) and adds the `asset_checks`
-table ([checks](assets.md#asset-checks)). an older file at any
-version opens straight into v8, rows intact — the v8 rebuild copies every
-keyed materialization across, where it becomes that asset's first history
-entry and stays its current one. every pending step
+table ([checks](assets.md#asset-checks)); version 9 adds `partition` to
+`asset_materializations` and `asset_checks` and re-keys every latest lookup
+per `(asset, partition)` ([partitions](assets.md#partitioned-assets)), and
+adds the `backfills` table ([backfills](assets.md#backfills)). an older file
+at any version opens straight into v9, rows intact — the v8 rebuild copies
+every keyed materialization across, where it becomes that asset's first
+history entry and stays its current one, and v9 leaves every existing row
+with a null partition, which is exactly what an unpartitioned asset is. every
+pending step
 and the version stamp run in one transaction
 (sqlite DDL is transactional), so a crash or failure mid-migration leaves
 the file exactly as it was found, never half-migrated. a database stamped
-with a version newer than the build refuses to open (`db schema v9 is newer
+with a version newer than the build refuses to open (`db schema v10 is newer
 than this build`) instead of quietly writing an older stamp over it.
 
 one wrinkle: databases written before the migration mechanism existed carry

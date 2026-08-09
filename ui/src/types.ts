@@ -204,6 +204,9 @@ export interface AssetSummary {
   kind: "source" | "derived";
   deps: string[];
   auto: boolean;
+  // the op that materializes it: the asset's own name, unless a multi-asset
+  // produces it alongside others. null for a source, which has no op
+  op: string | null;
   fingerprint: string | null;
   built_at: string | null;
   run_id: string | null;

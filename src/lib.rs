@@ -22,7 +22,7 @@ mod server;
 mod store;
 
 pub use app::Hestan;
-pub use asset::{Asset, AssetCheck, CheckOutcome, CheckResult};
+pub use asset::{Asset, AssetCheck, CheckOutcome, CheckResult, MultiAsset};
 pub use error::Error;
 pub use executor::{CancelOutcome, FailureHook, ResumePlan, RunFailure, Runner};
 #[cfg(feature = "http")]
@@ -41,8 +41,8 @@ pub use store::Store;
 
 pub mod prelude {
     pub use crate::{
-        Asset, AssetCheck, CheckResult, Graph, Hestan, Job, Meta, Op, OpCtx, OpResult, RunRequest,
-        Sensor, Severity,
+        Asset, AssetCheck, CheckResult, Graph, Hestan, Job, Meta, MultiAsset, Op, OpCtx, OpResult,
+        RunRequest, Sensor, Severity,
     };
     pub use serde_json::{Value, json};
 }

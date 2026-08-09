@@ -129,6 +129,15 @@ impl Asset {
         self
     }
 
+    /// declare lineage on an asset by name — the way to depend on one output
+    /// of a [`MultiAsset`], which produces names rather than [`Asset`] values.
+    /// a name nothing registers is a build error, exactly as with
+    /// [`from`](Self::from).
+    pub fn from_named(mut self, dep: impl Into<String>) -> Asset {
+        self.deps.push(dep.into());
+        self
+    }
+
     /// extra attempts for the materializing op (default 0).
     pub fn retries(mut self, n: u32) -> Asset {
         self.retries = n;
@@ -144,6 +153,106 @@ impl Asset {
     /// rebuild this asset automatically when a probe upstream makes it stale.
     /// without a probed source somewhere upstream it just waits forever.
     pub fn auto(mut self) -> Asset {
+        self.auto = true;
+        self
+    }
+}
+
+/// one computation, several assets: a query or a pull whose result splits into
+/// tables you do not want to fetch twice.
+///
+/// ```no_run
+/// # use hestan::{Asset, MultiAsset, OpCtx};
+/// # use serde_json::json;
+/// # let raw = Asset::source("raw_orders");
+/// MultiAsset::new("split_orders", |_ctx: OpCtx| async move {
+///     Ok(json!({
+///         "orders_clean":    {"rows": 2},
+///         "orders_rejected": {"rows": 0},
+///     }))
+/// })
+/// .produces(["orders_clean", "orders_rejected"])
+/// .from(&raw);
+/// ```
+///
+/// the body returns a json **object** whose keys are exactly the produced
+/// names — a missing or extra key fails the op and says which. it lowers to
+/// one op of the internal `assets` job, and each produced asset gets its own
+/// materialization, its own fingerprint (the hash of that key's value, or
+/// [`OpCtx::set_fingerprint_of`]) and its own metadata
+/// ([`OpCtx::meta_of`]). downstream assets depend on the produced names with
+/// [`Asset::from_named`] and read them with `ctx.input("<name>")`.
+///
+/// register with `Hestan::multi_assets`.
+pub struct MultiAsset {
+    name: String,
+    produces: Vec<String>,
+    deps: Vec<String>,
+    op: Op,
+    auto: bool,
+    retries: u32,
+    retry_delay: Option<Duration>,
+}
+
+impl MultiAsset {
+    /// `name` names the *op*, not an asset: nothing is materialized under it.
+    /// `f` has the same bounds as [`Asset::new`].
+    pub fn new<F, Fut>(name: impl Into<String>, f: F) -> MultiAsset
+    where
+        F: Fn(OpCtx) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = crate::op::OpResult> + Send + 'static,
+    {
+        let name = name.into();
+        MultiAsset {
+            op: Op::new(name.clone(), f),
+            name,
+            produces: Vec::new(),
+            deps: Vec::new(),
+            auto: false,
+            retries: 0,
+            retry_delay: None,
+        }
+    }
+
+    /// the assets this op produces, one per key of the object it returns.
+    /// repeatable; declaring none is a build error.
+    pub fn produces<I>(mut self, names: I) -> MultiAsset
+    where
+        I: IntoIterator,
+        I::Item: Into<String>,
+    {
+        self.produces.extend(names.into_iter().map(Into::into));
+        self
+    }
+
+    /// declare lineage; every produced asset gets it. repeatable.
+    pub fn from(mut self, dep: &Asset) -> MultiAsset {
+        self.deps.push(dep.name.clone());
+        self
+    }
+
+    /// [`from`](Self::from) by name, for depending on another multi-asset's
+    /// output.
+    pub fn from_named(mut self, dep: impl Into<String>) -> MultiAsset {
+        self.deps.push(dep.into());
+        self
+    }
+
+    /// extra attempts for the materializing op (default 0).
+    pub fn retries(mut self, n: u32) -> MultiAsset {
+        self.retries = n;
+        self
+    }
+
+    /// pause between attempts (default 1s).
+    pub fn retry_delay(mut self, d: Duration) -> MultiAsset {
+        self.retry_delay = Some(d);
+        self
+    }
+
+    /// rebuild automatically when a probe upstream makes any produced asset
+    /// stale; the flag lands on all of them, since one op produces them all.
+    pub fn auto(mut self) -> MultiAsset {
         self.auto = true;
         self
     }
@@ -265,9 +374,33 @@ pub(crate) struct AssetMeta {
     pub auto: bool,
     pub probe: Option<Arc<ProbeFn>>,
     pub probe_every: Duration,
-    op: Option<Op>,
+    /// the op that materializes this asset: its own name when it has an op to
+    /// itself, the [`MultiAsset`]'s name when several assets share one, and
+    /// `None` for a source, which has no op at all.
+    pub op: Option<String>,
+}
+
+/// one op of the lowered `assets` job and the assets it produces — one for a
+/// plain [`Asset`], several for a [`MultiAsset`]. the registry is asset -> op
+/// N:1, and this is the op side of it.
+pub(crate) struct OpMeta {
+    pub name: String,
+    pub produces: Vec<String>,
+    /// the assets this op reads, shared by everything it produces.
+    pub deps: Vec<String>,
+    op: Op,
     retries: u32,
     retry_delay: Option<Duration>,
+}
+
+/// how one dep asset reaches the op that reads it: the op that produces it
+/// (which is the name the run knows it by), and the key to take out of that
+/// op's output when the producer is a multi-asset.
+#[derive(Clone)]
+struct DepLink {
+    asset: String,
+    op: String,
+    key: Option<String>,
 }
 
 /// the validated asset graph, in topo order, with the checks bound to it.
@@ -275,6 +408,8 @@ pub(crate) struct AssetMeta {
 pub(crate) struct AssetRegistry {
     metas: Vec<AssetMeta>,
     by_name: HashMap<String, usize>,
+    ops: Vec<OpMeta>,
+    by_op: HashMap<String, usize>,
     checks: Vec<CheckMeta>,
 }
 
@@ -283,12 +418,19 @@ impl AssetRegistry {
         AssetRegistry {
             metas: Vec::new(),
             by_name: HashMap::new(),
+            ops: Vec::new(),
+            by_op: HashMap::new(),
             checks: Vec::new(),
         }
     }
 
-    pub(crate) fn new(assets: Vec<Asset>, checks: Vec<AssetCheck>) -> Result<AssetRegistry, Error> {
+    pub(crate) fn new(
+        assets: Vec<Asset>,
+        multis: Vec<MultiAsset>,
+        checks: Vec<AssetCheck>,
+    ) -> Result<AssetRegistry, Error> {
         let mut metas: Vec<AssetMeta> = Vec::with_capacity(assets.len());
+        let mut ops: Vec<OpMeta> = Vec::new();
         for a in assets {
             if a.source && a.auto {
                 return Err(Error::Graph(format!(
@@ -308,23 +450,77 @@ impl AssetRegistry {
                     a.name
                 )));
             }
+            if let Some(op) = a.op {
+                ops.push(OpMeta {
+                    name: a.name.clone(),
+                    produces: vec![a.name.clone()],
+                    deps: a.deps.clone(),
+                    op,
+                    retries: a.retries,
+                    retry_delay: a.retry_delay,
+                });
+            }
             metas.push(AssetMeta {
-                name: a.name,
+                name: a.name.clone(),
                 source: a.source,
                 deps: a.deps,
                 auto: a.auto,
                 probe: a.probe,
                 probe_every: a.probe_every,
-                op: a.op,
-                retries: a.retries,
-                retry_delay: a.retry_delay,
+                op: (!a.source).then_some(a.name),
+            });
+        }
+        for m in multis {
+            if m.produces.is_empty() {
+                return Err(Error::Graph(format!(
+                    "multi-asset {}: produces nothing; name its outputs with .produces([..])",
+                    m.name
+                )));
+            }
+            for produced in &m.produces {
+                metas.push(AssetMeta {
+                    name: produced.clone(),
+                    source: false,
+                    deps: m.deps.clone(),
+                    auto: m.auto,
+                    probe: None,
+                    probe_every: Duration::from_secs(60),
+                    op: Some(m.name.clone()),
+                });
+            }
+            ops.push(OpMeta {
+                name: m.name,
+                produces: m.produces,
+                deps: m.deps,
+                op: m.op,
+                retries: m.retries,
+                retry_delay: m.retry_delay,
             });
         }
         let pairs: Vec<(String, Vec<String>)> = metas
             .iter()
             .map(|m| (m.name.clone(), m.deps.clone()))
             .collect();
+        // first, so a duplicate asset name reads as one rather than as
+        // whatever the op-level checks below would make of it
         let order = graph::topo_order(&pairs).map_err(|e| Error::Graph(format!("assets: {e}")))?;
+        let mut seen_ops: HashSet<&str> = HashSet::new();
+        for o in &ops {
+            // ops and assets share one namespace inside the job, so a
+            // multi-asset named after an asset it does not produce collides
+            // there — said before the duplicate check below, which would
+            // otherwise report the collision as two multi-assets
+            if !o.produces.contains(&o.name) && order.contains(&o.name) {
+                return Err(Error::Graph(format!(
+                    "multi-asset {}: an asset is already called that; \
+                     a multi-asset names the op, not one of its outputs",
+                    o.name
+                )));
+            }
+            if !seen_ops.insert(&o.name) {
+                return Err(Error::Graph(format!("duplicate multi-asset {}", o.name)));
+            }
+        }
         let mut by_declared: HashMap<String, AssetMeta> =
             metas.into_iter().map(|m| (m.name.clone(), m)).collect();
         let ordered: Vec<AssetMeta> = order
@@ -339,6 +535,21 @@ impl AssetRegistry {
             .iter()
             .enumerate()
             .map(|(i, m)| (m.name.clone(), i))
+            .collect();
+        // ops in the topo order of the first asset each produces, so lowering
+        // and planning list them the same way every time
+        ops.sort_by_key(|o| {
+            o.produces
+                .iter()
+                .filter_map(|a| by_name.get(a))
+                .min()
+                .copied()
+                .unwrap_or(usize::MAX)
+        });
+        let by_op: HashMap<String, usize> = ops
+            .iter()
+            .enumerate()
+            .map(|(i, o)| (o.name.clone(), i))
             .collect();
 
         // checks in asset topo order then declaration order, so the ops a
@@ -378,6 +589,8 @@ impl AssetRegistry {
         Ok(AssetRegistry {
             metas: ordered,
             by_name,
+            ops,
+            by_op,
             checks: checked,
         })
     }
@@ -395,6 +608,40 @@ impl AssetRegistry {
         self.by_name.get(name).map(|&i| &self.metas[i])
     }
 
+    /// every lowered op, in the topo order of the assets it produces.
+    pub(crate) fn ops(&self) -> impl Iterator<Item = &OpMeta> {
+        self.ops.iter()
+    }
+
+    pub(crate) fn op(&self, name: &str) -> Option<&OpMeta> {
+        self.by_op.get(name).map(|&i| &self.ops[i])
+    }
+
+    /// what the run knows `asset` by: the op that produces it, or — for a
+    /// source, which has no op — the asset's own name, seeded as an external.
+    fn producer(&self, asset: &str) -> String {
+        match self.get(asset).and_then(|m| m.op.clone()) {
+            Some(op) => op,
+            None => asset.to_string(),
+        }
+    }
+
+    /// how an op reads one of its dep assets.
+    fn dep_link(&self, asset: &str) -> DepLink {
+        let op = self.producer(asset);
+        // a multi-asset's output is one object keyed by what it produces, so a
+        // dep on one of them is a key of it; everything else is the whole value
+        let key = self
+            .op(&op)
+            .filter(|o| o.produces.len() > 1)
+            .map(|_| asset.to_string());
+        DepLink {
+            asset: asset.to_string(),
+            op,
+            key,
+        }
+    }
+
     /// transitive dependents of `name`, excluding itself.
     pub(crate) fn downstream(&self, name: &str) -> HashSet<String> {
         let pairs: Vec<(String, Vec<String>)> = self
@@ -405,16 +652,16 @@ impl AssetRegistry {
         graph::downstream(&pairs, name)
     }
 
-    /// lower into the internal "assets" job: one wrapped op per derived asset,
-    /// one more per check hanging off the asset it checks, and sources as
-    /// external deps that a full launch seeds null.
+    /// lower into the internal "assets" job: one wrapped op per materializing
+    /// op — which is one asset, or all of a multi-asset's — one more per check
+    /// hanging off the asset it checks, and sources as external deps that a
+    /// full launch seeds null.
     pub(crate) fn lower_job(&self) -> Result<Job, Error> {
         let ops: Vec<Op> = self
-            .metas
+            .ops
             .iter()
-            .filter(|m| !m.source)
-            .map(wrap_op)
-            .chain(self.checks.iter().map(check_op))
+            .map(|m| wrap_op(self, m))
+            .chain(self.checks.iter().map(|c| check_op(self, c)))
             .collect();
         let external: Vec<String> = self
             .metas
@@ -431,61 +678,190 @@ impl AssetRegistry {
     }
 }
 
+/// the value one dep asset has, out of what the run handed the op that reads
+/// it: a multi-asset's output is an object keyed by what it produces, so the
+/// dep is one key of it, and everything else is the whole value.
+fn dep_value(ctx: &OpCtx, link: &DepLink) -> Option<Value> {
+    let held = ctx.input(&link.op)?;
+    Some(match &link.key {
+        Some(key) => held.get(key).cloned().unwrap_or(Value::Null),
+        None => held.clone(),
+    })
+}
+
+/// the ctx an asset body sees: inputs keyed by the *asset* names it declared,
+/// whatever ops the run actually ran to produce them. `ctx.input("orders")`
+/// reads the same inside an asset whether `orders` has an op to itself or is
+/// one output of a multi-asset.
+fn with_dep_inputs(ctx: &OpCtx, links: &[DepLink]) -> OpCtx {
+    let mut inputs: HashMap<String, Value> = HashMap::new();
+    let mut dep_statuses: HashMap<String, crate::model::OpStatus> = HashMap::new();
+    for link in links {
+        if let Some(v) = dep_value(ctx, link) {
+            inputs.insert(link.asset.clone(), v);
+        }
+        if let Some(s) = ctx.dep_status(&link.op) {
+            dep_statuses.insert(link.asset.clone(), s);
+        }
+    }
+    OpCtx {
+        inputs: Arc::new(inputs),
+        dep_statuses: Arc::new(dep_statuses),
+        ..ctx.clone()
+    }
+}
+
+/// what each produced asset's value is, out of the op's output. one asset is
+/// the whole output; a multi-asset splits by key, and a key it did not return
+/// — or one nothing declared — fails the op naming the discrepancy, because
+/// the alternative is a materialization of `null` nobody asked for.
+fn split_output<'a>(
+    op: &str,
+    produces: &'a [String],
+    output: &'a Value,
+) -> Result<Vec<(&'a str, &'a Value)>, String> {
+    if produces.len() == 1 {
+        return Ok(vec![(produces[0].as_str(), output)]);
+    }
+    let Some(map) = output.as_object() else {
+        return Err(format!(
+            "multi-asset {op}: returned {}, not an object keyed by the assets it produces",
+            json_type(output)
+        ));
+    };
+    let missing: Vec<&str> = produces
+        .iter()
+        .map(String::as_str)
+        .filter(|a| !map.contains_key(*a))
+        .collect();
+    let extra: Vec<&str> = map
+        .keys()
+        .map(String::as_str)
+        .filter(|k| !produces.iter().any(|a| a == k))
+        .collect();
+    if !missing.is_empty() || !extra.is_empty() {
+        let mut parts = Vec::new();
+        if !missing.is_empty() {
+            parts.push(format!("no key for {}", missing.join(", ")));
+        }
+        if !extra.is_empty() {
+            parts.push(format!(
+                "a key for {}, which it does not produce",
+                extra.join(", ")
+            ));
+        }
+        return Err(format!(
+            "multi-asset {op}: its output has {}",
+            parts.join("; ")
+        ));
+    }
+    Ok(produces
+        .iter()
+        .map(|a| (a.as_str(), &map[a.as_str()]))
+        .collect())
+}
+
+fn json_type(v: &Value) -> &'static str {
+    match v {
+        Value::Null => "null",
+        Value::Bool(_) => "a bool",
+        Value::Number(_) => "a number",
+        Value::String(_) => "a string",
+        Value::Array(_) => "an array",
+        Value::Object(_) => "an object",
+    }
+}
+
 // the materialization write lives inside the op body, so a crash before
 // op_finished re-runs the op next build — at-least-once, like op state
-fn wrap_op(meta: &AssetMeta) -> Op {
-    let inner = meta.op.clone().expect("derived asset has an op");
+fn wrap_op(reg: &AssetRegistry, meta: &OpMeta) -> Op {
+    let inner = meta.op.clone();
     let name = meta.name.clone();
-    let deps = meta.deps.clone();
+    let produces = meta.produces.clone();
+    let links: Vec<DepLink> = meta.deps.iter().map(|d| reg.dep_link(d)).collect();
+    // one entry per op the run knows, however many asset deps reach it
+    let mut after: Vec<String> = Vec::new();
+    for link in &links {
+        if !after.contains(&link.op) {
+            after.push(link.op.clone());
+        }
+    }
     let mut op = Op::new(name.clone(), move |ctx: OpCtx| {
         let inner = inner.clone();
         let name = name.clone();
-        let deps = deps.clone();
+        let produces = produces.clone();
+        let links = links.clone();
         async move {
-            let output = inner.call(ctx.clone()).await?;
-            let fingerprint = ctx
-                .take_fingerprint()
-                .unwrap_or_else(|| content_fingerprint(&output));
-            // deps' current fingerprints: ancestors in this run already wrote theirs
+            let output = inner.call(with_dep_inputs(&ctx, &links)).await?;
+            let values = split_output(&name, &produces, &output)?;
+            // deps' current fingerprints: ancestors in this run already wrote
+            // theirs. one entry per dep asset, not per op, so lineage reads in
+            // the names the asset graph uses
             let mut inputs = Map::new();
-            for dep in &deps {
-                let fp = ctx.store.materialization(dep)?.map(|m| m.fingerprint);
-                inputs.insert(dep.clone(), fp.map(Value::String).unwrap_or(Value::Null));
+            for link in &links {
+                let fp = ctx
+                    .store
+                    .materialization(&link.asset, None)?
+                    .map(|m| m.fingerprint);
+                inputs.insert(
+                    link.asset.clone(),
+                    fp.map(Value::String).unwrap_or(Value::Null),
+                );
             }
-            // read, not taken: the same map goes on this materialization and
-            // on the op run the executor writes when this op reports success
-            ctx.store.record_materialization(
-                &name,
-                &fingerprint,
-                &Value::Object(inputs),
-                Some(&output),
-                Some(ctx.run_id()),
-                ctx.staged_meta().as_ref(),
-            )?;
+            let inputs = Value::Object(inputs);
+            // the op-wide override, which covers every output that did not
+            // stage one of its own
+            let shared = ctx.take_fingerprint();
+            for (asset, value) in values {
+                let (fingerprint, meta) = ctx.staged_for(asset);
+                let fingerprint = fingerprint
+                    .or_else(|| shared.clone())
+                    .unwrap_or_else(|| content_fingerprint(value));
+                // read, not taken: the same map goes on this materialization
+                // and on the op run the executor writes when this op reports
+                // success
+                let meta = match (meta, produces.len()) {
+                    (Some(m), _) => Some(m),
+                    (None, 1) => ctx.staged_meta(),
+                    (None, _) => None,
+                };
+                ctx.store.record_materialization(
+                    asset,
+                    None,
+                    &fingerprint,
+                    &inputs,
+                    Some(value),
+                    Some(ctx.run_id()),
+                    meta.as_ref(),
+                )?;
+            }
             Ok(output)
         }
     })
-    .after(meta.deps.clone())
+    .after(after)
     .retries(meta.retries);
     if let Some(d) = meta.retry_delay {
         op = op.retry_delay(d);
     }
-    op.with_types_of(meta.op.as_ref().expect("derived asset has an op"))
+    op.with_types_of(&meta.op)
 }
 
-// a check is an op that depends on the asset it checks, so it receives the
-// freshly materialized value as an input and reuses the whole run machinery.
-// nothing depends on it in turn, which is what lets an error check fail the
-// run without un-materializing anything or cutting off downstream assets.
-fn check_op(meta: &CheckMeta) -> Op {
+// a check is an op that depends on the op that materializes the asset it
+// checks, so it receives the freshly materialized value as an input and reuses
+// the whole run machinery. nothing depends on it in turn, which is what lets an
+// error check fail the run without un-materializing anything or cutting off
+// downstream assets.
+fn check_op(reg: &AssetRegistry, meta: &CheckMeta) -> Op {
     let asset = meta.asset.clone();
+    let link = reg.dep_link(&meta.asset);
+    let producer = link.op.clone();
     let check = meta.name.clone();
     let severity = meta.severity;
     let f = meta.f.clone();
     Op::new(check_op_name(&meta.asset, &meta.name), move |ctx: OpCtx| {
-        let (asset, check, f) = (asset.clone(), check.clone(), f.clone());
+        let (asset, check, f, link) = (asset.clone(), check.clone(), f.clone(), link.clone());
         async move {
-            let value = ctx.input(&asset).cloned().unwrap_or(Value::Null);
+            let value = dep_value(&ctx, &link).unwrap_or(Value::Null);
             let result = f(ctx.clone(), value).await?;
             let status = if result.passed {
                 CheckStatus::Passed
@@ -496,6 +872,7 @@ fn check_op(meta: &CheckMeta) -> Op {
             // that fails the run still leaves behind what it found
             ctx.store.record_check(
                 &asset,
+                None,
                 &check,
                 ctx.run_id(),
                 status,
@@ -514,7 +891,7 @@ fn check_op(meta: &CheckMeta) -> Op {
             }))
         }
     })
-    .after([meta.asset.clone()])
+    .after([producer])
 }
 
 /// the default fingerprint: sha256 hex of the output's json text. serde_json
@@ -587,32 +964,62 @@ pub(crate) fn staleness(
     out
 }
 
-/// what one build run executes: derived assets in topo order with their check
-/// ops, plus seeds for everything they read that won't run — stored values for
-/// fresh derived deps, null for sources.
+/// what one build run executes: materializing ops in topo order with their
+/// check ops, plus seeds for everything they read that won't run — stored
+/// values for fresh derived deps, null for sources. every name here is an op
+/// of the `assets` job, which for a multi-asset is not the name of any asset.
 #[derive(Debug)]
 pub(crate) struct BuildPlan {
     pub ops: Vec<String>,
     pub seeds: HashMap<String, Value>,
 }
 
-/// the planned assets plus the check ops hanging off them. a check is in the
-/// plan exactly when the asset it checks is, which is the whole of the
-/// memoization story for checks: an asset that was seeded rather than rebuilt
-/// produced no new value this run, so nothing re-checks it and its last
+/// the planned ops plus the check ops hanging off the assets they produce. a
+/// check is in the plan exactly when the asset it checks is, which is the whole
+/// of the memoization story for checks: an asset that was seeded rather than
+/// rebuilt produced no new value this run, so nothing re-checks it and its last
 /// recorded result still describes the value that is still current.
 fn with_checks(reg: &AssetRegistry, ops: Vec<String>) -> Vec<String> {
     let mut all = Vec::with_capacity(ops.len());
-    for asset in ops {
-        // each asset ahead of the checks that read it, as the run runs them
+    for op in ops {
+        // each op ahead of the checks that read what it produced, as the run
+        // runs them
         let checks: Vec<String> = reg
-            .checks_on(&asset)
+            .op(&op)
+            .into_iter()
+            .flat_map(|m| m.produces.iter())
+            .flat_map(|asset| reg.checks_on(asset))
             .map(|c| check_op_name(&c.asset, &c.name))
             .collect();
-        all.push(asset);
+        all.push(op);
         all.extend(checks);
     }
     all
+}
+
+/// what a fresh dep the plan does not re-run is seeded with, under the name the
+/// run knows it by: a source is null, an asset with an op to itself is its
+/// stored value, and a multi-asset is the object its op returns — every asset
+/// it produces, so that whichever key a consumer reads is there.
+fn seed_value(reg: &AssetRegistry, mats: &HashMap<String, Materialization>, op: &str) -> Value {
+    let Some(meta) = reg.op(op) else {
+        // no op of that name: a source, whose value is null everywhere
+        return Value::Null;
+    };
+    let stored = |asset: &String| {
+        mats.get(asset)
+            .and_then(|m| m.value.clone())
+            .unwrap_or(Value::Null)
+    };
+    match meta.produces.as_slice() {
+        [one] => stored(one),
+        several => Value::Object(
+            several
+                .iter()
+                .map(|asset| (asset.clone(), stored(asset)))
+                .collect(),
+        ),
+    }
 }
 
 fn seeds_for(
@@ -623,19 +1030,14 @@ fn seeds_for(
     let in_plan: HashSet<&str> = ops.iter().map(String::as_str).collect();
     let mut seeds = HashMap::new();
     for name in ops {
-        let meta = reg.get(name).expect("planned asset is registered");
+        let meta = reg.op(name).expect("planned op is registered");
         for dep in &meta.deps {
-            if in_plan.contains(dep.as_str()) || seeds.contains_key(dep) {
+            let producer = reg.producer(dep);
+            if in_plan.contains(producer.as_str()) || seeds.contains_key(&producer) {
                 continue;
             }
-            let value = match reg.get(dep) {
-                Some(d) if d.source => Value::Null,
-                _ => mats
-                    .get(dep)
-                    .and_then(|m| m.value.clone())
-                    .unwrap_or(Value::Null),
-            };
-            seeds.insert(dep.clone(), value);
+            let value = seed_value(reg, mats, &producer);
+            seeds.insert(producer, value);
         }
     }
     seeds
@@ -680,13 +1082,19 @@ pub(crate) fn plan_targets(
         }
     }
     let stale = staleness(reg, mats);
+    // an op is in the plan once however many of its assets ask for it: a
+    // multi-asset is one computation, and running it twice would be two
+    // computations recording each other's lineage
     let ops: Vec<String> = reg
-        .topo()
-        .filter(|m| !m.source && want.contains(&m.name))
-        .filter(|m| targets.contains(&m.name) || stale[&m.name].stale)
-        .map(|m| m.name.clone())
+        .ops()
+        .filter(|o| {
+            o.produces
+                .iter()
+                .any(|a| want.contains(a) && (targets.contains(a) || stale[a].stale))
+        })
+        .map(|o| o.name.clone())
         .collect();
-    // seeds before checks: a check op is not an asset and seeds nothing
+    // seeds before checks: a check op produces no asset and seeds nothing
     let seeds = seeds_for(reg, mats, &ops);
     Ok(BuildPlan {
         ops: with_checks(reg, ops),
@@ -701,9 +1109,9 @@ pub(crate) fn plan_all(
 ) -> Option<BuildPlan> {
     let stale = staleness(reg, mats);
     let ops: Vec<String> = reg
-        .topo()
-        .filter(|m| !m.source && stale[&m.name].stale)
-        .map(|m| m.name.clone())
+        .ops()
+        .filter(|o| o.produces.iter().any(|a| stale[a].stale))
+        .map(|o| o.name.clone())
         .collect();
     if ops.is_empty() {
         return None;
@@ -750,6 +1158,7 @@ mod tests {
         Materialization {
             id: 0,
             asset: asset.into(),
+            partition: None,
             fingerprint: fp.into(),
             inputs,
             value,
@@ -776,15 +1185,22 @@ mod tests {
         let s = Asset::source("s");
         let a = echo("a").from(&s);
         let b = echo("b").from(&a);
-        AssetRegistry::new(vec![s, a, b], Vec::new()).unwrap()
+        AssetRegistry::new(vec![s, a, b], Vec::new(), Vec::new()).unwrap()
     }
 
     fn reg_err(assets: Vec<Asset>) -> Error {
         checked_err(assets, Vec::new())
     }
 
+    fn multi_err(assets: Vec<Asset>, multis: Vec<MultiAsset>) -> Error {
+        match AssetRegistry::new(assets, multis, Vec::new()) {
+            Err(e) => e,
+            Ok(_) => panic!("expected a graph error"),
+        }
+    }
+
     fn checked_err(assets: Vec<Asset>, checks: Vec<AssetCheck>) -> Error {
-        match AssetRegistry::new(assets, checks) {
+        match AssetRegistry::new(assets, Vec::new(), checks) {
             Err(e) => e,
             Ok(_) => panic!("expected a graph error"),
         }
@@ -796,7 +1212,7 @@ mod tests {
         let s = Asset::source("s");
         let a = echo("a").from(&s);
         let b = echo("b").from(&a);
-        let reg = AssetRegistry::new(vec![b, a, s], Vec::new()).unwrap();
+        let reg = AssetRegistry::new(vec![b, a, s], Vec::new(), Vec::new()).unwrap();
         let names: Vec<&str> = reg.topo().map(|m| m.name.as_str()).collect();
         assert_eq!(names, ["s", "a", "b"]);
 
@@ -907,7 +1323,7 @@ mod tests {
         let left = echo("left").from(&s);
         let right = echo("right").from(&s);
         let sink = echo("sink").from(&left).from(&right);
-        let reg = AssetRegistry::new(vec![s, left, right, sink], Vec::new()).unwrap();
+        let reg = AssetRegistry::new(vec![s, left, right, sink], Vec::new(), Vec::new()).unwrap();
         let m = mats(vec![
             mat("s", "s2", json!({}), None),
             mat("left", "l1", json!({"s": "s1"}), Some(json!("left"))),
@@ -961,7 +1377,7 @@ mod tests {
         let a = echo("a").from(&s);
         let b = echo("b").from(&a);
         let c = echo("c").from(&a);
-        let reg = AssetRegistry::new(vec![s, a, b, c], Vec::new()).unwrap();
+        let reg = AssetRegistry::new(vec![s, a, b, c], Vec::new(), Vec::new()).unwrap();
 
         let m = mats(vec![mat("s", "s1", json!({}), None)]);
         let plan = plan_targets(&reg, &m, &["b".into(), "c".into()]).unwrap();
@@ -1054,10 +1470,10 @@ mod tests {
         })
         .from(&s);
         let b = Asset::new("b", |_| async { Ok(json!("b")) }).from(&a);
-        let reg = AssetRegistry::new(vec![s, a, b], Vec::new()).unwrap();
+        let reg = AssetRegistry::new(vec![s, a, b], Vec::new(), Vec::new()).unwrap();
         let runner = Runner::new([reg.lower_job().unwrap()], store.clone());
         store
-            .record_materialization("s", "s-fp", &json!({}), None, None, None)
+            .record_materialization("s", None, "s-fp", &json!({}), None, None, None)
             .unwrap();
         build_all(&reg, &runner).await;
 
@@ -1066,7 +1482,7 @@ mod tests {
         *pinned.lock().unwrap() = "v2".to_string();
         build_target(&reg, &runner, "a").await;
 
-        let history = store.materializations("a", 10).unwrap();
+        let history = store.materializations("a", None, 10).unwrap();
         let seen: Vec<(&str, bool)> = history
             .iter()
             .map(|(m, changed)| (m.fingerprint.as_str(), *changed))
@@ -1106,11 +1522,11 @@ mod tests {
             Ok(json!({"doubled": rows * 2}))
         })
         .from(&a);
-        let reg = AssetRegistry::new(vec![s, a, b], Vec::new()).unwrap();
+        let reg = AssetRegistry::new(vec![s, a, b], Vec::new(), Vec::new()).unwrap();
         let runner = Runner::new([reg.lower_job().unwrap()], store.clone());
         // the source was probed before this build
         store
-            .record_materialization("s", "s-fp", &json!({}), None, None, None)
+            .record_materialization("s", None, "s-fp", &json!({}), None, None, None)
             .unwrap();
 
         let run = build_all(&reg, &runner).await;
@@ -1118,13 +1534,13 @@ mod tests {
         assert_eq!(run.job, ASSETS_JOB);
         assert_eq!(run.trigger, Trigger::Build);
 
-        let ma = store.materialization("a").unwrap().unwrap();
+        let ma = store.materialization("a", None).unwrap().unwrap();
         assert_eq!(ma.inputs, json!({"s": "s-fp"}));
         assert_eq!(ma.value, Some(json!({"rows": 3})));
         assert_eq!(ma.run_id.as_deref(), Some(run.id.as_str()));
         assert_eq!(ma.fingerprint, content_fingerprint(&json!({"rows": 3})));
 
-        let mb = store.materialization("b").unwrap().unwrap();
+        let mb = store.materialization("b", None).unwrap().unwrap();
         assert_eq!(mb.inputs, json!({"a": ma.fingerprint}));
         assert_eq!(mb.value, Some(json!({"doubled": 6})));
 
@@ -1144,7 +1560,7 @@ mod tests {
             Ok(json!({"rows": 3}))
         });
         let quiet = Asset::new("quiet", |_| async { Ok(json!(null)) });
-        let reg = AssetRegistry::new(vec![counted, quiet], Vec::new()).unwrap();
+        let reg = AssetRegistry::new(vec![counted, quiet], Vec::new(), Vec::new()).unwrap();
         let runner = Runner::new([reg.lower_job().unwrap()], store.clone());
         let run = build_all(&reg, &runner).await;
 
@@ -1155,14 +1571,18 @@ mod tests {
         let ops = store.op_runs(&run.id).unwrap();
         let op = ops.iter().find(|o| o.op == "counted").unwrap();
         assert_eq!(op.metadata, Some(reported.clone()));
-        let m = store.materialization("counted").unwrap().unwrap();
+        let m = store.materialization("counted", None).unwrap().unwrap();
         assert_eq!(m.metadata, Some(reported));
 
         // and an asset that reported nothing carries null in both places
         let quiet = ops.iter().find(|o| o.op == "quiet").unwrap();
         assert_eq!(quiet.metadata, None);
         assert_eq!(
-            store.materialization("quiet").unwrap().unwrap().metadata,
+            store
+                .materialization("quiet", None)
+                .unwrap()
+                .unwrap()
+                .metadata,
             None
         );
     }
@@ -1175,13 +1595,13 @@ mod tests {
             Ok(json!({"data": [1, 2]}))
         });
         let hashed = Asset::new("hashed", |_| async { Ok(json!({"data": [1, 2]})) });
-        let reg = AssetRegistry::new(vec![pinned, hashed], Vec::new()).unwrap();
+        let reg = AssetRegistry::new(vec![pinned, hashed], Vec::new(), Vec::new()).unwrap();
         let runner = Runner::new([reg.lower_job().unwrap()], store.clone());
         build_all(&reg, &runner).await;
 
         assert_eq!(
             store
-                .materialization("pinned")
+                .materialization("pinned", None)
                 .unwrap()
                 .unwrap()
                 .fingerprint,
@@ -1189,7 +1609,7 @@ mod tests {
         );
         assert_eq!(
             store
-                .materialization("hashed")
+                .materialization("hashed", None)
                 .unwrap()
                 .unwrap()
                 .fingerprint,
@@ -1207,10 +1627,10 @@ mod tests {
             Ok(json!({"doubled": rows * 2}))
         })
         .from(&a);
-        let reg = AssetRegistry::new(vec![s, a, b], Vec::new()).unwrap();
+        let reg = AssetRegistry::new(vec![s, a, b], Vec::new(), Vec::new()).unwrap();
         let runner = Runner::new([reg.lower_job().unwrap()], store.clone());
         store
-            .record_materialization("s", "s-fp", &json!({}), None, None, None)
+            .record_materialization("s", None, "s-fp", &json!({}), None, None, None)
             .unwrap();
         build_all(&reg, &runner).await;
 
@@ -1218,6 +1638,7 @@ mod tests {
         store
             .record_materialization(
                 "b",
+                None,
                 "b-old",
                 &json!({"a": "older"}),
                 Some(&json!({})),
@@ -1258,14 +1679,14 @@ mod tests {
         let store = Store::open(":memory:").unwrap();
         let s = Asset::source("s");
         let a = Asset::new("a", |_| async { Ok(json!(1)) }).from(&s);
-        let reg = AssetRegistry::new(vec![s, a], Vec::new()).unwrap();
+        let reg = AssetRegistry::new(vec![s, a], Vec::new(), Vec::new()).unwrap();
         let runner = Runner::new([reg.lower_job().unwrap()], store.clone());
         let run = runner
             .run(ASSETS_JOB, json!({}), crate::model::Trigger::Manual)
             .await
             .unwrap();
         assert_eq!(run.status, RunStatus::Success);
-        let m = store.materialization("a").unwrap().unwrap();
+        let m = store.materialization("a", None).unwrap().unwrap();
         assert_eq!(m.inputs, json!({"s": null}));
     }
 
@@ -1301,6 +1722,7 @@ mod tests {
         // the same name on two different assets is two different checks
         AssetRegistry::new(
             vec![echo("a"), echo("b")],
+            Vec::new(),
             vec![rows_check("rows", "a", 1), rows_check("rows", "b", 1)],
         )
         .unwrap();
@@ -1314,13 +1736,13 @@ mod tests {
             rows_check("has_rows", "a", 1),
             rows_check("has_many", "a", 100).severity(Severity::Warn),
         ];
-        let reg = AssetRegistry::new(vec![a], checks).unwrap();
+        let reg = AssetRegistry::new(vec![a], Vec::new(), checks).unwrap();
         let runner = Runner::new([reg.lower_job().unwrap()], store.clone());
         let run = build_all(&reg, &runner).await;
 
         // one passed, one failed, and the warn failure did not fail the run
         assert_eq!(run.status, RunStatus::Success);
-        let results = store.asset_checks("a", 10).unwrap();
+        let results = store.asset_checks("a", None, 10).unwrap();
         assert_eq!(results.len(), 2);
         let passed = results.iter().find(|c| c.check == "has_rows").unwrap();
         assert_eq!(passed.status, CheckStatus::Passed);
@@ -1341,7 +1763,8 @@ mod tests {
         // the same check at error severity fails its op and the run
         let store = Store::open(":memory:").unwrap();
         let a = Asset::new("a", |_| async { Ok(json!({"rows": 3})) });
-        let reg = AssetRegistry::new(vec![a], vec![rows_check("has_many", "a", 100)]).unwrap();
+        let reg = AssetRegistry::new(vec![a], Vec::new(), vec![rows_check("has_many", "a", 100)])
+            .unwrap();
         let runner = Runner::new([reg.lower_job().unwrap()], store.clone());
         let run = build_all(&reg, &runner).await;
         assert_eq!(run.status, RunStatus::Failed);
@@ -1352,13 +1775,13 @@ mod tests {
         );
         // the verdict is recorded even though the op failed
         assert_eq!(
-            store.asset_checks("a", 10).unwrap()[0].status,
+            store.asset_checks("a", None, 10).unwrap()[0].status,
             CheckStatus::Failed
         );
         // and the asset is materialized regardless: a failing check fails the
         // run that produced it, it does not un-produce the asset
         assert_eq!(
-            store.materialization("a").unwrap().unwrap().value,
+            store.materialization("a", None).unwrap().unwrap().value,
             Some(json!({"rows": 3}))
         );
     }
@@ -1372,7 +1795,12 @@ mod tests {
             Ok(json!({"rows": rows * 2}))
         })
         .from(&a);
-        let reg = AssetRegistry::new(vec![a, b], vec![rows_check("has_many", "a", 100)]).unwrap();
+        let reg = AssetRegistry::new(
+            vec![a, b],
+            Vec::new(),
+            vec![rows_check("has_many", "a", 100)],
+        )
+        .unwrap();
         let runner = Runner::new([reg.lower_job().unwrap()], store.clone());
         let run = build_all(&reg, &runner).await;
 
@@ -1383,7 +1811,7 @@ mod tests {
         let b_op = ops.iter().find(|o| o.op == "b").unwrap();
         assert_eq!(b_op.status, OpStatus::Success);
         assert_eq!(
-            store.materialization("b").unwrap().unwrap().value,
+            store.materialization("b", None).unwrap().unwrap().value,
             Some(json!({"rows": 6}))
         );
     }
@@ -1402,10 +1830,10 @@ mod tests {
             rows_check("has_rows", "a", 1),
             rows_check("has_rows", "b", 1),
         ];
-        let reg = AssetRegistry::new(vec![s, a, b], checks).unwrap();
+        let reg = AssetRegistry::new(vec![s, a, b], Vec::new(), checks).unwrap();
         let runner = Runner::new([reg.lower_job().unwrap()], store.clone());
         store
-            .record_materialization("s", "s-fp", &json!({}), None, None, None)
+            .record_materialization("s", None, "s-fp", &json!({}), None, None, None)
             .unwrap();
 
         let run = build_all(&reg, &runner).await;
@@ -1413,12 +1841,13 @@ mod tests {
         let ran = store.op_runs(&run.id).unwrap();
         let planned: Vec<&str> = ran.iter().map(|o| o.op.as_str()).collect();
         assert_eq!(planned, ["a", "b", "check:a:has_rows", "check:b:has_rows"]);
-        assert_eq!(store.asset_checks("a", 10).unwrap().len(), 1);
+        assert_eq!(store.asset_checks("a", None, 10).unwrap().len(), 1);
 
         // poke only b stale, so a is seeded rather than rebuilt
         store
             .record_materialization(
                 "b",
+                None,
                 "b-old",
                 &json!({"a": "older"}),
                 Some(&json!({})),
@@ -1443,8 +1872,273 @@ mod tests {
             .unwrap();
         assert_eq!(run.status, RunStatus::Success);
         // b re-checked, a not: it produced no new value for a check to see
-        assert_eq!(store.asset_checks("a", 10).unwrap().len(), 1);
-        assert_eq!(store.asset_checks("b", 10).unwrap().len(), 2);
+        assert_eq!(store.asset_checks("a", None, 10).unwrap().len(), 1);
+        assert_eq!(store.asset_checks("b", None, 10).unwrap().len(), 2);
+    }
+
+    // one pull, two tables: the motivating shape for a multi-asset
+    fn split() -> MultiAsset {
+        MultiAsset::new("split_orders", |_| async {
+            Ok(json!({
+                "orders_clean": {"rows": 2},
+                "orders_rejected": {"rows": 1},
+            }))
+        })
+        .produces(["orders_clean", "orders_rejected"])
+    }
+
+    #[test]
+    fn multi_assets_validate_what_they_produce() {
+        let bare = MultiAsset::new("split", |_| async { Ok(json!({})) });
+        let err = multi_err(Vec::new(), vec![bare]);
+        assert!(err.to_string().contains("produces nothing"), "{err}");
+
+        // one name, two ops: the job would have no way to tell them apart
+        let twin = MultiAsset::new("split_orders", |_| async { Ok(json!({})) })
+            .produces(["other_clean", "other_rejected"]);
+        let err = multi_err(Vec::new(), vec![split(), twin]);
+        assert!(
+            err.to_string()
+                .contains("duplicate multi-asset split_orders"),
+            "{err}"
+        );
+
+        // two multi-assets claiming one output is a duplicate asset, which the
+        // asset-level topo check names before anything op-level does
+        let other = MultiAsset::new("other", |_| async { Ok(json!({})) })
+            .produces(["orders_clean", "extra"]);
+        let err = multi_err(Vec::new(), vec![split(), other]);
+        assert!(err.to_string().contains("duplicate"), "{err}");
+
+        // an op and the assets share one namespace inside the job
+        let err = multi_err(vec![echo("split_orders")], vec![split()]);
+        assert!(
+            err.to_string().contains("an asset is already called that"),
+            "{err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn one_op_materializes_every_asset_it_produces() {
+        let store = Store::open(":memory:").unwrap();
+        let reg = AssetRegistry::new(Vec::new(), vec![split()], Vec::new()).unwrap();
+        let runner = Runner::new([reg.lower_job().unwrap()], store.clone());
+        let run = build_all(&reg, &runner).await;
+        assert_eq!(run.status, RunStatus::Success);
+
+        // one op run, two materializations, each fingerprinting its own key
+        let ops = store.op_runs(&run.id).unwrap();
+        let names: Vec<&str> = ops.iter().map(|o| o.op.as_str()).collect();
+        assert_eq!(names, ["split_orders"]);
+        let clean = store
+            .materialization("orders_clean", None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(clean.value, Some(json!({"rows": 2})));
+        assert_eq!(clean.fingerprint, content_fingerprint(&json!({"rows": 2})));
+        assert_eq!(clean.run_id.as_deref(), Some(run.id.as_str()));
+        let rejected = store
+            .materialization("orders_rejected", None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(rejected.value, Some(json!({"rows": 1})));
+        assert_ne!(clean.fingerprint, rejected.fingerprint);
+
+        // nothing is materialized under the op's own name
+        assert!(
+            store
+                .materialization("split_orders", None)
+                .unwrap()
+                .is_none()
+        );
+        let m = mats_map(&store).unwrap();
+        assert!(staleness(&reg, &m).values().all(|s| !s.stale));
+    }
+
+    #[tokio::test]
+    async fn a_multi_asset_output_that_does_not_match_what_it_produces_fails() {
+        let store = Store::open(":memory:").unwrap();
+        let short = MultiAsset::new("split_orders", |_| async {
+            Ok(json!({"orders_clean": {"rows": 2}, "surprise": 1}))
+        })
+        .produces(["orders_clean", "orders_rejected"]);
+        let reg = AssetRegistry::new(Vec::new(), vec![short], Vec::new()).unwrap();
+        let runner = Runner::new([reg.lower_job().unwrap()], store.clone());
+        let run = build_all(&reg, &runner).await;
+
+        assert_eq!(run.status, RunStatus::Failed);
+        let why = run.error.unwrap();
+        assert!(why.contains("no key for orders_rejected"), "{why}");
+        assert!(why.contains("a key for surprise"), "{why}");
+        // and neither asset materialized: the op never got that far
+        assert!(
+            store
+                .materialization("orders_clean", None)
+                .unwrap()
+                .is_none()
+        );
+
+        // the same for an output that is not an object at all
+        let store = Store::open(":memory:").unwrap();
+        let flat = MultiAsset::new("split_orders", |_| async { Ok(json!("done")) })
+            .produces(["orders_clean", "orders_rejected"]);
+        let reg = AssetRegistry::new(Vec::new(), vec![flat], Vec::new()).unwrap();
+        let runner = Runner::new([reg.lower_job().unwrap()], store.clone());
+        let run = build_all(&reg, &runner).await;
+        assert!(
+            run.error
+                .unwrap()
+                .contains("returned a string, not an object"),
+            "wrong error"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_downstream_asset_reads_the_key_it_depends_on() {
+        let store = Store::open(":memory:").unwrap();
+        let report = Asset::new("report", |ctx: OpCtx| async move {
+            // the dep is named as the asset, whatever op produced it
+            let rows = ctx.input("orders_clean").unwrap()["rows"].as_u64().unwrap();
+            assert_eq!(ctx.input("orders_rejected"), None, "undeclared dep leaked");
+            Ok(json!({"kept": rows}))
+        })
+        .from_named("orders_clean");
+        let reg = AssetRegistry::new(vec![report], vec![split()], Vec::new()).unwrap();
+        let runner = Runner::new([reg.lower_job().unwrap()], store.clone());
+        let run = build_all(&reg, &runner).await;
+        assert_eq!(run.status, RunStatus::Success);
+        assert_eq!(
+            store
+                .materialization("report", None)
+                .unwrap()
+                .unwrap()
+                .value,
+            Some(json!({"kept": 2}))
+        );
+        // lineage is recorded against the asset, not the op that produced it
+        let clean = store
+            .materialization("orders_clean", None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            store
+                .materialization("report", None)
+                .unwrap()
+                .unwrap()
+                .inputs,
+            json!({"orders_clean": clean.fingerprint})
+        );
+
+        // and a memoized rebuild seeds that key from the store rather than
+        // re-running the pull
+        store
+            .record_materialization(
+                "report",
+                None,
+                "stale",
+                &json!({"orders_clean": "older"}),
+                Some(&json!({})),
+                None,
+                None,
+            )
+            .unwrap();
+        let m = mats_map(&store).unwrap();
+        let plan = plan_target(&reg, &m, "report").unwrap();
+        assert_eq!(plan.ops, ["report"]);
+        assert_eq!(
+            plan.seeds,
+            HashMap::from([(
+                "split_orders".into(),
+                json!({"orders_clean": {"rows": 2}, "orders_rejected": {"rows": 1}}),
+            )])
+        );
+        let run = runner
+            .run_subset(
+                ASSETS_JOB,
+                plan.ops.into_iter().collect(),
+                plan.seeds,
+                json!({}),
+                Trigger::Build,
+            )
+            .await
+            .unwrap();
+        assert_eq!(run.status, RunStatus::Success);
+        assert_eq!(store.op_runs(&run.id).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn one_stale_output_plans_the_op_once() {
+        let reg = AssetRegistry::new(Vec::new(), vec![split()], Vec::new()).unwrap();
+        // both outputs stale: still one op
+        let plan = plan_all(&reg, &HashMap::new()).unwrap();
+        assert_eq!(plan.ops, ["split_orders"]);
+
+        // and so is one of them
+        let m = mats(vec![mat(
+            "orders_clean",
+            "c1",
+            json!({}),
+            Some(json!({"rows": 2})),
+        )]);
+        let plan = plan_all(&reg, &m).unwrap();
+        assert_eq!(plan.ops, ["split_orders"]);
+        let plan = plan_targets(&reg, &m, &["orders_rejected".into()]).unwrap();
+        assert_eq!(plan.ops, ["split_orders"]);
+        // naming both targets is still one run of one computation
+        let plan =
+            plan_targets(&reg, &m, &["orders_clean".into(), "orders_rejected".into()]).unwrap();
+        assert_eq!(plan.ops, ["split_orders"]);
+    }
+
+    #[tokio::test]
+    async fn per_asset_fingerprints_and_metadata_land_on_their_own_rows() {
+        let store = Store::open(":memory:").unwrap();
+        let tagged = MultiAsset::new("split_orders", |ctx: OpCtx| async move {
+            ctx.meta("pulled", 3);
+            ctx.set_fingerprint_of("orders_clean", "clean-v7".into());
+            ctx.meta_of("orders_clean", "rows", 2);
+            ctx.set_fingerprint("shared".into());
+            Ok(json!({"orders_clean": {"rows": 2}, "orders_rejected": {"rows": 1}}))
+        })
+        .produces(["orders_clean", "orders_rejected"]);
+        let reg = AssetRegistry::new(Vec::new(), vec![tagged], Vec::new()).unwrap();
+        let runner = Runner::new([reg.lower_job().unwrap()], store.clone());
+        let run = build_all(&reg, &runner).await;
+        assert_eq!(run.status, RunStatus::Success);
+
+        let clean = store
+            .materialization("orders_clean", None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(clean.fingerprint, "clean-v7");
+        assert_eq!(clean.metadata, Some(json!({"rows": {"int": 2}})));
+        // the op-wide override covers the output that staged none of its own
+        let rejected = store
+            .materialization("orders_rejected", None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(rejected.fingerprint, "shared");
+        assert_eq!(rejected.metadata, None);
+        // and what the op reported about the work as a whole is on its run row
+        let ops = store.op_runs(&run.id).unwrap();
+        assert_eq!(ops[0].metadata, Some(json!({"pulled": {"int": 3}})));
+    }
+
+    #[tokio::test]
+    async fn checks_bind_to_a_produced_asset() {
+        let store = Store::open(":memory:").unwrap();
+        let reg = AssetRegistry::new(
+            Vec::new(),
+            vec![split()],
+            vec![rows_check("has_rows", "orders_clean", 1)],
+        )
+        .unwrap();
+        let runner = Runner::new([reg.lower_job().unwrap()], store.clone());
+        let run = build_all(&reg, &runner).await;
+        assert_eq!(run.status, RunStatus::Success);
+        let results = store.asset_checks("orders_clean", None, 10).unwrap();
+        // the check saw that key's value, not the whole object the op returned
+        assert_eq!(results[0].metadata, Some(json!({"rows": {"int": 2}})));
     }
 
     #[tokio::test]
@@ -1460,7 +2154,7 @@ mod tests {
         }
         let base = echo("base");
         let t = Asset::typed("t", |_ctx: OpCtx, _input: In| async { Ok(Out { n: 5 }) }).from(&base);
-        let reg = AssetRegistry::new(vec![base, t], Vec::new()).unwrap();
+        let reg = AssetRegistry::new(vec![base, t], Vec::new(), Vec::new()).unwrap();
         let job = reg.lower_job().unwrap();
         let op = job.op("t").unwrap();
         assert!(op.input_type().unwrap().ends_with("In"));
@@ -1470,7 +2164,7 @@ mod tests {
         let runner = Runner::new([job], store.clone());
         build_all(&reg, &runner).await;
         assert_eq!(
-            store.materialization("t").unwrap().unwrap().value,
+            store.materialization("t", None).unwrap().unwrap().value,
             Some(json!({"n": 5}))
         );
     }

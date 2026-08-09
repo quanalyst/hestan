@@ -63,6 +63,13 @@ export default function AssetPanel({
           <span className="op-line-label">kind</span>
           <span className="mono">{asset.kind}</span>
         </div>
+        {/* only worth a line when it is not simply the asset's own name */}
+        {asset.op && asset.op !== asset.name && (
+          <div className="op-line">
+            <span className="op-line-label">op</span>
+            <span className="mono">{asset.op}</span>
+          </div>
+        )}
         {asset.deps.length > 0 && (
           <div className="op-line">
             <span className="op-line-label">deps</span>
