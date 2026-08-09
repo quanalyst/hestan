@@ -31,6 +31,8 @@ export interface OpSummary {
   name: string;
   deps: string[];
   when: When;
+  // process-wide resources this op declared with Op::requires
+  requires: string[];
   retries: number;
   timeout_secs: number | null;
   pool: string | null;

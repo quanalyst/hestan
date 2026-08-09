@@ -17,6 +17,7 @@ use crate::model::{
     EventKind, EventLevel, OpRun, OpStatus, Run, RunStatus, Trigger, When, new_run_id,
 };
 use crate::op::{Cancel, Op, OpCtx};
+use crate::resource::{self, Resources};
 use crate::store::Store;
 
 /// how far back a resume follows `resumed_from` links. resuming a resume is
@@ -108,6 +109,7 @@ pub struct Runner {
     active: Arc<Mutex<HashMap<String, watch::Sender<bool>>>>,
     hooks: Arc<Vec<FailureHook>>,
     pools: Pools,
+    resources: Resources,
 }
 
 impl Runner {
@@ -138,6 +140,7 @@ impl Runner {
             active: Arc::new(Mutex::new(HashMap::new())),
             hooks: Arc::new(hooks),
             pools: Arc::new(HashMap::new()),
+            resources: resource::none(),
         }
     }
 
@@ -150,6 +153,21 @@ impl Runner {
         store: Store,
         hooks: Vec<FailureHook>,
         pools: impl IntoIterator<Item = (String, usize)>,
+    ) -> Result<Runner, Error> {
+        Runner::with_resources(jobs, store, hooks, pools, resource::none())
+    }
+
+    /// like [`Runner::with_pools`] plus the process-wide resources every op
+    /// shares, already built. an op that declared [`Op::requires`] for a
+    /// resource that is not here is [`Error::Graph`], on the same grounds as
+    /// an undeclared pool: a dependency you named and did not get is a build
+    /// mistake, not a 3am one. `Hestan::resource` is the way in.
+    pub(crate) fn with_resources(
+        jobs: impl IntoIterator<Item = Job>,
+        store: Store,
+        hooks: Vec<FailureHook>,
+        pools: impl IntoIterator<Item = (String, usize)>,
+        resources: Resources,
     ) -> Result<Runner, Error> {
         let mut declared: HashMap<String, Pool> = HashMap::new();
         for (name, limit) in pools {
@@ -179,10 +197,36 @@ impl Runner {
                 }
             }
         }
+        for job in runner.jobs.values() {
+            for op in job.ops() {
+                for name in op.required_resources() {
+                    if !resources.contains_key(name) {
+                        return Err(Error::Graph(format!(
+                            "job {}: op {} requires resource {name}, which is not registered",
+                            job.name(),
+                            op.name()
+                        )));
+                    }
+                }
+            }
+        }
         Ok(Runner {
             pools: Arc::new(declared),
+            resources,
             ..runner
         })
+    }
+
+    /// the resources this runner hands its ops: names and declared types,
+    /// sorted, never values.
+    pub fn resources(&self) -> Vec<(&str, &'static str)> {
+        let mut all: Vec<(&str, &'static str)> = self
+            .resources
+            .iter()
+            .map(|(name, res)| (name.as_str(), res.type_name))
+            .collect();
+        all.sort_by_key(|(name, _)| *name);
+        all
     }
 
     pub fn store(&self) -> &Store {
@@ -860,6 +904,7 @@ async fn execute(
                 params.clone(),
                 Arc::new(inputs),
                 Arc::new(dep_statuses),
+                runner.resources.clone(),
                 store.clone(),
                 runner.pools.clone(),
                 cancel.clone(),
@@ -1206,6 +1251,7 @@ async fn run_op(
     params: Value,
     inputs: Arc<HashMap<String, Value>>,
     dep_statuses: Arc<HashMap<String, OpStatus>>,
+    resources: Resources,
     store: Store,
     pools: Pools,
     cancel: watch::Receiver<bool>,
@@ -1267,6 +1313,7 @@ async fn run_op(
             element: element.clone(),
             inputs: inputs.clone(),
             dep_statuses: dep_statuses.clone(),
+            resources: resources.clone(),
             state: state.clone(),
             new_state: new_state.clone(),
             new_fingerprint: Arc::new(Mutex::new(None)),

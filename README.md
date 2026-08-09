@@ -116,6 +116,11 @@ appears.
   budget for one external resource, however many jobs overlap). a terminal op
   failure skips its downstream and fails the run, while independent branches
   keep going
+- resources are built once at startup and shared by every op:
+  `Hestan::resource("api", |_| async { Ok(ApiClient::new()?) })` plus
+  `ctx.resource::<ApiClient>("api")?`, with `Op::requires(["api"])` turning a
+  missing one into a build error. a constructor that fails aborts startup
+  instead of leaving a half-live server
 - a reusable `Graph` of ops drops into a job as many times as you like:
   `.graph("clean_a", &clean).after(["fetch"])`. it is flattened at build into
   ordinary ops named `{instance}.{inner}`, so nothing at run time — resume,
@@ -177,7 +182,8 @@ appears.
 the details live in [docs/](docs/README.md):
 [getting started](docs/getting-started.md),
 [concepts](docs/concepts.md) (execution semantics),
-[typed io](docs/typed-io.md), [op state](docs/state.md),
+[typed io](docs/typed-io.md), [resources](docs/resources.md),
+[op state](docs/state.md),
 [assets](docs/assets.md), [sensors](docs/sensors.md),
 [scheduling](docs/scheduling.md), [http sources](docs/http-sources.md),
 [notifications](docs/notifications.md), [the web ui](docs/web-ui.md),

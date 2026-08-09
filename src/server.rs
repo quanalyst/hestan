@@ -40,6 +40,7 @@ pub(crate) struct AppState {
 pub(crate) fn router(state: AppState) -> Router {
     Router::new()
         .route("/api/health", get(health))
+        .route("/api/resources", get(list_resources))
         .route("/api/jobs", get(list_jobs))
         .route("/api/jobs/{name}", get(get_job))
         .route("/api/jobs/{name}/runs", post(launch_run))
@@ -130,6 +131,7 @@ fn job_summary(job: &Job, st: &AppState) -> Result<Value, Error> {
                 "name": op.name(),
                 "deps": op.deps(),
                 "when": op.runs_when(),
+                "requires": op.required_resources(),
                 "retries": op.max_retries(),
                 "timeout_secs": op.timeout_after().map(|d| d.as_secs_f64()),
                 "pool": op.pool_name(),
@@ -207,6 +209,18 @@ fn job_summary(job: &Job, st: &AppState) -> Result<Value, Error> {
 
 async fn health() -> Json<Value> {
     Json(json!({ "ok": true }))
+}
+
+// names and declared types only: a resource is usually a client holding
+// credentials, and the api has no business showing what is inside one
+async fn list_resources(State(st): State<AppState>) -> Json<Value> {
+    let resources: Vec<Value> = st
+        .runner
+        .resources()
+        .into_iter()
+        .map(|(name, ty)| json!({ "name": name, "type": ty }))
+        .collect();
+    Json(json!({ "resources": resources }))
 }
 
 async fn list_jobs(State(st): State<AppState>) -> Result<Json<Value>, ApiError> {
@@ -1282,6 +1296,40 @@ mod tests {
         assert_eq!(body["error"], "unknown job: nope");
     }
 
+    // names and types, never values: a resource is usually a client holding
+    // credentials
+    #[tokio::test]
+    async fn resources_endpoint_lists_names_and_types_only() {
+        let mut built = std::collections::HashMap::new();
+        built.insert(
+            "api".to_string(),
+            crate::resource::Resource {
+                type_name: "demo::ApiClient",
+                value: Arc::new("s3cret".to_string()),
+            },
+        );
+        let runner = Runner::with_resources(
+            Vec::<Job>::new(),
+            Store::open(":memory:").unwrap(),
+            Vec::new(),
+            Vec::new(),
+            Arc::new(built),
+        )
+        .unwrap();
+        let st = AppState {
+            jobs: Arc::new(runner.jobs().clone()),
+            runner,
+            assets: Arc::new(AssetRegistry::empty()),
+            sensors: Arc::new(Vec::new()),
+        };
+        let Json(body) = list_resources(State(st)).await;
+        assert_eq!(
+            body,
+            json!({ "resources": [ { "name": "api", "type": "demo::ApiClient" } ] })
+        );
+        assert!(!body.to_string().contains("s3cret"));
+    }
+
     // the dag draws a muted marker from this, and the default rule is the
     // absence of one
     #[tokio::test]
@@ -1301,6 +1349,7 @@ mod tests {
             .unwrap();
         let ops = body["ops"].as_array().unwrap();
         assert_eq!(ops[0]["when"], "all_succeeded");
+        assert_eq!(ops[0]["requires"], json!([]));
         assert_eq!(ops[1]["when"], "always");
         assert_eq!(ops[2]["when"], "any_failed");
     }

@@ -1,3 +1,4 @@
+use std::any::Any;
 use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -9,6 +10,7 @@ use crate::error::Error;
 use crate::executor::{FailureHook, RunFailure, Runner};
 use crate::job::Job;
 use crate::model::{Run, ScheduleDef, Trigger};
+use crate::resource::{self, Resource, ResourceCtx, ResourceFn};
 use crate::schedule::{self, ScheduleEntry};
 use crate::sensor::{Sensor, SensorEntry, SensorEval, run_sensors};
 use crate::server::{AppState, SensorInfo, router};
@@ -22,6 +24,7 @@ pub struct Hestan {
     assets: Vec<Asset>,
     sensors: Vec<Sensor>,
     pools: Vec<(String, usize)>,
+    resources: Vec<(String, ResourceFn)>,
     db_path: String,
     hooks: Vec<FailureHook>,
     retention_days: Option<u32>,
@@ -37,6 +40,7 @@ impl Default for Hestan {
             assets: Vec::new(),
             sensors: Vec::new(),
             pools: Vec::new(),
+            resources: Vec::new(),
             db_path: "hestan.db".into(),
             hooks: Vec::new(),
             retention_days: None,
@@ -88,6 +92,54 @@ impl Hestan {
     /// [`Error::Graph`]. a limit below 1 means 1.
     pub fn pool(mut self, name: impl Into<String>, limit: usize) -> Self {
         self.pools.push((name.into(), limit));
+        self
+    }
+
+    /// register a process-wide resource: a value built once at startup and
+    /// shared by every op that asks for it, which is what replaces capturing
+    /// a client in a closure.
+    ///
+    /// ```no_run
+    /// # use hestan::{Hestan, Op, OpCtx};
+    /// # use serde_json::json;
+    /// # #[derive(Clone)] struct ApiClient;
+    /// # impl ApiClient { fn new() -> Result<ApiClient, std::io::Error> { Ok(ApiClient) } }
+    /// Hestan::new()
+    ///     .resource("api", |_| async { Ok(ApiClient::new()?) })
+    ///     .job(todo!());
+    /// ```
+    ///
+    /// the constructor is async and fallible, and runs during startup before
+    /// the store is opened, so a resource that cannot be built aborts the
+    /// process with [`Error::Resource`] rather than leaving a half-live
+    /// server. resources are built in declaration order and each is handed a
+    /// [`ResourceCtx`] holding the ones before it, so a client can lean on
+    /// the config it reads.
+    ///
+    /// resources live for the process: there is no per-run scoping and no
+    /// teardown hook in this phase. anything needing either should own it
+    /// inside the op.
+    ///
+    /// ops read one with [`OpCtx::resource`](crate::OpCtx::resource), and
+    /// declaring it with [`Op::requires`](crate::Op::requires) turns a
+    /// missing name into a build error. declaring the same name twice is
+    /// [`Error::Resource`].
+    pub fn resource<T, F, Fut>(mut self, name: impl Into<String>, f: F) -> Self
+    where
+        T: Any + Send + Sync,
+        F: FnOnce(ResourceCtx) -> Fut + Send + 'static,
+        Fut: Future<Output = Result<T, Box<dyn std::error::Error + Send + Sync>>> + Send + 'static,
+    {
+        let ctor: ResourceFn = Box::new(move |ctx: ResourceCtx| {
+            Box::pin(async move {
+                let value = f(ctx).await?;
+                Ok(Resource {
+                    type_name: std::any::type_name::<T>(),
+                    value: Arc::new(value),
+                })
+            })
+        });
+        self.resources.push((name.into(), ctor));
         self
     }
 
@@ -165,7 +217,7 @@ impl Hestan {
     }
 
     pub async fn run_once(self, job: &str, params: Value) -> Result<Run, Error> {
-        let built = self.build()?;
+        let built = self.build().await?;
         built.runner.run(job, params, Trigger::Manual).await
     }
 
@@ -173,7 +225,7 @@ impl Hestan {
     /// its stale ancestors plus the target, which always rebuilds. check
     /// `GET /api/assets` first if you only want to build when stale.
     pub async fn build_asset(self, name: &str) -> Result<Run, Error> {
-        let built = self.build()?;
+        let built = self.build().await?;
         let mats = mats_map(built.runner.store())?;
         let plan = plan_target(&built.registry, &mats, name)?;
         built
@@ -190,7 +242,7 @@ impl Hestan {
 
     pub async fn serve(self, addr: impl Into<SocketAddr>) -> Result<(), Error> {
         let addr = addr.into();
-        let built = self.build()?;
+        let built = self.build().await?;
         // bind before spawning the loops: a bind failure must not leave detached
         // tasks firing jobs into a server that never started
         let listener = tokio::net::TcpListener::bind(addr).await?;
@@ -222,7 +274,7 @@ impl Hestan {
         Ok(())
     }
 
-    fn build(self) -> Result<Built, Error> {
+    async fn build(self) -> Result<Built, Error> {
         #[cfg(feature = "http")]
         let (mut jobs, schedules) = {
             let (mut jobs, mut schedules) = (self.jobs, self.schedules);
@@ -296,6 +348,11 @@ impl Hestan {
             }
         }
 
+        // before the store opens: a process whose api client could not be
+        // built has nothing useful to serve, and should not leave a database
+        // behind saying otherwise
+        let resources = resource::build(self.resources).await?;
+
         let store = Store::open(&self.db_path)?;
         store.fail_interrupted()?;
         store.sync_schedules(&schedules)?;
@@ -310,7 +367,7 @@ impl Hestan {
                 tracing::info!("retention: removed {removed} runs older than {days} days");
             }
         }
-        let runner = Runner::with_pools(jobs, store, self.hooks, self.pools)?;
+        let runner = Runner::with_resources(jobs, store, self.hooks, self.pools, resources)?;
         Ok(Built {
             runner,
             entries,

@@ -188,6 +188,29 @@ nothing to expand over, so it expands into **zero instances**: no bodies run,
 no instance rows, an `op_expanded` event with `instances: 0`, and output `[]`
 downstream — exactly the empty fan-out an empty array would have given.
 
+## Resources
+
+a *resource* is a value built once at startup and shared by every op that asks
+— an http client, a connection pool, a parsed config — instead of each op
+capturing its own in a closure:
+
+```rust
+Hestan::new().resource("api", |_| async { Ok(ApiClient::new()?) })
+
+Op::new("query", |ctx| async move {
+    let api = ctx.resource::<ApiClient>("api")?;   // Arc<ApiClient>
+    ..
+})
+.requires(["api"])
+```
+
+constructors are async and fallible and run before the store opens, so one
+that fails aborts startup with `Error::Resource { name, reason }` rather than
+leaving a half-live server. `Op::requires` turns a name nobody registered into
+a build error instead of a run that gets halfway. resources live for the
+process — no per-run scoping, no teardown hooks. the model has
+[its own page](resources.md).
+
 ## Concurrency pools
 
 `max_parallel` is a property of one job. the limit that usually matters is a

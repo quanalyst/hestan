@@ -103,6 +103,12 @@ export default function OpInspector({
             <span className="mono">{op.mapped_over}</span>
           </div>
         )}
+        {op.requires.length > 0 && (
+          <div className="op-line">
+            <span className="op-line-label">resources</span>
+            <span className="mono">{op.requires.join(", ")}</span>
+          </div>
+        )}
         {op.pool && (
           <div className="op-line">
             <span className="op-line-label">pool</span>

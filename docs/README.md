@@ -3,6 +3,7 @@
 - [getting started](getting-started.md) — add the dependency, write a first job, see it in the ui.
 - [concepts](concepts.md) — ops, jobs, runs, events, triggers, and exactly how a run executes.
 - [typed io](typed-io.md) — `Op::typed`, `input_as`, `.params::<P>()`, and what a type-check failure does.
+- [resources](resources.md) — values built once at startup and shared by every op: `Hestan::resource`, `ctx.resource::<T>`, `Op::requires`.
 - [op state](state.md) — persisted watermarks: `ctx.state`/`set_state`, the at-least-once commit order, the state endpoint.
 - [assets](assets.md) — fingerprints, provable staleness, memoized builds, serialized builds, probes, and `.auto()`.
 - [sensors](sensors.md) — the sensor loop, cursor commit-on-success, `RunRequest`, probes-as-sensors, pausing and tick history.

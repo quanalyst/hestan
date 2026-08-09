@@ -2336,3 +2336,199 @@ async fn a_nested_graph_with_fan_out_runs_flattened() {
     assert_eq!(out("s.total"), Some(json!(30)));
     assert_eq!(out("report"), Some(json!({"total": 30})));
 }
+
+// ---- resources ----
+
+#[derive(Debug)]
+struct ApiClient {
+    base: String,
+}
+
+#[derive(Debug)]
+struct Config {
+    retries: u32,
+}
+
+// one construction, one value, however many ops read it
+#[tokio::test]
+async fn one_resource_reaches_every_op_that_asks_for_it() {
+    let built = Arc::new(AtomicU32::new(0));
+    let counter = built.clone();
+    let seen: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let (a, b) = (seen.clone(), seen.clone());
+    // the same Arc reaching both ops is the claim; addresses prove it
+    let addrs: Arc<Mutex<Vec<usize>>> = Arc::new(Mutex::new(Vec::new()));
+    let (pa, pb) = (addrs.clone(), addrs.clone());
+
+    let job = Job::builder("api_work")
+        .op(Op::new("first", move |ctx: OpCtx| {
+            let (seen, addrs) = (a.clone(), pa.clone());
+            async move {
+                let api = ctx.resource::<ApiClient>("api")?;
+                seen.lock().unwrap().push(api.base.clone());
+                addrs.lock().unwrap().push(Arc::as_ptr(&api) as usize);
+                Ok(json!(null))
+            }
+        })
+        .requires(["api"]))
+        .op(Op::new("second", move |ctx: OpCtx| {
+            let (seen, addrs) = (b.clone(), pb.clone());
+            async move {
+                let api = ctx.resource::<ApiClient>("api")?;
+                seen.lock().unwrap().push(api.base.clone());
+                addrs.lock().unwrap().push(Arc::as_ptr(&api) as usize);
+                Ok(json!(null))
+            }
+        })
+        .after(["first"])
+        .requires(["api"]))
+        .build()
+        .unwrap();
+
+    let run = Hestan::new()
+        .resource("config", |_| async { Ok(Config { retries: 4 }) })
+        // a resource may lean on one declared before it
+        .resource("api", move |ctx: hestan::ResourceCtx| {
+            let counter = counter.clone();
+            async move {
+                counter.fetch_add(1, Ordering::SeqCst);
+                let config = ctx.resource::<Config>("config")?;
+                Ok(ApiClient {
+                    base: format!("https://api/{}", config.retries),
+                })
+            }
+        })
+        .job(job)
+        .db(":memory:")
+        .run_once("api_work", json!({}))
+        .await
+        .unwrap();
+
+    assert_eq!(run.status, RunStatus::Success);
+    assert_eq!(built.load(Ordering::SeqCst), 1, "built more than once");
+    assert_eq!(
+        *seen.lock().unwrap(),
+        ["https://api/4", "https://api/4"],
+        "the two ops saw different values"
+    );
+    let addrs = addrs.lock().unwrap();
+    assert_eq!(addrs.len(), 2);
+    assert_eq!(addrs[0], addrs[1], "the ops got two different instances");
+}
+
+#[tokio::test]
+async fn asking_for_the_wrong_type_or_an_unknown_name_says_which() {
+    let job = Job::builder("confused")
+        .op(Op::new("wrong_type", |ctx: OpCtx| async move {
+            let err = ctx.resource::<ApiClient>("config").unwrap_err().to_string();
+            assert!(err.contains("resource config is a"), "{err}");
+            assert!(err.contains("Config"), "{err}");
+            assert!(err.contains("ApiClient"), "{err}");
+            let err = ctx.resource::<Config>("ghost").unwrap_err().to_string();
+            assert_eq!(err, "no resource named ghost");
+            Ok(json!("checked"))
+        }))
+        .build()
+        .unwrap();
+
+    let run = Hestan::new()
+        .resource("config", |_| async { Ok(Config { retries: 1 }) })
+        .job(job)
+        .db(":memory:")
+        .run_once("confused", json!({}))
+        .await
+        .unwrap();
+    assert_eq!(run.status, RunStatus::Success);
+}
+
+// declaring is how you find out at startup instead of at 3am
+#[tokio::test]
+async fn a_required_resource_that_is_not_registered_fails_the_build() {
+    let job = || {
+        Job::builder("needy")
+            .op(Op::new("call", |_| async { Ok(json!(null)) }).requires(["api"]))
+            .build()
+            .unwrap()
+    };
+
+    let err = Hestan::new()
+        .job(job())
+        .db(":memory:")
+        .run_once("needy", json!({}))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, Error::Graph(_)), "{err}");
+    assert!(
+        err.to_string()
+            .contains("op call requires resource api, which is not registered"),
+        "{err}"
+    );
+
+    let run = Hestan::new()
+        .resource("api", |_| async {
+            Ok(ApiClient {
+                base: "https://api".into(),
+            })
+        })
+        .job(job())
+        .db(":memory:")
+        .run_once("needy", json!({}))
+        .await
+        .unwrap();
+    assert_eq!(run.status, RunStatus::Success);
+}
+
+// a process whose client could not be built has nothing useful to serve, and
+// must not leave a database behind saying otherwise
+#[tokio::test]
+async fn a_failing_constructor_aborts_startup() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("hestan.db");
+    let ran = Arc::new(AtomicBool::new(false));
+    let flag = ran.clone();
+
+    let err = Hestan::new()
+        .resource("api", |_| async {
+            Err::<ApiClient, _>("no credentials".into())
+        })
+        .job(
+            Job::builder("work")
+                .op(Op::new("go", move |_| {
+                    let flag = flag.clone();
+                    async move {
+                        flag.store(true, Ordering::SeqCst);
+                        Ok(json!(null))
+                    }
+                }))
+                .build()
+                .unwrap(),
+        )
+        .db(db.to_str().unwrap())
+        .run_once("work", json!({}))
+        .await
+        .unwrap_err();
+
+    assert!(
+        matches!(&err, Error::Resource { name, .. } if name == "api"),
+        "{err}"
+    );
+    assert!(err.to_string().contains("no credentials"), "{err}");
+    assert!(!ran.load(Ordering::SeqCst), "an op ran anyway");
+    assert!(!db.exists(), "the store opened despite the failed startup");
+
+    // and a name declared twice is caught the same way
+    let err = Hestan::new()
+        .resource("api", |_| async { Ok(Config { retries: 1 }) })
+        .resource("api", |_| async { Ok(Config { retries: 2 }) })
+        .job(
+            Job::builder("work")
+                .op(Op::new("go", |_| async { Ok(json!(null)) }))
+                .build()
+                .unwrap(),
+        )
+        .db(":memory:")
+        .run_once("work", json!({}))
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("declared twice"), "{err}");
+}

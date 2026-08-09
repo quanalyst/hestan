@@ -11,6 +11,7 @@ use tokio::sync::watch;
 
 use crate::backoff;
 use crate::model::{EventKind, EventLevel, OpStatus, When};
+use crate::resource::{self, Resources};
 use crate::store::Store;
 
 /// what an op body returns: json output on success, any error on failure.
@@ -55,6 +56,14 @@ pub enum InputError {
     Missing(String),
     #[error("type mismatch: {0}")]
     Mismatch(String),
+    #[error("no resource named {0}")]
+    NoResource(String),
+    #[error("resource {name} is a {got}, not a {want}")]
+    ResourceType {
+        name: String,
+        got: &'static str,
+        want: &'static str,
+    },
 }
 
 /// a named unit of work: an async fn plus the upstream ops it waits on.
@@ -62,6 +71,7 @@ pub enum InputError {
 pub struct Op {
     name: String,
     deps: Vec<String>,
+    requires: Vec<String>,
     // on an op flattened out of a Graph instance: (job-level dep name, the
     // name this body calls it). empty everywhere else, where they are the
     // same thing.
@@ -91,6 +101,7 @@ impl Op {
         Op {
             name: name.into(),
             deps: Vec::new(),
+            requires: Vec::new(),
             aliases: Vec::new(),
             when: When::default(),
             retries: 0,
@@ -121,6 +132,7 @@ impl Op {
         Op {
             name: name.into(),
             deps: Vec::new(),
+            requires: Vec::new(),
             aliases: Vec::new(),
             when: When::default(),
             retries: 0,
@@ -248,6 +260,20 @@ impl Op {
         self
     }
 
+    /// declare the [resources](crate::ResourceCtx) this op reads, so a name
+    /// that was never registered is a build error instead of a run that gets
+    /// halfway and fails. ops may also just ask with
+    /// [`OpCtx::resource`](OpCtx::resource) without declaring; declaring is
+    /// how you find out at startup rather than at 3am.
+    pub fn requires<I>(mut self, names: I) -> Op
+    where
+        I: IntoIterator,
+        I::Item: Into<String>,
+    {
+        self.requires.extend(names.into_iter().map(Into::into));
+        self
+    }
+
     /// declare the params type; a launch whose params don't deserialize into
     /// `P` is rejected before any run row is written.
     pub fn params<P: DeserializeOwned + 'static>(mut self) -> Op {
@@ -365,6 +391,11 @@ impl Op {
         self.when
     }
 
+    /// the resources this op declared with [`requires`](Self::requires).
+    pub fn required_resources(&self) -> &[String] {
+        &self.requires
+    }
+
     pub fn max_retries(&self) -> u32 {
         self.retries
     }
@@ -423,6 +454,7 @@ impl fmt::Debug for Op {
         f.debug_struct("Op")
             .field("name", &self.name)
             .field("deps", &self.deps)
+            .field("requires", &self.requires)
             .field("when", &self.when)
             .field("retries", &self.retries)
             .field("retry", &self.retry)
@@ -472,6 +504,7 @@ pub struct OpCtx {
     /// what each declared dep ended up doing, for an op with a
     /// [`when`](Op::when) rule that let it run anyway.
     pub(crate) dep_statuses: Arc<HashMap<String, OpStatus>>,
+    pub(crate) resources: Resources,
     pub(crate) state: Arc<Option<Value>>,
     pub(crate) new_state: Arc<Mutex<Option<Value>>>,
     pub(crate) new_fingerprint: Arc<Mutex<Option<String>>>,
@@ -578,6 +611,31 @@ impl OpCtx {
         serde_json::from_value(v.clone()).map_err(|e| InputError::Mismatch(e.to_string()))
     }
 
+    /// a process-wide resource, built once at startup by
+    /// `Hestan::resource(name, ..)` and shared by every op that asks — the
+    /// replacement for capturing a client in a closure.
+    ///
+    /// ```no_run
+    /// # use hestan::{Op, OpCtx};
+    /// # use serde_json::json;
+    /// # struct ApiClient;
+    /// Op::new("query", |ctx: OpCtx| async move {
+    ///     let api = ctx.resource::<ApiClient>("api")?;   // Arc<ApiClient>
+    ///     # let _ = api;
+    ///     Ok(json!(null))
+    /// })
+    /// .requires(["api"]);
+    /// ```
+    ///
+    /// the error says which of the two things went wrong: there is no such
+    /// resource, or there is and it is something else.
+    pub fn resource<T: std::any::Any + Send + Sync>(
+        &self,
+        name: &str,
+    ) -> Result<Arc<T>, InputError> {
+        resource::lookup(&self.resources, name)
+    }
+
     /// the state this op's last successful run committed via
     /// [`set_state`](Self::set_state). loaded once, before the first attempt.
     pub fn state(&self) -> Option<&Value> {
@@ -680,6 +738,7 @@ mod tests {
             element: None,
             inputs: Arc::new(HashMap::new()),
             dep_statuses: Arc::new(HashMap::new()),
+            resources: resource::none(),
             state: Arc::new(None),
             new_state: Arc::new(Mutex::new(None)),
             new_fingerprint: Arc::new(Mutex::new(None)),

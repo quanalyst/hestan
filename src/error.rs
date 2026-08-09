@@ -1,6 +1,7 @@
 /// every fallible operation in this crate returns one of these. the
 /// validation variants (`Graph`, `Cron`, `Timezone`, `InvalidParams`,
-/// `DuplicateJob`) surface at build time, before anything is written. the
+/// `DuplicateJob`, `Resource`) surface at build time, before anything is
+/// written. the
 /// resume variants (`UnknownRun`, `RunActive`, `RunNotFailed`,
 /// `NothingToResume`, `ResumeChain`) say why a run cannot be resumed.
 #[derive(Debug, thiserror::Error)]
@@ -31,6 +32,8 @@ pub enum Error {
     SchemaTooNew(u32),
     #[error("invalid params for op {op}: {reason}")]
     InvalidParams { op: String, reason: String },
+    #[error("resource {name}: {reason}")]
+    Resource { name: String, reason: String },
     #[error("storage: {0}")]
     Sqlite(#[from] rusqlite::Error),
     #[error(transparent)]

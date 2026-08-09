@@ -14,6 +14,7 @@ mod model;
 #[cfg(feature = "http")]
 pub mod notify;
 mod op;
+mod resource;
 mod schedule;
 mod sensor;
 mod server;
@@ -31,6 +32,7 @@ pub use model::{
     ScheduleRow, SensorOutcome, SensorRow, SensorTick, Tick, TickOutcome, Trigger, When,
 };
 pub use op::{InputError, Op, OpCtx, OpResult};
+pub use resource::ResourceCtx;
 pub use sensor::{RunRequest, Sensor, SensorCtx};
 pub use store::Store;
 

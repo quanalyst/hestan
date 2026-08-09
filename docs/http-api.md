@@ -12,6 +12,7 @@ failures. timestamps are rfc3339 strings in utc.
 | method | path | purpose |
 | --- | --- | --- |
 | GET | `/api/health` | liveness; `{"ok": true}` |
+| GET | `/api/resources` | registered resources: names and types |
 | GET | `/api/jobs` | all job summaries, sorted by name |
 | GET | `/api/jobs/{name}` | one job summary |
 | POST | `/api/jobs/{name}/runs` | launch a run |
@@ -50,6 +51,7 @@ summary or a 404. the shape:
       "name": "fetch_orders",
       "deps": [],
       "when": "all_succeeded",
+      "requires": [],
       "retries": 0,
       "timeout_secs": 30.0,
       "pool": "orders_api",
@@ -79,7 +81,9 @@ every other job in the process, not per job. an op's `pool` is the pool it
 takes a permit from (null for most ops) and `timeout_secs` its per-attempt
 time limit (null for none). `when` is the op's
 [trigger rule](concepts.md#trigger-rules) — `all_succeeded` (the default),
-`any_failed` or `always`. `mapped_over` is the dep an
+`any_failed` or `always`. `requires` lists the
+[resources](concepts.md#resources) the op declared with `Op::requires`.
+`mapped_over` is the dep an
 [`Op::mapped`](concepts.md#dynamic-fan-out) fans out over, null for every
 ordinary op. `interval_secs` is the gap between the next two fires, minimized across the
 job's unpaused schedules (`null` without one); `overdue` is true when the
@@ -87,6 +91,18 @@ previous scheduled fire is more than half an interval past and no successful
 run has finished since it (see [scheduling](scheduling.md)). the type fields
 are `std::any::type_name` strings from [typed io](typed-io.md), `null` for
 untyped ops.
+
+## Resources
+
+`GET /api/resources` lists the [resources](resources.md) this process built,
+sorted by name:
+
+```json
+{ "resources": [ { "name": "api", "type": "demo::ApiClient" } ] }
+```
+
+names and declared types only — never values. a resource is usually a client
+holding credentials, so there is nothing here to leak.
 
 ## Launching runs
 
