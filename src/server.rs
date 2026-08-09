@@ -135,6 +135,7 @@ fn job_summary(job: &Job, st: &AppState) -> Result<Value, Error> {
                 "retries": op.max_retries(),
                 "timeout_secs": op.timeout_after().map(|d| d.as_secs_f64()),
                 "pool": op.pool_name(),
+                "io": op.io_name(),
                 "mapped_over": op.mapped_over(),
                 "input_type": op.input_type(),
                 "output_type": op.output_type(),
@@ -1314,6 +1315,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             Arc::new(built),
+            crate::io::Io::default(),
         )
         .unwrap();
         let st = AppState {

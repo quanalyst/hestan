@@ -72,6 +72,7 @@ pub struct Op {
     name: String,
     deps: Vec<String>,
     requires: Vec<String>,
+    io: Option<String>,
     // on an op flattened out of a Graph instance: (job-level dep name, the
     // name this body calls it). empty everywhere else, where they are the
     // same thing.
@@ -102,6 +103,7 @@ impl Op {
             name: name.into(),
             deps: Vec::new(),
             requires: Vec::new(),
+            io: None,
             aliases: Vec::new(),
             when: When::default(),
             retries: 0,
@@ -133,6 +135,7 @@ impl Op {
             name: name.into(),
             deps: Vec::new(),
             requires: Vec::new(),
+            io: None,
             aliases: Vec::new(),
             when: When::default(),
             retries: 0,
@@ -274,6 +277,14 @@ impl Op {
         self
     }
 
+    /// persist this op's output through the [io manager](crate::IoManager)
+    /// registered under `name` with `Hestan::io_named`, instead of the
+    /// process default. naming one that was never registered fails the build.
+    pub fn io(mut self, name: impl Into<String>) -> Op {
+        self.io = Some(name.into());
+        self
+    }
+
     /// declare the params type; a launch whose params don't deserialize into
     /// `P` is rejected before any run row is written.
     pub fn params<P: DeserializeOwned + 'static>(mut self) -> Op {
@@ -394,6 +405,12 @@ impl Op {
     /// the resources this op declared with [`requires`](Self::requires).
     pub fn required_resources(&self) -> &[String] {
         &self.requires
+    }
+
+    /// the named io manager this op selected with [`io`](Self::io); `None`
+    /// means the process default.
+    pub fn io_name(&self) -> Option<&str> {
+        self.io.as_deref()
     }
 
     pub fn max_retries(&self) -> u32 {

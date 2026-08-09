@@ -9,6 +9,7 @@ mod executor;
 mod graph;
 #[cfg(feature = "http")]
 mod http;
+mod io;
 mod job;
 mod model;
 #[cfg(feature = "http")]
@@ -26,6 +27,7 @@ pub use error::Error;
 pub use executor::{CancelOutcome, FailureHook, ResumePlan, RunFailure, Runner};
 #[cfg(feature = "http")]
 pub use http::HttpSource;
+pub use io::{FileIo, Inline, IoKey, IoManager, IoResult};
 pub use job::{Graph, GraphBuilder, Job, JobBuilder};
 pub use model::{
     Event, EventKind, EventLevel, Materialization, OpRun, OpStatus, Overlap, Run, RunStatus,

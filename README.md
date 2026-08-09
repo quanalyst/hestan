@@ -116,6 +116,9 @@ appears.
   budget for one external resource, however many jobs overlap). a terminal op
   failure skips its downstream and fails the run, while independent branches
   keep going
+- op outputs are pluggable: `Hestan::io(FileIo::new(dir))` moves them out of
+  sqlite and leaves a `{"$io": ..}` handle in the run log, with `Op::io(name)`
+  for per-op managers. the default `Inline` is exactly today's behaviour
 - resources are built once at startup and shared by every op:
   `Hestan::resource("api", |_| async { Ok(ApiClient::new()?) })` plus
   `ctx.resource::<ApiClient>("api")?`, with `Op::requires(["api"])` turning a
@@ -183,7 +186,7 @@ the details live in [docs/](docs/README.md):
 [getting started](docs/getting-started.md),
 [concepts](docs/concepts.md) (execution semantics),
 [typed io](docs/typed-io.md), [resources](docs/resources.md),
-[op state](docs/state.md),
+[io managers](docs/io-managers.md), [op state](docs/state.md),
 [assets](docs/assets.md), [sensors](docs/sensors.md),
 [scheduling](docs/scheduling.md), [http sources](docs/http-sources.md),
 [notifications](docs/notifications.md), [the web ui](docs/web-ui.md),

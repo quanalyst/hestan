@@ -36,6 +36,9 @@ export interface OpSummary {
   retries: number;
   timeout_secs: number | null;
   pool: string | null;
+  // the named io manager this op's output is persisted through; null is the
+  // process default
+  io: string | null;
   // the dep this op fans out over, one instance per array element; null for
   // every ordinary op
   mapped_over: string | null;

@@ -2,6 +2,15 @@
 
 ## unreleased
 
+- pluggable io managers: `IoManager::put` persists an op's output and returns the handle recorded in `op_runs.output`, `get` turns a handle back into the value. the default `Inline` makes an output its own handle, so it is byte-for-byte what hestan has always done; the whole existing suite is the proof
+- bundled `FileIo::new(dir)` writes `{dir}/{run_id}/{op}.json` and records `{"$io": "file", "path": ".."}` — an object rather than a bare path so anything reading the run log can tell a reference from a value. nothing is ever cleaned up: retention prunes run rows, not files
+- `Hestan::io(manager)` sets the default and `Hestan::io_named(name, manager)` plus `Op::io(name)` select one per op; naming an unregistered manager is a build error rather than a quiet fall back to the run log. `Runner::with_io` is the direct-executor form
+- handles are resolved on every path an op reads: downstream inputs as each op is spawned, the array a mapped op expands over, a fan-out's collected instance outputs, resume seeds from an earlier run, and an asset build's memoized seeds. an input that cannot be fetched fails that op rather than reading as "produced nothing"
+- `put` runs **before** the success is recorded, so a failed put fails the op: a row claiming success for a value that was never stored would strand the next resume
+- `get` is required to be total — it returns anything it did not produce unchanged — because a run seeds source assets `null`, assembles fan-out arrays itself, and can mix managers op by op
+- the run page shows the selected op's output on one line, an `$io` handle as the reference it is; job summaries report each op's `io`
+- new page: [docs/io-managers.md](docs/io-managers.md)
+
 - resources: `Hestan::resource(name, |ctx| async { .. })` builds a value once at startup and shares it with every op that asks, replacing "capture a client in a closure". `ctx.resource::<T>(name)` hands back the same `Arc<T>` everywhere, and the error distinguishes "no such resource" from "there is one, and it is something else"
 - constructors are async and fallible and run **before the store opens**, so one that fails aborts startup with `Error::Resource { name, reason }` and leaves no database behind. they run in declaration order, each handed a `ResourceCtx` holding the ones before it, so a client can lean on the config it reads; declaring one name twice is an error
 - `Op::requires(["api"])` declares the dependency, making a resource nobody registered a build error rather than a run that gets halfway. ops may also just ask without declaring

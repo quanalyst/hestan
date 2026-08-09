@@ -200,9 +200,19 @@ job and op definitions are code, not rows — the database records history
 a retried run whose job has left the code is a 409, and why the store carries
 no job table to migrate when you refactor.
 
-op outputs go both places: persisted in `op_runs.output` for the api and ui,
-and handed to dependents directly in memory during the run. the executor
-never reads outputs back from sqlite.
+`op_runs.output` holds whatever the op's [io manager](io-managers.md)
+returned from `put`. under the default `Inline` manager that is the output
+itself, json in sqlite, which is what it has always been; under another it is
+a handle — `{"$io": "file", "path": ".."}` for `FileIo` — and the value lives
+wherever that manager put it. the write happens before the success row, so a
+row never claims success for a value that was not persisted.
+
+within a run, dependents are handed handles and resolve them as they are
+spawned; a resume and an asset build resolve the handles they seed the same
+way. the executor still never reads *outputs* back from sqlite during a run —
+it carries them — but it does read them back on a resume, which is where a
+pruned run breaks a chain (`get` is asked for a value the manager may no
+longer have; `FileIo` cleans up nothing, so this is on you to sweep).
 
 three tables are keyed by names instead of run ids and hold current state
 rather than history. `op_state`: one json value per `(job, op)`, upserted

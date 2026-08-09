@@ -1,5 +1,7 @@
 import type { OpSummary, RunStatus, When } from "./types";
 
+const OUTPUT_CAP = 160;
+
 export function shortId(id: string): string {
   return id.slice(0, 8);
 }
@@ -8,6 +10,19 @@ export function shortId(id: string): string {
 // because every op used to have it
 export function whenLabel(when: When): string | null {
   return when === "always" ? "always" : when === "any_failed" ? "if failed" : null;
+}
+
+// an op output on one line. an `$io` handle is a reference to somewhere the
+// value actually lives, so it reads as that rather than as pretty-printed json
+export function outputLine(output: unknown): string | null {
+  if (output === null || output === undefined) return null;
+  if (typeof output === "object" && "$io" in (output as object)) {
+    const handle = output as Record<string, unknown>;
+    const where = typeof handle.path === "string" ? handle.path : JSON.stringify(handle);
+    return `${String(handle.$io)} · ${where}`;
+  }
+  const json = JSON.stringify(output);
+  return json.length > OUTPUT_CAP ? json.slice(0, OUTPUT_CAP - 1) + "…" : json;
 }
 
 // a dag node's muted suffix: an instance count, a trigger rule, or both

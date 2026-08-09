@@ -1,5 +1,5 @@
 use std::any::Any;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::Arc;
 
@@ -8,6 +8,7 @@ use serde_json::Value;
 use crate::asset::{Asset, AssetRegistry, mats_map, plan_target};
 use crate::error::Error;
 use crate::executor::{FailureHook, RunFailure, Runner};
+use crate::io::{Io, IoManager};
 use crate::job::Job;
 use crate::model::{Run, ScheduleDef, Trigger};
 use crate::resource::{self, Resource, ResourceCtx, ResourceFn};
@@ -25,6 +26,8 @@ pub struct Hestan {
     sensors: Vec<Sensor>,
     pools: Vec<(String, usize)>,
     resources: Vec<(String, ResourceFn)>,
+    io_default: Option<Arc<dyn IoManager>>,
+    io_named: HashMap<String, Arc<dyn IoManager>>,
     db_path: String,
     hooks: Vec<FailureHook>,
     retention_days: Option<u32>,
@@ -41,6 +44,8 @@ impl Default for Hestan {
             sensors: Vec::new(),
             pools: Vec::new(),
             resources: Vec::new(),
+            io_default: None,
+            io_named: HashMap::new(),
             db_path: "hestan.db".into(),
             hooks: Vec::new(),
             retention_days: None,
@@ -140,6 +145,28 @@ impl Hestan {
             })
         });
         self.resources.push((name.into(), ctor));
+        self
+    }
+
+    /// where op outputs are persisted, for every op that does not select a
+    /// named manager. the default is [`Inline`](crate::Inline) — outputs are
+    /// their own handles and land in the run log as json, which is what
+    /// hestan has always done and is wrong for anything bulky.
+    ///
+    /// ```no_run
+    /// # use hestan::{FileIo, Hestan};
+    /// Hestan::new().io(FileIo::new("/var/lib/hestan/io"));
+    /// ```
+    pub fn io(mut self, manager: impl IoManager) -> Self {
+        self.io_default = Some(Arc::new(manager));
+        self
+    }
+
+    /// register an io manager under `name`, for ops that select it with
+    /// [`Op::io`](crate::Op::io). naming one that was never registered here
+    /// fails the build; registering the same name twice keeps the last.
+    pub fn io_named(mut self, name: impl Into<String>, manager: impl IoManager) -> Self {
+        self.io_named.insert(name.into(), Arc::new(manager));
         self
     }
 
@@ -367,7 +394,8 @@ impl Hestan {
                 tracing::info!("retention: removed {removed} runs older than {days} days");
             }
         }
-        let runner = Runner::with_resources(jobs, store, self.hooks, self.pools, resources)?;
+        let io = Io::new(self.io_default, self.io_named);
+        let runner = Runner::with_resources(jobs, store, self.hooks, self.pools, resources, io)?;
         Ok(Built {
             runner,
             entries,

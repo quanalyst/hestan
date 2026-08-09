@@ -16,7 +16,16 @@ import type {
   Run,
   RunEvent,
 } from "./types";
-import { clockTime, durationMs, fmtDuration, isTerminal, opBadge, relTime, shortId } from "./util";
+import {
+  clockTime,
+  durationMs,
+  fmtDuration,
+  isTerminal,
+  opBadge,
+  outputLine,
+  relTime,
+  shortId,
+} from "./util";
 
 const plan = (p: ResumePreview) => `${p.rerun.length} to re-run · ${p.reuse.length} reused`;
 
@@ -216,6 +225,8 @@ function RunView({ id }: { id: string }) {
 
   const dur = durationMs(run);
   const statuses: Record<string, OpStatus> = Object.fromEntries(ops.map((o) => [o.op, o.status]));
+  // an io handle points at where the value lives; anything else is the value
+  const selectedOutput = outputLine(ops.find((o) => o.op === opSel)?.output);
   const instances = fanOut(job, ops);
   const expanded = expansions(events);
   // a subset run (memoized asset build) writes no op_runs row for what it
@@ -338,6 +349,12 @@ function RunView({ id }: { id: string }) {
             </span>
           ))}
         </div>
+      )}
+
+      {opSel && selectedOutput !== null && (
+        <p className="muted dag-action">
+          output <span className="mono">{selectedOutput}</span>
+        </p>
       )}
 
       {done && opSel && (

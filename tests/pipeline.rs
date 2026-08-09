@@ -5,8 +5,8 @@ use std::time::Duration;
 
 use hestan::prelude::*;
 use hestan::{
-    CancelOutcome, Error, EventKind, FailureHook, Graph, OpStatus, Run, RunFailure, RunStatus,
-    Runner, Store, Trigger, When,
+    CancelOutcome, Error, EventKind, FailureHook, FileIo, Graph, IoKey, IoManager, IoResult,
+    OpStatus, Run, RunFailure, RunStatus, Runner, Store, Trigger, When,
 };
 use serde::{Deserialize, Serialize};
 
@@ -2531,4 +2531,307 @@ async fn a_failing_constructor_aborts_startup() {
         .await
         .unwrap_err();
     assert!(err.to_string().contains("declared twice"), "{err}");
+}
+
+// ---- io managers ----
+
+// a manager that refuses to persist anything, to prove a failed put is a
+// failed op rather than a success with a lost output
+struct Refuses;
+
+impl IoManager for Refuses {
+    fn put(&self, _key: &IoKey, _value: Value) -> IoResult {
+        Err("nowhere to put it".into())
+    }
+    fn get(&self, _key: &IoKey, handle: &Value) -> IoResult {
+        Ok(handle.clone())
+    }
+}
+
+fn file_backed(dir: &std::path::Path, jobs: Vec<Job>) -> Runner {
+    Runner::with_io(
+        jobs,
+        Store::open(":memory:").unwrap(),
+        Vec::new(),
+        Vec::new(),
+        Arc::new(FileIo::new(dir)),
+        Vec::new(),
+    )
+    .unwrap()
+}
+
+fn chain_job(name: &str) -> Job {
+    Job::builder(name)
+        .op(Op::new("extract", |_| async {
+            Ok(json!({"rows": [1, 2, 3]}))
+        }))
+        .op(Op::new("load", |ctx: OpCtx| async move {
+            let rows = ctx.input("extract").unwrap()["rows"].as_array().unwrap();
+            Ok(json!({"loaded": rows.len()}))
+        })
+        .after(["extract"]))
+        .build()
+        .unwrap()
+}
+
+#[tokio::test]
+async fn file_io_keeps_the_value_out_of_the_run_log_and_hands_it_downstream() {
+    let dir = tempfile::tempdir().unwrap();
+    let runner = file_backed(dir.path(), vec![chain_job("etl")]);
+    let run = runner.run("etl", json!({}), Trigger::Manual).await.unwrap();
+    assert_eq!(run.status, RunStatus::Success);
+
+    let ops = runner.store().op_runs(&run.id).unwrap();
+    let out = |name: &str| ops.iter().find(|o| o.op == name).unwrap().output.clone();
+    // the run log holds a reference, not the value
+    let path = dir.path().join(&run.id).join("extract.json");
+    assert_eq!(
+        out("extract"),
+        Some(json!({ "$io": "file", "path": path.to_string_lossy() }))
+    );
+    assert!(path.exists(), "no file at {path:?}");
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        r#"{"rows":[1,2,3]}"#
+    );
+    // and downstream still saw the value, so `get` ran on the way in
+    let loaded = out("load").unwrap();
+    let loaded = std::fs::read_to_string(loaded["path"].as_str().unwrap()).unwrap();
+    assert_eq!(loaded, r#"{"loaded":3}"#);
+}
+
+// recording success for a value that was not persisted would strand the next
+// run, which would seed a handle to nothing
+#[tokio::test]
+async fn a_failing_put_fails_the_op_and_skips_its_downstream() {
+    let runner = Runner::with_io(
+        [chain_job("etl")],
+        Store::open(":memory:").unwrap(),
+        Vec::new(),
+        Vec::new(),
+        Arc::new(Refuses),
+        Vec::new(),
+    )
+    .unwrap();
+    let run = runner.run("etl", json!({}), Trigger::Manual).await.unwrap();
+
+    assert_eq!(run.status, RunStatus::Failed);
+    assert!(
+        run.error.as_deref().unwrap().contains("nowhere to put it"),
+        "{:?}",
+        run.error
+    );
+    let ops = runner.store().op_runs(&run.id).unwrap();
+    let row = |name: &str| ops.iter().find(|o| o.op == name).unwrap();
+    assert_eq!(row("extract").status, OpStatus::Failed);
+    assert_eq!(row("extract").output, None);
+    assert!(
+        row("extract")
+            .error
+            .as_deref()
+            .unwrap()
+            .contains("could not persist the output")
+    );
+    assert_eq!(row("load").status, OpStatus::Skipped);
+}
+
+// the resume seed is a handle from an earlier run, so it only works if the
+// seeding path resolves it
+#[tokio::test]
+async fn resume_reads_a_seeded_output_back_out_of_file_io() {
+    let dir = tempfile::tempdir().unwrap();
+    let fail_once = Arc::new(AtomicBool::new(true));
+    let flag = fail_once.clone();
+    let job = Job::builder("etl")
+        .op(Op::new("extract", |_| async {
+            Ok(json!({"rows": [1, 2, 3]}))
+        }))
+        .op(Op::new("load", move |ctx: OpCtx| {
+            let flag = flag.clone();
+            async move {
+                if flag.swap(false, Ordering::SeqCst) {
+                    return Err("first time is unlucky".into());
+                }
+                let rows = ctx.input("extract").unwrap()["rows"].as_array().unwrap();
+                Ok(json!({"loaded": rows.len()}))
+            }
+        })
+        .after(["extract"]))
+        .build()
+        .unwrap();
+
+    let runner = file_backed(dir.path(), vec![job]);
+    let first = runner.run("etl", json!({}), Trigger::Manual).await.unwrap();
+    assert_eq!(first.status, RunStatus::Failed);
+
+    let plan = runner.resume_plan(&first.id, None).unwrap();
+    assert_eq!(plan.rerun, ["load"]);
+    assert_eq!(plan.reuse, ["extract"]);
+
+    let id = runner.resume(&first.id).unwrap();
+    let resumed = settled(&runner, &id).await;
+    assert_eq!(resumed.status, RunStatus::Success);
+
+    // load ran again and read the value behind the handle the first run wrote
+    let ops = runner.store().op_runs(&id).unwrap();
+    assert_eq!(ops.len(), 1);
+    assert_eq!(ops[0].op, "load");
+    let path = ops[0].output.clone().unwrap();
+    assert_eq!(
+        std::fs::read_to_string(path["path"].as_str().unwrap()).unwrap(),
+        r#"{"loaded":3}"#
+    );
+    // the seed really did come from the first run's directory
+    assert!(dir.path().join(&first.id).join("extract.json").exists());
+}
+
+// a memoized build seeds a fresh dep from its materialization while file io
+// is the default; that seed never went through `put`, so this only works
+// because `get` passes through what it did not write
+#[tokio::test]
+async fn asset_memoization_seeds_a_fresh_dep_under_file_io() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("hestan.db");
+    let io_dir = dir.path().join("io");
+    let builds = Arc::new(AtomicU32::new(0));
+    let boot = || {
+        let counter = builds.clone();
+        let a = Asset::new("a", move |_| {
+            let counter = counter.clone();
+            async move {
+                counter.fetch_add(1, Ordering::SeqCst);
+                Ok(json!({"rows": 3}))
+            }
+        });
+        let b = Asset::new("b", |ctx: OpCtx| async move {
+            let rows = ctx.input("a").unwrap()["rows"].as_u64().unwrap();
+            Ok(json!({"doubled": rows * 2}))
+        })
+        .from(&a);
+        Hestan::new()
+            .assets([a, b])
+            .io(FileIo::new(&io_dir))
+            .db(db.to_str().unwrap())
+    };
+
+    let run = boot().build_asset("b").await.unwrap();
+    assert_eq!(run.status, RunStatus::Success);
+    let store = Store::open(db.to_str().unwrap()).unwrap();
+    // the materialization keeps the asset's value; the op run keeps a handle
+    assert_eq!(
+        store.materialization("b").unwrap().unwrap().value,
+        Some(json!({"doubled": 6}))
+    );
+    let rows = store.op_runs(&run.id).unwrap();
+    let a_out = rows.iter().find(|o| o.op == "a").unwrap().output.clone();
+    assert_eq!(a_out.unwrap()["$io"], "file");
+    drop(store);
+
+    // a is fresh now, so the second build seeds it instead of rebuilding it
+    let run = boot().build_asset("b").await.unwrap();
+    assert_eq!(run.status, RunStatus::Success);
+    assert_eq!(builds.load(Ordering::SeqCst), 1, "a was rebuilt");
+    let store = Store::open(db.to_str().unwrap()).unwrap();
+    let rows = store.op_runs(&run.id).unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].op, "b");
+    // and b, reading the seeded value, got the same answer as before
+    assert_eq!(
+        store.materialization("b").unwrap().unwrap().value,
+        Some(json!({"doubled": 6}))
+    );
+}
+
+#[tokio::test]
+async fn an_op_naming_an_unregistered_io_manager_fails_the_build() {
+    let job = || {
+        Job::builder("etl")
+            .op(Op::new("extract", |_| async { Ok(json!(1)) }).io("archive"))
+            .build()
+            .unwrap()
+    };
+
+    let err = Hestan::new()
+        .job(job())
+        .db(":memory:")
+        .run_once("etl", json!({}))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, Error::Graph(_)), "{err}");
+    assert!(
+        err.to_string()
+            .contains("op extract persists through io manager archive, which is not registered"),
+        "{err}"
+    );
+
+    // registered, and the op's output goes there rather than to the default
+    let dir = tempfile::tempdir().unwrap();
+    let run = Hestan::new()
+        .io_named("archive", FileIo::new(dir.path()))
+        .job(job())
+        .db(":memory:")
+        .run_once("etl", json!({}))
+        .await
+        .unwrap();
+    assert_eq!(run.status, RunStatus::Success);
+    assert!(dir.path().join(&run.id).join("extract.json").exists());
+}
+
+// a mapped op has no row and never puts anything of its own, so the array
+// downstream sees is assembled from what its instances' handles resolve to
+#[tokio::test]
+async fn fan_out_under_file_io_collects_values_not_handles() {
+    let dir = tempfile::tempdir().unwrap();
+    let job = Job::builder("fanned")
+        .op(Op::new("pages", |_| async { Ok(json!([1, 2, 3])) }))
+        .op(Op::mapped("fetch", |_ctx: OpCtx, page: u64| async move {
+            Ok(json!({"page": page}))
+        })
+        .over("pages"))
+        .op(Op::new("total", |ctx: OpCtx| async move {
+            let pages = ctx.input("fetch").unwrap().as_array().unwrap();
+            let sum: u64 = pages.iter().map(|p| p["page"].as_u64().unwrap()).sum();
+            Ok(json!({"sum": sum}))
+        })
+        .after(["fetch"]))
+        .build()
+        .unwrap();
+
+    let runner = file_backed(dir.path(), vec![job]);
+    let run = runner
+        .run("fanned", json!({}), Trigger::Manual)
+        .await
+        .unwrap();
+    assert_eq!(run.status, RunStatus::Success);
+
+    let ops = runner.store().op_runs(&run.id).unwrap();
+    // every instance persisted under its own name
+    for i in 0..3 {
+        let path = dir.path().join(&run.id).join(format!("fetch[{i}].json"));
+        assert!(path.exists(), "no file at {path:?}");
+    }
+    let total = ops.iter().find(|o| o.op == "total").unwrap();
+    let path = total.output.clone().unwrap();
+    assert_eq!(
+        std::fs::read_to_string(path["path"].as_str().unwrap()).unwrap(),
+        r#"{"sum":6}"#
+    );
+
+    // and a resume past the fan-out seeds the same collected array
+    let plan = runner
+        .resume_plan(&run.id, Some(&["total".into()]))
+        .unwrap();
+    assert_eq!(plan.rerun, ["total"]);
+    assert_eq!(plan.reuse, ["pages", "fetch"]);
+    let id = runner
+        .resume_from(&run.id, Some(&["total".into()]))
+        .unwrap();
+    let resumed = settled(&runner, &id).await;
+    assert_eq!(resumed.status, RunStatus::Success);
+    let rows = runner.store().op_runs(&id).unwrap();
+    let path = rows[0].output.clone().unwrap();
+    assert_eq!(
+        std::fs::read_to_string(path["path"].as_str().unwrap()).unwrap(),
+        r#"{"sum":6}"#
+    );
 }

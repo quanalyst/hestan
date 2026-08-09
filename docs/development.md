@@ -9,6 +9,8 @@ src/
   op.rs         Op, OpCtx, OpResult, typed io
   job.rs        Job and JobBuilder (dag validation), Graph and graph flattening
   graph.rs      topo order (kahn's) and transitive-downstream
+  io.rs         IoManager, Inline, FileIo, the per-op manager table
+  resource.rs   process-wide resources and their constructors
   executor.rs   Runner and the run loop: concurrency, retries, skips, subset runs
   asset.rs      Asset, the registry, staleness/planning, the materializing wrapper
   sensor.rs     Sensor, SensorCtx, the sensor loop (probes included)

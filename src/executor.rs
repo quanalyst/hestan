@@ -12,6 +12,7 @@ use tokio::task::{Id, JoinSet};
 
 use crate::error::Error;
 use crate::graph;
+use crate::io::{Io, IoKey, IoManager};
 use crate::job::Job;
 use crate::model::{
     EventKind, EventLevel, OpRun, OpStatus, Run, RunStatus, Trigger, When, new_run_id,
@@ -110,6 +111,7 @@ pub struct Runner {
     hooks: Arc<Vec<FailureHook>>,
     pools: Pools,
     resources: Resources,
+    io: Io,
 }
 
 impl Runner {
@@ -141,6 +143,7 @@ impl Runner {
             hooks: Arc::new(hooks),
             pools: Arc::new(HashMap::new()),
             resources: resource::none(),
+            io: Io::default(),
         }
     }
 
@@ -154,7 +157,27 @@ impl Runner {
         hooks: Vec<FailureHook>,
         pools: impl IntoIterator<Item = (String, usize)>,
     ) -> Result<Runner, Error> {
-        Runner::with_resources(jobs, store, hooks, pools, resource::none())
+        Runner::with_resources(jobs, store, hooks, pools, resource::none(), Io::default())
+    }
+
+    /// like [`Runner::with_pools`] with [io managers](crate::IoManager)
+    /// attached: `default` is where every op's output is persisted, and
+    /// `named` are the ones an op can select with [`Op::io`]. an op naming a
+    /// manager that is not in `named` is [`Error::Graph`].
+    ///
+    /// `Arc::new(Inline)` as the default is exactly today's behaviour —
+    /// outputs are their own handles and land in the run log as json.
+    /// `Hestan::io` and `Hestan::io_named` are the way in from the builder.
+    pub fn with_io(
+        jobs: impl IntoIterator<Item = Job>,
+        store: Store,
+        hooks: Vec<FailureHook>,
+        pools: impl IntoIterator<Item = (String, usize)>,
+        default: Arc<dyn IoManager>,
+        named: impl IntoIterator<Item = (String, Arc<dyn IoManager>)>,
+    ) -> Result<Runner, Error> {
+        let io = Io::new(Some(default), named.into_iter().collect());
+        Runner::with_resources(jobs, store, hooks, pools, resource::none(), io)
     }
 
     /// like [`Runner::with_pools`] plus the process-wide resources every op
@@ -168,6 +191,7 @@ impl Runner {
         hooks: Vec<FailureHook>,
         pools: impl IntoIterator<Item = (String, usize)>,
         resources: Resources,
+        io: Io,
     ) -> Result<Runner, Error> {
         let mut declared: HashMap<String, Pool> = HashMap::new();
         for (name, limit) in pools {
@@ -210,9 +234,25 @@ impl Runner {
                 }
             }
         }
+        // an op persisting through a manager nobody registered would quietly
+        // fall back to the run log, which is the one place it said not to go
+        for job in runner.jobs.values() {
+            for op in job.ops() {
+                if let Some(name) = op.io_name()
+                    && !io.knows(name)
+                {
+                    return Err(Error::Graph(format!(
+                        "job {}: op {} persists through io manager {name}, which is not registered",
+                        job.name(),
+                        op.name()
+                    )));
+                }
+            }
+        }
         Ok(Runner {
             pools: Arc::new(declared),
             resources,
+            io,
             ..runner
         })
     }
@@ -337,7 +377,8 @@ impl Runner {
         let mut latest: HashMap<String, OpStatus> = HashMap::new();
         let mut reusable: HashMap<String, Value> = HashMap::new();
         for prev in self.resume_chain(&run)? {
-            for (op, status, output) in fold_instances(job, self.store.op_runs(&prev.id)?) {
+            let rows = self.store.op_runs(&prev.id)?;
+            for (op, status, output) in fold_instances(&self.io, job, &prev.id, rows) {
                 latest.entry(op.clone()).or_insert(status);
                 if let (OpStatus::Success, Some(output)) = (status, output) {
                     reusable.entry(op).or_insert(output);
@@ -648,7 +689,12 @@ fn instance_of(job: &Job, name: &str) -> Option<(String, usize)> {
 /// differ on a re-run, so anything less has to expand again from scratch. a
 /// mapped op with no rows at all — never reached, or expanded over an empty
 /// array — is absent here, which resume planning reads the same way.
-fn fold_instances(job: &Job, rows: Vec<OpRun>) -> Vec<(String, OpStatus, Option<Value>)> {
+fn fold_instances(
+    io: &Io,
+    job: &Job,
+    run_id: &str,
+    rows: Vec<OpRun>,
+) -> Vec<(String, OpStatus, Option<Value>)> {
     let mut folded: Vec<(String, OpStatus, Option<Value>)> = Vec::with_capacity(rows.len());
     let mut groups: HashMap<String, BTreeMap<usize, (OpStatus, Option<Value>)>> = HashMap::new();
     for row in rows {
@@ -671,10 +717,32 @@ fn fold_instances(job: &Job, rows: Vec<OpRun>) -> Vec<(String, OpStatus, Option<
             folded.push((parent, OpStatus::Failed, None));
             continue;
         }
-        let collected: Vec<Value> = slots
-            .into_values()
-            .map(|(_, output)| output.expect("checked just above"))
-            .collect();
+        // the instances' recorded outputs are handles; a mapped op's own
+        // value is the array of what they resolve to, exactly as the run that
+        // produced it assembled one. anything unreadable re-expands instead
+        let manager = io.manager(job.op(&parent).and_then(Op::io_name));
+        let mut collected: Vec<Value> = Vec::with_capacity(slots.len());
+        let mut readable = true;
+        for (index, (_, output)) in slots {
+            let handle = output.expect("checked just above");
+            let key = IoKey {
+                run_id: run_id.to_string(),
+                job: job.name().to_string(),
+                op: format!("{parent}[{index}]"),
+            };
+            match manager.get(&key, &handle) {
+                Ok(v) => collected.push(v),
+                Err(e) => {
+                    tracing::warn!(run = %run_id, op = %key.op, "instance output unreadable: {e}");
+                    readable = false;
+                    break;
+                }
+            }
+        }
+        if !readable {
+            folded.push((parent, OpStatus::Failed, None));
+            continue;
+        }
         folded.push((parent, OpStatus::Success, Some(Value::Array(collected))));
     }
     folded
@@ -778,19 +846,42 @@ async fn execute(
                     continue;
                 };
                 pending.remove(i);
+                let mut expanded_over: Option<&'static str> = None;
+                let mut unreadable: Option<String> = None;
                 // a rule can admit a mapped op whose array never arrived. there
                 // is nothing to expand over, so it expands into nothing: the
-                // same zero-instance fan-out an empty array gives, output `[]`
+                // same zero-instance fan-out an empty array gives, output `[]`.
+                // the array itself is an op output like any other, so it is
+                // fetched back through its manager before it can be counted.
                 let elements = match outputs.get(&over) {
-                    None => Some(Vec::new()),
-                    Some(Value::Array(a)) => Some(a.clone()),
-                    Some(_) => None,
+                    None => Ok(Some(Vec::new())),
+                    Some(held) => {
+                        resolve(&runner.io, &job, &run_id, &over, held).map(|v| match v {
+                            Value::Array(a) => Some(a),
+                            other => {
+                                expanded_over = Some(json_type(&other));
+                                None
+                            }
+                        })
+                    }
+                };
+                let elements = match elements {
+                    Ok(Some(elements)) => Some(elements),
+                    Ok(None) => None,
+                    Err(e) => {
+                        expanded_over = Some("unreadable");
+                        unreadable = Some(e);
+                        None
+                    }
                 };
                 let Some(elements) = elements else {
-                    let msg = format!(
-                        "mapped over {over}, which produced {} rather than an array",
-                        json_type(&outputs[&over])
-                    );
+                    let msg = match &unreadable {
+                        Some(e) => format!("could not read the output of {over}: {e}"),
+                        None => format!(
+                            "mapped over {over}, which produced {} rather than an array",
+                            expanded_over.unwrap_or("something else")
+                        ),
+                    };
                     note(store.append_event(
                         &run_id,
                         Some(&name),
@@ -886,14 +977,56 @@ async fn execute(
             // job-level name only inside a flattened graph instance
             let mut inputs: HashMap<String, Value> = HashMap::new();
             let mut dep_statuses: HashMap<String, OpStatus> = HashMap::new();
+            let mut unresolved: Option<(String, String)> = None;
             for dep in op.deps() {
                 let seen = op.dep_alias(dep).to_string();
-                if let Some(v) = outputs.get(dep) {
-                    inputs.entry(seen.clone()).or_insert_with(|| v.clone());
+                if let Some(held) = outputs.get(dep) {
+                    // `outputs` carries handles, so this is where a dep's
+                    // output is actually fetched back
+                    match resolve(&runner.io, &job, &run_id, dep, held) {
+                        Ok(v) => {
+                            inputs.entry(seen.clone()).or_insert(v);
+                        }
+                        Err(e) if unresolved.is_none() => {
+                            unresolved = Some((dep.clone(), e));
+                        }
+                        Err(_) => {}
+                    }
                 }
                 if let Some(s) = statuses.get(dep) {
                     dep_statuses.entry(seen).or_insert(*s);
                 }
+            }
+            // an input hestan cannot fetch is this op's failure, recorded the
+            // same way a failing body would be, rather than an op that runs
+            // believing its dep produced nothing
+            if let Some((dep, msg)) = unresolved {
+                let msg = format!("could not read the output of {dep}: {msg}");
+                note(store.append_event(
+                    &run_id,
+                    Some(&name),
+                    EventLevel::Error,
+                    EventKind::OpFailed,
+                    &msg,
+                    Some(&json!({ "error": &msg })),
+                ));
+                note(store.op_finished(&run_id, &name, OpStatus::Failed, None, Some(&msg)));
+                if first_failure.is_none() {
+                    first_failure = Some((name.clone(), msg));
+                }
+                failed = true;
+                give_up(
+                    &name,
+                    &instances,
+                    &mut fanouts,
+                    &job,
+                    &pairs,
+                    &mut pending,
+                    &mut statuses,
+                    &run_id,
+                    &store,
+                );
+                continue;
             }
             let handle = tasks.spawn(run_op(
                 op,
@@ -926,19 +1059,64 @@ async fn execute(
         match joined {
             Ok((id, (name, Ok((output, state))))) => {
                 names.remove(&id);
-                note(store.op_finished(&run_id, &name, OpStatus::Success, Some(&output), None));
-                // state second: a crash between the writes re-runs the op, never skips it
-                if let Some(state) = state {
-                    note(store.set_op_state(job.name(), &name, &state));
+                // persisted before the success is recorded: a row saying
+                // success with an output that was never stored is a lie the
+                // next run would trip over
+                let unit = unit_op(&job, &instances, &name);
+                let key = io_key(&run_id, &job, &name);
+                match runner.io.manager(unit.io_name()).put(&key, output) {
+                    Ok(handle) => {
+                        note(store.op_finished(
+                            &run_id,
+                            &name,
+                            OpStatus::Success,
+                            Some(&handle),
+                            None,
+                        ));
+                        // state second: a crash between the writes re-runs the op, never skips it
+                        if let Some(state) = state {
+                            note(store.set_op_state(job.name(), &name, &state));
+                        }
+                        collect(
+                            name,
+                            handle,
+                            &runner.io,
+                            &job,
+                            &run_id,
+                            &instances,
+                            &mut fanouts,
+                            &mut outputs,
+                            &mut statuses,
+                        );
+                    }
+                    Err(e) => {
+                        let msg = format!("could not persist the output: {e}");
+                        note(store.append_event(
+                            &run_id,
+                            Some(&name),
+                            EventLevel::Error,
+                            EventKind::OpFailed,
+                            &msg,
+                            Some(&json!({ "error": &msg })),
+                        ));
+                        note(store.op_finished(&run_id, &name, OpStatus::Failed, None, Some(&msg)));
+                        if first_failure.is_none() {
+                            first_failure = Some((name.clone(), msg));
+                        }
+                        failed = true;
+                        give_up(
+                            &name,
+                            &instances,
+                            &mut fanouts,
+                            &job,
+                            &pairs,
+                            &mut pending,
+                            &mut statuses,
+                            &run_id,
+                            &store,
+                        );
+                    }
                 }
-                collect(
-                    name,
-                    output,
-                    &instances,
-                    &mut fanouts,
-                    &mut outputs,
-                    &mut statuses,
-                );
             }
             Ok((id, (name, Err(msg)))) => {
                 names.remove(&id);
@@ -1008,9 +1186,33 @@ async fn execute(
                 // won the race against the abort: record what really happened
                 Ok((id, (name, Ok((output, state))))) => {
                     names.remove(&id);
-                    note(store.op_finished(&run_id, &name, OpStatus::Success, Some(&output), None));
-                    if let Some(state) = state {
-                        note(store.set_op_state(job.name(), &name, &state));
+                    // won the race against the abort, so it is persisted like
+                    // any other success — or recorded failed if it cannot be
+                    let unit = unit_op(&job, &instances, &name);
+                    let key = io_key(&run_id, &job, &name);
+                    match runner.io.manager(unit.io_name()).put(&key, output) {
+                        Ok(handle) => {
+                            note(store.op_finished(
+                                &run_id,
+                                &name,
+                                OpStatus::Success,
+                                Some(&handle),
+                                None,
+                            ));
+                            if let Some(state) = state {
+                                note(store.set_op_state(job.name(), &name, &state));
+                            }
+                        }
+                        Err(e) => {
+                            let msg = format!("could not persist the output: {e}");
+                            note(store.op_finished(
+                                &run_id,
+                                &name,
+                                OpStatus::Failed,
+                                None,
+                                Some(&msg),
+                            ));
+                        }
                     }
                 }
                 Ok((id, (name, Err(msg)))) => {
@@ -1143,9 +1345,13 @@ fn admits(op: &Op, statuses: &HashMap<String, OpStatus>) -> Result<(), &'static 
 
 // an instance's output goes into its parent's slot; the mapped op's own
 // output appears, in element order, once every instance has landed
+#[allow(clippy::too_many_arguments)]
 fn collect(
     name: String,
-    output: Value,
+    handle: Value,
+    io: &Io,
+    job: &Job,
+    run_id: &str,
     instances: &HashMap<String, Instance>,
     fanouts: &mut HashMap<String, Fanout>,
     outputs: &mut HashMap<String, Value>,
@@ -1153,22 +1359,62 @@ fn collect(
 ) {
     statuses.insert(name.clone(), OpStatus::Success);
     let Some(instance) = instances.get(&name) else {
-        outputs.insert(name, output);
+        outputs.insert(name, handle);
         return;
     };
     let fan = fanouts
         .get_mut(&instance.parent)
         .expect("an instance belongs to a live fan-out");
-    fan.slots[instance.index] = Some(output);
+    fan.slots[instance.index] = Some(handle);
     fan.remaining -= 1;
     if fan.remaining == 0 && !fan.failed {
-        let collected: Vec<Value> = std::mem::take(&mut fan.slots)
-            .into_iter()
-            .map(|slot| slot.expect("every instance filled its slot"))
-            .collect();
+        // the collected array is a value, not a handle: a mapped op has no
+        // row and never put anything of its own, so the instances' handles
+        // are resolved here rather than left for downstream to puzzle over
+        let manager = io.manager(job.op(&instance.parent).and_then(Op::io_name));
+        let mut collected: Vec<Value> = Vec::with_capacity(fan.slots.len());
+        for (index, slot) in std::mem::take(&mut fan.slots).into_iter().enumerate() {
+            let handle = slot.expect("every instance filled its slot");
+            let key = IoKey {
+                run_id: run_id.to_string(),
+                job: job.name().to_string(),
+                op: format!("{}[{index}]", instance.parent),
+            };
+            match manager.get(&key, &handle) {
+                Ok(v) => collected.push(v),
+                Err(e) => {
+                    // the whole fan-out is unusable, and saying so beats
+                    // handing downstream an array with a hole in it
+                    tracing::warn!(
+                        run = %run_id, op = %key.op, "instance output unreadable: {e}"
+                    );
+                    fan.failed = true;
+                    return;
+                }
+            }
+        }
         outputs.insert(instance.parent.clone(), Value::Array(collected));
         statuses.insert(instance.parent.clone(), OpStatus::Success);
     }
+}
+
+fn io_key(run_id: &str, job: &Job, op: &str) -> IoKey {
+    IoKey {
+        run_id: run_id.to_string(),
+        job: job.name().to_string(),
+        op: op.to_string(),
+    }
+}
+
+/// turn what the run holds for `op` back into a value. every input an op
+/// receives comes through here, whether it was produced by this run, seeded
+/// from a resume, or memoized by an asset build — which is why a manager's
+/// `get` has to pass through anything it did not write.
+fn resolve(io: &Io, job: &Job, run_id: &str, op: &str, held: &Value) -> Result<Value, String> {
+    let manager = io.manager(job.op(op).and_then(Op::io_name));
+    manager
+        .get(&io_key(run_id, job, op), held)
+        .map_err(|e| e.to_string())
 }
 
 // a failed unit skips its downstream. one failing instance fails its whole

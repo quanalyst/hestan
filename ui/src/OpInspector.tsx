@@ -118,6 +118,12 @@ export default function OpInspector({
             </span>
           </div>
         )}
+        {op.io && (
+          <div className="op-line">
+            <span className="op-line-label">io</span>
+            <span className="mono">{op.io}</span>
+          </div>
+        )}
         {op.params_type && (
           <div className="op-line">
             <span className="op-line-label">params</span>

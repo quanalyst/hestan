@@ -46,7 +46,10 @@ asset builds run as ordinary runs of an internal job named `assets`, so
 everything on this page applies to them unchanged. the model has
 [its own page](assets.md).
 
-all of it lands in sqlite as it happens — see [storage](storage.md).
+all of it lands in sqlite as it happens — see [storage](storage.md). op
+outputs land there too by default, which is wrong for anything bulky;
+[io managers](io-managers.md) move them somewhere else and keep a handle in
+the run log.
 
 ## OpCtx
 
@@ -75,8 +78,12 @@ task, so independent branches run concurrently — in a diamond
 `Job::builder(..).max_parallel(n)` caps how many ops of one run are in
 flight at once, and ready ops over the cap wait their turn in readiness
 order (first ready, first spawned). without a cap, everything ready runs
-together. an op's output is handed to its dependents directly in memory (and
-persisted as a side effect); downstream ops never read the database.
+together. an op's output is persisted through its
+[io manager](io-managers.md) before its success is recorded — a `put` that
+fails fails the op — and its dependents are handed the resulting handle,
+resolved back to the value as each is spawned. under the default `Inline`
+manager a handle *is* the value, so this is the same in-memory handoff it has
+always been.
 
 when an op exhausts its attempts, its transitive downstream is marked
 `skipped`, each with an `op_skipped` event naming the failed root, and the

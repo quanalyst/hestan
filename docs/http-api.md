@@ -55,6 +55,7 @@ summary or a 404. the shape:
       "retries": 0,
       "timeout_secs": 30.0,
       "pool": "orders_api",
+      "io": null,
       "mapped_over": null,
       "input_type": null,
       "output_type": null,
@@ -79,7 +80,9 @@ summary or a 404. the shape:
 in first-use order, with the limit each carries — that limit is shared with
 every other job in the process, not per job. an op's `pool` is the pool it
 takes a permit from (null for most ops) and `timeout_secs` its per-attempt
-time limit (null for none). `when` is the op's
+time limit (null for none). `io` is the named
+[io manager](io-managers.md) the op's output is persisted through, null for
+the process default. `when` is the op's
 [trigger rule](concepts.md#trigger-rules) — `all_succeeded` (the default),
 `any_failed` or `always`. `requires` lists the
 [resources](concepts.md#resources) the op declared with `Op::requires`.
