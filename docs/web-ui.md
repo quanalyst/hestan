@@ -76,7 +76,9 @@ of a stored parameter set is that it is a starting point you can still edit.
 inside the editor block, a name field with **save** stores whatever is in the
 editor under that name, and **delete** appears once the name matches a preset
 that exists. a preset the server refuses (it would not launch) reports inline
-and is not stored.
+and is not stored. under the editor, a tags line takes `env:prod, kind:smoke` —
+the same `key:value` the runs page filters on — and a line that is not tags
+disables the launch rather than dropping the part it could not read.
 
 when the job declares a [params schema](launching.md#params-schemas) the block
 also lists its fields under the editor — name, type, `required`, and the
@@ -229,9 +231,13 @@ now" — it is over, just not finished.
 
 the header names the job (linked), the short run id, trigger, creation time,
 and duration — plus, on a resumed run, a link back to the run it continued.
-next to the status sit the actions: cancel while the run is queued or
-running, re-run once it is terminal, and resume beside re-run when the run
-failed or was canceled. cancel posts and disables itself; cancellation is
+next to the status sit the actions: clone at any point, cancel while the run is
+queued or running, re-run once it is terminal, and resume beside re-run when
+the run failed or was canceled. clone launches nothing — it opens the job's
+launchpad prefilled with this run's params and tags
+([cloning](launching.md#cloning-a-past-run)), because editing one field is the
+point; a clone that launched straight away would be re-run, which is right
+beside it. cancel posts and disables itself; cancellation is
 asynchronous, so the page keeps polling until the status flips to canceled.
 if the run finished in the race, the server's 409 is swallowed — the next
 poll says the same thing better. canceled is terminal: polling stops, and

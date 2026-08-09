@@ -28,6 +28,7 @@ failures. timestamps are rfc3339 strings in utc.
 | POST | `/api/runs/{id}/retry` | launch a fresh run with the same params |
 | POST | `/api/runs/{id}/resume` | continue a run from where it broke |
 | GET | `/api/runs/{id}/resume_preview` | what a resume would do |
+| GET | `/api/runs/{id}/clone` | a past run's params and tags, to launch again |
 | POST | `/api/runs/{id}/cancel` | stop a queued or running run |
 | GET | `/api/assets` | every asset with lineage and staleness |
 | POST | `/api/assets/{name}/build` | build one asset (and stale ancestors) |
@@ -282,6 +283,18 @@ is null on a manual launch, a retry, a resume, a build or a sensor fire.
 `tags` is the run's [tag map](launching.md#run-tags), `{}` when it carries
 none — set at launch, defaulted with `Hestan::run_tags`, and set automatically
 on sensor, backfill and single-asset build runs.
+
+`GET /api/runs/{id}/clone` returns what a run was launched with, for the
+launchpad to open prefilled ([cloning](launching.md#cloning-a-past-run)):
+
+```json
+{ "job": "orders_etl", "params": {"days": 1}, "tags": {"kind": "smoke"} }
+```
+
+it launches nothing. an unknown run id is a 404; a run whose job has left the
+code is a `409 {"error": "job no longer defined: orders_etl"}` — the same
+refusal a retry of that run gets, since a launchpad prefilled for a job that
+cannot launch would be a lie.
 
 `GET /api/runs/{id}` returns `{"run": ..., "ops": [...]}` (404 for an unknown
 id), the op runs sorted by op name. a [mapped op](concepts.md#dynamic-fan-out)

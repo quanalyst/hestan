@@ -1029,7 +1029,8 @@ textarea.params-input::placeholder {
   margin-top: 6px;
 }
 
-.preset-row input.filter-input {
+.preset-row input.filter-input,
+.params-block > input.filter-input {
   width: 100%;
 }
 

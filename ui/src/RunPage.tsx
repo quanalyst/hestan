@@ -304,6 +304,17 @@ function RunView({ id }: { id: string }) {
             <span className="pill">
               <StatusDot status={run.status} />
             </span>
+            {/* not a launch: it opens the job's launchpad on this run's
+                params and tags, because the commonest real launch is that run
+                again with one field changed */}
+            <button
+              className="text-btn"
+              onClick={() =>
+                nav(`/jobs/${encodeURIComponent(run.job)}?from=${encodeURIComponent(run.id)}`)
+              }
+            >
+              clone
+            </button>
             {done ? (
               <>
                 <button

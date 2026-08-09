@@ -202,3 +202,28 @@ in the ui, selecting a node on the job page's dag offers **launch from here**
 with the number of ops it covers, next to the op inspector — the mirror of the
 run page's *re-run from here*. whether the selection is launchable is the
 server's answer, and a refusal appears beside the button.
+
+## Cloning a past run
+
+the commonest real launch is "that run again, with one field changed". the run
+page's **clone** does exactly that and nothing more: it opens the job's
+launchpad prefilled with that run's params and tags, and launches nothing.
+editing is the point — a clone that launched immediately would be `re-run`,
+which is already there.
+
+it works through a query parameter the job page reads,
+`/jobs/{name}?from={run_id}`, and fetches the values rather than carrying them
+in the url: a run's params do not belong in a query string, and a url long
+enough to hold them is a url that gets truncated.
+
+`GET /api/runs/{id}/clone` is what it fetches — `{"job", "params", "tags"}`,
+404 for a run that does not exist, and **409 `job no longer defined: {job}`**
+for a run whose job has left the code. that is the same refusal, in the same
+words, that a retry of such a run gets; a launchpad prefilled for a job that
+cannot launch would be a lie, and a 404 would blame the run, which is still
+right there.
+
+the launchpad's params block carries a tags line — `env:prod, kind:smoke`, the
+same `key:value` spelling the runs page filters on — so a cloned run's tags
+arrive editable rather than dropped. a line that is not tags disables the
+launch instead of quietly dropping the part that could not be read.

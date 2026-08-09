@@ -1,5 +1,5 @@
-import { useCallback, useState } from "react";
-import { Link, useNavigate, useParams } from "react-router-dom";
+import { useCallback, useEffect, useState } from "react";
+import { Link, useNavigate, useParams, useSearchParams } from "react-router-dom";
 import { del, get, HttpError, post, put, usePoll } from "./api";
 import DagView from "./DagView";
 import DurationBars from "./DurationBars";
@@ -85,6 +85,28 @@ function unknownKeys(text: string, known: Record<string, SchemaField>): string[]
   return Object.keys(parsed).filter((k) => !(k in known));
 }
 
+// tags as one editable line: `env:prod, kind:smoke`. the same key:value the
+// runs page filters on, so there is one spelling of a tag in the ui
+function formatTags(tags: Record<string, string>): string {
+  return Object.entries(tags)
+    .map(([k, v]) => `${k}:${v}`)
+    .join(", ");
+}
+
+// null for a line that is not tags at all, which is what disables the launch —
+// dropping the fragment we could not read would launch something else
+function parseTags(text: string): Record<string, string> | null {
+  const out: Record<string, string> = {};
+  for (const part of text.split(",")) {
+    const piece = part.trim();
+    if (!piece) continue;
+    const at = piece.indexOf(":");
+    if (at <= 0 || at === piece.length - 1) return null;
+    out[piece.slice(0, at).trim()] = piece.slice(at + 1).trim();
+  }
+  return out;
+}
+
 // how many ops a "launch from here" covers, for the label only — whether the
 // selection is launchable at all is the server's to say, and it says it
 function downstreamOf(ops: OpSummary[], root: string): string[] {
@@ -118,6 +140,9 @@ export default function JobPage() {
 
 function JobView({ name }: { name: string }) {
   const nav = useNavigate();
+  const [search] = useSearchParams();
+  // the run this launchpad was opened from, if it was cloned out of one
+  const from = search.get("from");
   const [job, setJob] = useState<JobSummary | null>(null);
   const [runs, setRuns] = useState<Run[]>([]);
   const [ticks, setTicks] = useState<Tick[]>([]);
@@ -132,6 +157,8 @@ function JobView({ name }: { name: string }) {
   const [presets, setPresets] = useState<Preset[]>([]);
   const [presetName, setPresetName] = useState("");
   const [presetError, setPresetError] = useState<string | null>(null);
+  const [tagsText, setTagsText] = useState("");
+  const [cloneError, setCloneError] = useState<string | null>(null);
   const [launching, setLaunching] = useState(false);
   const [launchError, setLaunchError] = useState<string | null>(null);
   const [paramsError, setParamsError] = useState<string | null>(null);
@@ -195,7 +222,30 @@ function JobView({ name }: { name: string }) {
     [name, windowSecs, missing],
   );
 
+  // a clone prefills rather than launches: editing is the whole point, so the
+  // params and tags are fetched and dropped into the editor. fetched, not
+  // carried in the url — a run's params do not belong in a query string
+  useEffect(() => {
+    if (!from) return;
+    get<{ job: string; params: unknown; tags: Record<string, string> }>(
+      `/api/runs/${encodeURIComponent(from)}/clone`,
+    )
+      .then((c) => {
+        if (c.job !== name) {
+          setCloneError(`run ${shortId(from)} belongs to job ${c.job}`);
+          return;
+        }
+        setParamsText(JSON.stringify(c.params, null, 2));
+        setTagsText(formatTags(c.tags));
+        setParamsOpen(true);
+        setParamsError(null);
+        setCloneError(null);
+      })
+      .catch((e) => setCloneError(e instanceof Error ? e.message : String(e)));
+  }, [from, name]);
+
   const paramsValid = validJson(paramsText);
+  const tags = parseTags(tagsText);
 
   // the client-side parse is the first gate; the server owns the second, since
   // only it knows what the ops declared
@@ -221,12 +271,13 @@ function JobView({ name }: { name: string }) {
     try {
       const text = paramsText.trim();
       saveParams(name, paramsText);
-      const body: { params?: unknown; ops?: string[] } = {};
+      const body: { params?: unknown; ops?: string[]; tags?: Record<string, string> } = {};
       if (text) body.params = JSON.parse(text);
       if (ops) body.ops = ops;
+      if (tags && Object.keys(tags).length > 0) body.tags = tags;
       const r = await post<{ run_id: string }>(
         `/api/jobs/${enc}/runs`,
-        text || ops ? body : undefined,
+        text || ops || body.tags ? body : undefined,
       );
       nav(`/runs/${r.run_id}`);
     } catch (e) {
@@ -332,7 +383,7 @@ function JobView({ name }: { name: string }) {
                 ))}
               </select>
             )}
-            <button onClick={() => launch()} disabled={launching || !paramsValid}>
+            <button onClick={() => launch()} disabled={launching || !paramsValid || tags === null}>
               launch run
             </button>
           </div>
@@ -386,6 +437,14 @@ function JobView({ name }: { name: string }) {
                   not in the schema: <span className="mono">{strangers.join(", ")}</span>
                 </p>
               )}
+              <div className="params-label">tags</div>
+              <input
+                className="filter-input"
+                value={tagsText}
+                placeholder="env:prod, kind:smoke"
+                onChange={(e) => setTagsText(e.target.value)}
+              />
+              {tags === null && <p className="muted params-hint">tags are key:value, comma separated</p>}
               <div className="preset-row">
                 <input
                   className="filter-input"
@@ -413,6 +472,8 @@ function JobView({ name }: { name: string }) {
             </div>
           )}
           {!paramsValid && !paramsOpen && <p className="muted">saved params are invalid json — open params to fix</p>}
+          {tags === null && !paramsOpen && <p className="muted">tags are not key:value — open params to fix</p>}
+          {cloneError && <p className="muted">clone failed: {cloneError}</p>}
           {launchError && <p className="muted">launch failed: {launchError}</p>}
         </div>
       </div>
@@ -430,7 +491,11 @@ function JobView({ name }: { name: string }) {
       />
       {opSel && (
         <p className="muted dag-action">
-          <button className="text-btn" onClick={() => launch([opSel])} disabled={launching}>
+          <button
+            className="text-btn"
+            onClick={() => launch([opSel])}
+            disabled={launching || !paramsValid || tags === null}
+          >
             launch from {opSel}
           </button>
           {` · ${downstreamOf(job.ops, opSel).length + 1} ops`}

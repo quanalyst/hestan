@@ -72,6 +72,7 @@ pub(crate) fn router(state: AppState) -> Router {
         .route("/api/runs/{id}/retry", post(retry_run))
         .route("/api/runs/{id}/resume", post(resume_run))
         .route("/api/runs/{id}/resume_preview", get(resume_preview))
+        .route("/api/runs/{id}/clone", get(clone_run))
         .route("/api/runs/{id}/cancel", post(cancel_run))
         .route("/api/assets", get(list_assets))
         .route("/api/assets/build", post(build_all_assets))
@@ -1318,6 +1319,36 @@ async fn resume_preview(
     Ok(Json(json!({ "reuse": plan.reuse, "rerun": plan.rerun })))
 }
 
+// what a past run was launched with, for the launchpad to open prefilled.
+// cloning is a launch you get to edit first, so this hands over what to edit
+// and launches nothing; the alternative — passing it through the url — puts a
+// run's whole params in a query string
+async fn clone_run(
+    State(st): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    let run = st
+        .runner
+        .store()
+        .run(&id)
+        .map_err(internal)?
+        .ok_or_else(|| err(StatusCode::NOT_FOUND, format!("unknown run: {id}")))?;
+    // the run is there and its job is not: a 404 would blame the run, and a
+    // launchpad half-loaded for a job that cannot launch is worse than either.
+    // the same status and words a retry of such a run answers with
+    if !st.jobs.contains_key(&run.job) {
+        return Err(err(
+            StatusCode::CONFLICT,
+            format!("job no longer defined: {}", run.job),
+        ));
+    }
+    Ok(Json(json!({
+        "job": run.job,
+        "params": run.params,
+        "tags": run.tags,
+    })))
+}
+
 async fn get_run(
     State(st): State<AppState>,
     Path(id): Path<String>,
@@ -2308,6 +2339,84 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn cloning_a_run_hands_over_its_params_and_tags() {
+        let st = state(vec![echo_job("etl")]);
+        let (_, Json(body)) = launch_run(
+            State(st.clone()),
+            Path("etl".into()),
+            raw(r#"{"params": {"n": 5}, "tags": {"kind": "smoke"}}"#),
+        )
+        .await
+        .unwrap();
+        let id = body["run_id"].as_str().unwrap().to_string();
+
+        let Json(body) = clone_run(State(st.clone()), Path(id.clone()))
+            .await
+            .unwrap();
+        assert_eq!(
+            body,
+            json!({"job": "etl", "params": {"n": 5}, "tags": {"kind": "smoke"}})
+        );
+        // an untagged run clones as an untagged one, not as a null
+        let (_, Json(plain)) = launch_run(State(st.clone()), Path("etl".into()), raw("{}"))
+            .await
+            .unwrap();
+        let Json(body) = clone_run(
+            State(st.clone()),
+            Path(plain["run_id"].as_str().unwrap().into()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(body["tags"], json!({}));
+        assert_eq!(body["params"], json!({}));
+
+        // and nothing was launched by any of it
+        assert_eq!(
+            st.runner
+                .store()
+                .runs(None, None, None, None, None, 10)
+                .unwrap()
+                .len(),
+            2
+        );
+
+        let (status, Json(body)) = clone_run(State(st), Path("nope".into())).await.unwrap_err();
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body["error"], "unknown run: nope");
+    }
+
+    // a run outliving its job is the one case where a prefilled launchpad
+    // would be a lie: it says so instead, exactly as a retry of one does
+    #[tokio::test]
+    async fn cloning_a_run_whose_job_is_gone_says_so() {
+        let st = state(vec![echo_job("etl")]);
+        let (_, Json(body)) = launch_run(State(st.clone()), Path("etl".into()), raw("{}"))
+            .await
+            .unwrap();
+        let id = body["run_id"].as_str().unwrap().to_string();
+        // finished, so the retry below refuses for the job rather than the status
+        wait_success(&st, &id).await;
+
+        // the same store, a process that no longer defines the job
+        let runner = Runner::new(Vec::<Job>::new(), st.runner.store().clone());
+        let gone = AppState {
+            jobs: Arc::new(runner.jobs().clone()),
+            runner,
+            assets: Arc::new(AssetRegistry::empty()),
+            sensors: Arc::new(Vec::new()),
+        };
+        let (status, Json(body)) = clone_run(State(gone.clone()), Path(id.clone()))
+            .await
+            .unwrap_err();
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body["error"], "job no longer defined: etl");
+        // which is what a retry of that run says too, so the two agree
+        let (retry_status, Json(retry_body)) = retry_run(State(gone), Path(id)).await.unwrap_err();
+        assert_eq!(retry_status, status);
+        assert_eq!(retry_body["error"], body["error"]);
     }
 
     #[tokio::test]
