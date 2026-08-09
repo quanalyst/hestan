@@ -14,7 +14,7 @@ use crate::job::Job;
 use crate::model::{Run, Trigger};
 use crate::resource::{self, Resource, ResourceCtx, ResourceFn};
 use crate::schedule::{self, Schedule, ScheduleEntry};
-use crate::sensor::{Sensor, SensorEntry, SensorEval, run_sensors};
+use crate::sensor::{RunStatusSensor, Sensor, SensorEntry, SensorEval, run_sensors};
 use crate::server::{AppState, SensorInfo, router};
 use crate::store::Store;
 
@@ -31,6 +31,7 @@ pub struct Hestan {
     multis: Vec<MultiAsset>,
     checks: Vec<AssetCheck>,
     sensors: Vec<Sensor>,
+    run_sensors: Vec<RunStatusSensor>,
     pools: Vec<(String, usize)>,
     resources: Vec<(String, ResourceFn)>,
     io_default: Option<Arc<dyn IoManager>>,
@@ -53,6 +54,7 @@ impl Default for Hestan {
             multis: Vec::new(),
             checks: Vec::new(),
             sensors: Vec::new(),
+            run_sensors: Vec::new(),
             pools: Vec::new(),
             resources: Vec::new(),
             io_default: None,
@@ -117,6 +119,15 @@ impl Hestan {
     /// sensor (and every source probe) on its interval.
     pub fn sensor(mut self, sensor: Sensor) -> Self {
         self.sensors.push(sensor);
+        self
+    }
+
+    /// register a [run-status sensor](RunStatusSensor): "when job A succeeds,
+    /// run job B". stackable, and registered as `run:{name}` alongside every
+    /// other sensor — it runs on the same loop, on its own interval, and
+    /// pauses the same way.
+    pub fn run_sensor(mut self, sensor: RunStatusSensor) -> Self {
+        self.run_sensors.push(sensor);
         self
     }
 
@@ -367,6 +378,7 @@ impl Hestan {
             .map(|e| SensorInfo {
                 name: e.name.clone(),
                 every: e.every,
+                filter: e.filter(),
             })
             .collect();
         let sensors = tokio::spawn(run_sensors(
@@ -469,6 +481,7 @@ impl Hestan {
 
         let mut sensor_entries: Vec<SensorEntry> =
             self.sensors.into_iter().map(SensorEntry::user).collect();
+        sensor_entries.extend(self.run_sensors.into_iter().map(SensorEntry::runs));
         for meta in registry.topo() {
             if let Some(probe) = &meta.probe {
                 sensor_entries.push(SensorEntry {

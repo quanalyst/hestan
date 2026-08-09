@@ -316,10 +316,18 @@ export interface SensorTick {
   error: string | null;
 }
 
+// what a run-status sensor watches; null for a user sensor or a probe, which
+// watch whatever their closure looks at
+export interface SensorFilter {
+  job: string | null;
+  statuses: RunStatus[];
+}
+
 export interface SensorSummary {
   name: string;
   every_secs: number;
   paused: boolean;
   cursor: unknown;
+  filter: SensorFilter | null;
   last_tick: SensorTick | null;
 }

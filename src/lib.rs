@@ -42,13 +42,14 @@ pub use op::{InputError, Meta, Op, OpCtx, OpResult};
 pub use partition::Partitions;
 pub use resource::ResourceCtx;
 pub use schedule::Schedule;
-pub use sensor::{RunRequest, Sensor, SensorCtx};
+pub use sensor::{RunRequest, RunStatusSensor, RunSummary, Sensor, SensorCtx};
 pub use store::Store;
 
 pub mod prelude {
     pub use crate::{
         Asset, AssetCheck, Catchup, CheckResult, Graph, Hestan, Job, Meta, MultiAsset, Op, OpCtx,
-        OpResult, Partitions, RunRequest, Schedule, Sensor, Severity,
+        OpResult, Partitions, RunRequest, RunStatus, RunStatusSensor, RunSummary, Schedule, Sensor,
+        Severity,
     };
     pub use serde_json::{Value, json};
 }

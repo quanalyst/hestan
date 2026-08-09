@@ -31,6 +31,9 @@ static UI_DIST: Dir<'static> = include_dir!("$CARGO_MANIFEST_DIR/ui/dist");
 pub(crate) struct SensorInfo {
     pub name: String,
     pub every: std::time::Duration,
+    /// what a [run-status sensor](crate::RunStatusSensor) watches; `None` for
+    /// a user sensor or a probe, which watch whatever their closure looks at.
+    pub filter: Option<Value>,
 }
 
 #[derive(Clone)]
@@ -814,6 +817,7 @@ async fn list_sensors(State(st): State<AppState>) -> Result<Json<Value>, ApiErro
                 "every_secs": info.every.as_secs(),
                 "paused": row.is_some_and(|r| r.paused),
                 "cursor": row.and_then(|r| r.cursor.clone()),
+                "filter": info.filter,
                 "last_tick": last_tick,
             }))
         })
@@ -2848,28 +2852,43 @@ mod tests {
                 SensorInfo {
                     name: "watch".into(),
                     every: std::time::Duration::from_secs(30),
+                    filter: None,
                 },
                 SensorInfo {
                     name: "probe:docs".into(),
                     every: std::time::Duration::from_secs(60),
+                    filter: None,
+                },
+                SensorInfo {
+                    name: "run:chain".into(),
+                    every: std::time::Duration::from_secs(15),
+                    filter: Some(json!({"job": "etl", "statuses": ["success"]})),
                 },
             ]),
             ..st
         };
         let store = st.runner.store();
         store
-            .sync_sensors(&["watch".into(), "probe:docs".into()])
+            .sync_sensors(&["watch".into(), "probe:docs".into(), "run:chain".into()])
             .unwrap();
 
         let Json(body) = list_sensors(State(st.clone())).await.unwrap();
         let sensors = body["sensors"].as_array().unwrap();
-        assert_eq!(sensors.len(), 2);
+        assert_eq!(sensors.len(), 3);
         assert_eq!(sensors[0]["name"], "watch");
         assert_eq!(sensors[0]["every_secs"], 30);
         assert_eq!(sensors[0]["paused"], json!(false));
         assert_eq!(sensors[0]["cursor"], json!(null));
         assert_eq!(sensors[0]["last_tick"], json!(null));
+        assert_eq!(sensors[0]["filter"], json!(null));
         assert_eq!(sensors[1]["name"], "probe:docs");
+        // a run sensor is a row like any other, with what it watches shown
+        assert_eq!(sensors[2]["name"], "run:chain");
+        assert_eq!(sensors[2]["every_secs"], 15);
+        assert_eq!(
+            sensors[2]["filter"],
+            json!({"job": "etl", "statuses": ["success"]})
+        );
 
         let Json(ok) = set_sensor_state(
             State(st.clone()),

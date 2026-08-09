@@ -73,7 +73,67 @@ stale. the usual unchanged tick stays the cheap, boring `fired` /
 `launched: 0`.
 
 sensor names share one namespace: two sensors named alike, or a user sensor
-colliding with a probe name, fail startup with a graph error.
+colliding with a probe or a `run:` name, fail startup with a graph error.
+
+## Run-status sensors
+
+"when job A succeeds, run job B" is the same shape again, with the run log as
+the outside world:
+
+```rust
+Hestan::new().run_sensor(
+    RunStatusSensor::new("chain", |_ctx, run: RunSummary| async move {
+        Ok(vec![RunRequest { job: "publish".into(), params: json!({"from": run.id}) }])
+    })
+    .on([RunStatus::Success])      // which terminal statuses; success by default
+    .for_job("orders_etl")         // optional; every job when absent
+    .every(Duration::from_secs(15)),
+)
+```
+
+it registers as `run:{name}` and is a **third source on the one sensor loop**,
+exactly as probes are a second — same interval handling, same pausing, same
+tick history, same cursor column, same endpoint. there is no second loop and
+no second set of concepts.
+
+the closure is handed a `RunSummary` — `id`, `job`, `status`, `trigger`,
+`started_at`, `finished_at`, `error` — and not the internal `Run`. what a chain
+needs to decide is which run it was and how it went, not the params blob or the
+resume chain, and a small public struct is a promise that can be kept.
+
+### Its cursor
+
+the cursor is the last terminal run it read, as `{"finished_at", "id"}`. each
+evaluation reads terminal runs after that pair — ordered by finish time then
+id, so two runs finishing in the same instant can neither be skipped nor seen
+twice — calls the closure once per run that matches the status filter, launches
+what comes back, and commits the cursor **only after every launch succeeded**.
+
+that is the same at-least-once contract a user sensor has, and it has the same
+consequence: a launch that fails halfway leaves the cursor where it was, so the
+runs already handled are handed over again on the next tick. downstream work
+should tolerate a duplicate request.
+
+the cursor covers every run *read*, not every run matched, so a filtered-out
+failure is consumed rather than re-read forever. a page is capped at 200 runs
+per evaluation, so a sensor resumed after a long pause drains its backlog over
+a few ticks instead of launching thousands of runs at once.
+
+a **new** run sensor seeds its cursor from the newest terminal run and chains
+nothing on its first evaluation: it is there for what happens next, not for the
+run log it was added to. adding one to a busy process does not replay history.
+
+### A chain can feed itself
+
+a closure that launches the job whose run triggered it is legal, and it will
+run forever: the launched run finishes, the sensor sees it, and round it goes.
+nothing stops you, because "re-run myself until a condition holds" is a real
+thing to want.
+
+what makes it safe is the filter. `for_job` restricts what it watches, the
+status list restricts which outcomes count, and the closure can look at what it
+was handed — `run.trigger != Trigger::Manual`, say — and return no requests.
+one of those has to break the cycle.
 
 ## Pausing, ticks, sync
 
@@ -93,5 +153,6 @@ flag and cursor across restarts. renaming a sensor is not a rename to the
 store — it is a new row, and the old cursor goes with the old name.
 
 `GET /api/sensors` lists each sensor with its interval, paused flag, cursor,
-and last tick — shapes in [http api](http-api.md), tables in
-[storage](storage.md).
+filter and last tick — shapes in [http api](http-api.md), tables in
+[storage](storage.md). the ui's sensors table shows all three kinds together,
+which is the point of them being one thing.

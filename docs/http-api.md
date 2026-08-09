@@ -517,21 +517,30 @@ runs — see [backfills](assets.md#backfills).
 ## Sensors
 
 `GET /api/sensors` returns every sensor, probes included (named
-`probe:<asset>`), in registration order — user sensors first, then probes
-in asset topo order:
+`probe:<asset>`) and [run-status chains](sensors.md#run-status-sensors) too
+(named `run:<name>`), in registration order — user sensors first, then run
+sensors, then probes in asset topo order:
 
 ```json
 { "sensors": [
   { "name": "marker_file", "every_secs": 5, "paused": false,
-    "cursor": 1786186914014,
+    "cursor": 1786186914014, "filter": null,
     "last_tick": { "id": 7, "sensor": "marker_file",
       "evaluated_at": "2026-08-08T11:02:06Z", "outcome": "fired",
-      "launched": 1, "error": null } }
+      "launched": 1, "error": null } },
+  { "name": "run:chain", "every_secs": 15, "paused": false,
+    "cursor": { "finished_at": "2026-08-08T11:02:04Z", "id": "0198f2a4-..." },
+    "filter": { "job": "orders_etl", "statuses": ["success"] },
+    "last_tick": null }
 ] }
 ```
 
 `cursor` is whatever the sensor last committed (null before the first
-commit); `last_tick` is null until the sensor has evaluated once.
+commit); for a run sensor it is the last terminal run it read, as
+`{finished_at, id}`. `filter` is what a run sensor watches — the job (null for
+every job) and the terminal statuses that fire it — and null for a user sensor
+or a probe, which watch whatever their closure looks at. `last_tick` is null
+until the sensor has evaluated once.
 
 `POST /api/sensors/state` with `{"name": ..., "paused": true}` flips the
 flag and returns `{"ok": true}`; an unknown name is a 404. paused sensors

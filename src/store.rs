@@ -9,8 +9,8 @@ use serde_json::Value;
 use crate::error::Error;
 use crate::model::{
     AssetCheckRow, Backfill, BackfillStatus, CheckStatus, Event, EventKind, EventLevel,
-    FreshnessRow, Materialization, OpRun, OpStatus, Run, RunStatus, ScheduleRow, SensorOutcome,
-    SensorRow, SensorTick, Severity, Tick, TickOutcome,
+    FreshnessRow, Materialization, OpRun, OpStatus, Run, RunCursor, RunStatus, ScheduleRow,
+    SensorOutcome, SensorRow, SensorTick, Severity, Tick, TickOutcome,
 };
 use crate::schedule::Schedule;
 
@@ -740,6 +740,62 @@ impl Store {
         let before = before.map(|t| t.to_rfc3339());
         let rows = stmt.query_map(params![job, since, before, before_id, limit], run_from_row)?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    /// terminal runs finished after `after`, oldest first — what a
+    /// [run-status sensor](crate::RunStatusSensor) reads each evaluation.
+    /// `job` narrows it to one job; `after` of `None` is every terminal run
+    /// there has ever been, which is why a fresh sensor seeds its cursor
+    /// instead of asking for that.
+    ///
+    /// the ordering is `(finished_at, id)` and so is the comparison, so a
+    /// strict cursor never drops a run that shares a finish instant with the
+    /// one before it.
+    pub(crate) fn terminal_runs_after(
+        &self,
+        job: Option<&str>,
+        after: Option<&RunCursor>,
+        limit: u32,
+    ) -> Result<Vec<Run>, Error> {
+        let conn = self.0.lock().unwrap();
+        let mut stmt = conn.prepare(
+            r#"SELECT id, job, status, "trigger", params, created_at, started_at, finished_at,
+                      resumed_from, error, scheduled_for
+               FROM runs
+               WHERE status IN ('success', 'failed', 'canceled') AND finished_at IS NOT NULL
+                 AND (?1 IS NULL OR job = ?1)
+                 AND (?2 IS NULL OR finished_at > ?2 OR (finished_at = ?2 AND id > ?3))
+               ORDER BY finished_at, id LIMIT ?4"#,
+        )?;
+        let at = after.map(|c| c.finished_at.to_rfc3339());
+        let id = after.map(|c| c.id.as_str());
+        let rows = stmt.query_map(params![job, at, id, limit], run_from_row)?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    /// the newest terminal run as a cursor, for a sensor starting from now
+    /// rather than from the whole history it was added to.
+    pub(crate) fn latest_terminal_run(
+        &self,
+        job: Option<&str>,
+    ) -> Result<Option<RunCursor>, Error> {
+        let conn = self.0.lock().unwrap();
+        let row = conn
+            .query_row(
+                "SELECT finished_at, id FROM runs
+                 WHERE status IN ('success', 'failed', 'canceled') AND finished_at IS NOT NULL
+                   AND (?1 IS NULL OR job = ?1)
+                 ORDER BY finished_at DESC, id DESC LIMIT 1",
+                params![job],
+                |r| {
+                    Ok(RunCursor {
+                        finished_at: ts_col(r, 0)?,
+                        id: r.get(1)?,
+                    })
+                },
+            )
+            .optional()?;
+        Ok(row)
     }
 
     /// finish time of the job's most recent successful run.

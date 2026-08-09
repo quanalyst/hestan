@@ -195,8 +195,10 @@ appears.
   rebuilds — a memoized asset is not re-checked
 - sensors poll the world on an interval and launch runs when something
   changed, with a store-backed cursor committed only on fully successful
-  evaluations. probes run as internal sensors on the same loop, and both are
-  pausable with tick history
+  evaluations. probes and run-status chains
+  (`RunStatusSensor::new("chain", f).on([RunStatus::Success]).for_job("etl")` —
+  "when job A succeeds, run job B") are two more sources on that same loop, not
+  loops of their own, so all three share pausing, cursors and tick history
 - freshness policies are declarations, not guesses: `fresh_within(d)` on a job
   or an asset says how old its latest success may get, and past that it is
   `late` — per key on a partitioned asset, so one late partition carries the

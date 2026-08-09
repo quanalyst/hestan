@@ -479,6 +479,15 @@ pub struct Backfill {
     pub status: BackfillStatus,
 }
 
+/// where a [run-status sensor](crate::RunStatusSensor) has read up to: the
+/// last terminal run it saw, ordered by finish time and then id so two runs
+/// finishing in the same instant can neither be skipped nor seen twice.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct RunCursor {
+    pub finished_at: DateTime<Utc>,
+    pub id: String,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct SensorRow {
     pub name: String,
