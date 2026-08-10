@@ -2,7 +2,7 @@ import { Link } from "react-router-dom";
 import Markdown from "./Markdown";
 import MicroBars from "./MicroBars";
 import type { Deltas, MetaDelta, MetaPoint, MetaTable, MetaValue, Metadata, Trends } from "./types";
-import { fmtDataSize, fmtDuration, shortId } from "./util";
+import { assetPath, fmtDataSize, fmtDuration, shortId } from "./util";
 
 // three points is the fewest that can show a direction; two is a delta, which
 // the row already carries, and one is the value itself
@@ -127,7 +127,7 @@ function MetaValueView({ value }: { value: MetaValue }) {
   }
   if ("asset" in value) {
     return (
-      <Link className="mono meta-val" to={`/assets?asset=${encodeURIComponent(value.asset)}`}>
+      <Link className="mono meta-val" to={assetPath(value.asset)}>
         {value.asset}
       </Link>
     );

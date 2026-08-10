@@ -98,6 +98,9 @@ export interface JobSchedule {
 // it, never when nothing has ever succeeded. null when nothing was declared
 export interface Freshness {
   status: "fresh" | "late" | "never";
+  // the window that was declared. how far a fresh one is into it cannot be
+  // derived from late_by_secs, which is null exactly while it is inside it
+  within_secs: number;
   late_by_secs: number | null;
   last_success: string | null;
 }

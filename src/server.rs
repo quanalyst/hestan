@@ -177,9 +177,18 @@ fn is_overdue(
 }
 
 /// the shape a declared policy reports as, everywhere it is reported.
-fn freshness_json(freshness: Freshness, last_success: Option<DateTime<Utc>>) -> Value {
+///
+/// `within_secs` is the window that was declared, not a verdict about it: how
+/// far a fresh one is into its window cannot be derived from `late_by_secs`,
+/// which is null exactly while it is still inside it.
+fn freshness_json(
+    freshness: Freshness,
+    within: std::time::Duration,
+    last_success: Option<DateTime<Utc>>,
+) -> Value {
     json!({
         "status": freshness.status(),
+        "within_secs": within.as_secs(),
         "late_by_secs": freshness.late_by().map(|d| d.as_secs()),
         "last_success": last_success,
     })
@@ -257,9 +266,13 @@ fn job_summary(job: &Job, st: &AppState) -> Result<Value, Error> {
     let last_success = st.runner.store().last_success(job.name())?;
     // a declared policy replaces the heuristic rather than sitting beside it:
     // two answers to "is this job behind" is one answer too many
-    let freshness = job
-        .fresh_within()
-        .map(|within| freshness_json(Freshness::of(last_success, within, now), last_success));
+    let freshness = job.fresh_within().map(|within| {
+        freshness_json(
+            Freshness::of(last_success, within, now),
+            within,
+            last_success,
+        )
+    });
     let overdue = match (prev, interval_secs) {
         _ if freshness.is_some() => false,
         (Some(prev), Some(gap)) => is_overdue(prev, gap, last_success, now),
@@ -766,8 +779,10 @@ async fn list_assets(State(st): State<AppState>) -> Result<Json<Value>, ApiError
                 "checks": check_summary(&latest_checks, &meta.name),
                 // stale and late are different claims: stale means a dep moved,
                 // late means time passed. null unless a policy was declared
-                "freshness": asset_freshness(&mats, meta, now)
-                    .map(|(f, last)| freshness_json(f, last)),
+                "freshness": meta.fresh_within.and_then(|within| {
+                    asset_freshness(&mats, meta, now)
+                        .map(|(f, last)| freshness_json(f, within, last))
+                }),
             })
         })
         .collect();
@@ -3771,6 +3786,9 @@ mod tests {
         assert_eq!(etl["freshness"]["status"], json!("fresh"));
         assert_eq!(etl["freshness"]["late_by_secs"], json!(null));
         assert_eq!(etl["overdue"], json!(false));
+        // the declared window comes back whatever the verdict is: how far a
+        // fresh one is into it cannot be derived from a null late_by_secs
+        assert_eq!(etl["freshness"]["within_secs"], json!(3600));
 
         let (status, body, _) = request(router(st.clone()), Method::GET, "/api/late").await;
         assert_eq!(status, StatusCode::OK);

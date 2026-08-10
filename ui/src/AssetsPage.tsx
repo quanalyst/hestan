@@ -1,6 +1,7 @@
 import { useState } from "react";
 import { Link, useNavigate, useSearchParams } from "react-router-dom";
 import { get, post, usePoll } from "./api";
+import { StateGlyph } from "./AssetDetail";
 import AssetPanel from "./AssetPanel";
 import DagView from "./DagView";
 import { GlyphShape } from "./StatusGlyph";
@@ -13,7 +14,7 @@ import type {
   SensorOutcome,
   SensorSummary,
 } from "./types";
-import { fmtDuration, relTime, untilTime } from "./util";
+import { assetPath, fmtDuration, relTime, untilTime } from "./util";
 
 const SENSOR_GLYPH = {
   fired: "success",
@@ -73,17 +74,6 @@ function Checks({ checks }: { checks: CheckSummary }) {
         <GlyphShape status={checks.failed > 0 ? "failed" : "success"} />
       </svg>
       {checks.failed > 0 ? `${checks.failed} failed` : `${checks.passed} passed`}
-    </span>
-  );
-}
-
-function Freshness({ stale }: { stale: boolean }) {
-  return (
-    <span className="status">
-      <svg className="glyph" width={12} height={12} viewBox="-6 -6 12 12" aria-hidden="true">
-        <GlyphShape status={stale ? "pending" : "success"} />
-      </svg>
-      {stale ? "stale" : "fresh"}
     </span>
   );
 }
@@ -241,7 +231,11 @@ export default function AssetsPage() {
                   onClick={() => select(a.name)}
                 >
                   <td>
-                    {a.name}
+                    {/* the row opens the panel; the name is the permanent
+                        address, which is the thing you send somebody */}
+                    <Link to={assetPath(a.name)} onClick={(e) => e.stopPropagation()}>
+                      {a.name}
+                    </Link>
                     {a.freshness?.status === "late" && <span className="tag">late</span>}
                   </td>
                   <td className="muted">{a.kind}</td>
@@ -267,7 +261,7 @@ export default function AssetsPage() {
                   </td>
                   <td>
                     <span className="status-cell">
-                      <Freshness stale={a.stale} />
+                      <StateGlyph stale={a.stale} />
                       {a.stale && (
                         <span className="muted" title={staleTitle(a)}>
                           {staleSummary(a)}

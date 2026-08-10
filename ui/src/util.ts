@@ -6,6 +6,12 @@ export function shortId(id: string): string {
   return id.slice(0, 8);
 }
 
+// an asset's permanent address. the name is a path segment per separator, so
+// `sales/orders` is a url you can read rather than one escape sequence
+export function assetPath(name: string): string {
+  return `/assets/${name.split("/").map(encodeURIComponent).join("/")}`;
+}
+
 // how a trigger rule reads on a node; the default rule earns no marker,
 // because every op used to have it
 export function whenLabel(when: When): string | null {
