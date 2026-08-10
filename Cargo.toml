@@ -21,7 +21,6 @@ cron = "0.17"
 futures = "0.3"
 include_dir = "0.7"
 mime_guess = "2"
-postgres = { version = "0.19", optional = true }
 reqwest = { version = "0.12", optional = true, default-features = false, features = ["json", "rustls-tls"] }
 rusqlite = "0.32"
 serde = { version = "1", features = ["derive"] }
@@ -29,6 +28,7 @@ serde_json = "1"
 sha2 = "0.10"
 thiserror = "2"
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "net", "time", "sync", "macros", "process", "signal", "io-util"] }
+tokio-postgres = { version = "0.7", optional = true }
 tracing = "0.1"
 # the `capture` feature only: the Layer trait the host composes hestan's
 # capture layer into its own subscriber with
@@ -60,7 +60,7 @@ http = ["dep:reqwest"]
 capture = ["dep:tracing-subscriber"]
 # a shared run log on a postgres server, for the deployments sqlite's one-host
 # file cannot serve. sqlite stays the default and needs no server
-postgres = ["dep:postgres"]
+postgres = ["dep:tokio-postgres"]
 
 [[example]]
 name = "http_source"

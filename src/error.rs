@@ -43,7 +43,7 @@ pub enum Error {
     Sqlite(#[from] rusqlite::Error),
     #[cfg(feature = "postgres")]
     #[error("storage: {}", chain(.0))]
-    Postgres(#[from] postgres::Error),
+    Postgres(#[from] tokio_postgres::Error),
     /// a column that could not be read as what it holds: json that does not
     /// parse, a timestamp that is not rfc3339, a status word this build does
     /// not know. the run log is not supposed to contain any of them.
@@ -63,7 +63,7 @@ pub enum Error {
 /// column and the reason in its source — so a storage failure that reached a
 /// log or an api response would say nothing whatsoever about what went wrong.
 #[cfg(feature = "postgres")]
-fn chain(e: &postgres::Error) -> String {
+fn chain(e: &tokio_postgres::Error) -> String {
     let mut out = e.to_string();
     let mut cause = std::error::Error::source(e);
     while let Some(next) = cause {

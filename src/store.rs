@@ -538,6 +538,24 @@ impl Dialect {
         }
     }
 
+    /// how a dispatcher takes the one row it means to claim, out of anyone
+    /// else's way, before spending a statement on it.
+    ///
+    /// this is the reason to want postgres. `SKIP LOCKED` hands a second
+    /// dispatcher reaching for the same run *nothing* for it, immediately, so
+    /// it moves on to the next run rather than waiting on a claim to commit
+    /// only to find it lost. one row, not the queue: a dispatcher that locked
+    /// every candidate it looked at would hand every other dispatcher an empty
+    /// queue. sqlite has no such clause and needs none — inside an immediate
+    /// transaction there is no other writer to wait for.
+    fn claim_lock(self) -> &'static str {
+        match self {
+            Dialect::Sqlite => "",
+            #[cfg(feature = "postgres")]
+            Dialect::Postgres => "FOR UPDATE SKIP LOCKED",
+        }
+    }
+
     /// whether a run carries exactly the tag `?5 = ?6`. sqlite walks the
     /// stored json with `json_each`; postgres reads the one key out of it and
     /// gets null for a run with no tags at all, which is the same answer.
@@ -595,7 +613,7 @@ impl Dialect {
 enum Db {
     Sqlite(Mutex<Connection>),
     #[cfg(feature = "postgres")]
-    Postgres(Mutex<postgres::Client>),
+    Postgres(Mutex<crate::pg::Client>),
 }
 
 /// a bound parameter. one list serves both backends: `Val` rather than each
@@ -616,6 +634,11 @@ macro_rules! args {
     () => { &[] as &[Val<'_>] };
     ($($v:expr),+ $(,)?) => { &[$(Val::from($v)),+] as &[Val<'_>] };
 }
+
+// the postgres backend binds the same lists; without that feature the macro is
+// only ever used in this file
+#[cfg(feature = "postgres")]
+pub(crate) use args;
 
 impl<'a> From<&'a str> for Val<'a> {
     fn from(v: &'a str) -> Val<'a> {
@@ -708,7 +731,7 @@ trait Exec {
 enum Conn<'a> {
     Sqlite(MutexGuard<'a, Connection>),
     #[cfg(feature = "postgres")]
-    Postgres(MutexGuard<'a, postgres::Client>),
+    Postgres(MutexGuard<'a, crate::pg::Client>),
 }
 
 impl Conn<'_> {
@@ -746,7 +769,7 @@ impl Conn<'_> {
         match self {
             Conn::Sqlite(c) => Ok(c.execute_batch(sql)?),
             #[cfg(feature = "postgres")]
-            Conn::Postgres(c) => Ok(c.batch_execute(sql)?),
+            Conn::Postgres(c) => c.batch(sql),
         }
     }
 }
@@ -764,7 +787,7 @@ impl Exec for Conn<'_> {
         match self {
             Conn::Sqlite(c) => sqlite_execute(c, sql, args),
             #[cfg(feature = "postgres")]
-            Conn::Postgres(c) => crate::pg::execute(&mut **c, sql, args),
+            Conn::Postgres(c) => c.execute(sql, args),
         }
     }
 
@@ -777,7 +800,7 @@ impl Exec for Conn<'_> {
         match self {
             Conn::Sqlite(c) => sqlite_query(c, sql, args, row),
             #[cfg(feature = "postgres")]
-            Conn::Postgres(c) => crate::pg::query(&mut **c, sql, args, row),
+            Conn::Postgres(c) => c.query(sql, args, row),
         }
     }
 }
@@ -787,15 +810,34 @@ impl Exec for Conn<'_> {
 enum Tx<'a> {
     Sqlite(rusqlite::Transaction<'a>),
     #[cfg(feature = "postgres")]
-    Postgres(postgres::Transaction<'a>),
+    Postgres(crate::pg::Transaction<'a>),
 }
 
 impl Tx<'_> {
+    /// hold the claim lock for the rest of this transaction, so that a
+    /// dispatcher counting capacity and a dispatcher about to spend it take
+    /// turns.
+    ///
+    /// the count and the claim sharing one transaction is enough on sqlite,
+    /// where an immediate transaction is already the only writer. it is not
+    /// enough on postgres: two transactions read the same free slot from their
+    /// own snapshots and both spend it, which is the one way two dispatchers
+    /// break a limit. asked for only when a limit is in force — see
+    /// [`Limits::binding`] — so that the ordinary case, where nothing is
+    /// capped, still has dispatchers never meeting.
+    fn take_turns(&mut self) -> Result<(), Error> {
+        match self {
+            Tx::Sqlite(_) => Ok(()),
+            #[cfg(feature = "postgres")]
+            Tx::Postgres(tx) => tx.claim_lock(),
+        }
+    }
+
     fn commit(self) -> Result<(), Error> {
         match self {
             Tx::Sqlite(tx) => Ok(tx.commit()?),
             #[cfg(feature = "postgres")]
-            Tx::Postgres(tx) => Ok(tx.commit()?),
+            Tx::Postgres(tx) => tx.commit(),
         }
     }
 }
@@ -813,7 +855,7 @@ impl Exec for Tx<'_> {
         match self {
             Tx::Sqlite(tx) => sqlite_execute(tx, sql, args),
             #[cfg(feature = "postgres")]
-            Tx::Postgres(tx) => crate::pg::execute(tx, sql, args),
+            Tx::Postgres(tx) => tx.execute(sql, args),
         }
     }
 
@@ -826,7 +868,7 @@ impl Exec for Tx<'_> {
         match self {
             Tx::Sqlite(tx) => sqlite_query(tx, sql, args, row),
             #[cfg(feature = "postgres")]
-            Tx::Postgres(tx) => crate::pg::query(tx, sql, args, row),
+            Tx::Postgres(tx) => tx.query(sql, args, row),
         }
     }
 }
@@ -859,7 +901,7 @@ fn sqlite_query<T>(
 pub(crate) enum AnyRow<'a> {
     Sqlite(&'a rusqlite::Row<'a>),
     #[cfg(feature = "postgres")]
-    Postgres(&'a postgres::Row),
+    Postgres(&'a tokio_postgres::Row),
 }
 
 impl AnyRow<'_> {
@@ -879,7 +921,7 @@ impl AnyRow<'_> {
         }
     }
 
-    fn int(&self, idx: usize) -> Result<i64, Error> {
+    pub(crate) fn int(&self, idx: usize) -> Result<i64, Error> {
         match self {
             AnyRow::Sqlite(r) => Ok(r.get(idx)?),
             #[cfg(feature = "postgres")]
@@ -1246,12 +1288,22 @@ impl Store {
     /// documented where a user meets it.
     ///
     /// the claim itself is `UPDATE ... WHERE claimed_by IS NULL`: one winner by
-    /// construction, whoever else is looking at the same row. counting and
-    /// claiming share one immediate transaction, so two dispatchers cannot both
-    /// read capacity for the last slot and both take it. postgres would use
-    /// `SELECT ... FOR UPDATE SKIP LOCKED` here and hold no global write lock;
-    /// sqlite serializes writers for us, which is the same guarantee on one
-    /// host and no guarantee at all across several.
+    /// construction, whoever else is reaching for the same row. that holds on
+    /// both backends, and it is what makes a race here a thing that resolves
+    /// rather than a thing to be avoided.
+    ///
+    /// how the two get there differs, and it is the whole reason to run this
+    /// on postgres. sqlite serializes writers for us: an immediate transaction
+    /// is the only one there is, which is a complete guarantee on one host and
+    /// none at all across several. postgres reserves the one row this claimer
+    /// decided on with [`SKIP LOCKED`](Dialect::claim_lock), so several
+    /// dispatchers walk the same queue at the same moment and come away with
+    /// different runs, none of them waiting on any other.
+    ///
+    /// counting capacity and spending it still have to be one decision, and on
+    /// postgres one transaction does not make them one — two snapshots can
+    /// each see the same last slot free. so when a limit is actually in force,
+    /// and only then, claimers [take turns](Tx::take_turns).
     ///
     /// returns the claimed run and its [plan](Self::create_run_keyed).
     pub(crate) fn claim_next(
@@ -1263,8 +1315,16 @@ impl Store {
     ) -> Result<Option<(Run, Option<Value>)>, Error> {
         let mut conn = self.conn();
         let mut tx = conn.begin_immediate()?;
+        if limits.binding() {
+            tx.take_turns()?;
+        }
         let counts = in_flight(&mut tx, limits)?;
         let candidates = queued(&mut tx, QUEUE_SCAN)?;
+        let reserve = format!(
+            "SELECT id FROM runs
+             WHERE id = ?1 AND claimed_by IS NULL AND status = 'queued' {}",
+            tx.dialect().claim_lock()
+        );
         let now = Utc::now();
         let until = now + chrono::Duration::from_std(lease).unwrap_or(chrono::Duration::MAX);
         for (mut run, plan) in candidates {
@@ -1272,6 +1332,12 @@ impl Store {
                 continue;
             }
             if counts.blocker(limits, &run.job, &run.tags).is_some() {
+                continue;
+            }
+            if tx
+                .query_opt(&reserve, args![&run.id], |_| Ok(()))?
+                .is_none()
+            {
                 continue;
             }
             let won = tx.execute(
@@ -2998,6 +3064,9 @@ fn in_flight(db: &mut impl Exec, limits: &Limits) -> Result<InFlight, Error> {
 
 /// the queue itself: runs nobody has claimed, in the order a dispatcher takes
 /// them, with the plan each would execute.
+///
+/// a plain read on both backends, the dispatcher's own walk included: what a
+/// dispatcher locks is the one row it decides on, not every row it considered.
 fn queued(db: &mut impl Exec, limit: u32) -> Result<Vec<(Run, Option<Value>)>, Error> {
     db.query(
         &format!(
@@ -3335,9 +3404,9 @@ mod tests {
         fn new() -> Option<Scratch> {
             let server = std::env::var(TEST_PG).ok()?;
             let schema = format!("hestan_{}", uuid::Uuid::now_v7().simple());
-            postgres::Client::connect(&server, postgres::NoTls)
+            crate::pg::unmigrated(&server)
                 .expect("HESTAN_TEST_PG names a server this test can reach")
-                .batch_execute(&format!("CREATE SCHEMA {schema}"))
+                .batch(&format!("CREATE SCHEMA {schema}"))
                 .unwrap();
             let sep = match server.contains('?') {
                 true => '&',
@@ -3359,8 +3428,8 @@ mod tests {
     #[cfg(feature = "postgres")]
     impl Drop for Scratch {
         fn drop(&mut self) {
-            if let Ok(mut admin) = postgres::Client::connect(&self.server, postgres::NoTls) {
-                let _ = admin.batch_execute(&format!("DROP SCHEMA {} CASCADE", self.schema));
+            if let Ok(mut admin) = crate::pg::unmigrated(&self.server) {
+                let _ = admin.batch(&format!("DROP SCHEMA {} CASCADE", self.schema));
             }
         }
     }
@@ -5894,6 +5963,288 @@ mod tests {
         });
     }
 
+    // ------------------------------------------------------------- contention
+    // what a shared run log is for, and the four things that have to be true of
+    // one. the racing cases below start real threads on connections of their
+    // own and release them together: two claimers that never actually overlap
+    // would prove nothing whatsoever about either backend.
+
+    /// `hands` claimers reaching for the queue at once, each on a connection of
+    /// its own, released together. returns what each came away with.
+    fn race(db: &Backend, hands: usize, limits: Limits) -> Vec<Option<(String, String)>> {
+        let defined = HashSet::from(["etl".to_string()]);
+        let gate = std::sync::Arc::new(std::sync::Barrier::new(hands));
+        let claimers: Vec<_> = (0..hands)
+            .map(|i| {
+                let (store, gate) = (db.store(), gate.clone());
+                let (defined, limits) = (defined.clone(), limits.clone());
+                std::thread::spawn(move || {
+                    let me = format!("claimer-{i}");
+                    gate.wait();
+                    let claimed = store
+                        .claim_next(&me, Duration::from_secs(30), &limits, &defined)
+                        .unwrap();
+                    claimed.map(|(run, _)| (me, run.id))
+                })
+            })
+            .collect();
+        claimers.into_iter().map(|c| c.join().unwrap()).collect()
+    }
+
+    #[test]
+    fn several_claimers_race_one_run_and_exactly_one_comes_away_with_it() {
+        both(|db| {
+            let store = db.store();
+            store
+                .create_run(&mk_run("contested", "etl", Utc::now()), &["a".into()])
+                .unwrap();
+
+            let won: Vec<_> = race(db, 4, Limits::new()).into_iter().flatten().collect();
+            assert_eq!(won.len(), 1, "one run went to several claimers: {won:?}");
+            let (winner, id) = &won[0];
+            assert_eq!(id, "contested");
+
+            let row = store.run("contested").unwrap().unwrap();
+            assert_eq!(row.claimed_by.as_ref(), Some(winner));
+            assert!(row.lease_until.is_some());
+            // and it is off the queue for good
+            assert_eq!(store.queue_depth().unwrap(), 0);
+        });
+    }
+
+    #[test]
+    fn several_claimers_race_a_full_queue_and_split_it_without_overlapping() {
+        both(|db| {
+            let store = db.store();
+            let t0 = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+            for i in 0..4 {
+                let run = mk_run(&format!("r{i}"), "etl", t0 + chrono::Duration::minutes(i));
+                store.create_run(&run, &["a".into()]).unwrap();
+            }
+
+            let taken: Vec<_> = race(db, 4, Limits::new()).into_iter().flatten().collect();
+            assert_eq!(taken.len(), 4, "a claimer came away empty: {taken:?}");
+            let mut ids: Vec<&str> = taken.iter().map(|(_, id)| id.as_str()).collect();
+            ids.sort_unstable();
+            ids.dedup();
+            assert_eq!(ids.len(), 4, "two claimers took the same run: {taken:?}");
+
+            // every row says who holds it, and each of them holds exactly one
+            for (claimer, id) in &taken {
+                let row = store.run(id).unwrap().unwrap();
+                assert_eq!(row.claimed_by.as_ref(), Some(claimer));
+                assert_eq!(store.held_by(claimer).unwrap(), [id.as_str()]);
+            }
+            assert_eq!(store.queue_depth().unwrap(), 0);
+        });
+    }
+
+    // what a limit is: counting the free slot and spending it are one decision,
+    // however many dispatchers are counting at the time
+    #[test]
+    fn two_dispatchers_cannot_both_take_the_last_slot() {
+        both(|db| {
+            let store = db.store();
+            let t0 = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+            for i in 0..4 {
+                let run = mk_run(&format!("r{i}"), "etl", t0 + chrono::Duration::minutes(i));
+                store.create_run(&run, &["a".into()]).unwrap();
+            }
+
+            let taken: Vec<_> = race(db, 4, Limits::new().global(1))
+                .into_iter()
+                .flatten()
+                .collect();
+            assert_eq!(taken.len(), 1, "a global limit of one started {taken:?}");
+            assert_eq!(store.queue_depth().unwrap(), 3);
+        });
+    }
+
+    // the review finding from the phase that made the queue durable, asserted
+    // on both backends: process B booting must not touch process A's work
+    #[test]
+    fn a_live_lease_survives_another_processs_boot_and_an_expired_one_does_not() {
+        both(|db| {
+            let store = db.store();
+            for id in ["live", "stranded", "waiting"] {
+                store
+                    .create_run(&mk_run(id, "etl", Utc::now()), &["work".into()])
+                    .unwrap();
+            }
+            // two are being executed by processes that are not this one; one is
+            // still saying so and the other stopped a while ago
+            let minute = chrono::Duration::seconds(60);
+            store
+                .plant_claim("live", "other-process", Some(Utc::now() + minute))
+                .unwrap();
+            store
+                .plant_claim("stranded", "dead-process", Some(Utc::now() - minute))
+                .unwrap();
+            for id in ["live", "stranded"] {
+                store.run_started(id, Utc::now()).unwrap();
+                store.op_started(id, "work", 1).unwrap();
+            }
+
+            // this is what booting is
+            store.fail_interrupted().unwrap();
+
+            let live = store.run("live").unwrap().unwrap();
+            assert_eq!(live.status, RunStatus::Running, "{:?}", live.error);
+            assert_eq!(live.claimed_by.as_deref(), Some("other-process"));
+            assert_eq!(
+                store.op_run("live", "work").unwrap().unwrap().status,
+                OpStatus::Running,
+                "a boot elsewhere interrupted a live process's op"
+            );
+            assert!(
+                !store
+                    .events("live", 0)
+                    .unwrap()
+                    .iter()
+                    .any(|e| e.message.contains("interrupted")),
+                "a boot elsewhere announced an interruption on a live run"
+            );
+
+            let stranded = store.run("stranded").unwrap().unwrap();
+            assert_eq!(stranded.status, RunStatus::Failed);
+            assert!(stranded.error.unwrap().contains("interrupted"));
+            assert_eq!(
+                store.op_run("stranded", "work").unwrap().unwrap().status,
+                OpStatus::Failed
+            );
+
+            // and a queued run nobody has claimed is the queue, not a casualty
+            let waiting = store.run("waiting").unwrap().unwrap();
+            assert_eq!(waiting.status, RunStatus::Queued);
+            assert_eq!(store.queue_depth().unwrap(), 1);
+        });
+    }
+
+    #[test]
+    fn an_expired_lease_is_reclaimed_and_a_live_one_is_left_where_it_is() {
+        both(|db| {
+            let store = db.store();
+            for id in ["stalled", "held"] {
+                store
+                    .create_run(&mk_run(id, "etl", Utc::now()), &["work".into()])
+                    .unwrap();
+                store.run_started(id, Utc::now()).unwrap();
+                store.op_started(id, "work", 1).unwrap();
+            }
+            let minute = chrono::Duration::seconds(60);
+            store
+                .plant_claim("stalled", "vanished", Some(Utc::now() - minute))
+                .unwrap();
+            store
+                .plant_claim("held", "alive", Some(Utc::now() + minute))
+                .unwrap();
+
+            let asked = std::cell::RefCell::new(Vec::new());
+            let taken = store
+                .reclaim_expired(Reclaim::Fail, |run| {
+                    asked.borrow_mut().push(run.id.clone());
+                    Some(json!({"run_id": run.id, "status": run.status.as_str()}))
+                })
+                .unwrap();
+            assert_eq!(taken.len(), 1, "a live lease was reclaimed: {taken:?}");
+            assert_eq!(taken[0].id, "stalled");
+            // the alert is written with the terminal status, in the transaction
+            // that wrote it, rather than a statement later
+            assert_eq!(asked.into_inner(), ["stalled"]);
+            let alerts = store.notifications(None, 10).unwrap();
+            assert_eq!(alerts.len(), 1);
+            assert_eq!(alerts[0].payload["status"], "failed");
+
+            let run = store.run("stalled").unwrap().unwrap();
+            assert_eq!(run.status, RunStatus::Failed);
+            assert_eq!(run.lease_until, None);
+            let why = run.error.unwrap();
+            assert!(why.contains("claimer went away"), "{why}");
+            assert!(why.contains("vanished"), "{why}");
+            let op = store.op_run("stalled", "work").unwrap().unwrap();
+            assert_eq!(op.status, OpStatus::Failed);
+            assert_eq!(op.pid, None);
+            assert_eq!(
+                store.run("held").unwrap().unwrap().status,
+                RunStatus::Running
+            );
+
+            // and under requeue it goes back to exactly what an unclaimed
+            // queued run is, for whoever takes it next
+            store
+                .plant_claim("held", "vanished-too", Some(Utc::now() - minute))
+                .unwrap();
+            let taken = store.reclaim_expired(Reclaim::Requeue, |_| None).unwrap();
+            assert_eq!(taken.len(), 1);
+            let run = store.run("held").unwrap().unwrap();
+            assert_eq!(run.status, RunStatus::Queued);
+            assert_eq!(run.claimed_by, None);
+            assert_eq!(run.claimed_at, None);
+            assert_eq!(run.started_at, None);
+            assert_eq!(store.queue_depth().unwrap(), 1);
+            assert!(
+                store
+                    .events("held", 0)
+                    .unwrap()
+                    .iter()
+                    .any(|e| e.message.contains("requeued for another claimer"))
+            );
+        });
+    }
+
+    // the throughput half of the claim, which is postgres's alone: a run
+    // somebody else is mid-claim on is skipped, not waited for. without
+    // `SKIP LOCKED` the claimer below blocks on the held row until the holder
+    // lets go, and the outcome is the same run claimed a great deal later.
+    #[cfg(feature = "postgres")]
+    #[test]
+    fn a_run_another_dispatcher_is_holding_is_skipped_rather_than_waited_on() {
+        let Some(pg) = Scratch::new() else {
+            return;
+        };
+        let store = pg.store();
+        let t0 = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+        for i in 0..2 {
+            let run = mk_run(&format!("r{i}"), "etl", t0 + chrono::Duration::minutes(i));
+            store.create_run(&run, &["a".into()]).unwrap();
+        }
+
+        // another dispatcher, mid-claim on the head of the queue
+        let mut other = crate::pg::unmigrated(&pg.url).unwrap();
+        let mut holding = other.transaction().unwrap();
+        holding
+            .execute("SELECT id FROM runs WHERE id = 'r0' FOR UPDATE", args![])
+            .unwrap();
+
+        let claiming = {
+            let (store, defined) = (pg.store(), HashSet::from(["etl".to_string()]));
+            std::thread::spawn(move || {
+                store
+                    .claim_next("beta", Duration::from_secs(30), &Limits::new(), &defined)
+                    .unwrap()
+            })
+        };
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !claiming.is_finished() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            claiming.is_finished(),
+            "the dispatcher is waiting for a row it could have skipped"
+        );
+        let (claimed, _) = claiming.join().unwrap().unwrap();
+        assert_eq!(claimed.id, "r1");
+
+        // and once the holder lets go, the head of the queue is claimable again
+        drop(holding);
+        let defined = HashSet::from(["etl".to_string()]);
+        let (claimed, _) = store
+            .claim_next("gamma", Duration::from_secs(30), &Limits::new(), &defined)
+            .unwrap()
+            .unwrap();
+        assert_eq!(claimed.id, "r0");
+    }
+
     // the three writes a test needs and a running process never makes: history
     // older than the test itself, and a delivery put back where a crash
     // between the hook returning and the mark landing would have left it
@@ -6052,11 +6403,10 @@ mod tests {
 
         // and it is still v17: a build that cannot read a database must not
         // rewrite it either
-        let version: i64 = postgres::Client::connect(&pg.url, postgres::NoTls)
+        let version = crate::pg::unmigrated(&pg.url)
             .unwrap()
-            .query_one("SELECT version FROM schema_version", &[])
-            .unwrap()
-            .get(0);
-        assert_eq!(version, 17);
+            .query("SELECT version FROM schema_version", args![], |r| r.int(0))
+            .unwrap();
+        assert_eq!(version, [17]);
     }
 }

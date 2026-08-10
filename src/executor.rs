@@ -114,6 +114,15 @@ impl Limits {
             .map(|((k, v), n)| (k.as_str(), v.as_str(), *n))
             .collect()
     }
+
+    /// whether anything here caps anything.
+    ///
+    /// which is what decides whether two dispatchers have to agree about
+    /// capacity before either spends it. no limits is the default and the
+    /// common case, and it is the case where they need not meet at all.
+    pub(crate) fn binding(&self) -> bool {
+        self.global.is_some() || !self.per_job.is_empty() || !self.tags.is_empty()
+    }
 }
 
 /// why a queued run is not starting right now.

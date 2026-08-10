@@ -10,6 +10,12 @@
 //! what is being tested is that **the process that decides a run and the
 //! process that executes it need not be the same process**. the parent here
 //! only ever enqueues; the children only ever execute.
+//!
+//! every case runs twice where there is a postgres to run it against: once on
+//! a sqlite file, once on a postgres schema of its own, the same processes
+//! racing the same queue either way. sqlite serializes writers for us and
+//! postgres does not, so "nothing was run twice" is a different claim on each
+//! and has to be made on each.
 
 use std::future::Future;
 use std::path::PathBuf;
@@ -50,15 +56,96 @@ fn main() {
 
     let dir = tempfile::tempdir().unwrap();
     let db = dir.path().join("queue.db").display().to_string();
-    let marks = dir.path().join("marks.txt").display().to_string();
-    // SAFETY: single-threaded, before the runtime starts and long before any
-    // child exists to inherit a half-written environment
-    unsafe {
-        std::env::set_var(DB, &db);
-        std::env::set_var(MARKS, &marks);
+    run_on(&rt, &db, dir.path().join("sqlite-marks.txt"));
+    println!("queue: every case passed on sqlite");
+
+    #[cfg(feature = "postgres")]
+    if let Some(pg) = Scratch::new() {
+        run_on(&rt, &pg.url, dir.path().join("postgres-marks.txt"));
+        println!("queue: every case passed on postgres");
     }
-    rt.block_on(cases(&db));
-    println!("queue: every case passed");
+}
+
+/// the whole of the suite against one database, with a mark file of its own so
+/// that the double-run detector is only ever reading this run of it.
+fn run_on(rt: &tokio::runtime::Runtime, db: &str, marks: PathBuf) {
+    // SAFETY: single-threaded, between runs, and long before any child exists
+    // to inherit a half-written environment
+    unsafe {
+        std::env::set_var(DB, db);
+        std::env::set_var(MARKS, marks.display().to_string());
+    }
+    rt.block_on(cases(db));
+}
+
+/// a schema of its own on the server `HESTAN_TEST_PG` names, dropped with the
+/// fixture. unset means no postgres here and the postgres half is skipped,
+/// which is what lets this test pass on a machine without one.
+#[cfg(feature = "postgres")]
+struct Scratch {
+    server: String,
+    url: String,
+    schema: String,
+}
+
+#[cfg(feature = "postgres")]
+impl Scratch {
+    fn new() -> Option<Scratch> {
+        let server = std::env::var("HESTAN_TEST_PG").ok()?;
+        let schema = format!("hestan_queue_{}", std::process::id());
+        admin(&server, &format!("DROP SCHEMA IF EXISTS {schema} CASCADE"));
+        admin(&server, &format!("CREATE SCHEMA {schema}"));
+        // `options` is how a url carries a session setting, which is what puts
+        // this process and every worker it starts in the same schema
+        let sep = match server.contains('?') {
+            true => '&',
+            false => '?',
+        };
+        let url = format!("{server}{sep}options=-c%20search_path%3D{schema}");
+        Some(Scratch {
+            server,
+            url,
+            schema,
+        })
+    }
+}
+
+#[cfg(feature = "postgres")]
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        admin(
+            &self.server,
+            &format!("DROP SCHEMA {} CASCADE", self.schema),
+        );
+    }
+}
+
+/// one statement against the server itself, outside anything hestan opened.
+/// the fixture has to make the schema before a store can be pointed at it and
+/// take it away afterwards, and a `Store` is not the tool for either.
+#[cfg(feature = "postgres")]
+fn admin(server: &str, sql: &str) {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let (client, connection) = tokio_postgres::connect(server, tokio_postgres::NoTls)
+            .await
+            .expect("HESTAN_TEST_PG names a server this test can reach");
+        tokio::spawn(async {
+            let _ = connection.await;
+        });
+        client.batch_execute(sql).await.unwrap();
+    });
+}
+
+/// a handle on whichever backend `target` names — a path or a url. what
+/// [`Hestan::db`] does for a whole app, for the cases that want a store
+/// beside one.
+fn open(target: &str) -> Store {
+    #[cfg(feature = "postgres")]
+    if target.starts_with("postgres://") || target.starts_with("postgresql://") {
+        return Store::connect(target).unwrap();
+    }
+    Store::open(target).unwrap()
 }
 
 /// the registry every process in this test builds — the parent that enqueues
@@ -112,7 +199,7 @@ fn marks() -> PathBuf {
 /// deployment, in this process, so a case can put work on the queue and be sure
 /// nothing here took it.
 fn enqueuer(db: &str) -> Runner {
-    Runner::new(jobs(), Store::open(db).unwrap()).with_role(Role::Scheduler, 1)
+    Runner::new(jobs(), open(db)).with_role(Role::Scheduler, 1)
 }
 
 async fn cases(db: &str) {
@@ -136,7 +223,7 @@ async fn cases(db: &str) {
 // ------------------------------------------------------------------ the cases
 
 async fn another_process_executes(db: &str) {
-    let store = Store::open(db).unwrap();
+    let store = open(db);
     let id = enqueuer(db)
         .launch("chunk", json!({}), Trigger::Manual)
         .unwrap();
@@ -166,7 +253,7 @@ async fn another_process_executes(db: &str) {
 }
 
 async fn two_workers_split_it(db: &str) {
-    let store = Store::open(db).unwrap();
+    let store = open(db);
     let runner = enqueuer(db);
     let ids: Vec<String> = (0..8)
         .map(|_| runner.launch("chunk", json!({}), Trigger::Manual).unwrap())
@@ -210,7 +297,7 @@ async fn two_workers_split_it(db: &str) {
 }
 
 async fn a_worker_decides_nothing(db: &str) {
-    let store = Store::open(db).unwrap();
+    let store = open(db);
     let before = store.runs(None, None, None, None, None, 500).unwrap().len();
     let ticks_before = store.ticks(None, 500).unwrap().len();
 

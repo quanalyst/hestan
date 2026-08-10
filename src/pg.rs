@@ -1,13 +1,18 @@
 //! the postgres half of the [store](crate::Store): a connection, the schema,
 //! and the two calls every query goes through.
 //!
-//! **the sync client.** `Store` is eighty-odd synchronous methods behind a
-//! mutex and every call site in the crate expects that. `tokio-postgres` would
-//! make all of them async and none of them faster: sqlite blocks the runtime
-//! on one connection today, deliberately, and this matches it. one `Client`
-//! behind the store's existing mutex, no pool — what postgres is for here is
-//! several processes sharing a run log, not one process issuing more
-//! statements at once.
+//! **a sync store over an async client.** `Store` is eighty-odd synchronous
+//! methods behind a mutex and every call site in the crate expects that;
+//! making them async would change all eighty and every caller for nothing,
+//! since sqlite blocks the runtime on one connection today and that is the
+//! accepted architecture. so this blocks too — but it drives the client
+//! itself rather than using the sync `postgres` crate, which owns a runtime
+//! and calls `block_on` on it, and so panics outright the moment it is called
+//! from a thread already driving one. hestan calls the store from async code
+//! nearly everywhere. one connection, one runtime of its own to carry it, and
+//! a caller that waits: the same blocking sqlite already does, and no pool —
+//! what postgres is for here is several processes sharing a run log, not one
+//! process issuing more statements at once.
 //!
 //! **timestamps stay text.** every query in the store compares and orders them
 //! as rfc3339 strings, and `timestamptz` would change ordering and comparison
@@ -20,12 +25,19 @@
 //! database sorts `probe:docs` in a place byte order does not. the run log's
 //! text is ids, names, keys and timestamps — opaque strings that must sort the
 //! same way on both backends or the same query answers two things.
+//!
+//! **no tls.** the connection is what libpq would call `sslmode=disable`: a
+//! unix socket, a private network or a local proxy. it is written down in
+//! `docs/storage.md` rather than pretended about.
 
-use postgres::types::{IsNull, ToSql, Type};
-use postgres::{Client, GenericClient, NoTls};
+use std::future::Future;
+
+use tokio::runtime::Runtime;
+use tokio_postgres::types::{IsNull, ToSql, Type};
+use tokio_postgres::{GenericClient, NoTls, Row};
 
 use crate::error::Error;
-use crate::store::{AnyRow, SCHEMA_VERSION, Val};
+use crate::store::{AnyRow, SCHEMA_VERSION, Val, args};
 
 /// the whole schema at [`SCHEMA_VERSION`], created in one statement batch.
 ///
@@ -225,11 +237,184 @@ CREATE INDEX notifications_delivered ON notifications(delivered_at);
 /// letters, in ascii.
 const BOOT_LOCK: i64 = 0x0068_6573_7461_6e00;
 
+/// and the one dispatchers take turns on when a limit is in force. a different
+/// number, because a boot and a claim have nothing to say to each other.
+const CLAIM_LOCK: i64 = 0x0068_6573_7461_6e01;
+
+/// one postgres connection, and the runtime that carries it.
+///
+/// the runtime is one thread whose whole job is the socket. the futures
+/// themselves are driven by whichever thread called — see [`wait`] — so a
+/// query blocks its caller and nothing else, and a caller that is itself a
+/// task on somebody else's runtime is not the special case it would be with
+/// the sync client.
+pub(crate) struct Client {
+    client: tokio_postgres::Client,
+    /// an `Option` only so that [`Drop`] can take it: dropping a runtime
+    /// blocks, blocking is not allowed on a thread that is driving one, and
+    /// the last handle on a store goes out of scope wherever it happens to —
+    /// which is as likely as not inside a task.
+    rt: Option<Runtime>,
+}
+
+impl Drop for Client {
+    fn drop(&mut self) {
+        if let Some(rt) = self.rt.take() {
+            rt.shutdown_background();
+        }
+    }
+}
+
 /// connect and bring the database to the current schema.
 pub(crate) fn open(url: &str) -> Result<Client, Error> {
-    let mut client = Client::connect(url, NoTls)?;
+    let mut client = connect(url)?;
     migrate(&mut client)?;
     Ok(client)
+}
+
+/// connect and nothing else. the fixtures that make and unmake the schemas the
+/// postgres cases run in need a connection to a database that has no schema
+/// yet, which is the one thing [`open`] will not give them.
+fn connect(url: &str) -> Result<Client, Error> {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .thread_name("hestan-postgres")
+        .enable_all()
+        .build()?;
+    let (client, connection) = wait(&rt, tokio_postgres::connect(url, NoTls))?;
+    // the connection task ends when the client is dropped; an error before
+    // that is the socket going away, which the next statement reports anyway
+    rt.spawn(async {
+        let _ = connection.await;
+    });
+    Ok(Client {
+        client,
+        rt: Some(rt),
+    })
+}
+
+#[cfg(test)]
+pub(crate) fn unmigrated(url: &str) -> Result<Client, Error> {
+    connect(url)
+}
+
+/// drive `f` to completion on the calling thread.
+///
+/// not `Runtime::block_on`, which panics when the thread already has a runtime
+/// — and every store call made from inside an op, a hook or an api handler is
+/// on such a thread. entering gives the future the reactor and the connection
+/// task it needs; blocking the caller is what keeps `Store` synchronous.
+fn wait<T>(rt: &Runtime, f: impl Future<Output = T>) -> T {
+    let _entered = rt.enter();
+    futures::executor::block_on(f)
+}
+
+impl Client {
+    /// the runtime carrying this connection. present for as long as the client
+    /// is — [`Drop`] takes it and nothing else does.
+    fn rt(&self) -> &Runtime {
+        self.rt.as_ref().expect("the runtime outlives its client")
+    }
+
+    pub(crate) fn execute(&mut self, sql: &str, args: &[Val<'_>]) -> Result<usize, Error> {
+        wait(self.rt(), execute(&self.client, sql, args))
+    }
+
+    pub(crate) fn query<T>(
+        &mut self,
+        sql: &str,
+        args: &[Val<'_>],
+        row: impl FnMut(&AnyRow<'_>) -> Result<T, Error>,
+    ) -> Result<Vec<T>, Error> {
+        map(wait(self.rt(), query(&self.client, sql, args))?, row)
+    }
+
+    /// several statements at once, no parameters: ddl and nothing else.
+    #[cfg(test)]
+    pub(crate) fn batch(&mut self, sql: &str) -> Result<(), Error> {
+        wait(self.rt(), self.client.batch_execute(sql))?;
+        Ok(())
+    }
+
+    pub(crate) fn transaction(&mut self) -> Result<Transaction<'_>, Error> {
+        let Client { client, rt } = self;
+        let rt = rt.as_ref().expect("the runtime outlives its client");
+        let tx = wait(rt, client.transaction())?;
+        Ok(Transaction { rt, tx })
+    }
+}
+
+pub(crate) struct Transaction<'a> {
+    rt: &'a Runtime,
+    tx: tokio_postgres::Transaction<'a>,
+}
+
+impl Transaction<'_> {
+    pub(crate) fn execute(&mut self, sql: &str, args: &[Val<'_>]) -> Result<usize, Error> {
+        wait(self.rt, execute(&self.tx, sql, args))
+    }
+
+    pub(crate) fn query<T>(
+        &mut self,
+        sql: &str,
+        args: &[Val<'_>],
+        row: impl FnMut(&AnyRow<'_>) -> Result<T, Error>,
+    ) -> Result<Vec<T>, Error> {
+        map(wait(self.rt, query(&self.tx, sql, args))?, row)
+    }
+
+    /// several statements at once, no parameters: ddl and nothing else.
+    pub(crate) fn batch(&mut self, sql: &str) -> Result<(), Error> {
+        wait(self.rt, self.tx.batch_execute(sql))?;
+        Ok(())
+    }
+
+    /// hold [`CLAIM_LOCK`] until this transaction ends. see `Tx::take_turns`.
+    pub(crate) fn claim_lock(&mut self) -> Result<(), Error> {
+        wait(
+            self.rt,
+            self.tx
+                .execute("SELECT pg_advisory_xact_lock($1)", &[&CLAIM_LOCK]),
+        )?;
+        Ok(())
+    }
+
+    pub(crate) fn commit(self) -> Result<(), Error> {
+        wait(self.rt, self.tx.commit())?;
+        Ok(())
+    }
+}
+
+async fn execute<C: GenericClient>(
+    client: &C,
+    sql: &str,
+    args: &[Val<'_>],
+) -> Result<usize, Error> {
+    let n = client
+        .execute(placeholders(sql).as_str(), &bound(args))
+        .await?;
+    Ok(n as usize)
+}
+
+async fn query<C: GenericClient>(
+    client: &C,
+    sql: &str,
+    args: &[Val<'_>],
+) -> Result<Vec<Row>, Error> {
+    Ok(client
+        .query(placeholders(sql).as_str(), &bound(args))
+        .await?)
+}
+
+fn map<T>(
+    rows: Vec<Row>,
+    mut row: impl FnMut(&AnyRow<'_>) -> Result<T, Error>,
+) -> Result<Vec<T>, Error> {
+    rows.iter().map(|r| row(&AnyRow::Postgres(r))).collect()
+}
+
+fn bound<'a>(args: &'a [Val<'a>]) -> Vec<&'a (dyn ToSql + Sync)> {
+    args.iter().map(|v| v as &(dyn ToSql + Sync)).collect()
 }
 
 /// create the schema, or refuse a database a later build wrote.
@@ -240,55 +425,36 @@ pub(crate) fn open(url: &str) -> Result<Client, Error> {
 /// a v17 step would go below the version read.
 fn migrate(client: &mut Client) -> Result<(), Error> {
     let mut tx = client.transaction()?;
-    tx.execute("SELECT pg_advisory_xact_lock($1)", &[&BOOT_LOCK])?;
+    tx.execute("SELECT pg_advisory_xact_lock(?1)", args![BOOT_LOCK])?;
     // asked this way rather than by reading the table, because a failed read
     // would abort the transaction the write is about to happen in
-    let stamped: bool = tx
-        .query_one("SELECT to_regclass('schema_version') IS NOT NULL", &[])?
-        .get(0);
-    match stamped {
-        true => {
-            let version: i64 = tx
-                .query_one("SELECT version FROM schema_version", &[])?
-                .get(0);
+    let stamped = tx.query(
+        "SELECT to_regclass('schema_version') IS NOT NULL",
+        args![],
+        |row| match row {
+            AnyRow::Postgres(r) => Ok(r.try_get::<_, bool>(0)?),
+            _ => unreachable!("this is the postgres backend"),
+        },
+    )?;
+    match stamped.first() {
+        Some(true) => {
+            let found = tx.query("SELECT version FROM schema_version", args![], |r| r.int(0))?;
+            let version = found.first().copied().unwrap_or_default();
             let version = u32::try_from(version).unwrap_or(u32::MAX);
             if version > SCHEMA_VERSION {
                 return Err(Error::SchemaTooNew(version));
             }
         }
-        false => {
-            tx.batch_execute(SCHEMA)?;
+        _ => {
+            tx.batch(SCHEMA)?;
             tx.execute(
-                "INSERT INTO schema_version (version) VALUES ($1)",
-                &[&i64::from(SCHEMA_VERSION)],
+                "INSERT INTO schema_version (version) VALUES (?1)",
+                args![i64::from(SCHEMA_VERSION)],
             )?;
         }
     }
     tx.commit()?;
     Ok(())
-}
-
-pub(crate) fn execute<C: GenericClient>(
-    client: &mut C,
-    sql: &str,
-    args: &[Val<'_>],
-) -> Result<usize, Error> {
-    let n = client.execute(placeholders(sql).as_str(), &bound(args))?;
-    Ok(n as usize)
-}
-
-pub(crate) fn query<C: GenericClient, T>(
-    client: &mut C,
-    sql: &str,
-    args: &[Val<'_>],
-    mut row: impl FnMut(&AnyRow<'_>) -> Result<T, Error>,
-) -> Result<Vec<T>, Error> {
-    let rows = client.query(placeholders(sql).as_str(), &bound(args))?;
-    rows.iter().map(|r| row(&AnyRow::Postgres(r))).collect()
-}
-
-fn bound<'a>(args: &'a [Val<'a>]) -> Vec<&'a (dyn ToSql + Sync)> {
-    args.iter().map(|v| v as &(dyn ToSql + Sync)).collect()
 }
 
 /// `?1` becomes `$1`. the two dialects number their placeholders identically
@@ -310,7 +476,7 @@ impl ToSql for Val<'_> {
     fn to_sql(
         &self,
         ty: &Type,
-        out: &mut postgres::types::private::BytesMut,
+        out: &mut tokio_postgres::types::private::BytesMut,
     ) -> Result<IsNull, Box<dyn std::error::Error + Sync + Send>> {
         match self {
             Val::Null => Ok(IsNull::Yes),
@@ -325,5 +491,5 @@ impl ToSql for Val<'_> {
         <&str as ToSql>::accepts(ty) || <i64 as ToSql>::accepts(ty)
     }
 
-    postgres::types::to_sql_checked!();
+    tokio_postgres::types::to_sql_checked!();
 }
