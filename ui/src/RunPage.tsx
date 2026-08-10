@@ -7,7 +7,7 @@ import GanttChart from "./GanttChart";
 import MetaList from "./MetaList";
 import StatusDot from "./StatusDot";
 import { GlyphShape } from "./StatusGlyph";
-import { logRows } from "./log";
+import { hits, logRows, marks } from "./log";
 import type { Source } from "./log";
 import type {
   EventLevel,
@@ -130,6 +130,12 @@ function RunView({ id }: { id: string }) {
   // the failure above it
   const [source, setSource] = useState<Source>("both");
   const [level, setLevel] = useState<"all" | EventLevel>("all");
+  const [find, setFind] = useState("");
+  const [only, setOnly] = useState(false);
+  // pinned to the newest line while the run is live, and released the moment
+  // you scroll up: a pane that yanks you back is worse than one that does not
+  // follow at all
+  const [follow, setFollow] = useState(true);
   const [opSel, setOpSel] = useState<string | null>(null);
   const [job, setJob] = useState<JobSummary | null>(null);
   const [pending, setPending] = useState<null | "re-run" | "resume">(null);
@@ -145,7 +151,6 @@ function RunView({ id }: { id: string }) {
   const lastLog = useRef(0);
   const doneRef = useRef(false);
   const logRef = useRef<HTMLDivElement>(null);
-  const stick = useRef(true);
 
   const done = run !== null && isTerminal(run.status);
   // a run that ended badly is the one resume continues; any finished run can be
@@ -232,12 +237,16 @@ function RunView({ id }: { id: string }) {
 
   useEffect(() => {
     const el = logRef.current;
-    if (el && stick.current) el.scrollTop = el.scrollHeight;
-  }, [events, output]);
+    if (el && follow && !done) el.scrollTop = el.scrollHeight;
+  }, [events, output, follow, done]);
 
+  // scrolling away from the tail turns following off; scrolling back to it
+  // does not turn it on, because that would be the yank again
   const onScroll = () => {
     const el = logRef.current;
-    if (el) stick.current = el.scrollHeight - el.scrollTop - el.clientHeight < 40;
+    if (!el) return;
+    const atEnd = el.scrollHeight - el.scrollTop - el.clientHeight < 40;
+    if (!atEnd && follow) setFollow(false);
   };
 
   // re-run redoes the whole job; resume continues this run, optionally from a
@@ -320,7 +329,9 @@ function RunView({ id }: { id: string }) {
         }),
       ]
     : [];
-  const shown = logRows(events, output, { source, kind: filter, level, op: opSel });
+  const shown = logRows(events, output, { source, kind: filter, level, op: opSel, find, only });
+  // counted over what the other filters left, since that is what is on screen
+  const matches = find === "" ? 0 : shown.filter((r) => hits(r, find)).length;
 
   return (
     <>
@@ -507,6 +518,43 @@ function RunView({ id }: { id: string }) {
               </button>
             </>
           )}
+          {/* off once the run is over: there is no newest line to pin to */}
+          {!done && (
+            <>
+              <span className="filter-sep" />
+              <button
+                className={follow ? "text-btn active" : "text-btn"}
+                onClick={() => setFollow((f) => !f)}
+              >
+                follow
+              </button>
+            </>
+          )}
+        </span>
+        <span className="log-find">
+          <input
+            className="filter-input"
+            value={find}
+            placeholder="find in log"
+            onChange={(e) => setFind(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === "Escape") setFind("");
+            }}
+          />
+          {find !== "" && (
+            <>
+              <span className="muted">
+                {matches} line{matches === 1 ? "" : "s"}
+              </span>
+              <button
+                className={only ? "text-btn active" : "text-btn"}
+                onClick={() => setOnly((o) => !o)}
+                disabled={matches === 0}
+              >
+                only
+              </button>
+            </>
+          )}
         </span>
         {output.length > 0 && (
           <a
@@ -522,7 +570,9 @@ function RunView({ id }: { id: string }) {
           <span className="muted">
             {events.length === 0 && output.length === 0
               ? "nothing yet"
-              : "nothing matches the filter"}
+              : find !== "" && only
+                ? `nothing says ${find}`
+                : "nothing matches the filter"}
           </span>
         )}
         {shown.map((r) => (
@@ -546,7 +596,15 @@ function RunView({ id }: { id: string }) {
               {r.attempt !== null && ` #${r.attempt}`}]
             </span>{" "}
             {r.tag !== null && <span className="ev-kind">{r.tag} </span>}
-            {r.message}
+            {/* pieces, never an html string: a log line is whatever an op
+                printed, and this ui builds no element out of one */}
+            {marks(r.message, find).map((piece, i) =>
+              piece.hit ? (
+                <mark key={i}>{piece.text}</mark>
+              ) : (
+                <span key={i}>{piece.text}</span>
+              ),
+            )}
           </div>
         ))}
       </div>

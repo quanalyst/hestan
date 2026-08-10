@@ -506,6 +506,26 @@ button:disabled {
   font-style: italic;
 }
 
+/* a search hit: the ink inverted, which is the one mark this palette has that
+   is not a shape — and it is marking text, where a shape has nowhere to go */
+.log mark {
+  background: var(--ink);
+  color: var(--page);
+}
+
+.log-find {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  margin-left: 12px;
+  font-weight: 400;
+  vertical-align: middle;
+}
+
+.log-find .filter-input {
+  width: 130px;
+}
+
 .log-download {
   margin-left: 12px;
   color: var(--muted);

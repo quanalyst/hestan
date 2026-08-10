@@ -269,6 +269,18 @@ appears.
   the row visible as `failed` with its error. delivery is at-least-once and the
   docs say so next to the api rather than in a footnote. off by default: a hook
   that bumps a metric wants a callback, not a table
+- **an asset's page says why it is stale as a chain of things that provably
+  moved**: the dep whose content changed, the recorded fingerprint against the
+  one it holds now, the build that fingerprint arrived in, and then the same
+  question asked of that build. inferring staleness from clocks cannot say any
+  of it. the catalog beside it searches, filters by state, groups by name
+  prefix and folds a group in the graph, because one flat table is fine at
+  twelve assets and useless at three hundred
+- **backfills you can start**: drag a range across the partition grid, see
+  which keys it covers and what it will cost from what a build of one has
+  actually taken, then start it. no timings on record means it says so rather
+  than quoting a guess, and an empty or already-fresh range is a disabled
+  button with a reason rather than an error after the click
 - the web ui is a prebuilt react bundle embedded in the binary; it polls the
   json api under `/api`
 

@@ -35,7 +35,38 @@ export interface Filters {
   kind: "all" | "logs";
   level: "all" | EventLevel;
   op: string | null;
+  // a substring to find in what was printed; "" is not a search
+  find: string;
+  // narrow to the lines that match, rather than marking them where they are
+  only: boolean;
 }
+
+// one piece of a message: matched, or the text around it. always at least one
+// piece, so a message with no match renders through the same path as one with
+export interface Piece {
+  text: string;
+  hit: boolean;
+}
+
+// a message split around every occurrence of `find`, case-insensitively.
+// pieces rather than html: nothing in this ui builds an element from a string
+export function marks(message: string, find: string): Piece[] {
+  const needle = find.toLowerCase();
+  if (needle === "") return [{ text: message, hit: false }];
+  const pieces: Piece[] = [];
+  const hay = message.toLowerCase();
+  let at = 0;
+  for (let cut = hay.indexOf(needle, at); cut >= 0; cut = hay.indexOf(needle, at)) {
+    if (cut > at) pieces.push({ text: message.slice(at, cut), hit: false });
+    pieces.push({ text: message.slice(cut, cut + needle.length), hit: true });
+    at = cut + needle.length;
+  }
+  if (at < message.length) pieces.push({ text: message.slice(at), hit: false });
+  return pieces;
+}
+
+export const hits = (row: LogRow, find: string) =>
+  find !== "" && row.message.toLowerCase().includes(find.toLowerCase());
 
 function fromEvent(e: RunEvent): LogRow {
   return {
@@ -80,5 +111,8 @@ export function logRows(events: RunEvent[], output: OpLog[], f: Filters): LogRow
     // a line off a pipe has no level, so a level filter hides it rather than
     // guessing one: stderr is where plenty of programs write their progress
     .filter((r) => f.level === "all" || r.level === f.level)
+    // a search marks where it hit by default; narrowing to the hits is a
+    // second decision, because the line above a match is often the point
+    .filter((r) => !f.only || f.find === "" || hits(r, f.find))
     .sort((a, b) => (a.ts < b.ts ? -1 : a.ts > b.ts ? 1 : 0));
 }

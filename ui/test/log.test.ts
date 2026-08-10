@@ -6,7 +6,7 @@
 // run with `npm test` (vite bundles this for node, node runs it).
 import assert from "node:assert/strict";
 import test from "node:test";
-import { logRows } from "../src/log";
+import { logRows, marks } from "../src/log";
 import type { Filters } from "../src/log";
 import type { EventKind, EventLevel, LogStream, OpLog, RunEvent } from "../src/types";
 
@@ -52,6 +52,8 @@ const filters = (over: Partial<Filters> = {}): Filters => ({
   kind: "all",
   level: "all",
   op: null,
+  find: "",
+  only: false,
   ...over,
 });
 
@@ -139,6 +141,53 @@ test("a row says which op, which stream, and which attempt when there was more t
       ["load", "info", null],
     ],
   );
+});
+
+test("a search marks where it hit, and narrows only when asked to", () => {
+  // by default every line stays: the line above a match is often the point
+  assert.deepEqual(messages({ find: "time" }), [
+    "started",
+    "connecting",
+    "asked for a page",
+    "timed out",
+    "retrying",
+    "attempt 1 failed: no",
+  ]);
+  assert.deepEqual(messages({ find: "time", only: true }), ["timed out"]);
+  // an empty search is not a search, whatever the toggle says
+  assert.equal(messages({ find: "", only: true }).length, 6);
+  assert.deepEqual(messages({ find: "nothing says this", only: true }), []);
+  // and it composes with the filters already there rather than replacing them
+  assert.deepEqual(messages({ find: "e", only: true, source: "output" }), [
+    "connecting",
+    "timed out",
+    "retrying",
+  ]);
+});
+
+test("a marked message is pieces, so nothing is ever built out of html", () => {
+  const pieces = (message: string, find: string) =>
+    marks(message, find).map((p) => [p.text, p.hit]);
+  assert.deepEqual(pieces("db locked", "lock"), [
+    ["db ", false],
+    ["lock", true],
+    ["ed", false],
+  ]);
+  // every occurrence, case-insensitively, and the case that was printed is
+  // the case that comes back
+  assert.deepEqual(pieces("Retry, retry", "RETRY"), [
+    ["Retry", true],
+    [", ", false],
+    ["retry", true],
+  ]);
+  assert.deepEqual(pieces("no match here", "zzz"), [["no match here", false]]);
+  assert.deepEqual(pieces("anything", ""), [["anything", false]]);
+  // a hit at either end leaves no empty piece beside it
+  assert.deepEqual(pieces("abc", "abc"), [["abc", true]]);
+  assert.deepEqual(pieces("<b>x</b>", "<b>"), [
+    ["<b>", true],
+    ["x</b>", false],
+  ]);
 });
 
 test("hestan's own line about the capture is marked as hestan's", () => {

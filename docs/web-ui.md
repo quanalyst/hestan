@@ -2,8 +2,8 @@
 
 the ui is a react bundle compiled into the binary; at deploy time the
 executable is all there is. it polls the [json api](http-api.md) and works
-entirely from real state. five pages: jobs (the overview at `/`), a job page,
-assets, runs, and a run page.
+entirely from real state. seven pages: jobs (the overview at `/`), a job page,
+the asset catalog, an asset page, runs, a run page, and a backfill page.
 
 ## The status language
 
@@ -123,39 +123,83 @@ overview), a bar chart of the last finished runs' durations, and a table of
 the ten most recent runs, with an "all runs" link into the runs page
 pre-filtered to this job.
 
-## Assets
+## The catalog
 
 the assets page shows everything registered through `Hestan::assets`,
-polling every 5s. it opens with the asset dag in the same layout as job
-graphs: a fresh asset wears the solid disc, a stale one the hollow ring,
-with the word under the name; source assets (external data with a probe
-instead of a body) additionally carry a muted `source` marker. clicking a
-node — or a table row — opens the detail panel below.
+polling every 5s. every control on it lives in the url — `q`, `state`,
+`sort`, `dir`, `closed`, `graph`, `depth`, `asset` — so a filtered, folded,
+sorted view is a link somebody else can open.
 
-the table lists assets in dependency order: name, kind, deps, the current
-fingerprint as a 12-character prefix (hover for the full hash; an em dash
-for an asset never built), when it was last built, its state, and its
-checks. a [partitioned](assets.md#partitioned-assets) asset has no single
-fingerprint, so that cell reads `built/total` keys instead and the built
-column is an em dash; its state says how many keys are stale and how many
-are missing. a stale asset says why: "dep X changed" or "N deps changed", with
-the recorded -> current short hashes per dep on hover, or "never built" when
-no materialization exists. the checks cell uses the same shapes as
-everything else — a solid disc with "n passed" when every check passed, an ×
+### The graph
+
+the asset dag draws in the same layout as job graphs: a fresh asset wears the
+solid disc, a stale one the hollow ring, with the word under the name; source
+assets (external data with a probe instead of a body) additionally carry a
+muted `source` marker. clicking a node — or a table row — opens the detail
+panel.
+
+drawing every node stops working somewhere past a hundred, so there are three
+ways of drawing fewer:
+
+- **focus.** `focus` narrows to one node and its neighbourhood — deps in both
+  directions, out to 1, 2 or 3 hops. capped at 40 nodes, because a source with
+  sixty dependents has a neighbourhood the size of the graph; past the cap the
+  caption says to fold a group instead.
+- **fold.** the `fold` chips collapse a prefix group to a single node carrying
+  its count, with the edges that crossed the group's boundary rewired to it
+  and the ones inside it gone. the same chips fold the table's groups: one set
+  of folded groups, two views of it.
+- **find.** what the search box below matches is marked in the graph with a
+  heavy outline and everything else recedes. a folded group is findable by
+  what it swallowed, and a search nothing matches marks nothing rather than
+  dimming the whole graph, which would read as a fault.
+
+**past 60 nodes the graph opens focused rather than whole** — on the selected
+asset, or on the first stale one, which is what anyone opening a graph of
+three hundred assets came to look at. 60 is about where the tallest column in
+a realistic graph stops fitting on a screen. `whole` is always one click away
+and the choice is remembered in the url.
+
+### The table
+
+a search box filters by name substring as you type, and a state filter
+separates four questions the engine answers with one word: `fresh`, `stale`,
+`never built` — which is the same verdict as stale, and a different thing to
+look at — and `failed check`, which cuts across the other three.
+
+names carrying a `/` are grouped under the part before the first one:
+`sales/orders` and `sales/returns` are one collapsible `sales` group, and the
+prefix is dropped from the rows underneath since the heading already says it.
+**with no separator anywhere there is no grouping**, since a common substring
+is not a namespace; assets that carry none sort last under their own heading,
+or the first of them reads as the last row of the group above.
+
+the columns are state (with the reason beside it), when it was last built, the
+run that built it, freshness where a policy is declared, and partition
+coverage where the asset is [partitioned](assets.md#partitioned-assets) — the
+last two only when something fills them. all of them sort, and clicking the
+column already sorted turns it around. deps and the current fingerprint are
+not columns: both live on the asset's own page, and neither was ever read
+across three hundred rows.
+
+a stale asset says why in a phrase — "dep X changed", "N deps changed",
+"never built", or the key counts on a partitioned one — with the recorded ->
+current short hashes on hover; the whole story is on
+[the asset's page](#the-asset-page). the checks cell uses the same shapes as
+everything else: a solid disc with "n passed" when every check passed, an ×
 with "n failed" when any did not, and nothing at all when no check has ever
-recorded anything for that asset. assets declared `.auto()` carry an `auto`
-tag. every
-derived row has a `build` action; sources have none, since the endpoint 400s
-on them. a launched build (202) navigates straight to the new run,
-while a build that finds nothing to do reports "up to date" inline. when any
-asset is stale the header shows a "build stale" button that materializes
-every stale asset as a single run.
+recorded anything. `source` and `auto` are tags beside the name, as `late` is.
 
-a **backfills** section appears under the table once any exist: the asset, the
-range, how many partitions have been launched against the total, the status in
-the usual shapes, a link to the chunk running now, and a cancel action while
-one is running. the partition grid re-polls with the panel, so a backfill lands
-cell by cell while you watch it.
+every derived row has a `build` action; sources have none, since the endpoint
+400s on them. a launched build (202) navigates straight to the new run, while
+a build that finds nothing to do reports "up to date" inline. when any asset
+is stale the header shows a "build stale" button that materializes every stale
+asset as a single run.
+
+a **backfills** section appears under the table once any exist: the id
+(linking to [its page](#backfills)), the asset, the range, how many partitions
+have been launched against the total, the status in the usual shapes, a link
+to the chunk running now, and a cancel action while one is running.
 
 asset builds are ordinary runs of the internal `assets` job, so the run
 page, gantt, cancel, and re-run all apply unchanged; the `assets` job
@@ -163,20 +207,118 @@ appears on the jobs overview like any other job, and asset build runs carry
 the `build` trigger on the runs page. checks are ops of that same job, so
 they appear in its dag and gantt as `check:{asset}:{check}` nodes.
 
+## The asset page
+
+`/assets/{name}` is an asset's permanent address — deep-linkable, and what a
+`Meta::asset_ref` points at. the name is a path, so `sales/orders` reads as
+`/assets/sales/orders` rather than as an escape sequence. the header carries
+the kind, when it was last built (or how many of its partitions are fresh),
+the run that produced the current value as a link, the state glyph, and a
+build button.
+
+### Why it is stale
+
+**this is the thing hestan can say that a clock-based orchestrator cannot.**
+staleness here is not a policy verdict about elapsed time: every build records
+its own content fingerprint and the fingerprints of the inputs it consumed, so
+what is on the page is a chain of facts on disk.
+
+each row names an upstream and what it did. three claims, kept apart, because
+collapsing them would be the easy lie:
+
+- **changed** — the dep's content moved. the row carries the fingerprint this
+  asset consumed, the one the dep holds now, the build the second arrived in
+  as a link to its run, and when. the build named is the *oldest* consecutive
+  one holding that fingerprint: a rebuild that produced the same bytes is not
+  when it changed.
+- **is stale itself** — the dep has not been rebuilt yet, so nothing has moved
+  here; rebuilding it is what would move it.
+- **has never been built** — there is no fingerprint to compare against.
+
+under a `changed` row sits the same question asked of that build: which of
+*its* inputs held a different fingerprint than they had for the build before
+it. that recursion goes four levels, so "customers is stale because orders
+changed, in run 3f2a1b8c four hours ago, because the events source moved
+under it" is one glance rather than four page loads. a fingerprint the
+recorded history does not reach names no build at all rather than the nearest
+plausible one.
+
+a partitioned asset's staleness is per key, so it says how many keys were
+built against inputs that have since moved and how many have never been built,
+and the grid below says which.
+
+### Freshness, lineage, and the rest
+
+where a [freshness policy](freshness.md) is declared, the page draws how far
+into its window the asset is — as a length and in words, since "fresh" with
+four of six hours gone is a different fact from "fresh". `within_secs` on the
+api is what makes that sayable: it cannot be derived from `late_by_secs`,
+which is null exactly while the asset is inside its window.
+
+lineage is links in both directions. downstream is the reverse edges, computed
+from the deps every asset already carries rather than from an endpoint of its
+own; a hub asset's sixty dependents wrap as a list with the rest behind a
+count, since sixty names down the page is not lineage.
+
+then the same body the drawer draws, described below — one implementation, so
+the quick look and the permanent page can never say different things.
+
+### Launching a backfill
+
+on a partitioned asset the grid is the control: **drag across it** and the
+cells you crossed are the range. two dates typed into boxes would be the ui
+guessing at a partition scheme, and the key set is already on the screen.
+
+under the grid, what the range covers: the first and last key, how many of
+them a launch would actually build once the already-fresh ones are dropped
+(`skip the ones already fresh` is the api's `only_missing`, on by default),
+and **what it will cost**. the estimate is the median of what a successful
+build of one of this asset's partitions has actually taken, from
+`op_stats` — a failure's duration is how long it took to break, which is not
+how long the work takes. with no history it says *"no build of this asset has
+been timed yet, so no estimate"*: a number with nothing behind it is worse
+than no number. it is quoted as work rather than as wall clock, because chunks
+go out one after another.
+
+nothing obviously wrong is a click. an empty range, a range holding no
+partitions, a range that is entirely fresh already, and an asset whose
+previous backfill is still running are each a **disabled button with the
+reason beside it**, rather than a 400 after the click.
+
+## Backfills
+
+`/backfills/{id}`: the range, how many partitions it holds, the status in the
+usual shapes, and cancel while it is running. the grid draws one cell per
+partition in the same vocabulary as everywhere else — solid built, hatched for
+one whose run failed, hollow for one not launched yet — with the built/failed/
+left counts under it, and the legend appears only once there is more than one
+state in the grid to tell apart.
+
+under that, the chunks: a backfill launches its keys in chunks of the asset's
+build limit, one run each, so each row is a run link, its status, the keys it
+covered and when it started. which run built which key is arithmetic rather
+than a stored fact — the chunk size is `launched` over the number of runs it
+took to launch them. a failed chunk stops the rest going out, and the page
+says so; starting the same range again picks up what is missing.
+
 ### The asset panel
 
-clicking an asset opens a drawer on the right, the same one job pages use
-for ops (escape or × closes it). it carries the asset's kind, the op that
-materializes it when that is not simply its own name (a
-[multi-asset](assets.md#one-op-several-assets)), its deps and its state.
+clicking an asset in the catalog opens a drawer on the right, the same one job
+pages use for ops (escape or × closes it), showing the same body as the asset
+page. its title links through to the page. it carries the asset's kind, the op
+that materializes it when that is not simply its own name (a
+[multi-asset](assets.md#one-op-several-assets)), its deps as links and its
+state.
 
 a partitioned asset then gets the **partition grid**: one cell per key,
 newest first, in the same shape vocabulary as everything else — solid for a
 materialized key, hatched for a stale one, hollow for one never built.
 hovering a cell names the key, its state, its short fingerprint and when it
-was built; clicking one builds exactly that key and follows the run. the grid
-shows the newest 120 keys and counts the rest, and it re-polls with the panel,
-so a backfill lands cell by cell while you watch.
+was built; clicking one builds exactly that key and follows the run — except
+on the asset page, where dragging across the grid picks a
+[backfill range](#launching-a-backfill) instead. the grid shows the newest 120
+keys and counts the rest, and it re-polls with the panel, so a backfill lands
+cell by cell while you watch.
 
 after that comes each check's latest result — status shape, the check name, a
 `warn` marker when a failure there would not fail the run, its message and
@@ -191,9 +333,10 @@ under the newest entry's numbers, each numeric key gets a
 there are three or more points; two points are a delta, which the row already
 says, and one is the value itself.
 
-the panel's selection lives in the url — `/assets?asset=orders` opens that
-asset with its panel already open, which is what a `Meta::asset_ref` links to
-and what makes a panel worth sending to somebody.
+the panel's selection lives in the url — `/assets?asset=orders` opens the
+catalog with that asset's panel already open, which is what a graph click
+records. what a `Meta::asset_ref` links to is the asset's own page, since that
+is the permanent address.
 
 ### Sensors
 
@@ -322,8 +465,19 @@ the diamond for any that never got to start. it answers "what would I speed
 up to make this run faster".
 
 the log streams while the run is live (polling every 1.5s on a cursor,
-stopping once the run is terminal). it auto-follows the tail unless you've
-scrolled up. filters sit in the header, starting with the source: `events`
+stopping once the run is terminal). while it does, a **follow** toggle pins
+the pane to the newest line, and **scrolling up releases it** — scrolling back
+down does not re-arm it, because a pane that yanks you back where you were
+reading is worse than one that does not follow at all. the toggle is absent on
+a finished run, which has no newest line to pin to.
+
+a **find** box searches what was printed, over both sources at once. matches
+are marked where they are and the count says how many lines hold one; `only`
+narrows the pane to those lines, which is a second decision, since the line
+above a match is often the point. the marks are pieces of text rather than
+html, like every other rendered value in this ui.
+
+filters sit in the header, starting with the source: `events`
 (hestan narrating the run), `output` ([what the ops printed](logs.md)), or
 both interleaved by time, which is the default. then `all` vs `logs`
 (`kind=log` only — just your `ctx.info/warn/error` lines, and only relevant
@@ -358,3 +512,10 @@ with no schedules has no schedules section; sparklines and gantt
 render nothing rather than placeholder marks. the assets page with nothing
 registered says so; a never-built asset shows an em dash where a fingerprint
 would be invented; and the sensors table only exists when sensors do.
+
+the ones this ui adds to that list: an asset never built says so and offers
+the build button rather than showing an empty history; an asset with no check
+shows nothing where a table of no rows would go; a backfill estimate with no
+timings behind it says there are none; a graph search that matches nothing
+marks nothing; and a url naming an asset or a backfill that does not exist
+says exactly that, as a missing run does.
