@@ -17,8 +17,8 @@
 - [notifications](notifications.md) — hooks: `on_run_finished`/`RunEvent`, `on_op_finished`/`OpEvent`, per-job scoping, `on_failure`/`RunFailure`, `on_late`/`LateEvent`, the webhook and slack helpers, and durable at-least-once delivery.
 - [launching](launching.md) — presets, params schemas, run tags, subset launches, and cloning a past run.
 - [web ui](web-ui.md) — page-by-page tour of the embedded ui and how it draws status.
-- [scaling](scaling.md) — the run queue, concurrency limits, priority, claims and leases, scheduler and worker roles, the compose example, and the honest limits of sqlite.
+- [scaling](scaling.md) — the run queue, concurrency limits, priority, claims and leases, scheduler and worker roles, the compose example, and what several hosts needs.
 - [http api](http-api.md) — every endpoint, parameter, response shape, and error code.
-- [storage](storage.md) — the sqlite schema, migrations, and crash recovery.
+- [storage](storage.md) — the two backends and how to choose, the schema, migrations, and crash recovery.
 - [embedding](embedding.md) — `serve` vs `run_once` vs `Runner`, testing, consuming from another repo.
 - [development](development.md) — repo layout, quality gates, the ui build loop, adding a migration.

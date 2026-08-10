@@ -4,9 +4,15 @@ check:
     cargo clippy --all-targets -- -D warnings
     cargo clippy --all-targets --features http -- -D warnings
     cargo clippy --all-targets --features capture -- -D warnings
+    cargo clippy --all-targets --features postgres -- -D warnings
     cargo test
     cargo test --features http
     cargo test --features capture
+    cargo test --features postgres
+
+# the same, with the postgres half of the store suite actually running
+check-pg url="postgres://hestan:hestan@localhost/hestan_test":
+    HESTAN_TEST_PG={{url}} cargo test --features postgres
 
 demo:
     cargo run --example demo

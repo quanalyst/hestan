@@ -466,8 +466,14 @@ impl Hestan {
 
     /// where the run log lives; defaults to `hestan.db`. `":memory:"` works
     /// for tests and keeps nothing.
-    pub fn db(mut self, path: impl Into<String>) -> Self {
-        self.db_path = path.into();
+    ///
+    /// a target beginning `postgres://` or `postgresql://` is a
+    /// [postgres](crate::Store::connect) database and anything else is a
+    /// sqlite path. this one string is what an [isolated
+    /// op](crate::Op::isolated)'s child process and every queue worker is
+    /// handed, so every process reaches the same database.
+    pub fn db(mut self, target: impl Into<String>) -> Self {
+        self.db_path = target.into();
         self
     }
 

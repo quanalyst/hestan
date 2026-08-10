@@ -479,12 +479,16 @@ const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 /// spellings and so does everything downstream of here.
 const PG_SCHEMES: [&str; 2] = ["postgres://", "postgresql://"];
 
-/// what the two backends spell differently, listed once.
+/// what the two backends spell differently, listed once — the seven methods
+/// below, plus the placeholder sigil, which is a lexical rewrite on the way
+/// out (`?1` to `$1`, in [`pg`](crate::pg)) and needs no branch anywhere.
 ///
-/// the survey behind this is short — nine `AUTOINCREMENT`s that are DDL and
-/// nothing else, four inserts that yield to whatever is already there,
-/// sqlite's null-safe `IS`, one json walk, one json append, the placeholder
-/// sigil, and the claim itself. everything else is the same text on both.
+/// the survey that opened this phase found six of the seven: nine
+/// `AUTOINCREMENT`s that are DDL and nothing else, four inserts that yield to
+/// whatever is already there, sqlite's null-safe `IS`, one json walk, one json
+/// append and the claim itself. running the store's suite against postgres
+/// found the seventh, which is what running it was for. everything else is the
+/// same text on both.
 ///
 /// naming each one here rather than at eighty call sites is the point: an
 /// explicit branch at a divergence is auditable, and a renderer that

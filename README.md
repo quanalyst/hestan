@@ -5,14 +5,14 @@
 dag-based job orchestration for rust — think dagster's core loop: ops, jobs,
 schedules, a run log, and a small web ui. it is a library, not a service: the
 jobs are async rust in your own binary and the run log is a sqlite file next
-to it, so there is nothing to deploy alongside it.
+to it, so there is nothing to deploy alongside it — or a postgres database,
+when the workers have to live on more than one machine.
 
 ## Alpha
 
 this is `0.1.0-alpha.2`. under 0.x the api changes without a deprecation cycle,
-so read the changelog before bumping — `Store` is public and a postgres backend
-will reshape it. it has not been run in production, and the gaps that are known
-are listed under [not here yet](#not-here-yet).
+so read the changelog before bumping. it has not been run in production, and
+the gaps that are known are listed under [not here yet](#not-here-yet).
 
 the ui and json api have no authentication. bind them to loopback — see
 [SECURITY.md](SECURITY.md).
@@ -182,11 +182,13 @@ appears.
   decisions, any number execute. claiming is a compare-and-set with a renewed
   lease, so exactly one claimer wins a run and a claimer that dies loses it
   rather than stranding it. `Dockerfile` and `docker-compose.yml` run one
-  scheduler and two workers against a shared volume; multi-node needs a store
-  every host can reach, and [scaling](docs/scaling.md) says so plainly
+  scheduler and two workers against a shared volume; past one host, point the
+  same binaries at postgres and nothing else changes
+  ([scaling](docs/scaling.md))
 - every run, op attempt, output, and log event lands in a sqlite file (WAL,
-  one connection behind a mutex — plenty at this scale) with no extra services
-  and optional retention: `Retention::days(30).keep_last(20).failed_days(90)`,
+  one connection behind a mutex — plenty at this scale) with no extra services,
+  or in postgres with `--features postgres` and a url — same schema, same api,
+  and the same test suite runs against both. with optional retention: `Retention::days(30).keep_last(20).failed_days(90)`,
   globally or per job, swept at startup and every hour after it rather than
   only at boot. a run goes only when **every** rule would take it, which is the
   conservative direction; the default keeps everything. the schema migrates
@@ -295,11 +297,10 @@ open http://localhost:4000
 
 `Dockerfile` and `docker-compose.yml` are at the repo root, and it is one
 image — a scheduler and its workers must build the same registry, so they
-differ only by `HESTAN_ROLE`. [docs/scaling.md](docs/scaling.md) has the whole
-of it, including the two limits worth knowing before you plan around them:
-this is multi-process on one host rather than multi-node, because sqlite is
-not reachable over a network, and a postgres backend is the next piece of
-work.
+differ only by `HESTAN_ROLE`. that compose file shares one sqlite file, which
+is multi-process on one host; several hosts want
+`.db("postgres://…")` instead, and [docs/scaling.md](docs/scaling.md) is
+careful about which of that has been run and which of it follows.
 
 ## Docs
 
@@ -338,8 +339,8 @@ the binary is yours: define jobs, then `Hestan::new()...serve(addr)`, or
 
 ## Not here yet
 
-- [ ] postgres store — and with it multi-node. the queue, claims, leases and
-      roles are already backend-agnostic; sqlite is what keeps them to one host
+- [ ] tls to postgres. the connection is `sslmode=disable` today: a socket, a
+      private network, or a proxy that terminates it
 - [ ] post/body http sources
 - [ ] incremental cursors for http sources
 - [ ] paired-param fan-out

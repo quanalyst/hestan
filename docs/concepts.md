@@ -55,7 +55,8 @@ asset builds run as ordinary runs of an internal job named `assets`, so
 everything on this page applies to them unchanged. the model has
 [its own page](assets.md).
 
-all of it lands in sqlite as it happens — see [storage](storage.md). op
+all of it lands in the store as it happens — sqlite by default, postgres if
+you point it at one — see [storage](storage.md). op
 outputs land there too by default, which is wrong for anything bulky;
 [io managers](io-managers.md) move them somewhere else and keep a handle in
 the run log.

@@ -1,5 +1,5 @@
 //! dag-based job orchestration: ops wired into jobs, cron schedules, assets and
-//! sensors, a sqlite run log, and an embedded web ui.
+//! sensors, a run log on sqlite or postgres, and an embedded web ui.
 
 mod app;
 mod asset;

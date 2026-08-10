@@ -89,7 +89,8 @@ keeps the tag; delete the file and you're back on the pin.
 
 ## Where the database lives
 
-`.db(path)` names the sqlite file; the default is `hestan.db` resolved
+`.db(target)` names the sqlite file — or, with `--features postgres`, a
+`postgres://` url ([storage](storage.md#configuring-it)). the default is `hestan.db` resolved
 against the process working directory, so a service manager's `WorkingDirectory`
 decides where it lands — pass an absolute path if that's ever ambiguous. WAL
 mode means `-wal` and `-shm` sidecar files appear next to it while a process

@@ -98,12 +98,24 @@ UPDATE runs SET claimed_by = ?, claimed_at = ?, lease_until = ?
 WHERE id = ? AND claimed_by IS NULL AND status = 'queued'
 ```
 
-One winner by construction, whoever else is looking at the same row. The
-counting of capacity and the claim share one immediate transaction, so two
-dispatchers cannot both read the last free slot and both fill it. On postgres
-this becomes `SELECT ... FOR UPDATE SKIP LOCKED` and holds no global write
-lock; sqlite serializes writers for us, which is the same guarantee on one
-host and no guarantee at all across several.
+One winner by construction, whoever else is looking at the same row. That
+holds on both backends and is what makes a race here a thing that resolves
+rather than a thing to avoid.
+
+How the two get there differs, and it is the reason to run this on
+[postgres](storage.md#postgres). sqlite serializes writers for us: an
+immediate transaction is the only one there is, which is a complete guarantee
+on one host and none at all across several. Postgres reserves the one run a
+dispatcher decided on with `SELECT ... FOR UPDATE SKIP LOCKED`, so several
+dispatchers walk the same queue at the same moment and come away with
+different runs, none of them waiting on any other.
+
+Counting capacity and spending it have to be one decision either way. One
+transaction is enough for that on sqlite; on postgres it is not, because two
+transactions each read the same last free slot from their own snapshot and
+both fill it. So **when a limit is in force — and only then** — postgres
+claimers take turns on an advisory lock for the length of one claim. With no
+limits declared, which is the default, dispatchers never meet.
 
 `claimed_by` is the claimer's **instance id**: eight hex digits, made once per
 process, reported by `GET /api/health` along with the runs that process is
@@ -209,34 +221,57 @@ deployment has `HESTAN_MAX_CONCURRENT_RUNS=4`.
 It is one image. The scheduler and the workers differ only by `HESTAN_ROLE`,
 because they must build the same registry.
 
+## Several hosts
+
+Everything above works on one host with the default sqlite file: several
+containers, one volume, and the compose example just above. Past one host you
+need
+a store every host can reach, and that is what the
+[postgres backend](storage.md#postgres) is:
+
+```rust
+Hestan::new().db("postgres://user:pw@db.internal/hestan").work(None).await
+```
+
+built with `--features postgres`. Nothing else about a deployment changes. The
+queue, the claims, the leases and the roles were always backend-agnostic and
+they still are — one scheduler, any number of workers, the same registry in
+every process.
+
+**What is proven and what merely follows.** hestan's suite runs the queue
+cases twice: worker processes racing one sqlite file, and worker processes
+racing one postgres schema, asserting in both that no run executed twice. Both
+of those are several *processes* against one database. Nobody has run hestan's
+workers on several *hosts*, because the machine the suite runs on is one
+machine — and a process on another host differs from a process on this one
+only in which socket it opens. It follows, and the difference between "it
+follows" and "it was run" is the difference this paragraph exists to keep.
+
+Two things do still hold whatever the backend. **Exactly one process may be
+`All` or `Scheduler`** — postgres does not change that, because two processes
+independently deciding to fire a schedule is two runs and there is no lock
+that would stop it. And **sqlite is still right** for one host: it needs no
+server, and reaching for postgres to run one container is a database to
+operate for nothing.
+
 ## What this does not do
-
-Two limits worth stating plainly rather than discovering.
-
-**Multi-node needs a store every host can reach, and sqlite is not one.**
-Everything above is multi-**process** on one host, which is real and useful and
-is exactly the compose case: three containers, one volume, one file. It is not
-multi-node. sqlite over a network filesystem does not lock correctly, and
-hestan will not pretend otherwise by shipping a config for it. **A postgres
-backend is the next piece of work**, and it is the only thing standing between
-the compose example and several machines — the queue, the claims, the leases
-and the roles are all already backend-agnostic; `claim_next` is one statement
-that becomes `SKIP LOCKED`.
 
 **There is no kubernetes executor and no celery integration, and this page is
 not going to imply otherwise.** Dagster ships three executors because it grew
 three ways to move work off-box. Hestan ships one, and a pod running
 `HESTAN_ROLE=worker` against a shared postgres is what "the kubernetes
-executor" would have been — once that postgres exists. Celery has no Rust
-analogue worth porting; the queue and the workers above are the equivalent
-capability, and calling them that is more useful than an integration page for
-something that is not there.
+executor" would have been — that is the mechanism, and there is no operator, no
+pod template and no autoscaler around it. Celery has no Rust analogue worth
+porting; the queue and the workers above are the equivalent capability, and
+calling them that is more useful than an integration page for something that is
+not there.
 
 ## See also
 
 - [scheduling](scheduling.md) — overlap policies, and why a queued run counts
   as outstanding.
 - [isolation](isolation.md) — the other mechanism that spawns processes.
-- [storage](storage.md) — the queue columns, and what boot recovery sweeps.
+- [storage](storage.md) — the two backends, the queue columns, and what boot
+  recovery sweeps.
 - [http api](http-api.md) — `/api/queue`, `/api/runs/{id}/priority`,
   `/api/health`.

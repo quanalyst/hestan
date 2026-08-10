@@ -1,11 +1,51 @@
 # Storage
 
-everything lands in one sqlite file — no extra services. `Store::open(path)`
-opens (and migrates) it; `":memory:"` gives a throwaway store for tests. file
-databases run in WAL mode. the store is a single rusqlite connection behind a
-mutex, cloneable and shareable across tasks; one writer is plenty at this
-scale, and it also means hestan assumes it is the one *orchestrator* writing
-(see [embedding](embedding.md)).
+two backends and one schema. sqlite is the default and needs no server;
+postgres is for the deployment one file cannot serve.
+
+## Choosing one
+
+|  | sqlite | postgres |
+| --- | --- | --- |
+| services to run | none | one |
+| processes that can share it | any number, on **one host** | any number, on any number of hosts |
+| how a claim is decided | one writer at a time, by the file lock | a row lock, `SKIP LOCKED` |
+| feature | on by default | `--features postgres` |
+
+sqlite is not the lesser option and is not deprecated. for one process, or for
+several on one host — which is the compose example and a great many real
+deployments — it is the right answer and the one with nothing to operate. reach
+for postgres when the workers have to live on more than one machine, and not
+before.
+
+whichever it is, the schema is the same schema, the api is the same api, and
+the same test suite runs against both — see
+[development](development.md#the-store-suite-runs-twice).
+
+## Configuring it
+
+```rust
+Hestan::new().db("hestan.db")                                // a sqlite file
+Hestan::new().db("postgres://user:pw@db.internal/hestan")    // a postgres server
+```
+
+`Hestan::db` takes either. a target beginning `postgres://` or `postgresql://`
+is a url and anything else is a path, and that one string is what an
+[isolated op](isolation.md)'s child process and every
+[queue worker](scaling.md) is handed, so all of them reach the same database.
+without `--features postgres` a url is refused by name — `unsupported
+database: postgres://…` — rather than opened as a very strange filename.
+
+directly, the two constructors are `Store::open(path)` and
+`Store::connect(url)`. `Store::open(":memory:")` gives a throwaway store for
+tests, private to the connection that made it.
+
+## sqlite
+
+one file, no extra services. file databases run in WAL mode. the store is a
+single rusqlite connection behind a mutex, cloneable and shareable across
+tasks; one writer is plenty at this scale, and it also means hestan assumes it
+is the one *orchestrator* writing (see [embedding](embedding.md)).
 
 there are other writers, and they are hestan's own. an [isolated
 op](isolation.md) runs in an op subprocess that opens this same file and
@@ -17,8 +57,58 @@ outright; the claim that decides who executes a run is a compare-and-set in an
 immediate transaction, so it does not depend on timing at all.
 
 that is multi-process on one host. it is not multi-node: sqlite is not
-reachable over a network, and [scaling](scaling.md) says so plainly rather
-than shipping a config that would corrupt.
+reachable over a network, and hestan will not ship a config pretending
+otherwise. that is what the other backend is for.
+
+## Postgres
+
+`--features postgres`, then a url. the schema below is the schema, with four
+deliberate differences and no others:
+
+- `BIGSERIAL` where sqlite has `INTEGER PRIMARY KEY AUTOINCREMENT`, and
+  `BIGINT` where it has `INTEGER`. postgres has two integer widths and this
+  schema only ever means the wide one.
+- **timestamps stay `TEXT`, rfc3339.** every query compares and orders them as
+  strings, and `timestamptz` would change comparison and ordering semantics
+  across the whole store for no gain here. the columns hestan reads as booleans
+  stay integers for the same reason. a row therefore reads back identically off
+  either backend, which is the point.
+- **every text column is `COLLATE "C"`.** sqlite compares text byte by byte and
+  postgres compares it in the database's collation; on an `en_US.UTF-8`
+  database that sorts names and keys in a place byte order does not, so the
+  same query would answer two different things. `C` is byte order, which is
+  what an opaque id, name or timestamp wants.
+- the version stamp is a one-row `schema_version` table, because postgres has
+  no `user_version`.
+
+**a fresh database is created at the current version in one statement batch.**
+there are no postgres databases in the world that predate this backend, so
+there is nothing for the sqlite chain's sixteen steps to migrate and walking
+them would be a re-enactment; from here it is forward-only. postgres ddl is
+transactional, so an interrupted first boot leaves the database exactly as
+found, and two processes booting against the same empty database take turns on
+an advisory lock rather than racing to create the same table. a database
+stamped with a version newer than the build is refused, exactly as a sqlite
+file is.
+
+**it is one connection, not a pool.** a pool would buy parallel statements and
+with them reconnection, a second set of failure modes and transactions that no
+longer sit where the code around them thinks. sqlite already blocks on one
+connection and this matches it deliberately: what postgres is here for is
+several *processes* sharing a run log, not one process issuing more statements
+at once. the client is async and hestan drives it on a runtime of its own, so
+`Store` stays synchronous and no call site changed.
+
+**there is no tls.** the connection is what libpq calls `sslmode=disable`. use
+a unix socket, a private network, or a proxy that terminates tls for you. this
+is a real limitation and it is written down here rather than implied away.
+
+what the two backends spell differently is nine `AUTOINCREMENT`s that are ddl
+and nothing else, four inserts that yield to a row already there, sqlite's
+null-safe `IS`, one json walk for the [tag filter](launching.md#run-tags), one
+json array append, the placeholder sigil, and the claim itself. every one of
+them is named in one place in `src/store.rs`; everything else is the same text
+on both.
 
 ## Schema
 
@@ -285,6 +375,10 @@ the same millisecond can't be dropped or repeated across pages; `before`
 alone keeps the old timestamp-only exclusive compare.
 
 ## Migrations
+
+this section is sqlite's chain, which every existing file walks and no
+postgres database ever will — see [postgres](#postgres) for why one is created
+whole instead.
 
 the schema version lives in `PRAGMA user_version` and `Store::open` migrates
 forward on every open. version 1 is the phase-1 schema (`runs`, `op_runs`,
