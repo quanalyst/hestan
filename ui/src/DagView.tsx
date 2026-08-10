@@ -21,6 +21,9 @@ export interface DagNode {
   note?: string;
   // a short suffix on the label, for a mapped op's instance count ("×3")
   badge?: string;
+  // extra text a search should find this node by, for a node that stands for
+  // several things: a folded group is findable by what is inside it
+  find?: string;
 }
 
 // "absent" is a node a subset run never contained: no status to claim, no glyph
@@ -47,17 +50,27 @@ export default function DagView({
   statuses,
   selected,
   onSelect,
+  highlight,
   label = "op dependency graph",
 }: {
   nodes: DagNode[];
   statuses?: Record<string, NodeStatus>;
   selected?: string | null;
   onSelect?: (name: string) => void;
+  // a substring to find in the graph: everything that matches is marked and
+  // everything else recedes, which is what makes a name findable in a graph
+  // too big to read node by node
+  highlight?: string;
   label?: string;
 }) {
   if (nodes.length === 0) return null;
   const nodeH = statuses ? STATUS_NODE_H : NODE_H;
   const glyphW = statuses ? 16 : 0;
+  const hay = (n: DagNode) => `${n.name} ${n.find ?? ""}`.toLowerCase();
+  const wanted = (highlight ?? "").trim().toLowerCase();
+  // a search nothing matches dims the whole graph, which looks like a fault
+  // rather than an answer, so it does not count as a search
+  const needle = wanted !== "" && nodes.some((n) => hay(n).includes(wanted)) ? wanted : "";
 
   const statusOf = (n: DagNode) => (statuses ? (statuses[n.name] ?? "pending") : undefined);
   const subOf = (n: DagNode) => {
@@ -146,11 +159,13 @@ export default function DagView({
         {[...placed.values()].map(({ node, x: nx, y, w }) => {
           const st = statusOf(node);
           const labelCy = statuses ? y + LABEL_ROW_Y : y + nodeH / 2;
+          const hit = needle !== "" && hay(node).includes(needle);
           const cls =
             [
               st === "skipped" ? "dag-skipped" : null,
               st === "canceled" ? "dag-canceled" : null,
               st === "absent" ? "dag-absent" : null,
+              needle === "" ? null : hit ? "dag-hit" : "dag-miss",
               onSelect ? "dag-click" : null,
               selected === node.name ? "dag-selected" : null,
             ]

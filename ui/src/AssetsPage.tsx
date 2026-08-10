@@ -4,8 +4,19 @@ import { get, post, usePoll } from "./api";
 import { StateGlyph } from "./AssetDetail";
 import AssetPanel from "./AssetPanel";
 import DagView from "./DagView";
+import type { NodeStatus } from "./DagView";
 import { GlyphShape } from "./StatusGlyph";
 import type { Status } from "./StatusGlyph";
+import {
+  SEPARATOR,
+  STATE_FILTERS,
+  filterAssets,
+  groupAssets,
+  groupOf,
+  sortAssets,
+} from "./catalog";
+import type { Dir, SortKey, StateFilter } from "./catalog";
+import { FOCUS_MAX, WHOLE_GRAPH_MAX, collapseGroups, groupNode, neighbourhood } from "./dag";
 import type {
   AssetSummary,
   Backfill,
@@ -14,7 +25,7 @@ import type {
   SensorOutcome,
   SensorSummary,
 } from "./types";
-import { assetPath, fmtDuration, relTime, untilTime } from "./util";
+import { assetPath, fmtDuration, fmtEvery, relTime, shortId, untilTime } from "./util";
 
 const SENSOR_GLYPH = {
   fired: "success",
@@ -32,12 +43,6 @@ const BACKFILL_GLYPH = {
 
 // enough hex to tell fingerprints apart at a glance; the title carries the rest
 const shortHash = (fp: string) => fp.slice(0, 12);
-
-function fmtEvery(secs: number): string {
-  if (secs >= 3600 && secs % 3600 === 0) return `${secs / 3600}h`;
-  if (secs >= 60 && secs % 60 === 0) return `${secs / 60}m`;
-  return `${secs}s`;
-}
 
 // stale with no reasons means no materialization exists at all. a partitioned
 // asset carries its evidence per key, so it counts keys instead
@@ -60,6 +65,49 @@ function staleTitle(a: AssetSummary): string | undefined {
   return a.reasons
     .map((r) => `${r.dep}: ${r.had ? shortHash(r.had) : "—"} -> ${r.now ? shortHash(r.now) : "—"}`)
     .join("\n");
+}
+
+// inside a group the prefix is the heading, so repeating it on every row is
+// noise; an ungrouped row keeps its whole name
+const leafName = (name: string, prefix: string) =>
+  prefix === "" ? name : name.slice(prefix.length + 1);
+
+const coverTitle = (a: AssetSummary) =>
+  a.partitions === null
+    ? undefined
+    : `${a.partitions.materialized} fresh · ${a.partitions.stale} stale · ${a.partitions.missing} never built`;
+
+// a sortable heading: clicking it sorts, clicking it again turns it around.
+// the arrow is the only thing that says which, since the ui has no colour to
+// say it with
+function Column({
+  label,
+  sort,
+  active,
+  dir,
+  onSort,
+}: {
+  label: string;
+  sort: SortKey;
+  active: SortKey;
+  dir: Dir;
+  onSort: (key: SortKey) => void;
+}) {
+  return (
+    <th className="sortable" onClick={() => onSort(sort)}>
+      {label}
+      <span className="sort-mark" aria-hidden="true">
+        {active === sort ? (dir === "asc" ? "↑" : "↓") : ""}
+      </span>
+    </th>
+  );
+}
+
+// a node's staleness, whether it is one asset or a folded group of them
+function staleOf(assets: AssetSummary[], node: string): boolean {
+  const prefix = node.endsWith(SEPARATOR) ? node.slice(0, -1) : null;
+  if (prefix === null) return assets.some((a) => a.name === node && a.stale);
+  return assets.some((a) => groupOf(a.name) === prefix && a.stale);
 }
 
 // the established shape vocabulary: a solid glyph when everything passed, an
@@ -89,13 +137,41 @@ export default function AssetsPage() {
   const [busyAsset, setBusyAsset] = useState<string | null>(null);
   const [rowMsg, setRowMsg] = useState<{ asset: string; msg: string } | null>(null);
   const [sensorErr, setSensorErr] = useState<string | null>(null);
-  // the selection lives in the url, so `?asset=orders` opens that asset's
-  // panel — which is where a Meta::AssetRef link goes, and what makes a
-  // panel worth sending to somebody
+  // every control on this page lives in the url, so a filtered, grouped,
+  // sorted view is a link somebody else can open — including the selection,
+  // which is where a Meta::AssetRef used to point
   const [params, setParams] = useSearchParams();
   const sel = params.get("asset");
+  const query = params.get("q") ?? "";
+  const stateFilter = (params.get("state") ?? "all") as StateFilter;
+  const sortKey = (params.get("sort") ?? "name") as SortKey;
+  const dir = (params.get("dir") ?? "asc") as Dir;
+  // one hop is what feeds it and what it feeds, which is the question that
+  // brought you to a focused graph; two is already most of a wide graph
+  const depth = Number(params.get("depth") ?? 1);
+  const closed = new Set((params.get("closed") ?? "").split(",").filter(Boolean));
+
+  const set = (edits: Record<string, string | null>) =>
+    setParams(
+      (prev) => {
+        for (const [key, value] of Object.entries(edits)) {
+          if (value === null || value === "") prev.delete(key);
+          else prev.set(key, value);
+        }
+        return prev;
+      },
+      { replace: true },
+    );
   const select = (name: string | null) =>
-    setParams(name === null || name === sel ? {} : { asset: name }, { replace: true });
+    set({ asset: name === null || name === sel ? null : name });
+  const toggleGroup = (prefix: string) => {
+    const next = new Set(closed);
+    if (!next.delete(prefix)) next.add(prefix);
+    set({ closed: [...next].join(",") });
+  };
+  // a column already sorted turns around rather than re-sorting the same way
+  const sortBy = (key: SortKey) =>
+    set({ sort: key, dir: sortKey === key && dir === "asc" ? "desc" : "asc" });
 
   usePoll(
     () => {
@@ -174,9 +250,41 @@ export default function AssetsPage() {
 
   const anyStale = assets.some((a) => a.stale);
   const selected = assets.find((a) => a.name === sel) ?? null;
-  const staleness = Object.fromEntries(
-    assets.map((a) => [a.name, a.stale ? "stale" : "fresh"] as const),
-  );
+  const shown = sortAssets(filterAssets(assets, query, stateFilter), sortKey, dir);
+  const groups = groupAssets(shown);
+  // the fold chips are about the registry, not about what survived a filter:
+  // a group filtered down to nothing still has a name and still folds
+  const allGroups = groupAssets(assets).filter((g) => g.prefix !== "");
+  // a column only earns its width where something fills it
+  const anyFreshness = assets.some((a) => a.freshness !== null);
+  const anyPartitioned = assets.some((a) => a.partitions !== null);
+  const columns = 6 + Number(anyFreshness) + Number(anyPartitioned);
+
+  // the graph draws the whole registry rather than the filtered rows: what
+  // feeds a thing does not stop mattering because it was filtered out. the
+  // search highlights in it instead
+  const whole = assets.map((a) => ({
+    name: a.name,
+    deps: a.deps,
+    note: a.kind === "source" ? "source" : undefined,
+  }));
+  const folded = collapseGroups(whole, closed);
+  // past the threshold the whole graph is a picture of having a lot of assets
+  // rather than of how they fit together, so it opens focused — on the
+  // selection, or on the first thing that is stale, which is what anyone
+  // opening a graph of three hundred assets came to look at
+  const mode = params.get("graph") ?? (folded.length > WHOLE_GRAPH_MAX ? "focus" : "whole");
+  const stale = folded.find((n) => staleOf(assets, n.name));
+  const focus = mode === "whole" ? null : (sel ?? stale?.name ?? folded[0]?.name ?? null);
+  const nodes = focus === null ? folded : neighbourhood(folded, focus, depth);
+  const staleness: Record<string, NodeStatus> = Object.fromEntries([
+    ...assets.map((a) => [a.name, a.stale ? "stale" : "fresh"] as const),
+    // a folded group is stale if anything in it is: the one claim that is
+    // true of the group rather than of one of its members
+    ...groupAssets(assets)
+      .filter((g) => g.prefix !== "" && closed.has(g.prefix))
+      .map((g) => [groupNode(g.prefix), g.assets.some((a) => a.stale) ? "stale" : "fresh"] as const),
+  ]);
 
   return (
     <>
@@ -196,103 +304,235 @@ export default function AssetsPage() {
         <p className="muted">no assets registered — declare them with Hestan::assets</p>
       ) : (
         <>
-          <h2>graph</h2>
+          <h2>
+            graph
+            <span className="log-filter">
+              {(["whole", "focus"] as const).map((m) => (
+                <button
+                  key={m}
+                  className={mode === m ? "text-btn active" : "text-btn"}
+                  onClick={() => set({ graph: m })}
+                >
+                  {m}
+                </button>
+              ))}
+            </span>
+            {mode === "focus" && (
+              <span className="log-filter">
+                {[1, 2, 3].map((d) => (
+                  <button
+                    key={d}
+                    className={depth === d ? "text-btn active" : "text-btn"}
+                    onClick={() => set({ depth: String(d) })}
+                  >
+                    {d}
+                  </button>
+                ))}
+              </span>
+            )}
+          </h2>
+          {allGroups.length > 0 && (
+            <div className="group-chips">
+              <span className="filter-label">fold</span>
+              {allGroups.map((g) => (
+                <button
+                  key={g.prefix}
+                  className={closed.has(g.prefix) ? "text-btn active" : "text-btn"}
+                  onClick={() => toggleGroup(g.prefix)}
+                >
+                  {g.prefix}/
+                </button>
+              ))}
+            </div>
+          )}
           <DagView
             label="asset dependency graph"
-            nodes={assets.map((a) => ({
-              name: a.name,
-              deps: a.deps,
-              note: a.kind === "source" ? "source" : undefined,
-            }))}
+            nodes={nodes}
             statuses={staleness}
             selected={sel}
             onSelect={select}
+            highlight={query}
           />
+          <p className="muted dag-action">
+            {focus === null
+              ? `the whole graph · ${nodes.length} nodes`
+              : `focused on ${focus} · ${nodes.length} of ${folded.length} nodes, ${depth} hop${depth > 1 ? "s" : ""} out`}
+            {closed.size > 0 && ` · ${closed.size} group${closed.size > 1 ? "s" : ""} folded`}
+            {focus !== null && nodes.length >= FOCUS_MAX && " · fold a group to see more of it"}
+          </p>
 
-          <h2>assets</h2>
-          <table>
-            <thead>
-              <tr>
-                <th>name</th>
-                <th>kind</th>
-                <th>deps</th>
-                <th>fingerprint</th>
-                <th>built</th>
-                <th>state</th>
-                <th>checks</th>
-                <th>auto</th>
-                <th />
-              </tr>
-            </thead>
-            <tbody>
-              {assets.map((a) => (
-                <tr
-                  key={a.name}
-                  onClick={() => select(a.name)}
+          <h2>
+            assets
+            {shown.length !== assets.length && (
+              <span className="secondary">
+                {" "}
+                — {shown.length} of {assets.length}
+              </span>
+            )}
+          </h2>
+          <div className="filter-row">
+            <span className="filter-group">
+              <span className="filter-label">state</span>
+              {STATE_FILTERS.map((f) => (
+                <button
+                  key={f}
+                  className={stateFilter === f ? "text-btn active" : "text-btn"}
+                  onClick={() => set({ state: f === "all" ? null : f })}
                 >
-                  <td>
-                    {/* the row opens the panel; the name is the permanent
-                        address, which is the thing you send somebody */}
-                    <Link to={assetPath(a.name)} onClick={(e) => e.stopPropagation()}>
-                      {a.name}
-                    </Link>
-                    {a.freshness?.status === "late" && <span className="tag">late</span>}
-                  </td>
-                  <td className="muted">{a.kind}</td>
-                  <td className="muted">{a.deps.length === 0 ? "—" : a.deps.join(", ")}</td>
-                  {/* a partitioned asset has no single fingerprint to show:
-                      how much of its key set is built is the fact instead */}
-                  <td
-                    className="mono"
-                    title={
-                      a.partitions
-                        ? `${a.partitions.materialized} of ${a.partitions.total} partitions built`
-                        : (a.fingerprint ?? undefined)
-                    }
-                  >
-                    {a.partitions
-                      ? `${a.partitions.materialized}/${a.partitions.total}`
-                      : a.fingerprint
-                        ? shortHash(a.fingerprint)
-                        : "—"}
-                  </td>
-                  <td className="muted" title={a.built_at ?? undefined}>
-                    {a.partitions ? "—" : relTime(a.built_at)}
-                  </td>
-                  <td>
-                    <span className="status-cell">
-                      <StateGlyph stale={a.stale} />
-                      {a.stale && (
-                        <span className="muted" title={staleTitle(a)}>
-                          {staleSummary(a)}
-                        </span>
-                      )}
-                    </span>
-                  </td>
-                  <td>
-                    <Checks checks={a.checks} />
-                  </td>
-                  <td>{a.auto && <span className="muted">auto</span>}</td>
-                  <td className="row-action">
-                    {/* sources are probed, never built — the endpoint 400s */}
-                    {a.kind !== "source" && (
-                      <button
-                        className="text-btn"
-                        disabled={busyAsset === a.name}
-                        onClick={(e) => {
-                          e.stopPropagation();
-                          buildOne(a.name);
-                        }}
-                      >
-                        build
-                      </button>
-                    )}
-                    {rowMsg?.asset === a.name && <span className="muted row-err">{rowMsg.msg}</span>}
-                  </td>
-                </tr>
+                  {f === "never" ? "never built" : f === "failed" ? "failed check" : f}
+                </button>
               ))}
-            </tbody>
-          </table>
+            </span>
+            <span className="filter-group">
+              <span className="filter-label">find</span>
+              <input
+                className="filter-input"
+                value={query}
+                placeholder="name"
+                onChange={(e) => set({ q: e.target.value })}
+                onKeyDown={(e) => {
+                  if (e.key === "Escape") set({ q: null });
+                }}
+              />
+            </span>
+          </div>
+          {shown.length === 0 ? (
+            <p className="muted">no asset matches the filter</p>
+          ) : (
+            <table>
+              <thead>
+                <tr>
+                  <Column label="name" sort="name" active={sortKey} dir={dir} onSort={sortBy} />
+                  <Column label="state" sort="state" active={sortKey} dir={dir} onSort={sortBy} />
+                  <Column label="built" sort="built" active={sortKey} dir={dir} onSort={sortBy} />
+                  <th>run</th>
+                  {anyFreshness && (
+                    <Column
+                      label="freshness"
+                      sort="freshness"
+                      active={sortKey}
+                      dir={dir}
+                      onSort={sortBy}
+                    />
+                  )}
+                  {anyPartitioned && (
+                    <Column
+                      label="partitions"
+                      sort="coverage"
+                      active={sortKey}
+                      dir={dir}
+                      onSort={sortBy}
+                    />
+                  )}
+                  <th>checks</th>
+                  <th />
+                </tr>
+              </thead>
+              {groups.map((g) => (
+                <tbody key={g.prefix}>
+                  {/* the unprefixed assets are a heading too, or the first of
+                      them reads as the last row of the group above */}
+                  {groups.length > 1 && g.prefix === "" && (
+                    <tr className="group-row plain-row">
+                      <td colSpan={columns}>
+                        <span className="group-mark" aria-hidden="true" />
+                        <span className="muted">no prefix · {g.assets.length}</span>
+                      </td>
+                    </tr>
+                  )}
+                  {g.prefix !== "" && (
+                    <tr className="group-row" onClick={() => toggleGroup(g.prefix)}>
+                      <td colSpan={columns}>
+                        <span className="group-mark" aria-hidden="true">
+                          {closed.has(g.prefix) ? "▸" : "▾"}
+                        </span>
+                        {g.prefix}
+                        <span className="muted"> · {g.assets.length}</span>
+                      </td>
+                    </tr>
+                  )}
+                  {(g.prefix === "" || !closed.has(g.prefix)) &&
+                    g.assets.map((a) => (
+                      <tr key={a.name} onClick={() => select(a.name)}>
+                        <td>
+                          {/* the row opens the panel; the name is the permanent
+                              address, which is the thing you send somebody */}
+                          <Link to={assetPath(a.name)} onClick={(e) => e.stopPropagation()}>
+                            {leafName(a.name, g.prefix)}
+                          </Link>
+                          {a.kind === "source" && <span className="tag">source</span>}
+                          {a.auto && <span className="tag">auto</span>}
+                          {a.freshness?.status === "late" && <span className="tag">late</span>}
+                        </td>
+                        <td>
+                          <span className="status-cell">
+                            <StateGlyph stale={a.stale} />
+                            {a.stale && (
+                              <span className="muted" title={staleTitle(a)}>
+                                {staleSummary(a)}
+                              </span>
+                            )}
+                          </span>
+                        </td>
+                        <td className="muted" title={a.built_at ?? undefined}>
+                          {a.partitions ? "—" : relTime(a.built_at)}
+                        </td>
+                        <td>
+                          {a.run_id ? (
+                            <Link
+                              className="mono"
+                              to={`/runs/${a.run_id}`}
+                              onClick={(e) => e.stopPropagation()}
+                            >
+                              {shortId(a.run_id)}
+                            </Link>
+                          ) : (
+                            <span className="muted">{a.built_at ? "probe" : "—"}</span>
+                          )}
+                        </td>
+                        {anyFreshness && (
+                          <td className="muted">
+                            {a.freshness === null
+                              ? "—"
+                              : a.freshness.late_by_secs !== null
+                                ? `late by ${fmtDuration(a.freshness.late_by_secs * 1000)}`
+                                : `within ${fmtEvery(a.freshness.within_secs)}`}
+                          </td>
+                        )}
+                        {anyPartitioned && (
+                          <td className="mono" title={a.partitions ? coverTitle(a) : undefined}>
+                            {a.partitions
+                              ? `${a.partitions.materialized}/${a.partitions.total}`
+                              : <span className="muted">—</span>}
+                          </td>
+                        )}
+                        <td>
+                          <Checks checks={a.checks} />
+                        </td>
+                        <td className="row-action">
+                          {/* sources are probed, never built — the endpoint 400s */}
+                          {a.kind !== "source" && (
+                            <button
+                              className="text-btn"
+                              disabled={busyAsset === a.name}
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                buildOne(a.name);
+                              }}
+                            >
+                              build
+                            </button>
+                          )}
+                          {rowMsg?.asset === a.name && (
+                            <span className="muted row-err">{rowMsg.msg}</span>
+                          )}
+                        </td>
+                      </tr>
+                    ))}
+                </tbody>
+              ))}
+            </table>
+          )}
         </>
       )}
 

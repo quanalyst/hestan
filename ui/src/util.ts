@@ -82,6 +82,15 @@ export function numericMetaKeys(metadata: Metadata | null): string[] {
     .map(([name]) => name);
 }
 
+// an interval the way it was declared — `6h`, not `6h 0m`. for a window or a
+// period somebody wrote down, where fmtDuration is for a span that was measured
+export function fmtEvery(secs: number): string {
+  if (secs >= 86400 && secs % 86400 === 0) return `${secs / 86400}d`;
+  if (secs >= 3600 && secs % 3600 === 0) return `${secs / 3600}h`;
+  if (secs >= 60 && secs % 60 === 0) return `${secs / 60}m`;
+  return `${secs}s`;
+}
+
 export function isTerminal(status: RunStatus): boolean {
   return status === "success" || status === "failed" || status === "canceled";
 }

@@ -347,6 +347,17 @@ button:disabled {
   opacity: var(--dim);
 }
 
+/* search-to-highlight: a match takes the ink, everything else recedes. the
+   ring is a shape rather than a colour, so it survives the monochrome rule */
+.dag-hit .dag-node {
+  stroke: var(--ink);
+  stroke-width: 2;
+}
+
+.dag-miss {
+  opacity: var(--dim);
+}
+
 .dag-edge {
   stroke: var(--hairline);
   stroke-width: 1.25;
@@ -1281,6 +1292,57 @@ input.filter-input::placeholder {
 
 .load-more {
   margin: 10px 0 0;
+}
+
+th.sortable {
+  cursor: pointer;
+  user-select: none;
+}
+
+th.sortable:hover {
+  color: var(--ink2);
+}
+
+/* a fixed slot, so the heading does not shift when the arrow appears */
+.sort-mark {
+  display: inline-block;
+  width: 12px;
+  text-align: right;
+  color: var(--ink);
+}
+
+/* a group heading is a row of the table, not a card over it: one rule above,
+   the name, and the count it stands for */
+.group-row td {
+  padding-top: 14px;
+  border-bottom: 1px solid var(--rule);
+  color: var(--ink2);
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.group-mark {
+  display: inline-block;
+  width: 14px;
+  color: var(--muted);
+}
+
+/* the unprefixed heading is a label rather than a control: there is no group
+   there to fold */
+tbody tr.plain-row {
+  cursor: auto;
+}
+
+tbody tr.plain-row:hover {
+  background: none;
+}
+
+.group-chips {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 2px;
+  margin: 6px 0 2px;
 }
 
 /* assets + sensors tables: rows lead nowhere, so don't promise a click */

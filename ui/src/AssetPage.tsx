@@ -6,7 +6,7 @@ import { CHAIN_DEPTH, downstreamOf, linkKind, movedInputs, whenChanged } from ".
 import type { ChainLink } from "./lineage";
 import { GlyphShape } from "./StatusGlyph";
 import type { AssetSummary, Freshness, MaterializationEntry, StaleReason } from "./types";
-import { assetPath, fmtDuration, relTime, shortId } from "./util";
+import { assetPath, fmtDuration, fmtEvery, relTime, shortId } from "./util";
 
 // enough hex to tell fingerprints apart at a glance; the title carries the rest
 const shortHash = (fp: string) => fp.slice(0, 12);
@@ -185,10 +185,10 @@ function FreshnessLine({ freshness }: { freshness: Freshness }) {
       </span>
       <span className="muted">
         {status === "never"
-          ? `nothing has succeeded yet · window ${fmtDuration(within_secs * 1000)}`
+          ? `nothing has succeeded yet · window ${fmtEvery(within_secs)}`
           : late_by_secs !== null
-            ? `late by ${fmtDuration(late_by_secs * 1000)} · window ${fmtDuration(within_secs * 1000)}`
-            : `${fmtDuration((elapsed ?? 0) * 1000)} of ${fmtDuration(within_secs * 1000)} used`}
+            ? `late by ${fmtDuration(late_by_secs * 1000)} · window ${fmtEvery(within_secs)}`
+            : `${fmtDuration((elapsed ?? 0) * 1000)} of ${fmtEvery(within_secs)} used`}
       </span>
     </div>
   );
