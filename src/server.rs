@@ -20,7 +20,7 @@ use crate::asset::{
 };
 use crate::backfill;
 use crate::error::Error;
-use crate::executor::{CancelOutcome, Runner};
+use crate::executor::{self, CancelOutcome, Runner};
 use crate::freshness::{self, asset_freshness};
 use crate::graph;
 use crate::job::Job;
@@ -616,9 +616,15 @@ async fn op_stats(
         .store()
         .recent_op_runs(&name, window)
         .map_err(internal)?;
-    let mut by_op: HashMap<&str, Vec<&OpRun>> = HashMap::new();
+    let mut by_op: HashMap<String, Vec<&OpRun>> = HashMap::new();
     for row in &rows {
-        by_op.entry(row.op.as_str()).or_default().push(row);
+        // a mapped op's instances are its history: attributed to the row's own
+        // name they land under a name the job does not declare, and the op
+        // itself reports no runs at all — which is what a partitioned asset's
+        // op did, for every run of it there had ever been. the executor's rule
+        // for what is an instance is the rule, so it is the one asked
+        let key = executor::instance_of(job, &row.op).map_or_else(|| row.op.clone(), |(op, _)| op);
+        by_op.entry(key).or_default().push(row);
     }
     let ops: Vec<Value> = job
         .ops()
@@ -2116,6 +2122,89 @@ mod tests {
 
         let Json(body) = stats(&st, Some(9999)).await.unwrap();
         assert_eq!(body["ops"][0]["runs"], 3);
+    }
+
+    /// a mapped op writes no `op_runs` row of its own, so reading its history
+    /// under its own name found nothing and reported "no runs yet" — for every
+    /// mapped op, forever, including the op that materializes a partitioned
+    /// asset, which is the one a backfill wants a duration from.
+    #[tokio::test]
+    async fn a_mapped_op_reads_the_history_of_its_instances() {
+        let job = Job::builder("fan")
+            .op(Op::new("keys", |_| async { Ok(json!(["a", "b"])) }))
+            .op(Op::mapped("fetch", |_ctx, _key: String| async { Ok(json!(null)) }).over("keys"))
+            .op(Op::new("keys[extra]", |_| async { Ok(json!(null)) }))
+            .build()
+            .unwrap();
+        let st = state(vec![job]);
+        let store = st.runner.store();
+        // an index and a key: a partitioned asset labels its instances by the
+        // partition, and both are instances of the same mapped op
+        let ops = ["fetch[0]", "fetch[2026-01-05]", "keys[extra]"].map(String::from);
+        let run = Run {
+            id: "r0".into(),
+            job: "fan".into(),
+            status: RunStatus::Success,
+            trigger: Trigger::Manual,
+            params: json!({}),
+            created_at: Utc::now(),
+            started_at: None,
+            finished_at: None,
+            error: None,
+            resumed_from: None,
+            scheduled_for: None,
+            tags: Default::default(),
+            priority: 0,
+            claimed_by: None,
+            claimed_at: None,
+            lease_until: None,
+        };
+        store.create_run(&run, &ops).unwrap();
+        for op in &ops {
+            store.op_started(&run.id, op, 1).unwrap();
+        }
+        store
+            .op_finished(&run.id, "fetch[0]", OpStatus::Success, None, None, None)
+            .unwrap();
+        store
+            .op_finished(
+                &run.id,
+                "fetch[2026-01-05]",
+                OpStatus::Failed,
+                None,
+                None,
+                Some("no"),
+            )
+            .unwrap();
+        store
+            .op_finished(&run.id, "keys[extra]", OpStatus::Success, None, None, None)
+            .unwrap();
+
+        let Json(body) = op_stats(
+            State(st),
+            Path("fan".into()),
+            Ok(Query(OpStatsQuery { runs: None })),
+        )
+        .await
+        .unwrap();
+        let of = |name: &str| {
+            body["ops"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|o| o["op"] == name)
+                .unwrap()
+                .clone()
+        };
+        let fetch = of("fetch");
+        assert_eq!(fetch["runs"], 2, "the instances are the history");
+        assert_eq!(fetch["failures"], 1);
+        assert_eq!(fetch["last_error"], "no");
+        assert!(fetch["avg_ms"].is_number());
+        // a bracketed name whose parent is not a mapped op is an op name and
+        // nothing else, so it keeps its own history
+        assert_eq!(of("keys[extra]")["runs"], 1);
+        assert_eq!(of("keys")["runs"], 0);
     }
 
     #[tokio::test]

@@ -1,6 +1,8 @@
 import { useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { get, post, usePoll } from "./api";
+import { keysInRange, rangeOf } from "./backfill";
+import type { KeyRange } from "./backfill";
 import type { PartitionEntry } from "./types";
 import { relTime } from "./util";
 
@@ -24,13 +26,26 @@ function cellTitle(p: PartitionEntry): string {
 }
 
 // one cell per key, newest first, in the established shape vocabulary: solid
-// materialized, hatched stale, hollow missing. clicking one builds that key.
-export default function PartitionGrid({ asset }: { asset: string }) {
+// materialized, hatched stale, hollow missing. clicking one builds that key —
+// unless the grid was handed a range to fill, in which case dragging across it
+// picks the span a backfill covers and a click builds nothing.
+export default function PartitionGrid({
+  asset,
+  range,
+  onShown,
+}: {
+  asset: string;
+  range?: { value: KeyRange | null; onChange: (r: KeyRange | null) => void };
+  // the keys this grid is drawing, for a caller that has to reason about them
+  onShown?: (shown: PartitionEntry[]) => void;
+}) {
   const nav = useNavigate();
   const [parts, setParts] = useState<PartitionEntry[] | null>(null);
   const [total, setTotal] = useState(0);
   const [busy, setBusy] = useState<string | null>(null);
   const [msg, setMsg] = useState<string | null>(null);
+  // the cell the drag started on; the other end is wherever it is now
+  const [anchor, setAnchor] = useState<string | null>(null);
 
   usePoll(
     () => {
@@ -40,6 +55,7 @@ export default function PartitionGrid({ asset }: { asset: string }) {
         .then((r) => {
           setParts(r.partitions);
           setTotal(r.total);
+          onShown?.(r.partitions);
         })
         .catch(() => setParts([]));
     },
@@ -66,18 +82,38 @@ export default function PartitionGrid({ asset }: { asset: string }) {
   if (parts === null) return <p className="muted">loading…</p>;
   if (parts.length === 0) return <p className="muted">no partitions</p>;
 
+  // a drag in progress shows what it covers as it goes, so the count under the
+  // grid is the count you would get by letting go now
+  const selected = new Set(
+    range === undefined ? [] : keysInRange(parts, range.value).map((p) => p.key),
+  );
+  const extend = (key: string) => {
+    if (anchor === null || range === undefined) return;
+    range.onChange(rangeOf(parts, anchor, key));
+  };
+
   const older = total - parts.length;
   return (
     <>
-      <div className="part-grid">
+      <div
+        className="part-grid"
+        onMouseLeave={() => setAnchor(null)}
+        onMouseUp={() => setAnchor(null)}
+      >
         {parts.map((p) => (
           <button
             key={p.key}
-            className={`part-cell ${p.state}`}
+            className={`part-cell ${p.state}${selected.has(p.key) ? " picked" : ""}`}
             title={cellTitle(p)}
             disabled={busy !== null}
             aria-label={`${p.key}: ${p.state}`}
-            onClick={() => build(p.key)}
+            onMouseDown={() => {
+              if (range === undefined) return;
+              setAnchor(p.key);
+              range.onChange({ from: p.key, to: p.key });
+            }}
+            onMouseEnter={() => extend(p.key)}
+            onClick={() => range === undefined && build(p.key)}
           />
         ))}
       </div>

@@ -1359,7 +1359,8 @@ table.plain-rows tbody tr:hover {
     animation: none;
   }
 
-  .tl-running {
+  .tl-running,
+  .part-cell.running {
     animation: none;
   }
 }
@@ -1405,6 +1406,37 @@ table.plain-rows tbody tr:hover {
   outline-offset: 1px;
 }
 
+/* a cell inside the picked range: the ring is the selection, so the fill
+   still says what state the partition is in */
+.part-cell.picked {
+  outline: 2px solid var(--ink);
+  outline-offset: 1px;
+}
+
+/* the backfill grid draws run states rather than partition states, in the
+   same vocabulary: solid done, hatched failed, hollow not launched yet */
+.part-cell.success {
+  background: var(--mark);
+}
+
+.part-cell.failed {
+  background: repeating-linear-gradient(45deg, var(--mark) 0 1.5px, transparent 1.5px 4px);
+}
+
+.part-cell.running {
+  background: var(--mark);
+  animation: bar-pulse 1.4s ease-in-out infinite;
+}
+
+.part-cell.queued,
+.part-cell.canceled {
+  border-color: var(--rule);
+}
+
+.part-cell.canceled {
+  opacity: var(--dim);
+}
+
 .part-cell:disabled {
   cursor: default;
 }
@@ -1432,6 +1464,39 @@ table.plain-rows tbody tr:hover {
 .part-more {
   margin: 4px 0 0;
   font-size: 12px;
+}
+
+/* the launcher sits under the grid it selects on, so what you picked and what
+   it would cost are in one eyeline with the button */
+.backfill-launch {
+  margin: 10px 0 4px;
+}
+
+.backfill-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 12px;
+  padding: 3px 0;
+  font-size: 12px;
+}
+
+.backfill-row .text-btn {
+  padding-left: 0;
+}
+
+.backfill-only {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  cursor: pointer;
+}
+
+/* a native checkbox paints itself in the platform accent, which is the one
+   colour on the page. the ink is the accent here */
+.backfill-only input {
+  accent-color: var(--ink);
+  margin: 0;
 }
 
 /* the staleness chain: one block per upstream that moved, nested under the

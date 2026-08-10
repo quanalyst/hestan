@@ -542,6 +542,7 @@ export default function AssetsPage() {
           <table className="plain-rows">
             <thead>
               <tr>
+                <th className="num">#</th>
                 <th>asset</th>
                 <th>range</th>
                 <th className="num">progress</th>
@@ -556,7 +557,14 @@ export default function AssetsPage() {
                 const current = b.run_ids[b.run_ids.length - 1];
                 return (
                   <tr key={b.id}>
-                    <td>{b.asset}</td>
+                    <td className="num">
+                      <Link className="mono" to={`/backfills/${b.id}`}>
+                        {b.id}
+                      </Link>
+                    </td>
+                    <td>
+                      <Link to={assetPath(b.asset)}>{b.asset}</Link>
+                    </td>
                     <td className="mono">
                       {b.from_key} → {b.to_key}
                     </td>

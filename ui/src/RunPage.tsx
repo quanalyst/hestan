@@ -33,7 +33,11 @@ import {
 
 const plan = (p: ResumePreview) => `${p.rerun.length} to re-run · ${p.reuse.length} reused`;
 
-const INSTANCE = /^(.*)\[(\d+)\]$/;
+// an instance's label is its index, or the element itself on an op that names
+// its instances by them — which is what makes a partitioned asset's instances
+// read as `daily_orders[2026-01-05]`. so the label is whatever is in the
+// brackets, and what makes it an instance is that its parent is mapped
+const INSTANCE = /^(.*)\[(.+)\]$/;
 
 // a mapped op writes no op_runs row of its own: its instances are the record,
 // so the ui rebuilds the group from their bracketed names
@@ -47,9 +51,15 @@ function fanOut(job: JobSummary | null, ops: OpRun[]): Map<string, OpRun[]> {
     if (group) group.push(o);
     else out.set(m[1], [o]);
   }
-  // element order, which is what the collected output is in
+  // element order, which is what the collected output is in; a key-labelled
+  // instance has no index to order by, so its label is the order
+  const label = (o: OpRun) => INSTANCE.exec(o.op)![2];
   for (const group of out.values())
-    group.sort((a, b) => Number(INSTANCE.exec(a.op)![2]) - Number(INSTANCE.exec(b.op)![2]));
+    group.sort((a, b) => {
+      const [x, y] = [label(a), label(b)];
+      const [i, j] = [Number(x), Number(y)];
+      return Number.isNaN(i) || Number.isNaN(j) ? x.localeCompare(y) : i - j;
+    });
   return out;
 }
 

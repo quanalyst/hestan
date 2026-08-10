@@ -8,10 +8,12 @@ import { fmtBytes, fmtDuration, numericMetaKeys, relTime } from "./util";
 
 const TITLE_CAP = 2000;
 
-// newest first from the api, oldest on the left in the chart
+// newest first from the api, oldest on the left in the chart. a mapped op's
+// samples are its instances, so several of them share a run and the position
+// is what tells two bars apart
 const statBars = (stat: OpStat): MicroBar[] =>
   stat.recent
-    .flatMap((s) => (s.ms === null ? [] : [{ id: s.run_id, value: s.ms, status: s.status }]))
+    .flatMap((s, i) => (s.ms === null ? [] : [{ id: `${s.run_id}:${i}`, value: s.ms, status: s.status }]))
     .reverse();
 
 export default function OpInspector({

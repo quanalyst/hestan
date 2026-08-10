@@ -2,10 +2,19 @@ import { useEffect, useRef, useState } from "react";
 import { Link, useNavigate, useParams } from "react-router-dom";
 import { get, post, usePoll } from "./api";
 import AssetDetail, { StateGlyph } from "./AssetDetail";
+import BackfillLauncher from "./BackfillLauncher";
+import type { KeyRange } from "./backfill";
 import { CHAIN_DEPTH, downstreamOf, linkKind, movedInputs, whenChanged } from "./lineage";
 import type { ChainLink } from "./lineage";
 import { GlyphShape } from "./StatusGlyph";
-import type { AssetSummary, Freshness, MaterializationEntry, StaleReason } from "./types";
+import type {
+  AssetSummary,
+  Backfill,
+  Freshness,
+  MaterializationEntry,
+  PartitionEntry,
+  StaleReason,
+} from "./types";
 import { assetPath, fmtDuration, fmtEvery, relTime, shortId } from "./util";
 
 // enough hex to tell fingerprints apart at a glance; the title carries the rest
@@ -208,6 +217,9 @@ function AssetView({ name }: { name: string }) {
   const [chain, setChain] = useState<ChainLink[] | null>(null);
   const [building, setBuilding] = useState(false);
   const [buildMsg, setBuildMsg] = useState<string | null>(null);
+  const [range, setRange] = useState<KeyRange | null>(null);
+  const [shown, setShown] = useState<PartitionEntry[]>([]);
+  const [backfills, setBackfills] = useState<Backfill[]>([]);
   // the walk reads every asset's reasons, but a new list every 5s is not a new
   // chain — the reasons are what changed it, so the list is held in a ref and
   // the effect turns on those
@@ -220,6 +232,9 @@ function AssetView({ name }: { name: string }) {
           listRef.current = r.assets;
           setAssets(r.assets);
         })
+        .catch(() => {});
+      get<{ backfills: Backfill[] }>("/api/backfills?limit=20")
+        .then((r) => setBackfills(r.backfills))
         .catch(() => {});
     },
     5000,
@@ -266,6 +281,10 @@ function AssetView({ name }: { name: string }) {
 
   const upstream = asset.deps;
   const downstream = downstreamOf(assets, name);
+  // one backfill per asset at a time, which the api enforces and the launcher
+  // says before the click rather than after it
+  const running = backfills.find((b) => b.asset === name && b.status === "running") ?? null;
+  const mine = backfills.filter((b) => b.asset === name);
   // "built" would count a key built against inputs that have since moved,
   // which is exactly the thing the grid draws differently
   const built = asset.partitions
@@ -363,7 +382,46 @@ function AssetView({ name }: { name: string }) {
       </div>
 
       <h2>detail</h2>
-      <AssetDetail asset={asset} />
+      <AssetDetail
+        asset={asset}
+        // a partitioned asset's grid is where a backfill range is picked, so
+        // on the page it selects rather than building the key under the cursor
+        range={asset.partitions ? { value: range, onChange: setRange } : undefined}
+        onShown={setShown}
+        partitionAction={
+          asset.partitions && (
+            <BackfillLauncher
+              asset={asset}
+              shown={shown}
+              range={range}
+              onRange={setRange}
+              running={running}
+            />
+          )
+        }
+      />
+
+      {mine.length > 0 && (
+        <>
+          <h2>backfills</h2>
+          {mine.map((b) => (
+            <div key={b.id} className="tick-row">
+              <Link className="mono" to={`/backfills/${b.id}`}>
+                backfill {b.id}
+              </Link>
+              <span className="mono muted">
+                {b.from_key} → {b.to_key}
+              </span>
+              <span className="muted">
+                {b.launched}/{b.total} launched · {b.status}
+              </span>
+              <span className="muted" title={b.created_at}>
+                {relTime(b.created_at)}
+              </span>
+            </div>
+          ))}
+        </>
+      )}
     </>
   );
 }

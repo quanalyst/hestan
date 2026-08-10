@@ -1414,7 +1414,7 @@ fn planned(job: &Job, plan: Option<&Value>) -> (Vec<String>, HashMap<String, Val
 
 // "process[3]" -> ("process", "3"), but only when `process` is a mapped op of
 // this job; any other bracketed name is just an op name
-fn instance_of(job: &Job, name: &str) -> Option<(String, String)> {
+pub(crate) fn instance_of(job: &Job, name: &str) -> Option<(String, String)> {
     let (parent, label) = name.split_once('[')?;
     let label = label.strip_suffix(']')?;
     job.op(parent)?.mapped_over()?;

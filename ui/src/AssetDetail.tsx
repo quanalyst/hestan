@@ -1,14 +1,17 @@
 import { useEffect, useState } from "react";
+import type { ReactNode } from "react";
 import { Link } from "react-router-dom";
 import { get, usePoll } from "./api";
 import MetaList from "./MetaList";
 import PartitionGrid from "./PartitionGrid";
+import type { KeyRange } from "./backfill";
 import { GlyphShape } from "./StatusGlyph";
 import type {
   AssetCheckResult,
   AssetSummary,
   MaterializationEntry,
   MetaPoint,
+  PartitionEntry,
   Trends,
 } from "./types";
 import { assetPath, numericMetaKeys, relTime, shortId } from "./util";
@@ -33,7 +36,21 @@ export function StateGlyph({ stale }: { stale: boolean }) {
 // what an asset is and what it has done, drawn the same whether it is the
 // drawer on the assets table or the asset's own page — one implementation, so
 // the quick look and the permanent address can never say different things.
-export default function AssetDetail({ asset }: { asset: AssetSummary }) {
+export default function AssetDetail({
+  asset,
+  range,
+  onShown,
+  partitionAction,
+}: {
+  asset: AssetSummary;
+  // a range selection over the partition grid; without one a click on a cell
+  // builds that key, which is what the drawer does
+  range?: { value: KeyRange | null; onChange: (r: KeyRange | null) => void };
+  // the keys the grid is drawing, for a caller that reasons about them
+  onShown?: (shown: PartitionEntry[]) => void;
+  // what sits under the grid: on the page, the backfill launcher
+  partitionAction?: ReactNode;
+}) {
   const [history, setHistory] = useState<MaterializationEntry[] | null>(null);
   const [checks, setChecks] = useState<AssetCheckResult[]>([]);
   const [trends, setTrends] = useState<Trends>({});
@@ -133,7 +150,8 @@ export default function AssetDetail({ asset }: { asset: AssetSummary }) {
       {asset.partitions && (
         <>
           <div className="sub-label">partitions</div>
-          <PartitionGrid asset={asset.name} />
+          <PartitionGrid asset={asset.name} range={range} onShown={onShown} />
+          {partitionAction}
         </>
       )}
 
