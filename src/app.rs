@@ -922,7 +922,7 @@ impl Hestan {
     ) -> Result<crate::isolate::Worked, Error> {
         let (jobs, _) = self.lower()?;
         let resources = resource::build(std::mem::take(&mut self.resources)).await?;
-        let store = Store::open(&self.db_path)?;
+        let store = Store::at(&self.db_path)?;
         logs::set_caps(Some(self.log_bytes), Some(self.log_line_cap));
         let io = Io::new(self.io_default.take(), std::mem::take(&mut self.io_named));
         crate::isolate::run_one_op(&req, &jobs, &store, &io, &resources).await
@@ -989,7 +989,7 @@ impl Hestan {
         // behind saying otherwise
         let resources = resource::build(self.resources).await?;
 
-        let store = Store::open(&self.db_path)?;
+        let store = Store::at(&self.db_path)?;
         logs::set_caps(Some(self.log_bytes), Some(self.log_line_cap));
         store.fail_interrupted()?;
         store.sync_schedules(&schedules)?;

@@ -21,6 +21,7 @@ cron = "0.17"
 futures = "0.3"
 include_dir = "0.7"
 mime_guess = "2"
+postgres = { version = "0.19", optional = true }
 reqwest = { version = "0.12", optional = true, default-features = false, features = ["json", "rustls-tls"] }
 rusqlite = "0.32"
 serde = { version = "1", features = ["derive"] }
@@ -57,6 +58,9 @@ http = ["dep:reqwest"]
 # emit on the run page. off by default: it is the host's subscriber, and
 # hestan does not install one
 capture = ["dep:tracing-subscriber"]
+# a shared run log on a postgres server, for the deployments sqlite's one-host
+# file cannot serve. sqlite stays the default and needs no server
+postgres = ["dep:postgres"]
 
 [[example]]
 name = "http_source"

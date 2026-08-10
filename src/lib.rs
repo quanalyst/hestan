@@ -28,6 +28,10 @@ mod model;
 pub mod notify;
 mod op;
 mod partition;
+// a shared run log on a postgres server. optional because sqlite is the right
+// default for one process and needs no server at all
+#[cfg(feature = "postgres")]
+mod pg;
 mod resource;
 mod retention;
 mod schedule;

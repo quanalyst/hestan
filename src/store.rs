@@ -1,10 +1,11 @@
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
-use rusqlite::{Connection, OptionalExtension, Row, params};
+use rusqlite::{Connection, OptionalExtension};
 use serde_json::Value;
 
 use crate::error::Error;
@@ -364,7 +365,7 @@ CREATE INDEX notifications_due ON notifications(next_attempt_at)
 CREATE INDEX notifications_delivered ON notifications(delivered_at);
 "#;
 
-const SCHEMA_VERSION: u32 = 16;
+pub(crate) const SCHEMA_VERSION: u32 = 16;
 
 // one transaction around every pending step and the version stamp (sqlite DDL
 // is transactional), so a crash mid-migration leaves the db exactly as found
@@ -437,7 +438,7 @@ fn table_exists(conn: &Connection, name: &str) -> Result<bool, Error> {
     let found = conn
         .query_row(
             "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1",
-            params![name],
+            [name],
             |_| Ok(()),
         )
         .optional()?;
@@ -474,15 +475,475 @@ const RUN_NOTIFICATION: &str = "run";
 /// immediately — which would be a lost event, or a lost terminal row.
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// sqlite-backed run history. cheap to clone; safe to share across tasks.
+/// the url scheme a postgres target is named with. libpq accepts both
+/// spellings and so does everything downstream of here.
+const PG_SCHEMES: [&str; 2] = ["postgres://", "postgresql://"];
+
+/// what the two backends spell differently, listed once.
 ///
-/// the second field is the path it was opened at, kept so a runner can tell
-/// whether a child process could open the same database.
+/// the survey behind this is short — nine `AUTOINCREMENT`s that are DDL and
+/// nothing else, four inserts that yield to whatever is already there,
+/// sqlite's null-safe `IS`, one json walk, one json append, the placeholder
+/// sigil, and the claim itself. everything else is the same text on both.
+///
+/// naming each one here rather than at eighty call sites is the point: an
+/// explicit branch at a divergence is auditable, and a renderer that
+/// translated the eighty and silently mis-rendered the eighty-first would not
+/// be. there is deliberately no such renderer.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Dialect {
+    Sqlite,
+    #[cfg(feature = "postgres")]
+    Postgres,
+}
+
+impl Dialect {
+    /// sqlite's null-safe comparison, which postgres spells out. `partition IS
+    /// ?2` matches a null column against a null parameter and `partition = ?2`
+    /// never does, which is the difference between "the unpartitioned asset"
+    /// and "no rows".
+    fn null_safe_eq(self) -> &'static str {
+        match self {
+            Dialect::Sqlite => "IS",
+            #[cfg(feature = "postgres")]
+            Dialect::Postgres => "IS NOT DISTINCT FROM",
+        }
+    }
+
+    /// an insert that yields to the row already there. sqlite says so at the
+    /// front of the statement and postgres at the back, so this is a pair
+    /// rather than a word.
+    fn insert_or_ignore(self) -> (&'static str, &'static str) {
+        match self {
+            Dialect::Sqlite => ("INSERT OR IGNORE INTO", ""),
+            #[cfg(feature = "postgres")]
+            Dialect::Postgres => ("INSERT INTO", "ON CONFLICT DO NOTHING"),
+        }
+    }
+
+    /// whether a run carries exactly the tag `?5 = ?6`. sqlite walks the
+    /// stored json with `json_each`; postgres reads the one key out of it and
+    /// gets null for a run with no tags at all, which is the same answer.
+    fn tag_filter(self) -> &'static str {
+        match self {
+            Dialect::Sqlite => {
+                "EXISTS (SELECT 1 FROM json_each(runs.tags)
+                         WHERE json_each.key = ?5 AND json_each.value = ?6)"
+            }
+            #[cfg(feature = "postgres")]
+            Dialect::Postgres => "runs.tags::json ->> ?5 = ?6",
+        }
+    }
+
+    /// append `?3` to the json array in `run_ids`. both keep the column as
+    /// text; only the function that edits it differs.
+    fn json_append(self) -> &'static str {
+        match self {
+            Dialect::Sqlite => "json_insert(run_ids, '$[#]', ?3)",
+            #[cfg(feature = "postgres")]
+            Dialect::Postgres => "(run_ids::jsonb || to_jsonb(?3::text))::text",
+        }
+    }
+
+    /// whether this history entry's fingerprint differs from the one before
+    /// it, as 0 or 1. sqlite's null-safe `IS NOT` is already an integer and
+    /// postgres's `IS DISTINCT FROM` is a boolean, so one of them says it the
+    /// long way and the column reads the same either way.
+    fn fingerprint_changed(self) -> &'static str {
+        match self {
+            Dialect::Sqlite => {
+                "fingerprint IS NOT LAG(fingerprint) OVER (PARTITION BY partition ORDER BY id)"
+            }
+            #[cfg(feature = "postgres")]
+            Dialect::Postgres => {
+                "CASE WHEN fingerprint IS DISTINCT FROM
+                      LAG(fingerprint) OVER (PARTITION BY partition ORDER BY id)
+                      THEN 1 ELSE 0 END"
+            }
+        }
+    }
+}
+
+/// the database behind a [`Store`], open.
+///
+/// one connection behind one mutex either way. a postgres pool would buy
+/// parallel statements, and with them reconnection, a second set of failure
+/// modes and transactions that no longer sit where the code around them thinks
+/// — sqlite already blocks on one connection and that is the architecture this
+/// matches. what postgres is for here is several *processes* sharing a run log,
+/// not one process issuing more statements at once.
+enum Db {
+    Sqlite(Mutex<Connection>),
+    #[cfg(feature = "postgres")]
+    Postgres(Mutex<postgres::Client>),
+}
+
+/// a bound parameter. one list serves both backends: `Val` rather than each
+/// crate's own, so [`args!`] can be written once at every call site.
+///
+/// three shapes, because the schema has three — text (which is every
+/// timestamp, every status word and every piece of json), integers, and null.
+#[derive(Debug)]
+pub(crate) enum Val<'a> {
+    Null,
+    Text(Cow<'a, str>),
+    Int(i64),
+}
+
+/// the bound parameters of one statement, in source order: `args![job, limit]`
+/// is `?1, ?2`.
+macro_rules! args {
+    () => { &[] as &[Val<'_>] };
+    ($($v:expr),+ $(,)?) => { &[$(Val::from($v)),+] as &[Val<'_>] };
+}
+
+impl<'a> From<&'a str> for Val<'a> {
+    fn from(v: &'a str) -> Val<'a> {
+        Val::Text(Cow::Borrowed(v))
+    }
+}
+
+impl<'a> From<&'a String> for Val<'a> {
+    fn from(v: &'a String) -> Val<'a> {
+        Val::Text(Cow::Borrowed(v))
+    }
+}
+
+impl From<String> for Val<'_> {
+    fn from(v: String) -> Val<'static> {
+        Val::Text(Cow::Owned(v))
+    }
+}
+
+impl From<i64> for Val<'_> {
+    fn from(v: i64) -> Val<'static> {
+        Val::Int(v)
+    }
+}
+
+impl From<u32> for Val<'_> {
+    fn from(v: u32) -> Val<'static> {
+        Val::Int(i64::from(v))
+    }
+}
+
+// hestan's booleans are stored as 0 and 1 on both backends — see the note on
+// the postgres schema — so this is where one becomes the other
+impl From<bool> for Val<'_> {
+    fn from(v: bool) -> Val<'static> {
+        Val::Int(i64::from(v))
+    }
+}
+
+impl<'a, T: Into<Val<'a>>> From<Option<T>> for Val<'a> {
+    fn from(v: Option<T>) -> Val<'a> {
+        v.map_or(Val::Null, Into::into)
+    }
+}
+
+impl rusqlite::ToSql for Val<'_> {
+    fn to_sql(&self) -> rusqlite::Result<rusqlite::types::ToSqlOutput<'_>> {
+        use rusqlite::types::{ToSqlOutput, ValueRef};
+        Ok(match self {
+            Val::Null => ToSqlOutput::Borrowed(ValueRef::Null),
+            Val::Text(s) => ToSqlOutput::Borrowed(ValueRef::Text(s.as_bytes())),
+            Val::Int(i) => ToSqlOutput::Borrowed(ValueRef::Integer(*i)),
+        })
+    }
+}
+
+/// what a statement runs against: a connection, or a transaction on one.
+///
+/// the same three calls either way, so a query written once runs in either
+/// place — which several methods below depend on, being handed a transaction
+/// by one caller and a bare connection by another.
+trait Exec {
+    fn dialect(&self) -> Dialect;
+
+    /// rows affected.
+    fn execute(&mut self, sql: &str, args: &[Val<'_>]) -> Result<usize, Error>;
+
+    fn query<T>(
+        &mut self,
+        sql: &str,
+        args: &[Val<'_>],
+        row: impl FnMut(&AnyRow<'_>) -> Result<T, Error>,
+    ) -> Result<Vec<T>, Error>;
+
+    /// the first row, or none. the first rather than "at most one": that is
+    /// what every caller here means and what rusqlite has always done, and a
+    /// postgres client that errored on a second row instead would be a
+    /// difference between the backends rather than a check on anything.
+    fn query_opt<T>(
+        &mut self,
+        sql: &str,
+        args: &[Val<'_>],
+        row: impl FnMut(&AnyRow<'_>) -> Result<T, Error>,
+    ) -> Result<Option<T>, Error> {
+        Ok(self.query(sql, args, row)?.into_iter().next())
+    }
+}
+
+/// an open connection with the store's mutex held.
+enum Conn<'a> {
+    Sqlite(MutexGuard<'a, Connection>),
+    #[cfg(feature = "postgres")]
+    Postgres(MutexGuard<'a, postgres::Client>),
+}
+
+impl Conn<'_> {
+    /// a transaction. sqlite gets a deferred one, which is what the callers
+    /// that only write want.
+    fn begin(&mut self) -> Result<Tx<'_>, Error> {
+        match self {
+            Conn::Sqlite(c) => Ok(Tx::Sqlite(c.transaction()?)),
+            #[cfg(feature = "postgres")]
+            Conn::Postgres(c) => Ok(Tx::Postgres(c.transaction()?)),
+        }
+    }
+
+    /// a transaction that takes the write lock at `BEGIN` rather than at the
+    /// first write, for the read-then-write sequences that must not have
+    /// another writer in the middle of them.
+    ///
+    /// postgres has no such knob and needs none: its writers do not queue
+    /// behind a database-wide lock, and what those callers rely on is a row
+    /// lock or a conditional update, both of which hold inside an ordinary
+    /// transaction.
+    fn begin_immediate(&mut self) -> Result<Tx<'_>, Error> {
+        match self {
+            Conn::Sqlite(c) => Ok(Tx::Sqlite(
+                c.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?,
+            )),
+            #[cfg(feature = "postgres")]
+            Conn::Postgres(c) => Ok(Tx::Postgres(c.transaction()?)),
+        }
+    }
+
+    /// several statements at once, no parameters: ddl and nothing else.
+    #[cfg(test)]
+    fn batch(&mut self, sql: &str) -> Result<(), Error> {
+        match self {
+            Conn::Sqlite(c) => Ok(c.execute_batch(sql)?),
+            #[cfg(feature = "postgres")]
+            Conn::Postgres(c) => Ok(c.batch_execute(sql)?),
+        }
+    }
+}
+
+impl Exec for Conn<'_> {
+    fn dialect(&self) -> Dialect {
+        match self {
+            Conn::Sqlite(_) => Dialect::Sqlite,
+            #[cfg(feature = "postgres")]
+            Conn::Postgres(_) => Dialect::Postgres,
+        }
+    }
+
+    fn execute(&mut self, sql: &str, args: &[Val<'_>]) -> Result<usize, Error> {
+        match self {
+            Conn::Sqlite(c) => sqlite_execute(c, sql, args),
+            #[cfg(feature = "postgres")]
+            Conn::Postgres(c) => crate::pg::execute(&mut **c, sql, args),
+        }
+    }
+
+    fn query<T>(
+        &mut self,
+        sql: &str,
+        args: &[Val<'_>],
+        row: impl FnMut(&AnyRow<'_>) -> Result<T, Error>,
+    ) -> Result<Vec<T>, Error> {
+        match self {
+            Conn::Sqlite(c) => sqlite_query(c, sql, args, row),
+            #[cfg(feature = "postgres")]
+            Conn::Postgres(c) => crate::pg::query(&mut **c, sql, args, row),
+        }
+    }
+}
+
+/// a transaction on either backend. dropping one rolls it back, which is what
+/// several of the methods below use to abandon a write they decided against.
+enum Tx<'a> {
+    Sqlite(rusqlite::Transaction<'a>),
+    #[cfg(feature = "postgres")]
+    Postgres(postgres::Transaction<'a>),
+}
+
+impl Tx<'_> {
+    fn commit(self) -> Result<(), Error> {
+        match self {
+            Tx::Sqlite(tx) => Ok(tx.commit()?),
+            #[cfg(feature = "postgres")]
+            Tx::Postgres(tx) => Ok(tx.commit()?),
+        }
+    }
+}
+
+impl Exec for Tx<'_> {
+    fn dialect(&self) -> Dialect {
+        match self {
+            Tx::Sqlite(_) => Dialect::Sqlite,
+            #[cfg(feature = "postgres")]
+            Tx::Postgres(_) => Dialect::Postgres,
+        }
+    }
+
+    fn execute(&mut self, sql: &str, args: &[Val<'_>]) -> Result<usize, Error> {
+        match self {
+            Tx::Sqlite(tx) => sqlite_execute(tx, sql, args),
+            #[cfg(feature = "postgres")]
+            Tx::Postgres(tx) => crate::pg::execute(tx, sql, args),
+        }
+    }
+
+    fn query<T>(
+        &mut self,
+        sql: &str,
+        args: &[Val<'_>],
+        row: impl FnMut(&AnyRow<'_>) -> Result<T, Error>,
+    ) -> Result<Vec<T>, Error> {
+        match self {
+            Tx::Sqlite(tx) => sqlite_query(tx, sql, args, row),
+            #[cfg(feature = "postgres")]
+            Tx::Postgres(tx) => crate::pg::query(tx, sql, args, row),
+        }
+    }
+}
+
+fn sqlite_execute(conn: &Connection, sql: &str, args: &[Val<'_>]) -> Result<usize, Error> {
+    Ok(conn.execute(sql, rusqlite::params_from_iter(args))?)
+}
+
+fn sqlite_query<T>(
+    conn: &Connection,
+    sql: &str,
+    args: &[Val<'_>],
+    mut row: impl FnMut(&AnyRow<'_>) -> Result<T, Error>,
+) -> Result<Vec<T>, Error> {
+    let mut stmt = conn.prepare(sql)?;
+    let mut rows = stmt.query(rusqlite::params_from_iter(args))?;
+    let mut out = Vec::new();
+    while let Some(r) = rows.next()? {
+        out.push(row(&AnyRow::Sqlite(r))?);
+    }
+    Ok(out)
+}
+
+/// one row from either backend.
+///
+/// the accessors are here rather than at the call sites because this is where
+/// the two disagree about types: rusqlite reads a column as whatever the value
+/// in it is, postgres as what the column was declared, and both hold hestan's
+/// timestamps as rfc3339 text and its booleans as 0 and 1.
+pub(crate) enum AnyRow<'a> {
+    Sqlite(&'a rusqlite::Row<'a>),
+    #[cfg(feature = "postgres")]
+    Postgres(&'a postgres::Row),
+}
+
+impl AnyRow<'_> {
+    fn text(&self, idx: usize) -> Result<String, Error> {
+        match self {
+            AnyRow::Sqlite(r) => Ok(r.get(idx)?),
+            #[cfg(feature = "postgres")]
+            AnyRow::Postgres(r) => Ok(r.try_get(idx)?),
+        }
+    }
+
+    fn opt_text(&self, idx: usize) -> Result<Option<String>, Error> {
+        match self {
+            AnyRow::Sqlite(r) => Ok(r.get(idx)?),
+            #[cfg(feature = "postgres")]
+            AnyRow::Postgres(r) => Ok(r.try_get(idx)?),
+        }
+    }
+
+    fn int(&self, idx: usize) -> Result<i64, Error> {
+        match self {
+            AnyRow::Sqlite(r) => Ok(r.get(idx)?),
+            #[cfg(feature = "postgres")]
+            AnyRow::Postgres(r) => Ok(r.try_get(idx)?),
+        }
+    }
+
+    fn opt_int(&self, idx: usize) -> Result<Option<i64>, Error> {
+        match self {
+            AnyRow::Sqlite(r) => Ok(r.get(idx)?),
+            #[cfg(feature = "postgres")]
+            AnyRow::Postgres(r) => Ok(r.try_get(idx)?),
+        }
+    }
+
+    /// a stored 0/1 column, which is how both backends keep a boolean here.
+    fn flag(&self, idx: usize) -> Result<bool, Error> {
+        Ok(self.int(idx)? != 0)
+    }
+
+    fn count(&self, idx: usize) -> Result<u32, Error> {
+        let n = self.int(idx)?;
+        u32::try_from(n).map_err(|_| Error::Column(idx, format!("{n} does not fit a u32")))
+    }
+
+    fn size(&self, idx: usize) -> Result<usize, Error> {
+        let n = self.int(idx)?;
+        usize::try_from(n).map_err(|_| Error::Column(idx, format!("{n} does not fit a usize")))
+    }
+
+    fn millis(&self, idx: usize) -> Result<u64, Error> {
+        let n = self.int(idx)?;
+        u64::try_from(n).map_err(|_| Error::Column(idx, format!("{n} does not fit a u64")))
+    }
+
+    fn ts(&self, idx: usize) -> Result<DateTime<Utc>, Error> {
+        parse_ts(idx, &self.text(idx)?)
+    }
+
+    fn opt_ts(&self, idx: usize) -> Result<Option<DateTime<Utc>>, Error> {
+        self.opt_text(idx)?.map(|s| parse_ts(idx, &s)).transpose()
+    }
+
+    fn json(&self, idx: usize) -> Result<Value, Error> {
+        parse_json(idx, &self.text(idx)?)
+    }
+
+    fn opt_json(&self, idx: usize) -> Result<Option<Value>, Error> {
+        self.opt_text(idx)?.map(|s| parse_json(idx, &s)).transpose()
+    }
+
+    fn parse<T: FromStr<Err = String>>(&self, idx: usize) -> Result<T, Error> {
+        self.text(idx)?.parse().map_err(|e| Error::Column(idx, e))
+    }
+
+    fn opt_parse<T: FromStr<Err = String>>(&self, idx: usize) -> Result<Option<T>, Error> {
+        match self.opt_text(idx)? {
+            Some(s) => s.parse().map(Some).map_err(|e| Error::Column(idx, e)),
+            None => Ok(None),
+        }
+    }
+}
+
+fn parse_ts(idx: usize, text: &str) -> Result<DateTime<Utc>, Error> {
+    DateTime::parse_from_rfc3339(text)
+        .map(|t| t.with_timezone(&Utc))
+        .map_err(|e| Error::Column(idx, e.to_string()))
+}
+
+fn parse_json(idx: usize, text: &str) -> Result<Value, Error> {
+    serde_json::from_str(text).map_err(|e| Error::Column(idx, e.to_string()))
+}
+
+/// run history on sqlite or postgres. cheap to clone; safe to share across
+/// tasks.
+///
+/// the second field is the target it was opened at — a path or a url — kept so
+/// a runner can tell whether a child process could reach the same database.
 #[derive(Clone)]
-pub struct Store(Arc<Mutex<Connection>>, Arc<str>);
+pub struct Store(Arc<Db>, Arc<str>);
 
 impl Store {
-    /// open (and migrate) the database at `path`; `":memory:"` works too.
+    /// open (and migrate) the sqlite database at `path`; `":memory:"` works
+    /// too.
     pub fn open(path: &str) -> Result<Store, Error> {
         let mut conn = Connection::open(path)?;
         if path != ":memory:" {
@@ -490,7 +951,47 @@ impl Store {
         }
         conn.busy_timeout(BUSY_TIMEOUT)?;
         migrate(&mut conn)?;
-        Ok(Store(Arc::new(Mutex::new(conn)), path.into()))
+        Ok(Store(Arc::new(Db::Sqlite(Mutex::new(conn))), path.into()))
+    }
+
+    /// open (and migrate) the postgres database at `url` —
+    /// `postgres://user:password@host/database`, as libpq spells it.
+    ///
+    /// a fresh database is created at the current schema version in one go.
+    /// there are no postgres databases in the world that predate this, so
+    /// there is nothing for the sqlite chain's sixteen steps to migrate and
+    /// walking them would only be a re-enactment.
+    #[cfg(feature = "postgres")]
+    pub fn connect(url: &str) -> Result<Store, Error> {
+        let client = crate::pg::open(url)?;
+        Ok(Store(
+            Arc::new(Db::Postgres(Mutex::new(client))),
+            url.into(),
+        ))
+    }
+
+    /// whichever of the two `target` names: a `postgres://` url connects, and
+    /// anything else is a path. what [`Hestan::db`](crate::Hestan::db) is
+    /// handed, and what an [isolated op](crate::Op::isolated)'s child is
+    /// handed again so that it opens the same database its parent did.
+    pub(crate) fn at(target: &str) -> Result<Store, Error> {
+        match PG_SCHEMES.iter().any(|s| target.starts_with(s)) {
+            #[cfg(feature = "postgres")]
+            true => Store::connect(target),
+            #[cfg(not(feature = "postgres"))]
+            true => Err(Error::UnsupportedDb(target.to_string())),
+            false => Store::open(target),
+        }
+    }
+
+    /// the connection, with the mutex held. every method below goes through
+    /// one of these or a [transaction](Conn::begin) on one.
+    fn conn(&self) -> Conn<'_> {
+        match &*self.0 {
+            Db::Sqlite(db) => Conn::Sqlite(db.lock().unwrap()),
+            #[cfg(feature = "postgres")]
+            Db::Postgres(db) => Conn::Postgres(db.lock().unwrap()),
+        }
     }
 
     /// whether this database lives only in this process's memory, and so
@@ -531,13 +1032,16 @@ impl Store {
         key: Option<RunKey<'_>>,
         plan: Option<&Value>,
     ) -> Result<bool, Error> {
-        let mut conn = self.0.lock().unwrap();
-        let tx = conn.transaction()?;
+        let mut conn = self.conn();
+        let (insert, ignore) = conn.dialect().insert_or_ignore();
+        let mut tx = conn.begin()?;
         if let Some(k) = key {
             let claimed = tx.execute(
-                "INSERT OR IGNORE INTO sensor_run_keys (sensor, run_key, run_id, launched_at)
-                 VALUES (?1, ?2, ?3, ?4)",
-                params![k.sensor, k.key, run.id, Utc::now().to_rfc3339()],
+                &format!(
+                    "{insert} sensor_run_keys (sensor, run_key, run_id, launched_at)
+                     VALUES (?1, ?2, ?3, ?4) {ignore}"
+                ),
+                args![k.sensor, k.key, &run.id, Utc::now().to_rfc3339()],
             )?;
             // dropping the transaction rolls it back, so losing the claim
             // leaves neither a run nor a key behind
@@ -550,36 +1054,35 @@ impl Store {
                                  finished_at, error, resumed_from, scheduled_for, tags,
                                  priority, plan)
                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)"#,
-            params![
-                run.id,
-                run.job,
+            args![
+                &run.id,
+                &run.job,
                 run.status.as_str(),
                 run.trigger.as_str(),
                 run.params.to_string(),
                 run.created_at.to_rfc3339(),
                 run.started_at.map(|t| t.to_rfc3339()),
                 run.finished_at.map(|t| t.to_rfc3339()),
-                run.error,
-                run.resumed_from,
+                run.error.as_deref(),
+                run.resumed_from.as_deref(),
                 run.scheduled_for.map(|t| t.to_rfc3339()),
                 tags_col(&run.tags),
                 run.priority,
                 plan.map(|v| v.to_string()),
             ],
         )?;
-        {
-            let mut stmt =
-                tx.prepare("INSERT INTO op_runs (run_id, op, status) VALUES (?1, ?2, ?3)")?;
-            for op in ops {
-                stmt.execute(params![run.id, op, OpStatus::Pending.as_str()])?;
-            }
+        for op in ops {
+            tx.execute(
+                "INSERT INTO op_runs (run_id, op, status) VALUES (?1, ?2, ?3)",
+                args![&run.id, op, OpStatus::Pending.as_str()],
+            )?;
         }
         // same transaction as the row, so a run never exists without its queued event
         tx.execute(
             "INSERT INTO events (run_id, op, level, kind, message, ts)
              VALUES (?1, NULL, ?2, ?3, ?4, ?5)",
-            params![
-                run.id,
+            args![
+                &run.id,
                 EventLevel::Info.as_str(),
                 EventKind::RunQueued.as_str(),
                 "run queued",
@@ -592,14 +1095,11 @@ impl Store {
 
     /// whether `sensor` has already launched a run under `key`.
     pub(crate) fn run_key_claimed(&self, sensor: &str, key: &str) -> Result<bool, Error> {
-        let conn = self.0.lock().unwrap();
-        let found = conn
-            .query_row(
-                "SELECT 1 FROM sensor_run_keys WHERE sensor = ?1 AND run_key = ?2",
-                params![sensor, key],
-                |_| Ok(()),
-            )
-            .optional()?;
+        let found = self.conn().query_opt(
+            "SELECT 1 FROM sensor_run_keys WHERE sensor = ?1 AND run_key = ?2",
+            args![sensor, key],
+            |_| Ok(()),
+        )?;
         Ok(found.is_some())
     }
 
@@ -607,23 +1107,22 @@ impl Store {
     /// their own — a sensor keyed by the day would keep a row per day for as
     /// long as the file exists — so they ride the retention knob.
     pub(crate) fn prune_sensor_run_keys(&self, older_than: DateTime<Utc>) -> Result<usize, Error> {
-        let conn = self.0.lock().unwrap();
-        let removed = conn.execute(
+        self.conn().execute(
             "DELETE FROM sensor_run_keys WHERE launched_at < ?1",
-            params![older_than.to_rfc3339()],
-        )?;
-        Ok(removed)
+            args![older_than.to_rfc3339()],
+        )
     }
 
     /// add a `pending` op_runs row to a run already under way, for one
     /// instance a fan-out just created. the run's own loop is the only caller
     /// and it inserts before spawning, so a row can never land after the run's
-    /// terminal status write; `OR IGNORE` keeps a repeat harmless.
+    /// terminal status write; ignoring a conflict keeps a repeat harmless.
     pub(crate) fn create_op_run(&self, run_id: &str, op: &str) -> Result<(), Error> {
-        let conn = self.0.lock().unwrap();
+        let mut conn = self.conn();
+        let (insert, ignore) = conn.dialect().insert_or_ignore();
         conn.execute(
-            "INSERT OR IGNORE INTO op_runs (run_id, op, status) VALUES (?1, ?2, ?3)",
-            params![run_id, op, OpStatus::Pending.as_str()],
+            &format!("{insert} op_runs (run_id, op, status) VALUES (?1, ?2, ?3) {ignore}"),
+            args![run_id, op, OpStatus::Pending.as_str()],
         )?;
         Ok(())
     }
@@ -656,8 +1155,8 @@ impl Store {
     /// lease-aware: see [`INTERRUPTED`](Self::INTERRUPTED) for what that means
     /// and why it has to be.
     pub(crate) fn fail_interrupted(&self) -> Result<(), Error> {
-        let mut conn = self.0.lock().unwrap();
-        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let mut conn = self.conn();
+        let mut tx = conn.begin_immediate()?;
         let now = Utc::now().to_rfc3339();
         let doomed = format!("SELECT id FROM runs WHERE {}", Self::INTERRUPTED);
         tx.execute(
@@ -669,7 +1168,7 @@ impl Store {
                      finished_at = ?1
                  WHERE status IN ('pending', 'running') AND run_id IN ({doomed})"
             ),
-            params![now],
+            args![&now],
         )?;
         tx.execute(
             &format!(
@@ -678,7 +1177,7 @@ impl Store {
                  FROM runs WHERE {}",
                 Self::INTERRUPTED
             ),
-            params![now],
+            args![&now],
         )?;
         tx.execute(
             &format!(
@@ -687,7 +1186,7 @@ impl Store {
                  WHERE {}",
                 Self::INTERRUPTED
             ),
-            params![now],
+            args![&now],
         )?;
         tx.commit()?;
         Ok(())
@@ -709,14 +1208,11 @@ impl Store {
     /// [`Limits`](crate::Limits) asks the other question, and counts the other
     /// set.
     pub(crate) fn has_active_run(&self, job: &str) -> Result<bool, Error> {
-        let conn = self.0.lock().unwrap();
-        let found = conn
-            .query_row(
-                "SELECT 1 FROM runs WHERE job = ?1 AND status IN ('queued', 'running') LIMIT 1",
-                params![job],
-                |_| Ok(()),
-            )
-            .optional()?;
+        let found = self.conn().query_opt(
+            "SELECT 1 FROM runs WHERE job = ?1 AND status IN ('queued', 'running') LIMIT 1",
+            args![job],
+            |_| Ok(()),
+        )?;
         Ok(found.is_some())
     }
 
@@ -745,10 +1241,10 @@ impl Store {
         limits: &Limits,
         defined: &HashSet<String>,
     ) -> Result<Option<(Run, Option<Value>)>, Error> {
-        let mut conn = self.0.lock().unwrap();
-        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        let counts = in_flight(&tx, limits)?;
-        let candidates = queued(&tx, QUEUE_SCAN)?;
+        let mut conn = self.conn();
+        let mut tx = conn.begin_immediate()?;
+        let counts = in_flight(&mut tx, limits)?;
+        let candidates = queued(&mut tx, QUEUE_SCAN)?;
         let now = Utc::now();
         let until = now + chrono::Duration::from_std(lease).unwrap_or(chrono::Duration::MAX);
         for (mut run, plan) in candidates {
@@ -761,12 +1257,7 @@ impl Store {
             let won = tx.execute(
                 "UPDATE runs SET claimed_by = ?1, claimed_at = ?2, lease_until = ?3
                  WHERE id = ?4 AND claimed_by IS NULL AND status = 'queued'",
-                params![
-                    claimer,
-                    now.to_rfc3339(),
-                    until.to_rfc3339(),
-                    run.id.clone()
-                ],
+                args![claimer, now.to_rfc3339(), until.to_rfc3339(), &run.id],
             )?;
             if won == 0 {
                 continue;
@@ -794,10 +1285,10 @@ impl Store {
         defined: &HashSet<String>,
         limit: u32,
     ) -> Result<Vec<Queued>, Error> {
-        let conn = self.0.lock().unwrap();
-        let mut counts = in_flight(&conn, limits)?;
+        let mut conn = self.conn();
+        let mut counts = in_flight(&mut conn, limits)?;
         let mut out = Vec::new();
-        for (position, (run, _)) in queued(&conn, limit)?.into_iter().enumerate() {
+        for (position, (run, _)) in queued(&mut conn, limit)?.into_iter().enumerate() {
             let blocked = match defined.contains(&run.job) {
                 false => Some(Blocked::Undefined(run.job.clone())),
                 true => counts.blocker(limits, &run.job, &run.tags),
@@ -817,27 +1308,24 @@ impl Store {
     /// how many runs are queued and unclaimed, which is what "queue depth"
     /// means. counted rather than taken from [`queue`](Self::queue), which caps.
     pub(crate) fn queue_depth(&self) -> Result<usize, Error> {
-        let conn = self.0.lock().unwrap();
-        let n: i64 = conn.query_row(
+        let n = self.conn().query_opt(
             "SELECT COUNT(*) FROM runs WHERE status = 'queued' AND claimed_by IS NULL",
-            [],
-            |r| r.get(0),
+            args![],
+            |r| r.size(0),
         )?;
-        Ok(n as usize)
+        Ok(n.unwrap_or_default())
     }
 
     /// move a run up or down the queue. false when there is no such run, and
     /// [`Error::RunActive`] once something has claimed it — by then the
     /// priority has already been spent.
     pub(crate) fn set_run_priority(&self, id: &str, priority: i64) -> Result<bool, Error> {
-        let conn = self.0.lock().unwrap();
-        let found: Option<(String, Option<String>)> = conn
-            .query_row(
-                "SELECT status, claimed_by FROM runs WHERE id = ?1",
-                params![id],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )
-            .optional()?;
+        let mut conn = self.conn();
+        let found = conn.query_opt(
+            "SELECT status, claimed_by FROM runs WHERE id = ?1",
+            args![id],
+            |r| Ok((r.text(0)?, r.opt_text(1)?)),
+        )?;
         let Some((status, claimed_by)) = found else {
             return Ok(false);
         };
@@ -846,7 +1334,7 @@ impl Store {
         }
         conn.execute(
             "UPDATE runs SET priority = ?2 WHERE id = ?1 AND claimed_by IS NULL",
-            params![id, priority],
+            args![id, priority],
         )?;
         Ok(true)
     }
@@ -854,26 +1342,23 @@ impl Store {
     /// say that `claimer` is still here, for every run it holds. returns how
     /// many leases moved, which is how many runs this process is executing.
     pub(crate) fn renew_leases(&self, claimer: &str, lease: Duration) -> Result<usize, Error> {
-        let conn = self.0.lock().unwrap();
         let until = Utc::now() + chrono::Duration::from_std(lease).unwrap_or(chrono::Duration::MAX);
-        let n = conn.execute(
+        self.conn().execute(
             "UPDATE runs SET lease_until = ?2
              WHERE claimed_by = ?1 AND status IN ('queued', 'running')",
-            params![claimer, until.to_rfc3339()],
-        )?;
-        Ok(n)
+            args![claimer, until.to_rfc3339()],
+        )
     }
 
     /// the runs `claimer` currently holds, so a process can say what it is
     /// executing and anyone else can tell who holds what.
     pub(crate) fn held_by(&self, claimer: &str) -> Result<Vec<String>, Error> {
-        let conn = self.0.lock().unwrap();
-        let mut stmt = conn.prepare(
+        self.conn().query(
             "SELECT id FROM runs
              WHERE claimed_by = ?1 AND status IN ('queued', 'running') ORDER BY created_at",
-        )?;
-        let rows = stmt.query_map(params![claimer], |r| r.get(0))?;
-        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+            args![claimer],
+            |r| r.text(0),
+        )
     }
 
     /// take back every run whose claimer stopped saying it was there, and
@@ -892,19 +1377,19 @@ impl Store {
         policy: Reclaim,
         note: impl Fn(&Run) -> Option<Value>,
     ) -> Result<Vec<Run>, Error> {
-        let mut conn = self.0.lock().unwrap();
-        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let mut conn = self.conn();
+        let mut tx = conn.begin_immediate()?;
         let at = Utc::now();
         let now = at.to_rfc3339();
-        let mut expired: Vec<Run> = {
-            let mut stmt = tx.prepare(&format!(
+        let mut expired: Vec<Run> = tx.query(
+            &format!(
                 "SELECT {RUN_COLS} FROM runs
                  WHERE claimed_by IS NOT NULL AND status IN ('queued', 'running')
                    AND (lease_until IS NULL OR lease_until < ?1)"
-            ))?;
-            let rows = stmt.query_map(params![now], run_from_row)?;
-            rows.collect::<Result<Vec<_>, _>>()?
-        };
+            ),
+            args![&now],
+            run_from_row,
+        )?;
         for run in &mut expired {
             let id = run.id.clone();
             let claimer = run.claimed_by.clone().unwrap_or_default();
@@ -915,7 +1400,7 @@ impl Store {
                      error = CASE status WHEN 'running' THEN ?2 ELSE error END,
                      finished_at = ?3, pid = NULL
                  WHERE run_id = ?1 AND status IN ('pending', 'running')",
-                params![id, why, now],
+                args![&id, &why, &now],
             )?;
             let (level, kind, message) = match policy {
                 Reclaim::Fail => (EventLevel::Error, EventKind::RunFailed, why.clone()),
@@ -928,7 +1413,7 @@ impl Store {
             tx.execute(
                 "INSERT INTO events (run_id, op, level, kind, message, ts)
                  VALUES (?1, NULL, ?2, ?3, ?4, ?5)",
-                params![id, level.as_str(), kind.as_str(), message, now],
+                args![&id, level.as_str(), kind.as_str(), message, &now],
             )?;
             match policy {
                 Reclaim::Fail => {
@@ -936,14 +1421,14 @@ impl Store {
                         "UPDATE runs SET status = 'failed', finished_at = ?2, lease_until = NULL,
                              error = COALESCE(error, ?3)
                          WHERE id = ?1",
-                        params![id, now, why],
+                        args![&id, &now, &why],
                     )?;
                     run.status = RunStatus::Failed;
                     run.finished_at = Some(at);
                     run.lease_until = None;
                     run.error.get_or_insert(why);
                     if let Some(payload) = note(run) {
-                        queue_note(&tx, &payload, at)?;
+                        queue_note(&mut tx, &payload, at)?;
                     }
                 }
                 // back to exactly what an unclaimed queued run is: no owner, no
@@ -953,7 +1438,7 @@ impl Store {
                         "UPDATE runs SET status = 'queued', claimed_by = NULL, claimed_at = NULL,
                              lease_until = NULL, started_at = NULL
                          WHERE id = ?1",
-                        params![id],
+                        args![&id],
                     )?;
                     run.status = RunStatus::Queued;
                     run.claimed_at = None;
@@ -975,10 +1460,9 @@ impl Store {
         claimer: &str,
         lease_until: Option<DateTime<Utc>>,
     ) -> Result<(), Error> {
-        let conn = self.0.lock().unwrap();
-        conn.execute(
+        self.conn().execute(
             "UPDATE runs SET claimed_by = ?2, claimed_at = ?3, lease_until = ?4 WHERE id = ?1",
-            params![
+            args![
                 id,
                 claimer,
                 Utc::now().to_rfc3339(),
@@ -993,14 +1477,14 @@ impl Store {
     /// canceled. false means it was claimed in the meantime and has to be
     /// stopped the ordinary way.
     pub(crate) fn cancel_queued(&self, id: &str) -> Result<bool, Error> {
-        let mut conn = self.0.lock().unwrap();
-        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let mut conn = self.conn();
+        let mut tx = conn.begin_immediate()?;
         let now = Utc::now().to_rfc3339();
         let taken = tx.execute(
             "UPDATE runs SET status = 'canceled', finished_at = ?2,
                  error = COALESCE(error, 'canceled before it started')
              WHERE id = ?1 AND status = 'queued' AND claimed_by IS NULL",
-            params![id, now],
+            args![id, &now],
         )?;
         if taken == 0 {
             tx.commit()?;
@@ -1010,12 +1494,12 @@ impl Store {
             "UPDATE op_runs SET status = 'canceled', error = 'canceled before it started',
                  finished_at = ?2
              WHERE run_id = ?1 AND status = 'pending'",
-            params![id, now],
+            args![id, &now],
         )?;
         tx.execute(
             "INSERT INTO events (run_id, op, level, kind, message, ts)
              VALUES (?1, NULL, 'warn', 'run_canceled', 'canceled before it started', ?2)",
-            params![id, now],
+            args![id, &now],
         )?;
         tx.commit()?;
         Ok(true)
@@ -1024,10 +1508,9 @@ impl Store {
     /// `at` is passed in rather than read here so the row and the event the
     /// executor hands its hooks carry the same instant.
     pub(crate) fn run_started(&self, id: &str, at: DateTime<Utc>) -> Result<(), Error> {
-        let conn = self.0.lock().unwrap();
-        conn.execute(
+        self.conn().execute(
             "UPDATE runs SET status = ?1, started_at = ?2 WHERE id = ?3",
-            params![RunStatus::Running.as_str(), at.to_rfc3339(), id],
+            args![RunStatus::Running.as_str(), at.to_rfc3339(), id],
         )?;
         Ok(())
     }
@@ -1049,18 +1532,18 @@ impl Store {
         at: DateTime<Utc>,
         note: Option<&Value>,
     ) -> Result<(), Error> {
-        let mut conn = self.0.lock().unwrap();
-        let tx = conn.transaction()?;
+        let mut conn = self.conn();
+        let mut tx = conn.begin()?;
         // and the lease with it: there is nothing left to renew, and a run that
         // is over must never look reclaimable
         tx.execute(
             "UPDATE runs SET status = ?1, finished_at = ?2, error = COALESCE(?3, error),
                  lease_until = NULL
              WHERE id = ?4",
-            params![status.as_str(), at.to_rfc3339(), error, id],
+            args![status.as_str(), at.to_rfc3339(), error, id],
         )?;
         if let Some(note) = note {
-            queue_note(&tx, note, at)?;
+            queue_note(&mut tx, note, at)?;
         }
         tx.commit()?;
         Ok(())
@@ -1072,14 +1555,15 @@ impl Store {
         now: DateTime<Utc>,
         limit: u32,
     ) -> Result<Vec<Notification>, Error> {
-        let conn = self.0.lock().unwrap();
-        let mut stmt = conn.prepare(&format!(
-            "SELECT {NOTIFICATION_COLS} FROM notifications
-             WHERE delivered_at IS NULL AND next_attempt_at <= ?1
-             ORDER BY id LIMIT ?2"
-        ))?;
-        let rows = stmt.query_map(params![now.to_rfc3339(), limit], notification_from_row)?;
-        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+        self.conn().query(
+            &format!(
+                "SELECT {NOTIFICATION_COLS} FROM notifications
+                 WHERE delivered_at IS NULL AND next_attempt_at <= ?1
+                 ORDER BY id LIMIT ?2"
+            ),
+            args![now.to_rfc3339(), limit],
+            notification_from_row,
+        )
     }
 
     /// what `state` covers, newest first. `None` is all of them.
@@ -1094,13 +1578,14 @@ impl Store {
             Some(DeliveryState::Pending) => "delivered_at IS NULL AND next_attempt_at IS NOT NULL",
             Some(DeliveryState::Failed) => "delivered_at IS NULL AND next_attempt_at IS NULL",
         };
-        let conn = self.0.lock().unwrap();
-        let mut stmt = conn.prepare(&format!(
-            "SELECT {NOTIFICATION_COLS} FROM notifications
-             WHERE {filter} ORDER BY id DESC LIMIT ?1"
-        ))?;
-        let rows = stmt.query_map(params![limit], notification_from_row)?;
-        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+        self.conn().query(
+            &format!(
+                "SELECT {NOTIFICATION_COLS} FROM notifications
+                 WHERE {filter} ORDER BY id DESC LIMIT ?1"
+            ),
+            args![limit],
+            notification_from_row,
+        )
     }
 
     /// mark one delivered. guarded on it not already being so, which is what
@@ -1108,11 +1593,10 @@ impl Store {
     /// though it says nothing about the *hook* having run twice, and hestan
     /// promises at-least-once and no more.
     pub(crate) fn delivered(&self, id: i64, at: DateTime<Utc>) -> Result<bool, Error> {
-        let conn = self.0.lock().unwrap();
-        let marked = conn.execute(
+        let marked = self.conn().execute(
             "UPDATE notifications SET delivered_at = ?1, last_error = NULL
              WHERE id = ?2 AND delivered_at IS NULL",
-            params![at.to_rfc3339(), id],
+            args![at.to_rfc3339(), id],
         )?;
         Ok(marked > 0)
     }
@@ -1127,11 +1611,10 @@ impl Store {
         next: Option<DateTime<Utc>>,
         error: &str,
     ) -> Result<(), Error> {
-        let conn = self.0.lock().unwrap();
-        conn.execute(
+        self.conn().execute(
             "UPDATE notifications SET attempts = ?1, next_attempt_at = ?2, last_error = ?3
              WHERE id = ?4",
-            params![attempts, next.map(|t| t.to_rfc3339()), error, id],
+            args![attempts, next.map(|t| t.to_rfc3339()), error, id],
         )?;
         Ok(())
     }
@@ -1141,10 +1624,9 @@ impl Store {
     /// the one thing a process cannot do to itself honestly.
     #[cfg(test)]
     pub(crate) fn undeliver(&self, id: i64, due: DateTime<Utc>) -> Result<(), Error> {
-        let conn = self.0.lock().unwrap();
-        conn.execute(
+        self.conn().execute(
             "UPDATE notifications SET delivered_at = NULL, next_attempt_at = ?1 WHERE id = ?2",
-            params![due.to_rfc3339(), id],
+            args![due.to_rfc3339(), id],
         )?;
         Ok(())
     }
@@ -1154,25 +1636,22 @@ impl Store {
     /// something outstanding, and a sweep that quietly cleared it would be the
     /// same loss this table exists to prevent.
     pub(crate) fn prune_notifications(&self, older_than: DateTime<Utc>) -> Result<usize, Error> {
-        let conn = self.0.lock().unwrap();
-        let removed = conn.execute(
+        self.conn().execute(
             "DELETE FROM notifications WHERE delivered_at IS NOT NULL AND delivered_at < ?1",
-            params![older_than.to_rfc3339()],
-        )?;
-        Ok(removed)
+            args![older_than.to_rfc3339()],
+        )
     }
 
     pub(crate) fn op_started(&self, run_id: &str, op: &str, attempts: u32) -> Result<(), Error> {
-        let conn = self.0.lock().unwrap();
         // coalesce so retries keep the first attempt's start time. the finish
         // and the error are cleared: a fresh attempt has neither, and an
         // isolated op's child records its failure on this row before the parent
         // decides to retry it
-        conn.execute(
+        self.conn().execute(
             "UPDATE op_runs SET status = ?1, attempts = ?2, started_at = COALESCE(started_at, ?3),
                  finished_at = NULL, error = NULL
              WHERE run_id = ?4 AND op = ?5",
-            params![
+            args![
                 OpStatus::Running.as_str(),
                 attempts,
                 Utc::now().to_rfc3339(),
@@ -1195,14 +1674,13 @@ impl Store {
         metadata: Option<&Value>,
         error: Option<&str>,
     ) -> Result<(), Error> {
-        let conn = self.0.lock().unwrap();
         // pid goes with it: the row says where an op is running, and nothing is
         // running once this write lands
-        conn.execute(
+        self.conn().execute(
             "UPDATE op_runs SET status = ?1, finished_at = ?2, output = ?3, metadata = ?4,
                  error = ?5, pid = NULL
              WHERE run_id = ?6 AND op = ?7",
-            params![
+            args![
                 status.as_str(),
                 Utc::now().to_rfc3339(),
                 output.map(|v| v.to_string()),
@@ -1219,12 +1697,11 @@ impl Store {
     /// requested and the task never joined, so when — or whether — the work
     /// stopped is exactly what this process does not know.
     pub(crate) fn op_unstopped(&self, run_id: &str, op: &str, error: &str) -> Result<(), Error> {
-        let conn = self.0.lock().unwrap();
-        conn.execute(
+        self.conn().execute(
             "UPDATE op_runs SET status = ?1, finished_at = NULL, output = NULL, metadata = NULL,
                  error = ?2, pid = NULL
              WHERE run_id = ?3 AND op = ?4",
-            params![OpStatus::Canceled.as_str(), error, run_id, op],
+            args![OpStatus::Canceled.as_str(), error, run_id, op],
         )?;
         Ok(())
     }
@@ -1236,10 +1713,9 @@ impl Store {
     /// row before the parent gets here — and a pid written onto a finished op
     /// would name a process that no longer exists.
     pub(crate) fn op_spawned(&self, run_id: &str, op: &str, pid: u32) -> Result<(), Error> {
-        let conn = self.0.lock().unwrap();
-        conn.execute(
+        self.conn().execute(
             "UPDATE op_runs SET pid = ?1 WHERE run_id = ?2 AND op = ?3 AND status = 'running'",
-            params![i64::from(pid), run_id, op],
+            args![pid, run_id, op],
         )?;
         Ok(())
     }
@@ -1252,24 +1728,20 @@ impl Store {
         op: &str,
         inputs: &Value,
     ) -> Result<(), Error> {
-        let conn = self.0.lock().unwrap();
-        conn.execute(
+        self.conn().execute(
             "UPDATE op_runs SET inputs = ?1 WHERE run_id = ?2 AND op = ?3",
-            params![inputs.to_string(), run_id, op],
+            args![inputs.to_string(), run_id, op],
         )?;
         Ok(())
     }
 
     /// what the parent recorded for this op, read by the child that runs it.
     pub(crate) fn op_inputs(&self, run_id: &str, op: &str) -> Result<Option<Value>, Error> {
-        let conn = self.0.lock().unwrap();
-        let inputs = conn
-            .query_row(
-                "SELECT inputs FROM op_runs WHERE run_id = ?1 AND op = ?2",
-                params![run_id, op],
-                |r| opt_json_col(r, 0),
-            )
-            .optional()?;
+        let inputs = self.conn().query_opt(
+            "SELECT inputs FROM op_runs WHERE run_id = ?1 AND op = ?2",
+            args![run_id, op],
+            |r| r.opt_json(0),
+        )?;
         Ok(inputs.flatten())
     }
 
@@ -1282,11 +1754,10 @@ impl Store {
         message: &str,
         data: Option<&Value>,
     ) -> Result<(), Error> {
-        let conn = self.0.lock().unwrap();
-        conn.execute(
+        self.conn().execute(
             "INSERT INTO events (run_id, op, level, kind, message, data, ts)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            params![
+            args![
                 run_id,
                 op,
                 level.as_str(),
@@ -1309,13 +1780,12 @@ impl Store {
         message: &str,
     ) -> Result<(), Error> {
         let (stream, level, target) = source.columns();
-        let conn = self.0.lock().unwrap();
-        conn.execute(
+        self.conn().execute(
             "INSERT INTO op_logs (run_id, op, attempt, at, stream, level, target, message)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-            params![
-                at.run_id,
-                at.op,
+            args![
+                &at.run_id,
+                &at.op,
                 at.attempt,
                 Utc::now().to_rfc3339(),
                 stream,
@@ -1339,47 +1809,46 @@ impl Store {
         after: i64,
         limit: u32,
     ) -> Result<Vec<OpLog>, Error> {
-        let conn = self.0.lock().unwrap();
-        let mut stmt = conn.prepare(
+        self.conn().query(
             "SELECT id, run_id, op, attempt, at, stream, level, target, message
              FROM op_logs
              WHERE run_id = ?1 AND (?2 IS NULL OR op = ?2) AND id > ?3
              ORDER BY id LIMIT ?4",
-        )?;
-        let rows = stmt.query_map(params![run_id, op, after, limit], op_log_from_row)?;
-        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+            args![run_id, op, after, limit],
+            op_log_from_row,
+        )
     }
 
     /// make the schedules table mirror the code: insert new (job, expr) pairs,
     /// refresh tz and params on existing ones (pause state survives), drop the
     /// rest.
     pub(crate) fn sync_schedules(&self, defined: &[Schedule]) -> Result<(), Error> {
-        let mut conn = self.0.lock().unwrap();
-        let tx = conn.transaction()?;
-        {
-            let mut insert = tx.prepare(
-                "INSERT OR IGNORE INTO schedules (job, expr, tz, params, catchup)
-                 VALUES (?1, ?2, ?3, ?4, ?5)",
+        let mut conn = self.conn();
+        let (insert, ignore) = conn.dialect().insert_or_ignore();
+        let mut tx = conn.begin()?;
+        for s in defined {
+            let declared = s.params.to_string();
+            let catchup = s.catchup.to_string();
+            tx.execute(
+                &format!(
+                    "{insert} schedules (job, expr, tz, params, catchup)
+                     VALUES (?1, ?2, ?3, ?4, ?5) {ignore}"
+                ),
+                args![&s.job, &s.expr, &s.tz, &declared, &catchup],
             )?;
             // the cursor is deliberately not touched: it is what the scheduler
             // knows about this pair, and a restart that rewrote it would be a
             // restart that forgot the downtime it is meant to detect
-            let mut update = tx.prepare(
+            tx.execute(
                 "UPDATE schedules SET tz = ?3, params = ?4, catchup = ?5
                  WHERE job = ?1 AND expr = ?2",
+                args![&s.job, &s.expr, &s.tz, &declared, &catchup],
             )?;
-            for s in defined {
-                let declared = s.params.to_string();
-                let catchup = s.catchup.to_string();
-                insert.execute(params![s.job, s.expr, s.tz, declared, catchup])?;
-                update.execute(params![s.job, s.expr, s.tz, declared, catchup])?;
-            }
         }
-        let existing: Vec<(String, String)> = {
-            let mut stmt = tx.prepare("SELECT job, expr FROM schedules")?;
-            let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
-            rows.collect::<Result<Vec<_>, _>>()?
-        };
+        let existing: Vec<(String, String)> =
+            tx.query("SELECT job, expr FROM schedules", args![], |r| {
+                Ok((r.text(0)?, r.text(1)?))
+            })?;
         let keep: HashSet<(&str, &str)> = defined
             .iter()
             .map(|s| (s.job.as_str(), s.expr.as_str()))
@@ -1388,7 +1857,7 @@ impl Store {
             if !keep.contains(&(job.as_str(), expr.as_str())) {
                 tx.execute(
                     "DELETE FROM schedules WHERE job = ?1 AND expr = ?2",
-                    params![job, expr],
+                    args![job, expr],
                 )?;
             }
         }
@@ -1397,31 +1866,29 @@ impl Store {
     }
 
     pub fn schedules(&self) -> Result<Vec<ScheduleRow>, Error> {
-        let conn = self.0.lock().unwrap();
-        let mut stmt = conn.prepare(
+        self.conn().query(
             "SELECT job, expr, tz, paused, params, catchup, cursor
              FROM schedules ORDER BY job, expr",
-        )?;
-        let rows = stmt.query_map([], |r| {
-            Ok(ScheduleRow {
-                job: r.get(0)?,
-                expr: r.get(1)?,
-                tz: r.get(2)?,
-                paused: r.get(3)?,
-                params: json_col(r, 4)?,
-                catchup: parse_col(r, 5)?,
-                cursor: opt_ts_col(r, 6)?,
-            })
-        })?;
-        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+            args![],
+            |r| {
+                Ok(ScheduleRow {
+                    job: r.text(0)?,
+                    expr: r.text(1)?,
+                    tz: r.text(2)?,
+                    paused: r.flag(3)?,
+                    params: r.json(4)?,
+                    catchup: r.parse(5)?,
+                    cursor: r.opt_ts(6)?,
+                })
+            },
+        )
     }
 
     /// returns false if the (job, expr) pair isn't registered.
     pub fn set_schedule_paused(&self, job: &str, expr: &str, paused: bool) -> Result<bool, Error> {
-        let conn = self.0.lock().unwrap();
-        let n = conn.execute(
+        let n = self.conn().execute(
             "UPDATE schedules SET paused = ?3 WHERE job = ?1 AND expr = ?2",
-            params![job, expr, paused],
+            args![job, expr, paused],
         )?;
         Ok(n > 0)
     }
@@ -1436,11 +1903,10 @@ impl Store {
         expr: &str,
         at: DateTime<Utc>,
     ) -> Result<(), Error> {
-        let conn = self.0.lock().unwrap();
-        conn.execute(
+        self.conn().execute(
             "UPDATE schedules SET cursor = ?3
              WHERE job = ?1 AND expr = ?2 AND (cursor IS NULL OR cursor < ?3)",
-            params![job, expr, at.to_rfc3339()],
+            args![job, expr, at.to_rfc3339()],
         )?;
         Ok(())
     }
@@ -1450,8 +1916,7 @@ impl Store {
     /// scheduled_for)`. the tick log *is* the queue — a fire held in memory
     /// dies with the process, and this one does not.
     pub(crate) fn pending_fires(&self) -> Result<Vec<(String, String, DateTime<Utc>)>, Error> {
-        let conn = self.0.lock().unwrap();
-        let mut stmt = conn.prepare(
+        self.conn().query(
             "SELECT job, expr, scheduled_for FROM schedule_ticks d
              WHERE d.outcome = 'deferred'
                AND NOT EXISTS (
@@ -1460,31 +1925,26 @@ impl Store {
                      AND f.scheduled_for = d.scheduled_for AND f.id > d.id
                )
              ORDER BY d.scheduled_for, d.id",
-        )?;
-        let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, ts_col(r, 2)?)))?;
-        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+            args![],
+            |r| Ok((r.text(0)?, r.text(1)?, r.ts(2)?)),
+        )
     }
 
     /// every [preset](Preset) stored for `job`, by name.
     pub fn presets(&self, job: &str) -> Result<Vec<Preset>, Error> {
-        let conn = self.0.lock().unwrap();
-        let mut stmt = conn.prepare(
+        self.conn().query(
             "SELECT job, name, params, created_at FROM presets WHERE job = ?1 ORDER BY name",
-        )?;
-        let rows = stmt.query_map(params![job], preset_from_row)?;
-        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+            args![job],
+            preset_from_row,
+        )
     }
 
     pub fn preset(&self, job: &str, name: &str) -> Result<Option<Preset>, Error> {
-        let conn = self.0.lock().unwrap();
-        let row = conn
-            .query_row(
-                "SELECT job, name, params, created_at FROM presets WHERE job = ?1 AND name = ?2",
-                params![job, name],
-                preset_from_row,
-            )
-            .optional()?;
-        Ok(row)
+        self.conn().query_opt(
+            "SELECT job, name, params, created_at FROM presets WHERE job = ?1 AND name = ?2",
+            args![job, name],
+            preset_from_row,
+        )
     }
 
     /// store `params` under `(job, name)`, replacing whatever was there.
@@ -1495,31 +1955,28 @@ impl Store {
     /// `created_at` survives the rewrite, so a preset's age means when it first
     /// appeared rather than when the process last booted.
     pub fn put_preset(&self, job: &str, name: &str, params: &Value) -> Result<(), Error> {
-        let conn = self.0.lock().unwrap();
-        conn.execute(
+        self.conn().execute(
             "INSERT INTO presets (job, name, params, created_at) VALUES (?1, ?2, ?3, ?4)
              ON CONFLICT (job, name) DO UPDATE SET params = excluded.params",
-            params![job, name, params.to_string(), Utc::now().to_rfc3339()],
+            args![job, name, params.to_string(), Utc::now().to_rfc3339()],
         )?;
         Ok(())
     }
 
     /// returns false when there was no such preset.
     pub fn delete_preset(&self, job: &str, name: &str) -> Result<bool, Error> {
-        let conn = self.0.lock().unwrap();
-        let n = conn.execute(
+        let n = self.conn().execute(
             "DELETE FROM presets WHERE job = ?1 AND name = ?2",
-            params![job, name],
+            args![job, name],
         )?;
         Ok(n > 0)
     }
 
     pub(crate) fn prune_ticks(&self, keep: usize) -> Result<(), Error> {
-        let conn = self.0.lock().unwrap();
-        conn.execute(
+        self.conn().execute(
             "DELETE FROM schedule_ticks WHERE id NOT IN
              (SELECT id FROM schedule_ticks ORDER BY id DESC LIMIT ?1)",
-            params![keep as i64],
+            args![keep as i64],
         )?;
         Ok(())
     }
@@ -1533,17 +1990,16 @@ impl Store {
     /// same answer off the same index by walking every entry in it, which on a
     /// table with a year of runs in it is the sweep's whole cost.
     pub(crate) fn run_jobs(&self) -> Result<Vec<String>, Error> {
-        let conn = self.0.lock().unwrap();
-        let mut stmt = conn.prepare(
+        self.conn().query(
             "WITH RECURSIVE names(job) AS (
                  SELECT MIN(job) FROM runs
                  UNION ALL
                  SELECT (SELECT MIN(job) FROM runs WHERE job > names.job)
                  FROM names WHERE job IS NOT NULL)
              SELECT job FROM names WHERE job IS NOT NULL",
-        )?;
-        let rows = stmt.query_map([], |r| r.get(0))?;
-        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+            args![],
+            |r| r.text(0),
+        )
     }
 
     /// delete what one job's [policy](Retention) says it may no longer keep,
@@ -1579,22 +2035,31 @@ impl Store {
                    SELECT id FROM runs
                    WHERE job = ?1 AND status IN ('success', 'failed', 'canceled')
                    ORDER BY created_at DESC LIMIT ?4)";
-        let mut conn = self.0.lock().unwrap();
-        let tx = conn.transaction()?;
-        let args = params![
-            job,
-            cutoffs.success.map(|t| t.to_rfc3339()),
-            cutoffs.failed.map(|t| t.to_rfc3339()),
-            cutoffs.keep_last,
-        ];
+        let success = cutoffs.success.map(|t| t.to_rfc3339());
+        let failed = cutoffs.failed.map(|t| t.to_rfc3339());
+        let mut conn = self.conn();
+        let mut tx = conn.begin()?;
         // children first: the transaction should make it moot, the order makes it true anyway
         for table in ["op_runs", "events", "op_logs"] {
             tx.execute(
                 &format!("DELETE FROM {table} WHERE run_id IN ({DOOMED})"),
-                args,
+                args![
+                    job,
+                    success.as_deref(),
+                    failed.as_deref(),
+                    cutoffs.keep_last
+                ],
             )?;
         }
-        let removed = tx.execute(&format!("DELETE FROM runs WHERE id IN ({DOOMED})"), args)?;
+        let removed = tx.execute(
+            &format!("DELETE FROM runs WHERE id IN ({DOOMED})"),
+            args![
+                job,
+                success.as_deref(),
+                failed.as_deref(),
+                cutoffs.keep_last
+            ],
+        )?;
         tx.commit()?;
         Ok(removed)
     }
@@ -1608,11 +2073,10 @@ impl Store {
         run_id: Option<&str>,
         error: Option<&str>,
     ) -> Result<(), Error> {
-        let conn = self.0.lock().unwrap();
-        conn.execute(
+        self.conn().execute(
             "INSERT INTO schedule_ticks (job, expr, scheduled_for, fired_at, outcome, run_id, error)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            params![
+            args![
                 job,
                 expr,
                 scheduled_for.to_rfc3339(),
@@ -1626,38 +2090,28 @@ impl Store {
     }
 
     pub fn ticks(&self, job: Option<&str>, limit: u32) -> Result<Vec<Tick>, Error> {
-        let conn = self.0.lock().unwrap();
-        let rows = match job {
-            Some(job) => {
-                let mut stmt = conn.prepare(
-                    "SELECT id, job, expr, scheduled_for, fired_at, outcome, run_id, error
-                     FROM schedule_ticks WHERE job = ?1 ORDER BY id DESC LIMIT ?2",
-                )?;
-                let rows = stmt.query_map(params![job, limit], tick_from_row)?;
-                rows.collect::<Result<Vec<_>, _>>()?
-            }
-            None => {
-                let mut stmt = conn.prepare(
-                    "SELECT id, job, expr, scheduled_for, fired_at, outcome, run_id, error
-                     FROM schedule_ticks ORDER BY id DESC LIMIT ?1",
-                )?;
-                let rows = stmt.query_map(params![limit], tick_from_row)?;
-                rows.collect::<Result<Vec<_>, _>>()?
-            }
-        };
-        Ok(rows)
+        match job {
+            Some(job) => self.conn().query(
+                "SELECT id, job, expr, scheduled_for, fired_at, outcome, run_id, error
+                 FROM schedule_ticks WHERE job = ?1 ORDER BY id DESC LIMIT ?2",
+                args![job, limit],
+                tick_from_row,
+            ),
+            None => self.conn().query(
+                "SELECT id, job, expr, scheduled_for, fired_at, outcome, run_id, error
+                 FROM schedule_ticks ORDER BY id DESC LIMIT ?1",
+                args![limit],
+                tick_from_row,
+            ),
+        }
     }
 
     pub fn run(&self, id: &str) -> Result<Option<Run>, Error> {
-        let conn = self.0.lock().unwrap();
-        let run = conn
-            .query_row(
-                &format!("SELECT {RUN_COLS} FROM runs WHERE id = ?1"),
-                params![id],
-                run_from_row,
-            )
-            .optional()?;
-        Ok(run)
+        self.conn().query_opt(
+            &format!("SELECT {RUN_COLS} FROM runs WHERE id = ?1"),
+            args![id],
+            run_from_row,
+        )
     }
 
     // created_at is always rfc3339 utc, so the comparisons below are plain string
@@ -1672,26 +2126,24 @@ impl Store {
         tag: Option<(&str, &str)>,
         limit: u32,
     ) -> Result<Vec<Run>, Error> {
-        let conn = self.0.lock().unwrap();
-        let mut stmt = conn.prepare(&format!(
-            r#"SELECT {RUN_COLS}
-               FROM runs
-               WHERE (?1 IS NULL OR job = ?1) AND (?2 IS NULL OR created_at >= ?2)
-                 AND (?3 IS NULL OR created_at < ?3
-                      OR (?4 IS NOT NULL AND created_at = ?3 AND id < ?4))
-                 AND (?5 IS NULL OR EXISTS (
-                      SELECT 1 FROM json_each(runs.tags)
-                      WHERE json_each.key = ?5 AND json_each.value = ?6))
-               ORDER BY created_at DESC, id DESC LIMIT ?7"#
-        ))?;
+        let mut conn = self.conn();
+        let tagged = conn.dialect().tag_filter();
         let since = since.map(|t| t.to_rfc3339());
         let before = before.map(|t| t.to_rfc3339());
         let (key, value) = (tag.map(|t| t.0), tag.map(|t| t.1));
-        let rows = stmt.query_map(
-            params![job, since, before, before_id, key, value, limit],
+        conn.query(
+            &format!(
+                r#"SELECT {RUN_COLS}
+                   FROM runs
+                   WHERE (?1 IS NULL OR job = ?1) AND (?2 IS NULL OR created_at >= ?2)
+                     AND (?3 IS NULL OR created_at < ?3
+                          OR (?4 IS NOT NULL AND created_at = ?3 AND id < ?4))
+                     AND (?5 IS NULL OR {tagged})
+                   ORDER BY created_at DESC, id DESC LIMIT ?7"#
+            ),
+            args![job, since, before, before_id, key, value, limit],
             run_from_row,
-        )?;
-        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+        )
     }
 
     /// terminal runs finished after `after`, oldest first — what a
@@ -1709,19 +2161,20 @@ impl Store {
         after: Option<&RunCursor>,
         limit: u32,
     ) -> Result<Vec<Run>, Error> {
-        let conn = self.0.lock().unwrap();
-        let mut stmt = conn.prepare(&format!(
-            r#"SELECT {RUN_COLS}
-               FROM runs
-               WHERE status IN ('success', 'failed', 'canceled') AND finished_at IS NOT NULL
-                 AND (?1 IS NULL OR job = ?1)
-                 AND (?2 IS NULL OR finished_at > ?2 OR (finished_at = ?2 AND id > ?3))
-               ORDER BY finished_at, id LIMIT ?4"#
-        ))?;
         let at = after.map(|c| c.finished_at.to_rfc3339());
         let id = after.map(|c| c.id.as_str());
-        let rows = stmt.query_map(params![job, at, id, limit], run_from_row)?;
-        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+        self.conn().query(
+            &format!(
+                r#"SELECT {RUN_COLS}
+                   FROM runs
+                   WHERE status IN ('success', 'failed', 'canceled') AND finished_at IS NOT NULL
+                     AND (?1 IS NULL OR job = ?1)
+                     AND (?2 IS NULL OR finished_at > ?2 OR (finished_at = ?2 AND id > ?3))
+                   ORDER BY finished_at, id LIMIT ?4"#
+            ),
+            args![job, at, id, limit],
+            run_from_row,
+        )
     }
 
     /// the newest terminal run as a cursor, for a sensor starting from now
@@ -1730,76 +2183,65 @@ impl Store {
         &self,
         job: Option<&str>,
     ) -> Result<Option<RunCursor>, Error> {
-        let conn = self.0.lock().unwrap();
-        let row = conn
-            .query_row(
-                "SELECT finished_at, id FROM runs
-                 WHERE status IN ('success', 'failed', 'canceled') AND finished_at IS NOT NULL
-                   AND (?1 IS NULL OR job = ?1)
-                 ORDER BY finished_at DESC, id DESC LIMIT 1",
-                params![job],
-                |r| {
-                    Ok(RunCursor {
-                        finished_at: ts_col(r, 0)?,
-                        id: r.get(1)?,
-                    })
-                },
-            )
-            .optional()?;
-        Ok(row)
+        self.conn().query_opt(
+            "SELECT finished_at, id FROM runs
+             WHERE status IN ('success', 'failed', 'canceled') AND finished_at IS NOT NULL
+               AND (?1 IS NULL OR job = ?1)
+             ORDER BY finished_at DESC, id DESC LIMIT 1",
+            args![job],
+            |r| {
+                Ok(RunCursor {
+                    finished_at: r.ts(0)?,
+                    id: r.text(1)?,
+                })
+            },
+        )
     }
 
     /// finish time of the job's most recent successful run.
     pub fn last_success(&self, job: &str) -> Result<Option<DateTime<Utc>>, Error> {
-        let conn = self.0.lock().unwrap();
-        let ts = conn.query_row(
+        let ts = self.conn().query_opt(
             "SELECT MAX(finished_at) FROM runs WHERE job = ?1 AND status = 'success'",
-            params![job],
-            |r| opt_ts_col(r, 0),
+            args![job],
+            |r| r.opt_ts(0),
         )?;
-        Ok(ts)
+        Ok(ts.flatten())
     }
 
     pub fn op_runs(&self, run_id: &str) -> Result<Vec<OpRun>, Error> {
-        let conn = self.0.lock().unwrap();
-        let mut stmt = conn.prepare(
+        self.conn().query(
             "SELECT run_id, op, status, attempts, started_at, finished_at, output, metadata, error,
                     pid
              FROM op_runs WHERE run_id = ?1 ORDER BY op",
-        )?;
-        let rows = stmt.query_map(params![run_id], op_run_from_row)?;
-        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+            args![run_id],
+            op_run_from_row,
+        )
     }
 
     /// one op's row. the parent of an isolated op reads back what its child
     /// recorded through this — the whole of what a worker process reports.
     pub fn op_run(&self, run_id: &str, op: &str) -> Result<Option<OpRun>, Error> {
-        let conn = self.0.lock().unwrap();
-        let row = conn
-            .query_row(
-                "SELECT run_id, op, status, attempts, started_at, finished_at, output, metadata,
-                        error, pid
-                 FROM op_runs WHERE run_id = ?1 AND op = ?2",
-                params![run_id, op],
-                op_run_from_row,
-            )
-            .optional()?;
-        Ok(row)
+        self.conn().query_opt(
+            "SELECT run_id, op, status, attempts, started_at, finished_at, output, metadata,
+                    error, pid
+             FROM op_runs WHERE run_id = ?1 AND op = ?2",
+            args![run_id, op],
+            op_run_from_row,
+        )
     }
 
     /// op_run rows across the job's most recent `runs` runs, newest run first.
     pub fn recent_op_runs(&self, job: &str, runs: u32) -> Result<Vec<OpRun>, Error> {
-        let conn = self.0.lock().unwrap();
-        let mut stmt = conn.prepare(
+        self.conn().query(
             "SELECT o.run_id, o.op, o.status, o.attempts, o.started_at, o.finished_at, o.output,
                     o.metadata, o.error, o.pid
              FROM op_runs o
              JOIN (SELECT id, created_at FROM runs WHERE job = ?1
                    ORDER BY created_at DESC LIMIT ?2) r ON r.id = o.run_id
              ORDER BY r.created_at DESC",
-        )?;
-        let rows = stmt.query_map(params![job, runs], op_run_from_row)?;
-        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+            args![job, runs],
+            op_run_from_row,
+        )
     }
 
     /// what each of `job`'s ops last reported, from the newest run before the
@@ -1818,8 +2260,9 @@ impl Store {
         before: DateTime<Utc>,
         run_id: &str,
     ) -> Result<HashMap<String, Value>, Error> {
-        let conn = self.0.lock().unwrap();
-        let mut stmt = conn.prepare(
+        // the subquery is named because postgres insists on it and sqlite does
+        // not mind, which is one fewer branch
+        let rows = self.conn().query(
             "SELECT op, metadata FROM (
                  SELECT o.op AS op, o.metadata AS metadata,
                         ROW_NUMBER() OVER (
@@ -1828,12 +2271,11 @@ impl Store {
                  FROM op_runs o JOIN runs r ON r.id = o.run_id
                  WHERE r.job = ?1 AND o.metadata IS NOT NULL
                    AND (r.created_at < ?2 OR (r.created_at = ?2 AND r.id < ?3))
-             ) WHERE rn = 1",
+             ) latest WHERE rn = 1",
+            args![job, before.to_rfc3339(), run_id],
+            |r| Ok((r.text(0)?, r.json(1)?)),
         )?;
-        let rows = stmt.query_map(params![job, before.to_rfc3339(), run_id], |r| {
-            Ok((r.get(0)?, json_col(r, 1)?))
-        })?;
-        Ok(rows.collect::<Result<HashMap<_, _>, _>>()?)
+        Ok(rows.into_iter().collect())
     }
 
     /// what a numeric metadata key was across `job`'s recent runs of one op,
@@ -1849,19 +2291,17 @@ impl Store {
         key: &str,
         limit: u32,
     ) -> Result<Vec<MetaPoint>, Error> {
-        let conn = self.0.lock().unwrap();
-        let mut stmt = conn.prepare(
+        let rows = self.conn().query(
             "SELECT o.run_id, o.metadata, COALESCE(o.finished_at, r.created_at)
              FROM op_runs o JOIN runs r ON r.id = o.run_id
              WHERE r.job = ?1 AND o.op = ?2 AND o.metadata IS NOT NULL
              ORDER BY r.created_at DESC, r.id DESC LIMIT ?3",
+            args![job, op, limit],
+            |r| Ok((r.json(1)?, r.ts(2)?, r.text(0)?)),
         )?;
-        let rows = stmt.query_map(params![job, op, limit], |r| {
-            Ok((json_col(r, 1)?, ts_col(r, 2)?, r.get::<_, String>(0)?))
-        })?;
         let mut points = Vec::new();
         for row in rows {
-            let (metadata, at, run_id) = row?;
+            let (metadata, at, run_id) = row;
             if let Some(value) = op::numeric_key(&metadata, key) {
                 points.push(MetaPoint {
                     at,
@@ -1885,22 +2325,21 @@ impl Store {
         key: &str,
         limit: u32,
     ) -> Result<Vec<MetaPoint>, Error> {
-        let conn = self.0.lock().unwrap();
-        let mut stmt = conn.prepare(
-            "SELECT run_id, metadata, built_at FROM asset_materializations
-             WHERE asset = ?1 AND (?2 IS NULL OR partition IS ?2) AND metadata IS NOT NULL
-             ORDER BY id DESC LIMIT ?3",
+        let mut conn = self.conn();
+        let same = conn.dialect().null_safe_eq();
+        let rows = conn.query(
+            &format!(
+                "SELECT run_id, metadata, built_at FROM asset_materializations
+                 WHERE asset = ?1 AND (?2 IS NULL OR partition {same} ?2)
+                   AND metadata IS NOT NULL
+                 ORDER BY id DESC LIMIT ?3"
+            ),
+            args![asset, partition, limit],
+            |r| Ok((r.json(1)?, r.ts(2)?, r.opt_text(0)?)),
         )?;
-        let rows = stmt.query_map(params![asset, partition, limit], |r| {
-            Ok((
-                json_col(r, 1)?,
-                ts_col(r, 2)?,
-                r.get::<_, Option<String>>(0)?,
-            ))
-        })?;
         let mut points = Vec::new();
         for row in rows {
-            let (metadata, at, run_id) = row?;
+            let (metadata, at, run_id) = row;
             if let Some(value) = op::numeric_key(&metadata, key) {
                 points.push(MetaPoint { at, value, run_id });
             }
@@ -1911,46 +2350,38 @@ impl Store {
 
     /// the state an op's last successful run committed, if any.
     pub fn op_state(&self, job: &str, op: &str) -> Result<Option<Value>, Error> {
-        let conn = self.0.lock().unwrap();
-        let value = conn
-            .query_row(
-                "SELECT value FROM op_state WHERE job = ?1 AND op = ?2",
-                params![job, op],
-                |r| json_col(r, 0),
-            )
-            .optional()?;
-        Ok(value)
+        self.conn().query_opt(
+            "SELECT value FROM op_state WHERE job = ?1 AND op = ?2",
+            args![job, op],
+            |r| r.json(0),
+        )
     }
 
     pub(crate) fn set_op_state(&self, job: &str, op: &str, value: &Value) -> Result<(), Error> {
-        let conn = self.0.lock().unwrap();
-        conn.execute(
+        self.conn().execute(
             "INSERT INTO op_state (job, op, value, updated_at) VALUES (?1, ?2, ?3, ?4)
              ON CONFLICT (job, op) DO UPDATE SET value = ?3, updated_at = ?4",
-            params![job, op, value.to_string(), Utc::now().to_rfc3339()],
+            args![job, op, value.to_string(), Utc::now().to_rfc3339()],
         )?;
         Ok(())
     }
 
     /// every op state a job carries, ordered by op.
     pub fn job_states(&self, job: &str) -> Result<Vec<(String, Value, DateTime<Utc>)>, Error> {
-        let conn = self.0.lock().unwrap();
-        let mut stmt =
-            conn.prepare("SELECT op, value, updated_at FROM op_state WHERE job = ?1 ORDER BY op")?;
-        let rows = stmt.query_map(params![job], |r| {
-            Ok((r.get(0)?, json_col(r, 1)?, ts_col(r, 2)?))
-        })?;
-        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+        self.conn().query(
+            "SELECT op, value, updated_at FROM op_state WHERE job = ?1 ORDER BY op",
+            args![job],
+            |r| Ok((r.text(0)?, r.json(1)?, r.ts(2)?)),
+        )
     }
 
     pub fn events(&self, run_id: &str, after: i64) -> Result<Vec<Event>, Error> {
-        let conn = self.0.lock().unwrap();
-        let mut stmt = conn.prepare(
+        self.conn().query(
             "SELECT seq, run_id, op, level, kind, message, data, ts
              FROM events WHERE run_id = ?1 AND seq > ?2 ORDER BY seq",
-        )?;
-        let rows = stmt.query_map(params![run_id, after], event_from_row)?;
-        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+            args![run_id, after],
+            event_from_row,
+        )
     }
 
     /// append a materialization. the table is history, so a rebuild that came
@@ -1971,12 +2402,11 @@ impl Store {
         run_id: Option<&str>,
         metadata: Option<&Value>,
     ) -> Result<(), Error> {
-        let conn = self.0.lock().unwrap();
-        conn.execute(
+        self.conn().execute(
             "INSERT INTO asset_materializations
                  (asset, partition, fingerprint, inputs, value, run_id, built_at, metadata)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-            params![
+            args![
                 asset,
                 partition,
                 fingerprint,
@@ -1998,32 +2428,36 @@ impl Store {
         asset: &str,
         partition: Option<&str>,
     ) -> Result<Option<Materialization>, Error> {
-        let conn = self.0.lock().unwrap();
-        let row = conn
-            .query_row(
-                "SELECT id, asset, partition, fingerprint, inputs, value, run_id, built_at, metadata
-                 FROM asset_materializations WHERE asset = ?1 AND partition IS ?2
-                 ORDER BY id DESC LIMIT 1",
-                params![asset, partition],
-                materialization_from_row,
-            )
-            .optional()?;
-        Ok(row)
+        let mut conn = self.conn();
+        let same = conn.dialect().null_safe_eq();
+        conn.query_opt(
+            &format!(
+                "SELECT id, asset, partition, fingerprint, inputs, value, run_id, built_at,
+                        metadata
+                 FROM asset_materializations WHERE asset = ?1 AND partition {same} ?2
+                 ORDER BY id DESC LIMIT 1"
+            ),
+            args![asset, partition],
+            materialization_from_row,
+        )
     }
 
     /// the current materialization of every `(asset, partition)` pair, one row
     /// each, ordered by asset then partition.
+    ///
+    /// `NULLS FIRST` is written out because the two backends disagree about
+    /// where an unpartitioned asset's null sorts by default, and both accept
+    /// being told.
     pub fn latest_materializations(&self) -> Result<Vec<Materialization>, Error> {
-        let conn = self.0.lock().unwrap();
-        let mut stmt = conn.prepare(
+        self.conn().query(
             "SELECT id, asset, partition, fingerprint, inputs, value, run_id, built_at, metadata
              FROM asset_materializations
              WHERE id IN
                  (SELECT MAX(id) FROM asset_materializations GROUP BY asset, partition)
-             ORDER BY asset, partition",
-        )?;
-        let rows = stmt.query_map([], materialization_from_row)?;
-        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+             ORDER BY asset, partition NULLS FIRST",
+            args![],
+            materialization_from_row,
+        )
     }
 
     /// one asset's history, newest first, each entry carrying whether its
@@ -2043,31 +2477,35 @@ impl Store {
         partition: Option<&str>,
         limit: u32,
     ) -> Result<Vec<HistoryEntry>, Error> {
-        let conn = self.0.lock().unwrap();
+        let mut conn = self.conn();
+        let (same, changed) = (
+            conn.dialect().null_safe_eq(),
+            conn.dialect().fingerprint_changed(),
+        );
         // both look one row back within the partition: one key's rebuild says
         // nothing about whether another key's fingerprint or row count moved
-        let mut stmt = conn.prepare(
-            "SELECT id, asset, partition, fingerprint, inputs, value, run_id, built_at,
-                    metadata, changed, previous_metadata FROM (
-                 SELECT id, asset, partition, fingerprint, inputs, value, run_id, built_at,
-                        metadata,
-                        fingerprint IS NOT
-                            LAG(fingerprint) OVER (PARTITION BY partition ORDER BY id)
-                            AS changed,
-                        LAG(metadata) OVER (PARTITION BY partition ORDER BY id)
-                            AS previous_metadata
-                 FROM asset_materializations
-                 WHERE asset = ?1 AND (?2 IS NULL OR partition IS ?2)
-             ) ORDER BY id DESC LIMIT ?3",
-        )?;
-        let rows = stmt.query_map(params![asset, partition, limit], |r| {
-            Ok(HistoryEntry {
-                mat: materialization_from_row(r)?,
-                changed: r.get(9)?,
-                previous_metadata: opt_json_col(r, 10)?,
-            })
-        })?;
-        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+        conn.query(
+            &format!(
+                "SELECT id, asset, partition, fingerprint, inputs, value, run_id, built_at,
+                        metadata, changed, previous_metadata FROM (
+                     SELECT id, asset, partition, fingerprint, inputs, value, run_id, built_at,
+                            metadata,
+                            {changed} AS changed,
+                            LAG(metadata) OVER (PARTITION BY partition ORDER BY id)
+                                AS previous_metadata
+                     FROM asset_materializations
+                     WHERE asset = ?1 AND (?2 IS NULL OR partition {same} ?2)
+                 ) history ORDER BY id DESC LIMIT ?3"
+            ),
+            args![asset, partition, limit],
+            |r| {
+                Ok(HistoryEntry {
+                    mat: materialization_from_row(r)?,
+                    changed: r.flag(9)?,
+                    previous_metadata: r.opt_json(10)?,
+                })
+            },
+        )
     }
 
     /// trim every `(asset, partition)` pair's history to its newest `keep`
@@ -2075,22 +2513,23 @@ impl Store {
     /// state, not history, and dropping it would read as a partition that has
     /// never been built.
     pub(crate) fn prune_materializations(&self, keep: usize) -> Result<usize, Error> {
-        let conn = self.0.lock().unwrap();
-        let removed = conn.execute(
-            "DELETE FROM asset_materializations WHERE id NOT IN
-             (SELECT id FROM asset_materializations AS newest
-              WHERE newest.asset = asset_materializations.asset
-                AND newest.partition IS asset_materializations.partition
-              ORDER BY newest.id DESC LIMIT ?1)",
-            params![keep.max(1) as i64],
-        )?;
-        Ok(removed)
+        let mut conn = self.conn();
+        let same = conn.dialect().null_safe_eq();
+        conn.execute(
+            &format!(
+                "DELETE FROM asset_materializations WHERE id NOT IN
+                 (SELECT id FROM asset_materializations AS newest
+                  WHERE newest.asset = asset_materializations.asset
+                    AND newest.partition {same} asset_materializations.partition
+                  ORDER BY newest.id DESC LIMIT ?1)"
+            ),
+            args![keep.max(1) as i64],
+        )
     }
 
     /// record what a check said. written inside the check's op, before it
     /// decides whether to fail, so a failing error check leaves its verdict
     /// behind rather than only a failed op.
-    #[allow(clippy::too_many_arguments)]
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn record_check(
         &self,
@@ -2103,13 +2542,12 @@ impl Store {
         message: Option<&str>,
         metadata: Option<&Value>,
     ) -> Result<(), Error> {
-        let conn = self.0.lock().unwrap();
-        conn.execute(
+        self.conn().execute(
             "INSERT INTO asset_checks
                  (asset, partition, check_name, run_id, status, severity, message,
                   metadata, checked_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-            params![
+            args![
                 asset,
                 partition,
                 check,
@@ -2134,48 +2572,52 @@ impl Store {
         partition: Option<&str>,
         limit: u32,
     ) -> Result<Vec<AssetCheckRow>, Error> {
-        let conn = self.0.lock().unwrap();
-        let mut stmt = conn.prepare(
-            "SELECT id, asset, partition, check_name, run_id, status, severity, message,
-                    metadata, checked_at
-             FROM asset_checks WHERE asset = ?1 AND (?2 IS NULL OR partition IS ?2)
-             ORDER BY id DESC LIMIT ?3",
-        )?;
-        let rows = stmt.query_map(params![asset, partition, limit], asset_check_from_row)?;
-        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+        let mut conn = self.conn();
+        let same = conn.dialect().null_safe_eq();
+        conn.query(
+            &format!(
+                "SELECT id, asset, partition, check_name, run_id, status, severity, message,
+                        metadata, checked_at
+                 FROM asset_checks WHERE asset = ?1 AND (?2 IS NULL OR partition {same} ?2)
+                 ORDER BY id DESC LIMIT ?3"
+            ),
+            args![asset, partition, limit],
+            asset_check_from_row,
+        )
     }
 
     /// the latest result of every `(asset, partition, check)` triple, ordered
     /// by all three.
     pub fn latest_asset_checks(&self) -> Result<Vec<AssetCheckRow>, Error> {
-        let conn = self.0.lock().unwrap();
-        let mut stmt = conn.prepare(
+        self.conn().query(
             "SELECT id, asset, partition, check_name, run_id, status, severity, message,
                     metadata, checked_at
              FROM asset_checks
              WHERE id IN
                  (SELECT MAX(id) FROM asset_checks GROUP BY asset, partition, check_name)
-             ORDER BY asset, partition, check_name",
-        )?;
-        let rows = stmt.query_map([], asset_check_from_row)?;
-        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+             ORDER BY asset, partition NULLS FIRST, check_name",
+            args![],
+            asset_check_from_row,
+        )
     }
 
     /// trim every check to its newest `keep` results per partition, floored at
     /// 1 like [`prune_materializations`](Self::prune_materializations) — the
     /// latest result is what the asset summary counts.
     pub(crate) fn prune_asset_checks(&self, keep: usize) -> Result<usize, Error> {
-        let conn = self.0.lock().unwrap();
-        let removed = conn.execute(
-            "DELETE FROM asset_checks WHERE id NOT IN
-             (SELECT id FROM asset_checks AS newest
-              WHERE newest.asset = asset_checks.asset
-                AND newest.partition IS asset_checks.partition
-                AND newest.check_name = asset_checks.check_name
-              ORDER BY newest.id DESC LIMIT ?1)",
-            params![keep.max(1) as i64],
-        )?;
-        Ok(removed)
+        let mut conn = self.conn();
+        let same = conn.dialect().null_safe_eq();
+        conn.execute(
+            &format!(
+                "DELETE FROM asset_checks WHERE id NOT IN
+                 (SELECT id FROM asset_checks AS newest
+                  WHERE newest.asset = asset_checks.asset
+                    AND newest.partition {same} asset_checks.partition
+                    AND newest.check_name = asset_checks.check_name
+                  ORDER BY newest.id DESC LIMIT ?1)"
+            ),
+            args![keep.max(1) as i64],
+        )
     }
 
     /// record a backfill request and the keys it resolved to, `running` with
@@ -2188,18 +2630,22 @@ impl Store {
         to_key: &str,
         keys: &[String],
     ) -> Result<i64, Error> {
-        let conn = self.0.lock().unwrap();
         // a range that resolved to nothing is complete the moment it is made,
         // which is a truer record than refusing to write one
         let (status, finished) = match keys.is_empty() {
             true => (BackfillStatus::Complete, Some(Utc::now().to_rfc3339())),
             false => (BackfillStatus::Running, None),
         };
-        conn.execute(
+        // the one place that wanted `last_insert_rowid`. `RETURNING` is the
+        // portable spelling — postgres has always had it and sqlite has since
+        // 3.35 — so the id comes back with the row rather than from a second
+        // question about what the connection did last
+        let id = self.conn().query_opt(
             "INSERT INTO backfills
                  (asset, from_key, to_key, partition_keys, total, created_at, finished_at, status)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-            params![
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+             RETURNING id",
+            args![
                 asset,
                 from_key,
                 to_key,
@@ -2209,47 +2655,42 @@ impl Store {
                 finished,
                 status.as_str(),
             ],
+            |r| r.int(0),
         )?;
-        Ok(conn.last_insert_rowid())
+        id.ok_or_else(|| Error::Column(0, "an insert returned no id".into()))
     }
 
     pub fn backfill(&self, id: i64) -> Result<Option<Backfill>, Error> {
-        let conn = self.0.lock().unwrap();
-        let row = conn
-            .query_row(
-                "SELECT id, asset, from_key, to_key, partition_keys, run_ids, total, launched,
-                        created_at, finished_at, status
-                 FROM backfills WHERE id = ?1",
-                params![id],
-                backfill_from_row,
-            )
-            .optional()?;
-        Ok(row)
+        self.conn().query_opt(
+            "SELECT id, asset, from_key, to_key, partition_keys, run_ids, total, launched,
+                    created_at, finished_at, status
+             FROM backfills WHERE id = ?1",
+            args![id],
+            backfill_from_row,
+        )
     }
 
     /// recent backfills, newest first.
     pub fn backfills(&self, limit: u32) -> Result<Vec<Backfill>, Error> {
-        let conn = self.0.lock().unwrap();
-        let mut stmt = conn.prepare(
+        self.conn().query(
             "SELECT id, asset, from_key, to_key, partition_keys, run_ids, total, launched,
                     created_at, finished_at, status
              FROM backfills ORDER BY id DESC LIMIT ?1",
-        )?;
-        let rows = stmt.query_map(params![limit], backfill_from_row)?;
-        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+            args![limit],
+            backfill_from_row,
+        )
     }
 
     /// every backfill still going, oldest first — what the loop that chunks
     /// them reads, and what makes a second one for the same asset a conflict.
     pub(crate) fn running_backfills(&self) -> Result<Vec<Backfill>, Error> {
-        let conn = self.0.lock().unwrap();
-        let mut stmt = conn.prepare(
+        self.conn().query(
             "SELECT id, asset, from_key, to_key, partition_keys, run_ids, total, launched,
                     created_at, finished_at, status
              FROM backfills WHERE status = ?1 ORDER BY id",
-        )?;
-        let rows = stmt.query_map(params![BackfillStatus::Running.as_str()], backfill_from_row)?;
-        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+            args![BackfillStatus::Running.as_str()],
+            backfill_from_row,
+        )
     }
 
     /// record that a chunk went out: its run, and how many keys are now
@@ -2260,13 +2701,16 @@ impl Store {
         run_id: &str,
         launched: usize,
     ) -> Result<(), Error> {
-        let conn = self.0.lock().unwrap();
+        let mut conn = self.conn();
+        let append = conn.dialect().json_append();
         conn.execute(
-            "UPDATE backfills
-             SET launched = ?2,
-                 run_ids = json_insert(run_ids, '$[#]', ?3)
-             WHERE id = ?1",
-            params![id, launched as i64, run_id],
+            &format!(
+                "UPDATE backfills
+                 SET launched = ?2,
+                     run_ids = {append}
+                 WHERE id = ?1"
+            ),
+            args![id, launched as i64, run_id],
         )?;
         Ok(())
     }
@@ -2274,10 +2718,9 @@ impl Store {
     /// close a backfill. the first terminal status wins, so a cancel racing
     /// the chunker cannot be overwritten by what the run did next.
     pub(crate) fn finish_backfill(&self, id: i64, status: BackfillStatus) -> Result<(), Error> {
-        let conn = self.0.lock().unwrap();
-        conn.execute(
+        self.conn().execute(
             "UPDATE backfills SET status = ?2, finished_at = ?3 WHERE id = ?1 AND status = ?4",
-            params![
+            args![
                 id,
                 status.as_str(),
                 Utc::now().to_rfc3339(),
@@ -2290,18 +2733,18 @@ impl Store {
     /// what the last freshness check concluded about everything it has ever
     /// seen, ordered by kind then name.
     pub fn freshness_states(&self) -> Result<Vec<FreshnessRow>, Error> {
-        let conn = self.0.lock().unwrap();
-        let mut stmt = conn
-            .prepare("SELECT kind, name, late, since FROM freshness_state ORDER BY kind, name")?;
-        let rows = stmt.query_map([], |r| {
-            Ok(FreshnessRow {
-                kind: r.get(0)?,
-                name: r.get(1)?,
-                late: r.get(2)?,
-                since: opt_ts_col(r, 3)?,
-            })
-        })?;
-        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+        self.conn().query(
+            "SELECT kind, name, late, since FROM freshness_state ORDER BY kind, name",
+            args![],
+            |r| {
+                Ok(FreshnessRow {
+                    kind: r.text(0)?,
+                    name: r.text(1)?,
+                    late: r.flag(2)?,
+                    since: r.opt_ts(3)?,
+                })
+            },
+        )
     }
 
     /// record a crossing. `since` is when it went late and is dropped on the
@@ -2314,11 +2757,10 @@ impl Store {
         late: bool,
         since: Option<DateTime<Utc>>,
     ) -> Result<(), Error> {
-        let conn = self.0.lock().unwrap();
-        conn.execute(
+        self.conn().execute(
             "INSERT INTO freshness_state (kind, name, late, since) VALUES (?1, ?2, ?3, ?4)
              ON CONFLICT (kind, name) DO UPDATE SET late = ?3, since = ?4",
-            params![kind, name, late, since.map(|t| t.to_rfc3339())],
+            args![kind, name, late, since.map(|t| t.to_rfc3339())],
         )?;
         Ok(())
     }
@@ -2326,25 +2768,21 @@ impl Store {
     /// make the sensors table mirror the code: insert new names, drop the
     /// rest. existing rows keep their paused flag and cursor.
     pub(crate) fn sync_sensors(&self, defined: &[String]) -> Result<(), Error> {
-        let mut conn = self.0.lock().unwrap();
-        let tx = conn.transaction()?;
-        {
-            let mut insert =
-                tx.prepare("INSERT OR IGNORE INTO sensors (name, updated_at) VALUES (?1, ?2)")?;
-            let now = Utc::now().to_rfc3339();
-            for name in defined {
-                insert.execute(params![name, now])?;
-            }
+        let mut conn = self.conn();
+        let (insert, ignore) = conn.dialect().insert_or_ignore();
+        let mut tx = conn.begin()?;
+        let now = Utc::now().to_rfc3339();
+        for name in defined {
+            tx.execute(
+                &format!("{insert} sensors (name, updated_at) VALUES (?1, ?2) {ignore}"),
+                args![name, &now],
+            )?;
         }
-        let existing: Vec<String> = {
-            let mut stmt = tx.prepare("SELECT name FROM sensors")?;
-            let rows = stmt.query_map([], |r| r.get(0))?;
-            rows.collect::<Result<Vec<_>, _>>()?
-        };
+        let existing: Vec<String> = tx.query("SELECT name FROM sensors", args![], |r| r.text(0))?;
         let keep: HashSet<&str> = defined.iter().map(String::as_str).collect();
         for name in &existing {
             if !keep.contains(name.as_str()) {
-                tx.execute("DELETE FROM sensors WHERE name = ?1", params![name])?;
+                tx.execute("DELETE FROM sensors WHERE name = ?1", args![name])?;
             }
         }
         tx.commit()?;
@@ -2352,35 +2790,33 @@ impl Store {
     }
 
     pub fn sensors(&self) -> Result<Vec<SensorRow>, Error> {
-        let conn = self.0.lock().unwrap();
-        let mut stmt =
-            conn.prepare("SELECT name, paused, cursor, updated_at FROM sensors ORDER BY name")?;
-        let rows = stmt.query_map([], |r| {
-            Ok(SensorRow {
-                name: r.get(0)?,
-                paused: r.get(1)?,
-                cursor: opt_json_col(r, 2)?,
-                updated_at: ts_col(r, 3)?,
-            })
-        })?;
-        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+        self.conn().query(
+            "SELECT name, paused, cursor, updated_at FROM sensors ORDER BY name",
+            args![],
+            |r| {
+                Ok(SensorRow {
+                    name: r.text(0)?,
+                    paused: r.flag(1)?,
+                    cursor: r.opt_json(2)?,
+                    updated_at: r.ts(3)?,
+                })
+            },
+        )
     }
 
     /// returns false if no sensor with that name is registered.
     pub fn set_sensor_paused(&self, name: &str, paused: bool) -> Result<bool, Error> {
-        let conn = self.0.lock().unwrap();
-        let n = conn.execute(
+        let n = self.conn().execute(
             "UPDATE sensors SET paused = ?2 WHERE name = ?1",
-            params![name, paused],
+            args![name, paused],
         )?;
         Ok(n > 0)
     }
 
     pub(crate) fn set_sensor_cursor(&self, name: &str, cursor: &Value) -> Result<(), Error> {
-        let conn = self.0.lock().unwrap();
-        conn.execute(
+        self.conn().execute(
             "UPDATE sensors SET cursor = ?2, updated_at = ?3 WHERE name = ?1",
-            params![name, cursor.to_string(), Utc::now().to_rfc3339()],
+            args![name, cursor.to_string(), Utc::now().to_rfc3339()],
         )?;
         Ok(())
     }
@@ -2398,18 +2834,17 @@ impl Store {
         duration_ms: u64,
         error: Option<&str>,
     ) -> Result<(), Error> {
-        let conn = self.0.lock().unwrap();
-        conn.execute(
+        self.conn().execute(
             "INSERT INTO sensor_ticks
                  (sensor, evaluated_at, outcome, launched, skipped, duration_ms, error)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            params![
+            args![
                 sensor,
                 Utc::now().to_rfc3339(),
                 outcome.as_str(),
                 launched,
                 skipped,
-                duration_ms,
+                duration_ms as i64,
                 error
             ],
         )?;
@@ -2417,14 +2852,13 @@ impl Store {
     }
 
     pub fn sensor_ticks(&self, sensor: Option<&str>, limit: u32) -> Result<Vec<SensorTick>, Error> {
-        let conn = self.0.lock().unwrap();
-        let mut stmt = conn.prepare(
+        self.conn().query(
             "SELECT id, sensor, evaluated_at, outcome, launched, skipped, duration_ms, error
              FROM sensor_ticks WHERE (?1 IS NULL OR sensor = ?1)
              ORDER BY id DESC LIMIT ?2",
-        )?;
-        let rows = stmt.query_map(params![sensor, limit], sensor_tick_from_row)?;
-        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+            args![sensor, limit],
+            sensor_tick_from_row,
+        )
     }
 
     /// move a finished run's finish time. tests that need history older than
@@ -2432,10 +2866,9 @@ impl Store {
     /// about how old a success is.
     #[cfg(test)]
     pub(crate) fn backdate_run(&self, id: &str, finished_at: DateTime<Utc>) -> Result<(), Error> {
-        let conn = self.0.lock().unwrap();
-        conn.execute(
+        self.conn().execute(
             "UPDATE runs SET finished_at = ?2 WHERE id = ?1",
-            params![id, finished_at.to_rfc3339()],
+            args![id, finished_at.to_rfc3339()],
         )?;
         Ok(())
     }
@@ -2449,12 +2882,15 @@ impl Store {
         partition: Option<&str>,
         built_at: DateTime<Utc>,
     ) -> Result<(), Error> {
-        let conn = self.0.lock().unwrap();
+        let mut conn = self.conn();
+        let same = conn.dialect().null_safe_eq();
         conn.execute(
-            "UPDATE asset_materializations SET built_at = ?3
-             WHERE id = (SELECT MAX(id) FROM asset_materializations
-                         WHERE asset = ?1 AND partition IS ?2)",
-            params![asset, partition, built_at.to_rfc3339()],
+            &format!(
+                "UPDATE asset_materializations SET built_at = ?3
+                 WHERE id = (SELECT MAX(id) FROM asset_materializations
+                             WHERE asset = ?1 AND partition {same} ?2)"
+            ),
+            args![asset, partition, built_at.to_rfc3339()],
         )?;
         Ok(())
     }
@@ -2463,17 +2899,45 @@ impl Store {
     /// control-plane read fails closed has no other way to break one.
     #[cfg(test)]
     pub(crate) fn drop_table(&self, name: &str) -> Result<(), Error> {
-        let conn = self.0.lock().unwrap();
-        conn.execute_batch(&format!("DROP TABLE {name}"))?;
-        Ok(())
+        self.conn().batch(&format!("DROP TABLE {name}"))
+    }
+
+    /// refuse every insert into `notifications` from here on, which is what a
+    /// crash between a run's terminal row and the alert it owes looks like to
+    /// the transaction around both. tests only, and each backend has its own
+    /// way of being made to say no.
+    #[cfg(test)]
+    pub(crate) fn refuse_notifications(&self) -> Result<(), Error> {
+        let mut conn = self.conn();
+        match conn.dialect() {
+            Dialect::Sqlite => conn.batch(
+                "CREATE TRIGGER refused BEFORE INSERT ON notifications
+                 BEGIN SELECT RAISE(ABORT, 'refused'); END",
+            ),
+            // not validated against the rows already there: those are history,
+            // and this is about the next write
+            #[cfg(feature = "postgres")]
+            Dialect::Postgres => conn
+                .batch("ALTER TABLE notifications ADD CONSTRAINT refused CHECK (false) NOT VALID"),
+        }
+    }
+
+    /// how sqlite says it will answer `sql`. the one case that reads a plan is
+    /// about sqlite's own planner and runs on nothing else.
+    #[cfg(test)]
+    pub(crate) fn sqlite_plan(&self, sql: &str) -> String {
+        let rows = self
+            .conn()
+            .query(&format!("EXPLAIN QUERY PLAN {sql}"), args![], |r| r.text(3))
+            .unwrap();
+        rows.join(" | ")
     }
 
     pub(crate) fn prune_sensor_ticks(&self, keep: usize) -> Result<(), Error> {
-        let conn = self.0.lock().unwrap();
-        conn.execute(
+        self.conn().execute(
             "DELETE FROM sensor_ticks WHERE id NOT IN
              (SELECT id FROM sensor_ticks ORDER BY id DESC LIMIT ?1)",
-            params![keep as i64],
+            args![keep as i64],
         )?;
         Ok(())
     }
@@ -2481,15 +2945,15 @@ impl Store {
 
 /// what is executing right now, counted against `limits`. "executing" is
 /// claimed and not finished — the set a concurrency limit is about.
-fn in_flight(conn: &Connection, limits: &Limits) -> Result<InFlight, Error> {
+fn in_flight(db: &mut impl Exec, limits: &Limits) -> Result<InFlight, Error> {
     let mut counts = InFlight::new();
-    let mut stmt = conn.prepare(
+    let rows = db.query(
         "SELECT job, tags FROM runs
          WHERE claimed_by IS NOT NULL AND status IN ('queued', 'running')",
+        args![],
+        |r| Ok((r.text(0)?, tags_from_col(r, 1)?)),
     )?;
-    let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, tags_from_col(r, 1)?)))?;
-    for row in rows {
-        let (job, tags) = row?;
+    for (job, tags) in rows {
         counts.take(limits, &job, &tags);
     }
     Ok(counts)
@@ -2497,36 +2961,36 @@ fn in_flight(conn: &Connection, limits: &Limits) -> Result<InFlight, Error> {
 
 /// the queue itself: runs nobody has claimed, in the order a dispatcher takes
 /// them, with the plan each would execute.
-fn queued(conn: &Connection, limit: u32) -> Result<Vec<(Run, Option<Value>)>, Error> {
-    let mut stmt = conn.prepare(&format!(
-        "SELECT {RUN_COLS}, plan FROM runs
-         WHERE status = 'queued' AND claimed_by IS NULL
-         ORDER BY priority DESC, created_at, id LIMIT ?1"
-    ))?;
-    let rows = stmt.query_map(params![limit], |r| {
-        Ok((run_from_row(r)?, opt_json_col(r, 16)?))
-    })?;
-    Ok(rows.collect::<Result<Vec<_>, _>>()?)
+fn queued(db: &mut impl Exec, limit: u32) -> Result<Vec<(Run, Option<Value>)>, Error> {
+    db.query(
+        &format!(
+            "SELECT {RUN_COLS}, plan FROM runs
+             WHERE status = 'queued' AND claimed_by IS NULL
+             ORDER BY priority DESC, created_at, id LIMIT ?1"
+        ),
+        args![limit],
+        |r| Ok((run_from_row(r)?, r.opt_json(16)?)),
+    )
 }
 
-fn run_from_row(row: &Row) -> rusqlite::Result<Run> {
+fn run_from_row(row: &AnyRow<'_>) -> Result<Run, Error> {
     Ok(Run {
-        id: row.get(0)?,
-        job: row.get(1)?,
-        status: parse_col(row, 2)?,
-        trigger: parse_col(row, 3)?,
-        params: json_col(row, 4)?,
-        created_at: ts_col(row, 5)?,
-        started_at: opt_ts_col(row, 6)?,
-        finished_at: opt_ts_col(row, 7)?,
-        resumed_from: row.get(8)?,
-        error: row.get(9)?,
-        scheduled_for: opt_ts_col(row, 10)?,
+        id: row.text(0)?,
+        job: row.text(1)?,
+        status: row.parse(2)?,
+        trigger: row.parse(3)?,
+        params: row.json(4)?,
+        created_at: row.ts(5)?,
+        started_at: row.opt_ts(6)?,
+        finished_at: row.opt_ts(7)?,
+        resumed_from: row.opt_text(8)?,
+        error: row.opt_text(9)?,
+        scheduled_for: row.opt_ts(10)?,
         tags: tags_from_col(row, 11)?,
-        priority: row.get(12)?,
-        claimed_by: row.get(13)?,
-        claimed_at: opt_ts_col(row, 14)?,
-        lease_until: opt_ts_col(row, 15)?,
+        priority: row.int(12)?,
+        claimed_by: row.opt_text(13)?,
+        claimed_at: row.opt_ts(14)?,
+        lease_until: row.opt_ts(15)?,
     })
 }
 
@@ -2539,37 +3003,37 @@ fn tags_col(tags: &RunTags) -> Option<String> {
 
 // null and anything that is not a flat string map read as no tags: the column
 // is a fact about a run, and a run is not worth failing to list over it
-fn tags_from_col(row: &Row, idx: usize) -> rusqlite::Result<RunTags> {
-    match row.get::<_, Option<String>>(idx)? {
+fn tags_from_col(row: &AnyRow<'_>, idx: usize) -> Result<RunTags, Error> {
+    match row.opt_text(idx)? {
         Some(s) => Ok(serde_json::from_str(&s).unwrap_or_default()),
         None => Ok(RunTags::new()),
     }
 }
 
-fn op_run_from_row(row: &Row) -> rusqlite::Result<OpRun> {
+fn op_run_from_row(row: &AnyRow<'_>) -> Result<OpRun, Error> {
     Ok(OpRun {
-        run_id: row.get(0)?,
-        op: row.get(1)?,
-        status: parse_col(row, 2)?,
-        attempts: row.get(3)?,
-        started_at: opt_ts_col(row, 4)?,
-        finished_at: opt_ts_col(row, 5)?,
-        output: opt_json_col(row, 6)?,
-        metadata: opt_json_col(row, 7)?,
-        error: row.get(8)?,
-        pid: row.get(9)?,
+        run_id: row.text(0)?,
+        op: row.text(1)?,
+        status: row.parse(2)?,
+        attempts: row.count(3)?,
+        started_at: row.opt_ts(4)?,
+        finished_at: row.opt_ts(5)?,
+        output: row.opt_json(6)?,
+        metadata: row.opt_json(7)?,
+        error: row.opt_text(8)?,
+        pid: row.opt_int(9)?,
     })
 }
 
-fn notification_from_row(row: &Row) -> rusqlite::Result<Notification> {
-    let next_attempt_at = opt_ts_col(row, 5)?;
-    let delivered_at = opt_ts_col(row, 6)?;
+fn notification_from_row(row: &AnyRow<'_>) -> Result<Notification, Error> {
+    let next_attempt_at = row.opt_ts(5)?;
+    let delivered_at = row.opt_ts(6)?;
     Ok(Notification {
-        id: row.get(0)?,
-        kind: row.get(1)?,
-        payload: json_col(row, 2)?,
-        created_at: ts_col(row, 3)?,
-        attempts: row.get(4)?,
+        id: row.int(0)?,
+        kind: row.text(1)?,
+        payload: row.json(2)?,
+        created_at: row.ts(3)?,
+        attempts: row.count(4)?,
         // the state is these two columns and nothing else, worked out here so
         // the api and the delivery loop cannot come to different conclusions
         state: match (&delivered_at, &next_attempt_at) {
@@ -2579,177 +3043,129 @@ fn notification_from_row(row: &Row) -> rusqlite::Result<Notification> {
         },
         next_attempt_at,
         delivered_at,
-        last_error: row.get(7)?,
+        last_error: row.opt_text(7)?,
     })
 }
 
 /// insert one notification, due immediately. inside whatever transaction the
 /// caller is already in — that is the only way it is worth anything.
-fn queue_note(tx: &Connection, payload: &Value, at: DateTime<Utc>) -> Result<(), Error> {
+fn queue_note(tx: &mut impl Exec, payload: &Value, at: DateTime<Utc>) -> Result<(), Error> {
     tx.execute(
         "INSERT INTO notifications (kind, payload, created_at, next_attempt_at)
          VALUES (?1, ?2, ?3, ?3)",
-        params![RUN_NOTIFICATION, payload.to_string(), at.to_rfc3339()],
+        args![RUN_NOTIFICATION, payload.to_string(), at.to_rfc3339()],
     )?;
     Ok(())
 }
 
-fn preset_from_row(row: &Row) -> rusqlite::Result<Preset> {
+fn preset_from_row(row: &AnyRow<'_>) -> Result<Preset, Error> {
     Ok(Preset {
-        job: row.get(0)?,
-        name: row.get(1)?,
-        params: json_col(row, 2)?,
-        created_at: ts_col(row, 3)?,
+        job: row.text(0)?,
+        name: row.text(1)?,
+        params: row.json(2)?,
+        created_at: row.ts(3)?,
     })
 }
 
-fn event_from_row(row: &Row) -> rusqlite::Result<Event> {
+fn event_from_row(row: &AnyRow<'_>) -> Result<Event, Error> {
     Ok(Event {
-        seq: row.get(0)?,
-        run_id: row.get(1)?,
-        op: row.get(2)?,
-        level: parse_col(row, 3)?,
-        kind: parse_col(row, 4)?,
-        message: row.get(5)?,
-        data: opt_json_col(row, 6)?,
-        ts: ts_col(row, 7)?,
+        seq: row.int(0)?,
+        run_id: row.text(1)?,
+        op: row.opt_text(2)?,
+        level: row.parse(3)?,
+        kind: row.parse(4)?,
+        message: row.text(5)?,
+        data: row.opt_json(6)?,
+        ts: row.ts(7)?,
     })
 }
 
-fn op_log_from_row(row: &Row) -> rusqlite::Result<OpLog> {
+fn op_log_from_row(row: &AnyRow<'_>) -> Result<OpLog, Error> {
     Ok(OpLog {
-        id: row.get(0)?,
-        run_id: row.get(1)?,
-        op: row.get(2)?,
-        attempt: row.get(3)?,
-        at: ts_col(row, 4)?,
-        stream: opt_parse_col(row, 5)?,
-        level: opt_parse_col(row, 6)?,
-        target: row.get(7)?,
-        message: row.get(8)?,
+        id: row.int(0)?,
+        run_id: row.text(1)?,
+        op: row.text(2)?,
+        attempt: row.count(3)?,
+        at: row.ts(4)?,
+        stream: row.opt_parse(5)?,
+        level: row.opt_parse(6)?,
+        target: row.opt_text(7)?,
+        message: row.text(8)?,
     })
 }
 
-fn materialization_from_row(row: &Row) -> rusqlite::Result<Materialization> {
+fn materialization_from_row(row: &AnyRow<'_>) -> Result<Materialization, Error> {
     Ok(Materialization {
-        id: row.get(0)?,
-        asset: row.get(1)?,
-        partition: row.get(2)?,
-        fingerprint: row.get(3)?,
-        inputs: json_col(row, 4)?,
-        value: opt_json_col(row, 5)?,
-        run_id: row.get(6)?,
-        built_at: ts_col(row, 7)?,
-        metadata: opt_json_col(row, 8)?,
+        id: row.int(0)?,
+        asset: row.text(1)?,
+        partition: row.opt_text(2)?,
+        fingerprint: row.text(3)?,
+        inputs: row.json(4)?,
+        value: row.opt_json(5)?,
+        run_id: row.opt_text(6)?,
+        built_at: row.ts(7)?,
+        metadata: row.opt_json(8)?,
     })
 }
 
-fn asset_check_from_row(row: &Row) -> rusqlite::Result<AssetCheckRow> {
+fn asset_check_from_row(row: &AnyRow<'_>) -> Result<AssetCheckRow, Error> {
     Ok(AssetCheckRow {
-        id: row.get(0)?,
-        asset: row.get(1)?,
-        partition: row.get(2)?,
-        check: row.get(3)?,
-        run_id: row.get(4)?,
-        status: parse_col(row, 5)?,
-        severity: parse_col(row, 6)?,
-        message: row.get(7)?,
-        metadata: opt_json_col(row, 8)?,
-        checked_at: ts_col(row, 9)?,
+        id: row.int(0)?,
+        asset: row.text(1)?,
+        partition: row.opt_text(2)?,
+        check: row.text(3)?,
+        run_id: row.text(4)?,
+        status: row.parse(5)?,
+        severity: row.parse(6)?,
+        message: row.opt_text(7)?,
+        metadata: row.opt_json(8)?,
+        checked_at: row.ts(9)?,
     })
 }
 
-fn backfill_from_row(row: &Row) -> rusqlite::Result<Backfill> {
-    let list = |idx: usize| -> rusqlite::Result<Vec<String>> {
-        let text: String = row.get(idx)?;
-        serde_json::from_str(&text).map_err(|e| conv_err(idx, e))
+fn backfill_from_row(row: &AnyRow<'_>) -> Result<Backfill, Error> {
+    let list = |idx: usize| -> Result<Vec<String>, Error> {
+        serde_json::from_str(&row.text(idx)?).map_err(|e| Error::Column(idx, e.to_string()))
     };
     Ok(Backfill {
-        id: row.get(0)?,
-        asset: row.get(1)?,
-        from_key: row.get(2)?,
-        to_key: row.get(3)?,
+        id: row.int(0)?,
+        asset: row.text(1)?,
+        from_key: row.text(2)?,
+        to_key: row.text(3)?,
         partitions: list(4)?,
         run_ids: list(5)?,
-        total: row.get::<_, i64>(6)? as usize,
-        launched: row.get::<_, i64>(7)? as usize,
-        created_at: ts_col(row, 8)?,
-        finished_at: opt_ts_col(row, 9)?,
-        status: parse_col(row, 10)?,
+        total: row.size(6)?,
+        launched: row.size(7)?,
+        created_at: row.ts(8)?,
+        finished_at: row.opt_ts(9)?,
+        status: row.parse(10)?,
     })
 }
 
-fn sensor_tick_from_row(row: &Row) -> rusqlite::Result<SensorTick> {
+fn sensor_tick_from_row(row: &AnyRow<'_>) -> Result<SensorTick, Error> {
     Ok(SensorTick {
-        id: row.get(0)?,
-        sensor: row.get(1)?,
-        evaluated_at: ts_col(row, 2)?,
-        outcome: parse_col(row, 3)?,
-        launched: row.get(4)?,
-        skipped: row.get(5)?,
-        duration_ms: row.get(6)?,
-        error: row.get(7)?,
+        id: row.int(0)?,
+        sensor: row.text(1)?,
+        evaluated_at: row.ts(2)?,
+        outcome: row.parse(3)?,
+        launched: row.count(4)?,
+        skipped: row.count(5)?,
+        duration_ms: row.millis(6)?,
+        error: row.opt_text(7)?,
     })
 }
 
-fn tick_from_row(row: &Row) -> rusqlite::Result<Tick> {
+fn tick_from_row(row: &AnyRow<'_>) -> Result<Tick, Error> {
     Ok(Tick {
-        id: row.get(0)?,
-        job: row.get(1)?,
-        expr: row.get(2)?,
-        scheduled_for: ts_col(row, 3)?,
-        fired_at: ts_col(row, 4)?,
-        outcome: parse_col(row, 5)?,
-        run_id: row.get(6)?,
-        error: row.get(7)?,
+        id: row.int(0)?,
+        job: row.text(1)?,
+        expr: row.text(2)?,
+        scheduled_for: row.ts(3)?,
+        fired_at: row.ts(4)?,
+        outcome: row.parse(5)?,
+        run_id: row.opt_text(6)?,
+        error: row.opt_text(7)?,
     })
-}
-
-fn conv_err(idx: usize, e: impl Into<Box<dyn std::error::Error + Send + Sync>>) -> rusqlite::Error {
-    rusqlite::Error::FromSqlConversionFailure(idx, rusqlite::types::Type::Text, e.into())
-}
-
-fn parse_col<T: FromStr<Err = String>>(row: &Row, idx: usize) -> rusqlite::Result<T> {
-    row.get::<_, String>(idx)?
-        .parse()
-        .map_err(|e: String| conv_err(idx, e))
-}
-
-fn opt_parse_col<T: FromStr<Err = String>>(row: &Row, idx: usize) -> rusqlite::Result<Option<T>> {
-    match row.get::<_, Option<String>>(idx)? {
-        Some(s) => s.parse().map(Some).map_err(|e: String| conv_err(idx, e)),
-        None => Ok(None),
-    }
-}
-
-fn ts_col(row: &Row, idx: usize) -> rusqlite::Result<DateTime<Utc>> {
-    let s: String = row.get(idx)?;
-    DateTime::parse_from_rfc3339(&s)
-        .map(|t| t.with_timezone(&Utc))
-        .map_err(|e| conv_err(idx, e))
-}
-
-fn opt_ts_col(row: &Row, idx: usize) -> rusqlite::Result<Option<DateTime<Utc>>> {
-    match row.get::<_, Option<String>>(idx)? {
-        Some(s) => DateTime::parse_from_rfc3339(&s)
-            .map(|t| Some(t.with_timezone(&Utc)))
-            .map_err(|e| conv_err(idx, e)),
-        None => Ok(None),
-    }
-}
-
-fn json_col(row: &Row, idx: usize) -> rusqlite::Result<Value> {
-    let s: String = row.get(idx)?;
-    serde_json::from_str(&s).map_err(|e| conv_err(idx, e))
-}
-
-fn opt_json_col(row: &Row, idx: usize) -> rusqlite::Result<Option<Value>> {
-    match row.get::<_, Option<String>>(idx)? {
-        Some(s) => serde_json::from_str(&s)
-            .map(Some)
-            .map_err(|e| conv_err(idx, e)),
-        None => Ok(None),
-    }
 }
 
 #[cfg(test)]
@@ -2778,6 +3194,61 @@ mod tests {
             claimed_by: None,
             claimed_at: None,
             lease_until: None,
+        }
+    }
+
+    /// where the postgres cases connect. unset means no postgres on this
+    /// machine and every postgres case skips itself, so the suite still passes
+    /// with nothing installed.
+    #[cfg(feature = "postgres")]
+    const TEST_PG: &str = "HESTAN_TEST_PG";
+
+    /// one case's postgres database: a schema of its own on the server
+    /// `HESTAN_TEST_PG` names, dropped when the fixture is.
+    ///
+    /// a schema rather than a database per case because the isolation is the
+    /// same and creating one is milliseconds. `options` is how a url carries a
+    /// session setting, which is what puts every connection a case opens —
+    /// including one in a child process — in the same schema.
+    #[cfg(feature = "postgres")]
+    struct Scratch {
+        server: String,
+        url: String,
+        schema: String,
+    }
+
+    #[cfg(feature = "postgres")]
+    impl Scratch {
+        fn new() -> Option<Scratch> {
+            let server = std::env::var(TEST_PG).ok()?;
+            let schema = format!("hestan_{}", uuid::Uuid::now_v7().simple());
+            postgres::Client::connect(&server, postgres::NoTls)
+                .expect("HESTAN_TEST_PG names a server this test can reach")
+                .batch_execute(&format!("CREATE SCHEMA {schema}"))
+                .unwrap();
+            let sep = match server.contains('?') {
+                true => '&',
+                false => '?',
+            };
+            let url = format!("{server}{sep}options=-c%20search_path%3D{schema}");
+            Some(Scratch {
+                server,
+                url,
+                schema,
+            })
+        }
+
+        fn store(&self) -> Store {
+            Store::connect(&self.url).unwrap()
+        }
+    }
+
+    #[cfg(feature = "postgres")]
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            if let Ok(mut admin) = postgres::Client::connect(&self.server, postgres::NoTls) {
+                let _ = admin.batch_execute(&format!("DROP SCHEMA {} CASCADE", self.schema));
+            }
         }
     }
 
@@ -3213,15 +3684,7 @@ mod tests {
 
         // and now with the insert refused, which is a crash between the two as
         // far as the transaction is concerned
-        store
-            .0
-            .lock()
-            .unwrap()
-            .execute_batch(
-                "CREATE TRIGGER refuse BEFORE INSERT ON notifications
-                 BEGIN SELECT RAISE(ABORT, 'no'); END",
-            )
-            .unwrap();
+        store.refuse_notifications().unwrap();
         let err = store
             .run_finished(
                 "r2",
@@ -3231,7 +3694,7 @@ mod tests {
                 Some(&note),
             )
             .unwrap_err();
-        assert!(err.to_string().contains("no"), "{err}");
+        assert!(err.to_string().contains("refused"), "{err}");
         // neither half landed: the run is still running and there is still one
         // notification, not two
         assert_eq!(store.run("r2").unwrap().unwrap().status, RunStatus::Running);
@@ -3320,16 +3783,7 @@ mod tests {
     #[test]
     fn the_sweep_reaches_its_rows_through_the_index() {
         let store = Store::open(":memory:").unwrap();
-        let conn = store.0.lock().unwrap();
-        let plan = |sql: &str| -> String {
-            let mut stmt = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
-            let rows = stmt
-                .query_map([], |r| r.get::<_, String>(3))
-                .unwrap()
-                .collect::<Result<Vec<_>, _>>()
-                .unwrap();
-            rows.join(" | ")
-        };
+        let plan = |sql: &str| store.sqlite_plan(sql);
 
         // the jobs walk seeks once per job rather than reading every run
         let jobs = plan(
@@ -4835,5 +5289,107 @@ mod tests {
         assert_eq!(etl[1].scheduled_for, t0);
 
         assert_eq!(store.ticks(None, 1).unwrap().len(), 1);
+    }
+
+    /// every table the sqlite chain arrives at after sixteen migrations. a
+    /// fresh postgres database has all of them from its first statement.
+    #[cfg(feature = "postgres")]
+    const TABLES: [&str; 17] = [
+        "asset_checks",
+        "asset_materializations",
+        "backfills",
+        "events",
+        "freshness_state",
+        "notifications",
+        "op_logs",
+        "op_runs",
+        "op_state",
+        "presets",
+        "runs",
+        "schedule_ticks",
+        "schedules",
+        "schema_version",
+        "sensor_run_keys",
+        "sensor_ticks",
+        "sensors",
+    ];
+
+    #[cfg(feature = "postgres")]
+    #[test]
+    fn a_fresh_postgres_database_is_created_whole_at_the_current_version() {
+        let Some(pg) = Scratch::new() else {
+            return;
+        };
+        let store = pg.store();
+
+        let mut found: Vec<String> = store
+            .conn()
+            .query(
+                "SELECT table_name FROM information_schema.tables
+                 WHERE table_schema = current_schema()",
+                args![],
+                |r| r.text(0),
+            )
+            .unwrap();
+        found.sort();
+        assert_eq!(found, TABLES, "the schema is not the one sqlite arrives at");
+
+        let version = store
+            .conn()
+            .query_opt("SELECT version FROM schema_version", args![], |r| r.int(0))
+            .unwrap();
+        assert_eq!(version, Some(i64::from(SCHEMA_VERSION)));
+
+        // and the partial index the delivery loop scans, which is the one
+        // index that is more than a column list
+        let due: Option<String> = store
+            .conn()
+            .query_opt(
+                "SELECT indexdef FROM pg_indexes
+                 WHERE schemaname = current_schema() AND indexname = 'notifications_due'",
+                args![],
+                |r| r.text(0),
+            )
+            .unwrap();
+        assert!(
+            due.unwrap_or_default()
+                .contains("WHERE (delivered_at IS NULL)"),
+            "the undelivered-notifications index is not partial"
+        );
+
+        // opening it again finds it already there and writes nothing
+        let again = pg.store();
+        assert!(again.schedules().unwrap().is_empty());
+    }
+
+    #[cfg(feature = "postgres")]
+    #[test]
+    fn a_postgres_database_from_a_later_build_is_refused_not_downgraded() {
+        let Some(pg) = Scratch::new() else {
+            return;
+        };
+        let store = pg.store();
+        store
+            .conn()
+            .execute("UPDATE schema_version SET version = ?1", args![17_i64])
+            .unwrap();
+        drop(store);
+
+        let err = Store::connect(&pg.url).err().unwrap();
+        assert_eq!(err.to_string(), "db schema v17 is newer than this build");
+
+        // and it is still v17: a build that cannot read a database must not
+        // rewrite it either
+        let store = Store(
+            Arc::new(Db::Postgres(Mutex::new(
+                postgres::Client::connect(&pg.url, postgres::NoTls).unwrap(),
+            ))),
+            pg.url.as_str().into(),
+        );
+        let version = store
+            .conn()
+            .query_opt("SELECT version FROM schema_version", args![], |r| r.int(0))
+            .unwrap();
+        assert_eq!(version, Some(17));
     }
 }

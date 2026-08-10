@@ -41,6 +41,18 @@ pub enum Error {
     Resource { name: String, reason: String },
     #[error("storage: {0}")]
     Sqlite(#[from] rusqlite::Error),
+    #[cfg(feature = "postgres")]
+    #[error("storage: {0}")]
+    Postgres(#[from] postgres::Error),
+    /// a column that could not be read as what it holds: json that does not
+    /// parse, a timestamp that is not rfc3339, a status word this build does
+    /// not know. the run log is not supposed to contain any of them.
+    #[error("storage: column {0}: {1}")]
+    Column(usize, String),
+    /// a database target this build cannot open — a `postgres://` url without
+    /// the `postgres` feature compiled in.
+    #[error("unsupported database: {0}")]
+    UnsupportedDb(String),
     #[error(transparent)]
     Io(#[from] std::io::Error),
 }
