@@ -42,7 +42,7 @@ pub enum Error {
     #[error("storage: {0}")]
     Sqlite(#[from] rusqlite::Error),
     #[cfg(feature = "postgres")]
-    #[error("storage: {0}")]
+    #[error("storage: {}", chain(.0))]
     Postgres(#[from] postgres::Error),
     /// a column that could not be read as what it holds: json that does not
     /// parse, a timestamp that is not rfc3339, a status word this build does
@@ -55,4 +55,20 @@ pub enum Error {
     UnsupportedDb(String),
     #[error(transparent)]
     Io(#[from] std::io::Error),
+}
+
+/// a postgres error and everything under it, in one line.
+///
+/// on its own the crate's error says "db error" and puts the constraint, the
+/// column and the reason in its source — so a storage failure that reached a
+/// log or an api response would say nothing whatsoever about what went wrong.
+#[cfg(feature = "postgres")]
+fn chain(e: &postgres::Error) -> String {
+    let mut out = e.to_string();
+    let mut cause = std::error::Error::source(e);
+    while let Some(next) = cause {
+        out.push_str(&format!(": {next}"));
+        cause = next.source();
+    }
+    out
 }

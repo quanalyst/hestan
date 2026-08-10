@@ -498,6 +498,23 @@ enum Dialect {
 }
 
 impl Dialect {
+    /// what an optional filter's parameter needs saying about it.
+    ///
+    /// half the queries below are shaped `WHERE (?1 IS NULL OR job = ?1)` — a
+    /// filter that is a filter only when it was asked for. postgres works
+    /// through an expression left to right and gives a parameter its type at
+    /// the first place that implies one; `?1 IS NULL` implies nothing at all,
+    /// so it reaches the end still not knowing and refuses the statement. the
+    /// cast says it once, up front. sqlite infers nothing from anything and
+    /// needs none of this.
+    fn text_param(self) -> &'static str {
+        match self {
+            Dialect::Sqlite => "",
+            #[cfg(feature = "postgres")]
+            Dialect::Postgres => "::text",
+        }
+    }
+
     /// sqlite's null-safe comparison, which postgres spells out. `partition IS
     /// ?2` matches a null column against a null parameter and `partition = ?2`
     /// never does, which is the difference between "the unpartitioned asset"
@@ -554,11 +571,14 @@ impl Dialect {
             Dialect::Sqlite => {
                 "fingerprint IS NOT LAG(fingerprint) OVER (PARTITION BY partition ORDER BY id)"
             }
+            // and cast, because postgres has two integer widths and an
+            // integer literal is the narrow one, which is not what a column
+            // of this schema ever is
             #[cfg(feature = "postgres")]
             Dialect::Postgres => {
-                "CASE WHEN fingerprint IS DISTINCT FROM
-                      LAG(fingerprint) OVER (PARTITION BY partition ORDER BY id)
-                      THEN 1 ELSE 0 END"
+                "(CASE WHEN fingerprint IS DISTINCT FROM
+                       LAG(fingerprint) OVER (PARTITION BY partition ORDER BY id)
+                       THEN 1 ELSE 0 END)::bigint"
             }
         }
     }
@@ -1809,11 +1829,15 @@ impl Store {
         after: i64,
         limit: u32,
     ) -> Result<Vec<OpLog>, Error> {
-        self.conn().query(
-            "SELECT id, run_id, op, attempt, at, stream, level, target, message
-             FROM op_logs
-             WHERE run_id = ?1 AND (?2 IS NULL OR op = ?2) AND id > ?3
-             ORDER BY id LIMIT ?4",
+        let mut conn = self.conn();
+        let opt = conn.dialect().text_param();
+        conn.query(
+            &format!(
+                "SELECT id, run_id, op, attempt, at, stream, level, target, message
+                 FROM op_logs
+                 WHERE run_id = ?1 AND (?2{opt} IS NULL OR op = ?2) AND id > ?3
+                 ORDER BY id LIMIT ?4"
+            ),
             args![run_id, op, after, limit],
             op_log_from_row,
         )
@@ -2127,7 +2151,7 @@ impl Store {
         limit: u32,
     ) -> Result<Vec<Run>, Error> {
         let mut conn = self.conn();
-        let tagged = conn.dialect().tag_filter();
+        let (tagged, opt) = (conn.dialect().tag_filter(), conn.dialect().text_param());
         let since = since.map(|t| t.to_rfc3339());
         let before = before.map(|t| t.to_rfc3339());
         let (key, value) = (tag.map(|t| t.0), tag.map(|t| t.1));
@@ -2135,10 +2159,11 @@ impl Store {
             &format!(
                 r#"SELECT {RUN_COLS}
                    FROM runs
-                   WHERE (?1 IS NULL OR job = ?1) AND (?2 IS NULL OR created_at >= ?2)
-                     AND (?3 IS NULL OR created_at < ?3
-                          OR (?4 IS NOT NULL AND created_at = ?3 AND id < ?4))
-                     AND (?5 IS NULL OR {tagged})
+                   WHERE (?1{opt} IS NULL OR job = ?1)
+                     AND (?2{opt} IS NULL OR created_at >= ?2)
+                     AND (?3{opt} IS NULL OR created_at < ?3
+                          OR (?4{opt} IS NOT NULL AND created_at = ?3 AND id < ?4))
+                     AND (?5{opt} IS NULL OR {tagged})
                    ORDER BY created_at DESC, id DESC LIMIT ?7"#
             ),
             args![job, since, before, before_id, key, value, limit],
@@ -2163,13 +2188,16 @@ impl Store {
     ) -> Result<Vec<Run>, Error> {
         let at = after.map(|c| c.finished_at.to_rfc3339());
         let id = after.map(|c| c.id.as_str());
-        self.conn().query(
+        let mut conn = self.conn();
+        let opt = conn.dialect().text_param();
+        conn.query(
             &format!(
                 r#"SELECT {RUN_COLS}
                    FROM runs
                    WHERE status IN ('success', 'failed', 'canceled') AND finished_at IS NOT NULL
-                     AND (?1 IS NULL OR job = ?1)
-                     AND (?2 IS NULL OR finished_at > ?2 OR (finished_at = ?2 AND id > ?3))
+                     AND (?1{opt} IS NULL OR job = ?1)
+                     AND (?2{opt} IS NULL OR finished_at > ?2
+                          OR (finished_at = ?2 AND id > ?3))
                    ORDER BY finished_at, id LIMIT ?4"#
             ),
             args![job, at, id, limit],
@@ -2183,11 +2211,15 @@ impl Store {
         &self,
         job: Option<&str>,
     ) -> Result<Option<RunCursor>, Error> {
-        self.conn().query_opt(
-            "SELECT finished_at, id FROM runs
-             WHERE status IN ('success', 'failed', 'canceled') AND finished_at IS NOT NULL
-               AND (?1 IS NULL OR job = ?1)
-             ORDER BY finished_at DESC, id DESC LIMIT 1",
+        let mut conn = self.conn();
+        let opt = conn.dialect().text_param();
+        conn.query_opt(
+            &format!(
+                "SELECT finished_at, id FROM runs
+                 WHERE status IN ('success', 'failed', 'canceled') AND finished_at IS NOT NULL
+                   AND (?1{opt} IS NULL OR job = ?1)
+                 ORDER BY finished_at DESC, id DESC LIMIT 1"
+            ),
             args![job],
             |r| {
                 Ok(RunCursor {
@@ -2326,11 +2358,11 @@ impl Store {
         limit: u32,
     ) -> Result<Vec<MetaPoint>, Error> {
         let mut conn = self.conn();
-        let same = conn.dialect().null_safe_eq();
+        let (same, opt) = (conn.dialect().null_safe_eq(), conn.dialect().text_param());
         let rows = conn.query(
             &format!(
                 "SELECT run_id, metadata, built_at FROM asset_materializations
-                 WHERE asset = ?1 AND (?2 IS NULL OR partition {same} ?2)
+                 WHERE asset = ?1 AND (?2{opt} IS NULL OR partition {same} ?2)
                    AND metadata IS NOT NULL
                  ORDER BY id DESC LIMIT ?3"
             ),
@@ -2478,9 +2510,10 @@ impl Store {
         limit: u32,
     ) -> Result<Vec<HistoryEntry>, Error> {
         let mut conn = self.conn();
-        let (same, changed) = (
+        let (same, changed, opt) = (
             conn.dialect().null_safe_eq(),
             conn.dialect().fingerprint_changed(),
+            conn.dialect().text_param(),
         );
         // both look one row back within the partition: one key's rebuild says
         // nothing about whether another key's fingerprint or row count moved
@@ -2494,7 +2527,7 @@ impl Store {
                             LAG(metadata) OVER (PARTITION BY partition ORDER BY id)
                                 AS previous_metadata
                      FROM asset_materializations
-                     WHERE asset = ?1 AND (?2 IS NULL OR partition {same} ?2)
+                     WHERE asset = ?1 AND (?2{opt} IS NULL OR partition {same} ?2)
                  ) history ORDER BY id DESC LIMIT ?3"
             ),
             args![asset, partition, limit],
@@ -2573,12 +2606,12 @@ impl Store {
         limit: u32,
     ) -> Result<Vec<AssetCheckRow>, Error> {
         let mut conn = self.conn();
-        let same = conn.dialect().null_safe_eq();
+        let (same, opt) = (conn.dialect().null_safe_eq(), conn.dialect().text_param());
         conn.query(
             &format!(
                 "SELECT id, asset, partition, check_name, run_id, status, severity, message,
                         metadata, checked_at
-                 FROM asset_checks WHERE asset = ?1 AND (?2 IS NULL OR partition {same} ?2)
+                 FROM asset_checks WHERE asset = ?1 AND (?2{opt} IS NULL OR partition {same} ?2)
                  ORDER BY id DESC LIMIT ?3"
             ),
             args![asset, partition, limit],
@@ -2852,10 +2885,14 @@ impl Store {
     }
 
     pub fn sensor_ticks(&self, sensor: Option<&str>, limit: u32) -> Result<Vec<SensorTick>, Error> {
-        self.conn().query(
-            "SELECT id, sensor, evaluated_at, outcome, launched, skipped, duration_ms, error
-             FROM sensor_ticks WHERE (?1 IS NULL OR sensor = ?1)
-             ORDER BY id DESC LIMIT ?2",
+        let mut conn = self.conn();
+        let opt = conn.dialect().text_param();
+        conn.query(
+            &format!(
+                "SELECT id, sensor, evaluated_at, outcome, launched, skipped, duration_ms, error
+                 FROM sensor_ticks WHERE (?1{opt} IS NULL OR sensor = ?1)
+                 ORDER BY id DESC LIMIT ?2"
+            ),
             args![sensor, limit],
             sensor_tick_from_row,
         )
@@ -3203,6 +3240,82 @@ mod tests {
     #[cfg(feature = "postgres")]
     const TEST_PG: &str = "HESTAN_TEST_PG";
 
+    /// one case's database, on one backend.
+    ///
+    /// cases are handed this rather than a `Store` because several of them
+    /// want a *second* handle to the same database: two connections is what a
+    /// race needs, and one `Store` cloned is one connection behind one mutex.
+    /// which also means sqlite cases run against a file rather than
+    /// `":memory:"`, since a private memory database cannot be opened twice.
+    enum Backend {
+        Sqlite(tempfile::TempDir),
+        #[cfg(feature = "postgres")]
+        Postgres(Scratch),
+    }
+
+    impl Backend {
+        /// the postgres half of a run of the suite, when there is one.
+        #[cfg(feature = "postgres")]
+        fn postgres() -> Option<Backend> {
+            Scratch::new().map(Backend::Postgres)
+        }
+
+        #[cfg(not(feature = "postgres"))]
+        fn postgres() -> Option<Backend> {
+            None
+        }
+
+        /// what a child process would be handed to reach the same database: a
+        /// path or a url.
+        fn target(&self) -> String {
+            match self {
+                Backend::Sqlite(dir) => dir.path().join("hestan.db").display().to_string(),
+                #[cfg(feature = "postgres")]
+                Backend::Postgres(pg) => pg.url.clone(),
+            }
+        }
+
+        /// a new handle to this database — a new connection, every call.
+        fn store(&self) -> Store {
+            match self {
+                Backend::Sqlite(dir) => Store::open(dir.path().join("hestan.db").to_str().unwrap()),
+                #[cfg(feature = "postgres")]
+                Backend::Postgres(pg) => Store::connect(&pg.url),
+            }
+            .unwrap()
+        }
+
+        fn name(&self) -> &'static str {
+            match self {
+                Backend::Sqlite(_) => "sqlite",
+                #[cfg(feature = "postgres")]
+                Backend::Postgres(_) => "postgres",
+            }
+        }
+    }
+
+    /// run one case against every backend this build can reach: sqlite always,
+    /// and postgres when `HESTAN_TEST_PG` names a server.
+    ///
+    /// one suite run twice, rather than two suites. a second set of cases for
+    /// the second backend is exactly how two backends quietly come to disagree
+    /// — the cases that were never copied are the ones nobody notices — so
+    /// there is no second set. a machine with no postgres runs the sqlite half
+    /// and passes, which is what makes that honest rather than optional.
+    fn both(case: impl Fn(&Backend)) {
+        let mut backends = vec![Backend::Sqlite(tempfile::tempdir().unwrap())];
+        backends.extend(Backend::postgres());
+        for db in &backends {
+            // the same case runs twice and a bare panic would not say which
+            // half of it failed, which is the first thing you want to know
+            let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| case(db)));
+            if let Err(panic) = ran {
+                eprintln!("^^ the case above failed on {}", db.name());
+                std::panic::resume_unwind(panic);
+            }
+        }
+    }
+
     /// one case's postgres database: a schema of its own on the server
     /// `HESTAN_TEST_PG` names, dropped when the fixture is.
     ///
@@ -3254,247 +3367,261 @@ mod tests {
 
     #[test]
     fn run_lifecycle_roundtrips() {
-        let store = Store::open(":memory:").unwrap();
-        let run = mk_run("r1", "etl", Utc::now());
-        store.create_run(&run, &["a".into(), "b".into()]).unwrap();
+        both(|db| {
+            let store = db.store();
+            let run = mk_run("r1", "etl", Utc::now());
+            store.create_run(&run, &["a".into(), "b".into()]).unwrap();
 
-        let got = store.run("r1").unwrap().unwrap();
-        assert_eq!(got.status, RunStatus::Queued);
-        assert_eq!(got.trigger, Trigger::Schedule);
-        assert_eq!(got.params, json!({"limit": 5}));
+            let got = store.run("r1").unwrap().unwrap();
+            assert_eq!(got.status, RunStatus::Queued);
+            assert_eq!(got.trigger, Trigger::Schedule);
+            assert_eq!(got.params, json!({"limit": 5}));
 
-        let ops = store.op_runs("r1").unwrap();
-        assert_eq!(ops.len(), 2);
-        assert!(
-            ops.iter()
-                .all(|o| o.status == OpStatus::Pending && o.attempts == 0)
-        );
+            let ops = store.op_runs("r1").unwrap();
+            assert_eq!(ops.len(), 2);
+            assert!(
+                ops.iter()
+                    .all(|o| o.status == OpStatus::Pending && o.attempts == 0)
+            );
 
-        store.run_started("r1", Utc::now()).unwrap();
-        store.op_started("r1", "a", 1).unwrap();
-        let first_start = store.op_runs("r1").unwrap()[0].started_at.unwrap();
-        store.op_started("r1", "a", 2).unwrap();
-        store
-            .op_finished(
-                "r1",
-                "a",
-                OpStatus::Success,
-                Some(&json!({"rows": 3})),
-                Some(&json!({"rows": {"int": 3}})),
-                None,
-            )
-            .unwrap();
-        store
-            .op_finished("r1", "b", OpStatus::Failed, None, None, Some("boom"))
-            .unwrap();
-        store
-            .run_finished("r1", RunStatus::Failed, None, Utc::now(), None)
-            .unwrap();
+            store.run_started("r1", Utc::now()).unwrap();
+            store.op_started("r1", "a", 1).unwrap();
+            let first_start = store.op_runs("r1").unwrap()[0].started_at.unwrap();
+            store.op_started("r1", "a", 2).unwrap();
+            store
+                .op_finished(
+                    "r1",
+                    "a",
+                    OpStatus::Success,
+                    Some(&json!({"rows": 3})),
+                    Some(&json!({"rows": {"int": 3}})),
+                    None,
+                )
+                .unwrap();
+            store
+                .op_finished("r1", "b", OpStatus::Failed, None, None, Some("boom"))
+                .unwrap();
+            store
+                .run_finished("r1", RunStatus::Failed, None, Utc::now(), None)
+                .unwrap();
 
-        let got = store.run("r1").unwrap().unwrap();
-        assert_eq!(got.status, RunStatus::Failed);
-        assert!(got.started_at.is_some() && got.finished_at.is_some());
+            let got = store.run("r1").unwrap().unwrap();
+            assert_eq!(got.status, RunStatus::Failed);
+            assert!(got.started_at.is_some() && got.finished_at.is_some());
 
-        let ops = store.op_runs("r1").unwrap();
-        assert_eq!(ops[0].attempts, 2);
-        assert_eq!(ops[0].started_at.unwrap(), first_start);
-        assert_eq!(ops[0].output, Some(json!({"rows": 3})));
-        assert_eq!(ops[0].metadata, Some(json!({"rows": {"int": 3}})));
-        assert_eq!(ops[1].status, OpStatus::Failed);
-        assert_eq!(ops[1].error.as_deref(), Some("boom"));
-        assert_eq!(ops[1].metadata, None, "a failure reported no facts");
+            let ops = store.op_runs("r1").unwrap();
+            assert_eq!(ops[0].attempts, 2);
+            assert_eq!(ops[0].started_at.unwrap(), first_start);
+            assert_eq!(ops[0].output, Some(json!({"rows": 3})));
+            assert_eq!(ops[0].metadata, Some(json!({"rows": {"int": 3}})));
+            assert_eq!(ops[1].status, OpStatus::Failed);
+            assert_eq!(ops[1].error.as_deref(), Some("boom"));
+            assert_eq!(ops[1].metadata, None, "a failure reported no facts");
+        });
     }
 
     #[test]
     fn events_filter_by_seq() {
-        let store = Store::open(":memory:").unwrap();
-        store
-            .create_run(&mk_run("r1", "etl", Utc::now()), &[])
-            .unwrap();
-        store
-            .append_event(
-                "r1",
-                Some("a"),
-                EventLevel::Warn,
-                EventKind::Log,
-                "flaky",
-                None,
-            )
-            .unwrap();
-        store
-            .append_event(
-                "r1",
-                Some("a"),
-                EventLevel::Error,
-                EventKind::OpFailed,
-                "boom",
-                Some(&json!({"error": "boom"})),
-            )
-            .unwrap();
+        both(|db| {
+            let store = db.store();
+            store
+                .create_run(&mk_run("r1", "etl", Utc::now()), &[])
+                .unwrap();
+            store
+                .append_event(
+                    "r1",
+                    Some("a"),
+                    EventLevel::Warn,
+                    EventKind::Log,
+                    "flaky",
+                    None,
+                )
+                .unwrap();
+            store
+                .append_event(
+                    "r1",
+                    Some("a"),
+                    EventLevel::Error,
+                    EventKind::OpFailed,
+                    "boom",
+                    Some(&json!({"error": "boom"})),
+                )
+                .unwrap();
 
-        let all = store.events("r1", 0).unwrap();
-        assert_eq!(all.len(), 3);
-        assert_eq!(all[0].op, None);
-        assert_eq!(all[0].kind, EventKind::RunQueued);
-        assert_eq!(all[1].level, EventLevel::Warn);
-        assert_eq!(all[1].data, None);
-        assert_eq!(all[2].kind, EventKind::OpFailed);
-        assert_eq!(all[2].data, Some(json!({"error": "boom"})));
+            let all = store.events("r1", 0).unwrap();
+            assert_eq!(all.len(), 3);
+            assert_eq!(all[0].op, None);
+            assert_eq!(all[0].kind, EventKind::RunQueued);
+            assert_eq!(all[1].level, EventLevel::Warn);
+            assert_eq!(all[1].data, None);
+            assert_eq!(all[2].kind, EventKind::OpFailed);
+            assert_eq!(all[2].data, Some(json!({"error": "boom"})));
 
-        let tail = store.events("r1", all[0].seq).unwrap();
-        assert_eq!(tail.len(), 2);
-        assert_eq!(tail[0].message, "flaky");
+            let tail = store.events("r1", all[0].seq).unwrap();
+            assert_eq!(tail.len(), 2);
+            assert_eq!(tail[0].message, "flaky");
+        });
     }
 
     #[test]
     fn runs_filter_order_and_limit() {
-        let store = Store::open(":memory:").unwrap();
-        let t0 = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
-        for (i, job) in [(0, "etl"), (1, "etl"), (2, "health"), (3, "etl")] {
-            let run = mk_run(&format!("r{i}"), job, t0 + chrono::Duration::minutes(i));
-            store.create_run(&run, &[]).unwrap();
-        }
+        both(|db| {
+            let store = db.store();
+            let t0 = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+            for (i, job) in [(0, "etl"), (1, "etl"), (2, "health"), (3, "etl")] {
+                let run = mk_run(&format!("r{i}"), job, t0 + chrono::Duration::minutes(i));
+                store.create_run(&run, &[]).unwrap();
+            }
 
-        let etl = store.runs(Some("etl"), None, None, None, None, 10).unwrap();
-        assert_eq!(
-            etl.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(),
-            ["r3", "r1", "r0"]
-        );
-        assert_eq!(
-            store.runs(None, None, None, None, None, 2).unwrap().len(),
-            2
-        );
-        assert!(
-            store
-                .runs(Some("nope"), None, None, None, None, 10)
-                .unwrap()
-                .is_empty()
-        );
+            let etl = store.runs(Some("etl"), None, None, None, None, 10).unwrap();
+            assert_eq!(
+                etl.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(),
+                ["r3", "r1", "r0"]
+            );
+            assert_eq!(
+                store.runs(None, None, None, None, None, 2).unwrap().len(),
+                2
+            );
+            assert!(
+                store
+                    .runs(Some("nope"), None, None, None, None, 10)
+                    .unwrap()
+                    .is_empty()
+            );
+        });
     }
 
     #[test]
     fn runs_since_cutoff() {
-        let store = Store::open(":memory:").unwrap();
-        let t0 = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
-        for (i, job) in [(0, "etl"), (1, "etl"), (2, "health"), (3, "etl")] {
-            let run = mk_run(&format!("r{i}"), job, t0 + chrono::Duration::minutes(i));
-            store.create_run(&run, &[]).unwrap();
-        }
+        both(|db| {
+            let store = db.store();
+            let t0 = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+            for (i, job) in [(0, "etl"), (1, "etl"), (2, "health"), (3, "etl")] {
+                let run = mk_run(&format!("r{i}"), job, t0 + chrono::Duration::minutes(i));
+                store.create_run(&run, &[]).unwrap();
+            }
 
-        let since = t0 + chrono::Duration::minutes(2);
-        let recent = store.runs(None, Some(since), None, None, None, 10).unwrap();
-        assert_eq!(
-            recent.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(),
-            ["r3", "r2"]
-        );
+            let since = t0 + chrono::Duration::minutes(2);
+            let recent = store.runs(None, Some(since), None, None, None, 10).unwrap();
+            assert_eq!(
+                recent.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(),
+                ["r3", "r2"]
+            );
 
-        let etl = store
-            .runs(Some("etl"), Some(since), None, None, None, 10)
-            .unwrap();
-        assert_eq!(
-            etl.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(),
-            ["r3"]
-        );
+            let etl = store
+                .runs(Some("etl"), Some(since), None, None, None, 10)
+                .unwrap();
+            assert_eq!(
+                etl.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(),
+                ["r3"]
+            );
 
-        let future = t0 + chrono::Duration::hours(1);
-        assert!(
-            store
-                .runs(None, Some(future), None, None, None, 10)
-                .unwrap()
-                .is_empty()
-        );
+            let future = t0 + chrono::Duration::hours(1);
+            assert!(
+                store
+                    .runs(None, Some(future), None, None, None, 10)
+                    .unwrap()
+                    .is_empty()
+            );
+        });
     }
 
     #[test]
     fn runs_before_cutoff() {
-        let store = Store::open(":memory:").unwrap();
-        let t0 = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
-        for (i, job) in [(0, "etl"), (1, "etl"), (2, "health"), (3, "etl")] {
-            let run = mk_run(&format!("r{i}"), job, t0 + chrono::Duration::minutes(i));
-            store.create_run(&run, &[]).unwrap();
-        }
+        both(|db| {
+            let store = db.store();
+            let t0 = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+            for (i, job) in [(0, "etl"), (1, "etl"), (2, "health"), (3, "etl")] {
+                let run = mk_run(&format!("r{i}"), job, t0 + chrono::Duration::minutes(i));
+                store.create_run(&run, &[]).unwrap();
+            }
 
-        let before = t0 + chrono::Duration::minutes(2);
-        let older = store
-            .runs(None, None, Some(before), None, None, 10)
-            .unwrap();
-        assert_eq!(
-            older.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(),
-            ["r1", "r0"]
-        );
+            let before = t0 + chrono::Duration::minutes(2);
+            let older = store
+                .runs(None, None, Some(before), None, None, 10)
+                .unwrap();
+            assert_eq!(
+                older.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(),
+                ["r1", "r0"]
+            );
 
-        let since = t0 + chrono::Duration::minutes(1);
-        let etl = store
-            .runs(Some("etl"), Some(since), Some(before), None, None, 10)
-            .unwrap();
-        assert_eq!(
-            etl.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(),
-            ["r1"]
-        );
+            let since = t0 + chrono::Duration::minutes(1);
+            let etl = store
+                .runs(Some("etl"), Some(since), Some(before), None, None, 10)
+                .unwrap();
+            assert_eq!(
+                etl.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(),
+                ["r1"]
+            );
 
-        let page = store.runs(None, None, None, None, None, 2).unwrap();
-        assert_eq!(
-            page.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(),
-            ["r3", "r2"]
-        );
-        let next = store
-            .runs(None, None, Some(page[1].created_at), None, None, 2)
-            .unwrap();
-        assert_eq!(
-            next.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(),
-            ["r1", "r0"]
-        );
+            let page = store.runs(None, None, None, None, None, 2).unwrap();
+            assert_eq!(
+                page.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(),
+                ["r3", "r2"]
+            );
+            let next = store
+                .runs(None, None, Some(page[1].created_at), None, None, 2)
+                .unwrap();
+            assert_eq!(
+                next.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(),
+                ["r1", "r0"]
+            );
+        });
     }
 
     #[test]
     fn runs_composite_cursor_pages_ties() {
-        let store = Store::open(":memory:").unwrap();
-        let t0 = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
-        // r1 and r2 share an identical created_at string, deliberately
-        store.create_run(&mk_run("r0", "etl", t0), &[]).unwrap();
-        let tied = t0 + chrono::Duration::minutes(1);
-        store.create_run(&mk_run("r1", "etl", tied), &[]).unwrap();
-        store.create_run(&mk_run("r2", "etl", tied), &[]).unwrap();
+        both(|db| {
+            let store = db.store();
+            let t0 = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+            // r1 and r2 share an identical created_at string, deliberately
+            store.create_run(&mk_run("r0", "etl", t0), &[]).unwrap();
+            let tied = t0 + chrono::Duration::minutes(1);
+            store.create_run(&mk_run("r1", "etl", tied), &[]).unwrap();
+            store.create_run(&mk_run("r2", "etl", tied), &[]).unwrap();
 
-        let mut seen: Vec<String> = Vec::new();
-        let mut cursor: Option<(DateTime<Utc>, String)> = None;
-        loop {
-            let page = match &cursor {
-                Some((ts, id)) => store
-                    .runs(None, None, Some(*ts), Some(id.as_str()), None, 1)
-                    .unwrap(),
-                None => store.runs(None, None, None, None, None, 1).unwrap(),
-            };
-            let Some(run) = page.into_iter().next() else {
-                break;
-            };
-            cursor = Some((run.created_at, run.id.clone()));
-            seen.push(run.id);
-        }
-        assert_eq!(seen, ["r2", "r1", "r0"]);
+            let mut seen: Vec<String> = Vec::new();
+            let mut cursor: Option<(DateTime<Utc>, String)> = None;
+            loop {
+                let page = match &cursor {
+                    Some((ts, id)) => store
+                        .runs(None, None, Some(*ts), Some(id.as_str()), None, 1)
+                        .unwrap(),
+                    None => store.runs(None, None, None, None, None, 1).unwrap(),
+                };
+                let Some(run) = page.into_iter().next() else {
+                    break;
+                };
+                cursor = Some((run.created_at, run.id.clone()));
+                seen.push(run.id);
+            }
+            assert_eq!(seen, ["r2", "r1", "r0"]);
+        });
     }
 
     #[test]
     fn recent_op_runs_window_and_order() {
-        let store = Store::open(":memory:").unwrap();
-        let t0 = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
-        for i in 0..3 {
-            let run = mk_run(&format!("r{i}"), "etl", t0 + chrono::Duration::minutes(i));
-            store.create_run(&run, &["a".into(), "b".into()]).unwrap();
-        }
-        store
-            .create_run(&mk_run("hx", "health", t0), &["h".into()])
-            .unwrap();
+        both(|db| {
+            let store = db.store();
+            let t0 = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+            for i in 0..3 {
+                let run = mk_run(&format!("r{i}"), "etl", t0 + chrono::Duration::minutes(i));
+                store.create_run(&run, &["a".into(), "b".into()]).unwrap();
+            }
+            store
+                .create_run(&mk_run("hx", "health", t0), &["h".into()])
+                .unwrap();
 
-        let rows = store.recent_op_runs("etl", 2).unwrap();
-        assert_eq!(
-            rows.iter().map(|o| o.run_id.as_str()).collect::<Vec<_>>(),
-            ["r2", "r2", "r1", "r1"]
-        );
-        assert!(rows.iter().all(|o| o.op == "a" || o.op == "b"));
+            let rows = store.recent_op_runs("etl", 2).unwrap();
+            assert_eq!(
+                rows.iter().map(|o| o.run_id.as_str()).collect::<Vec<_>>(),
+                ["r2", "r2", "r1", "r1"]
+            );
+            assert!(rows.iter().all(|o| o.op == "a" || o.op == "b"));
 
-        assert_eq!(store.recent_op_runs("etl", 10).unwrap().len(), 6);
-        assert!(store.recent_op_runs("nope", 5).unwrap().is_empty());
+            assert_eq!(store.recent_op_runs("etl", 10).unwrap().len(), 6);
+            assert!(store.recent_op_runs("nope", 5).unwrap().is_empty());
+        });
     }
 
     /// the whole-store sweep, for cases that are about one policy rather than
@@ -3511,148 +3638,156 @@ mod tests {
 
     #[test]
     fn prune_runs_cascades_and_keeps_the_rest() {
-        let store = Store::open(":memory:").unwrap();
-        let old = Utc::now() - chrono::Duration::days(10);
-        for (id, status) in [
-            ("os", RunStatus::Success),
-            ("of", RunStatus::Failed),
-            ("oc", RunStatus::Canceled),
-        ] {
+        both(|db| {
+            let store = db.store();
+            let old = Utc::now() - chrono::Duration::days(10);
+            for (id, status) in [
+                ("os", RunStatus::Success),
+                ("of", RunStatus::Failed),
+                ("oc", RunStatus::Canceled),
+            ] {
+                store
+                    .create_run(&mk_run(id, "etl", old), &["a".into()])
+                    .unwrap();
+                store
+                    .run_finished(id, status, None, Utc::now(), None)
+                    .unwrap();
+            }
             store
-                .create_run(&mk_run(id, "etl", old), &["a".into()])
+                .create_run(&mk_run("live", "etl", old), &["a".into()])
+                .unwrap();
+            store.run_started("live", Utc::now()).unwrap();
+            store
+                .create_run(&mk_run("young", "etl", Utc::now()), &["a".into()])
                 .unwrap();
             store
-                .run_finished(id, status, None, Utc::now(), None)
+                .run_finished("young", RunStatus::Success, None, Utc::now(), None)
                 .unwrap();
-        }
-        store
-            .create_run(&mk_run("live", "etl", old), &["a".into()])
-            .unwrap();
-        store.run_started("live", Utc::now()).unwrap();
-        store
-            .create_run(&mk_run("young", "etl", Utc::now()), &["a".into()])
-            .unwrap();
-        store
-            .run_finished("young", RunStatus::Success, None, Utc::now(), None)
-            .unwrap();
-        store
-            .set_op_state("etl", "a", &json!({"cursor": 9}))
-            .unwrap();
+            store
+                .set_op_state("etl", "a", &json!({"cursor": 9}))
+                .unwrap();
 
-        assert_eq!(prune(&store, &Retention::days(7)), 3);
+            assert_eq!(prune(&store, &Retention::days(7)), 3);
 
-        for id in ["os", "of", "oc"] {
-            assert!(store.run(id).unwrap().is_none());
-            assert!(
-                store.op_runs(id).unwrap().is_empty(),
-                "orphan op_runs for {id}"
+            for id in ["os", "of", "oc"] {
+                assert!(store.run(id).unwrap().is_none());
+                assert!(
+                    store.op_runs(id).unwrap().is_empty(),
+                    "orphan op_runs for {id}"
+                );
+                assert!(
+                    store.events(id, 0).unwrap().is_empty(),
+                    "orphan events for {id}"
+                );
+            }
+            let live = store.run("live").unwrap().unwrap();
+            assert_eq!(live.status, RunStatus::Running);
+            assert_eq!(store.op_runs("live").unwrap().len(), 1);
+            assert!(store.run("young").unwrap().is_some());
+            assert!(!store.events("young", 0).unwrap().is_empty());
+            assert_eq!(
+                store.op_state("etl", "a").unwrap(),
+                Some(json!({"cursor": 9}))
             );
-            assert!(
-                store.events(id, 0).unwrap().is_empty(),
-                "orphan events for {id}"
-            );
-        }
-        let live = store.run("live").unwrap().unwrap();
-        assert_eq!(live.status, RunStatus::Running);
-        assert_eq!(store.op_runs("live").unwrap().len(), 1);
-        assert!(store.run("young").unwrap().is_some());
-        assert!(!store.events("young", 0).unwrap().is_empty());
-        assert_eq!(
-            store.op_state("etl", "a").unwrap(),
-            Some(json!({"cursor": 9}))
-        );
 
-        assert_eq!(prune(&store, &Retention::days(7)), 0);
+            assert_eq!(prune(&store, &Retention::days(7)), 0);
+        });
     }
 
     // the conservative direction, at the boundary and from both sides: a run
     // is deleted only when the age rule and keep_last would both take it
     #[test]
     fn keep_last_and_the_age_cutoff_each_hold_a_run_the_other_would_delete() {
-        let store = Store::open(":memory:").unwrap();
-        for (id, age) in [("oldest", 30), ("older", 20), ("old", 10), ("new", 1)] {
-            let at = Utc::now() - chrono::Duration::days(age);
-            store
-                .create_run(&mk_run(id, "etl", at), &["a".into()])
-                .unwrap();
-            store
-                .run_finished(id, RunStatus::Success, None, Utc::now(), None)
-                .unwrap();
-        }
+        both(|db| {
+            let store = db.store();
+            for (id, age) in [("oldest", 30), ("older", 20), ("old", 10), ("new", 1)] {
+                let at = Utc::now() - chrono::Duration::days(age);
+                store
+                    .create_run(&mk_run(id, "etl", at), &["a".into()])
+                    .unwrap();
+                store
+                    .run_finished(id, RunStatus::Success, None, Utc::now(), None)
+                    .unwrap();
+            }
 
-        // keep_last holds two runs past an age cutoff that would take three
-        assert_eq!(prune(&store, &Retention::days(7).keep_last(3)), 1);
-        assert!(store.run("oldest").unwrap().is_none());
-        assert!(store.run("older").unwrap().is_some(), "keep_last let it go");
+            // keep_last holds two runs past an age cutoff that would take three
+            assert_eq!(prune(&store, &Retention::days(7).keep_last(3)), 1);
+            assert!(store.run("oldest").unwrap().is_none());
+            assert!(store.run("older").unwrap().is_some(), "keep_last let it go");
 
-        // and the age cutoff holds a run keep_last would drop: two of the three
-        // left are inside 15 days, and keep_last(1) does not reach them
-        assert_eq!(prune(&store, &Retention::days(15).keep_last(1)), 1);
-        assert!(store.run("older").unwrap().is_none());
-        assert!(
-            store.run("old").unwrap().is_some(),
-            "the age cutoff let it go"
-        );
-        assert!(store.run("new").unwrap().is_some());
+            // and the age cutoff holds a run keep_last would drop: two of the three
+            // left are inside 15 days, and keep_last(1) does not reach them
+            assert_eq!(prune(&store, &Retention::days(15).keep_last(1)), 1);
+            assert!(store.run("older").unwrap().is_none());
+            assert!(
+                store.run("old").unwrap().is_some(),
+                "the age cutoff let it go"
+            );
+            assert!(store.run("new").unwrap().is_some());
 
-        // keep_last on its own is a protection, not a policy: with no age rule
-        // to hold anything back from, it deletes nothing at all
-        assert_eq!(prune(&store, &Retention::default().keep_last(1)), 0);
-        assert_eq!(
-            store.runs(None, None, None, None, None, 10).unwrap().len(),
-            2
-        );
+            // keep_last on its own is a protection, not a policy: with no age rule
+            // to hold anything back from, it deletes nothing at all
+            assert_eq!(prune(&store, &Retention::default().keep_last(1)), 0);
+            assert_eq!(
+                store.runs(None, None, None, None, None, 10).unwrap().len(),
+                2
+            );
+        });
     }
 
     #[test]
     fn failed_days_keeps_a_failure_and_drops_a_success_of_the_same_age() {
-        let store = Store::open(":memory:").unwrap();
-        let old = Utc::now() - chrono::Duration::days(30);
-        for (id, status) in [
-            ("won", RunStatus::Success),
-            ("lost", RunStatus::Failed),
-            ("stopped", RunStatus::Canceled),
-        ] {
-            store
-                .create_run(&mk_run(id, "etl", old), &["a".into()])
-                .unwrap();
-            store
-                .run_finished(id, status, None, Utc::now(), None)
-                .unwrap();
-        }
+        both(|db| {
+            let store = db.store();
+            let old = Utc::now() - chrono::Duration::days(30);
+            for (id, status) in [
+                ("won", RunStatus::Success),
+                ("lost", RunStatus::Failed),
+                ("stopped", RunStatus::Canceled),
+            ] {
+                store
+                    .create_run(&mk_run(id, "etl", old), &["a".into()])
+                    .unwrap();
+                store
+                    .run_finished(id, status, None, Utc::now(), None)
+                    .unwrap();
+            }
 
-        assert_eq!(prune(&store, &Retention::days(7).failed_days(90)), 1);
-        assert!(store.run("won").unwrap().is_none());
-        // a cancel is not a success either: what you keep longer is what went
-        // wrong, and someone stopping a run is a thing that went wrong
-        assert!(store.run("lost").unwrap().is_some());
-        assert!(store.run("stopped").unwrap().is_some());
+            assert_eq!(prune(&store, &Retention::days(7).failed_days(90)), 1);
+            assert!(store.run("won").unwrap().is_none());
+            // a cancel is not a success either: what you keep longer is what went
+            // wrong, and someone stopping a run is a thing that went wrong
+            assert!(store.run("lost").unwrap().is_some());
+            assert!(store.run("stopped").unwrap().is_some());
 
-        assert_eq!(prune(&store, &Retention::days(7).failed_days(14)), 2);
+            assert_eq!(prune(&store, &Retention::days(7).failed_days(14)), 2);
+        });
     }
 
     // a queued run older than the cutoff is a queue problem, not a retention
     // one, and deleting it would take work nobody has done yet
     #[test]
     fn retention_never_takes_a_run_that_has_not_finished() {
-        let store = Store::open(":memory:").unwrap();
-        let old = Utc::now() - chrono::Duration::days(400);
-        for id in ["waiting", "working"] {
-            store
-                .create_run(&mk_run(id, "etl", old), &["a".into()])
-                .unwrap();
-        }
-        store.run_started("working", Utc::now()).unwrap();
+        both(|db| {
+            let store = db.store();
+            let old = Utc::now() - chrono::Duration::days(400);
+            for id in ["waiting", "working"] {
+                store
+                    .create_run(&mk_run(id, "etl", old), &["a".into()])
+                    .unwrap();
+            }
+            store.run_started("working", Utc::now()).unwrap();
 
-        assert_eq!(prune(&store, &Retention::days(1).keep_last(0)), 0);
-        assert_eq!(
-            store.run("waiting").unwrap().unwrap().status,
-            RunStatus::Queued
-        );
-        assert_eq!(
-            store.run("working").unwrap().unwrap().status,
-            RunStatus::Running
-        );
+            assert_eq!(prune(&store, &Retention::days(1).keep_last(0)), 0);
+            assert_eq!(
+                store.run("waiting").unwrap().unwrap().status,
+                RunStatus::Queued
+            );
+            assert_eq!(
+                store.run("working").unwrap().unwrap().status,
+                RunStatus::Running
+            );
+        });
     }
 
     // the point of the whole part: written after the terminal row, a crash in
@@ -3661,121 +3796,127 @@ mod tests {
     // the insert fail and asserts the run row went back with it
     #[test]
     fn a_notification_and_its_run_row_land_together_or_not_at_all() {
-        let store = Store::open(":memory:").unwrap();
-        let note = json!({"run_id": "r1", "job": "etl", "status": "failed"});
-        for id in ["r1", "r2"] {
+        both(|db| {
+            let store = db.store();
+            let note = json!({"run_id": "r1", "job": "etl", "status": "failed"});
+            for id in ["r1", "r2"] {
+                store
+                    .create_run(&mk_run(id, "etl", Utc::now()), &["a".into()])
+                    .unwrap();
+                store.run_started(id, Utc::now()).unwrap();
+            }
+
             store
-                .create_run(&mk_run(id, "etl", Utc::now()), &["a".into()])
+                .run_finished(
+                    "r1",
+                    RunStatus::Failed,
+                    Some("boom"),
+                    Utc::now(),
+                    Some(&note),
+                )
                 .unwrap();
-            store.run_started(id, Utc::now()).unwrap();
-        }
+            assert_eq!(store.run("r1").unwrap().unwrap().status, RunStatus::Failed);
+            assert_eq!(store.notifications(None, 10).unwrap().len(), 1);
 
-        store
-            .run_finished(
-                "r1",
-                RunStatus::Failed,
-                Some("boom"),
-                Utc::now(),
-                Some(&note),
-            )
-            .unwrap();
-        assert_eq!(store.run("r1").unwrap().unwrap().status, RunStatus::Failed);
-        assert_eq!(store.notifications(None, 10).unwrap().len(), 1);
-
-        // and now with the insert refused, which is a crash between the two as
-        // far as the transaction is concerned
-        store.refuse_notifications().unwrap();
-        let err = store
-            .run_finished(
-                "r2",
-                RunStatus::Failed,
-                Some("boom"),
-                Utc::now(),
-                Some(&note),
-            )
-            .unwrap_err();
-        assert!(err.to_string().contains("refused"), "{err}");
-        // neither half landed: the run is still running and there is still one
-        // notification, not two
-        assert_eq!(store.run("r2").unwrap().unwrap().status, RunStatus::Running);
-        assert_eq!(store.run("r2").unwrap().unwrap().error, None);
-        assert_eq!(store.notifications(None, 10).unwrap().len(), 1);
+            // and now with the insert refused, which is a crash between the two as
+            // far as the transaction is concerned
+            store.refuse_notifications().unwrap();
+            let err = store
+                .run_finished(
+                    "r2",
+                    RunStatus::Failed,
+                    Some("boom"),
+                    Utc::now(),
+                    Some(&note),
+                )
+                .unwrap_err();
+            assert!(err.to_string().contains("refused"), "{err}");
+            // neither half landed: the run is still running and there is still one
+            // notification, not two
+            assert_eq!(store.run("r2").unwrap().unwrap().status, RunStatus::Running);
+            assert_eq!(store.run("r2").unwrap().unwrap().error, None);
+            assert_eq!(store.notifications(None, 10).unwrap().len(), 1);
+        });
     }
 
     #[test]
     fn a_notifications_state_is_its_two_timestamps() {
-        let store = Store::open(":memory:").unwrap();
-        let note = json!({"run_id": "r1"});
-        for id in ["r1", "r2", "r3"] {
+        both(|db| {
+            let store = db.store();
+            let note = json!({"run_id": "r1"});
+            for id in ["r1", "r2", "r3"] {
+                store
+                    .create_run(&mk_run(id, "etl", Utc::now()), &["a".into()])
+                    .unwrap();
+                store
+                    .run_finished(id, RunStatus::Failed, None, Utc::now(), Some(&note))
+                    .unwrap();
+            }
+            let queued = store.notifications(None, 10).unwrap();
+            assert_eq!(queued.len(), 3);
+            assert!(queued.iter().all(|n| n.state == DeliveryState::Pending));
+            assert!(queued.iter().all(|n| n.next_attempt_at.is_some()));
+            assert_eq!(queued[0].kind, "run");
+            assert_eq!(queued[0].payload, note);
+
+            // ids descend, so the last row written is first
+            let (delivered, given_up) = (queued[0].id, queued[1].id);
+            assert!(store.delivered(delivered, Utc::now()).unwrap());
+            // a second mark finds nothing: two loops cannot both claim one row
+            assert!(!store.delivered(delivered, Utc::now()).unwrap());
             store
-                .create_run(&mk_run(id, "etl", Utc::now()), &["a".into()])
+                .delivery_failed(given_up, 8, None, "connection refused")
                 .unwrap();
-            store
-                .run_finished(id, RunStatus::Failed, None, Utc::now(), Some(&note))
-                .unwrap();
-        }
-        let queued = store.notifications(None, 10).unwrap();
-        assert_eq!(queued.len(), 3);
-        assert!(queued.iter().all(|n| n.state == DeliveryState::Pending));
-        assert!(queued.iter().all(|n| n.next_attempt_at.is_some()));
-        assert_eq!(queued[0].kind, "run");
-        assert_eq!(queued[0].payload, note);
 
-        // ids descend, so the last row written is first
-        let (delivered, given_up) = (queued[0].id, queued[1].id);
-        assert!(store.delivered(delivered, Utc::now()).unwrap());
-        // a second mark finds nothing: two loops cannot both claim one row
-        assert!(!store.delivered(delivered, Utc::now()).unwrap());
-        store
-            .delivery_failed(given_up, 8, None, "connection refused")
-            .unwrap();
+            let of = |state| store.notifications(Some(state), 10).unwrap();
+            assert_eq!(of(DeliveryState::Delivered).len(), 1);
+            assert_eq!(of(DeliveryState::Delivered)[0].id, delivered);
+            let failed = of(DeliveryState::Failed);
+            assert_eq!(failed.len(), 1);
+            assert_eq!(failed[0].last_error.as_deref(), Some("connection refused"));
+            assert_eq!(failed[0].attempts, 8);
+            assert_eq!(of(DeliveryState::Pending).len(), 1);
 
-        let of = |state| store.notifications(Some(state), 10).unwrap();
-        assert_eq!(of(DeliveryState::Delivered).len(), 1);
-        assert_eq!(of(DeliveryState::Delivered)[0].id, delivered);
-        let failed = of(DeliveryState::Failed);
-        assert_eq!(failed.len(), 1);
-        assert_eq!(failed[0].last_error.as_deref(), Some("connection refused"));
-        assert_eq!(failed[0].attempts, 8);
-        assert_eq!(of(DeliveryState::Pending).len(), 1);
-
-        // and a given-up row is out of the delivery loop's way for good
-        let due = store.due_notifications(Utc::now(), 10).unwrap();
-        assert_eq!(due.len(), 1);
-        assert_eq!(due[0].id, queued[2].id);
+            // and a given-up row is out of the delivery loop's way for good
+            let due = store.due_notifications(Utc::now(), 10).unwrap();
+            assert_eq!(due.len(), 1);
+            assert_eq!(due[0].id, queued[2].id);
+        });
     }
 
     #[test]
     fn retention_takes_delivered_notifications_and_leaves_the_rest() {
-        let store = Store::open(":memory:").unwrap();
-        let old = Utc::now() - chrono::Duration::days(30);
-        let note = json!({"run_id": "r1"});
-        for id in ["sent", "waiting", "given-up"] {
+        both(|db| {
+            let store = db.store();
+            let old = Utc::now() - chrono::Duration::days(30);
+            let note = json!({"run_id": "r1"});
+            for id in ["sent", "waiting", "given-up"] {
+                store
+                    .create_run(&mk_run(id, "etl", old), &["a".into()])
+                    .unwrap();
+                store
+                    .run_finished(id, RunStatus::Failed, None, old, Some(&note))
+                    .unwrap();
+            }
+            let rows = store.notifications(None, 10).unwrap();
+            store.delivered(rows[2].id, old).unwrap();
             store
-                .create_run(&mk_run(id, "etl", old), &["a".into()])
+                .delivery_failed(rows[0].id, 8, None, "gave up")
                 .unwrap();
-            store
-                .run_finished(id, RunStatus::Failed, None, old, Some(&note))
-                .unwrap();
-        }
-        let rows = store.notifications(None, 10).unwrap();
-        store.delivered(rows[2].id, old).unwrap();
-        store
-            .delivery_failed(rows[0].id, 8, None, "gave up")
-            .unwrap();
 
-        assert_eq!(
-            store
-                .prune_notifications(Utc::now() - chrono::Duration::days(7))
-                .unwrap(),
-            1
-        );
-        let left = store.notifications(None, 10).unwrap();
-        // an alert nobody received is not history however old it is: it is
-        // something outstanding, and a sweep that cleared it would be the
-        // same loss this table exists to prevent
-        assert_eq!(left.len(), 2);
-        assert!(left.iter().all(|n| n.delivered_at.is_none()));
+            assert_eq!(
+                store
+                    .prune_notifications(Utc::now() - chrono::Duration::days(7))
+                    .unwrap(),
+                1
+            );
+            let left = store.notifications(None, 10).unwrap();
+            // an alert nobody received is not history however old it is: it is
+            // something outstanding, and a sweep that cleared it would be the
+            // same loss this table exists to prevent
+            assert_eq!(left.len(), 2);
+            assert!(left.iter().all(|n| n.delivered_at.is_none()));
+        });
     }
 
     // what makes the sweep affordable on a table with a year of runs in it:
@@ -3809,136 +3950,144 @@ mod tests {
 
     #[test]
     fn the_log_cursor_pages_and_narrows_to_one_op() {
-        let store = Store::open(":memory:").unwrap();
-        let mut budget = crate::logs::Budget::new();
-        for op in ["load", "clean"] {
-            for i in 0..5 {
-                budget.line(
-                    &store,
-                    &crate::logs::Attempt::new("r1", op, 1),
-                    crate::logs::Source::Stream(crate::model::LogStream::Stdout),
-                    &format!("{op} {i}"),
-                );
+        both(|db| {
+            let store = db.store();
+            let mut budget = crate::logs::Budget::new();
+            for op in ["load", "clean"] {
+                for i in 0..5 {
+                    budget.line(
+                        &store,
+                        &crate::logs::Attempt::new("r1", op, 1),
+                        crate::logs::Source::Stream(crate::model::LogStream::Stdout),
+                        &format!("{op} {i}"),
+                    );
+                }
             }
-        }
 
-        let first = store.op_logs("r1", None, 0, 4).unwrap();
-        assert_eq!(first.len(), 4);
-        assert_eq!(first[0].message, "load 0");
-        let next = store.op_logs("r1", None, first[3].id, 4).unwrap();
-        assert_eq!(next[0].message, "load 4");
-        // the cursor is the id, so the pages meet exactly once
-        let rest = store.op_logs("r1", None, next[3].id, 100).unwrap();
-        assert_eq!(rest.len(), 2);
-        assert_eq!(rest[1].message, "clean 4");
+            let first = store.op_logs("r1", None, 0, 4).unwrap();
+            assert_eq!(first.len(), 4);
+            assert_eq!(first[0].message, "load 0");
+            let next = store.op_logs("r1", None, first[3].id, 4).unwrap();
+            assert_eq!(next[0].message, "load 4");
+            // the cursor is the id, so the pages meet exactly once
+            let rest = store.op_logs("r1", None, next[3].id, 100).unwrap();
+            assert_eq!(rest.len(), 2);
+            assert_eq!(rest[1].message, "clean 4");
 
-        let one = store.op_logs("r1", Some("clean"), 0, 100).unwrap();
-        assert_eq!(one.len(), 5);
-        assert!(one.iter().all(|l| l.op == "clean"));
-        assert!(
-            store
-                .op_logs("r1", Some("nope"), 0, 100)
-                .unwrap()
-                .is_empty()
-        );
-        assert!(store.op_logs("other", None, 0, 100).unwrap().is_empty());
+            let one = store.op_logs("r1", Some("clean"), 0, 100).unwrap();
+            assert_eq!(one.len(), 5);
+            assert!(one.iter().all(|l| l.op == "clean"));
+            assert!(
+                store
+                    .op_logs("r1", Some("nope"), 0, 100)
+                    .unwrap()
+                    .is_empty()
+            );
+            assert!(store.op_logs("other", None, 0, 100).unwrap().is_empty());
+        });
     }
 
     #[test]
     fn retention_takes_captured_output_with_its_run() {
-        let store = Store::open(":memory:").unwrap();
-        let old = Utc::now() - chrono::Duration::days(10);
-        let mut budget = crate::logs::Budget::new();
-        for (id, created) in [("gone", old), ("kept", Utc::now())] {
+        both(|db| {
+            let store = db.store();
+            let old = Utc::now() - chrono::Duration::days(10);
+            let mut budget = crate::logs::Budget::new();
+            for (id, created) in [("gone", old), ("kept", Utc::now())] {
+                store
+                    .create_run(&mk_run(id, "etl", created), &["a".into()])
+                    .unwrap();
+                store
+                    .run_finished(id, RunStatus::Success, None, Utc::now(), None)
+                    .unwrap();
+                budget.line(
+                    &store,
+                    &crate::logs::Attempt::new(id, "a", 1),
+                    crate::logs::Source::Stream(crate::model::LogStream::Stdout),
+                    "printed something",
+                );
+            }
+            // and a run that is only halfway: a reclaim puts one back on the queue,
+            // and the second claimer's page must still carry the first's output
             store
-                .create_run(&mk_run(id, "etl", created), &["a".into()])
-                .unwrap();
-            store
-                .run_finished(id, RunStatus::Success, None, Utc::now(), None)
+                .create_run(&mk_run("live", "etl", old), &["a".into()])
                 .unwrap();
             budget.line(
                 &store,
-                &crate::logs::Attempt::new(id, "a", 1),
+                &crate::logs::Attempt::new("live", "a", 1),
                 crate::logs::Source::Stream(crate::model::LogStream::Stdout),
-                "printed something",
+                "half done",
             );
-        }
-        // and a run that is only halfway: a reclaim puts one back on the queue,
-        // and the second claimer's page must still carry the first's output
-        store
-            .create_run(&mk_run("live", "etl", old), &["a".into()])
-            .unwrap();
-        budget.line(
-            &store,
-            &crate::logs::Attempt::new("live", "a", 1),
-            crate::logs::Source::Stream(crate::model::LogStream::Stdout),
-            "half done",
-        );
 
-        assert_eq!(prune(&store, &Retention::days(7)), 1);
-        assert!(
-            store.op_logs("gone", None, 0, 100).unwrap().is_empty(),
-            "orphan op_logs outlived their run"
-        );
-        assert_eq!(store.op_logs("kept", None, 0, 100).unwrap().len(), 1);
-        assert_eq!(store.op_logs("live", None, 0, 100).unwrap().len(), 1);
+            assert_eq!(prune(&store, &Retention::days(7)), 1);
+            assert!(
+                store.op_logs("gone", None, 0, 100).unwrap().is_empty(),
+                "orphan op_logs outlived their run"
+            );
+            assert_eq!(store.op_logs("kept", None, 0, 100).unwrap().len(), 1);
+            assert_eq!(store.op_logs("live", None, 0, 100).unwrap().len(), 1);
+        });
     }
 
     #[test]
     fn active_run_check_tracks_lifecycle() {
-        let store = Store::open(":memory:").unwrap();
-        assert!(!store.has_active_run("etl").unwrap());
-        store
-            .create_run(&mk_run("r1", "etl", Utc::now()), &["a".into()])
-            .unwrap();
-        assert!(store.has_active_run("etl").unwrap());
-        store.run_started("r1", Utc::now()).unwrap();
-        assert!(store.has_active_run("etl").unwrap());
-        store
-            .run_finished("r1", RunStatus::Failed, None, Utc::now(), None)
-            .unwrap();
-        assert!(!store.has_active_run("etl").unwrap());
+        both(|db| {
+            let store = db.store();
+            assert!(!store.has_active_run("etl").unwrap());
+            store
+                .create_run(&mk_run("r1", "etl", Utc::now()), &["a".into()])
+                .unwrap();
+            assert!(store.has_active_run("etl").unwrap());
+            store.run_started("r1", Utc::now()).unwrap();
+            assert!(store.has_active_run("etl").unwrap());
+            store
+                .run_finished("r1", RunStatus::Failed, None, Utc::now(), None)
+                .unwrap();
+            assert!(!store.has_active_run("etl").unwrap());
+        });
     }
 
     #[test]
     fn interrupted_runs_failed_on_startup() {
-        let store = Store::open(":memory:").unwrap();
-        store
-            .create_run(
-                &mk_run("dead", "etl", Utc::now()),
-                &["a".into(), "b".into()],
-            )
-            .unwrap();
-        store.run_started("dead", Utc::now()).unwrap();
-        store.op_started("dead", "a", 1).unwrap();
+        both(|db| {
+            let store = db.store();
+            store
+                .create_run(
+                    &mk_run("dead", "etl", Utc::now()),
+                    &["a".into(), "b".into()],
+                )
+                .unwrap();
+            store.run_started("dead", Utc::now()).unwrap();
+            store.op_started("dead", "a", 1).unwrap();
 
-        let done = mk_run("done", "etl", Utc::now());
-        store.create_run(&done, &["a".into()]).unwrap();
-        store.run_started("done", Utc::now()).unwrap();
-        store
-            .op_finished("done", "a", OpStatus::Success, None, None, None)
-            .unwrap();
-        store
-            .run_finished("done", RunStatus::Success, None, Utc::now(), None)
-            .unwrap();
+            let done = mk_run("done", "etl", Utc::now());
+            store.create_run(&done, &["a".into()]).unwrap();
+            store.run_started("done", Utc::now()).unwrap();
+            store
+                .op_finished("done", "a", OpStatus::Success, None, None, None)
+                .unwrap();
+            store
+                .run_finished("done", RunStatus::Success, None, Utc::now(), None)
+                .unwrap();
 
-        store.fail_interrupted().unwrap();
+            store.fail_interrupted().unwrap();
 
-        let dead = store.run("dead").unwrap().unwrap();
-        assert_eq!(dead.status, RunStatus::Failed);
-        assert!(dead.finished_at.is_some());
-        let ops = store.op_runs("dead").unwrap();
-        assert_eq!(ops[0].status, OpStatus::Failed);
-        assert_eq!(ops[0].error.as_deref(), Some("interrupted: process exited"));
-        assert_eq!(ops[1].status, OpStatus::Skipped);
-        let last = store.events("dead", 0).unwrap().pop().unwrap();
-        assert!(last.message.contains("interrupted"));
-        assert_eq!(last.kind, EventKind::RunFailed);
+            let dead = store.run("dead").unwrap().unwrap();
+            assert_eq!(dead.status, RunStatus::Failed);
+            assert!(dead.finished_at.is_some());
+            let ops = store.op_runs("dead").unwrap();
+            assert_eq!(ops[0].status, OpStatus::Failed);
+            assert_eq!(ops[0].error.as_deref(), Some("interrupted: process exited"));
+            assert_eq!(ops[1].status, OpStatus::Skipped);
+            let last = store.events("dead", 0).unwrap().pop().unwrap();
+            assert!(last.message.contains("interrupted"));
+            assert_eq!(last.kind, EventKind::RunFailed);
 
-        assert_eq!(
-            store.run("done").unwrap().unwrap().status,
-            RunStatus::Success
-        );
+            assert_eq!(
+                store.run("done").unwrap().unwrap().status,
+                RunStatus::Success
+            );
+        });
     }
 
     // the schema as phase 1 shipped it: no kind/data on events, no schedule tables
@@ -4295,102 +4444,106 @@ mod tests {
 
     #[test]
     fn run_tags_round_trip_and_the_filter_matches_exactly() {
-        let store = Store::open(":memory:").unwrap();
-        let tagged = |id: &str, tags: RunTags| {
-            let mut run = mk_run(id, "etl", Utc::now());
-            run.tags = tags;
+        both(|db| {
+            let store = db.store();
+            let tagged = |id: &str, tags: RunTags| {
+                let mut run = mk_run(id, "etl", Utc::now());
+                run.tags = tags;
+                store.create_run(&run, &[]).unwrap();
+            };
+            tagged(
+                "r1",
+                RunTags::from([
+                    ("kind".to_string(), "backfill".to_string()),
+                    ("env".to_string(), "prod".to_string()),
+                ]),
+            );
+            tagged("r2", RunTags::from([("kind".to_string(), "smoke".into())]));
+            tagged("r3", RunTags::new());
+
+            let read = store.run("r1").unwrap().unwrap().tags;
+            assert_eq!(read["kind"], "backfill");
+            assert_eq!(read["env"], "prod");
+            // an untagged run reads as no tags, not as a null anything
+            assert!(store.run("r3").unwrap().unwrap().tags.is_empty());
+
+            let ids = |tag: Option<(&str, &str)>| -> Vec<String> {
+                store
+                    .runs(None, None, None, None, tag, 10)
+                    .unwrap()
+                    .into_iter()
+                    .map(|r| r.id)
+                    .collect()
+            };
+            assert_eq!(ids(Some(("kind", "backfill"))), ["r1"]);
+            assert_eq!(ids(Some(("env", "prod"))), ["r1"]);
+            // exactly: neither a different value nor a prefix of one matches, and
+            // an unknown key matches nothing rather than everything
+            assert!(ids(Some(("kind", "back"))).is_empty());
+            assert!(ids(Some(("kind", "backfills"))).is_empty());
+            assert!(ids(Some(("kind", "prod"))).is_empty());
+            assert!(ids(Some(("ghost", "backfill"))).is_empty());
+            // and no filter is still every run, tagged or not
+            assert_eq!(ids(None).len(), 3);
+
+            // the filter composes with the others rather than replacing them
+            let run = mk_run("r4", "other", Utc::now());
             store.create_run(&run, &[]).unwrap();
-        };
-        tagged(
-            "r1",
-            RunTags::from([
-                ("kind".to_string(), "backfill".to_string()),
-                ("env".to_string(), "prod".to_string()),
-            ]),
-        );
-        tagged("r2", RunTags::from([("kind".to_string(), "smoke".into())]));
-        tagged("r3", RunTags::new());
-
-        let read = store.run("r1").unwrap().unwrap().tags;
-        assert_eq!(read["kind"], "backfill");
-        assert_eq!(read["env"], "prod");
-        // an untagged run reads as no tags, not as a null anything
-        assert!(store.run("r3").unwrap().unwrap().tags.is_empty());
-
-        let ids = |tag: Option<(&str, &str)>| -> Vec<String> {
-            store
-                .runs(None, None, None, None, tag, 10)
-                .unwrap()
-                .into_iter()
-                .map(|r| r.id)
-                .collect()
-        };
-        assert_eq!(ids(Some(("kind", "backfill"))), ["r1"]);
-        assert_eq!(ids(Some(("env", "prod"))), ["r1"]);
-        // exactly: neither a different value nor a prefix of one matches, and
-        // an unknown key matches nothing rather than everything
-        assert!(ids(Some(("kind", "back"))).is_empty());
-        assert!(ids(Some(("kind", "backfills"))).is_empty());
-        assert!(ids(Some(("kind", "prod"))).is_empty());
-        assert!(ids(Some(("ghost", "backfill"))).is_empty());
-        // and no filter is still every run, tagged or not
-        assert_eq!(ids(None).len(), 3);
-
-        // the filter composes with the others rather than replacing them
-        let run = mk_run("r4", "other", Utc::now());
-        store.create_run(&run, &[]).unwrap();
-        assert_eq!(
-            store
-                .runs(Some("etl"), None, None, None, Some(("kind", "smoke")), 10)
-                .unwrap()
-                .len(),
-            1
-        );
+            assert_eq!(
+                store
+                    .runs(Some("etl"), None, None, None, Some(("kind", "smoke")), 10)
+                    .unwrap()
+                    .len(),
+                1
+            );
+        });
     }
 
     #[test]
     fn presets_are_stored_upserted_and_deleted_per_job() {
-        let store = Store::open(":memory:").unwrap();
-        assert!(store.presets("etl").unwrap().is_empty());
-        assert!(store.preset("etl", "nightly").unwrap().is_none());
+        both(|db| {
+            let store = db.store();
+            assert!(store.presets("etl").unwrap().is_empty());
+            assert!(store.preset("etl", "nightly").unwrap().is_none());
 
-        store
-            .put_preset("etl", "nightly", &json!({"days": 7}))
-            .unwrap();
-        store
-            .put_preset("etl", "backfill", &json!({"days": 90}))
-            .unwrap();
-        // another job's preset of the same name is a different preset
-        store
-            .put_preset("other", "nightly", &json!({"days": 1}))
-            .unwrap();
+            store
+                .put_preset("etl", "nightly", &json!({"days": 7}))
+                .unwrap();
+            store
+                .put_preset("etl", "backfill", &json!({"days": 90}))
+                .unwrap();
+            // another job's preset of the same name is a different preset
+            store
+                .put_preset("other", "nightly", &json!({"days": 1}))
+                .unwrap();
 
-        let all = store.presets("etl").unwrap();
-        assert_eq!(
-            all.iter().map(|p| p.name.as_str()).collect::<Vec<_>>(),
-            ["backfill", "nightly"],
-            "presets come back sorted by name"
-        );
-        assert_eq!(all[1].params, json!({"days": 7}));
-        assert_eq!(
-            store.preset("other", "nightly").unwrap().unwrap().params,
-            json!({"days": 1})
-        );
+            let all = store.presets("etl").unwrap();
+            assert_eq!(
+                all.iter().map(|p| p.name.as_str()).collect::<Vec<_>>(),
+                ["backfill", "nightly"],
+                "presets come back sorted by name"
+            );
+            assert_eq!(all[1].params, json!({"days": 7}));
+            assert_eq!(
+                store.preset("other", "nightly").unwrap().unwrap().params,
+                json!({"days": 1})
+            );
 
-        // a rewrite replaces the params and keeps the age
-        let first = store.preset("etl", "nightly").unwrap().unwrap().created_at;
-        store
-            .put_preset("etl", "nightly", &json!({"days": 14}))
-            .unwrap();
-        let again = store.preset("etl", "nightly").unwrap().unwrap();
-        assert_eq!(again.params, json!({"days": 14}));
-        assert_eq!(again.created_at, first);
-        assert_eq!(store.presets("etl").unwrap().len(), 2);
+            // a rewrite replaces the params and keeps the age
+            let first = store.preset("etl", "nightly").unwrap().unwrap().created_at;
+            store
+                .put_preset("etl", "nightly", &json!({"days": 14}))
+                .unwrap();
+            let again = store.preset("etl", "nightly").unwrap().unwrap();
+            assert_eq!(again.params, json!({"days": 14}));
+            assert_eq!(again.created_at, first);
+            assert_eq!(store.presets("etl").unwrap().len(), 2);
 
-        assert!(store.delete_preset("etl", "nightly").unwrap());
-        assert!(!store.delete_preset("etl", "nightly").unwrap());
-        assert!(store.preset("etl", "nightly").unwrap().is_none());
-        assert!(store.preset("other", "nightly").unwrap().is_some());
+            assert!(store.delete_preset("etl", "nightly").unwrap());
+            assert!(!store.delete_preset("etl", "nightly").unwrap());
+            assert!(store.preset("etl", "nightly").unwrap().is_none());
+            assert!(store.preset("other", "nightly").unwrap().is_some());
+        });
     }
 
     #[test]
@@ -4433,50 +4586,52 @@ mod tests {
 
     #[test]
     fn a_run_key_is_claimed_with_its_run_or_not_at_all() {
-        let store = Store::open(":memory:").unwrap();
-        let key = RunKey {
-            sensor: "watch",
-            key: "2026-08-09",
-        };
-        assert!(
-            store
-                .create_run_keyed(
-                    &mk_run("r1", "etl", Utc::now()),
-                    &["a".into()],
-                    Some(key),
-                    None
-                )
-                .unwrap()
-        );
-        assert!(store.run_key_claimed("watch", "2026-08-09").unwrap());
-        assert_eq!(store.op_runs("r1").unwrap().len(), 1);
+        both(|db| {
+            let store = db.store();
+            let key = RunKey {
+                sensor: "watch",
+                key: "2026-08-09",
+            };
+            assert!(
+                store
+                    .create_run_keyed(
+                        &mk_run("r1", "etl", Utc::now()),
+                        &["a".into()],
+                        Some(key),
+                        None
+                    )
+                    .unwrap()
+            );
+            assert!(store.run_key_claimed("watch", "2026-08-09").unwrap());
+            assert_eq!(store.op_runs("r1").unwrap().len(), 1);
 
-        // the same key again writes nothing at all — no run, no op rows, no
-        // second key — because the whole thing is one transaction
-        assert!(
-            !store
-                .create_run_keyed(
-                    &mk_run("r2", "etl", Utc::now()),
-                    &["a".into()],
-                    Some(key),
-                    None
-                )
-                .unwrap()
-        );
-        assert!(store.run("r2").unwrap().is_none());
-        assert!(store.op_runs("r2").unwrap().is_empty());
-        // and the key means nothing to another sensor
-        assert!(!store.run_key_claimed("other", "2026-08-09").unwrap());
+            // the same key again writes nothing at all — no run, no op rows, no
+            // second key — because the whole thing is one transaction
+            assert!(
+                !store
+                    .create_run_keyed(
+                        &mk_run("r2", "etl", Utc::now()),
+                        &["a".into()],
+                        Some(key),
+                        None
+                    )
+                    .unwrap()
+            );
+            assert!(store.run("r2").unwrap().is_none());
+            assert!(store.op_runs("r2").unwrap().is_empty());
+            // and the key means nothing to another sensor
+            assert!(!store.run_key_claimed("other", "2026-08-09").unwrap());
 
-        let day = chrono::Duration::days(1);
-        assert_eq!(store.prune_sensor_run_keys(Utc::now() - day).unwrap(), 0);
-        assert_eq!(store.prune_sensor_run_keys(Utc::now() + day).unwrap(), 1);
-        assert!(
-            !store.run_key_claimed("watch", "2026-08-09").unwrap(),
-            "retention left the key behind"
-        );
-        // pruning a key does not touch the run it launched
-        assert!(store.run("r1").unwrap().is_some());
+            let day = chrono::Duration::days(1);
+            assert_eq!(store.prune_sensor_run_keys(Utc::now() - day).unwrap(), 0);
+            assert_eq!(store.prune_sensor_run_keys(Utc::now() + day).unwrap(), 1);
+            assert!(
+                !store.run_key_claimed("watch", "2026-08-09").unwrap(),
+                "retention left the key behind"
+            );
+            // pruning a key does not touch the run it launched
+            assert!(store.run("r1").unwrap().is_some());
+        });
     }
 
     #[test]
@@ -4829,100 +4984,106 @@ mod tests {
 
     #[test]
     fn run_error_survives_a_later_status_write() {
-        let store = Store::open(":memory:").unwrap();
-        store
-            .create_run(&mk_run("r1", "etl", Utc::now()), &["a".into()])
-            .unwrap();
-        store
-            .run_finished(
-                "r1",
-                RunStatus::Failed,
-                Some("op a failed: boom"),
-                Utc::now(),
-                None,
-            )
-            .unwrap();
-        // None must not blank an error a caller already recorded
-        store
-            .run_finished("r1", RunStatus::Failed, None, Utc::now(), None)
-            .unwrap();
-        assert_eq!(
-            store.run("r1").unwrap().unwrap().error.as_deref(),
-            Some("op a failed: boom")
-        );
+        both(|db| {
+            let store = db.store();
+            store
+                .create_run(&mk_run("r1", "etl", Utc::now()), &["a".into()])
+                .unwrap();
+            store
+                .run_finished(
+                    "r1",
+                    RunStatus::Failed,
+                    Some("op a failed: boom"),
+                    Utc::now(),
+                    None,
+                )
+                .unwrap();
+            // None must not blank an error a caller already recorded
+            store
+                .run_finished("r1", RunStatus::Failed, None, Utc::now(), None)
+                .unwrap();
+            assert_eq!(
+                store.run("r1").unwrap().unwrap().error.as_deref(),
+                Some("op a failed: boom")
+            );
+        });
     }
 
     #[test]
     fn unstopped_op_keeps_no_finish_time() {
-        let store = Store::open(":memory:").unwrap();
-        store
-            .create_run(&mk_run("r1", "etl", Utc::now()), &["a".into()])
-            .unwrap();
-        store.op_started("r1", "a", 1).unwrap();
-        store
-            .op_unstopped("r1", "a", "not observed to stop")
-            .unwrap();
+        both(|db| {
+            let store = db.store();
+            store
+                .create_run(&mk_run("r1", "etl", Utc::now()), &["a".into()])
+                .unwrap();
+            store.op_started("r1", "a", 1).unwrap();
+            store
+                .op_unstopped("r1", "a", "not observed to stop")
+                .unwrap();
 
-        let op = &store.op_runs("r1").unwrap()[0];
-        assert_eq!(op.status, OpStatus::Canceled);
-        assert_eq!(op.error.as_deref(), Some("not observed to stop"));
-        assert!(op.started_at.is_some());
-        assert_eq!(
-            op.finished_at, None,
-            "claimed a finish time for work it never saw finish"
-        );
+            let op = &store.op_runs("r1").unwrap()[0];
+            assert_eq!(op.status, OpStatus::Canceled);
+            assert_eq!(op.error.as_deref(), Some("not observed to stop"));
+            assert!(op.started_at.is_some());
+            assert_eq!(
+                op.finished_at, None,
+                "claimed a finish time for work it never saw finish"
+            );
+        });
     }
 
     #[test]
     fn materialization_records_and_latest_wins() {
-        let store = Store::open(":memory:").unwrap();
-        assert!(store.materialization("stats", None).unwrap().is_none());
+        both(|db| {
+            let store = db.store();
+            assert!(store.materialization("stats", None).unwrap().is_none());
 
-        store
-            .record_materialization(
-                "stats",
-                None,
-                "f1",
-                &json!({"docs": "d1"}),
-                Some(&json!({"files": 12})),
-                Some("r1"),
-                Some(&json!({"files": {"int": 12}})),
-            )
-            .unwrap();
-        store
-            .record_materialization("docs", None, "d1", &json!({}), None, None, None)
-            .unwrap();
+            store
+                .record_materialization(
+                    "stats",
+                    None,
+                    "f1",
+                    &json!({"docs": "d1"}),
+                    Some(&json!({"files": 12})),
+                    Some("r1"),
+                    Some(&json!({"files": {"int": 12}})),
+                )
+                .unwrap();
+            store
+                .record_materialization("docs", None, "d1", &json!({}), None, None, None)
+                .unwrap();
 
-        let m = store.materialization("stats", None).unwrap().unwrap();
-        assert_eq!(m.fingerprint, "f1");
-        assert_eq!(m.inputs, json!({"docs": "d1"}));
-        assert_eq!(m.value, Some(json!({"files": 12})));
-        assert_eq!(m.run_id.as_deref(), Some("r1"));
-        let first_built = m.built_at;
+            let m = store.materialization("stats", None).unwrap().unwrap();
+            assert_eq!(m.fingerprint, "f1");
+            assert_eq!(m.inputs, json!({"docs": "d1"}));
+            assert_eq!(m.value, Some(json!({"files": 12})));
+            assert_eq!(m.run_id.as_deref(), Some("r1"));
+            let first_built = m.built_at;
 
-        let d = store.materialization("docs", None).unwrap().unwrap();
-        assert_eq!(d.value, None);
-        assert_eq!(d.run_id, None);
+            let d = store.materialization("docs", None).unwrap().unwrap();
+            assert_eq!(d.value, None);
+            assert_eq!(d.run_id, None);
 
-        store
-            .record_materialization(
-                "stats",
-                None,
-                "f2",
-                &json!({"docs": "d2"}),
-                Some(&json!({"files": 13})),
-                Some("r2"),
-                None,
-            )
-            .unwrap();
-        let all = store.latest_materializations().unwrap();
-        assert_eq!(all.len(), 2);
-        let m = store.materialization("stats", None).unwrap().unwrap();
-        assert_eq!(m.fingerprint, "f2");
-        assert_eq!(m.run_id.as_deref(), Some("r2"));
-        assert!(m.built_at >= first_built);
-        // the first entry survives the second: this is history, not a slot
-        assert_eq!(store.materializations("stats", None, 10).unwrap().len(), 2);
+            store
+                .record_materialization(
+                    "stats",
+                    None,
+                    "f2",
+                    &json!({"docs": "d2"}),
+                    Some(&json!({"files": 13})),
+                    Some("r2"),
+                    None,
+                )
+                .unwrap();
+            let all = store.latest_materializations().unwrap();
+            assert_eq!(all.len(), 2);
+            let m = store.materialization("stats", None).unwrap().unwrap();
+            assert_eq!(m.fingerprint, "f2");
+            assert_eq!(m.run_id.as_deref(), Some("r2"));
+            assert!(m.built_at >= first_built);
+            // the first entry survives the second: this is history, not a slot
+            assert_eq!(store.materializations("stats", None, 10).unwrap().len(), 2);
+        });
     }
 
     fn record(store: &Store, asset: &str, fp: &str) {
@@ -4933,362 +5094,873 @@ mod tests {
 
     #[test]
     fn history_flags_only_real_fingerprint_transitions() {
-        let store = Store::open(":memory:").unwrap();
-        assert!(
-            store
-                .materializations("stats", None, 10)
-                .unwrap()
-                .is_empty()
-        );
+        both(|db| {
+            let store = db.store();
+            assert!(
+                store
+                    .materializations("stats", None, 10)
+                    .unwrap()
+                    .is_empty()
+            );
 
-        // built four times, moved twice
-        for fp in ["f1", "f1", "f2", "f2"] {
-            record(&store, "stats", fp);
-        }
-        record(&store, "other", "x1");
+            // built four times, moved twice
+            for fp in ["f1", "f1", "f2", "f2"] {
+                record(&store, "stats", fp);
+            }
+            record(&store, "other", "x1");
 
-        let history = store.materializations("stats", None, 10).unwrap();
-        let seen: Vec<(&str, bool)> = history
-            .iter()
-            .map(|e| (e.mat.fingerprint.as_str(), e.changed))
-            .collect();
-        // newest first; the oldest entry counts as a change from nothing
-        assert_eq!(
-            seen,
-            [("f2", false), ("f2", true), ("f1", false), ("f1", true)]
-        );
-        assert!(history.windows(2).all(|w| w[0].mat.id > w[1].mat.id));
+            let history = store.materializations("stats", None, 10).unwrap();
+            let seen: Vec<(&str, bool)> = history
+                .iter()
+                .map(|e| (e.mat.fingerprint.as_str(), e.changed))
+                .collect();
+            // newest first; the oldest entry counts as a change from nothing
+            assert_eq!(
+                seen,
+                [("f2", false), ("f2", true), ("f1", false), ("f1", true)]
+            );
+            assert!(history.windows(2).all(|w| w[0].mat.id > w[1].mat.id));
 
-        // a page's oldest entry is compared with the entry just off it, not
-        // reported as a change because the window cut its predecessor away
-        let page = store.materializations("stats", None, 3).unwrap();
-        assert_eq!(page.len(), 3);
-        assert!(!page[2].changed, "the page edge invented a change");
+            // a page's oldest entry is compared with the entry just off it, not
+            // reported as a change because the window cut its predecessor away
+            let page = store.materializations("stats", None, 3).unwrap();
+            assert_eq!(page.len(), 3);
+            assert!(!page[2].changed, "the page edge invented a change");
+        });
     }
 
     #[test]
     fn history_carries_what_the_build_before_it_reported() {
-        let store = Store::open(":memory:").unwrap();
-        let meta = |rows: i64| json!({ "rows": { "count": rows } });
-        for (key, rows) in [(None, 10), (Some("k"), 400), (None, 14), (None, 21)] {
-            store
-                .record_materialization(
-                    "stats",
-                    key,
-                    "f",
-                    &json!({}),
-                    None,
-                    None,
-                    Some(&meta(rows)),
-                )
-                .unwrap();
-        }
+        both(|db| {
+            let store = db.store();
+            let meta = |rows: i64| json!({ "rows": { "count": rows } });
+            for (key, rows) in [(None, 10), (Some("k"), 400), (None, 14), (None, 21)] {
+                store
+                    .record_materialization(
+                        "stats",
+                        key,
+                        "f",
+                        &json!({}),
+                        None,
+                        None,
+                        Some(&meta(rows)),
+                    )
+                    .unwrap();
+            }
 
-        let history = store.materializations("stats", None, 10).unwrap();
-        let seen: Vec<(Value, Option<Value>)> = history
-            .iter()
-            .map(|e| (e.mat.metadata.clone().unwrap(), e.previous_metadata.clone()))
-            .collect();
-        // each entry against the build before it *of its own partition*: the
-        // 400 belongs to key k and is nobody else's predecessor
-        assert_eq!(
-            seen,
-            [
-                (meta(21), Some(meta(14))),
-                (meta(14), Some(meta(10))),
-                (meta(400), None),
-                (meta(10), None),
-            ]
-        );
+            let history = store.materializations("stats", None, 10).unwrap();
+            let seen: Vec<(Value, Option<Value>)> = history
+                .iter()
+                .map(|e| (e.mat.metadata.clone().unwrap(), e.previous_metadata.clone()))
+                .collect();
+            // each entry against the build before it *of its own partition*: the
+            // 400 belongs to key k and is nobody else's predecessor
+            assert_eq!(
+                seen,
+                [
+                    (meta(21), Some(meta(14))),
+                    (meta(14), Some(meta(10))),
+                    (meta(400), None),
+                    (meta(10), None),
+                ]
+            );
 
-        // and a page's oldest entry still sees the entry just off it
-        let page = store.materializations("stats", None, 1).unwrap();
-        assert_eq!(page[0].previous_metadata, Some(meta(14)));
+            // and a page's oldest entry still sees the entry just off it
+            let page = store.materializations("stats", None, 1).unwrap();
+            assert_eq!(page[0].previous_metadata, Some(meta(14)));
+        });
     }
 
     #[test]
     fn the_previous_metadata_of_an_op_skips_the_runs_that_reported_none() {
-        let store = Store::open(":memory:").unwrap();
-        let at = |n: i64| Utc.timestamp_opt(1_700_000_000 + n, 0).unwrap();
-        let meta = |rows: i64| json!({ "rows": { "int": rows } });
-        for (i, reported) in [Some(3), Some(5), None, None].into_iter().enumerate() {
-            let id = format!("r{i}");
-            let run = mk_run(&id, "etl", at(i as i64));
+        both(|db| {
+            let store = db.store();
+            let at = |n: i64| Utc.timestamp_opt(1_700_000_000 + n, 0).unwrap();
+            let meta = |rows: i64| json!({ "rows": { "int": rows } });
+            for (i, reported) in [Some(3), Some(5), None, None].into_iter().enumerate() {
+                let id = format!("r{i}");
+                let run = mk_run(&id, "etl", at(i as i64));
+                store
+                    .create_run(&run, &["load".into(), "quiet".into()])
+                    .unwrap();
+                store
+                    .op_finished(
+                        &id,
+                        "load",
+                        OpStatus::Success,
+                        None,
+                        reported.map(meta).as_ref(),
+                        None,
+                    )
+                    .unwrap();
+            }
+            // another job's op of the same name says nothing about this one
+            let other = mk_run("x", "elsewhere", at(9));
+            store.create_run(&other, &["load".into()]).unwrap();
             store
-                .create_run(&run, &["load".into(), "quiet".into()])
+                .op_finished("x", "load", OpStatus::Success, None, Some(&meta(999)), None)
                 .unwrap();
-            store
-                .op_finished(
-                    &id,
-                    "load",
-                    OpStatus::Success,
-                    None,
-                    reported.map(meta).as_ref(),
-                    None,
-                )
+
+            let now = mk_run("r9", "etl", at(9));
+            store.create_run(&now, &["load".into()]).unwrap();
+            let previous = store
+                .previous_op_metadata("etl", now.created_at, &now.id)
                 .unwrap();
-        }
-        // another job's op of the same name says nothing about this one
-        let other = mk_run("x", "elsewhere", at(9));
-        store.create_run(&other, &["load".into()]).unwrap();
-        store
-            .op_finished("x", "load", OpStatus::Success, None, Some(&meta(999)), None)
-            .unwrap();
+            // the last two runs recorded nothing, which is not the same as
+            // recording that there was nothing to say
+            assert_eq!(previous.get("load"), Some(&meta(5)));
+            // an op that has never reported anything has no entry at all
+            assert_eq!(previous.get("quiet"), None);
 
-        let now = mk_run("r9", "etl", at(9));
-        store.create_run(&now, &["load".into()]).unwrap();
-        let previous = store
-            .previous_op_metadata("etl", now.created_at, &now.id)
-            .unwrap();
-        // the last two runs recorded nothing, which is not the same as
-        // recording that there was nothing to say
-        assert_eq!(previous.get("load"), Some(&meta(5)));
-        // an op that has never reported anything has no entry at all
-        assert_eq!(previous.get("quiet"), None);
-
-        // strictly before, by (created_at, id): a run does not compare
-        // against itself, and the first run of all has nothing behind it
-        let r0 = store.run("r0").unwrap().unwrap();
-        assert!(
-            store
-                .previous_op_metadata("etl", r0.created_at, &r0.id)
-                .unwrap()
-                .is_empty()
-        );
-        let r1 = store.run("r1").unwrap().unwrap();
-        assert_eq!(
-            store
-                .previous_op_metadata("etl", r1.created_at, &r1.id)
-                .unwrap()
-                .get("load"),
-            Some(&meta(3))
-        );
+            // strictly before, by (created_at, id): a run does not compare
+            // against itself, and the first run of all has nothing behind it
+            let r0 = store.run("r0").unwrap().unwrap();
+            assert!(
+                store
+                    .previous_op_metadata("etl", r0.created_at, &r0.id)
+                    .unwrap()
+                    .is_empty()
+            );
+            let r1 = store.run("r1").unwrap().unwrap();
+            assert_eq!(
+                store
+                    .previous_op_metadata("etl", r1.created_at, &r1.id)
+                    .unwrap()
+                    .get("load"),
+                Some(&meta(3))
+            );
+        });
     }
 
     #[test]
     fn history_prunes_to_the_cap_and_never_drops_the_latest() {
-        let store = Store::open(":memory:").unwrap();
-        for i in 0..5 {
-            record(&store, "stats", &format!("f{i}"));
-        }
-        for i in 0..3 {
-            record(&store, "docs", &format!("d{i}"));
-        }
+        both(|db| {
+            let store = db.store();
+            for i in 0..5 {
+                record(&store, "stats", &format!("f{i}"));
+            }
+            for i in 0..3 {
+                record(&store, "docs", &format!("d{i}"));
+            }
 
-        assert_eq!(store.prune_materializations(2).unwrap(), 4);
-        let stats: Vec<String> = store
-            .materializations("stats", None, 10)
-            .unwrap()
-            .into_iter()
-            .map(|e| e.mat.fingerprint)
-            .collect();
-        assert_eq!(stats, ["f4", "f3"]);
-        assert_eq!(store.materializations("docs", None, 10).unwrap().len(), 2);
-        assert_eq!(
-            store
-                .materialization("docs", None)
+            assert_eq!(store.prune_materializations(2).unwrap(), 4);
+            let stats: Vec<String> = store
+                .materializations("stats", None, 10)
                 .unwrap()
-                .unwrap()
-                .fingerprint,
-            "d2"
-        );
+                .into_iter()
+                .map(|e| e.mat.fingerprint)
+                .collect();
+            assert_eq!(stats, ["f4", "f3"]);
+            assert_eq!(store.materializations("docs", None, 10).unwrap().len(), 2);
+            assert_eq!(
+                store
+                    .materialization("docs", None)
+                    .unwrap()
+                    .unwrap()
+                    .fingerprint,
+                "d2"
+            );
 
-        // a cap of zero still leaves current state standing
-        assert_eq!(store.prune_materializations(0).unwrap(), 2);
-        assert_eq!(store.materializations("stats", None, 10).unwrap().len(), 1);
-        assert_eq!(
-            store
-                .materialization("stats", None)
-                .unwrap()
-                .unwrap()
-                .fingerprint,
-            "f4"
-        );
-        assert_eq!(store.latest_materializations().unwrap().len(), 2);
-        assert_eq!(store.prune_materializations(1).unwrap(), 0);
+            // a cap of zero still leaves current state standing
+            assert_eq!(store.prune_materializations(0).unwrap(), 2);
+            assert_eq!(store.materializations("stats", None, 10).unwrap().len(), 1);
+            assert_eq!(
+                store
+                    .materialization("stats", None)
+                    .unwrap()
+                    .unwrap()
+                    .fingerprint,
+                "f4"
+            );
+            assert_eq!(store.latest_materializations().unwrap().len(), 2);
+            assert_eq!(store.prune_materializations(1).unwrap(), 0);
+        });
     }
 
     #[test]
     fn sensor_sync_preserves_paused_and_cursor() {
-        let store = Store::open(":memory:").unwrap();
-        store
-            .sync_sensors(&["watch".into(), "probe:docs".into()])
-            .unwrap();
-        let rows = store.sensors().unwrap();
-        assert_eq!(rows.len(), 2);
-        assert!(rows.iter().all(|r| !r.paused && r.cursor.is_none()));
+        both(|db| {
+            let store = db.store();
+            store
+                .sync_sensors(&["watch".into(), "probe:docs".into()])
+                .unwrap();
+            let rows = store.sensors().unwrap();
+            assert_eq!(rows.len(), 2);
+            assert!(rows.iter().all(|r| !r.paused && r.cursor.is_none()));
 
-        assert!(store.set_sensor_paused("watch", true).unwrap());
-        assert!(!store.set_sensor_paused("nope", true).unwrap());
-        store
-            .set_sensor_cursor("watch", &json!({"mtime": 42}))
-            .unwrap();
+            assert!(store.set_sensor_paused("watch", true).unwrap());
+            assert!(!store.set_sensor_paused("nope", true).unwrap());
+            store
+                .set_sensor_cursor("watch", &json!({"mtime": 42}))
+                .unwrap();
 
-        store
-            .sync_sensors(&["watch".into(), "fresh".into()])
-            .unwrap();
-        let rows = store.sensors().unwrap();
-        assert_eq!(rows.len(), 2);
-        let watch = rows.iter().find(|r| r.name == "watch").unwrap();
-        assert!(watch.paused);
-        assert_eq!(watch.cursor, Some(json!({"mtime": 42})));
-        let fresh = rows.iter().find(|r| r.name == "fresh").unwrap();
-        assert!(!fresh.paused && fresh.cursor.is_none());
-        assert!(!rows.iter().any(|r| r.name == "probe:docs"));
+            store
+                .sync_sensors(&["watch".into(), "fresh".into()])
+                .unwrap();
+            let rows = store.sensors().unwrap();
+            assert_eq!(rows.len(), 2);
+            let watch = rows.iter().find(|r| r.name == "watch").unwrap();
+            assert!(watch.paused);
+            assert_eq!(watch.cursor, Some(json!({"mtime": 42})));
+            let fresh = rows.iter().find(|r| r.name == "fresh").unwrap();
+            assert!(!fresh.paused && fresh.cursor.is_none());
+            assert!(!rows.iter().any(|r| r.name == "probe:docs"));
+        });
     }
 
     #[test]
     fn sensor_ticks_record_filter_and_prune() {
-        let store = Store::open(":memory:").unwrap();
-        store
-            .record_sensor_tick("watch", SensorOutcome::Fired, 2, 1, 12, None)
-            .unwrap();
-        store
-            .record_sensor_tick("watch", SensorOutcome::Error, 0, 0, 4, Some("boom"))
-            .unwrap();
-        store
-            .record_sensor_tick("probe:docs", SensorOutcome::Fired, 0, 0, 0, None)
-            .unwrap();
+        both(|db| {
+            let store = db.store();
+            store
+                .record_sensor_tick("watch", SensorOutcome::Fired, 2, 1, 12, None)
+                .unwrap();
+            store
+                .record_sensor_tick("watch", SensorOutcome::Error, 0, 0, 4, Some("boom"))
+                .unwrap();
+            store
+                .record_sensor_tick("probe:docs", SensorOutcome::Fired, 0, 0, 0, None)
+                .unwrap();
 
-        let all = store.sensor_ticks(None, 10).unwrap();
-        assert_eq!(all.len(), 3);
-        assert_eq!(all[0].sensor, "probe:docs");
+            let all = store.sensor_ticks(None, 10).unwrap();
+            assert_eq!(all.len(), 3);
+            assert_eq!(all[0].sensor, "probe:docs");
 
-        let watch = store.sensor_ticks(Some("watch"), 10).unwrap();
-        assert_eq!(watch.len(), 2);
-        assert_eq!(watch[0].outcome, SensorOutcome::Error);
-        assert_eq!(watch[0].error.as_deref(), Some("boom"));
-        assert_eq!(watch[1].outcome, SensorOutcome::Fired);
-        assert_eq!(watch[1].launched, 2);
-        assert_eq!((watch[1].skipped, watch[1].duration_ms), (1, 12));
-        assert_eq!(store.sensor_ticks(None, 1).unwrap().len(), 1);
+            let watch = store.sensor_ticks(Some("watch"), 10).unwrap();
+            assert_eq!(watch.len(), 2);
+            assert_eq!(watch[0].outcome, SensorOutcome::Error);
+            assert_eq!(watch[0].error.as_deref(), Some("boom"));
+            assert_eq!(watch[1].outcome, SensorOutcome::Fired);
+            assert_eq!(watch[1].launched, 2);
+            assert_eq!((watch[1].skipped, watch[1].duration_ms), (1, 12));
+            assert_eq!(store.sensor_ticks(None, 1).unwrap().len(), 1);
 
-        store.prune_sensor_ticks(1).unwrap();
-        let left = store.sensor_ticks(None, 10).unwrap();
-        assert_eq!(left.len(), 1);
-        assert_eq!(left[0].sensor, "probe:docs");
+            store.prune_sensor_ticks(1).unwrap();
+            let left = store.sensor_ticks(None, 10).unwrap();
+            assert_eq!(left.len(), 1);
+            assert_eq!(left[0].sensor, "probe:docs");
+        });
     }
 
     #[test]
     fn op_state_roundtrip_and_upsert() {
-        let store = Store::open(":memory:").unwrap();
-        assert_eq!(store.op_state("etl", "pull").unwrap(), None);
-        assert!(store.job_states("etl").unwrap().is_empty());
+        both(|db| {
+            let store = db.store();
+            assert_eq!(store.op_state("etl", "pull").unwrap(), None);
+            assert!(store.job_states("etl").unwrap().is_empty());
 
-        store
-            .set_op_state("etl", "pull", &json!({"cursor": 1}))
-            .unwrap();
-        store.set_op_state("etl", "clean", &json!(42)).unwrap();
-        store.set_op_state("health", "pull", &json!("x")).unwrap();
-        assert_eq!(
-            store.op_state("etl", "pull").unwrap(),
-            Some(json!({"cursor": 1}))
-        );
-        assert_eq!(store.op_state("etl", "nope").unwrap(), None);
+            store
+                .set_op_state("etl", "pull", &json!({"cursor": 1}))
+                .unwrap();
+            store.set_op_state("etl", "clean", &json!(42)).unwrap();
+            store.set_op_state("health", "pull", &json!("x")).unwrap();
+            assert_eq!(
+                store.op_state("etl", "pull").unwrap(),
+                Some(json!({"cursor": 1}))
+            );
+            assert_eq!(store.op_state("etl", "nope").unwrap(), None);
 
-        let states = store.job_states("etl").unwrap();
-        assert_eq!(states.len(), 2);
-        assert_eq!(states[0].0, "clean");
-        assert_eq!(states[1].0, "pull");
-        let first_update = states[1].2;
+            let states = store.job_states("etl").unwrap();
+            assert_eq!(states.len(), 2);
+            assert_eq!(states[0].0, "clean");
+            assert_eq!(states[1].0, "pull");
+            let first_update = states[1].2;
 
-        store
-            .set_op_state("etl", "pull", &json!({"cursor": 2}))
-            .unwrap();
-        assert_eq!(
-            store.op_state("etl", "pull").unwrap(),
-            Some(json!({"cursor": 2}))
-        );
-        let states = store.job_states("etl").unwrap();
-        assert_eq!(states.len(), 2);
-        assert!(states[1].2 >= first_update);
+            store
+                .set_op_state("etl", "pull", &json!({"cursor": 2}))
+                .unwrap();
+            assert_eq!(
+                store.op_state("etl", "pull").unwrap(),
+                Some(json!({"cursor": 2}))
+            );
+            let states = store.job_states("etl").unwrap();
+            assert_eq!(states.len(), 2);
+            assert!(states[1].2 >= first_update);
+        });
     }
 
     #[test]
     fn schedule_sync_and_pause_roundtrip() {
-        let store = Store::open(":memory:").unwrap();
-        let defined = vec![
-            Schedule::new("etl", "0 * * * *").params(json!({"full": true})),
-            Schedule::new("health", "*/5 * * * *").catchup(crate::model::Catchup::One),
-        ];
-        store.sync_schedules(&defined).unwrap();
-        let rows = store.schedules().unwrap();
-        assert_eq!(rows.len(), 2);
-        assert!(rows.iter().all(|r| !r.paused));
-        assert_eq!(rows[0].params, json!({"full": true}));
-        assert_eq!(rows[1].params, json!({}));
-        assert_eq!(rows[0].catchup, crate::model::Catchup::Skip);
-        assert_eq!(rows[1].catchup, crate::model::Catchup::One);
-        assert!(rows.iter().all(|r| r.cursor.is_none()));
+        both(|db| {
+            let store = db.store();
+            let defined = vec![
+                Schedule::new("etl", "0 * * * *").params(json!({"full": true})),
+                Schedule::new("health", "*/5 * * * *").catchup(crate::model::Catchup::One),
+            ];
+            store.sync_schedules(&defined).unwrap();
+            let rows = store.schedules().unwrap();
+            assert_eq!(rows.len(), 2);
+            assert!(rows.iter().all(|r| !r.paused));
+            assert_eq!(rows[0].params, json!({"full": true}));
+            assert_eq!(rows[1].params, json!({}));
+            assert_eq!(rows[0].catchup, crate::model::Catchup::Skip);
+            assert_eq!(rows[1].catchup, crate::model::Catchup::One);
+            assert!(rows.iter().all(|r| r.cursor.is_none()));
 
-        assert!(store.set_schedule_paused("etl", "0 * * * *", true).unwrap());
-        assert!(!store.set_schedule_paused("etl", "bogus", true).unwrap());
+            assert!(store.set_schedule_paused("etl", "0 * * * *", true).unwrap());
+            assert!(!store.set_schedule_paused("etl", "bogus", true).unwrap());
 
-        // tz and params follow the declaration; the paused flag stays put
-        let cursor = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
-        store
-            .set_schedule_cursor("etl", "0 * * * *", cursor)
-            .unwrap();
-        let defined = vec![
-            Schedule::new("etl", "0 * * * *")
-                .tz("Europe/London")
-                .params(json!({"full": false}))
-                .catchup(crate::model::Catchup::All { limit: 6 }),
-        ];
-        store.sync_schedules(&defined).unwrap();
-        let rows = store.schedules().unwrap();
-        assert_eq!(rows.len(), 1);
-        assert!(rows[0].paused);
-        assert_eq!(rows[0].tz, "Europe/London");
-        assert_eq!(rows[0].params, json!({"full": false}));
-        assert_eq!(rows[0].catchup, crate::model::Catchup::All { limit: 6 });
-        // the cursor is the scheduler's, not the declaration's: a sync that
-        // reset it would be a restart that forgot the downtime it must detect
-        assert_eq!(rows[0].cursor, Some(cursor));
+            // tz and params follow the declaration; the paused flag stays put
+            let cursor = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+            store
+                .set_schedule_cursor("etl", "0 * * * *", cursor)
+                .unwrap();
+            let defined = vec![
+                Schedule::new("etl", "0 * * * *")
+                    .tz("Europe/London")
+                    .params(json!({"full": false}))
+                    .catchup(crate::model::Catchup::All { limit: 6 }),
+            ];
+            store.sync_schedules(&defined).unwrap();
+            let rows = store.schedules().unwrap();
+            assert_eq!(rows.len(), 1);
+            assert!(rows[0].paused);
+            assert_eq!(rows[0].tz, "Europe/London");
+            assert_eq!(rows[0].params, json!({"full": false}));
+            assert_eq!(rows[0].catchup, crate::model::Catchup::All { limit: 6 });
+            // the cursor is the scheduler's, not the declaration's: a sync that
+            // reset it would be a restart that forgot the downtime it must detect
+            assert_eq!(rows[0].cursor, Some(cursor));
+        });
     }
 
     #[test]
     fn ticks_record_and_query() {
-        let store = Store::open(":memory:").unwrap();
-        let t0 = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
-        store
-            .record_tick("etl", "0 * * * *", t0, TickOutcome::Fired, Some("r1"), None)
-            .unwrap();
-        store
-            .record_tick(
-                "etl",
-                "0 * * * *",
-                t0 + chrono::Duration::hours(1),
-                TickOutcome::Error,
-                None,
-                Some("boom"),
-            )
-            .unwrap();
-        store
-            .record_tick(
-                "health",
-                "*/5 * * * *",
-                t0,
-                TickOutcome::Fired,
-                Some("r2"),
-                None,
-            )
-            .unwrap();
+        both(|db| {
+            let store = db.store();
+            let t0 = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+            store
+                .record_tick("etl", "0 * * * *", t0, TickOutcome::Fired, Some("r1"), None)
+                .unwrap();
+            store
+                .record_tick(
+                    "etl",
+                    "0 * * * *",
+                    t0 + chrono::Duration::hours(1),
+                    TickOutcome::Error,
+                    None,
+                    Some("boom"),
+                )
+                .unwrap();
+            store
+                .record_tick(
+                    "health",
+                    "*/5 * * * *",
+                    t0,
+                    TickOutcome::Fired,
+                    Some("r2"),
+                    None,
+                )
+                .unwrap();
 
-        let all = store.ticks(None, 10).unwrap();
-        assert_eq!(all.len(), 3);
-        assert_eq!(all[0].job, "health");
+            let all = store.ticks(None, 10).unwrap();
+            assert_eq!(all.len(), 3);
+            assert_eq!(all[0].job, "health");
 
-        let etl = store.ticks(Some("etl"), 10).unwrap();
-        assert_eq!(etl.len(), 2);
-        assert_eq!(etl[0].outcome, TickOutcome::Error);
-        assert_eq!(etl[0].error.as_deref(), Some("boom"));
-        assert_eq!(etl[0].run_id, None);
-        assert_eq!(etl[1].outcome, TickOutcome::Fired);
-        assert_eq!(etl[1].run_id.as_deref(), Some("r1"));
-        assert_eq!(etl[1].scheduled_for, t0);
+            let etl = store.ticks(Some("etl"), 10).unwrap();
+            assert_eq!(etl.len(), 2);
+            assert_eq!(etl[0].outcome, TickOutcome::Error);
+            assert_eq!(etl[0].error.as_deref(), Some("boom"));
+            assert_eq!(etl[0].run_id, None);
+            assert_eq!(etl[1].outcome, TickOutcome::Fired);
+            assert_eq!(etl[1].run_id.as_deref(), Some("r1"));
+            assert_eq!(etl[1].scheduled_for, t0);
 
-        assert_eq!(store.ticks(None, 1).unwrap().len(), 1);
+            assert_eq!(store.ticks(None, 1).unwrap().len(), 1);
+        });
+    }
+
+    // ------------------------------------------------------------------------
+    // the cases below exist because of the second backend. what they cover was
+    // covered before — by the executor's tests, the backfill loop's, the asset
+    // registry's — and all of those run on sqlite and only sqlite. a query
+    // nothing exercises on postgres is a query nobody has run on postgres, so
+    // each of these puts one family of statements through the shared suite.
+
+    #[test]
+    fn the_queue_is_taken_in_priority_order_and_a_claim_takes_a_run_off_it() {
+        both(|db| {
+            let store = db.store();
+            let defined = HashSet::from(["etl".to_string()]);
+            let lease = Duration::from_secs(30);
+            let t0 = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+            for (i, job) in [(0, "etl"), (1, "etl"), (2, "other")] {
+                let at = t0 + chrono::Duration::minutes(i);
+                let run = mk_run(&format!("r{i}"), job, at);
+                store.create_run(&run, &["a".into()]).unwrap();
+            }
+            assert_eq!(store.queue_depth().unwrap(), 3);
+
+            // a job this process does not define is blocked where it stands
+            // rather than holding up everything behind it
+            let queue = store.queue(&Limits::new(), &defined, 10).unwrap();
+            let order: Vec<&str> = queue.iter().map(|q| q.run.id.as_str()).collect();
+            assert_eq!(order, ["r0", "r1", "r2"]);
+            assert_eq!(queue[0].position, 1);
+            assert_eq!(queue[2].blocked, Some(Blocked::Undefined("other".into())));
+
+            assert!(store.set_run_priority("r1", 5).unwrap());
+            assert!(!store.set_run_priority("nobody", 5).unwrap());
+            assert_eq!(
+                store.queue(&Limits::new(), &defined, 10).unwrap()[0].run.id,
+                "r1"
+            );
+
+            let (claimed, plan) = store
+                .claim_next("alpha", lease, &Limits::new(), &defined)
+                .unwrap()
+                .unwrap();
+            assert_eq!(claimed.id, "r1", "priority did not order the claim");
+            assert_eq!(plan, None);
+            assert_eq!(claimed.claimed_by.as_deref(), Some("alpha"));
+            assert_eq!(store.queue_depth().unwrap(), 2);
+            assert_eq!(store.held_by("alpha").unwrap(), ["r1"]);
+            // by then the priority has been spent
+            let err = store.set_run_priority("r1", 9).unwrap_err();
+            assert!(matches!(err, Error::RunActive(_)), "{err}");
+
+            // a limit skips rather than blocks, and the queue says so
+            let one = Limits::new().global(1);
+            assert!(
+                store
+                    .claim_next("beta", lease, &one, &defined)
+                    .unwrap()
+                    .is_none()
+            );
+            let queue = store.queue(&one, &defined, 10).unwrap();
+            assert_eq!(queue[0].blocked, Some(Blocked::Global(1)));
+
+            // a heartbeat moves the leases this claimer holds and nobody else's
+            let before = store.run("r1").unwrap().unwrap().lease_until.unwrap();
+            let longer = Duration::from_secs(600);
+            assert_eq!(store.renew_leases("alpha", longer).unwrap(), 1);
+            assert!(store.run("r1").unwrap().unwrap().lease_until.unwrap() > before);
+            assert_eq!(store.renew_leases("beta", lease).unwrap(), 0);
+
+            // cancelling takes an unclaimed run off the queue and leaves a
+            // claimed one to be stopped the ordinary way
+            assert!(store.cancel_queued("r0").unwrap());
+            assert!(!store.cancel_queued("r1").unwrap());
+            assert_eq!(
+                store.run("r0").unwrap().unwrap().status,
+                RunStatus::Canceled
+            );
+            assert_eq!(store.op_runs("r0").unwrap()[0].status, OpStatus::Canceled);
+
+            // and a fan-out adds op rows to a run already under way, twice
+            // without complaint
+            store.create_op_run("r1", "a[0]").unwrap();
+            store.create_op_run("r1", "a[0]").unwrap();
+            assert_eq!(store.op_runs("r1").unwrap().len(), 2);
+        });
+    }
+
+    #[test]
+    fn a_backfill_records_the_range_it_fixed_and_the_runs_it_chunked_out() {
+        both(|db| {
+            let store = db.store();
+            let keys = ["2026-01-01".to_string(), "2026-01-02".to_string()];
+            let id = store
+                .create_backfill("stats", "2026-01-01", "2026-01-02", &keys)
+                .unwrap();
+            let nothing = store.create_backfill("docs", "a", "b", &[]).unwrap();
+            assert_ne!(id, nothing, "two backfills, two ids");
+
+            let row = store.backfill(id).unwrap().unwrap();
+            assert_eq!(row.asset, "stats");
+            assert_eq!(row.partitions, keys);
+            assert_eq!((row.total, row.launched), (2, 0));
+            assert_eq!(row.status, BackfillStatus::Running);
+            assert!(row.run_ids.is_empty());
+            // a range that resolved to nothing is complete the moment it is made
+            let row = store.backfill(nothing).unwrap().unwrap();
+            assert_eq!(row.status, BackfillStatus::Complete);
+            assert!(row.finished_at.is_some());
+            assert!(store.backfill(9_999).unwrap().is_none());
+
+            assert_eq!(store.running_backfills().unwrap().len(), 1);
+            store.backfill_launched(id, "r1", 1).unwrap();
+            store.backfill_launched(id, "r2", 2).unwrap();
+            let row = store.backfill(id).unwrap().unwrap();
+            assert_eq!(row.run_ids, ["r1", "r2"], "the chunks did not append");
+            assert_eq!(row.launched, 2);
+
+            store.finish_backfill(id, BackfillStatus::Complete).unwrap();
+            // the first terminal status wins: a cancel racing the chunker
+            // cannot be overwritten by what the run did next
+            store.finish_backfill(id, BackfillStatus::Canceled).unwrap();
+            let row = store.backfill(id).unwrap().unwrap();
+            assert_eq!(row.status, BackfillStatus::Complete);
+            assert!(store.running_backfills().unwrap().is_empty());
+            assert_eq!(store.backfills(10).unwrap().len(), 2);
+        });
+    }
+
+    #[test]
+    fn check_results_are_history_per_partition_and_prune_to_the_latest() {
+        both(|db| {
+            let store = db.store();
+            let facts = json!({"rows": {"int": 3}});
+            let record = |partition, status, message| {
+                store
+                    .record_check(
+                        "stats",
+                        partition,
+                        "has_rows",
+                        "r1",
+                        status,
+                        Severity::Error,
+                        message,
+                        Some(&facts),
+                    )
+                    .unwrap();
+            };
+            record(None, CheckStatus::Passed, None);
+            record(None, CheckStatus::Failed, Some("no rows"));
+            record(Some("2026-01-01"), CheckStatus::Passed, None);
+
+            let all = store.asset_checks("stats", None, 10).unwrap();
+            assert_eq!(all.len(), 3, "every key of the asset, newest first");
+            assert_eq!(all[0].partition.as_deref(), Some("2026-01-01"));
+            assert_eq!(all[1].status, CheckStatus::Failed);
+            assert_eq!(all[1].message.as_deref(), Some("no rows"));
+            assert_eq!(all[1].metadata, Some(facts));
+            assert_eq!(all[1].severity, Severity::Error);
+            assert_eq!(
+                store
+                    .asset_checks("stats", Some("2026-01-01"), 10)
+                    .unwrap()
+                    .len(),
+                1
+            );
+            assert!(store.asset_checks("nothing", None, 10).unwrap().is_empty());
+
+            // the latest of every (asset, partition, check) triple, with the
+            // unpartitioned one first
+            let latest = store.latest_asset_checks().unwrap();
+            assert_eq!(latest.len(), 2);
+            assert_eq!(latest[0].partition, None);
+            assert_eq!(latest[0].status, CheckStatus::Failed);
+
+            assert_eq!(store.prune_asset_checks(1).unwrap(), 1);
+            assert_eq!(store.asset_checks("stats", None, 10).unwrap().len(), 2);
+            assert_eq!(
+                store.prune_asset_checks(0).unwrap(),
+                0,
+                "the latest result is what the summary counts, at any cap"
+            );
+        });
+    }
+
+    #[test]
+    fn freshness_state_records_a_crossing_and_drops_it_on_the_way_back() {
+        both(|db| {
+            let store = db.store();
+            assert!(store.freshness_states().unwrap().is_empty());
+            let since = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+            store
+                .set_freshness_state("job", "etl", true, Some(since))
+                .unwrap();
+            store
+                .set_freshness_state("asset", "stats", false, None)
+                .unwrap();
+
+            let rows = store.freshness_states().unwrap();
+            assert_eq!(rows.len(), 2);
+            assert_eq!(rows[0].kind, "asset");
+            assert!(!rows[0].late && rows[0].since.is_none());
+            assert!(rows[1].late);
+            assert_eq!(rows[1].since, Some(since));
+
+            // the way back is the same row rewritten, and the interval goes
+            // with it so a relapse is a new one
+            store
+                .set_freshness_state("job", "etl", false, None)
+                .unwrap();
+            let rows = store.freshness_states().unwrap();
+            assert_eq!(rows.len(), 2);
+            assert!(!rows[1].late);
+            assert_eq!(rows[1].since, None);
+        });
+    }
+
+    #[test]
+    fn a_metadata_series_follows_one_key_across_runs_and_builds() {
+        both(|db| {
+            let store = db.store();
+            let t0 = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+            for (i, rows) in [Some(3), None, Some(5)].into_iter().enumerate() {
+                let id = format!("r{i}");
+                let at = t0 + chrono::Duration::minutes(i as i64);
+                store
+                    .create_run(&mk_run(&id, "etl", at), &["load".into()])
+                    .unwrap();
+                let reported = rows.map(|n| json!({"rows": {"int": n}, "note": {"text": "x"}}));
+                store
+                    .op_finished(
+                        &id,
+                        "load",
+                        OpStatus::Success,
+                        None,
+                        reported.as_ref(),
+                        None,
+                    )
+                    .unwrap();
+            }
+
+            // oldest first, and the run that reported nothing is no point
+            // rather than a gap or a zero
+            let series = store.op_metadata_series("etl", "load", "rows", 10).unwrap();
+            assert_eq!(
+                series.iter().map(|p| p.value).collect::<Vec<_>>(),
+                [3.0, 5.0]
+            );
+            assert_eq!(series[0].run_id.as_deref(), Some("r0"));
+            assert!(
+                store
+                    .op_metadata_series("etl", "load", "note", 10)
+                    .unwrap()
+                    .is_empty(),
+                "something that is not a number is not a point"
+            );
+
+            for (key, rows) in [(None, 10), (Some("k"), 400), (None, 14)] {
+                store
+                    .record_materialization(
+                        "stats",
+                        key,
+                        "f",
+                        &json!({}),
+                        None,
+                        Some("r0"),
+                        Some(&json!({"rows": {"int": rows}})),
+                    )
+                    .unwrap();
+            }
+            // without a key the builds of every key interleave by time, which
+            // is a trend of the asset rather than of any one of them
+            let every = store
+                .asset_metadata_series("stats", None, "rows", 10)
+                .unwrap();
+            assert_eq!(
+                every.iter().map(|p| p.value).collect::<Vec<_>>(),
+                [10.0, 400.0, 14.0]
+            );
+            let one = store
+                .asset_metadata_series("stats", Some("k"), "rows", 10)
+                .unwrap();
+            assert_eq!(one.iter().map(|p| p.value).collect::<Vec<_>>(), [400.0]);
+            assert_eq!(one[0].run_id.as_deref(), Some("r0"));
+        });
+    }
+
+    #[test]
+    fn terminal_runs_read_forward_from_a_cursor_that_never_repeats_a_tie() {
+        both(|db| {
+            let store = db.store();
+            let t0 = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+            assert!(store.latest_terminal_run(None).unwrap().is_none());
+            assert!(store.last_success("etl").unwrap().is_none());
+
+            // two of them finish at the same instant, deliberately
+            for (id, job, status, at) in [
+                ("a", "etl", RunStatus::Success, t0),
+                (
+                    "b",
+                    "etl",
+                    RunStatus::Failed,
+                    t0 + chrono::Duration::minutes(1),
+                ),
+                (
+                    "c",
+                    "other",
+                    RunStatus::Success,
+                    t0 + chrono::Duration::minutes(1),
+                ),
+            ] {
+                store.create_run(&mk_run(id, job, t0), &[]).unwrap();
+                store.run_finished(id, status, None, at, None).unwrap();
+            }
+            // and one that has not finished at all
+            store.create_run(&mk_run("live", "etl", t0), &[]).unwrap();
+            store.run_started("live", Utc::now()).unwrap();
+
+            let all = store.terminal_runs_after(None, None, 10).unwrap();
+            let seen: Vec<&str> = all.iter().map(|r| r.id.as_str()).collect();
+            assert_eq!(seen, ["a", "b", "c"], "oldest finish first, ties by id");
+
+            let cursor = store.latest_terminal_run(None).unwrap().unwrap();
+            assert_eq!(cursor.id, "c");
+            assert!(
+                store
+                    .terminal_runs_after(None, Some(&cursor), 10)
+                    .unwrap()
+                    .is_empty(),
+                "a cursor at the newest run read it again"
+            );
+            // strictly after, so the run sharing an instant with the cursor is
+            // not read twice either
+            let tied = RunCursor {
+                finished_at: t0 + chrono::Duration::minutes(1),
+                id: "b".into(),
+            };
+            let after = store.terminal_runs_after(None, Some(&tied), 10).unwrap();
+            assert_eq!(
+                after.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(),
+                ["c"]
+            );
+
+            let etl = store.terminal_runs_after(Some("etl"), None, 10).unwrap();
+            assert_eq!(
+                etl.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(),
+                ["a", "b"]
+            );
+            assert_eq!(
+                store.latest_terminal_run(Some("etl")).unwrap().unwrap().id,
+                "b"
+            );
+            assert_eq!(store.last_success("etl").unwrap(), Some(t0));
+            assert!(store.last_success("nothing").unwrap().is_none());
+        });
+    }
+
+    #[test]
+    fn an_isolated_ops_row_carries_the_process_and_the_inputs_it_was_handed() {
+        both(|db| {
+            let store = db.store();
+            store
+                .create_run(&mk_run("r1", "etl", Utc::now()), &["a".into()])
+                .unwrap();
+            assert_eq!(store.op_inputs("r1", "a").unwrap(), None);
+            assert!(store.op_run("r1", "nobody").unwrap().is_none());
+
+            // guarded on `running`: a fast child can record its own terminal
+            // row first, and a pid on a finished op names a dead process
+            store.op_spawned("r1", "a", 4242).unwrap();
+            assert_eq!(store.op_run("r1", "a").unwrap().unwrap().pid, None);
+            store.op_started("r1", "a", 1).unwrap();
+            store.op_spawned("r1", "a", 4242).unwrap();
+            assert_eq!(store.op_run("r1", "a").unwrap().unwrap().pid, Some(4242));
+
+            let handed = json!({"held": {"up": "h1"}, "deps": {"up": "success"}});
+            store.set_op_inputs("r1", "a", &handed).unwrap();
+            assert_eq!(store.op_inputs("r1", "a").unwrap(), Some(handed));
+
+            // and the terminal write hands the process back
+            store
+                .op_finished("r1", "a", OpStatus::Success, None, None, None)
+                .unwrap();
+            assert_eq!(store.op_run("r1", "a").unwrap().unwrap().pid, None);
+        });
+    }
+
+    #[test]
+    fn a_deferred_fire_waits_on_the_tick_log_until_a_later_tick_replaces_it() {
+        both(|db| {
+            let store = db.store();
+            let t0 = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+            let hour = chrono::Duration::hours(1);
+            let tick = |at, outcome| {
+                store
+                    .record_tick("etl", "0 * * * *", at, outcome, None, None)
+                    .unwrap();
+            };
+            tick(t0, TickOutcome::Deferred);
+            tick(t0 + hour, TickOutcome::Deferred);
+            // the first occurrence launched on a later pass; the second has not
+            store
+                .record_tick("etl", "0 * * * *", t0, TickOutcome::Fired, Some("r1"), None)
+                .unwrap();
+
+            let waiting = store.pending_fires().unwrap();
+            assert_eq!(waiting.len(), 1, "a fire that launched is not still due");
+            assert_eq!(waiting[0], ("etl".into(), "0 * * * *".into(), t0 + hour));
+
+            // the cursor only ever goes forward, so a held fire draining late
+            // does not un-account for everything since
+            store
+                .sync_schedules(&[Schedule::new("etl", "0 * * * *")])
+                .unwrap();
+            store
+                .set_schedule_cursor("etl", "0 * * * *", t0 + hour)
+                .unwrap();
+            store.set_schedule_cursor("etl", "0 * * * *", t0).unwrap();
+            assert_eq!(store.schedules().unwrap()[0].cursor, Some(t0 + hour));
+
+            store.prune_ticks(1).unwrap();
+            let left = store.ticks(None, 10).unwrap();
+            assert_eq!(left.len(), 1);
+            assert_eq!(left[0].outcome, TickOutcome::Fired);
+        });
+    }
+
+    // the three writes a test needs and a running process never makes: history
+    // older than the test itself, and a delivery put back where a crash
+    // between the hook returning and the mark landing would have left it
+    #[test]
+    fn history_can_be_backdated_and_a_delivery_undone() {
+        both(|db| {
+            let store = db.store();
+            let old = Utc::now() - chrono::Duration::days(30);
+            store
+                .create_run(&mk_run("r1", "etl", Utc::now()), &[])
+                .unwrap();
+            store
+                .run_finished(
+                    "r1",
+                    RunStatus::Success,
+                    None,
+                    Utc::now(),
+                    Some(&json!({"run_id": "r1"})),
+                )
+                .unwrap();
+            store.backdate_run("r1", old).unwrap();
+            assert_eq!(store.last_success("etl").unwrap(), Some(old));
+
+            for key in [None, Some("k")] {
+                store
+                    .record_materialization("stats", key, "f", &json!({}), None, None, None)
+                    .unwrap();
+            }
+            store.backdate_materialization("stats", None, old).unwrap();
+            assert_eq!(
+                store
+                    .materialization("stats", None)
+                    .unwrap()
+                    .unwrap()
+                    .built_at,
+                old
+            );
+            assert!(
+                store
+                    .materialization("stats", Some("k"))
+                    .unwrap()
+                    .unwrap()
+                    .built_at
+                    > old,
+                "backdating one key moved another"
+            );
+
+            let note = store.notifications(None, 10).unwrap().pop().unwrap();
+            assert!(store.delivered(note.id, Utc::now()).unwrap());
+            assert!(store.due_notifications(Utc::now(), 10).unwrap().is_empty());
+            store.undeliver(note.id, old).unwrap();
+            let due = store.due_notifications(Utc::now(), 10).unwrap();
+            assert_eq!(due.len(), 1);
+            assert_eq!(due[0].state, DeliveryState::Pending);
+        });
+    }
+
+    // what `Hestan::db` hands a store, and what an isolated op's child is
+    // handed again: one string that says which backend it means
+    #[test]
+    fn a_target_is_a_path_or_a_url_and_opens_the_right_backend() {
+        both(|db| {
+            let store = Store::at(&db.target()).unwrap();
+            assert!(store.schedules().unwrap().is_empty());
+            assert!(!store.is_private(), "a case's database is reachable twice");
+        });
+        assert!(Store::open(":memory:").unwrap().is_private());
     }
 
     /// every table the sqlite chain arrives at after sixteen migrations. a
@@ -5380,16 +6052,11 @@ mod tests {
 
         // and it is still v17: a build that cannot read a database must not
         // rewrite it either
-        let store = Store(
-            Arc::new(Db::Postgres(Mutex::new(
-                postgres::Client::connect(&pg.url, postgres::NoTls).unwrap(),
-            ))),
-            pg.url.as_str().into(),
-        );
-        let version = store
-            .conn()
-            .query_opt("SELECT version FROM schema_version", args![], |r| r.int(0))
-            .unwrap();
-        assert_eq!(version, Some(17));
+        let version: i64 = postgres::Client::connect(&pg.url, postgres::NoTls)
+            .unwrap()
+            .query_one("SELECT version FROM schema_version", &[])
+            .unwrap()
+            .get(0);
+        assert_eq!(version, 17);
     }
 }
