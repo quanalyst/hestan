@@ -18,6 +18,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::asset::{ASSETS_JOB, AssetRegistry, launch_plan, mats_map, plan_all, staleness};
+use crate::auth::{self, Access, Auth, Identity};
 use crate::backfill;
 use crate::error::Error;
 use crate::executor::{self, CancelOutcome, Runner};
@@ -63,9 +64,13 @@ pub(crate) struct AppState {
     pub runner: Runner,
     pub assets: Arc<AssetRegistry>,
     pub sensors: Arc<Vec<SensorInfo>>,
+    /// what checks who is asking. `None` is nothing configured, which
+    /// [`serve`](crate::Hestan::serve) only allows on loopback.
+    pub auth: Option<Auth>,
 }
 
 pub(crate) fn router(state: AppState) -> Router {
+    let auth = state.auth.clone();
     Router::new()
         .route("/api/health", get(health))
         .route("/api/resources", get(list_resources))
@@ -121,8 +126,101 @@ pub(crate) fn router(state: AppState) -> Router {
         .route("/api/notifications", get(list_notifications))
         .route("/api/events", get(list_events))
         .route("/api/events/stream", get(stream_events))
+        // every route above and nothing below it: the ui's own files are
+        // served by the fallback, which is outside this on purpose — a login
+        // page that needs a credential to load is a login page nobody can use
+        .route_layer(axum::middleware::from_fn_with_state(auth, guard))
+        .route("/api/whoami", get(whoami))
         .fallback(static_ui)
         .with_state(state)
+}
+
+/// the endpoints that need an [admin](Access), by the route each request
+/// matched.
+///
+/// only the exceptions are listed. everything else is the rule — a `GET` reads
+/// and needs a viewer, anything else changes something and needs an operator —
+/// so a route added tomorrow lands on the rule rather than in a hole, and the
+/// worst a forgotten line here can do is ask for too little privilege in one
+/// direction that is still not "anyone".
+///
+/// these are the ones that change how the deployment *behaves* rather than
+/// what it is doing now: a paused schedule stays paused, a preset is what the
+/// next launch will use, a priority reorders work nobody asked about.
+const ADMIN_ONLY: [&str; 4] = [
+    "/api/schedules/state",
+    "/api/sensors/state",
+    "/api/runs/{id}/priority",
+    "/api/jobs/{name}/presets/{preset}",
+];
+
+/// what this request needs of whoever is making it.
+fn needed(method: &Method, route: Option<&str>) -> Access {
+    if method == Method::GET || method == Method::HEAD {
+        return Access::Viewer;
+    }
+    match route {
+        Some(route) if ADMIN_ONLY.contains(&route) => Access::Admin,
+        _ => Access::Operator,
+    }
+}
+
+/// 401 for nobody we know, 403 for somebody who may not, and the
+/// [identity](Identity) on the request for everyone else.
+///
+/// the identity goes on the request rather than being re-derived in each
+/// handler for the reason every check that happens twice eventually happens
+/// differently: this is the only place that decides.
+async fn guard(
+    State(auth): State<Option<Auth>>,
+    mut req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    // nothing configured, or the deliberate opt-out: served exactly as it was
+    // before any of this existed, and with no identity, because there is
+    // nobody here to name
+    let Some(auth) = auth.filter(Auth::checks) else {
+        return next.run(req).await;
+    };
+    // the route that matched, not the path that arrived: `/api/runs/{id}/cancel`
+    // is one thing to reason about and one line in the docs, however the id is
+    // spelled
+    let route = req
+        .extensions()
+        .get::<axum::extract::MatchedPath>()
+        .map(|m| m.as_str().to_string());
+    let needs = needed(req.method(), route.as_deref());
+    let identity: Option<Identity> = {
+        let seen = auth::Request::new(req.method().as_str(), req.uri().path(), req.headers());
+        auth.identify(&seen)
+    };
+    let Some(identity) = identity else {
+        // no hint about what was wrong with it: "that token is close" is a
+        // sentence an attacker can work with and a person cannot
+        let mut refused = err(
+            StatusCode::UNAUTHORIZED,
+            "authentication required: present your credentials",
+        )
+        .into_response();
+        if let Some(scheme) = auth.challenge() {
+            refused
+                .headers_mut()
+                .insert(header::WWW_AUTHENTICATE, scheme.parse().expect("a scheme"));
+        }
+        return refused;
+    };
+    if identity.role < needs {
+        return err(
+            StatusCode::FORBIDDEN,
+            format!(
+                "this needs {needs}, and {} is a {}",
+                identity.name, identity.role
+            ),
+        )
+        .into_response();
+    }
+    req.extensions_mut().insert(identity);
+    next.run(req).await
 }
 
 type ApiError = (StatusCode, Json<Value>);
@@ -318,6 +416,32 @@ async fn health(State(st): State<AppState>) -> Json<Value> {
         "ok": true,
         "instance": st.runner.instance(),
         "holding": holding,
+    }))
+}
+
+/// whether this deployment checks who is asking, and who it makes you.
+///
+/// **outside the guard**, and it is the only endpoint that is. the ui has to
+/// be able to ask before it holds anything to present, and `hestan doctor`
+/// has to be able to tell an authenticated deployment from an open one
+/// without credentials — a 401 there would answer the question with a question.
+///
+/// credentials it does not recognize are `identity: null` rather than a 401,
+/// which is what lets the ui's token prompt say "that one was refused" instead
+/// of guessing from a status code.
+async fn whoami(
+    State(st): State<AppState>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+) -> Json<Value> {
+    let identity = st
+        .auth
+        .as_ref()
+        .and_then(|auth| auth.identify(&auth::Request::new(method.as_str(), uri.path(), &headers)));
+    Json(json!({
+        "auth": st.auth.as_ref().is_some_and(Auth::checks),
+        "identity": identity,
     }))
 }
 
@@ -2001,6 +2125,7 @@ mod tests {
             runner,
             assets: Arc::new(AssetRegistry::empty()),
             sensors: Arc::new(Vec::new()),
+            auth: None,
         }
     }
 
@@ -2493,6 +2618,7 @@ mod tests {
             runner,
             assets: Arc::new(AssetRegistry::empty()),
             sensors: Arc::new(Vec::new()),
+            auth: None,
         };
 
         let Json(body) = get_job(State(st), Path("pull".into())).await.unwrap();
@@ -3114,6 +3240,7 @@ mod tests {
             runner,
             assets: Arc::new(AssetRegistry::empty()),
             sensors: Arc::new(Vec::new()),
+            auth: None,
         };
         let (status, Json(body)) = clone_run(State(gone.clone()), Path(id.clone()))
             .await
@@ -3181,6 +3308,7 @@ mod tests {
             runner,
             assets: Arc::new(AssetRegistry::empty()),
             sensors: Arc::new(Vec::new()),
+            auth: None,
         };
         let Json(body) = list_resources(State(st)).await;
         assert_eq!(
@@ -3550,6 +3678,7 @@ mod tests {
             runner,
             assets: Arc::new(AssetRegistry::empty()),
             sensors: Arc::new(Vec::new()),
+            auth: None,
         };
 
         st.runner
@@ -4281,6 +4410,7 @@ mod tests {
             runner,
             assets: registry,
             sensors: Arc::new(Vec::new()),
+            auth: None,
         }
     }
 
@@ -4474,6 +4604,7 @@ mod tests {
             runner,
             assets: registry,
             sensors: Arc::new(Vec::new()),
+            auth: None,
         };
         st.runner
             .store()
@@ -4605,6 +4736,7 @@ mod tests {
             runner,
             assets: registry,
             sensors: Arc::new(Vec::new()),
+            auth: None,
         }
     }
 
@@ -5320,5 +5452,317 @@ mod tests {
         let (status, _, content_type) = request(router(st), Method::GET, "/runs").await;
         assert_eq!(status, StatusCode::OK);
         assert!(content_type.starts_with("text/html"), "{content_type}");
+    }
+
+    // ------------------------------------------------------------- the guard
+
+    /// every read the api serves, and every mutation, by the route each one
+    /// matches.
+    ///
+    /// this is `docs/auth.md`'s table as a test. a route missing from here is
+    /// a route nobody asserted the access of, so the two lists below are
+    /// checked against the router itself in
+    /// [`the_table_covers_every_endpoint_the_router_serves`].
+    const READS: [&str; 32] = [
+        "/api/health",
+        "/api/resources",
+        "/api/jobs",
+        "/api/jobs/etl",
+        "/api/jobs/etl/presets",
+        "/api/jobs/etl/op_stats",
+        "/api/jobs/etl/ops/echo/metadata/rows",
+        "/api/jobs/etl/state",
+        "/api/runs",
+        "/api/runs/r1",
+        "/api/runs/r1/events",
+        "/api/runs/r1/logs",
+        "/api/runs/r1/logs/download",
+        "/api/runs/r1/resume_preview",
+        "/api/runs/r1/clone",
+        "/api/queue",
+        "/api/assets",
+        "/api/assets/docs/history",
+        "/api/assets/docs/metadata/rows",
+        "/api/assets/docs/partitions",
+        "/api/assets/docs/checks",
+        "/api/backfills",
+        "/api/backfills/1",
+        "/api/sensors",
+        "/api/sensors/ticks",
+        "/api/schedules",
+        "/api/schedules/ticks",
+        "/api/schedules/upcoming",
+        "/api/late",
+        "/api/notifications",
+        "/api/events",
+        "/api/events/stream",
+    ];
+
+    /// what each mutation needs of whoever asks for it. an operator drives what
+    /// is happening now; an admin changes what the deployment will do next.
+    const MUTATIONS: [(&str, &str, Access); 14] = [
+        ("POST", "/api/jobs/etl/runs", Access::Operator),
+        ("POST", "/api/jobs/etl/validate_params", Access::Operator),
+        ("POST", "/api/runs/r1/retry", Access::Operator),
+        ("POST", "/api/runs/r1/resume", Access::Operator),
+        ("POST", "/api/runs/r1/cancel", Access::Operator),
+        ("POST", "/api/assets/build", Access::Operator),
+        ("POST", "/api/assets/docs/build", Access::Operator),
+        ("POST", "/api/assets/docs/backfill", Access::Operator),
+        ("POST", "/api/backfills/1/cancel", Access::Operator),
+        ("POST", "/api/runs/r1/priority", Access::Admin),
+        ("POST", "/api/sensors/state", Access::Admin),
+        ("POST", "/api/schedules/state", Access::Admin),
+        ("PUT", "/api/jobs/etl/presets/nightly", Access::Admin),
+        ("DELETE", "/api/jobs/etl/presets/nightly", Access::Admin),
+    ];
+
+    /// three people, told apart by a header, so a case can be any of them
+    /// without a token each.
+    fn people() -> Auth {
+        Auth::custom(|req| match req.header("x-user")? {
+            "ada" => Some(Identity::admin("ada")),
+            "ola" => Some(Identity::operator("ola")),
+            "vic" => Some(Identity::viewer("vic")),
+            _ => None,
+        })
+    }
+
+    fn guarded(auth: Auth) -> AppState {
+        let st = state(vec![echo_job("etl")]);
+        insert_run(&st, "r1", "etl", RunStatus::Success, json!({}));
+        AppState {
+            auth: Some(auth),
+            ..st
+        }
+    }
+
+    /// one request as somebody, or as nobody: the header they are known by,
+    /// the status, and whatever json came back.
+    async fn asked(
+        st: &AppState,
+        method: &str,
+        path: &str,
+        who: Option<(&str, &str)>,
+    ) -> (StatusCode, Value) {
+        use tower::util::ServiceExt;
+        let mut req = axum::http::Request::builder()
+            .method(method)
+            .uri(path)
+            .header(header::CONTENT_TYPE, "application/json");
+        if let Some((name, value)) = who {
+            req = req.header(name, value);
+        }
+        // a body every mutation will parse if it gets that far; the ones that
+        // want another shape answer 400, which is still not a refusal
+        let req = req.body(axum::body::Body::from("{}")).unwrap();
+        let resp = router(st.clone()).oneshot(req).await.unwrap();
+        let status = resp.status();
+        // the event stream does not end, and reading a body that does not end
+        // is a test that does not finish: who got through is the whole of what
+        // these cases assert
+        let streaming = resp
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .is_some_and(|v| v.as_bytes().starts_with(b"text/event-stream"));
+        if streaming {
+            return (status, Value::Null);
+        }
+        let body = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        (status, serde_json::from_slice(&body).unwrap_or(Value::Null))
+    }
+
+    async fn status_of(
+        st: &AppState,
+        method: &str,
+        path: &str,
+        who: Option<(&str, &str)>,
+    ) -> StatusCode {
+        asked(st, method, path, who).await.0
+    }
+
+    fn refused(status: StatusCode) -> bool {
+        status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN
+    }
+
+    /// whether a request path is one this route serves: `{param}` matches a
+    /// segment and everything else is itself.
+    fn serves(route: &str, path: &str) -> bool {
+        let (route, path): (Vec<&str>, Vec<&str>) =
+            (route.split('/').collect(), path.split('/').collect());
+        route.len() == path.len()
+            && route
+                .iter()
+                .zip(&path)
+                .all(|(r, p)| r.starts_with('{') || r == p)
+    }
+
+    /// every route [`router`] declares, read out of this file.
+    ///
+    /// the string literal after each `.route(`, which is the only place a
+    /// route is declared — there is no other way for an endpoint to exist, and
+    /// no way for one to be added without landing here.
+    fn declared_routes() -> Vec<String> {
+        // spelled at runtime so this line is not itself one of the matches
+        let declaration = format!(".{}(", "route");
+        include_str!("server.rs")
+            .split(&declaration)
+            .skip(1)
+            .filter_map(|rest| {
+                let quoted = rest.trim_start().strip_prefix('"')?;
+                Some(quoted[..quoted.find('"')?].to_string())
+            })
+            .collect()
+    }
+
+    // the mapping, endpoint by endpoint: a viewer reads everything and changes
+    // nothing, an operator drives runs, and only an admin changes how the
+    // deployment behaves
+    #[tokio::test]
+    async fn every_role_may_exactly_what_the_table_says() {
+        let st = guarded(people());
+        for path in READS {
+            for who in ["vic", "ola", "ada"] {
+                let status = status_of(&st, "GET", path, Some(("x-user", who))).await;
+                assert!(!refused(status), "{who} could not read {path}: {status}");
+            }
+        }
+        for (method, path, needs) in MUTATIONS {
+            for (who, role) in [
+                ("vic", Access::Viewer),
+                ("ola", Access::Operator),
+                ("ada", Access::Admin),
+            ] {
+                let status = status_of(&st, method, path, Some(("x-user", who))).await;
+                match role >= needs {
+                    // what they got back is the endpoint's business — a 404
+                    // for a run that is not there is not a refusal
+                    true => assert!(
+                        !refused(status),
+                        "{who} was refused {method} {path}: {status}"
+                    ),
+                    false => assert_eq!(
+                        status,
+                        StatusCode::FORBIDDEN,
+                        "{who} was not stopped at {method} {path}"
+                    ),
+                }
+            }
+        }
+    }
+
+    // the tables above are the api and not most of it: a route added without a
+    // line here fails this rather than going unasserted
+    #[test]
+    fn the_table_covers_every_endpoint_the_router_serves() {
+        let missed: Vec<String> = declared_routes()
+            .into_iter()
+            // the one endpoint deliberately outside the guard, asserted by
+            // name in `the_ui_and_the_whoami_endpoint_need_no_credentials`
+            .filter(|route| route != "/api/whoami")
+            .filter(|route| {
+                !READS.iter().any(|path| serves(route, path))
+                    && !MUTATIONS.iter().any(|(_, path, _)| serves(route, path))
+            })
+            .collect();
+        assert!(
+            missed.is_empty(),
+            "endpoints nobody asserted the access of: {missed:?}"
+        );
+        // and the count, so that a scraper that quietly stopped finding
+        // anything cannot pass this by covering nothing
+        assert_eq!(declared_routes().len(), 46);
+    }
+
+    // a role that may not is 403 and says what it would take; nobody at all is
+    // 401 and says nothing about the credential it did not accept
+    #[tokio::test]
+    async fn a_stranger_is_401_and_a_viewer_is_403() {
+        let st = guarded(Auth::bearer("s3cret"));
+        // no credentials, the wrong token, and the right token with the scheme
+        // word missing are one answer
+        for asking in [None, Some("Bearer wrong"), Some("s3cret")] {
+            let asking = asking.map(|value| ("authorization", value));
+            for (method, path) in [("GET", "/api/runs"), ("POST", "/api/jobs/etl/runs")] {
+                let (status, body) = asked(&st, method, path, asking).await;
+                assert_eq!(
+                    status,
+                    StatusCode::UNAUTHORIZED,
+                    "{asking:?} {method} {path}"
+                );
+                // and it says nothing about what was wrong with it: "that one
+                // was close" is a sentence an attacker can use and a person
+                // cannot
+                let said = body["error"].as_str().unwrap();
+                assert!(!said.contains("s3cret"), "{said}");
+            }
+        }
+        // the right one is an admin, which is what a bearer token is
+        let asking = Some(("authorization", "Bearer s3cret"));
+        let status = status_of(&st, "POST", "/api/schedules/state", asking).await;
+        assert!(!refused(status), "{status}");
+
+        // a viewer is somebody, so what they cannot do is 403, and it says
+        // what it would have taken — the only useful half of a refusal
+        let (status, body) = asked(
+            &guarded(people()),
+            "POST",
+            "/api/jobs/etl/runs",
+            Some(("x-user", "vic")),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        let said = body["error"].as_str().unwrap();
+        assert!(said.contains("operator") && said.contains("vic"), "{said}");
+    }
+
+    // the ui is files, and a login page that needs a credential to load is a
+    // login page nobody can use
+    #[tokio::test]
+    async fn the_ui_and_the_whoami_endpoint_need_no_credentials() {
+        let st = guarded(Auth::bearer("s3cret"));
+        let (status, _, content_type) = request(router(st.clone()), Method::GET, "/").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(content_type.starts_with("text/html"), "{content_type}");
+
+        let (status, body, _) = request(router(st.clone()), Method::GET, "/api/whoami").await;
+        assert_eq!(status, StatusCode::OK);
+        let body = body.unwrap();
+        assert_eq!(body["auth"], true);
+        // no credentials, so nobody — and not a 401, because this is the
+        // endpoint that is asked before there is anything to present
+        assert_eq!(body["identity"], Value::Null);
+
+        // an open deployment says so in the same shape, which is what the ui
+        // and `doctor` read to know they need nothing
+        let (_, body, _) = request(router(state(vec![])), Method::GET, "/api/whoami").await;
+        assert_eq!(body.unwrap()["auth"], false);
+    }
+
+    // nothing configured serves exactly as it did before any of this existed
+    #[tokio::test]
+    async fn an_unauthenticated_deployment_refuses_nobody() {
+        let st = state(vec![echo_job("etl")]);
+        insert_run(&st, "r1", "etl", RunStatus::Success, json!({}));
+        let opted_out = AppState {
+            auth: Some(Auth::None),
+            ..guarded(people())
+        };
+        for open in [st, opted_out] {
+            for path in READS {
+                assert!(
+                    !refused(status_of(&open, "GET", path, None).await),
+                    "{path}"
+                );
+            }
+            for (method, path, _) in MUTATIONS {
+                assert!(
+                    !refused(status_of(&open, method, path, None).await),
+                    "{method} {path}"
+                );
+            }
+        }
     }
 }

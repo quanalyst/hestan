@@ -861,6 +861,7 @@ impl Hestan {
             runner: built.runner,
             assets: built.registry,
             sensors: Arc::new(sensor_infos),
+            auth,
         };
         let served = match listener {
             Some(listener) => {
@@ -1478,10 +1479,19 @@ mod tests {
     }
 
     /// serve in a task and read `/api/health` back, by hand: a default build
-    /// has no http client in it, and what is being asserted here is only that
-    /// something answered.
-    async fn health(app: Hestan, addr: SocketAddr) -> String {
+    /// has no http client in it, and what is being asserted here is only who
+    /// got an answer.
+    async fn health(app: Hestan, addr: SocketAddr, token: Option<&str>) -> String {
         let serving = tokio::spawn(app.serve(addr));
+        let request = match token {
+            Some(token) => format!(
+                "GET /api/health HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {token}\r\n\
+                 Connection: close\r\n\r\n"
+            ),
+            None => {
+                "GET /api/health HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n".into()
+            }
+        };
         let mut answered = None;
         for _ in 0..100 {
             // whatever it bound to, the request comes from this machine
@@ -1490,12 +1500,7 @@ mod tests {
                 tokio::time::sleep(Duration::from_millis(20)).await;
                 continue;
             };
-            socket
-                .write_all(
-                    b"GET /api/health HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
-                )
-                .await
-                .unwrap();
+            socket.write_all(request.as_bytes()).await.unwrap();
             let mut said = String::new();
             socket.read_to_string(&mut said).await.unwrap();
             answered = Some(said);
@@ -1533,26 +1538,33 @@ mod tests {
     // nothing configured
     #[tokio::test]
     async fn loopback_serves_with_nothing_configured_at_all() {
-        let said = health(Hestan::new().db(":memory:"), free_port("127.0.0.1")).await;
+        let said = health(Hestan::new().db(":memory:"), free_port("127.0.0.1"), None).await;
         assert!(said.contains("200 OK"), "{said}");
         assert!(said.contains("\"ok\":true"), "{said}");
     }
 
     #[tokio::test]
     async fn an_authenticator_is_what_makes_a_reachable_address_servable() {
-        let addr = free_port("0.0.0.0");
-        let said = health(
-            Hestan::new().db(":memory:").auth(Auth::bearer("s3cret")),
-            addr,
-        )
-        .await;
+        let served = |token| {
+            health(
+                Hestan::new().db(":memory:").auth(Auth::bearer("s3cret")),
+                free_port("0.0.0.0"),
+                token,
+            )
+        };
+        let said = served(Some("s3cret")).await;
         assert!(said.contains("200 OK"), "{said}");
+        // and the same address answers a stranger with a 401 rather than the
+        // deployment
+        let said = served(None).await;
+        assert!(said.contains("401 Unauthorized"), "{said}");
 
-        // the opt-out serves the same address, having said what it is leaning
-        // on — see `auth::guard`, where that sentence is asserted
+        // the opt-out serves everyone, having said what it is leaning on — see
+        // `auth::guard`, where that sentence is asserted
         let said = health(
             Hestan::new().db(":memory:").auth(Auth::None),
             free_port("0.0.0.0"),
+            None,
         )
         .await;
         assert!(said.contains("200 OK"), "{said}");

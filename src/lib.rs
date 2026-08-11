@@ -53,7 +53,7 @@ mod store;
 
 pub use app::Hestan;
 pub use asset::{Asset, AssetCheck, CheckOutcome, CheckResult, MultiAsset};
-pub use auth::Auth;
+pub use auth::{Access, Auth, Identity};
 #[cfg(feature = "capture")]
 pub use capture::{CaptureLayer, capture_layer};
 pub use error::Error;

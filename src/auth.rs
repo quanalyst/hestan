@@ -28,12 +28,162 @@
 //! a refusal rather than a warning because a warning is a line in a log that
 //! scrolled past three deploys ago, and what it would have been warning about
 //! is a stranger's run on your warehouse.
+//!
+//! # The two authenticators
+//!
+//! [`Auth::bearer`] is one token in an `Authorization: Bearer` header, for the
+//! deployment with no identities of its own to lend. [`Auth::custom`] is a
+//! closure over the request, for the host that already knows who its people
+//! are — a header its proxy set, a signature it can check, a table it owns.
+//! one is something to stand up in an afternoon; the other composes hestan
+//! into what you already have rather than running a second scheme beside it.
+//!
+//! # The roles
+//!
+//! | role | may |
+//! | --- | --- |
+//! | [`Access::Viewer`] | read: every `GET` |
+//! | [`Access::Operator`] | that, plus launch, cancel, retry, resume, build, backfill |
+//! | [`Access::Admin`] | that, plus pause, unpause, priority, presets — what changes how the deployment behaves rather than what it is doing now |
+//!
+//! `docs/auth.md` writes that out endpoint by endpoint. the code that enforces
+//! it is derived from the table rather than the table from the code, and
+//! anything the table does not name is a mutation and needs an operator: a
+//! route added tomorrow lands on the rule and not in a hole.
 
 use std::net::{IpAddr, SocketAddr};
+use std::sync::Arc;
 
 use sha2::{Digest, Sha256};
 
 use crate::error::Error;
+
+/// what someone may do, in the order the roles contain each other: an operator
+/// may everything a viewer may, and the whole of every decision in the server
+/// is `identity.role >= needed`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Access {
+    Viewer,
+    Operator,
+    Admin,
+}
+
+impl Access {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Access::Viewer => "viewer",
+            Access::Operator => "operator",
+            Access::Admin => "admin",
+        }
+    }
+}
+
+impl std::fmt::Display for Access {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// who is asking: a name for the audit trail, and a [role](Access) for the
+/// decision.
+///
+/// the name is what the event log records and what the ui shows. it is never a
+/// credential — see [`Auth::bearer`] — and it is never invented: a deployment
+/// with no authenticator records no actor at all rather than a name that means
+/// nothing.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct Identity {
+    pub name: String,
+    pub role: Access,
+}
+
+impl Identity {
+    pub fn new(name: impl Into<String>, role: Access) -> Identity {
+        Identity {
+            name: name.into(),
+            role,
+        }
+    }
+
+    pub fn viewer(name: impl Into<String>) -> Identity {
+        Identity::new(name, Access::Viewer)
+    }
+
+    pub fn operator(name: impl Into<String>) -> Identity {
+        Identity::new(name, Access::Operator)
+    }
+
+    pub fn admin(name: impl Into<String>) -> Identity {
+        Identity::new(name, Access::Admin)
+    }
+}
+
+/// what a [custom authenticator](Auth::custom) is shown: the request, minus
+/// its body.
+///
+/// no body because a credential is not in one, and because reading it here
+/// would consume it before the handler that needs it. everything an
+/// authenticator has to look at is a header, a path or a method.
+pub struct Request<'a> {
+    method: &'a str,
+    path: &'a str,
+    headers: &'a axum::http::HeaderMap,
+}
+
+impl<'a> Request<'a> {
+    pub(crate) fn new(
+        method: &'a str,
+        path: &'a str,
+        headers: &'a axum::http::HeaderMap,
+    ) -> Request<'a> {
+        Request {
+            method,
+            path,
+            headers,
+        }
+    }
+
+    /// the method in capitals: `GET`, `POST`, `PUT`, `DELETE`.
+    pub fn method(&self) -> &str {
+        self.method
+    }
+
+    /// the path, with no query string: `/api/runs/019.../cancel`.
+    pub fn path(&self) -> &str {
+        self.path
+    }
+
+    /// one header by name, case-insensitively, or `None` when it is absent or
+    /// is not valid utf-8.
+    pub fn header(&self, name: &str) -> Option<&str> {
+        self.headers.get(name)?.to_str().ok()
+    }
+
+    /// the token from `Authorization: Bearer <token>`, for an authenticator
+    /// that looks one up rather than being handed the identity.
+    ///
+    /// compare it with [`secret_eq`], not with `==`.
+    pub fn bearer(&self) -> Option<&str> {
+        let value = self.header("authorization")?;
+        let (scheme, token) = value.split_once(' ')?;
+        scheme
+            .eq_ignore_ascii_case("bearer")
+            .then_some(token.trim())
+    }
+}
+
+/// a host's own check, from [`Auth::custom`].
+#[derive(Clone)]
+pub struct Check(Checker);
+
+type Checker = Arc<dyn Fn(&Request<'_>) -> Option<Identity> + Send + Sync>;
+
+impl std::fmt::Debug for Check {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Check(…)")
+    }
+}
 
 /// one token, kept as its digest.
 ///
@@ -77,10 +227,13 @@ pub enum Auth {
     None,
     /// one token, from [`Auth::bearer`].
     Bearer(Token),
+    /// a host's own check, from [`Auth::custom`].
+    Custom(Check),
 }
 
 impl Auth {
-    /// one shared token, presented as `Authorization: Bearer <token>`.
+    /// one shared token, presented as `Authorization: Bearer <token>`, and it
+    /// is an [admin](Access::Admin) token.
     ///
     /// ```no_run
     /// # use hestan::{Auth, Hestan};
@@ -95,8 +248,75 @@ impl Auth {
     /// never logs it, never puts it in an event, an error or a response body,
     /// and never sends it to the ui: the only copies anywhere are the one you
     /// configured and the one whoever is asking presents.
+    ///
+    /// one token is one identity, named `bearer`, and everyone holding it is
+    /// that identity — which is why the audit trail says "somebody with the
+    /// token" rather than a person's name. [`custom`](Auth::custom) is where
+    /// names and read-only roles come from; hestan has no user store and is
+    /// not going to grow one.
     pub fn bearer(token: impl AsRef<str>) -> Auth {
         Auth::Bearer(Token(digest(token.as_ref())))
+    }
+
+    /// hestan's decision, from the host's own check.
+    ///
+    /// the closure sees each request's method, path and headers and answers
+    /// with an [`Identity`] or `None`, which is a 401. this is how a
+    /// deployment that already authenticates composes hestan into what it has:
+    ///
+    /// ```no_run
+    /// # use hestan::{Access, Auth, Hestan, Identity};
+    /// # fn f(app: Hestan) -> Hestan {
+    /// app.auth(Auth::custom(|req| {
+    ///     // whatever the thing in front of this promises it has checked
+    ///     let user = req.header("x-forwarded-user")?;
+    ///     let role = match req.header("x-forwarded-groups").unwrap_or_default() {
+    ///         groups if groups.contains("ops") => Access::Admin,
+    ///         _ => Access::Viewer,
+    ///     };
+    ///     Some(Identity::new(user, role))
+    /// }))
+    /// # }
+    /// ```
+    ///
+    /// it runs on the request path, so it must not block — a lookup that costs
+    /// a network round trip belongs in the thing in front of hestan, where its
+    /// answer is already being taken. and if it compares a secret of its own,
+    /// compare it with [`secret_eq`].
+    pub fn custom(f: impl Fn(&Request<'_>) -> Option<Identity> + Send + Sync + 'static) -> Auth {
+        Auth::Custom(Check(Arc::new(f)))
+    }
+
+    /// who this request is, or `None` for nobody this deployment knows.
+    ///
+    /// [`Auth::None`] is nobody too: an assertion that something else checked
+    /// is not an identity, and inventing one here is what would put a name
+    /// that means nothing on every event in the log.
+    pub(crate) fn identify(&self, req: &Request<'_>) -> Option<Identity> {
+        match self {
+            Auth::None => None,
+            Auth::Bearer(token) => {
+                let presented = req.bearer()?;
+                token.matches(presented).then(|| Identity::admin("bearer"))
+            }
+            Auth::Custom(check) => (check.0)(req),
+        }
+    }
+
+    /// whether this checks anything at all. [`Auth::None`] does not, and every
+    /// request under it is served with no identity — the same as a deployment
+    /// that configured nothing and is therefore on loopback.
+    pub(crate) fn checks(&self) -> bool {
+        !matches!(self, Auth::None)
+    }
+
+    /// what a 401 from this one offers, for the `WWW-Authenticate` header.
+    ///
+    /// `None` for a custom authenticator: it knows what it reads and hestan
+    /// does not, and naming a scheme it is not using would be a lie in a
+    /// header clients act on.
+    pub(crate) fn challenge(&self) -> Option<&'static str> {
+        matches!(self, Auth::Bearer(_)).then_some("Bearer")
     }
 }
 
@@ -168,9 +388,20 @@ pub(crate) fn guard(addr: SocketAddr, auth: Option<&Auth>) -> Result<Option<Stri
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::http::HeaderMap;
 
     fn addr(s: &str) -> SocketAddr {
         s.parse().unwrap()
+    }
+
+    fn identify(auth: &Auth, headers: &HeaderMap) -> Option<Identity> {
+        auth.identify(&Request::new("GET", "/api/runs", headers))
+    }
+
+    fn bearer_header(token: &str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", format!("Bearer {token}").parse().unwrap());
+        headers
     }
 
     #[test]
@@ -251,6 +482,68 @@ mod tests {
         assert!(!token.matches("s3cre"));
         assert!(!token.matches("s3cret "));
         assert!(!token.matches(""));
+    }
+
+    #[test]
+    fn a_bearer_token_is_the_only_thing_that_identifies_as_one() {
+        let auth = Auth::bearer("s3cret");
+        assert_eq!(
+            identify(&auth, &bearer_header("s3cret")),
+            Some(Identity::admin("bearer"))
+        );
+        // a wrong token, a prefix of the right one, and no header at all are
+        // one answer: nobody
+        assert_eq!(identify(&auth, &bearer_header("s3crft")), None);
+        assert_eq!(identify(&auth, &bearer_header("s3cre")), None);
+        assert_eq!(identify(&auth, &bearer_header("")), None);
+        assert_eq!(identify(&auth, &HeaderMap::new()), None);
+
+        // the scheme word is case-insensitive; the token is not
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", "bearer s3cret".parse().unwrap());
+        assert!(identify(&auth, &headers).is_some());
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", "Bearer S3CRET".parse().unwrap());
+        assert!(identify(&auth, &headers).is_none());
+    }
+
+    #[test]
+    fn a_custom_authenticator_names_who_it_recognized() {
+        let auth = Auth::custom(|req| match req.header("x-user")? {
+            "ada" => Some(Identity::admin("ada")),
+            "bob" => Some(Identity::viewer("bob")),
+            _ => None,
+        });
+        let named = |who: &str| {
+            let mut headers = HeaderMap::new();
+            headers.insert("x-user", who.parse().unwrap());
+            identify(&auth, &headers)
+        };
+        assert_eq!(named("ada").unwrap().role, Access::Admin);
+        assert_eq!(named("bob").unwrap().name, "bob");
+        assert_eq!(named("nobody"), None);
+        assert_eq!(identify(&auth, &HeaderMap::new()), None);
+        // and it is asked nothing about a scheme it is not using
+        assert_eq!(auth.challenge(), None);
+        assert_eq!(Auth::bearer("s3cret").challenge(), Some("Bearer"));
+    }
+
+    // the opt-out identifies nobody rather than inventing somebody, which is
+    // what keeps a made-up name off every event in an unauthenticated log
+    #[test]
+    fn the_opt_out_identifies_nobody_and_checks_nothing() {
+        assert_eq!(identify(&Auth::None, &bearer_header("s3cret")), None);
+        assert!(!Auth::None.checks());
+        assert!(Auth::bearer("s3cret").checks());
+    }
+
+    // the roles contain each other, and every decision in the server is this
+    // comparison
+    #[test]
+    fn a_role_may_whatever_the_ones_below_it_may() {
+        assert!(Access::Admin > Access::Operator);
+        assert!(Access::Operator > Access::Viewer);
+        assert!(Access::Viewer >= Access::Viewer);
     }
 
     #[test]

@@ -139,3 +139,9 @@ harness = false
 name = "cli"
 harness = false
 required-features = ["cli"]
+
+# a token and every place it must not be: this binary is both the deployment
+# under test and the thing driving it, so it needs a `main` of its own
+[[test]]
+name = "auth"
+harness = false
