@@ -32,9 +32,8 @@ cancellation all mean what they meant.
 
 ## Per op, not per job
 
-the comparison is dagster's multiprocess executor, which is chosen for a whole
-job: every step pays a python interpreter start and a re-import of your code,
-whether or not that step was ever going to crash.
+the usual shape is an executor chosen for a whole job: every step pays a fresh
+process and a reload of your code, whether or not it was ever going to crash.
 
 isolation here is a property of the op. one risky parser is contained while
 the other forty ops in the same job stay in-process and free. that is possible

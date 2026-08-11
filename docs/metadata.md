@@ -67,8 +67,8 @@ units (kB, MB, GB, TB), the way storage and warehouses quote them.
 
 ### Links hestan can follow
 
-`RunRef` and `AssetRef` take an id and a name, not a url. Dagster needs a url
-here because it cannot know where its own pages are; hestan is the ui, so an
+`RunRef` and `AssetRef` take an id and a name, not a url. a url would mean
+knowing from inside an op where the ui is served; hestan is the ui, so an
 op that says `Meta::run_ref(id)` gets a working link to that run and
 `Meta::asset_ref(name)` opens that asset's panel. Neither is validated — a
 reference to a run that has since been swept is a link to a 404, which is

@@ -13,9 +13,9 @@ drop all of it, which meant every op that calls a real library was half
 invisible: the run log said "attempt 1 failed", and the reason was on a
 terminal nobody was watching.
 
-dagster solves this by scraping a step's stdout and stderr into a text blob.
-hestan does something better in one case and refuses to do something worse in
-the other, and the split is the whole design:
+the obvious answer is to scrape a step's stdout and stderr into a text blob.
+hestan does better than that in one case and refuses to do worse in the other,
+and the split is the whole design:
 
 | the op                                  | what is captured                              | how                                     |
 | --------------------------------------- | --------------------------------------------- | --------------------------------------- |

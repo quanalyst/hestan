@@ -144,8 +144,8 @@ pub enum Meta {
     Count(u64),
     /// a filesystem path, rendered monospace with the basename emphasised.
     Path(String),
-    /// another run of this deployment, by id, rendered as a link to it. dagster
-    /// needs a url here; hestan knows its own graph.
+    /// another run of this deployment, by id, rendered as a link to it. no url
+    /// is needed; hestan knows its own graph.
     RunRef(String),
     /// an asset of this deployment, by name, rendered as a link to it.
     AssetRef(String),

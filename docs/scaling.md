@@ -7,7 +7,7 @@ execution paths — which is why there is no kubernetes executor here, and no
 docker executor, and no celery integration.
 
 Read [what this does not do](#what-this-does-not-do) first if you are sizing
-hestan against dagster. the limits are real and stated rather than papered
+hestan for a deployment. the limits are real and stated rather than papered
 over.
 
 ## The queue
@@ -257,8 +257,8 @@ operate for nothing.
 ## What this does not do
 
 **There is no kubernetes executor and no celery integration, and this page is
-not going to imply otherwise.** Dagster ships three executors because it grew
-three ways to move work off-box. Hestan ships one, and a pod running
+not going to imply otherwise.** hestan ships one mechanism for moving work
+off-box rather than several, and a pod running
 `HESTAN_ROLE=worker` against a shared postgres is what "the kubernetes
 executor" would have been — that is the mechanism, and there is no operator, no
 pod template and no autoscaler around it. Celery has no Rust analogue worth

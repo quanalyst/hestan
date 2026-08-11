@@ -2,11 +2,11 @@
 
 [![ci](https://img.shields.io/github/actions/workflow/status/quanalyst/hestan/ci.yml?branch=main&label=ci)](https://github.com/quanalyst/hestan/actions/workflows/ci.yml) [![crates.io](https://img.shields.io/crates/v/hestan.svg)](https://crates.io/crates/hestan) [![docs.rs](https://img.shields.io/docsrs/hestan)](https://docs.rs/hestan)
 
-dag-based job orchestration for rust — think dagster's core loop: ops, jobs,
-schedules, a run log, and a small web ui. it is a library, not a service: the
-jobs are async rust in your own binary and the run log is a sqlite file next
-to it, so there is nothing to deploy alongside it — or a postgres database,
-when the workers have to live on more than one machine.
+dag-based job orchestration for rust: ops, jobs, schedules, a run log, and a
+small web ui. it is a library, not a service: the jobs are async rust in your
+own binary and the run log is a sqlite file next to it, so there is nothing to
+deploy alongside it — or a postgres database, when the workers have to live on
+more than one machine.
 
 ## Alpha
 
