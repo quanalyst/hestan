@@ -228,6 +228,15 @@ impl std::fmt::Debug for Token {
 
 /// what checks who is asking.
 ///
+/// ```no_run
+/// # use hestan::{Auth, Hestan};
+/// # async fn f(app: Hestan) -> Result<(), hestan::Error> {
+/// app.auth(Auth::bearer(std::env::var("HESTAN_TOKEN").expect("a token")))
+///     .serve(([0, 0, 0, 0], 4000))
+///     .await
+/// # }
+/// ```
+///
 /// there is no default variant: a deployment either configures one of these or
 /// serves loopback only. see the [module docs](crate::auth).
 #[derive(Debug, Clone)]

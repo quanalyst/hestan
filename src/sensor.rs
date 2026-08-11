@@ -89,6 +89,37 @@ type SensorFn = dyn Fn(
 /// a polling closure evaluated on an interval: it inspects the world (a
 /// directory, a queue, an api) and returns the runs to launch — usually none.
 /// register with `Hestan::sensor`; `serve` runs the loop.
+///
+/// ```no_run
+/// # use hestan::{Hestan, RunRequest, Sensor, SensorCtx};
+/// # use serde_json::json;
+/// # use std::time::Duration;
+/// # async fn f(dir: std::path::PathBuf) -> Result<(), hestan::Error> {
+/// let drop_box = Sensor::new("drop_box", Duration::from_secs(30), move |ctx: SensorCtx| {
+///     let dir = dir.clone();
+///     async move {
+///         let seen: Vec<String> = ctx.cursor_as()?.unwrap_or_default();
+///         let mut launches = Vec::new();
+///         for entry in std::fs::read_dir(&dir)? {
+///             let name = entry?.file_name().to_string_lossy().into_owned();
+///             if !seen.contains(&name) {
+///                 launches.push(RunRequest::new("ingest")
+///                     .params(json!({ "file": name.clone() }))
+///                     .key(name));
+///             }
+///         }
+///         Ok(launches)
+///     }
+/// });
+///
+/// Hestan::new().sensor(drop_box).serve(([127, 0, 0, 1], 4000)).await
+/// # }
+/// ```
+///
+/// the [run key](RunRequest::key) is what makes that safe to write naively:
+/// a request whose key has already been claimed does not launch, so a
+/// closure that forgets to move its cursor repeats itself harmlessly instead
+/// of ingesting the same file every thirty seconds.
 pub struct Sensor {
     name: String,
     every: Duration,

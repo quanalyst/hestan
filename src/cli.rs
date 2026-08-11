@@ -464,6 +464,19 @@ struct ServeArgs {
 /// one for the other gains a command line and changes nothing else, which is
 /// the only way a mount like this is worth having.
 ///
+/// ```no_run
+/// # use hestan::{Hestan, Job};
+/// #[tokio::main]
+/// async fn main() -> Result<(), hestan::Error> {
+/// #   let nightly = Job::builder("nightly").build()?;
+///     let app = Hestan::new().job(nightly).schedule("nightly", "0 3 * * *");
+///     hestan::cli::run(app, ([127, 0, 0, 1], 4000)).await
+/// }
+/// ```
+///
+/// that binary serves with no arguments, and answers `runs`, `logs`, `launch`,
+/// `doctor` and the rest with the registry it already holds.
+///
 /// anything that is not a success exits the process with the code its
 /// [table](Exit) documents, after one line on stderr saying what happened.
 /// that is why the `Ok` case here is only ever a success: a return value cannot

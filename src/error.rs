@@ -109,6 +109,7 @@ pub enum Error {
     /// error's source chain, and a message that dropped them would say
     /// nothing at all.
     #[cfg(feature = "postgres")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "postgres")))]
     #[error("storage: {}", chain(.0))]
     Postgres(#[from] tokio_postgres::Error),
     /// a column that could not be read as what it holds: json that does not

@@ -546,6 +546,26 @@ pub enum InputError {
 }
 
 /// a named unit of work: an async fn plus the upstream ops it waits on.
+///
+/// ```
+/// # use hestan::{Op, OpCtx};
+/// # use serde_json::json;
+/// # use std::time::Duration;
+/// Op::new("load", |ctx: OpCtx| async move {
+///     let rows = ctx.input("fetch").and_then(|v| v["rows"].as_i64()).unwrap_or(0);
+///     ctx.meta("rows", rows);
+///     Ok(json!({ "loaded": rows }))
+/// })
+/// .after(["fetch"])
+/// .retries(3)
+/// .timeout(Duration::from_secs(60));
+/// ```
+///
+/// everything past the body is a policy about *this* op: what it waits on,
+/// how many attempts it gets, how long one may take, whether it runs in a
+/// child process. all of it is declaration — an op cannot decide at run time
+/// to have more retries — which is what makes a job's behaviour readable from
+/// its definition rather than from a log.
 #[derive(Clone)]
 pub struct Op {
     name: String,
@@ -842,13 +862,23 @@ impl Op {
     /// params.
     ///
     /// hestan takes no schemars dependency; the value is whatever you hand it,
-    /// and `schemars::schema_for!(P)` produces exactly this in one line:
+    /// so a schema written out by hand is as good as a derived one:
     ///
-    /// ```ignore
-    /// Op::new("fetch", body)
-    ///     .params::<Fetch>()
-    ///     .params_schema(serde_json::to_value(schemars::schema_for!(Fetch))?)
     /// ```
+    /// # use hestan::{Op, OpCtx};
+    /// # use serde_json::json;
+    /// # #[derive(serde::Deserialize)]
+    /// # struct Fetch { day: String }
+    /// Op::new("fetch", |_: OpCtx| async { Ok(json!(null)) })
+    ///     .params::<Fetch>()
+    ///     .params_schema(json!({
+    ///         "properties": { "day": { "type": "string" } },
+    ///         "required": ["day"],
+    ///     }));
+    /// ```
+    ///
+    /// `serde_json::to_value(schemars::schema_for!(Fetch))` produces the same
+    /// thing without writing it out, for a crate that already has schemars.
     ///
     /// only `properties`, `required` and `$defs`/`definitions` are read, to
     /// merge every op's schema into one for the job — see

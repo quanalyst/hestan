@@ -11,6 +11,30 @@ use crate::op::Op;
 use crate::retention::Retention;
 
 /// a validated dag of ops, built via [`Job::builder`].
+///
+/// ```
+/// # use hestan::{Job, Op, OpCtx};
+/// # use serde_json::json;
+/// # fn main() -> Result<(), hestan::Error> {
+/// let job = Job::builder("orders")
+///     .description("pull yesterday's orders and load them")
+///     .op(Op::new("fetch", |_| async { Ok(json!({ "rows": 3 })) }).retries(2))
+///     .op(Op::new("load", |ctx: OpCtx| async move {
+///         Ok(ctx.input("fetch").cloned().unwrap_or(json!(null)))
+///     })
+///     .after(["fetch"]))
+///     .build()?;
+///
+/// assert_eq!(job.ops().len(), 2);
+/// # Ok(())
+/// # }
+/// ```
+///
+/// the dag is checked once, here: a cycle, a dep on a name no op has, or two
+/// ops sharing a name is [`Error::Graph`](crate::Error::Graph) from
+/// [`build`](JobBuilder::build) and never a run that gets halfway. after that
+/// a `Job` is immutable and cheap to clone, which is what lets the same one be
+/// registered, executed and read back concurrently.
 #[derive(Clone, Debug)]
 pub struct Job {
     name: String,

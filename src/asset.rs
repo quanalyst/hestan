@@ -34,6 +34,30 @@ pub(crate) type ProbeFn = dyn Fn() -> BoxFuture<'static, Result<String, Box<dyn 
 /// and deps; source assets ([`Asset::source`]) stand for external data and
 /// carry only a cheap [`probe`](Asset::probe) that fingerprints it. register
 /// with `Hestan::assets`.
+///
+/// ```no_run
+/// # use hestan::{Asset, Hestan, OpCtx};
+/// # use serde_json::json;
+/// # async fn f() -> Result<(), hestan::Error> {
+/// let orders = Asset::source("orders")
+///     .probe(|| async { Ok("2026-08-11T03:00:00Z".to_string()) });
+///
+/// let daily = Asset::new("daily_revenue", |ctx: OpCtx| async move {
+///     let raw = ctx.input("orders").cloned().unwrap_or(json!(null));
+///     Ok(json!({ "total": raw["total"].as_f64().unwrap_or(0.0) }))
+/// })
+/// .from(&orders)
+/// .auto();
+///
+/// Hestan::new().assets([orders, daily]).serve(([127, 0, 0, 1], 4000)).await
+/// # }
+/// ```
+///
+/// nothing above says when anything runs. that is the difference from a
+/// [`Job`](crate::Job): an asset declares what it is made of, and
+/// [`auto`](Asset::auto) lets hestan rebuild it when what it is made of
+/// changes. `docs/choosing.md` is about which of the two a given piece of
+/// work wants.
 pub struct Asset {
     name: String,
     source: bool,

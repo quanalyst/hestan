@@ -1,6 +1,65 @@
 //! dag-based job orchestration: ops wired into jobs, cron schedules, assets and
 //! sensors, a run log on sqlite or postgres, and an embedded web ui.
+//!
+//! ```no_run
+//! use hestan::prelude::*;
+//!
+//! # async fn main_() -> Result<(), hestan::Error> {
+//! let nightly = Job::builder("nightly")
+//!     .op(Op::new("extract", |_| async { Ok(json!({ "rows": 12 })) }))
+//!     .op(Op::new("load", |ctx: OpCtx| async move {
+//!         let rows = ctx.input("extract").unwrap()["rows"].clone();
+//!         ctx.meta("rows", rows.as_i64().unwrap_or(0));
+//!         Ok(json!(null))
+//!     })
+//!     .after(["extract"]))
+//!     .build()?;
+//!
+//! Hestan::new()
+//!     .job(nightly)
+//!     .schedule("nightly", "0 3 * * *")
+//!     .serve(([127, 0, 0, 1], 4000))
+//!     .await
+//! # }
+//! ```
+//!
+//! that is a deployment. `serve` opens `hestan.db`, runs the scheduler, and
+//! puts the ui on <http://127.0.0.1:4000> — every run, every op, the logs each
+//! one produced, and a button to launch one by hand. nothing else has to be
+//! installed and there is no separate daemon: this is your binary.
+//!
+//! # Where to go next
+//!
+//! - [`Op`] is a unit of work and [`Job`] wires ops into a dag. that is the
+//!   whole of the core model.
+//! - [`Asset`] is the other way of describing the same work — by what it
+//!   *produces* rather than by what runs. `docs/choosing.md` is about picking
+//!   between the two, and between the other pairs that look alike.
+//! - [`Schedule`] fires a job on a cron expression; [`Sensor`] fires one when
+//!   something it polls says to.
+//! - [`Hestan`] is the registry everything is declared on, and `serve` is what
+//!   starts it.
+//! - [`Store`] is the run log, readable on its own — a report, an export, a
+//!   test that asserts what a run did.
+//!
+//! # Features
+//!
+//! everything below is off by default, and each one is a dependency somebody
+//! should get to decline. `docs.rs` shows them all.
+//!
+//! | feature | what it adds |
+//! | --- | --- |
+//! | `postgres` | `Store::connect`, for a run log several processes share |
+//! | `cli` | `hestan::cli::run`, a command line in your own binary |
+//! | `capture` | `hestan::capture_layer`, storing the `tracing` events ops emit |
+//! | `otel` | `hestan::otel`, a run as a distributed trace |
+//! | `http` | `hestan::HttpSource`, pulling a rest api on a schedule, and `hestan::notify` |
+//! | `bundled` | **on** by default: compiles sqlite from source rather than linking the system one |
 
+// `doc(cfg(..))` puts "available on crate feature x" on the items that need
+// one. it is a nightly attribute, so it is behind a cfg only docs.rs sets —
+// which leaves a stable `cargo doc` building exactly as it did
+#![cfg_attr(docsrs, feature(doc_cfg))]
 // a public item with no rustdoc is a gap nothing reports: the build stays
 // green, the docs page grows a bare signature, and the number only ever goes
 // up. so it is an error, under every feature combination — a feature-gated
@@ -22,11 +81,13 @@ mod backoff;
 // so that what it deliberately does not capture is written somewhere a reader
 // lands on, rather than in a private module rustdoc never renders
 #[cfg(feature = "capture")]
+#[cfg_attr(docsrs, doc(cfg(feature = "capture")))]
 pub mod capture;
 // the command line this binary already knows everything to serve. optional
 // because it is a dependency on an argument parser, and because owning argv is
 // something a host asks for rather than something a library takes
 #[cfg(feature = "cli")]
+#[cfg_attr(docsrs, doc(cfg(feature = "cli")))]
 pub mod cli;
 mod error;
 mod executor;
@@ -44,11 +105,13 @@ mod job;
 mod logs;
 mod model;
 #[cfg(feature = "http")]
+#[cfg_attr(docsrs, doc(cfg(feature = "http")))]
 pub mod notify;
 mod op;
 // a run as a distributed trace. optional because it is a dependency on the
 // opentelemetry crates, and off because hestan installs no exporter
 #[cfg(feature = "otel")]
+#[cfg_attr(docsrs, doc(cfg(feature = "otel")))]
 pub mod otel;
 mod partition;
 // a shared run log on a postgres server. optional because sqlite is the right
@@ -66,12 +129,14 @@ pub use app::Hestan;
 pub use asset::{Asset, AssetCheck, CheckOutcome, CheckResult, MultiAsset};
 pub use auth::{Access, Auth, Identity};
 #[cfg(feature = "capture")]
+#[cfg_attr(docsrs, doc(cfg(feature = "capture")))]
 pub use capture::{CaptureLayer, capture_layer};
 pub use error::Error;
 pub use executor::{Blocked, CancelOutcome, Limits, Queued, ResumePlan, Runner};
 pub use freshness::{LateEvent, LateHook, LateKind};
 pub use hooks::{FailureHook, OpEvent, OpHook, RunEvent, RunFailure, RunHook};
 #[cfg(feature = "http")]
+#[cfg_attr(docsrs, doc(cfg(feature = "http")))]
 pub use http::HttpSource;
 pub use io::{FileIo, Inline, IoKey, IoManager, IoResult};
 pub use job::{Graph, GraphBuilder, Job, JobBuilder};

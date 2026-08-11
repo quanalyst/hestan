@@ -1084,6 +1084,23 @@ fn parse_json(idx: usize, text: &str) -> Result<Value, Error> {
 /// run history on sqlite or postgres. cheap to clone; safe to share across
 /// tasks.
 ///
+/// ```no_run
+/// # use hestan::Store;
+/// # fn f() -> Result<(), hestan::Error> {
+/// let store = Store::open("hestan.db")?;
+/// for run in store.runs(Some("nightly"), None, None, None, None, 20)? {
+///     println!("{} {} {}", run.id, run.status, run.created_at);
+/// }
+/// # Ok(())
+/// # }
+/// ```
+///
+/// nothing above needs a server, a registry or a running deployment: the run
+/// log is a database and this is a reader for it. that is what a report, an
+/// export, or a test asserting what a run actually did is written against.
+/// opening it does migrate the schema, so point it at a copy if that is not
+/// wanted.
+///
 /// the second field is the target it was opened at — a path or a url — kept so
 /// a runner can tell whether a child process could reach the same database.
 #[derive(Clone)]
@@ -1110,6 +1127,7 @@ impl Store {
     /// there is nothing for the sqlite chain's sixteen steps to migrate and
     /// walking them would only be a re-enactment.
     #[cfg(feature = "postgres")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "postgres")))]
     pub fn connect(url: &str) -> Result<Store, Error> {
         let client = crate::pg::open(url)?;
         Ok(Store(

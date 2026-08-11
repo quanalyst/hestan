@@ -10,8 +10,13 @@ keywords = ["orchestration", "scheduler", "dag", "pipeline", "cron"]
 categories = ["asynchronous", "development-tools", "web-programming::http-server"]
 repository = "https://github.com/quanalyst/hestan"
 
+# docs.rs builds with every feature on, so the postgres store, the cli, the
+# capture layer, the otel bridge and the http source are all on the page —
+# and `--cfg docsrs` is what makes each of them carry the feature it needs.
+# nothing else sets that cfg, so an ordinary `cargo doc` is unaffected
 [package.metadata.docs.rs]
 all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
 
 [dependencies]
 axum = "0.8"

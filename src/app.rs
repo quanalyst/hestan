@@ -31,6 +31,27 @@ const DEFAULT_ASSET_HISTORY: usize = 200;
 
 /// entry point: collect jobs, assets, sensors and schedules, then `serve` the ui
 /// or `run_once` headless.
+///
+/// ```no_run
+/// # use hestan::{Hestan, Job, Op, Retention};
+/// # use serde_json::json;
+/// # async fn f(nightly: Job) -> Result<(), hestan::Error> {
+/// Hestan::new()
+///     .job(nightly)
+///     .schedule("nightly", "0 3 * * *")
+///     .db("var/hestan.db")
+///     .retention(Retention::days(30).keep_last(50))
+///     .serve(([127, 0, 0, 1], 4000))
+///     .await
+/// # }
+/// ```
+///
+/// nothing here opens a file, resolves a name or validates a dag: the whole
+/// builder is inert until one of [`serve`](Hestan::serve),
+/// [`run_once`](Hestan::run_once) or [`build_asset`](Hestan::build_asset) is
+/// called, which is where a bad cron expression or a cycle is reported. so
+/// a registry can be assembled in pieces, by several modules, and handed
+/// around before anyone decides what to do with it.
 pub struct Hestan {
     jobs: Vec<Job>,
     schedules: Vec<Schedule>,
@@ -466,6 +487,7 @@ impl Hestan {
     /// register an http source: build lowers it into a job named after the
     /// source, plus a schedule if `cron` was set.
     #[cfg(feature = "http")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "http")))]
     pub fn source(mut self, src: crate::http::HttpSource) -> Self {
         self.sources.push(src);
         self
