@@ -55,7 +55,8 @@ pub use model::{
     AssetCheckRow, Backfill, BackfillStatus, Catchup, CheckStatus, DeliveryState, Event, EventKind,
     EventLevel, Freshness, FreshnessRow, HistoryEntry, LogStream, Materialization, MetaPoint,
     Notification, OpLog, OpRun, OpStatus, Overlap, Preset, Reclaim, Role, Run, RunStatus, RunTags,
-    ScheduleRow, SensorOutcome, SensorRow, SensorTick, Severity, Tick, TickOutcome, Trigger, When,
+    ScheduleRow, SensorOutcome, SensorRow, SensorTick, Severity, SubjectKind, Tick, TickOutcome,
+    Trigger, When,
 };
 pub use op::{InputError, META_TABLE_ROWS, Meta, MetaColumn, MetaTable, Op, OpCtx, OpResult};
 pub use partition::Partitions;
@@ -63,7 +64,7 @@ pub use resource::ResourceCtx;
 pub use retention::Retention;
 pub use schedule::Schedule;
 pub use sensor::{RunRequest, RunStatusSensor, RunSummary, Sensor, SensorCtx};
-pub use store::Store;
+pub use store::{EventQuery, Store};
 
 pub mod prelude {
     pub use crate::{

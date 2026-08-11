@@ -17,7 +17,18 @@ const event = (
   level: EventLevel,
   kind: EventKind,
   message: string,
-): RunEvent => ({ seq, run_id: "r1", op, level, kind, message, data: null, ts });
+): RunEvent => ({
+  seq,
+  run_id: "r1",
+  subject_kind: "run",
+  subject: null,
+  op,
+  level,
+  kind,
+  message,
+  data: null,
+  ts,
+});
 
 const printed = (
   id: number,

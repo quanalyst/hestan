@@ -93,14 +93,55 @@ pub enum EventLevel {
 }
 str_enum!(EventLevel { Info => "info", Warn => "warn", Error => "error" });
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+/// what an [`Event`] is about: which of hestan's tables the thing that happened
+/// lives in.
+///
+/// the log described runs and nothing else until v17, so every event written
+/// before it reads as [`Run`](SubjectKind::Run) — which is what those events
+/// were.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum SubjectKind {
+    /// one run, named by [`Event::run_id`] rather than by `subject`.
+    Run,
+    /// one job, by name: what retention pruned, and nothing else so far.
+    Job,
+    /// one asset, by name; the partition, if it has one, is in the payload.
+    Asset,
+    /// one schedule, by the job it fires.
+    Schedule,
+    /// one sensor, by name.
+    Sensor,
+    /// one backfill, by id.
+    Backfill,
+    /// hestan itself: a notification's delivery, which belongs to no one job.
+    System,
+    /// a kind written by a build newer than this one. carried through rather
+    /// than refused — see [`EventKind::Unknown`].
+    Unknown(String),
+}
+
+/// what happened. one variant per thing hestan does, and
+/// [`Unknown`](EventKind::Unknown) for what a later one will.
+///
+/// the run kinds are the eight this log started with. the rest were added in
+/// v17 and are written by the subsystem that does the work, in the transaction
+/// that does it — `docs/events.md` has the table, and says which of them cannot
+/// be atomic and what the window is.
+///
+/// **not a closed set.** a kind this build does not know reads as
+/// [`Unknown`](EventKind::Unknown) carrying the stored word, because the
+/// alternative — a parse error — is one row from a newer writer breaking every
+/// query that would have read the rows around it. the same reason
+/// [`Meta::from_tagged`](crate::Meta::from_tagged) tolerates an unknown tag.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum EventKind {
     RunQueued,
     RunStarted,
     RunSuccess,
     RunFailed,
     RunCanceled,
+    /// a claim expired and the run was taken back from whoever held it.
+    RunReclaimed,
     OpStarted,
     OpExpanded,
     OpRetry,
@@ -109,14 +150,97 @@ pub enum EventKind {
     OpSkipped,
     OpCanceled,
     TypeCheckFailed,
+    /// an asset (or one partition of one) was built and recorded.
+    AssetMaterialized,
+    CheckPassed,
+    CheckFailed,
+    /// a schedule came due and launched a run.
+    ScheduleFired,
+    /// a schedule fired for an occurrence that came due while nothing was
+    /// running to fire it.
+    ScheduleCaughtUp,
+    /// an occurrence was accounted for without firing: an overlap policy, a
+    /// catch-up cap, or a declaration that has since gone.
+    ScheduleSkipped,
+    /// an occurrence held back until the job is free, and still waiting.
+    ScheduleDeferred,
+    /// an occurrence came due and the launch failed.
+    ScheduleError,
+    /// one sensor evaluation, however it ended.
+    SensorTick,
+    BackfillStarted,
+    /// one chunk of a backfill was launched.
+    BackfillChunk,
+    BackfillFinished,
+    BackfillCanceled,
+    NotificationDelivered,
+    /// a notification hestan has stopped trying to deliver.
+    NotificationFailed,
+    /// what one job's [retention policy](crate::Retention) deleted.
+    RetentionPruned,
     Log,
+    /// a kind written by a build newer than this one, carrying its word.
+    Unknown(String),
 }
-str_enum!(EventKind {
+
+/// the `as_str`/`FromStr`/`Display`/serde set that [`str_enum!`] generates,
+/// for the two enums that also have an `Unknown` arm: a parse that cannot fail
+/// and an `as_str` that borrows from `self` rather than from `'static`.
+macro_rules! open_enum {
+    ($ty:ident { $($variant:ident => $s:literal),+ $(,)? }) => {
+        impl $ty {
+            pub fn as_str(&self) -> &str {
+                match self {
+                    $(Self::$variant => $s,)+
+                    Self::Unknown(s) => s,
+                }
+            }
+        }
+        impl std::str::FromStr for $ty {
+            type Err = std::convert::Infallible;
+            fn from_str(s: &str) -> Result<Self, Self::Err> {
+                Ok(match s {
+                    $($s => Self::$variant,)+
+                    other => Self::Unknown(other.to_string()),
+                })
+            }
+        }
+        impl std::fmt::Display for $ty {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str(self.as_str())
+            }
+        }
+        impl Serialize for $ty {
+            fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+                s.serialize_str(self.as_str())
+            }
+        }
+        impl<'de> Deserialize<'de> for $ty {
+            fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+                let s = String::deserialize(d)?;
+                Ok(s.parse().unwrap_or_else(|e| match e {}))
+            }
+        }
+    };
+}
+
+open_enum!(SubjectKind {
+    Run => "run",
+    Job => "job",
+    Asset => "asset",
+    Schedule => "schedule",
+    Sensor => "sensor",
+    Backfill => "backfill",
+    System => "system",
+});
+
+open_enum!(EventKind {
     RunQueued => "run_queued",
     RunStarted => "run_started",
     RunSuccess => "run_success",
     RunFailed => "run_failed",
     RunCanceled => "run_canceled",
+    RunReclaimed => "run_reclaimed",
     OpStarted => "op_started",
     OpExpanded => "op_expanded",
     OpRetry => "op_retry",
@@ -125,6 +249,22 @@ str_enum!(EventKind {
     OpSkipped => "op_skipped",
     OpCanceled => "op_canceled",
     TypeCheckFailed => "type_check_failed",
+    AssetMaterialized => "asset_materialized",
+    CheckPassed => "check_passed",
+    CheckFailed => "check_failed",
+    ScheduleFired => "schedule_fired",
+    ScheduleCaughtUp => "schedule_caught_up",
+    ScheduleSkipped => "schedule_skipped",
+    ScheduleDeferred => "schedule_deferred",
+    ScheduleError => "schedule_error",
+    SensorTick => "sensor_tick",
+    BackfillStarted => "backfill_started",
+    BackfillChunk => "backfill_chunk",
+    BackfillFinished => "backfill_finished",
+    BackfillCanceled => "backfill_canceled",
+    NotificationDelivered => "notification_delivered",
+    NotificationFailed => "notification_failed",
+    RetentionPruned => "retention_pruned",
     Log => "log",
 });
 
@@ -476,16 +616,40 @@ pub struct OpRun {
     pub pid: Option<i64>,
 }
 
+/// one thing that happened, in the order it was written down.
+///
+/// `subject_kind` and `subject` say what it is about, and the pair is the whole
+/// of how the log describes something that is not a run.
+/// [`Store::event_log`](crate::Store::event_log) filters on them.
 #[derive(Debug, Clone, Serialize)]
 pub struct Event {
+    /// monotonic within the table and allocated on insert. see
+    /// [`Store::event_log`](crate::Store::event_log) for what that does and
+    /// does not promise a reader following the log.
     pub seq: i64,
-    pub run_id: String,
+    /// the run this is about; `None` on everything that is not about a run.
+    pub run_id: Option<String>,
+    pub subject_kind: SubjectKind,
+    /// which one, by name or id. `None` on a run event, where the run is
+    /// `run_id`, and on a `system` event that is about no particular thing.
+    pub subject: Option<String>,
+    /// which op of the run, on the run events that have one.
     pub op: Option<String>,
     pub level: EventLevel,
     pub kind: EventKind,
     pub message: String,
+    /// the payload, documented per kind in `docs/events.md`.
     pub data: Option<Value>,
     pub ts: DateTime<Utc>,
+}
+
+impl Event {
+    /// what this event is about, as one string: `subject`, or the run id on a
+    /// run event. v17 does not copy `run_id` into `subject` — see the migration
+    /// — so this is where the two become one answer.
+    pub fn about(&self) -> Option<&str> {
+        self.subject.as_deref().or(self.run_id.as_deref())
+    }
 }
 
 /// which pipe of an [isolated op](crate::Op::isolated)'s process a captured

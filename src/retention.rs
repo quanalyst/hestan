@@ -15,6 +15,16 @@ pub(crate) const DEFAULT_INTERVAL: Duration = Duration::from_secs(3600);
 /// retention policy was asked for.
 const TICKS_KEPT: usize = 5000;
 
+/// how many of the newest events about something other than a run are kept, for
+/// exactly the same reason and unconditionally for exactly the same reason.
+///
+/// a run's events go when the run does. everything the v17 log added belongs to
+/// no run — an asset built every five minutes, a sensor evaluated every ten
+/// seconds — so without this nothing would ever collect them. larger than the
+/// tick caps because this is the table you read to find out what happened last
+/// night, and a night is not a small number of events.
+const EVENTS_KEPT: usize = 50_000;
+
 /// how much history a job keeps: nothing is deleted unless one of these says so.
 ///
 /// [`Hestan::retention`](crate::Hestan::retention) sets it for every job and
@@ -116,6 +126,9 @@ pub(crate) fn sweep(runner: &Runner, policy: &Retention, now: DateTime<Utc>) {
     }
     if let Err(e) = store.prune_sensor_ticks(TICKS_KEPT) {
         tracing::warn!("sensor tick prune failed: {e}");
+    }
+    if let Err(e) = store.prune_events(EVENTS_KEPT) {
+        tracing::warn!("event prune failed: {e}");
     }
     let jobs = match store.run_jobs() {
         Ok(jobs) => jobs,

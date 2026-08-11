@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use rusqlite::{Connection, OptionalExtension};
-use serde_json::Value;
+use serde_json::{Value, json};
 
 use crate::error::Error;
 use crate::executor::{Blocked, InFlight, Limits, QUEUE_SCAN, Queued};
@@ -15,7 +15,7 @@ use crate::model::{
     AssetCheckRow, Backfill, BackfillStatus, CheckStatus, DeliveryState, Event, EventKind,
     EventLevel, FreshnessRow, HistoryEntry, Materialization, MetaPoint, Notification, OpLog, OpRun,
     OpStatus, Preset, Reclaim, Run, RunCursor, RunStatus, RunTags, ScheduleRow, SensorOutcome,
-    SensorRow, SensorTick, Severity, Tick, TickOutcome,
+    SensorRow, SensorTick, Severity, SubjectKind, Tick, TickOutcome,
 };
 use crate::op;
 use crate::retention::Retention;
@@ -365,7 +365,52 @@ CREATE INDEX notifications_due ON notifications(next_attempt_at)
 CREATE INDEX notifications_delivered ON notifications(delivered_at);
 "#;
 
-pub(crate) const SCHEMA_VERSION: u32 = 16;
+// the event log stops being about runs. `run_id` was NOT NULL, so an event
+// could only ever describe a run — everything else hestan does happened in its
+// own table and reached no stream at all.
+//
+// `subject_kind` and `subject` are what a non-run event says it is about:
+// `('asset', 'sales/orders')`, `('sensor', 'watch')`, `('backfill', '12')`.
+// existing rows are runs and are stamped as such, which is what they were.
+//
+// **`subject` is not a copy of `run_id`.** a run event leaves it null and is
+// found by the column that already named it; filling it in would rewrite every
+// row of the largest table in the database to store a second copy of an indexed
+// column. `Event::about` is where the two become one answer.
+//
+// two queries matter and one index is added: newest first *within a subject*.
+// newest first globally is `seq` descending, and `seq` is the primary key on
+// both backends, so it is the primary key read backwards and an index of its
+// own would only be a second copy of it.
+//
+// sqlite has no `ALTER COLUMN`, so dropping the NOT NULL means rebuilding the
+// table — the v8 pattern, and the expensive half of this migration on a
+// database with a year of events in it. postgres drops a NOT NULL and adds two
+// defaulted columns in the catalog and touches no row at all; the two backends
+// are genuinely not doing the same amount of work here, and `docs/storage.md`
+// says so.
+const SCHEMA_V17: &str = r#"
+CREATE TABLE events_v17 (
+    seq INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id TEXT,
+    op TEXT,
+    level TEXT NOT NULL,
+    message TEXT NOT NULL,
+    ts TEXT NOT NULL,
+    kind TEXT NOT NULL DEFAULT 'log',
+    data TEXT,
+    subject_kind TEXT NOT NULL DEFAULT 'run',
+    subject TEXT
+);
+INSERT INTO events_v17 (seq, run_id, op, level, message, ts, kind, data, subject_kind)
+    SELECT seq, run_id, op, level, message, ts, kind, data, 'run' FROM events;
+DROP TABLE events;
+ALTER TABLE events_v17 RENAME TO events;
+CREATE INDEX events_run ON events(run_id, seq);
+CREATE INDEX events_subject ON events(subject_kind, subject, seq DESC);
+"#;
+
+pub(crate) const SCHEMA_VERSION: u32 = 17;
 
 // one transaction around every pending step and the version stamp (sqlite DDL
 // is transactional), so a crash mid-migration leaves the db exactly as found
@@ -427,6 +472,9 @@ fn migrate(conn: &mut Connection) -> Result<(), Error> {
     if version < 16 {
         tx.execute_batch(SCHEMA_V16)?;
     }
+    if version < 17 {
+        tx.execute_batch(SCHEMA_V17)?;
+    }
     if version != SCHEMA_VERSION {
         tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     }
@@ -453,6 +501,9 @@ pub(crate) struct RunKey<'a> {
     pub sensor: &'a str,
     pub key: &'a str,
 }
+
+/// every column [`event_from_row`] reads, in the order it reads them.
+const EVENT_COLS: &str = "seq, run_id, subject_kind, subject, op, level, kind, message, data, ts";
 
 /// every column [`run_from_row`] reads, in the order it reads them. one list
 /// rather than four copies of it, since a run now carries enough columns that
@@ -977,13 +1028,29 @@ impl AnyRow<'_> {
         self.opt_text(idx)?.map(|s| parse_json(idx, &s)).transpose()
     }
 
-    fn parse<T: FromStr<Err = String>>(&self, idx: usize) -> Result<T, Error> {
-        self.text(idx)?.parse().map_err(|e| Error::Column(idx, e))
+    // the bound is `Display` rather than `Err = String` because the two enums
+    // that tolerate an unknown word parse infallibly, and one that cannot fail
+    // should not have to invent an error type to be read with the rest
+    fn parse<T>(&self, idx: usize) -> Result<T, Error>
+    where
+        T: FromStr,
+        T::Err: std::fmt::Display,
+    {
+        self.text(idx)?
+            .parse()
+            .map_err(|e: T::Err| Error::Column(idx, e.to_string()))
     }
 
-    fn opt_parse<T: FromStr<Err = String>>(&self, idx: usize) -> Result<Option<T>, Error> {
+    fn opt_parse<T>(&self, idx: usize) -> Result<Option<T>, Error>
+    where
+        T: FromStr,
+        T::Err: std::fmt::Display,
+    {
         match self.opt_text(idx)? {
-            Some(s) => s.parse().map(Some).map_err(|e| Error::Column(idx, e)),
+            Some(s) => s
+                .parse()
+                .map(Some)
+                .map_err(|e: T::Err| Error::Column(idx, e.to_string())),
             None => Ok(None),
         }
     }
@@ -1144,16 +1211,10 @@ impl Store {
             )?;
         }
         // same transaction as the row, so a run never exists without its queued event
-        tx.execute(
-            "INSERT INTO events (run_id, op, level, kind, message, ts)
-             VALUES (?1, NULL, ?2, ?3, ?4, ?5)",
-            args![
-                &run.id,
-                EventLevel::Info.as_str(),
-                EventKind::RunQueued.as_str(),
-                "run queued",
-                Utc::now().to_rfc3339()
-            ],
+        write_event(
+            &mut tx,
+            &NewEvent::run(&run.id, EventKind::RunQueued, "run queued"),
+            Utc::now(),
         )?;
         tx.commit()?;
         Ok(true)
@@ -1238,8 +1299,8 @@ impl Store {
         )?;
         tx.execute(
             &format!(
-                "INSERT INTO events (run_id, op, level, kind, message, ts)
-                 SELECT id, NULL, 'error', 'run_failed', 'run interrupted: process exited', ?1
+                "INSERT INTO events (run_id, subject_kind, level, kind, message, ts)
+                 SELECT id, 'run', 'error', 'run_failed', 'run interrupted: process exited', ?1
                  FROM runs WHERE {}",
                 Self::INTERRUPTED
             ),
@@ -1492,18 +1553,19 @@ impl Store {
                  WHERE run_id = ?1 AND status IN ('pending', 'running')",
                 args![&id, &why, &now],
             )?;
-            let (level, kind, message) = match policy {
-                Reclaim::Fail => (EventLevel::Error, EventKind::RunFailed, why.clone()),
-                Reclaim::Requeue => (
-                    EventLevel::Warn,
-                    EventKind::Log,
-                    format!("{why}; requeued for another claimer"),
-                ),
+            // the reclaim is its own fact whichever policy is in force: the run
+            // ends up failed or requeued, and "somebody's lease ran out" is the
+            // thing you are looking for when you ask why
+            let message = match policy {
+                Reclaim::Fail => why.clone(),
+                Reclaim::Requeue => format!("{why}; requeued for another claimer"),
             };
-            tx.execute(
-                "INSERT INTO events (run_id, op, level, kind, message, ts)
-                 VALUES (?1, NULL, ?2, ?3, ?4, ?5)",
-                args![&id, level.as_str(), kind.as_str(), message, &now],
+            write_event(
+                &mut tx,
+                &NewEvent::run(&id, EventKind::RunReclaimed, message)
+                    .level(EventLevel::Warn)
+                    .data(json!({ "claimer": claimer, "policy": policy })),
+                at,
             )?;
             match policy {
                 Reclaim::Fail => {
@@ -1512,6 +1574,13 @@ impl Store {
                              error = COALESCE(error, ?3)
                          WHERE id = ?1",
                         args![&id, &now, &why],
+                    )?;
+                    // and the run's own terminal event after it: the reclaim is
+                    // why, and this is what the run did
+                    write_event(
+                        &mut tx,
+                        &NewEvent::run(&id, EventKind::RunFailed, &*why).level(EventLevel::Error),
+                        at,
                     )?;
                     run.status = RunStatus::Failed;
                     run.finished_at = Some(at);
@@ -1569,7 +1638,8 @@ impl Store {
     pub(crate) fn cancel_queued(&self, id: &str) -> Result<bool, Error> {
         let mut conn = self.conn();
         let mut tx = conn.begin_immediate()?;
-        let now = Utc::now().to_rfc3339();
+        let at = Utc::now();
+        let now = at.to_rfc3339();
         let taken = tx.execute(
             "UPDATE runs SET status = 'canceled', finished_at = ?2,
                  error = COALESCE(error, 'canceled before it started')
@@ -1586,10 +1656,11 @@ impl Store {
              WHERE run_id = ?1 AND status = 'pending'",
             args![id, &now],
         )?;
-        tx.execute(
-            "INSERT INTO events (run_id, op, level, kind, message, ts)
-             VALUES (?1, NULL, 'warn', 'run_canceled', 'canceled before it started', ?2)",
-            args![id, &now],
+        write_event(
+            &mut tx,
+            &NewEvent::run(id, EventKind::RunCanceled, "canceled before it started")
+                .level(EventLevel::Warn),
+            at,
         )?;
         tx.commit()?;
         Ok(true)
@@ -1682,18 +1753,41 @@ impl Store {
     /// makes a second delivery loop unable to claim the same row twice —
     /// though it says nothing about the *hook* having run twice, and hestan
     /// promises at-least-once and no more.
+    ///
+    /// the [event](EventKind::NotificationDelivered) is in the same
+    /// transaction as the mark and is therefore about the mark, not about the
+    /// hook: the hook already returned, and the gap between it returning and
+    /// this landing is the at-least-once window this method's guard exists for.
     pub(crate) fn delivered(&self, id: i64, at: DateTime<Utc>) -> Result<bool, Error> {
-        let marked = self.conn().execute(
+        let mut conn = self.conn();
+        let mut tx = conn.begin()?;
+        let marked = tx.execute(
             "UPDATE notifications SET delivered_at = ?1, last_error = NULL
              WHERE id = ?2 AND delivered_at IS NULL",
             args![at.to_rfc3339(), id],
         )?;
+        if marked > 0 {
+            write_event(
+                &mut tx,
+                &NewEvent::about(
+                    SubjectKind::System,
+                    id.to_string(),
+                    EventKind::NotificationDelivered,
+                    format!("notification {id} delivered"),
+                )
+                .data(json!({ "notification_id": id })),
+                at,
+            )?;
+        }
+        tx.commit()?;
         Ok(marked > 0)
     }
 
     /// record a failed attempt. `next` of `None` is giving up: the row leaves
     /// the due scan and stays visible as failed, carrying the error that
-    /// stopped it.
+    /// stopped it — and only *that* gets an event. an attempt that will be
+    /// retried in ninety seconds is not news, and eight of them per alert
+    /// would bury the one that matters.
     pub(crate) fn delivery_failed(
         &self,
         id: i64,
@@ -1701,11 +1795,33 @@ impl Store {
         next: Option<DateTime<Utc>>,
         error: &str,
     ) -> Result<(), Error> {
-        self.conn().execute(
+        let at = Utc::now();
+        let mut conn = self.conn();
+        let mut tx = conn.begin()?;
+        tx.execute(
             "UPDATE notifications SET attempts = ?1, next_attempt_at = ?2, last_error = ?3
              WHERE id = ?4",
             args![attempts, next.map(|t| t.to_rfc3339()), error, id],
         )?;
+        if next.is_none() {
+            write_event(
+                &mut tx,
+                &NewEvent::about(
+                    SubjectKind::System,
+                    id.to_string(),
+                    EventKind::NotificationFailed,
+                    format!("notification {id} given up on after {attempts} attempts: {error}"),
+                )
+                .level(EventLevel::Error)
+                .data(json!({
+                    "notification_id": id,
+                    "attempts": attempts,
+                    "error": error,
+                })),
+                at,
+            )?;
+        }
+        tx.commit()?;
         Ok(())
     }
 
@@ -1835,6 +1951,13 @@ impl Store {
         Ok(inputs.flatten())
     }
 
+    /// one event about a run, on its own.
+    ///
+    /// the run's own progress is the one part of the log with nothing to be
+    /// atomic *with*: an op starting is not a row anywhere else, so this is a
+    /// statement of its own and a crash between the work and the event loses
+    /// the event. the terminal ones are not written here — a run's queued and
+    /// finished rows go in the transaction that moves the run.
     pub(crate) fn append_event(
         &self,
         run_id: &str,
@@ -1844,20 +1967,11 @@ impl Store {
         message: &str,
         data: Option<&Value>,
     ) -> Result<(), Error> {
-        self.conn().execute(
-            "INSERT INTO events (run_id, op, level, kind, message, data, ts)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            args![
-                run_id,
-                op,
-                level.as_str(),
-                kind.as_str(),
-                message,
-                data.map(|v| v.to_string()),
-                Utc::now().to_rfc3339()
-            ],
-        )?;
-        Ok(())
+        let mut event = NewEvent::run(run_id, kind, message).op(op).level(level);
+        if let Some(data) = data {
+            event = event.data(data.clone());
+        }
+        write_event(&mut self.conn(), &event, Utc::now())
     }
 
     /// append one captured line. the cap lives in [`logs::Budget`], which is
@@ -2154,32 +2268,109 @@ impl Store {
                 cutoffs.keep_last
             ],
         )?;
+        // in the same transaction as the deletes, and only when there were
+        // some: a sweep that took nothing is not an event, and this one runs
+        // every hour against every job that has ever had a run
+        if removed > 0 {
+            write_event(
+                &mut tx,
+                &NewEvent::about(
+                    SubjectKind::Job,
+                    job,
+                    EventKind::RetentionPruned,
+                    format!("retention removed {removed} runs of {job}"),
+                )
+                .data(json!({ "job": job, "runs": removed })),
+                now,
+            )?;
+        }
         tx.commit()?;
         Ok(removed)
     }
 
+    /// trim the events that belong to no run down to the newest `keep`.
+    ///
+    /// run events are deleted with their run by
+    /// [`prune_job_runs`](Self::prune_job_runs) and always were. everything
+    /// v17 added belongs to no run, so nothing collected it: an asset built
+    /// every five minutes writes a row here forever. a count cap rather than
+    /// the retention policy's age, for the same reason the two tick logs have
+    /// one — this grows with time rather than with the history somebody asked
+    /// to keep.
+    pub(crate) fn prune_events(&self, keep: usize) -> Result<usize, Error> {
+        self.conn().execute(
+            "DELETE FROM events WHERE run_id IS NULL AND seq NOT IN
+             (SELECT seq FROM events WHERE run_id IS NULL ORDER BY seq DESC LIMIT ?1)",
+            args![keep as i64],
+        )
+    }
+
+    /// record one occurrence and what the scheduler did about it, with its
+    /// [event](EventKind::ScheduleFired) in the same transaction.
+    ///
+    /// `caught_up` is the one thing the tick row cannot say for itself: a fire
+    /// for an occurrence that came due while nothing was running looks exactly
+    /// like an ordinary one except for the gap between `scheduled_for` and
+    /// `fired_at`, and only the caller knows which it made.
+    ///
+    /// **the run is not in this transaction.** a fired tick's run was created
+    /// by a launch that committed first, so a crash in between leaves a run
+    /// with no tick and no event — the run is still there, still queued, and
+    /// still executes. the other direction, a tick claiming a run that was
+    /// never created, is the one that cannot happen.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn record_tick(
         &self,
         job: &str,
         expr: &str,
         scheduled_for: DateTime<Utc>,
         outcome: TickOutcome,
+        caught_up: bool,
         run_id: Option<&str>,
         error: Option<&str>,
     ) -> Result<(), Error> {
-        self.conn().execute(
+        let at = Utc::now();
+        let mut conn = self.conn();
+        let mut tx = conn.begin()?;
+        tx.execute(
             "INSERT INTO schedule_ticks (job, expr, scheduled_for, fired_at, outcome, run_id, error)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             args![
                 job,
                 expr,
                 scheduled_for.to_rfc3339(),
-                Utc::now().to_rfc3339(),
+                at.to_rfc3339(),
                 outcome.as_str(),
                 run_id,
                 error
             ],
         )?;
+        let (kind, level) = match (outcome, caught_up) {
+            (TickOutcome::Fired, false) => (EventKind::ScheduleFired, EventLevel::Info),
+            (TickOutcome::Fired, true) => (EventKind::ScheduleCaughtUp, EventLevel::Info),
+            (TickOutcome::Skipped, _) => (EventKind::ScheduleSkipped, EventLevel::Info),
+            (TickOutcome::Deferred, _) => (EventKind::ScheduleDeferred, EventLevel::Info),
+            (TickOutcome::Error, _) => (EventKind::ScheduleError, EventLevel::Error),
+        };
+        let message = match error {
+            Some(why) => format!("{expr}: {} — {why}", outcome.as_str()),
+            None => format!("{expr}: {}", outcome.as_str()),
+        };
+        write_event(
+            &mut tx,
+            &NewEvent::about(SubjectKind::Schedule, job, kind, message)
+                .level(level)
+                .data(json!({
+                    "job": job,
+                    "expr": expr,
+                    "scheduled_for": scheduled_for,
+                    "outcome": outcome,
+                    "run_id": run_id,
+                    "error": error,
+                })),
+            at,
+        )?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -2477,13 +2668,95 @@ impl Store {
         )
     }
 
+    /// one run's events, oldest first, after cursor `after`.
     pub fn events(&self, run_id: &str, after: i64) -> Result<Vec<Event>, Error> {
         self.conn().query(
-            "SELECT seq, run_id, op, level, kind, message, data, ts
-             FROM events WHERE run_id = ?1 AND seq > ?2 ORDER BY seq",
+            &format!("SELECT {EVENT_COLS} FROM events WHERE run_id = ?1 AND seq > ?2 ORDER BY seq"),
             args![run_id, after],
             event_from_row,
         )
+    }
+
+    /// the whole log, newest first: what happened, across every subsystem.
+    ///
+    /// `before` pages backwards — the last seq of the page you have, and the
+    /// next page is what is below it. a page of the past is exact, because
+    /// nothing is still being written down there; the newest page has the same
+    /// in-flight window [`event_tail`](Self::event_tail) documents, and for the
+    /// same reason.
+    pub fn event_log(&self, q: &EventQuery, limit: u32) -> Result<Vec<Event>, Error> {
+        let mut conn = self.conn();
+        let (where_sql, args) = q.sql(conn.dialect());
+        let mut args = args;
+        args.push(Val::Int(i64::from(limit)));
+        let n = args.len();
+        conn.query(
+            &format!(
+                "SELECT {EVENT_COLS} FROM events WHERE {where_sql} ORDER BY seq DESC LIMIT ?{n}"
+            ),
+            &args,
+            event_from_row,
+        )
+    }
+
+    /// the log oldest first from a cursor: what a follower reads to catch up
+    /// and then to keep up.
+    ///
+    /// **`seq` is allocated on insert, not on commit**, and that is the whole
+    /// difficulty with following this table. a writer that has taken seq 5 and
+    /// not committed is invisible while a writer that took 6 and did commit is
+    /// not, so a follower that takes what it can see and moves its cursor to 6
+    /// will never come back for 5. `up_to` is how a caller keeps that from
+    /// happening: it is a ceiling the caller believes nothing can still appear
+    /// below, and [`event_watermark`](Self::event_watermark) is where one comes
+    /// from.
+    pub fn event_tail(
+        &self,
+        q: &EventQuery,
+        after: i64,
+        up_to: Option<i64>,
+        limit: u32,
+    ) -> Result<Vec<Event>, Error> {
+        let mut conn = self.conn();
+        let (where_sql, args) = q.sql(conn.dialect());
+        let mut args = args;
+        args.push(Val::Int(after));
+        let cursor = args.len();
+        args.push(Val::Int(up_to.unwrap_or(i64::MAX)));
+        let ceiling = args.len();
+        args.push(Val::Int(i64::from(limit)));
+        let n = args.len();
+        conn.query(
+            &format!(
+                "SELECT {EVENT_COLS} FROM events
+                 WHERE {where_sql} AND seq > ?{cursor} AND seq <= ?{ceiling}
+                 ORDER BY seq LIMIT ?{n}"
+            ),
+            &args,
+            event_from_row,
+        )
+    }
+
+    /// the newest seq anything has committed, or 0 on an empty log.
+    ///
+    /// what a follower turns into the ceiling it reads up to. on sqlite that is
+    /// this number directly: writers take the database's write lock and hold it
+    /// to commit, so no transaction can commit *below* one that already has and
+    /// seq order is commit order. on postgres several processes write at once
+    /// and it is not, so a follower lags this by one poll — see
+    /// [`Store::settles_in_order`](Self::settles_in_order).
+    pub fn event_watermark(&self) -> Result<i64, Error> {
+        let seq = self
+            .conn()
+            .query_opt("SELECT MAX(seq) FROM events", args![], |r| r.opt_int(0))?;
+        Ok(seq.flatten().unwrap_or(0))
+    }
+
+    /// whether this backend allocates `seq` in commit order, which decides
+    /// whether a follower may read up to [the
+    /// watermark](Self::event_watermark) or has to stay a poll behind it.
+    pub fn settles_in_order(&self) -> bool {
+        matches!(self.conn().dialect(), Dialect::Sqlite)
     }
 
     /// append a materialization. the table is history, so a rebuild that came
@@ -2493,6 +2766,10 @@ impl Store {
     /// `partition` is the key one build of a [partitioned
     /// asset](crate::Partitions) produced, and `None` for every unpartitioned
     /// one: history, staleness and seeding are all per `(asset, partition)`.
+    ///
+    /// the [event](EventKind::AssetMaterialized) goes in the same transaction:
+    /// "this asset was built" is exactly what this row is, and an event written
+    /// beside it would be a second copy that a crash can disagree with.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn record_materialization(
         &self,
@@ -2504,7 +2781,10 @@ impl Store {
         run_id: Option<&str>,
         metadata: Option<&Value>,
     ) -> Result<(), Error> {
-        self.conn().execute(
+        let at = Utc::now();
+        let mut conn = self.conn();
+        let mut tx = conn.begin()?;
+        tx.execute(
             "INSERT INTO asset_materializations
                  (asset, partition, fingerprint, inputs, value, run_id, built_at, metadata)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
@@ -2515,10 +2795,32 @@ impl Store {
                 inputs.to_string(),
                 value.map(|v| v.to_string()),
                 run_id,
-                Utc::now().to_rfc3339(),
+                at.to_rfc3339(),
                 metadata.map(|v| v.to_string()),
             ],
         )?;
+        let message = match partition {
+            None => format!("{asset} materialized"),
+            Some(key) => format!("{asset}[{key}] materialized"),
+        };
+        let event = NewEvent::about(
+            SubjectKind::Asset,
+            asset,
+            EventKind::AssetMaterialized,
+            message,
+        )
+        .data(json!({
+            "partition": partition,
+            "fingerprint": fingerprint,
+            // where it happened, which is not what it is about — a probe
+            // materializes outside any run and this is null there
+            "run_id": run_id,
+            // what the build reported, exactly as the op run carries it: the
+            // rows, the bytes and the seconds are already tagged `Meta`
+            "meta": metadata,
+        }));
+        write_event(&mut tx, &event, at)?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -2632,7 +2934,8 @@ impl Store {
 
     /// record what a check said. written inside the check's op, before it
     /// decides whether to fail, so a failing error check leaves its verdict
-    /// behind rather than only a failed op.
+    /// behind rather than only a failed op. its
+    /// [event](EventKind::CheckFailed) goes in the same transaction.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn record_check(
         &self,
@@ -2645,7 +2948,10 @@ impl Store {
         message: Option<&str>,
         metadata: Option<&Value>,
     ) -> Result<(), Error> {
-        self.conn().execute(
+        let at = Utc::now();
+        let mut conn = self.conn();
+        let mut tx = conn.begin()?;
+        tx.execute(
             "INSERT INTO asset_checks
                  (asset, partition, check_name, run_id, status, severity, message,
                   metadata, checked_at)
@@ -2659,9 +2965,41 @@ impl Store {
                 severity.as_str(),
                 message,
                 metadata.map(|v| v.to_string()),
-                Utc::now().to_rfc3339(),
+                at.to_rfc3339(),
             ],
         )?;
+        // a failed check at `warn` is a run that succeeded and a check that did
+        // not, so the level follows the severity rather than the verdict
+        let (kind, level) = match (status, severity) {
+            (CheckStatus::Passed, _) => (EventKind::CheckPassed, EventLevel::Info),
+            (CheckStatus::Failed, Severity::Warn) => (EventKind::CheckFailed, EventLevel::Warn),
+            (CheckStatus::Failed, Severity::Error) => (EventKind::CheckFailed, EventLevel::Error),
+        };
+        let subject = match partition {
+            None => Cow::Borrowed(asset),
+            Some(key) => Cow::Owned(format!("{asset}[{key}]")),
+        };
+        write_event(
+            &mut tx,
+            &NewEvent::about(
+                SubjectKind::Asset,
+                asset,
+                kind,
+                format!("check {check} {} on {subject}", status.as_str()),
+            )
+            .level(level)
+            .data(json!({
+                "check": check,
+                "partition": partition,
+                "status": status,
+                "severity": severity,
+                "message": message,
+                "run_id": run_id,
+                "meta": metadata,
+            })),
+            at,
+        )?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -2739,11 +3077,14 @@ impl Store {
             true => (BackfillStatus::Complete, Some(Utc::now().to_rfc3339())),
             false => (BackfillStatus::Running, None),
         };
+        let at = Utc::now();
+        let mut conn = self.conn();
+        let mut tx = conn.begin()?;
         // the one place that wanted `last_insert_rowid`. `RETURNING` is the
         // portable spelling — postgres has always had it and sqlite has since
         // 3.35 — so the id comes back with the row rather than from a second
         // question about what the connection did last
-        let id = self.conn().query_opt(
+        let id = tx.query_opt(
             "INSERT INTO backfills
                  (asset, from_key, to_key, partition_keys, total, created_at, finished_at, status)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
@@ -2754,13 +3095,39 @@ impl Store {
                 to_key,
                 serde_json::to_string(keys).unwrap_or_else(|_| "[]".into()),
                 keys.len() as i64,
-                Utc::now().to_rfc3339(),
+                at.to_rfc3339(),
                 finished,
                 status.as_str(),
             ],
             |r| r.int(0),
         )?;
-        id.ok_or_else(|| Error::Column(0, "an insert returned no id".into()))
+        let id = id.ok_or_else(|| Error::Column(0, "an insert returned no id".into()))?;
+        write_event(
+            &mut tx,
+            &NewEvent::about(
+                SubjectKind::Backfill,
+                id.to_string(),
+                EventKind::BackfillStarted,
+                format!(
+                    "backfill of {asset} {from_key}..{to_key}: {} keys",
+                    keys.len()
+                ),
+            )
+            .data(json!({
+                "asset": asset,
+                "from_key": from_key,
+                "to_key": to_key,
+                "total": keys.len(),
+            })),
+            at,
+        )?;
+        // a range that resolved to nothing is over the moment it is made, and
+        // both facts are true at once rather than one of them being suppressed
+        if status == BackfillStatus::Complete {
+            write_event(&mut tx, &backfill_over(id, asset, status, 0, 0), at)?;
+        }
+        tx.commit()?;
+        Ok(id)
     }
 
     pub fn backfill(&self, id: i64) -> Result<Option<Backfill>, Error> {
@@ -2798,15 +3165,24 @@ impl Store {
 
     /// record that a chunk went out: its run, and how many keys are now
     /// launched in total.
+    ///
+    /// the run itself was created by a launch that committed first, so this is
+    /// the same window [`record_tick`](Self::record_tick) has and for the same
+    /// reason: a chunk run with no event is recoverable, and an event naming a
+    /// run that was never launched is not.
     pub(crate) fn backfill_launched(
         &self,
         id: i64,
+        asset: &str,
         run_id: &str,
         launched: usize,
+        total: usize,
     ) -> Result<(), Error> {
+        let at = Utc::now();
         let mut conn = self.conn();
         let append = conn.dialect().json_append();
-        conn.execute(
+        let mut tx = conn.begin()?;
+        tx.execute(
             &format!(
                 "UPDATE backfills
                  SET launched = ?2,
@@ -2815,21 +3191,57 @@ impl Store {
             ),
             args![id, launched as i64, run_id],
         )?;
+        write_event(
+            &mut tx,
+            &NewEvent::about(
+                SubjectKind::Backfill,
+                id.to_string(),
+                EventKind::BackfillChunk,
+                format!("chunk launched: {launched} of {total} keys"),
+            )
+            .data(json!({
+                "asset": asset,
+                "run_id": run_id,
+                "launched": launched,
+                "total": total,
+            })),
+            at,
+        )?;
+        tx.commit()?;
         Ok(())
     }
 
     /// close a backfill. the first terminal status wins, so a cancel racing
-    /// the chunker cannot be overwritten by what the run did next.
-    pub(crate) fn finish_backfill(&self, id: i64, status: BackfillStatus) -> Result<(), Error> {
-        self.conn().execute(
+    /// the chunker cannot be overwritten by what the run did next — and the
+    /// event is written only by the writer that won, so there is exactly one.
+    pub(crate) fn finish_backfill(
+        &self,
+        id: i64,
+        asset: &str,
+        status: BackfillStatus,
+        launched: usize,
+        total: usize,
+    ) -> Result<(), Error> {
+        let at = Utc::now();
+        let mut conn = self.conn();
+        let mut tx = conn.begin()?;
+        let closed = tx.execute(
             "UPDATE backfills SET status = ?2, finished_at = ?3 WHERE id = ?1 AND status = ?4",
             args![
                 id,
                 status.as_str(),
-                Utc::now().to_rfc3339(),
+                at.to_rfc3339(),
                 BackfillStatus::Running.as_str(),
             ],
         )?;
+        if closed > 0 {
+            write_event(
+                &mut tx,
+                &backfill_over(id, asset, status, launched, total),
+                at,
+            )?;
+        }
+        tx.commit()?;
         Ok(())
     }
 
@@ -2927,7 +3339,10 @@ impl Store {
     /// `skipped` counts the requests this evaluation did not launch because
     /// their run key was already claimed — distinct from launching nothing —
     /// and `duration_ms` is how long the evaluation took, which is the other
-    /// half of "is this sensor healthy".
+    /// half of "is this sensor healthy". `runs` is what it launched, by id,
+    /// which is the tick's whole reason for existing and the one thing the
+    /// counts cannot give you.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn record_sensor_tick(
         &self,
         sensor: &str,
@@ -2935,15 +3350,19 @@ impl Store {
         launched: u32,
         skipped: u32,
         duration_ms: u64,
+        runs: &[String],
         error: Option<&str>,
     ) -> Result<(), Error> {
-        self.conn().execute(
+        let at = Utc::now();
+        let mut conn = self.conn();
+        let mut tx = conn.begin()?;
+        tx.execute(
             "INSERT INTO sensor_ticks
                  (sensor, evaluated_at, outcome, launched, skipped, duration_ms, error)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             args![
                 sensor,
-                Utc::now().to_rfc3339(),
+                at.to_rfc3339(),
                 outcome.as_str(),
                 launched,
                 skipped,
@@ -2951,6 +3370,33 @@ impl Store {
                 error
             ],
         )?;
+        let level = match outcome {
+            SensorOutcome::Error => EventLevel::Error,
+            _ => EventLevel::Info,
+        };
+        write_event(
+            &mut tx,
+            &NewEvent::about(
+                SubjectKind::Sensor,
+                sensor,
+                EventKind::SensorTick,
+                match error {
+                    Some(why) => format!("{} — {why}", outcome.as_str()),
+                    None => format!("{}, {launched} launched", outcome.as_str()),
+                },
+            )
+            .level(level)
+            .data(json!({
+                "outcome": outcome,
+                "launched": launched,
+                "skipped": skipped,
+                "duration_ms": duration_ms,
+                "runs": runs,
+                "error": error,
+            })),
+            at,
+        )?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -3157,6 +3603,211 @@ fn notification_from_row(row: &AnyRow<'_>) -> Result<Notification, Error> {
     })
 }
 
+/// the event a backfill's last write leaves. a cancel is its own kind because
+/// it is the one ending somebody asked for, and the two places that close a
+/// backfill say it the same way.
+fn backfill_over(
+    id: i64,
+    asset: &str,
+    status: BackfillStatus,
+    launched: usize,
+    total: usize,
+) -> NewEvent<'_> {
+    let (kind, level) = match status {
+        BackfillStatus::Canceled => (EventKind::BackfillCanceled, EventLevel::Warn),
+        BackfillStatus::Failed => (EventKind::BackfillFinished, EventLevel::Error),
+        _ => (EventKind::BackfillFinished, EventLevel::Info),
+    };
+    NewEvent::about(
+        SubjectKind::Backfill,
+        id.to_string(),
+        kind,
+        format!(
+            "backfill of {asset} {}: {launched} of {total} keys launched",
+            status.as_str()
+        ),
+    )
+    .level(level)
+    .data(json!({
+        "asset": asset,
+        "status": status,
+        "launched": launched,
+        "total": total,
+    }))
+}
+
+/// bind one parameter and answer with its number, which is what a `?n` in the
+/// fragment being built beside it needs.
+fn bind<'a>(args: &mut Vec<Val<'a>>, v: Val<'a>) -> usize {
+    args.push(v);
+    args.len()
+}
+
+/// what a reader is asking the [log](Store::event_log) for. every field
+/// narrows, an unset one does not, and they compose.
+#[derive(Debug, Default, Clone)]
+pub struct EventQuery {
+    pub kind: Option<EventKind>,
+    pub subject_kind: Option<SubjectKind>,
+    /// what it is about, matched the way [`Event::about`] reports it: a run
+    /// event has no `subject` of its own and is found by its run id.
+    pub subject: Option<String>,
+    /// this level exactly, not this level and worse: three levels and a
+    /// filter that means "show me the errors" is the one anybody types.
+    pub level: Option<EventLevel>,
+    pub since: Option<DateTime<Utc>>,
+    pub until: Option<DateTime<Utc>>,
+    /// only what is below this seq, which is how a page asks for the one
+    /// before it.
+    pub before: Option<i64>,
+}
+
+impl EventQuery {
+    /// the `WHERE` fragment and the parameters it binds, numbered from 1.
+    ///
+    /// the two reads share this so a filter cannot mean one thing to the query
+    /// and another to the stream — which, given that the stream exists to
+    /// deliver what the query would have returned, would be a hard thing to
+    /// notice and an easy thing to do.
+    fn sql(&self, dialect: Dialect) -> (String, Vec<Val<'_>>) {
+        let opt = dialect.text_param();
+        let mut args: Vec<Val<'_>> = Vec::new();
+        let mut clauses: Vec<String> = Vec::new();
+        if let Some(kind) = &self.kind {
+            let n = bind(&mut args, Val::Text(Cow::Borrowed(kind.as_str())));
+            clauses.push(format!("kind = ?{n}"));
+        }
+        if let Some(sk) = &self.subject_kind {
+            let n = bind(&mut args, Val::Text(Cow::Borrowed(sk.as_str())));
+            clauses.push(format!("subject_kind = ?{n}"));
+        }
+        if let Some(subject) = &self.subject {
+            let n = bind(&mut args, Val::Text(Cow::Borrowed(subject.as_str())));
+            // a run event keeps its subject null and is named by `run_id`, so
+            // asking for one by id has to look in both places — the v17
+            // migration says why the column was not filled in
+            clauses.push(format!(
+                "(subject = ?{n} OR (subject IS NULL AND run_id = ?{n}))"
+            ));
+        }
+        if let Some(level) = self.level {
+            let n = bind(&mut args, Val::Text(Cow::Borrowed(level.as_str())));
+            clauses.push(format!("level = ?{n}"));
+        }
+        if let Some(since) = self.since {
+            let n = bind(&mut args, Val::Text(Cow::Owned(since.to_rfc3339())));
+            clauses.push(format!("ts >= ?{n}{opt}"));
+        }
+        if let Some(until) = self.until {
+            let n = bind(&mut args, Val::Text(Cow::Owned(until.to_rfc3339())));
+            clauses.push(format!("ts < ?{n}{opt}"));
+        }
+        if let Some(before) = self.before {
+            let n = bind(&mut args, Val::Int(before));
+            clauses.push(format!("seq < ?{n}"));
+        }
+        // nothing asked for is every row, and `1 = 1` is what makes the
+        // fragment a fragment rather than a special case at every call site
+        let where_sql = match clauses.is_empty() {
+            true => "1 = 1".to_string(),
+            false => clauses.join(" AND "),
+        };
+        (where_sql, args)
+    }
+}
+
+/// one event on its way into the log.
+///
+/// built by whichever subsystem did the thing and written by [`write_event`],
+/// which every writer goes through — including the ones already inside a
+/// transaction, which is nearly all of them. an event asserts that something
+/// happened, so it is written where that happens and, wherever there is one,
+/// in the same transaction: written next to the call instead, a crash in the
+/// gap leaves a log that says a thing happened which did not, or a thing that
+/// happened and left no trace. `docs/events.md` lists the three places that
+/// have no transaction to join and says what the window is.
+pub(crate) struct NewEvent<'a> {
+    run_id: Option<&'a str>,
+    subject_kind: SubjectKind,
+    subject: Option<Cow<'a, str>>,
+    op: Option<&'a str>,
+    level: EventLevel,
+    kind: EventKind,
+    message: Cow<'a, str>,
+    data: Option<Value>,
+}
+
+impl<'a> NewEvent<'a> {
+    /// an event about one run. `subject` stays null: the run is `run_id`.
+    pub(crate) fn run(run_id: &'a str, kind: EventKind, message: impl Into<Cow<'a, str>>) -> Self {
+        NewEvent {
+            run_id: Some(run_id),
+            subject_kind: SubjectKind::Run,
+            subject: None,
+            op: None,
+            level: EventLevel::Info,
+            kind,
+            message: message.into(),
+            data: None,
+        }
+    }
+
+    /// an event about something that is not a run: an asset, a schedule, a
+    /// sensor, a backfill, a job, or hestan itself.
+    pub(crate) fn about(
+        subject_kind: SubjectKind,
+        subject: impl Into<Cow<'a, str>>,
+        kind: EventKind,
+        message: impl Into<Cow<'a, str>>,
+    ) -> Self {
+        NewEvent {
+            run_id: None,
+            subject_kind,
+            subject: Some(subject.into()),
+            op: None,
+            level: EventLevel::Info,
+            kind,
+            message: message.into(),
+            data: None,
+        }
+    }
+
+    pub(crate) fn op(mut self, op: Option<&'a str>) -> Self {
+        self.op = op;
+        self
+    }
+
+    pub(crate) fn level(mut self, level: EventLevel) -> Self {
+        self.level = level;
+        self
+    }
+
+    pub(crate) fn data(mut self, data: Value) -> Self {
+        self.data = Some(data);
+        self
+    }
+}
+
+/// append one event, inside whatever the caller is already in.
+fn write_event(tx: &mut impl Exec, ev: &NewEvent<'_>, at: DateTime<Utc>) -> Result<(), Error> {
+    tx.execute(
+        "INSERT INTO events (run_id, subject_kind, subject, op, level, kind, message, data, ts)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        args![
+            ev.run_id,
+            ev.subject_kind.as_str(),
+            ev.subject.as_deref(),
+            ev.op,
+            ev.level.as_str(),
+            ev.kind.as_str(),
+            ev.message.as_ref(),
+            ev.data.as_ref().map(|v| v.to_string()),
+            at.to_rfc3339()
+        ],
+    )?;
+    Ok(())
+}
+
 /// insert one notification, due immediately. inside whatever transaction the
 /// caller is already in — that is the only way it is worth anything.
 fn queue_note(tx: &mut impl Exec, payload: &Value, at: DateTime<Utc>) -> Result<(), Error> {
@@ -3180,13 +3831,18 @@ fn preset_from_row(row: &AnyRow<'_>) -> Result<Preset, Error> {
 fn event_from_row(row: &AnyRow<'_>) -> Result<Event, Error> {
     Ok(Event {
         seq: row.int(0)?,
-        run_id: row.text(1)?,
-        op: row.opt_text(2)?,
-        level: row.parse(3)?,
-        kind: row.parse(4)?,
-        message: row.text(5)?,
-        data: row.opt_json(6)?,
-        ts: row.ts(7)?,
+        run_id: row.opt_text(1)?,
+        // neither of these two can fail to parse, by construction: a word this
+        // build does not know is an `Unknown` arm rather than an error, so one
+        // row from a newer writer cannot break the page it is on
+        subject_kind: row.parse(2)?,
+        subject: row.opt_text(3)?,
+        op: row.opt_text(4)?,
+        level: row.parse(5)?,
+        kind: row.parse(6)?,
+        message: row.text(7)?,
+        data: row.opt_json(8)?,
+        ts: row.ts(9)?,
     })
 }
 
@@ -3533,6 +4189,307 @@ mod tests {
             let tail = store.events("r1", all[0].seq).unwrap();
             assert_eq!(tail.len(), 2);
             assert_eq!(tail[0].message, "flaky");
+
+            // a run event says which run in the column it always did, and its
+            // subject stays null: `about` is where the two become one answer
+            assert!(all.iter().all(|e| e.run_id.as_deref() == Some("r1")));
+            assert!(all.iter().all(|e| e.subject_kind == SubjectKind::Run));
+            assert!(all.iter().all(|e| e.about() == Some("r1")));
+        });
+    }
+
+    /// the newest event of `kind`, or a panic naming what was there instead.
+    fn newest(store: &Store, kind: EventKind) -> Event {
+        let q = EventQuery {
+            kind: Some(kind.clone()),
+            ..EventQuery::default()
+        };
+        store.event_log(&q, 1).unwrap().pop().unwrap_or_else(|| {
+            let seen: Vec<String> = store
+                .event_log(&EventQuery::default(), 50)
+                .unwrap()
+                .iter()
+                .map(|e| e.kind.to_string())
+                .collect();
+            panic!("no {kind} event; the log holds {seen:?}")
+        })
+    }
+
+    // the point of the whole phase: every subsystem's work reaches the one log,
+    // saying what it was about. written by the subsystem that does the work and
+    // in the transaction that does it, which is what the cases below reach
+    // through the store method rather than through an event api of their own
+    #[test]
+    fn each_subsystem_writes_an_event_about_its_own_subject() {
+        both(|db| {
+            let store = db.store();
+            store
+                .create_run(&mk_run("r1", "etl", Utc::now()), &["a".into()])
+                .unwrap();
+
+            store
+                .record_materialization(
+                    "sales/orders",
+                    Some("2026-01-01"),
+                    "fp",
+                    &json!({}),
+                    None,
+                    Some("r1"),
+                    Some(&json!({"rows": {"count": 12}})),
+                )
+                .unwrap();
+            let ev = newest(&store, EventKind::AssetMaterialized);
+            assert_eq!(ev.subject_kind, SubjectKind::Asset);
+            assert_eq!(ev.subject.as_deref(), Some("sales/orders"));
+            assert_eq!(
+                ev.run_id, None,
+                "the run is where it happened, not what it is about"
+            );
+            let data = ev.data.unwrap();
+            assert_eq!(data["partition"], json!("2026-01-01"));
+            assert_eq!(data["run_id"], json!("r1"));
+            assert_eq!(data["meta"], json!({"rows": {"count": 12}}));
+
+            store
+                .record_check(
+                    "sales/orders",
+                    None,
+                    "not_empty",
+                    "r1",
+                    CheckStatus::Failed,
+                    Severity::Warn,
+                    Some("0 rows"),
+                    None,
+                )
+                .unwrap();
+            let ev = newest(&store, EventKind::CheckFailed);
+            assert_eq!(ev.subject.as_deref(), Some("sales/orders"));
+            // a warn check that failed did not fail the run, and the level says
+            // so rather than the verdict saying it twice
+            assert_eq!(ev.level, EventLevel::Warn);
+            assert_eq!(ev.data.unwrap()["check"], json!("not_empty"));
+
+            let due = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+            store
+                .record_tick(
+                    "etl",
+                    "0 * * * *",
+                    due,
+                    TickOutcome::Fired,
+                    false,
+                    Some("r1"),
+                    None,
+                )
+                .unwrap();
+            let ev = newest(&store, EventKind::ScheduleFired);
+            assert_eq!(ev.subject_kind, SubjectKind::Schedule);
+            assert_eq!(ev.subject.as_deref(), Some("etl"));
+            assert_eq!(ev.data.unwrap()["run_id"], json!("r1"));
+
+            // the same tick outcome, for an occurrence downtime swallowed: a
+            // different kind, because "it fired" and "it caught up" are the two
+            // things anybody asks a schedule after a restart
+            store
+                .record_tick(
+                    "etl",
+                    "0 * * * *",
+                    due,
+                    TickOutcome::Fired,
+                    true,
+                    Some("r1"),
+                    None,
+                )
+                .unwrap();
+            assert_eq!(
+                newest(&store, EventKind::ScheduleCaughtUp)
+                    .subject
+                    .as_deref(),
+                Some("etl")
+            );
+
+            store
+                .record_sensor_tick(
+                    "watch",
+                    SensorOutcome::Fired,
+                    1,
+                    0,
+                    12,
+                    &["r1".to_string()],
+                    None,
+                )
+                .unwrap();
+            let ev = newest(&store, EventKind::SensorTick);
+            assert_eq!(ev.subject_kind, SubjectKind::Sensor);
+            assert_eq!(ev.subject.as_deref(), Some("watch"));
+            assert_eq!(ev.data.unwrap()["runs"], json!(["r1"]));
+
+            let id = store
+                .create_backfill("sales/orders", "a", "c", &["a".into(), "b".into()])
+                .unwrap();
+            let ev = newest(&store, EventKind::BackfillStarted);
+            assert_eq!(ev.subject_kind, SubjectKind::Backfill);
+            assert_eq!(ev.subject.as_deref(), Some(id.to_string().as_str()));
+            store
+                .backfill_launched(id, "sales/orders", "r1", 1, 2)
+                .unwrap();
+            assert_eq!(
+                newest(&store, EventKind::BackfillChunk).data.unwrap()["launched"],
+                json!(1)
+            );
+            store
+                .finish_backfill(id, "sales/orders", BackfillStatus::Canceled, 1, 2)
+                .unwrap();
+            assert_eq!(
+                newest(&store, EventKind::BackfillCanceled)
+                    .subject
+                    .as_deref(),
+                Some(id.to_string().as_str())
+            );
+
+            // a delivery, and one hestan has stopped trying: only the second
+            // failure kind is an event, since the seven retries before it are
+            // the mechanism working rather than news
+            store
+                .run_finished(
+                    "r1",
+                    RunStatus::Failed,
+                    None,
+                    Utc::now(),
+                    Some(&json!({"run_id": "r1"})),
+                )
+                .unwrap();
+            let note = store.notifications(None, 10).unwrap().pop().unwrap();
+            store
+                .delivery_failed(note.id, 1, Some(Utc::now()), "503")
+                .unwrap();
+            assert!(
+                store
+                    .event_log(
+                        &EventQuery {
+                            kind: Some(EventKind::NotificationFailed),
+                            ..EventQuery::default()
+                        },
+                        1
+                    )
+                    .unwrap()
+                    .is_empty(),
+                "a retry that is still coming is not an event"
+            );
+            store.delivery_failed(note.id, 8, None, "503").unwrap();
+            let ev = newest(&store, EventKind::NotificationFailed);
+            assert_eq!(ev.subject_kind, SubjectKind::System);
+            assert_eq!(ev.level, EventLevel::Error);
+            store.delivered(note.id, Utc::now()).unwrap();
+            assert_eq!(
+                newest(&store, EventKind::NotificationDelivered)
+                    .subject
+                    .as_deref(),
+                Some(note.id.to_string().as_str())
+            );
+
+            // and what retention took, per job, in the transaction that took it
+            store
+                .backdate_run("r1", Utc::now() - chrono::Duration::days(30))
+                .unwrap();
+            store
+                .conn()
+                .execute(
+                    "UPDATE runs SET created_at = ?2 WHERE id = ?1",
+                    args!["r1", (Utc::now() - chrono::Duration::days(30)).to_rfc3339()],
+                )
+                .unwrap();
+            let removed = store
+                .prune_job_runs("etl", &Retention::days(7), Utc::now())
+                .unwrap();
+            assert_eq!(removed, 1);
+            let ev = newest(&store, EventKind::RetentionPruned);
+            assert_eq!(ev.subject_kind, SubjectKind::Job);
+            assert_eq!(ev.subject.as_deref(), Some("etl"));
+            assert_eq!(ev.data.unwrap()["runs"], json!(1));
+            // the run's own events went with it and this one did not: it
+            // belongs to the job, which is still there
+            assert!(store.events("r1", 0).unwrap().is_empty());
+        });
+    }
+
+    // a lease that ran out is the one run event that is not about what the run
+    // did — and both policies write it, because "who stopped answering" is the
+    // question either way
+    #[test]
+    fn a_reclaim_says_so_whichever_policy_took_it() {
+        both(|db| {
+            let store = db.store();
+            for (id, policy) in [("failed", Reclaim::Fail), ("requeued", Reclaim::Requeue)] {
+                store
+                    .create_run(&mk_run(id, "etl", Utc::now()), &[])
+                    .unwrap();
+                store
+                    .plant_claim(id, "gone", Some(Utc::now() - chrono::Duration::minutes(5)))
+                    .unwrap();
+                store.reclaim_expired(policy, |_| None).unwrap();
+                let kinds: Vec<EventKind> = store
+                    .events(id, 0)
+                    .unwrap()
+                    .into_iter()
+                    .map(|e| e.kind)
+                    .collect();
+                assert!(kinds.contains(&EventKind::RunReclaimed), "{id}: {kinds:?}");
+                let ev = store
+                    .events(id, 0)
+                    .unwrap()
+                    .into_iter()
+                    .find(|e| e.kind == EventKind::RunReclaimed)
+                    .unwrap();
+                assert_eq!(ev.data.unwrap()["claimer"], json!("gone"));
+                assert_eq!(ev.subject_kind, SubjectKind::Run);
+                assert_eq!(ev.run_id.as_deref(), Some(id));
+            }
+            // failing one also ends it, and the terminal event is the last word
+            assert_eq!(
+                store.events("failed", 0).unwrap().pop().unwrap().kind,
+                EventKind::RunFailed
+            );
+        });
+    }
+
+    // a run's events go when its run does, and always did. what v17 added
+    // belongs to no run, so without a cap of its own an asset built every five
+    // minutes would write a row here forever
+    #[test]
+    fn the_events_that_belong_to_no_run_have_a_cap_of_their_own() {
+        both(|db| {
+            let store = db.store();
+            store
+                .create_run(&mk_run("r1", "etl", Utc::now()), &[])
+                .unwrap();
+            for i in 0..10 {
+                store
+                    .record_materialization(
+                        &format!("a{i}"),
+                        None,
+                        "fp",
+                        &json!({}),
+                        None,
+                        None,
+                        None,
+                    )
+                    .unwrap();
+            }
+
+            assert_eq!(store.prune_events(4).unwrap(), 6);
+            let kept = store
+                .event_log(
+                    &EventQuery {
+                        subject_kind: Some(SubjectKind::Asset),
+                        ..EventQuery::default()
+                    },
+                    50,
+                )
+                .unwrap();
+            assert_eq!(kept.len(), 4);
+            assert_eq!(kept[0].subject.as_deref(), Some("a9"), "the newest went");
+            // and the run's own event is untouched: it is the run's to lose
+            assert_eq!(store.events("r1", 0).unwrap().len(), 1);
         });
     }
 
@@ -4307,14 +5264,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("future.db");
         let path = path.to_str().unwrap();
-        phase1_db(path, 17);
+        phase1_db(path, 18);
         let err = Store::open(path).err().unwrap();
-        assert_eq!(err.to_string(), "db schema v17 is newer than this build");
+        assert_eq!(err.to_string(), "db schema v18 is newer than this build");
         let conn = Connection::open(path).unwrap();
         let version: u32 = conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 17);
+        assert_eq!(version, 18);
     }
 
     #[test]
@@ -4416,6 +5373,116 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].state, DeliveryState::Pending);
         assert_eq!(rows[0].payload, json!({"run_id": "r2"}));
+    }
+
+    /// bring `db` to v16 with `events` rows in it, ready for v17 to move.
+    ///
+    /// the two backends get there differently and cannot not. sqlite walks the
+    /// chain it has always walked. postgres is created whole at the current
+    /// version, so the only honest way to make a v16 postgres database out of
+    /// this build is to walk the one step *backwards* — which also means the
+    /// fixture fails loudly if v17 ever stops being exactly these four
+    /// statements. either way what the migration then meets is a populated
+    /// events table with a NOT NULL `run_id`.
+    fn at_v16(db: &Backend, events: usize) {
+        let rows: String = (0..events)
+            .map(|i| {
+                format!(
+                    "INSERT INTO events (run_id, op, level, kind, message, ts)
+                     VALUES ('r1', 'a', 'info', 'log', 'line {i}',
+                             '2026-01-01T00:00:00+00:00');"
+                )
+            })
+            .collect();
+        match db {
+            Backend::Sqlite(dir) => {
+                let conn = Connection::open(dir.path().join("hestan.db")).unwrap();
+                for batch in [
+                    PHASE1_SCHEMA,
+                    SCHEMA_V2,
+                    SCHEMA_V3,
+                    SCHEMA_V4,
+                    SCHEMA_V5,
+                    SCHEMA_V6,
+                    SCHEMA_V7,
+                    SCHEMA_V8,
+                    SCHEMA_V9,
+                    SCHEMA_V10,
+                    SCHEMA_V11,
+                    SCHEMA_V12,
+                    SCHEMA_V13,
+                    SCHEMA_V14,
+                    SCHEMA_V15,
+                    SCHEMA_V16,
+                    &rows,
+                ] {
+                    conn.execute_batch(batch).unwrap();
+                }
+                conn.pragma_update(None, "user_version", 16).unwrap();
+            }
+            #[cfg(feature = "postgres")]
+            Backend::Postgres(pg) => {
+                let store = pg.store();
+                store
+                    .create_run(&mk_run("r1", "etl", Utc::now()), &["a".into()])
+                    .unwrap();
+                store
+                    .run_finished("r1", RunStatus::Success, None, Utc::now(), None)
+                    .unwrap();
+                store
+                    .conn()
+                    .batch(&format!(
+                        "{rows}
+                         DROP INDEX events_subject;
+                         ALTER TABLE events DROP COLUMN subject_kind;
+                         ALTER TABLE events DROP COLUMN subject;
+                         ALTER TABLE events ALTER COLUMN run_id SET NOT NULL;
+                         UPDATE schema_version SET version = 16;"
+                    ))
+                    .unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn a_populated_v16_db_migrates_to_v17_keeping_its_rows() {
+        both(|db| {
+            // two hundred events rather than one. sqlite has no `ALTER COLUMN`
+            // and rebuilds the table to drop the NOT NULL, and a rebuild that
+            // preserved one row is no evidence about one that has to preserve
+            // the seq of every row a reader's cursor might be sitting on
+            at_v16(db, 200);
+            let store = db.store();
+
+            let events = store.events("r1", 0).unwrap();
+            assert!(events.len() >= 200, "rows were lost: {}", events.len());
+            assert!(events.iter().all(|e| e.run_id.as_deref() == Some("r1")));
+            assert!(events.iter().all(|e| e.subject_kind == SubjectKind::Run));
+            // and the run event that migrated is still found by the run
+            assert!(events.iter().all(|e| e.subject.is_none()));
+            assert!(events.iter().all(|e| e.about() == Some("r1")));
+            assert!(
+                events.windows(2).all(|w| w[0].seq < w[1].seq),
+                "seq stopped being the order it was"
+            );
+            assert_eq!(store.run("r1").unwrap().unwrap().status, RunStatus::Success);
+
+            // the column the whole migration was for: an event about no run
+            let seq_before = store.event_watermark().unwrap();
+            store
+                .record_materialization("sales", None, "fp", &json!({}), None, None, None)
+                .unwrap();
+            let log = store.event_log(&EventQuery::default(), 5).unwrap();
+            assert_eq!(log[0].kind, EventKind::AssetMaterialized);
+            assert_eq!(log[0].run_id, None);
+            assert_eq!(log[0].about(), Some("sales"));
+            assert!(log[0].seq > seq_before);
+
+            // reopening does not migrate a second time
+            drop(store);
+            let store = db.store();
+            assert_eq!(store.events("r1", 0).unwrap().len(), events.len());
+        });
     }
 
     #[test]
@@ -5386,13 +6453,13 @@ mod tests {
         both(|db| {
             let store = db.store();
             store
-                .record_sensor_tick("watch", SensorOutcome::Fired, 2, 1, 12, None)
+                .record_sensor_tick("watch", SensorOutcome::Fired, 2, 1, 12, &[], None)
                 .unwrap();
             store
-                .record_sensor_tick("watch", SensorOutcome::Error, 0, 0, 4, Some("boom"))
+                .record_sensor_tick("watch", SensorOutcome::Error, 0, 0, 4, &[], Some("boom"))
                 .unwrap();
             store
-                .record_sensor_tick("probe:docs", SensorOutcome::Fired, 0, 0, 0, None)
+                .record_sensor_tick("probe:docs", SensorOutcome::Fired, 0, 0, 0, &[], None)
                 .unwrap();
 
             let all = store.sensor_ticks(None, 10).unwrap();
@@ -5503,7 +6570,15 @@ mod tests {
             let store = db.store();
             let t0 = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
             store
-                .record_tick("etl", "0 * * * *", t0, TickOutcome::Fired, Some("r1"), None)
+                .record_tick(
+                    "etl",
+                    "0 * * * *",
+                    t0,
+                    TickOutcome::Fired,
+                    false,
+                    Some("r1"),
+                    None,
+                )
                 .unwrap();
             store
                 .record_tick(
@@ -5511,6 +6586,7 @@ mod tests {
                     "0 * * * *",
                     t0 + chrono::Duration::hours(1),
                     TickOutcome::Error,
+                    false,
                     None,
                     Some("boom"),
                 )
@@ -5521,6 +6597,7 @@ mod tests {
                     "*/5 * * * *",
                     t0,
                     TickOutcome::Fired,
+                    false,
                     Some("r2"),
                     None,
                 )
@@ -5652,16 +6729,20 @@ mod tests {
             assert!(store.backfill(9_999).unwrap().is_none());
 
             assert_eq!(store.running_backfills().unwrap().len(), 1);
-            store.backfill_launched(id, "r1", 1).unwrap();
-            store.backfill_launched(id, "r2", 2).unwrap();
+            store.backfill_launched(id, "sales", "r1", 1, 2).unwrap();
+            store.backfill_launched(id, "sales", "r2", 2, 2).unwrap();
             let row = store.backfill(id).unwrap().unwrap();
             assert_eq!(row.run_ids, ["r1", "r2"], "the chunks did not append");
             assert_eq!(row.launched, 2);
 
-            store.finish_backfill(id, BackfillStatus::Complete).unwrap();
+            store
+                .finish_backfill(id, "sales", BackfillStatus::Complete, 2, 2)
+                .unwrap();
             // the first terminal status wins: a cancel racing the chunker
             // cannot be overwritten by what the run did next
-            store.finish_backfill(id, BackfillStatus::Canceled).unwrap();
+            store
+                .finish_backfill(id, "sales", BackfillStatus::Canceled, 2, 2)
+                .unwrap();
             let row = store.backfill(id).unwrap().unwrap();
             assert_eq!(row.status, BackfillStatus::Complete);
             assert!(store.running_backfills().unwrap().is_empty());
@@ -5935,14 +7016,22 @@ mod tests {
             let hour = chrono::Duration::hours(1);
             let tick = |at, outcome| {
                 store
-                    .record_tick("etl", "0 * * * *", at, outcome, None, None)
+                    .record_tick("etl", "0 * * * *", at, outcome, false, None, None)
                     .unwrap();
             };
             tick(t0, TickOutcome::Deferred);
             tick(t0 + hour, TickOutcome::Deferred);
             // the first occurrence launched on a later pass; the second has not
             store
-                .record_tick("etl", "0 * * * *", t0, TickOutcome::Fired, Some("r1"), None)
+                .record_tick(
+                    "etl",
+                    "0 * * * *",
+                    t0,
+                    TickOutcome::Fired,
+                    false,
+                    Some("r1"),
+                    None,
+                )
                 .unwrap();
 
             let waiting = store.pending_fires().unwrap();
@@ -6398,19 +7487,19 @@ mod tests {
         let store = pg.store();
         store
             .conn()
-            .execute("UPDATE schema_version SET version = ?1", args![17_i64])
+            .execute("UPDATE schema_version SET version = ?1", args![18_i64])
             .unwrap();
         drop(store);
 
         let err = Store::connect(&pg.url).err().unwrap();
-        assert_eq!(err.to_string(), "db schema v17 is newer than this build");
+        assert_eq!(err.to_string(), "db schema v18 is newer than this build");
 
-        // and it is still v17: a build that cannot read a database must not
+        // and it is still v18: a build that cannot read a database must not
         // rewrite it either
         let version = crate::pg::unmigrated(&pg.url)
             .unwrap()
             .query("SELECT version FROM schema_version", args![], |r| r.int(0))
             .unwrap();
-        assert_eq!(version, [17]);
+        assert_eq!(version, [18]);
     }
 }

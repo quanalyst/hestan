@@ -286,6 +286,7 @@ fn catch_up(entry: &ScheduleEntry, runner: &Runner, row: Option<&ScheduleRow>, n
                     &entry.expr,
                     *oldest,
                     TickOutcome::Skipped,
+                    false,
                     None,
                     Some(&msg),
                 ) {
@@ -318,7 +319,7 @@ fn queue_fire(runner: &Runner, entry: &ScheduleEntry, at: DateTime<Utc>) {
     let free = matches!(runner.store().has_active_run(&entry.job), Ok(false))
         && !has_pending(runner, &entry.job);
     match free {
-        true => note_tick(runner, &entry.job, &entry.expr, at, &entry.params),
+        true => note_tick(runner, &entry.job, &entry.expr, at, &entry.params, true),
         false => note_runless_tick(runner, &entry.job, &entry.expr, at, TickOutcome::Deferred),
     }
 }
@@ -368,7 +369,7 @@ fn drain_pending(
         match runner.store().has_active_run(job) {
             Ok(false) => {
                 tracing::info!(job = %job, expr = %expr, "held fire launching");
-                note_tick(runner, job, expr, *at, &entry.params);
+                note_tick(runner, job, expr, *at, &entry.params, true);
                 launched.insert(job.as_str());
             }
             Ok(true) => {
@@ -487,7 +488,7 @@ pub(crate) async fn run_scheduler(mut entries: Vec<ScheduleEntry>, runner: Runne
                 .unwrap_or_default();
             if !active || policy == Overlap::Allow {
                 tracing::info!(job = %job, expr = %expr, "schedule fired");
-                note_tick(&runner, &job, &expr, t, &params);
+                note_tick(&runner, &job, &expr, t, &params, false);
             } else if policy == Overlap::Queue && !held {
                 tracing::info!(job = %job, expr = %expr, "fire deferred: run still active");
                 note_runless_tick(&runner, &job, &expr, t, TickOutcome::Deferred);
@@ -508,19 +509,33 @@ fn note_runless_tick(
 ) {
     if let Err(e) = runner
         .store()
-        .record_tick(job, expr, due, outcome, None, None)
+        .record_tick(job, expr, due, outcome, false, None, None)
     {
         tracing::warn!(job = %job, "tick write failed: {e}");
     }
 }
 
-fn note_tick(runner: &Runner, job: &str, expr: &str, due: DateTime<Utc>, params: &Value) {
+/// launch one occurrence and record what happened to it. `caught_up` says the
+/// occurrence came due while nothing was running to fire it — the tick row
+/// cannot tell the two apart, and the event kind does.
+fn note_tick(
+    runner: &Runner,
+    job: &str,
+    expr: &str,
+    due: DateTime<Utc>,
+    params: &Value,
+    caught_up: bool,
+) {
     let tick = match runner.launch_at(job, params.clone(), Trigger::Schedule, Some(due)) {
-        Ok(run_id) => {
-            runner
-                .store()
-                .record_tick(job, expr, due, TickOutcome::Fired, Some(&run_id), None)
-        }
+        Ok(run_id) => runner.store().record_tick(
+            job,
+            expr,
+            due,
+            TickOutcome::Fired,
+            caught_up,
+            Some(&run_id),
+            None,
+        ),
         Err(err) => {
             tracing::error!(job = %job, error = %err, "scheduled launch failed");
             runner.store().record_tick(
@@ -528,6 +543,7 @@ fn note_tick(runner: &Runner, job: &str, expr: &str, due: DateTime<Utc>, params:
                 expr,
                 due,
                 TickOutcome::Error,
+                caught_up,
                 None,
                 Some(&err.to_string()),
             )
@@ -952,7 +968,15 @@ mod tests {
         // this same process is exactly what a live claim looks like
         wait_idle(&store, "etl").await;
         store
-            .record_tick("etl", HOURLY, held, TickOutcome::Deferred, None, None)
+            .record_tick(
+                "etl",
+                HOURLY,
+                held,
+                TickOutcome::Deferred,
+                false,
+                None,
+                None,
+            )
             .unwrap();
         let cursor = cursor_of(&store);
         assert_eq!(cursor, Some(now - chrono::Duration::minutes(30)));

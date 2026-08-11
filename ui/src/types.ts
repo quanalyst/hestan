@@ -3,12 +3,17 @@ export type OpStatus = "pending" | "running" | "success" | "failed" | "skipped" 
 export type Trigger = "manual" | "schedule" | "retry" | "resume" | "build" | "sensor";
 export type EventLevel = "info" | "warn" | "error";
 
+// what happened. the string is open, not closed: a build newer than this ui
+// writes kinds it has never heard of, and the api hands them through rather
+// than refusing the row — so the union documents what is known and the trailing
+// `(string & {})` is what keeps an unknown one from being a type error
 export type EventKind =
   | "run_queued"
   | "run_started"
   | "run_success"
   | "run_failed"
   | "run_canceled"
+  | "run_reclaimed"
   | "op_started"
   | "op_expanded"
   | "op_retry"
@@ -17,7 +22,35 @@ export type EventKind =
   | "op_skipped"
   | "op_canceled"
   | "type_check_failed"
-  | "log";
+  | "asset_materialized"
+  | "check_passed"
+  | "check_failed"
+  | "schedule_fired"
+  | "schedule_caught_up"
+  | "schedule_skipped"
+  | "schedule_deferred"
+  | "schedule_error"
+  | "sensor_tick"
+  | "backfill_started"
+  | "backfill_chunk"
+  | "backfill_finished"
+  | "backfill_canceled"
+  | "notification_delivered"
+  | "notification_failed"
+  | "retention_pruned"
+  | "log"
+  | (string & {});
+
+// which of hestan's tables an event is about
+export type SubjectKind =
+  | "run"
+  | "job"
+  | "asset"
+  | "schedule"
+  | "sensor"
+  | "backfill"
+  | "system"
+  | (string & {});
 
 export type TickOutcome = "fired" | "error" | "skipped" | "deferred";
 
@@ -287,7 +320,11 @@ export interface OpRun {
 
 export interface RunEvent {
   seq: number;
-  run_id: string;
+  // the run this is about; null on everything that is not about a run
+  run_id: string | null;
+  subject_kind: SubjectKind;
+  // which one, by name or id. null on a run event, where the run is run_id
+  subject: string | null;
   op: string | null;
   level: EventLevel;
   kind: EventKind;

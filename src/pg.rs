@@ -46,6 +46,9 @@ use crate::store::{AnyRow, SCHEMA_VERSION, Val, args};
 /// added it. the differences are `BIGSERIAL` where sqlite writes `INTEGER
 /// PRIMARY KEY AUTOINCREMENT`, `BIGINT` where it writes `INTEGER`, and the
 /// collation.
+///
+/// this is a *fresh* database's schema. an existing one is brought forward by
+/// [`migrate`], which is where the steps live.
 const SCHEMA: &str = r#"
 -- postgres has no `user_version`, so the stamp is a table. one row, and the
 -- constraint says so: this is a fact about the database, not a log of them
@@ -90,15 +93,18 @@ CREATE TABLE op_runs (
 );
 CREATE TABLE events (
     seq BIGSERIAL PRIMARY KEY,
-    run_id TEXT COLLATE "C" NOT NULL,
+    run_id TEXT COLLATE "C",
     op TEXT COLLATE "C",
     level TEXT COLLATE "C" NOT NULL,
     message TEXT COLLATE "C" NOT NULL,
     ts TEXT COLLATE "C" NOT NULL,
     kind TEXT COLLATE "C" NOT NULL DEFAULT 'log',
-    data TEXT COLLATE "C"
+    data TEXT COLLATE "C",
+    subject_kind TEXT COLLATE "C" NOT NULL DEFAULT 'run',
+    subject TEXT COLLATE "C"
 );
 CREATE INDEX events_run ON events(run_id, seq);
+CREATE INDEX events_subject ON events(subject_kind, subject, seq DESC);
 CREATE TABLE schedules (
     job TEXT COLLATE "C" NOT NULL,
     expr TEXT COLLATE "C" NOT NULL,
@@ -417,12 +423,26 @@ fn bound<'a>(args: &'a [Val<'a>]) -> Vec<&'a (dyn ToSql + Sync)> {
     args.iter().map(|v| v as &(dyn ToSql + Sync)).collect()
 }
 
-/// create the schema, or refuse a database a later build wrote.
+/// the events table stops being about runs. the postgres half of
+/// `SCHEMA_V17`, and a fraction of the work: dropping a NOT NULL is a catalog
+/// row, and a column added with a constant default has been catalog-only since
+/// postgres 11. only the index reads the table, and it reads it once. sqlite
+/// has no `ALTER COLUMN` and rebuilds the whole thing.
+const MIGRATE_V17: &str = r#"
+ALTER TABLE events ALTER COLUMN run_id DROP NOT NULL;
+ALTER TABLE events ADD COLUMN subject_kind TEXT COLLATE "C" NOT NULL DEFAULT 'run';
+ALTER TABLE events ADD COLUMN subject TEXT COLLATE "C";
+CREATE INDEX events_subject ON events(subject_kind, subject, seq DESC);
+"#;
+
+/// create the schema, or bring an existing one forward, or refuse a database a
+/// later build wrote.
 ///
 /// one transaction around the lot (postgres ddl is transactional), so an
-/// interrupted first boot leaves the database exactly as found — the same
-/// guarantee the sqlite chain gives. from here the chain is forward-only, and
-/// a v17 step would go below the version read.
+/// interrupted first boot — or an interrupted step — leaves the database
+/// exactly as found, which is the same guarantee the sqlite chain gives. the
+/// chain is forward-only: a step is a `if version < n` below, in order, and
+/// the stamp moves once at the end.
 fn migrate(client: &mut Client) -> Result<(), Error> {
     let mut tx = client.transaction()?;
     tx.execute("SELECT pg_advisory_xact_lock(?1)", args![BOOT_LOCK])?;
@@ -443,6 +463,15 @@ fn migrate(client: &mut Client) -> Result<(), Error> {
             let version = u32::try_from(version).unwrap_or(u32::MAX);
             if version > SCHEMA_VERSION {
                 return Err(Error::SchemaTooNew(version));
+            }
+            if version < 17 {
+                tx.batch(MIGRATE_V17)?;
+            }
+            if version != SCHEMA_VERSION {
+                tx.execute(
+                    "UPDATE schema_version SET version = ?1",
+                    args![i64::from(SCHEMA_VERSION)],
+                )?;
             }
         }
         _ => {

@@ -88,9 +88,7 @@ pub(crate) fn cancel(runner: &Runner, id: i64) -> Result<bool, Error> {
     }
     // recorded before the run finishes: the status is the request, and the
     // chunker must not send another one in the gap
-    runner
-        .store()
-        .finish_backfill(id, BackfillStatus::Canceled)?;
+    close(runner, &backfill, BackfillStatus::Canceled)?;
     Ok(true)
 }
 
@@ -115,18 +113,25 @@ pub(crate) fn tick(runner: &Runner, registry: &AssetRegistry) -> Result<(), Erro
             RunStatus::Success if backfill.launched < backfill.total => {
                 launch_next(runner, registry, &backfill)?;
             }
-            RunStatus::Success => runner
-                .store()
-                .finish_backfill(backfill.id, BackfillStatus::Complete)?,
-            RunStatus::Failed => runner
-                .store()
-                .finish_backfill(backfill.id, BackfillStatus::Failed)?,
-            RunStatus::Canceled => runner
-                .store()
-                .finish_backfill(backfill.id, BackfillStatus::Canceled)?,
+            RunStatus::Success => close(runner, &backfill, BackfillStatus::Complete)?,
+            RunStatus::Failed => close(runner, &backfill, BackfillStatus::Failed)?,
+            RunStatus::Canceled => close(runner, &backfill, BackfillStatus::Canceled)?,
         }
     }
     Ok(())
+}
+
+/// close a backfill out, with what it managed to launch. the store wants the
+/// asset and the counts for the [event](crate::EventKind::BackfillFinished) it
+/// writes beside the status, and every caller here has the row in hand.
+fn close(runner: &Runner, backfill: &Backfill, status: BackfillStatus) -> Result<(), Error> {
+    runner.store().finish_backfill(
+        backfill.id,
+        &backfill.asset,
+        status,
+        backfill.launched,
+        backfill.total,
+    )
 }
 
 /// launch the next chunk of `backfill`, capped at the asset's build limit —
@@ -154,9 +159,7 @@ fn launch_next(
         .cloned()
         .collect();
     if chunk.is_empty() {
-        runner
-            .store()
-            .finish_backfill(backfill.id, BackfillStatus::Complete)?;
+        close(runner, backfill, BackfillStatus::Complete)?;
         return Ok(());
     }
     let mats = mats_map(runner.store())?;
@@ -168,9 +171,13 @@ fn launch_next(
     let mut tags = asset_tag(&backfill.asset);
     tags.insert("backfill".to_string(), backfill.id.to_string());
     let run_id = launch_plan(runner, plan, Trigger::Build, tags)?;
-    runner
-        .store()
-        .backfill_launched(backfill.id, &run_id, backfill.launched + chunk.len())?;
+    runner.store().backfill_launched(
+        backfill.id,
+        &backfill.asset,
+        &run_id,
+        backfill.launched + chunk.len(),
+        backfill.total,
+    )?;
     tracing::info!(
         backfill = backfill.id,
         asset = %backfill.asset,

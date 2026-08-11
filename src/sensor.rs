@@ -623,6 +623,7 @@ fn note_skipped_tick(runner: &Runner, name: &str) {
         0,
         // no evaluation ran, so there is no duration to claim
         0,
+        &[],
         Some("previous evaluation still running"),
     ) {
         tracing::warn!(sensor = %name, "tick write failed: {e}");
@@ -651,17 +652,25 @@ fn sensor_paused(runner: &Runner, name: &str) -> bool {
 /// its timeout.
 #[derive(Default)]
 struct Counts {
-    launched: AtomicU32,
+    /// the runs it launched, in the order it launched them. the ids rather
+    /// than a number, because "what did this sensor do at 3am" is answered by
+    /// the runs and not by how many there were — the length is the count.
+    launched: Mutex<Vec<String>>,
     skipped: AtomicU32,
 }
 
 impl Counts {
     fn record(&self, fired: Fired) {
-        let counter = match fired {
-            Fired::Launched => &self.launched,
-            Fired::Skipped => &self.skipped,
-        };
-        counter.fetch_add(1, Ordering::Relaxed);
+        match fired {
+            Fired::Launched(run_id) => self.launched.lock().unwrap().push(run_id),
+            Fired::Skipped => {
+                self.skipped.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+
+    fn runs(&self) -> Vec<String> {
+        self.launched.lock().unwrap().clone()
     }
 }
 
@@ -703,12 +712,14 @@ async fn evaluate(entry: &SensorEntry, runner: &Runner, registry: &AssetRegistry
             (SensorOutcome::Error, Some(msg))
         }
     };
+    let runs = counts.runs();
     if let Err(e) = runner.store().record_sensor_tick(
         &entry.name,
         outcome,
-        counts.launched.load(Ordering::Relaxed),
+        runs.len() as u32,
         counts.skipped.load(Ordering::Relaxed),
         started.elapsed().as_millis() as u64,
+        &runs,
         error.as_deref(),
     ) {
         tracing::warn!(sensor = %entry.name, "tick write failed: {e}");
@@ -724,7 +735,8 @@ fn sensor_tag(sensor: &str) -> RunTags {
 
 /// what launching one request did.
 enum Fired {
-    Launched,
+    /// the run it launched, by id: what a tick says it did.
+    Launched(String),
     /// its run key was already claimed, so it is not launched again.
     Skipped,
 }
@@ -743,7 +755,7 @@ fn launch_request(sensor: &str, req: RunRequest, runner: &Runner) -> Result<Fire
         return match runner.launch_tagged(&job, params, Trigger::Sensor, sensor_tag(sensor)) {
             Ok(run_id) => {
                 tracing::info!(sensor = %sensor, job = %job, run = %run_id, "sensor fired");
-                Ok(Fired::Launched)
+                Ok(Fired::Launched(run_id))
             }
             Err(e) => Err(fail(e)),
         };
@@ -765,7 +777,7 @@ fn launch_request(sensor: &str, req: RunRequest, runner: &Runner) -> Result<Fire
     ) {
         Ok(Some(run_id)) => {
             tracing::info!(sensor = %sensor, job = %job, key = %key, run = %run_id, "sensor fired");
-            Ok(Fired::Launched)
+            Ok(Fired::Launched(run_id))
         }
         // claimed between the read and the insert; one launch either way
         Ok(None) => Ok(Fired::Skipped),
@@ -1010,7 +1022,9 @@ async fn evaluate_probe(
     // every tick is what heals a launch that failed after the commit
     match launch_stale_auto(asset, runner, registry) {
         Ok(launched) => {
-            counts.launched.fetch_add(launched, Ordering::Relaxed);
+            if let Some(run_id) = launched {
+                counts.record(Fired::Launched(run_id));
+            }
             (SensorOutcome::Fired, None)
         }
         Err(msg) => (SensorOutcome::Error, Some(msg)),
@@ -1023,7 +1037,7 @@ fn launch_stale_auto(
     asset: &str,
     runner: &Runner,
     registry: &AssetRegistry,
-) -> Result<u32, String> {
+) -> Result<Option<String>, String> {
     let mats = mats_map(runner.store()).map_err(|e| e.to_string())?;
     let stale = staleness(registry, &mats);
     let downstream = registry.downstream(asset);
@@ -1034,7 +1048,7 @@ fn launch_stale_auto(
         .map(|m| m.name.clone())
         .collect();
     if targets.is_empty() {
-        return Ok(0);
+        return Ok(None);
     }
     if runner
         .store()
@@ -1042,7 +1056,7 @@ fn launch_stale_auto(
         .map_err(|e| e.to_string())?
     {
         tracing::info!(asset = %asset, "auto build skipped: asset build already running");
-        return Ok(0);
+        return Ok(None);
     }
     let plan = plan_targets(registry, &mats, &targets).map_err(|e| e.to_string())?;
     // a probe is a sensor named after the source it watches, and `build` does
@@ -1050,7 +1064,7 @@ fn launch_stale_auto(
     let run_id = launch_plan(runner, plan, Trigger::Build, sensor_tag(asset))
         .map_err(|e| format!("auto build of {} failed: {e}", targets.join(", ")))?;
     tracing::info!(assets = %targets.join(", "), run = %run_id, "auto build launched");
-    Ok(1)
+    Ok(Some(run_id))
 }
 
 fn panic_payload(panic: &(dyn std::any::Any + Send)) -> Option<&str> {

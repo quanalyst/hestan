@@ -4646,7 +4646,7 @@ mod tests {
             .set_sensor_cursor("watch", &json!({"mtime": 5}))
             .unwrap();
         store
-            .record_sensor_tick("watch", crate::SensorOutcome::Fired, 2, 1, 12, None)
+            .record_sensor_tick("watch", crate::SensorOutcome::Fired, 2, 1, 12, &[], None)
             .unwrap();
         store
             .record_sensor_tick(
@@ -4655,6 +4655,7 @@ mod tests {
                 0,
                 0,
                 3,
+                &[],
                 Some("no such dir"),
             )
             .unwrap();
