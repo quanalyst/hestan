@@ -152,7 +152,7 @@ standalone binary for those two. [docs/cli.md](docs/cli.md).
   failure skips its downstream and fails the run, while independent branches
   keep going
 - op outputs are pluggable: `Hestan::io(FileIo::new(dir))` moves them out of
-  sqlite and leaves a `{"$io": ..}` handle in the run log, with `Op::io(name)`
+  the run log and leaves a `{"$io": ..}` handle in it, with `Op::io(name)`
   for per-op managers. the default `Inline` is exactly today's behaviour
 - resources are built once at startup and shared by every op:
   `Hestan::resource("api", |_| async { Ok(ApiClient::new()?) })` plus
@@ -360,6 +360,7 @@ careful about which of that has been run and which of it follows.
 
 the details live in [docs/](docs/README.md):
 [getting started](docs/getting-started.md),
+[choosing](docs/choosing.md) (which of these do you want),
 [concepts](docs/concepts.md) (execution semantics),
 [typed io](docs/typed-io.md), [resources](docs/resources.md),
 [io managers](docs/io-managers.md), [op state](docs/state.md),

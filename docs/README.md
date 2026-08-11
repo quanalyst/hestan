@@ -1,6 +1,7 @@
 # hestan docs
 
-- [getting started](getting-started.md) — add the dependency, write a first job, see it in the ui.
+- [getting started](getting-started.md) — `cargo add hestan` to a scheduled job with a ui, in one pass.
+- [choosing](choosing.md) — which of these do you want: job or asset, sqlite or postgres, in-process or isolated, schedule or sensor.
 - [concepts](concepts.md) — ops, jobs, runs, events, triggers, and exactly how a run executes.
 - [typed io](typed-io.md) — `Op::typed`, `input_as`, `.params::<P>()`, and what a type-check failure does.
 - [resources](resources.md) — values built once at startup and shared by every op: `Hestan::resource`, `ctx.resource::<T>`, `Op::requires`.
