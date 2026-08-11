@@ -16,7 +16,7 @@ use std::process::{Command, Output};
 use std::time::{Duration, Instant};
 
 use hestan::prelude::*;
-use hestan::{Limits, Runner, Store, Trigger};
+use hestan::{EventQuery, Limits, Runner, Store, Trigger};
 
 /// where the process under test finds its run log. absent means "run the
 /// cases", which is how one binary is both halves of this.
@@ -97,6 +97,8 @@ async fn cases(dir: &Path) {
     case("quiet_prints_the_id_and_nothing_else", quiet(dir)).await;
     case("nothing_is_styled_into_a_pipe", unstyled(dir)).await;
     case("no_arguments_serves", serves(dir)).await;
+    case("each_mode_reaches_what_it_should", modes(dir)).await;
+    case("a_follow_resumes_from_a_cursor", resumes(dir)).await;
 }
 
 // ------------------------------------------------------------------ the cases
@@ -304,6 +306,106 @@ async fn serves(dir: &Path) {
     let _ = child.wait();
 }
 
+/// the three ways to reach a deployment, against one database: this binary,
+/// the standalone one over the same file, and the standalone one over a server
+/// that is serving it.
+async fn modes(dir: &Path) {
+    let db = db(dir, "modes");
+    let addr = free_port();
+    let mut server = Command::new(exe())
+        .env(DB, &db)
+        .env(ADDR, addr.to_string())
+        .spawn()
+        .expect("the deployment serves");
+    wait_for("the ui to come up", || get(addr, "/api/health")).await;
+
+    // embedded: everything, because everything is here
+    cli(&db, &["run", "quick", "--wait"]).assert(0);
+
+    // a run log: the reads are there and the registry is not, and what it
+    // cannot do it says in a sentence rather than an error code
+    let listed = operator(&["--db", db.to_str().unwrap(), "--json", "runs"]);
+    listed.assert(0);
+    let value: Value = serde_json::from_str(&listed.stdout).expect("one json object");
+    assert!(!value["runs"].as_array().unwrap().is_empty());
+
+    for command in [vec!["run", "quick"], vec!["jobs"], vec!["serve"]] {
+        let mut args = vec!["--db", db.to_str().unwrap()];
+        args.extend(command.iter().copied());
+        let refused = operator(&args);
+        refused.assert(6);
+        assert!(
+            refused.stderr.contains("no job definitions"),
+            "{command:?} was refused without saying why: {refused:?}"
+        );
+    }
+
+    // a server: the same commands over the api it was already serving
+    let url = format!("http://{addr}");
+    let over = |args: &[&str]| {
+        let mut all = vec!["--server", &url];
+        all.extend(args.iter().copied());
+        operator(&all)
+    };
+    over(&["runs"]).assert(0);
+    let jobs = over(&["--quiet", "jobs"]);
+    jobs.assert(0);
+    assert!(jobs.stdout.contains("quick"), "{jobs:?}");
+    let waited = over(&["--json", "run", "quick", "--wait"]);
+    waited.assert(0);
+    let run: Value = serde_json::from_str(&waited.stdout).expect("one json object");
+    assert_eq!(run["status"], "success", "{waited:?}");
+    // and a run that fails over the network still fails here
+    over(&["run", "boom", "--wait"]).assert(1);
+    // an unreachable server is its own answer, not a failure of the work
+    operator(&["--server", "http://127.0.0.1:1", "runs"]).assert(5);
+
+    let _ = server.kill();
+    let _ = server.wait();
+}
+
+/// a follower given a cursor starts above it, which is what makes a dropped
+/// connection something you can pick back up rather than a hole.
+async fn resumes(dir: &Path) {
+    let db = db(dir, "resume");
+    cli(&db, &["run", "quick", "--wait"]).assert(0);
+    let store = Store::open(db.to_str().unwrap()).unwrap();
+    let all = store.event_log(&EventQuery::default(), 500).unwrap();
+    // the log comes back newest first; the cursor is halfway down it
+    let cursor = all[all.len() / 2].seq;
+    let above = all.iter().filter(|e| e.seq > cursor).count();
+    assert!(above > 1, "not enough log to resume through");
+
+    let mut following = spawn(
+        &db,
+        &[
+            "--json",
+            "events",
+            "--follow",
+            "--after",
+            &cursor.to_string(),
+        ],
+    );
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    let _ = following.kill();
+    let ran = Ran::of(following.wait_with_output().unwrap());
+    let seqs: Vec<i64> = ran
+        .stdout
+        .lines()
+        .map(|line| {
+            let event: Value = serde_json::from_str(line)
+                .unwrap_or_else(|e| panic!("a followed line is not json: {e}: {line}"));
+            event["seq"].as_i64().expect("every event has a seq")
+        })
+        .collect();
+    assert_eq!(seqs.len(), above, "a resumed follow read the wrong range");
+    assert!(seqs.iter().all(|&seq| seq > cursor), "{seqs:?}");
+    assert!(
+        seqs.windows(2).all(|w| w[0] < w[1]),
+        "out of order: {seqs:?}"
+    );
+}
+
 // ---------------------------------------------------------------- the harness
 
 #[derive(Debug)]
@@ -316,7 +418,9 @@ struct Ran {
 impl Ran {
     fn of(out: Output) -> Ran {
         Ran {
-            code: out.status.code().expect("the process was not signalled"),
+            // a follower this suite killed has no code of its own, and -1 is
+            // not one any case asserts on
+            code: out.status.code().unwrap_or(-1),
             stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
             stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
         }
@@ -344,6 +448,17 @@ fn cli(db: &Path, args: &[&str]) -> Ran {
             .args(args)
             .output()
             .expect("the command starts"),
+    )
+}
+
+/// the standalone `hestan`, which has no registry of its own: the binary an
+/// operator installs, run against whatever this case points it at.
+fn operator(args: &[&str]) -> Ran {
+    Ran::of(
+        Command::new(env!("CARGO_BIN_EXE_hestan"))
+            .args(args)
+            .output()
+            .expect("the standalone binary starts"),
     )
 }
 

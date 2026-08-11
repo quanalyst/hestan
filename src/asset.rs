@@ -1544,6 +1544,49 @@ pub(crate) fn launch_plan(
     )
 }
 
+/// launch a build of one asset: it, plus whatever upstream of it is stale, as
+/// one run.
+///
+/// `Ok(None)` is an asset that is already up to date and had nothing to do —
+/// not a refusal and not a run. named `keys` are a rebuild of exactly those
+/// partitions whatever staleness says, which is the point of naming them.
+///
+/// the api handler and the command line both come through here, so "build this
+/// asset" cannot come to mean two things depending on which one asked.
+pub(crate) fn build_one(
+    runner: &crate::executor::Runner,
+    reg: &AssetRegistry,
+    name: &str,
+    keys: &[String],
+) -> Result<Option<String>, Error> {
+    let Some(meta) = reg.get(name) else {
+        return Err(Error::UnknownAsset(name.to_string()));
+    };
+    if meta.source {
+        return Err(Error::Graph("sources are probed, never built".into()));
+    }
+    let named: HashMap<String, Vec<String>> = match keys.is_empty() {
+        true => HashMap::new(),
+        false => {
+            if meta.partitions.is_none() {
+                return Err(Error::Graph(format!("asset {name} is not partitioned")));
+            }
+            HashMap::from([(name.to_string(), keys.to_vec())])
+        }
+    };
+    // one build at a time: they share the assets job, and two overlapping ones
+    // would materialize the same asset twice from different plans
+    if runner.store().has_active_run(ASSETS_JOB)? {
+        return Err(Error::Conflict("asset build already running".into()));
+    }
+    let mats = mats_map(runner.store())?;
+    if named.is_empty() && !staleness(reg, &mats)[name].stale {
+        return Ok(None);
+    }
+    let plan = plan_partitions(reg, &mats, std::slice::from_ref(&name.to_string()), &named)?;
+    launch_plan(runner, plan, Trigger::Build, asset_tag(name)).map(Some)
+}
+
 /// the tag a build of one named asset carries.
 pub(crate) fn asset_tag(asset: &str) -> RunTags {
     RunTags::from([("asset".to_string(), asset.to_string())])

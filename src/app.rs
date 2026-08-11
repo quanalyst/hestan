@@ -949,6 +949,22 @@ impl Hestan {
         Store::at(&self.db_path)
     }
 
+    /// the registry beside the store, lowered and validated, and still with
+    /// none of the boot behaviour — see [`open`](Self::open) for what is
+    /// deliberately not happening.
+    #[cfg(feature = "cli")]
+    pub(crate) fn inspect(mut self) -> Result<Inspected, Error> {
+        let (jobs, registry) = self.lower()?;
+        let store = Store::at(&self.db_path)?;
+        Ok(Inspected {
+            jobs,
+            registry,
+            store,
+            pools: self.pools,
+            limits: self.limits,
+        })
+    }
+
     pub(crate) async fn build(mut self) -> Result<Built, Error> {
         let (jobs, registry) = self.lower()?;
         let schedules = std::mem::take(&mut self.schedules);
@@ -1059,6 +1075,18 @@ async fn delivered(runner: &Runner) {
     if runner.durable() {
         hooks::deliver_once(runner, chrono::Utc::now()).await;
     }
+}
+
+/// what an app is, to a reader: the jobs it defines, the assets it declares,
+/// the store it would open, and the limits it would apply. no runner, because
+/// nothing here executes anything.
+#[cfg(feature = "cli")]
+pub(crate) struct Inspected {
+    pub(crate) jobs: Vec<Job>,
+    pub(crate) registry: Arc<AssetRegistry>,
+    pub(crate) store: Store,
+    pub(crate) pools: Vec<(String, usize)>,
+    pub(crate) limits: Limits,
 }
 
 pub(crate) struct Built {

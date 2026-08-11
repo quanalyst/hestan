@@ -2,7 +2,7 @@ use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
 use std::sync::{Arc, Mutex, MutexGuard};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
 use rusqlite::{Connection, OptionalExtension};
@@ -1461,6 +1461,21 @@ impl Store {
         Ok(out)
     }
 
+    /// the queue in the order a dispatcher would take it, and nothing about
+    /// why anything is waiting.
+    ///
+    /// that omission is the whole reason this exists beside
+    /// [`queue`](Self::queue). the blame belongs to whoever owns the limits,
+    /// and a reader that has only opened the database owns none: it would
+    /// either have to invent them, and report a queue that nothing is holding
+    /// back, or report every job as undefined because this process defines
+    /// none. saying only what it knows is the third option.
+    #[cfg(any(test, feature = "cli"))]
+    pub(crate) fn queue_rows(&self, limit: u32) -> Result<Vec<Run>, Error> {
+        let rows = queued(&mut self.conn(), limit)?;
+        Ok(rows.into_iter().map(|(run, _)| run).collect())
+    }
+
     /// how many runs are queued and unclaimed, which is what "queue depth"
     /// means. counted rather than taken from [`queue`](Self::queue), which caps.
     pub(crate) fn queue_depth(&self) -> Result<usize, Error> {
@@ -2809,6 +2824,59 @@ impl Store {
         })
     }
 
+    /// what a follower may take this pass.
+    ///
+    /// on a backend that [settles in order](Self::settles_in_order) that is
+    /// everything committed, full stop. on one that does not, it is the
+    /// unbroken run above the cursor — and the gap that ended it is remembered
+    /// in `waiting`, so that the same gap seen for longer than
+    /// [`SETTLE_GRACE`] is stepped over rather than stalling the follower
+    /// forever on a rolled-back write.
+    ///
+    /// **every follower of this table goes through here**, so the sse stream
+    /// and a command line tailing the log cannot come to different conclusions
+    /// about what is safe to read — which, for a rule this subtle, they
+    /// otherwise would.
+    pub(crate) fn readable(
+        &self,
+        cursor: i64,
+        waiting: &mut Option<(i64, Instant)>,
+    ) -> Result<Step, Error> {
+        if self.settles_in_order() {
+            return Ok(Step {
+                ceiling: self.event_watermark()?,
+                skip_to: None,
+            });
+        }
+        let settled = self.settled_after(cursor, SETTLE_SCAN)?;
+        let Some(gap) = settled.gap else {
+            *waiting = None;
+            return Ok(Step {
+                ceiling: settled.upto,
+                skip_to: None,
+            });
+        };
+        let since = match waiting {
+            Some((at, since)) if *at == gap => *since,
+            _ => {
+                let now = Instant::now();
+                *waiting = Some((gap, now));
+                now
+            }
+        };
+        let expired = since.elapsed() >= SETTLE_GRACE;
+        if expired {
+            tracing::debug!("event log: seq {gap} never arrived; stepping over it");
+            *waiting = None;
+        }
+        Ok(Step {
+            ceiling: settled.upto,
+            // resume at the next visible seq when the scan found one; otherwise
+            // just past the gap, and the next pass walks on from there
+            skip_to: expired.then(|| settled.after_gap.map_or(gap, |next| next - 1)),
+        })
+    }
+
     /// append a materialization. the table is history, so a rebuild that came
     /// out fingerprint-identical is still an entry — that a build happened and
     /// that it changed anything are different facts.
@@ -3709,6 +3777,28 @@ pub struct Settled {
     /// a follower giving up on the gap resumes here rather than one seq at a
     /// time, so a pruned range costs one wait rather than one per row.
     pub after_gap: Option<i64>,
+}
+
+/// how long a follower waits on a missing seq before deciding it is never
+/// coming.
+///
+/// a hole is a transaction still committing or one that aborted, and nothing
+/// can tell those apart from outside. waiting forever stalls the follower on
+/// every rolled-back write; not waiting at all skips events that were about to
+/// land. so: wait, bounded, and say in the docs that a transaction slower than
+/// this may be skipped. hestan's event-writing transactions are a handful of
+/// statements each.
+pub(crate) const SETTLE_GRACE: Duration = Duration::from_secs(2);
+
+/// how far ahead the gap walk looks, which also caps what one poll delivers.
+pub(crate) const SETTLE_SCAN: u32 = 2_000;
+
+/// how far one pass of a follower may read, and whether it is also stepping
+/// over a gap — from [`Store::readable`].
+pub(crate) struct Step {
+    pub(crate) ceiling: i64,
+    /// the cursor to jump to afterwards, when a gap has been waited out.
+    pub(crate) skip_to: Option<i64>,
 }
 
 /// bind one parameter and answer with its number, which is what a `?n` in the
@@ -7078,6 +7168,11 @@ mod tests {
                 store.queue(&Limits::new(), &defined, 10).unwrap()[0].run.id,
                 "r1"
             );
+            // the same order to a reader that owns no limits and so says
+            // nothing about what is holding anything back
+            let rows = store.queue_rows(10).unwrap();
+            let order: Vec<&str> = rows.iter().map(|r| r.id.as_str()).collect();
+            assert_eq!(order, ["r1", "r0", "r2"]);
 
             let (claimed, plan) = store
                 .claim_next("alpha", lease, &Limits::new(), &defined)

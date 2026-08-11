@@ -24,7 +24,7 @@ demo:
     cargo run --example demo --features cli
 
 assets:
-    cargo run --example assets
+    cargo run --example assets --features cli
 
 http-source:
     cargo run --example http_source --features http

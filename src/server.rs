@@ -17,10 +17,7 @@ use include_dir::{Dir, include_dir};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use crate::asset::{
-    ASSETS_JOB, AssetRegistry, asset_tag, launch_plan, mats_map, plan_all, plan_partitions,
-    staleness,
-};
+use crate::asset::{ASSETS_JOB, AssetRegistry, launch_plan, mats_map, plan_all, staleness};
 use crate::backfill;
 use crate::error::Error;
 use crate::executor::{self, CancelOutcome, Runner};
@@ -34,7 +31,7 @@ use crate::model::{
 use crate::op;
 use crate::schedule;
 use crate::sensor::SensorState;
-use crate::store::{EventQuery, Store};
+use crate::store::{EventQuery, Step, Store};
 
 static UI_DIST: Dir<'static> = include_dir!("$CARGO_MANIFEST_DIR/ui/dist");
 
@@ -200,7 +197,16 @@ fn freshness_json(
     })
 }
 
-fn job_summary(job: &Job, st: &AppState) -> Result<Value, Error> {
+/// everything `GET /api/jobs` says about one job.
+///
+/// `store` and `pool_limit` rather than the whole server state, because the
+/// command line answers `jobs` with this same function and has no router
+/// around it — one description of a job, however it is asked for.
+pub(crate) fn job_summary(
+    job: &Job,
+    store: &Store,
+    pool_limit: impl Fn(&str) -> Option<usize>,
+) -> Result<Value, Error> {
     let ops: Vec<Value> = job
         .ops()
         .iter()
@@ -239,11 +245,9 @@ fn job_summary(job: &Job, st: &AppState) -> Result<Value, Error> {
     }
     let pools: Vec<Value> = seen
         .into_iter()
-        .map(|name| json!({ "name": name, "limit": st.runner.pool_limit(name) }))
+        .map(|name| json!({ "name": name, "limit": pool_limit(name) }))
         .collect();
-    let rows: Vec<ScheduleRow> = st
-        .runner
-        .store()
+    let rows: Vec<ScheduleRow> = store
         .schedules()?
         .into_iter()
         .filter(|s| s.job == job.name())
@@ -269,7 +273,7 @@ fn job_summary(job: &Job, st: &AppState) -> Result<Value, Error> {
         .filter(|s| !s.paused)
         .filter_map(|s| prev_fire(s, now))
         .max();
-    let last_success = st.runner.store().last_success(job.name())?;
+    let last_success = store.last_success(job.name())?;
     // a declared policy replaces the heuristic rather than sitting beside it:
     // two answers to "is this job behind" is one answer too many
     let freshness = job.fresh_within().map(|within| {
@@ -284,9 +288,7 @@ fn job_summary(job: &Job, st: &AppState) -> Result<Value, Error> {
         (Some(prev), Some(gap)) => is_overdue(prev, gap, last_success, now),
         _ => false,
     };
-    let last_run = st
-        .runner
-        .store()
+    let last_run = store
         .runs(Some(job.name()), None, None, None, None, 1)?
         .pop();
     Ok(json!({
@@ -336,7 +338,7 @@ async fn list_jobs(State(st): State<AppState>) -> Result<Json<Value>, ApiError> 
     jobs.sort_by(|a, b| a.name().cmp(b.name()));
     let jobs: Vec<Value> = jobs
         .iter()
-        .map(|j| job_summary(j, &st))
+        .map(|j| job_summary(j, st.runner.store(), |p| st.runner.pool_limit(p)))
         .collect::<Result<_, _>>()
         .map_err(internal)?;
     Ok(Json(json!({ "jobs": jobs })))
@@ -350,7 +352,9 @@ async fn get_job(
         .jobs
         .get(&name)
         .ok_or_else(|| err(StatusCode::NOT_FOUND, format!("unknown job: {name}")))?;
-    Ok(Json(job_summary(job, &st).map_err(internal)?))
+    Ok(Json(
+        job_summary(job, st.runner.store(), |p| st.runner.pool_limit(p)).map_err(internal)?,
+    ))
 }
 
 #[derive(Deserialize, Default)]
@@ -685,10 +689,29 @@ async fn cancel_run(
 /// queue ten thousand deep is a fact about the deployment rather than a list
 /// anybody reads to the end.
 async fn list_queue(State(st): State<AppState>) -> Result<Json<Value>, ApiError> {
-    let queued: Vec<Value> = st
-        .runner
-        .queue(QUEUE_PAGE)
-        .map_err(internal)?
+    queue_json(
+        st.runner.store(),
+        &st.runner.limits(),
+        &st.jobs.keys().cloned().collect(),
+    )
+    .map(Json)
+    .map_err(internal)
+}
+
+/// everything `GET /api/queue` says: what is waiting, in the order a dispatch
+/// pass would take it, and what is holding each one back.
+///
+/// **the blame needs the limits**, which is why they are a parameter rather
+/// than something read out of the database: "three runs are already executing,
+/// which is the limit" is a claim only a process that knows the limit can
+/// make.
+pub(crate) fn queue_json(
+    store: &Store,
+    limits: &executor::Limits,
+    defined: &HashSet<String>,
+) -> Result<Value, Error> {
+    let queued: Vec<Value> = store
+        .queue(limits, defined, QUEUE_PAGE)?
         .into_iter()
         .map(|q| {
             json!({
@@ -701,9 +724,8 @@ async fn list_queue(State(st): State<AppState>) -> Result<Json<Value>, ApiError>
             })
         })
         .collect();
-    let limits = st.runner.limits();
-    Ok(Json(json!({
-        "depth": st.runner.queue_depth().map_err(internal)?,
+    Ok(json!({
+        "depth": store.queue_depth()?,
         "queued": queued,
         "limits": {
             "global": limits.global_limit(),
@@ -713,7 +735,7 @@ async fn list_queue(State(st): State<AppState>) -> Result<Json<Value>, ApiError>
                 .map(|(k, v, n)| json!({"key": k, "value": v, "limit": n}))
                 .collect::<Vec<_>>(),
         },
-    })))
+    }))
 }
 
 #[derive(Deserialize)]
@@ -740,12 +762,20 @@ async fn set_run_priority(
 }
 
 async fn list_assets(State(st): State<AppState>) -> Result<Json<Value>, ApiError> {
-    let mats = mats_map(st.runner.store()).map_err(internal)?;
-    let stale = staleness(&st.assets, &mats);
-    let latest_checks = st.runner.store().latest_asset_checks().map_err(internal)?;
+    assets_json(&st.assets, st.runner.store())
+        .map(Json)
+        .map_err(internal)
+}
+
+/// everything `GET /api/assets` says, for the same reason
+/// [`job_summary`] takes a store: the command line answers `assets` with it
+/// too, and one answer is one answer.
+pub(crate) fn assets_json(registry: &AssetRegistry, store: &Store) -> Result<Value, Error> {
+    let mats = mats_map(store)?;
+    let stale = staleness(registry, &mats);
+    let latest_checks = store.latest_asset_checks()?;
     let now = Utc::now();
-    let assets: Vec<Value> = st
-        .assets
+    let assets: Vec<Value> = registry
         .topo()
         .map(|meta| {
             let mat = mats.get(&meta.name, None);
@@ -798,7 +828,7 @@ async fn list_assets(State(st): State<AppState>) -> Result<Json<Value>, ApiError
             })
         })
         .collect();
-    Ok(Json(json!({ "assets": assets })))
+    Ok(json!({ "assets": assets }))
 }
 
 #[derive(Deserialize)]
@@ -1059,42 +1089,19 @@ async fn build_one_asset(
     body: Bytes,
 ) -> Result<(StatusCode, Json<Value>), ApiError> {
     let body = build_body(&body)?;
-    let Some(meta) = st.assets.get(&name) else {
-        return Err(err(StatusCode::NOT_FOUND, format!("unknown asset: {name}")));
-    };
-    if meta.source {
-        return Err(err(
-            StatusCode::BAD_REQUEST,
-            "sources are probed, never built",
-        ));
+    // an omitted key set is the plain build; one that is there and empty is a
+    // request that named nothing, and answering it with the plain build would
+    // be building something nobody asked for
+    if body.partitions.as_ref().is_some_and(|k| k.is_empty()) {
+        return Err(err(StatusCode::BAD_REQUEST, "no partitions named"));
     }
-    let named: HashMap<String, Vec<String>> = match body.partitions {
-        None => HashMap::new(),
-        Some(keys) => {
-            if meta.partitions.is_none() {
-                return Err(err(
-                    StatusCode::BAD_REQUEST,
-                    format!("asset {name} is not partitioned"),
-                ));
-            }
-            if keys.is_empty() {
-                return Err(err(StatusCode::BAD_REQUEST, "no partitions named"));
-            }
-            HashMap::from([(name.clone(), keys)])
-        }
-    };
-    build_gate(&st)?;
-    let mats = mats_map(st.runner.store()).map_err(internal)?;
-    // named keys are a rebuild of exactly those, whatever staleness says; a
-    // plain build of a fresh asset has nothing to do
-    if named.is_empty() && !staleness(&st.assets, &mats)[&name].stale {
-        return Ok((StatusCode::OK, Json(json!({ "up_to_date": true }))));
-    }
-    let plan = plan_partitions(&st.assets, &mats, std::slice::from_ref(&name), &named)
-        .map_err(bad_plan)?;
-    match launch_plan(&st.runner, plan, Trigger::Build, asset_tag(&name)) {
-        Ok(run_id) => Ok((StatusCode::ACCEPTED, Json(json!({ "run_id": run_id })))),
-        Err(e) => Err(internal(e)),
+    let keys = body.partitions.unwrap_or_default();
+    match crate::asset::build_one(&st.runner, &st.assets, &name, &keys) {
+        Ok(Some(run_id)) => Ok((StatusCode::ACCEPTED, Json(json!({ "run_id": run_id })))),
+        // nothing to do is not a refusal, and a 202 with no run id would be a
+        // caller waiting on something that was never launched
+        Ok(None) => Ok((StatusCode::OK, Json(json!({ "up_to_date": true })))),
+        Err(e) => Err(bad_plan(e)),
     }
 }
 
@@ -1275,11 +1282,16 @@ async fn sensor_ticks(
 }
 
 async fn list_schedules(State(st): State<AppState>) -> Result<Json<Value>, ApiError> {
-    let schedules: Vec<Value> = st
-        .runner
-        .store()
-        .schedules()
-        .map_err(internal)?
+    schedules_json(st.runner.store())
+        .map(Json)
+        .map_err(internal)
+}
+
+/// everything `GET /api/schedules` says. shared with the command line for the
+/// same reason [`job_summary`] is.
+pub(crate) fn schedules_json(store: &Store) -> Result<Value, Error> {
+    let schedules: Vec<Value> = store
+        .schedules()?
         .iter()
         .map(|s| {
             json!({
@@ -1294,7 +1306,7 @@ async fn list_schedules(State(st): State<AppState>) -> Result<Json<Value>, ApiEr
             })
         })
         .collect();
-    Ok(Json(json!({ "schedules": schedules })))
+    Ok(json!({ "schedules": schedules }))
 }
 
 #[derive(Deserialize)]
@@ -1784,8 +1796,8 @@ async fn follow(
     let mut waiting: Option<(i64, std::time::Instant)> = None;
     let mut lost: Option<(u64, i64)> = None;
     loop {
-        let ceiling = match ceiling(&store, cursor, &mut waiting) {
-            Ok(ceiling) => ceiling,
+        let step = match store.readable(cursor, &mut waiting) {
+            Ok(step) => Some(step),
             // a read that failed says nothing about the log; keep the cursor
             // and try again rather than closing the stream
             Err(e) => {
@@ -1793,7 +1805,7 @@ async fn follow(
                 None
             }
         };
-        if let Some(Step { ceiling, skip_to }) = ceiling {
+        if let Some(Step { ceiling, skip_to }) = step {
             while cursor < ceiling {
                 let batch = match store.event_tail(&filter, cursor, Some(ceiling), STREAM_BATCH) {
                     Ok(batch) => batch,
@@ -1847,75 +1859,6 @@ async fn follow(
         }
         tokio::time::sleep(STREAM_POLL).await;
     }
-}
-
-/// how far this pass may read, and whether it is also stepping over a gap.
-struct Step {
-    ceiling: i64,
-    /// the cursor to jump to afterwards, when a gap has been waited out.
-    skip_to: Option<i64>,
-}
-
-/// how long a follower waits on a missing seq before deciding it is never
-/// coming.
-///
-/// a hole is a transaction still committing or one that aborted, and nothing
-/// can tell those apart from outside. waiting forever stalls the stream on
-/// every rolled-back write; not waiting at all skips events that were about to
-/// land. so: wait, bounded, and say in the docs that a transaction slower than
-/// this may be skipped. hestan's event-writing transactions are a handful of
-/// statements each.
-const SETTLE_GRACE: StdDuration = StdDuration::from_secs(2);
-
-/// how far ahead the gap walk looks, which also caps what one poll delivers.
-const SETTLE_SCAN: u32 = 2_000;
-
-/// what a follower may take this pass.
-///
-/// on a backend that [settles in order](Store::settles_in_order) that is
-/// everything committed, full stop. on one that does not, it is the unbroken
-/// run above the cursor — and the gap that ended it is remembered, so that the
-/// same gap seen for longer than [`SETTLE_GRACE`] is stepped over rather than
-/// stalling the stream forever on a rolled-back write.
-fn ceiling(
-    store: &Store,
-    cursor: i64,
-    waiting: &mut Option<(i64, std::time::Instant)>,
-) -> Result<Option<Step>, Error> {
-    if store.settles_in_order() {
-        let hi = store.event_watermark()?;
-        return Ok(Some(Step {
-            ceiling: hi,
-            skip_to: None,
-        }));
-    }
-    let settled = store.settled_after(cursor, SETTLE_SCAN)?;
-    let Some(gap) = settled.gap else {
-        *waiting = None;
-        return Ok(Some(Step {
-            ceiling: settled.upto,
-            skip_to: None,
-        }));
-    };
-    let since = match waiting {
-        Some((at, since)) if *at == gap => *since,
-        _ => {
-            let now = std::time::Instant::now();
-            *waiting = Some((gap, now));
-            now
-        }
-    };
-    let expired = since.elapsed() >= SETTLE_GRACE;
-    if expired {
-        tracing::debug!("event stream: seq {gap} never arrived; stepping over it");
-        *waiting = None;
-    }
-    Ok(Some(Step {
-        ceiling: settled.upto,
-        // resume at the next visible seq when the scan found one; otherwise
-        // just past the gap, and the next pass walks on from there
-        skip_to: expired.then(|| settled.after_gap.map_or(gap, |next| next - 1)),
-    }))
 }
 
 #[derive(Deserialize)]
@@ -4070,7 +4013,7 @@ mod tests {
         let st = state(vec![echo_job("etl")]);
         let job = &st.jobs["etl"];
 
-        let s = job_summary(job, &st).unwrap();
+        let s = job_summary(job, st.runner.store(), |p| st.runner.pool_limit(p)).unwrap();
         assert_eq!(s["interval_secs"], json!(null));
         assert_eq!(s["overdue"], json!(false));
 
@@ -4080,7 +4023,7 @@ mod tests {
             .sync_schedules(&[Schedule::new("etl", "0,1 0 1 1 *")])
             .unwrap();
 
-        let s = job_summary(job, &st).unwrap();
+        let s = job_summary(job, st.runner.store(), |p| st.runner.pool_limit(p)).unwrap();
         assert_eq!(s["interval_secs"], json!(60));
         assert_eq!(s["overdue"], json!(true));
 
@@ -4103,21 +4046,21 @@ mod tests {
             lease_until: None,
         };
         st.runner.store().create_run(&stale, &[]).unwrap();
-        let s = job_summary(job, &st).unwrap();
+        let s = job_summary(job, st.runner.store(), |p| st.runner.pool_limit(p)).unwrap();
         assert_eq!(s["overdue"], json!(true));
 
         st.runner
             .run("etl", json!({}), Trigger::Manual)
             .await
             .unwrap();
-        let s = job_summary(job, &st).unwrap();
+        let s = job_summary(job, st.runner.store(), |p| st.runner.pool_limit(p)).unwrap();
         assert_eq!(s["overdue"], json!(false));
 
         st.runner
             .store()
             .set_schedule_paused("etl", "0,1 0 1 1 *", true)
             .unwrap();
-        let s = job_summary(job, &st).unwrap();
+        let s = job_summary(job, st.runner.store(), |p| st.runner.pool_limit(p)).unwrap();
         assert_eq!(s["interval_secs"], json!(null));
         assert_eq!(s["overdue"], json!(false));
     }
@@ -4139,13 +4082,19 @@ mod tests {
             .sync_schedules(&[sched("etl"), sched("plain")])
             .unwrap();
 
-        let plain = job_summary(&st.jobs["plain"], &st).unwrap();
+        let plain = job_summary(&st.jobs["plain"], st.runner.store(), |p| {
+            st.runner.pool_limit(p)
+        })
+        .unwrap();
         assert_eq!(plain["overdue"], json!(true));
         assert_eq!(plain["freshness"], json!(null));
 
         // the heuristic would say overdue too; the policy is asked instead, and
         // never having succeeded is not late
-        let etl = job_summary(&st.jobs["etl"], &st).unwrap();
+        let etl = job_summary(&st.jobs["etl"], st.runner.store(), |p| {
+            st.runner.pool_limit(p)
+        })
+        .unwrap();
         assert_eq!(etl["overdue"], json!(false), "the policy is the answer now");
         assert_eq!(etl["freshness"]["status"], json!("never"));
         assert_eq!(etl["freshness"]["last_success"], json!(null));
@@ -4154,7 +4103,10 @@ mod tests {
             .run("etl", json!({}), Trigger::Manual)
             .await
             .unwrap();
-        let etl = job_summary(&st.jobs["etl"], &st).unwrap();
+        let etl = job_summary(&st.jobs["etl"], st.runner.store(), |p| {
+            st.runner.pool_limit(p)
+        })
+        .unwrap();
         assert_eq!(etl["freshness"]["status"], json!("fresh"));
         assert_eq!(etl["freshness"]["late_by_secs"], json!(null));
         assert_eq!(etl["overdue"], json!(false));
@@ -4179,7 +4131,10 @@ mod tests {
             .store()
             .backdate_run(&id, Utc::now() - Duration::minutes(90))
             .unwrap();
-        let etl = job_summary(&st.jobs["etl"], &st).unwrap();
+        let etl = job_summary(&st.jobs["etl"], st.runner.store(), |p| {
+            st.runner.pool_limit(p)
+        })
+        .unwrap();
         assert_eq!(etl["freshness"]["status"], json!("late"));
         assert_eq!(etl["freshness"]["late_by_secs"], json!(1800));
         let (_, body, _) = request(router(st.clone()), Method::GET, "/api/late").await;

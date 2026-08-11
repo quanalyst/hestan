@@ -879,6 +879,23 @@ impl Runner {
         }
     }
 
+    /// the queue as this runner sees it: its limits, its jobs. only the cases
+    /// below ask — the ui and the command line both go through
+    /// [`server::queue_json`](crate::server::queue_json), which takes the
+    /// limits as an argument because a reader that does not own them has none
+    /// to report.
+    #[cfg(test)]
+    pub(crate) fn queue(&self, limit: u32) -> Result<Vec<Queued>, Error> {
+        let limits = self.limits.lock().unwrap().clone();
+        let defined: HashSet<String> = self.jobs.keys().cloned().collect();
+        self.store.queue(&limits, &defined, limit)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn queue_depth(&self) -> Result<usize, Error> {
+        self.store.queue_depth()
+    }
+
     /// execute a run this process has claimed.
     fn start(&self, run: Run, plan: Option<Value>) {
         let job = self
@@ -905,19 +922,6 @@ impl Runner {
             pending,
             seeded,
         ));
-    }
-
-    /// the queue: runs nobody has claimed, in the order they will be taken,
-    /// each with what is holding it back.
-    pub(crate) fn queue(&self, limit: u32) -> Result<Vec<Queued>, Error> {
-        let limits = self.limits.lock().unwrap().clone();
-        let defined: HashSet<String> = self.jobs.keys().cloned().collect();
-        self.store.queue(&limits, &defined, limit)
-    }
-
-    /// how many runs are waiting on the queue, uncapped.
-    pub(crate) fn queue_depth(&self) -> Result<usize, Error> {
-        self.store.queue_depth()
     }
 
     /// the runs this process is executing, by id.

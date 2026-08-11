@@ -67,7 +67,7 @@ http = ["dep:reqwest"]
 # a command line in your own binary: `hestan::cli::run`, and the standalone
 # `hestan` binary beside it. off by default because a deployment that only
 # serves should not compile a parser it never calls
-cli = ["dep:clap"]
+cli = ["dep:clap", "dep:reqwest"]
 # `hestan::capture_layer`, for a host that wants the tracing events its ops
 # emit on the run page. off by default: it is the host's subscriber, and
 # hestan does not install one
@@ -80,6 +80,17 @@ postgres = ["dep:tokio-postgres"]
 # by default, and it installs nothing — the host composes the layer and owns
 # the exporter, exactly as it does for `capture`
 otel = ["dep:opentelemetry", "dep:opentelemetry_sdk", "dep:tracing-opentelemetry"]
+
+# the operator's binary: the store and server modes with no registry of its
+# own, for inspecting a database or driving a running instance. behind the
+# same feature, so a default build compiles no binary at all
+[[bin]]
+name = "hestan"
+required-features = ["cli"]
+
+[[example]]
+name = "assets"
+required-features = ["cli"]
 
 [[example]]
 name = "demo"

@@ -228,15 +228,17 @@ async fn main() -> Result<(), hestan::Error> {
         ])
     });
 
-    println!("hestan assets example: http://127.0.0.1:4002");
-    Hestan::new()
+    let app = Hestan::new()
         .assets([docs_dir, doc_stats, doc_totals, daily_changes])
         .multi_assets([split_docs])
         .check(non_empty)
         .check(enough_docs)
         .job(ingest)
         .sensor(marker_watch)
-        .db("assets_demo.db")
-        .serve(([127, 0, 0, 1], 4002))
-        .await
+        .db(std::env::var("HESTAN_DB").unwrap_or_else(|_| "assets_demo.db".into()));
+
+    // the same mount the demo uses: with no arguments this serves on :4002 and
+    // the example is what it was, and with any it is a command line over the
+    // assets declared above — `assets`, `build`, `backfill` and the rest
+    hestan::cli::run(app, ([127, 0, 0, 1], 4002)).await
 }

@@ -17,21 +17,35 @@
 //! **with no arguments it serves**, on exactly the address it was handed. that
 //! is the promise the whole mount rests on: a deployment that swaps the one
 //! call for the other and changes nothing else behaves as it did.
+//!
+//! # three ways to reach a deployment
+//!
+//! the same commands mean the same things whether the jobs are in this binary,
+//! in a database on disk, or in a server across the network:
+//!
+//! - **embedded**, the default — everything works, because everything is here.
+//! - **`--db <path|url>`** — a run log opened directly, with no server running.
+//!   reads work; launching does not in a binary the jobs are not compiled into,
+//!   and it says so in a sentence rather than an error code.
+//! - **`--server <url>`** — a running instance, over the http api it already
+//!   serves. no new endpoints: everything asked for over the network is
+//!   something the ui already asks for.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::io::IsTerminal;
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, CommandFactory, Parser, Subcommand};
 use serde_json::{Value, json};
 
-use crate::app::Hestan;
+use crate::app::{Built, Hestan, Inspected};
 use crate::error::Error;
 use crate::executor::Runner;
-use crate::model::{EventLevel, OpLog, OpStatus, Role, Run, RunStatus, RunTags, Trigger};
-use crate::store::Store;
+use crate::job::Job;
+use crate::model::{EventLevel, Role, Run, RunStatus, RunTags, Trigger};
+use crate::store::{EventQuery, Store};
 
 /// how often the wait loop looks for new lines and for a settled status.
 ///
@@ -40,12 +54,20 @@ use crate::store::Store;
 /// boundary, and the store is the only thing both of them can see.
 const TAIL_POLL: Duration = Duration::from_millis(50);
 
+/// how often a followed event log is read. slower than a run's own tail on
+/// purpose: this is the whole system's log rather than one run's, and a second
+/// of lag on "what is happening" costs nothing.
+const FOLLOW_POLL: Duration = Duration::from_secs(1);
+
 /// how many captured lines or events one drain reads at a time. an op that
 /// printed a million lines is paged through rather than read whole.
 const TAIL_PAGE: u32 = 500;
 
 /// how many runs `runs` shows unless `--limit` says otherwise.
 const RUNS_PAGE: u32 = 20;
+
+/// how much of the queue `queue` shows — the same page the api serves.
+const QUEUE_PAGE: u32 = 200;
 
 /// what the process exits with.
 ///
@@ -147,12 +169,32 @@ struct Cli {
 
 #[derive(Args, Clone)]
 struct Global {
+    /// open this run log directly, with no server running
+    #[arg(
+        long,
+        global = true,
+        value_name = "PATH|URL",
+        conflicts_with = "server"
+    )]
+    db: Option<String>,
+    /// drive a running instance over its http api
+    #[arg(long, global = true, value_name = "URL")]
+    server: Option<String>,
     /// one json object on stdout; anything that streams is one object per line
     #[arg(long, global = true)]
     json: bool,
     /// the id alone and nothing else, which is what `$(...)` wants
     #[arg(long, short, global = true, conflicts_with = "json")]
     quiet: bool,
+}
+
+impl Global {
+    /// whether these flags point somewhere other than this process's own
+    /// deployment, which is what decides whether `serve` is even about this
+    /// binary.
+    fn elsewhere(&self) -> Option<&str> {
+        self.server.as_deref()
+    }
 }
 
 #[derive(Subcommand)]
@@ -171,8 +213,50 @@ enum Command {
     Retry(RunRef),
     /// re-run what did not succeed, seeding what did
     Resume(ResumeArgs),
+    /// every job this deployment defines
+    Jobs,
+    /// every asset, and whether it is stale
+    Assets,
+    /// materialize an asset and whatever upstream of it is stale
+    Build(BuildArgs),
+    /// launch a range of an asset's partitions, a chunk at a time
+    Backfill(BackfillArgs),
+    /// every schedule, when it fires next, and whether it is paused
+    Schedules,
+    /// stop a schedule firing or a sensor evaluating
+    Pause {
+        #[command(subcommand)]
+        what: What,
+    },
+    /// start it again
+    Unpause {
+        #[command(subcommand)]
+        what: What,
+    },
+    /// what is waiting to execute, in the order it will be taken
+    Queue,
+    /// move a queued run up or down the queue
+    Priority(PriorityArgs),
+    /// what happened, across every subsystem
+    Events(EventsArgs),
     /// the ui and whatever loops this process's role owns
     Serve(ServeArgs),
+}
+
+/// the two things that can be paused. spelled as a subcommand rather than a
+/// flag because a job and a sensor can share a name, and a command line that
+/// guesses which one you meant is a command line that eventually guesses wrong.
+#[derive(Subcommand)]
+enum What {
+    /// every schedule on this job, or the one `--expr` names
+    Schedule {
+        job: String,
+        #[arg(long, value_name = "CRON")]
+        expr: Option<String>,
+    },
+    Sensor {
+        name: String,
+    },
 }
 
 #[derive(Args)]
@@ -251,6 +335,68 @@ struct ResumeArgs {
 }
 
 #[derive(Args)]
+struct BuildArgs {
+    /// the asset to materialize
+    asset: String,
+    /// rebuild exactly these partitions, whatever staleness says; repeatable
+    #[arg(long = "partition", value_name = "KEY")]
+    partitions: Vec<String>,
+    /// wait for the build, streaming it, and exit with what it did
+    #[arg(long, short)]
+    wait: bool,
+    #[arg(long, value_name = "SECS", requires = "wait")]
+    timeout: Option<u64>,
+}
+
+#[derive(Args)]
+struct BackfillArgs {
+    /// the partitioned asset to fill in
+    asset: String,
+    /// the first partition key of the range
+    #[arg(long, value_name = "KEY")]
+    from: String,
+    /// the last one, inclusive
+    #[arg(long, value_name = "KEY")]
+    to: String,
+    /// build every key in the range, not only the missing and stale ones
+    #[arg(long)]
+    all: bool,
+}
+
+#[derive(Args)]
+struct PriorityArgs {
+    /// the run id, which must still be queued and unclaimed
+    run: String,
+    /// higher goes first
+    #[arg(allow_negative_numbers = true)]
+    priority: i64,
+}
+
+#[derive(Args)]
+struct EventsArgs {
+    /// only this kind of event
+    #[arg(long, value_name = "KIND")]
+    kind: Option<String>,
+    /// only events about this run, job, asset, schedule or sensor
+    #[arg(long, value_name = "NAME")]
+    subject: Option<String>,
+    /// this level exactly: info, warn or error
+    #[arg(long, value_name = "LEVEL")]
+    level: Option<String>,
+    /// only events since then: `2h`, `30m`, `7d`, or an rfc3339 instant
+    #[arg(long, value_name = "WHEN")]
+    since: Option<String>,
+    #[arg(long, default_value_t = 50)]
+    limit: u32,
+    /// keep printing as more arrives
+    #[arg(long, short)]
+    follow: bool,
+    /// resume a follow from this seq, which is the last one you saw
+    #[arg(long, value_name = "SEQ", requires = "follow")]
+    after: Option<i64>,
+}
+
+#[derive(Args)]
 struct ServeArgs {
     /// bind here instead of wherever the host asked for
     #[arg(long, value_name = "HOST:PORT")]
@@ -283,10 +429,39 @@ pub async fn run(app: Hestan, addr: impl Into<SocketAddr>) -> Result<(), Error> 
     let command = match cli.command {
         // the promise at the top of this file
         None => return app.serve(addr).await,
-        Some(Command::Serve(args)) => return app.serve(args.addr.unwrap_or(addr.into())).await,
+        Some(Command::Serve(args)) if cli.global.elsewhere().is_none() => {
+            return app.serve(args.addr.unwrap_or(addr.into())).await;
+        }
         Some(command) => command,
     };
-    match embedded(app, command, &out).await {
+    finish(reach(Some(app), &cli.global), command, &out).await
+}
+
+/// the same command line in a binary that has no jobs of its own: the
+/// [standalone `hestan`](../../hestan/index.html), which reaches a deployment
+/// through its database or its server and says so plainly when that is not
+/// enough.
+///
+/// there is no address to serve on and no registry to serve, so unlike
+/// [`run`] this needs to be told where to look — `--db` or `--server`, and
+/// nothing at all is a usage error rather than a default.
+pub async fn standalone() -> Result<(), Error> {
+    let cli = Cli::parse();
+    let out = Out::new(&cli.global);
+    let Some(command) = cli.command else {
+        let _ = Cli::command().print_help();
+        std::process::exit(Exit::Usage as i32)
+    };
+    finish(reach(None, &cli.global), command, &out).await
+}
+
+/// run the command and turn whatever it says into an exit code.
+async fn finish(reach: Result<Reach, Fail>, command: Command, out: &Out) -> Result<(), Error> {
+    let done = match reach {
+        Ok(reach) => dispatch(reach, command, out).await,
+        Err(fail) => Err(fail),
+    };
+    match done {
         Ok(()) => Ok(()),
         Err(fail) => {
             eprintln!("{} {}", out.paint("error:", RED), fail.message);
@@ -295,44 +470,371 @@ pub async fn run(app: Hestan, addr: impl Into<SocketAddr>) -> Result<(), Error> 
     }
 }
 
-/// everything the registry in this process can answer.
-async fn embedded(app: Hestan, command: Command, out: &Out) -> Result<(), Fail> {
-    match command {
-        Command::Run(args) => launch(app, args, out).await,
-        Command::Runs(args) => list_runs(&app.open()?, args, out),
-        Command::Show(args) => show(&app.open()?, &args.run, out),
-        Command::Logs(args) => logs(&app.open()?, args, out).await,
-        Command::Cancel(args) => cancel(&app.open()?, &args.run, out),
-        Command::Retry(args) => {
-            let built = app.role(launching_role(false)).build().await?;
-            let run = run_row(built.runner.store(), &args.run)?;
-            if matches!(run.status, RunStatus::Queued | RunStatus::Running) {
-                return Err(Fail::usage(format!("run still active: {}", args.run)));
+// ----------------------------------------------------------------- the three ways
+
+/// what a command is being run against.
+///
+/// the same commands mean the same things in all three, and where one of them
+/// genuinely cannot answer, it says which one it is and what would — see
+/// [`no_registry`]. what separates them is only what is in front of them:
+/// definitions and a database, a database, or somebody else's process.
+enum Reach {
+    /// this binary: the jobs are compiled in, and every command works.
+    Local(Box<Hestan>),
+    /// a run log and nothing else. reads work; launching does not, because a
+    /// database holds no job definitions.
+    Store { store: Store, target: String },
+    /// a running instance, over the http api it already serves.
+    Server(Api),
+}
+
+fn reach(app: Option<Hestan>, global: &Global) -> Result<Reach, Fail> {
+    if let Some(url) = &global.server {
+        return Ok(Reach::Server(Api::new(url)));
+    }
+    match (app, &global.db) {
+        // a binary with the jobs in it keeps them whichever database it is
+        // pointed at: `--db` moves the run log, not the registry
+        (Some(app), Some(db)) => Ok(Reach::Local(Box::new(app.db(db)))),
+        (Some(app), None) => Ok(Reach::Local(Box::new(app))),
+        (None, Some(db)) => Ok(Reach::Store {
+            store: Store::at(db)?,
+            target: db.clone(),
+        }),
+        (None, None) => Err(Fail::usage(
+            "nothing to reach: --db <path|url> for a run log, or --server <url> for a \
+             running instance. a binary with your jobs compiled into it needs neither",
+        )),
+    }
+}
+
+impl Reach {
+    /// the store in front of this, for the reads that need only rows.
+    fn store(self) -> Result<Store, Fail> {
+        match self {
+            Reach::Local(app) => Ok(app.open()?),
+            Reach::Store { store, .. } => Ok(store),
+            Reach::Server(_) => unreachable!("a server-mode read goes through the api"),
+        }
+    }
+
+    /// the registry beside the store, for the reads that need to know what is
+    /// defined rather than only what has happened.
+    fn inspect(self) -> Result<Inspected, Fail> {
+        match self {
+            Reach::Local(app) => Ok(app.inspect()?),
+            Reach::Store { target, .. } => {
+                Err(no_registry(&target, "listing what a deployment defines"))
             }
-            let id = built
-                .runner
-                .launch(&run.job, run.params, Trigger::Retry)
-                .map_err(Fail::from)?;
-            out.launched(&id, &run.job);
+            Reach::Server(_) => unreachable!("a server-mode read goes through the api"),
+        }
+    }
+
+    /// a runner over this binary's jobs, for the commands that launch.
+    async fn built(self, wait: bool) -> Result<Built, Fail> {
+        match self {
+            Reach::Local(app) => Ok(app.role(launching_role(wait)).build().await?),
+            Reach::Store { target, .. } => Err(no_registry(&target, "launching")),
+            Reach::Server(_) => unreachable!("a server-mode launch goes through the api"),
+        }
+    }
+}
+
+/// the one clear line a database gets when it is asked for something only a
+/// registry has.
+///
+/// worth spelling out rather than failing with an error code, because the
+/// reason is not obvious from where you are standing: the run log looks like it
+/// holds a deployment, and it holds everything about a deployment except the
+/// part that is rust.
+fn no_registry(target: &str, wanted: &str) -> Fail {
+    Fail::new(
+        Exit::Unsupported,
+        format!(
+            "--db {target} opens a run log, which records what ran but holds no job \
+             definitions — {wanted} needs the binary they are compiled into, or --server \
+             pointed at one that is running"
+        ),
+    )
+}
+
+// ------------------------------------------------------------------- dispatching
+
+async fn dispatch(reach: Reach, command: Command, out: &Out) -> Result<(), Fail> {
+    match command {
+        Command::Run(args) => launch(reach, args, out).await,
+
+        Command::Runs(args) => {
+            let query = runs_query(&args)?;
+            let answer = match reach {
+                Reach::Server(api) => api.get(&format!("/api/runs?{query}")).await?,
+                reach => {
+                    let store = reach.store()?;
+                    let tag = args.tag.as_deref().map(split_pair).transpose()?;
+                    let since = args.since.as_deref().map(instant).transpose()?;
+                    json!({
+                        "runs": store.runs(
+                            args.job.as_deref(),
+                            since,
+                            None,
+                            None,
+                            tag.as_ref().map(|(k, v)| (k.as_str(), v.as_str())),
+                            args.limit.clamp(1, 2000),
+                        )?,
+                    })
+                }
+            };
+            render_runs(&answer, out);
             Ok(())
         }
-        Command::Resume(args) => {
-            let built = app.role(launching_role(false)).build().await?;
-            let from = (!args.from.is_empty()).then_some(args.from.as_slice());
-            let id = built
-                .runner
-                .resume_from(&args.run, from)
-                .map_err(Fail::from)?;
-            let job = built
-                .runner
-                .store()
-                .run(&id)?
-                .map_or_else(String::new, |r| r.job);
-            out.launched(&id, &job);
+
+        Command::Show(args) => {
+            let answer = match reach {
+                Reach::Server(api) => api.get(&format!("/api/runs/{}", args.run)).await?,
+                reach => {
+                    let store = reach.store()?;
+                    let run = run_row(&store, &args.run)?;
+                    json!({ "run": run, "ops": store.op_runs(&args.run)? })
+                }
+            };
+            render_show(&answer, out);
             Ok(())
         }
-        // handled before the registry is built, since they never return
-        Command::Serve(_) => unreachable!("serve is dispatched by `run`"),
+
+        Command::Logs(args) => logs(reach, args, out).await,
+
+        Command::Cancel(args) => match reach {
+            Reach::Server(api) => {
+                let answer = api
+                    .post(&format!("/api/runs/{}/cancel", args.run), json!({}))
+                    .await?;
+                out.said(
+                    &answer,
+                    &format!("cancel {}: {}", args.run, s(&answer, "outcome")),
+                );
+                Ok(())
+            }
+            reach => cancel(&reach.store()?, &args.run, out),
+        },
+
+        Command::Retry(args) => match reach {
+            Reach::Server(api) => {
+                let answer = api
+                    .post(&format!("/api/runs/{}/retry", args.run), json!({}))
+                    .await?;
+                out.launched(&s(&answer, "run_id"), "");
+                Ok(())
+            }
+            reach => {
+                let built = reach.built(false).await?;
+                let run = run_row(built.runner.store(), &args.run)?;
+                if matches!(run.status, RunStatus::Queued | RunStatus::Running) {
+                    return Err(Fail::usage(format!("run still active: {}", args.run)));
+                }
+                let id = built
+                    .runner
+                    .launch(&run.job, run.params, Trigger::Retry)
+                    .map_err(Fail::from)?;
+                out.launched(&id, &run.job);
+                Ok(())
+            }
+        },
+
+        Command::Resume(args) => match reach {
+            Reach::Server(api) => {
+                let answer = api
+                    .post(
+                        &format!("/api/runs/{}/resume", args.run),
+                        json!({ "from": args.from }),
+                    )
+                    .await?;
+                out.launched(&s(&answer, "run_id"), "");
+                Ok(())
+            }
+            reach => {
+                let built = reach.built(false).await?;
+                let from = (!args.from.is_empty()).then_some(args.from.as_slice());
+                let id = built
+                    .runner
+                    .resume_from(&args.run, from)
+                    .map_err(Fail::from)?;
+                let job = built
+                    .runner
+                    .store()
+                    .run(&id)?
+                    .map_or_else(String::new, |r| r.job);
+                out.launched(&id, &job);
+                Ok(())
+            }
+        },
+
+        Command::Jobs => {
+            let answer = match reach {
+                Reach::Server(api) => api.get("/api/jobs").await?,
+                reach => {
+                    let app = reach.inspect()?;
+                    let pools: HashMap<&str, usize> =
+                        app.pools.iter().map(|(n, l)| (n.as_str(), *l)).collect();
+                    let mut jobs: Vec<&Job> = app.jobs.iter().collect();
+                    jobs.sort_by_key(|j| j.name());
+                    let jobs: Vec<Value> = jobs
+                        .iter()
+                        .map(|j| {
+                            crate::server::job_summary(j, &app.store, |p| pools.get(p).copied())
+                        })
+                        .collect::<Result<_, _>>()?;
+                    json!({ "jobs": jobs })
+                }
+            };
+            render_jobs(&answer, out);
+            Ok(())
+        }
+
+        Command::Assets => {
+            let answer = match reach {
+                Reach::Server(api) => api.get("/api/assets").await?,
+                Reach::Local(app) => {
+                    let app = app.inspect()?;
+                    crate::server::assets_json(&app.registry, &app.store)?
+                }
+                // a database records what was built and cannot say what should
+                // have been: the keys a registry fills in are absent rather
+                // than guessed at
+                Reach::Store { store, .. } => {
+                    let built: Vec<Value> = store
+                        .latest_materializations()?
+                        .into_iter()
+                        .map(|m| {
+                            json!({
+                                "name": m.asset,
+                                "fingerprint": m.fingerprint,
+                                "built_at": m.built_at,
+                                "run_id": m.run_id,
+                            })
+                        })
+                        .collect();
+                    json!({ "assets": built })
+                }
+            };
+            render_assets(&answer, out);
+            Ok(())
+        }
+
+        Command::Build(args) => build(reach, args, out).await,
+
+        Command::Backfill(args) => match reach {
+            Reach::Server(api) => {
+                let answer = api
+                    .post(
+                        &format!("/api/assets/{}/backfill", args.asset),
+                        json!({ "from": args.from, "to": args.to, "only_missing": !args.all }),
+                    )
+                    .await?;
+                out.said(&answer, &format!("backfill {} started", args.asset));
+                Ok(())
+            }
+            reach => {
+                let built = reach.built(false).await?;
+                let backfill = crate::backfill::start(
+                    &built.runner,
+                    &built.registry,
+                    &args.asset,
+                    &args.from,
+                    &args.to,
+                    !args.all,
+                )
+                .map_err(Fail::from)?;
+                let answer = json!(backfill);
+                out.said(
+                    &answer,
+                    &format!(
+                        "backfill {} of {}: {} partitions",
+                        s(&answer, "id"),
+                        args.asset,
+                        answer["total"]
+                    ),
+                );
+                Ok(())
+            }
+        },
+
+        Command::Schedules => {
+            let answer = match reach {
+                Reach::Server(api) => api.get("/api/schedules").await?,
+                reach => crate::server::schedules_json(&reach.store()?)?,
+            };
+            render_schedules(&answer, out);
+            Ok(())
+        }
+
+        Command::Pause { what } => paused(reach, what, true, out).await,
+        Command::Unpause { what } => paused(reach, what, false, out).await,
+
+        Command::Queue => {
+            let answer = match reach {
+                Reach::Server(api) => api.get("/api/queue").await?,
+                Reach::Local(app) => {
+                    let app = app.inspect()?;
+                    let defined = app.jobs.iter().map(|j| j.name().to_string()).collect();
+                    crate::server::queue_json(&app.store, &app.limits, &defined)?
+                }
+                // the order is a fact about the queue; the blame is a fact
+                // about the limits, and this mode has none — see
+                // `Store::queue_rows`
+                Reach::Store { store, .. } => {
+                    let queued: Vec<Value> = store
+                        .queue_rows(QUEUE_PAGE)?
+                        .into_iter()
+                        .enumerate()
+                        .map(|(i, run)| json!({ "run": run, "position": i + 1 }))
+                        .collect();
+                    json!({ "depth": store.queue_depth()?, "queued": queued })
+                }
+            };
+            render_queue(&answer, out);
+            Ok(())
+        }
+
+        Command::Priority(args) => {
+            let answer = match reach {
+                Reach::Server(api) => {
+                    api.post(
+                        &format!("/api/runs/{}/priority", args.run),
+                        json!({ "priority": args.priority }),
+                    )
+                    .await?
+                }
+                reach => {
+                    let store = reach.store()?;
+                    if !store.set_run_priority(&args.run, args.priority)? {
+                        return Err(Fail::usage(format!("unknown run: {}", args.run)));
+                    }
+                    json!({ "run_id": args.run, "priority": args.priority })
+                }
+            };
+            out.said(
+                &answer,
+                &format!("{} moved to priority {}", args.run, args.priority),
+            );
+            Ok(())
+        }
+
+        Command::Events(args) => events(reach, args, out).await,
+
+        Command::Serve(args) => match reach {
+            Reach::Local(app) => {
+                let addr = args.addr.ok_or_else(|| {
+                    Fail::usage("--addr is where to serve, since none was compiled in")
+                })?;
+                app.serve(addr).await.map_err(Fail::from)
+            }
+            Reach::Store { target, .. } => Err(no_registry(&target, "serving")),
+            Reach::Server(_) => Err(Fail::new(
+                Exit::Unsupported,
+                "--server points at an instance that is already serving; \
+                 to start another one, run its own binary",
+            )),
+        },
     }
 }
 
@@ -358,43 +860,191 @@ fn launching_role(wait: bool) -> Role {
     }
 }
 
-async fn launch(app: Hestan, args: RunArgs, out: &Out) -> Result<(), Fail> {
+async fn launch(reach: Reach, args: RunArgs, out: &Out) -> Result<(), Fail> {
     let tags = parse_tags(&args.tags)?;
-    let built = app.role(launching_role(args.wait)).build().await?;
-    let runner = built.runner;
-    let params = match (&args.params, &args.preset) {
-        (Some(text), _) => serde_json::from_str(text)
-            .map_err(|e| Fail::usage(format!("--params is one json object: {e}")))?,
-        (None, Some(preset)) => {
-            runner
-                .store()
-                .preset(&args.job, preset)?
-                .ok_or_else(|| {
-                    Fail::usage(format!("unknown preset: {preset} on job {}", args.job))
-                })?
-                .params
+    let timeout = args.timeout.map(Duration::from_secs);
+    let (id, watched) = match reach {
+        Reach::Server(api) => {
+            let mut body = json!({ "tags": tags, "priority": args.priority });
+            match (&args.params, &args.preset) {
+                (Some(text), _) => body["params"] = json_arg(text)?,
+                (None, Some(preset)) => body["preset"] = json!(preset),
+                (None, None) => {}
+            }
+            let answer = api
+                .post(&format!("/api/jobs/{}/runs", args.job), body)
+                .await?;
+            (s(&answer, "run_id"), Watched::There(api))
         }
-        (None, None) => json!({}),
+        reach => {
+            let built = reach.built(args.wait).await?;
+            let runner = built.runner;
+            let params = match (&args.params, &args.preset) {
+                (Some(text), _) => json_arg(text)?,
+                (None, Some(preset)) => {
+                    runner
+                        .store()
+                        .preset(&args.job, preset)?
+                        .ok_or_else(|| {
+                            Fail::usage(format!("unknown preset: {preset} on job {}", args.job))
+                        })?
+                        .params
+                }
+                (None, None) => json!({}),
+            };
+            let id = runner
+                .launch_prioritized(&args.job, params, Trigger::Manual, tags, args.priority)
+                .map_err(Fail::from)?;
+            (id, Watched::Here(runner))
+        }
     };
-    let id = runner
-        .launch_prioritized(&args.job, params, Trigger::Manual, tags, args.priority)
-        .map_err(Fail::from)?;
     if !args.wait {
         out.launched(&id, &args.job);
         return Ok(());
     }
+    settle(&watched, &id, timeout, out).await
+}
+
+async fn build(reach: Reach, args: BuildArgs, out: &Out) -> Result<(), Fail> {
     let timeout = args.timeout.map(Duration::from_secs);
-    let run = wait(&runner, &id, timeout, out).await?;
+    let (answer, watched) = match reach {
+        Reach::Server(api) => {
+            let mut body = json!({});
+            if !args.partitions.is_empty() {
+                body["partitions"] = json!(args.partitions);
+            }
+            let answer = api
+                .post(&format!("/api/assets/{}/build", args.asset), body)
+                .await?;
+            (answer, Watched::There(api))
+        }
+        reach => {
+            let built = reach.built(args.wait).await?;
+            let launched = crate::asset::build_one(
+                &built.runner,
+                &built.registry,
+                &args.asset,
+                &args.partitions,
+            )
+            .map_err(Fail::from)?;
+            let answer = match launched {
+                Some(id) => json!({ "run_id": id }),
+                None => json!({ "up_to_date": true }),
+            };
+            (answer, Watched::Here(built.runner))
+        }
+    };
+    if answer["up_to_date"] == json!(true) {
+        out.said(&answer, &format!("{} is already up to date", args.asset));
+        return Ok(());
+    }
+    let id = s(&answer, "run_id");
+    if !args.wait {
+        out.launched(&id, &args.asset);
+        return Ok(());
+    }
+    settle(&watched, &id, timeout, out).await
+}
+
+/// wait for a run and answer with what it did, which includes the exit code.
+async fn settle(
+    watched: &Watched,
+    id: &str,
+    timeout: Option<Duration>,
+    out: &Out,
+) -> Result<(), Fail> {
+    let run = wait(watched, id, timeout, out).await?;
     out.settled(&run);
-    match run.status {
-        RunStatus::Success => Ok(()),
-        RunStatus::Canceled => Err(Fail::new(Exit::Canceled, format!("run {id} was canceled"))),
+    match terminal(&run) {
+        Some(RunStatus::Success) => Ok(()),
+        Some(RunStatus::Canceled) => {
+            Err(Fail::new(Exit::Canceled, format!("run {id} was canceled")))
+        }
         _ => Err(Fail::new(
             Exit::Failed,
-            run.error
-                .clone()
-                .unwrap_or_else(|| format!("run {id} failed")),
+            match run["error"].as_str() {
+                Some(error) => error.to_string(),
+                None => format!("run {id} failed"),
+            },
         )),
+    }
+}
+
+// --------------------------------------------------------------------- waiting
+
+/// what a wait reads through.
+///
+/// a run may be executing in this process, in a process across the network, or
+/// in one on the same machine that this one only shares a database with. the
+/// wait is the same either way and this is the whole of the difference: where
+/// the rows come from, and whether there is a dispatcher here to poke.
+enum Watched {
+    Here(Runner),
+    There(Api),
+}
+
+impl Watched {
+    async fn run(&self, id: &str) -> Result<Value, Fail> {
+        match self {
+            Watched::Here(runner) => Ok(json!(run_row(runner.store(), id)?)),
+            Watched::There(api) => {
+                let answer = api.get(&format!("/api/runs/{id}")).await?;
+                Ok(answer["run"].clone())
+            }
+        }
+    }
+
+    async fn events(&self, id: &str, after: i64) -> Result<Vec<Value>, Fail> {
+        match self {
+            Watched::Here(runner) => Ok(runner
+                .store()
+                .events(id, after)?
+                .into_iter()
+                .map(|e| json!(e))
+                .collect()),
+            Watched::There(api) => {
+                let answer = api
+                    .get(&format!("/api/runs/{id}/events?after={after}"))
+                    .await?;
+                Ok(list(&answer, "events"))
+            }
+        }
+    }
+
+    async fn logs(&self, id: &str, after: i64) -> Result<Vec<Value>, Fail> {
+        match self {
+            Watched::Here(runner) => Ok(runner
+                .store()
+                .op_logs(id, None, after, TAIL_PAGE)?
+                .into_iter()
+                .map(|l| json!(l))
+                .collect()),
+            Watched::There(api) => {
+                let answer = api
+                    .get(&format!(
+                        "/api/runs/{id}/logs?after={after}&limit={TAIL_PAGE}"
+                    ))
+                    .await?;
+                Ok(list(&answer, "logs"))
+            }
+        }
+    }
+
+    /// start whatever the queue will let this process start, now. nothing to do
+    /// where the run belongs to somebody else.
+    fn poke(&self) {
+        if let Watched::Here(runner) = self {
+            runner.dispatch();
+        }
+    }
+
+    /// whether the run is executing in this very process, which is the only
+    /// case where giving up on it also ends it.
+    fn ours(&self, run: &Value) -> bool {
+        match self {
+            Watched::Here(runner) => run["claimed_by"] == json!(runner.instance()),
+            Watched::There(_) => false,
+        }
     }
 }
 
@@ -403,22 +1053,22 @@ async fn launch(app: Hestan, args: RunArgs, out: &Out) -> Result<(), Fail> {
 /// the ordering is the whole of this function. the status is read *before* the
 /// drain that follows it, so a run that finished between two polls has its last
 /// lines read after the status that ends the loop rather than before it — which
-/// is the race a fast job loses: it can be over before the first poll, and
-/// every line it wrote still has to come out. the executor writes a run's
-/// terminal event before its terminal status for the same reason, so stopping
-/// at the status leaves nothing behind.
+/// is the race a fast job loses: it can be over before the first poll, and every
+/// line it wrote still has to come out. the executor writes a run's terminal
+/// event before its terminal status for the same reason, so stopping at the
+/// status leaves nothing behind.
 async fn wait(
-    runner: &Runner,
+    watched: &Watched,
     id: &str,
     timeout: Option<Duration>,
     out: &Out,
-) -> Result<Run, Fail> {
+) -> Result<Value, Fail> {
     let deadline = timeout.map(|t| Instant::now() + t);
     let mut tail = Tail::default();
     loop {
-        let run = run_row(runner.store(), id)?;
-        let settled = !matches!(run.status, RunStatus::Queued | RunStatus::Running);
-        tail.drain(runner.store(), id, out)?;
+        let run = watched.run(id).await?;
+        let settled = terminal(&run).is_some();
+        tail.drain(watched, id, out).await?;
         if settled {
             return Ok(run);
         }
@@ -427,8 +1077,7 @@ async fn wait(
             // only one of them happened — except when the run is executing
             // right here, where exiting is the other one too, and saying so
             // beats leaving it to be discovered
-            let mine = run.claimed_by.as_deref() == Some(runner.instance());
-            let ours = match mine {
+            let ours = match watched.ours(&run) {
                 true => ", which was executing here and stops with this process",
                 false => "",
             };
@@ -440,8 +1089,16 @@ async fn wait(
         // whatever the queue will let this process start, now: without this a
         // limit that freed up elsewhere would be noticed a dispatch interval
         // late, and a run launched into a full queue would sit there
-        runner.dispatch();
+        watched.poke();
         tokio::time::sleep(TAIL_POLL).await;
+    }
+}
+
+/// the terminal status of a run, or `None` while it is still going.
+fn terminal(run: &Value) -> Option<RunStatus> {
+    match run["status"].as_str()?.parse().ok()? {
+        RunStatus::Queued | RunStatus::Running => None,
+        status => Some(status),
     }
 }
 
@@ -460,34 +1117,24 @@ impl Tail {
     /// are two halves of one account of the run: the op that said it was
     /// starting and the line it printed a millisecond later belong next to each
     /// other.
-    fn drain(&mut self, store: &Store, run: &str, out: &Out) -> Result<(), Error> {
+    async fn drain(&mut self, watched: &Watched, run: &str, out: &Out) -> Result<(), Fail> {
         loop {
-            let events = store.events(run, self.events)?;
-            let logs = store.op_logs(run, None, self.logs, TAIL_PAGE)?;
+            let events = watched.events(run, self.events).await?;
+            let logs = watched.logs(run, self.logs).await?;
             if events.is_empty() && logs.is_empty() {
                 return Ok(());
             }
             let full = logs.len() as u32 == TAIL_PAGE;
             let mut lines: Vec<Line> = Vec::with_capacity(events.len() + logs.len());
-            for e in events {
-                self.events = self.events.max(e.seq);
-                lines.push(Line {
-                    at: e.ts,
-                    op: e.op,
-                    level: Some(e.level),
-                    message: e.message,
-                });
+            for e in &events {
+                self.events = self.events.max(e["seq"].as_i64().unwrap_or_default());
+                lines.push(Line::event(e));
             }
-            for l in logs {
-                self.logs = self.logs.max(l.id);
-                lines.push(Line {
-                    at: l.at,
-                    op: Some(l.op),
-                    level: l.level,
-                    message: l.message,
-                });
+            for l in &logs {
+                self.logs = self.logs.max(l["id"].as_i64().unwrap_or_default());
+                lines.push(Line::log(l));
             }
-            lines.sort_by_key(|l| l.at);
+            lines.sort_by(|a, b| a.at.cmp(&b.at));
             for line in lines {
                 out.stream(&line);
             }
@@ -501,149 +1148,74 @@ impl Tail {
 
 /// one line of what a run is saying, from either of the two tables that say it.
 struct Line {
-    at: DateTime<Utc>,
+    at: String,
     op: Option<String>,
     level: Option<EventLevel>,
     message: String,
 }
 
+impl Line {
+    fn event(e: &Value) -> Line {
+        Line {
+            at: s(e, "ts"),
+            op: e["op"].as_str().map(str::to_string),
+            level: e["level"].as_str().and_then(|l| l.parse().ok()),
+            message: s(e, "message"),
+        }
+    }
+
+    fn log(l: &Value) -> Line {
+        Line {
+            at: s(l, "at"),
+            op: l["op"].as_str().map(str::to_string),
+            level: l["level"].as_str().and_then(|l| l.parse().ok()),
+            message: s(l, "message"),
+        }
+    }
+}
+
 // --------------------------------------------------------------------- reading
 
-fn list_runs(store: &Store, args: RunsArgs, out: &Out) -> Result<(), Fail> {
-    let tag = args.tag.as_deref().map(split_pair).transpose()?;
-    let since = args.since.as_deref().map(instant).transpose()?;
-    let runs = store.runs(
-        args.job.as_deref(),
-        since,
-        None,
-        None,
-        tag.as_ref().map(|(k, v)| (k.as_str(), v.as_str())),
-        args.limit.clamp(1, 2000),
-    )?;
-    if out.json {
-        out.object(&json!({ "runs": runs }));
-        return Ok(());
-    }
-    if out.quiet {
-        for run in &runs {
-            println!("{}", run.id);
+async fn logs(reach: Reach, args: LogsArgs, out: &Out) -> Result<(), Fail> {
+    let limit = args.limit.clamp(1, 100_000);
+    let op = args.op.clone().unwrap_or_default();
+    let watched = match reach {
+        Reach::Server(api) => Watched::There(api),
+        reach => {
+            let store = reach.store()?;
+            run_row(&store, &args.run)?;
+            Watched::Here(Runner::new([], store))
         }
-        return Ok(());
-    }
-    let mut table = Table::new(["RUN", "JOB", "STATUS", "TRIGGER", "STARTED", "TOOK"]);
-    for run in &runs {
-        table.row([
-            Cell::plain(&run.id),
-            Cell::plain(&run.job),
-            Cell::styled(run.status.as_str(), status_color(run.status)),
-            Cell::plain(run.trigger.as_str()),
-            Cell::plain(stamp(run.started_at.unwrap_or(run.created_at))),
-            Cell::plain(took(run)),
-        ]);
-    }
-    table.print(out, "no runs");
-    Ok(())
-}
-
-fn show(store: &Store, id: &str, out: &Out) -> Result<(), Fail> {
-    let run = run_row(store, id)?;
-    let mut ops = store.op_runs(id)?;
-    // in the order they ran, not the order they are stored in: what a person
-    // reading a run wants first is where it got to
-    ops.sort_by(|a, b| match (a.started_at, b.started_at) {
-        (Some(a), Some(b)) => a.cmp(&b),
-        (Some(_), None) => std::cmp::Ordering::Less,
-        (None, Some(_)) => std::cmp::Ordering::Greater,
-        (None, None) => std::cmp::Ordering::Equal,
-    });
-    if out.json {
-        out.object(&json!({ "run": run, "ops": ops }));
-        return Ok(());
-    }
-    if out.quiet {
-        println!("{}", run.id);
-        return Ok(());
-    }
-    println!(
-        "{} {}  {}",
-        out.paint(&run.job, BOLD),
-        run.id,
-        out.paint(run.status.as_str(), status_color(run.status))
-    );
-    println!("trigger  {}", run.trigger.as_str());
-    println!("created  {}", run.created_at.to_rfc3339());
-    if let Some(started) = run.started_at {
-        println!("started  {}", started.to_rfc3339());
-    }
-    if let Some(finished) = run.finished_at {
-        println!("ended    {}  ({})", finished.to_rfc3339(), took(&run));
-    }
-    if run.params != json!({}) {
-        println!("params   {}", run.params);
-    }
-    if !run.tags.is_empty() {
-        let tags: Vec<String> = run.tags.iter().map(|(k, v)| format!("{k}={v}")).collect();
-        println!("tags     {}", tags.join(" "));
-    }
-    if let Some(error) = &run.error {
-        println!("error    {}", out.paint(error, RED));
-    }
-    println!();
-    let mut table = Table::new(["OP", "STATUS", "ATTEMPTS", "TOOK", "ERROR"]);
-    for op in &ops {
-        let elapsed = match (op.started_at, op.finished_at) {
-            (Some(a), Some(b)) => secs((b - a).num_milliseconds()),
-            _ => "-".into(),
-        };
-        table.row([
-            Cell::plain(&op.op),
-            Cell::styled(op.status.as_str(), op_color(op.status)),
-            Cell::plain(op.attempts.to_string()),
-            Cell::plain(elapsed),
-            Cell::plain(op.error.clone().unwrap_or_default()),
-        ]);
-    }
-    table.print(out, "no ops recorded");
-    Ok(())
-}
-
-async fn logs(store: &Store, args: LogsArgs, out: &Out) -> Result<(), Fail> {
-    let run = run_row(store, &args.run)?;
+    };
     if !args.follow {
-        let lines = store.op_logs(
-            &args.run,
-            args.op.as_deref(),
-            0,
-            args.limit.clamp(1, 100_000),
-        )?;
+        let lines = read_logs(&watched, &args.run, &op, 0, limit).await?;
         if out.json {
             out.object(&json!({ "logs": lines }));
             return Ok(());
         }
         for line in &lines {
-            print_log(out, line);
+            out.log(&Line::log(line));
         }
         return Ok(());
     }
     let mut after = 0;
-    let mut settled = !matches!(run.status, RunStatus::Queued | RunStatus::Running);
+    let mut settled = terminal(&watched.run(&args.run).await?).is_some();
     loop {
-        // the same ordering `wait` documents: the status first, the drain
-        // after it, so the last line of a run that ended mid-poll still prints
-        let lines = store.op_logs(&args.run, args.op.as_deref(), after, TAIL_PAGE)?;
+        // the same ordering `wait` documents: the status first, the drain after
+        // it, so the last line of a run that ended mid-poll still prints
+        let lines = read_logs(&watched, &args.run, &op, after, TAIL_PAGE).await?;
         for line in &lines {
-            after = after.max(line.id);
+            after = after.max(line["id"].as_i64().unwrap_or_default());
             match out.json {
-                true => out.line(&json!(line)),
-                false => print_log(out, line),
+                true => out.line(line),
+                false => out.log(&Line::log(line)),
             }
         }
         if settled && lines.is_empty() {
             return Ok(());
         }
         if !settled {
-            let run = run_row(store, &args.run)?;
-            settled = !matches!(run.status, RunStatus::Queued | RunStatus::Running);
+            settled = terminal(&watched.run(&args.run).await?).is_some();
         }
         if lines.is_empty() {
             tokio::time::sleep(TAIL_POLL).await;
@@ -651,16 +1223,220 @@ async fn logs(store: &Store, args: LogsArgs, out: &Out) -> Result<(), Fail> {
     }
 }
 
-fn print_log(out: &Out, line: &OpLog) {
+/// one page of captured output, narrowed to one op where one was named.
+async fn read_logs(
+    watched: &Watched,
+    run: &str,
+    op: &str,
+    after: i64,
+    limit: u32,
+) -> Result<Vec<Value>, Fail> {
+    match watched {
+        Watched::Here(runner) => Ok(runner
+            .store()
+            .op_logs(run, (!op.is_empty()).then_some(op), after, limit)?
+            .into_iter()
+            .map(|l| json!(l))
+            .collect()),
+        Watched::There(api) => {
+            let answer = api
+                .get(&format!(
+                    "/api/runs/{run}/logs?op={op}&after={after}&limit={limit}"
+                ))
+                .await?;
+            Ok(list(&answer, "logs"))
+        }
+    }
+}
+
+async fn events(reach: Reach, args: EventsArgs, out: &Out) -> Result<(), Fail> {
+    let query = events_query(&args)?;
+    let filter = EventQuery {
+        kind: args
+            .kind
+            .as_deref()
+            .map(|k| k.parse().unwrap_or_else(|e| match e {})),
+        subject_kind: None,
+        subject: args.subject.clone(),
+        level: match &args.level {
+            Some(word) => Some(word.parse().map_err(Fail::usage)?),
+            None => None,
+        },
+        since: args.since.as_deref().map(instant).transpose()?,
+        until: None,
+        before: None,
+    };
+    if !args.follow {
+        let answer = match reach {
+            Reach::Server(api) => api.get(&format!("/api/events?{query}")).await?,
+            reach => {
+                let events = reach
+                    .store()?
+                    .event_log(&filter, args.limit.clamp(1, 1000))?;
+                json!({ "events": events })
+            }
+        };
+        render_events(&answer, out);
+        return Ok(());
+    }
+    match reach {
+        Reach::Server(api) => {
+            let from = match args.after {
+                Some(seq) => format!("&after={seq}"),
+                None => String::new(),
+            };
+            api.stream(&format!("/api/events/stream?{query}{from}"), |event| {
+                show_event(&event, out)
+            })
+            .await
+        }
+        reach => follow_events(&reach.store()?, &filter, args.after, out).await,
+    }
+}
+
+/// the log as it lands, from a cursor.
+///
+/// **the same rule the sse stream follows**, because it is the same call:
+/// [`Store::readable`] decides what is safe to deliver, so a terminal tailing
+/// the log and a browser watching it cannot disagree about what has settled.
+async fn follow_events(
+    store: &Store,
+    filter: &EventQuery,
+    after: Option<i64>,
+    out: &Out,
+) -> Result<(), Fail> {
+    // where a follower with no cursor starts: now, not the beginning. "show me
+    // what happens from here" is what opening a live feed means, and the whole
+    // history is one command away
+    let mut cursor = match after {
+        Some(seq) => seq,
+        None => store.event_watermark()?,
+    };
+    let mut waiting = None;
+    loop {
+        let step = store.readable(cursor, &mut waiting)?;
+        while cursor < step.ceiling {
+            let batch = store.event_tail(filter, cursor, Some(step.ceiling), TAIL_PAGE)?;
+            if batch.is_empty() {
+                cursor = step.ceiling;
+                break;
+            }
+            for event in &batch {
+                cursor = event.seq;
+                show_event(&json!(event), out);
+            }
+        }
+        if let Some(skip_to) = step.skip_to {
+            cursor = cursor.max(skip_to);
+        }
+        tokio::time::sleep(FOLLOW_POLL).await;
+    }
+}
+
+fn show_event(event: &Value, out: &Out) {
+    if out.json {
+        out.line(event);
+        return;
+    }
+    if out.quiet {
+        println!("{}", event["seq"]);
+        return;
+    }
+    let level = event["level"].as_str().and_then(|l| l.parse().ok());
     println!(
-        "{} {} {}",
-        out.paint(&stamp(line.at), DIM),
-        out.paint(&line.op, CYAN),
-        line.message
+        "{} {} {} {}",
+        out.paint(&stamp(&s(event, "ts")), DIM),
+        out.paint(&s(event, "kind"), level_color(level)),
+        out.paint(
+            event["subject"]
+                .as_str()
+                .or(event["run_id"].as_str())
+                .unwrap_or("-"),
+            CYAN
+        ),
+        s(event, "message"),
     );
 }
 
-// -------------------------------------------------------------------- stopping
+// -------------------------------------------------------------------- changing
+
+/// pause or unpause a schedule or a sensor, in whichever mode is in front of us.
+///
+/// a job may have several schedules, so naming one without an expression means
+/// all of them: pausing "the nightly job" is what somebody means, and asking
+/// them to type its cron back at it is not an improvement.
+async fn paused(reach: Reach, what: What, paused: bool, out: &Out) -> Result<(), Fail> {
+    let word = match paused {
+        true => "paused",
+        false => "unpaused",
+    };
+    match (what, reach) {
+        (What::Sensor { name }, Reach::Server(api)) => {
+            let answer = api
+                .post(
+                    "/api/sensors/state",
+                    json!({ "name": name, "paused": paused }),
+                )
+                .await?;
+            out.said(&answer, &format!("sensor {name} {word}"));
+            Ok(())
+        }
+        (What::Sensor { name }, reach) => {
+            let store = reach.store()?;
+            if !store.set_sensor_paused(&name, paused)? {
+                return Err(Fail::usage(format!("unknown sensor: {name}")));
+            }
+            out.said(&json!({ "ok": true }), &format!("sensor {name} {word}"));
+            Ok(())
+        }
+        (What::Schedule { job, expr }, reach) => {
+            let matched = match &reach {
+                Reach::Server(api) => list(&api.get("/api/schedules").await?, "schedules"),
+                _ => list(
+                    &crate::server::schedules_json(&stored(&reach)?)?,
+                    "schedules",
+                ),
+            };
+            let matched: Vec<Value> = matched
+                .into_iter()
+                .filter(|s| s["job"] == json!(job))
+                .filter(|s| expr.as_ref().is_none_or(|e| s["expr"] == json!(e)))
+                .collect();
+            if matched.is_empty() {
+                return Err(Fail::usage(match &expr {
+                    Some(expr) => format!("no schedule {expr:?} on job {job}"),
+                    None => format!("no schedules on job {job}"),
+                }));
+            }
+            for row in &matched {
+                let body = json!({ "job": job, "expr": s(row, "expr"), "paused": paused });
+                match &reach {
+                    Reach::Server(api) => {
+                        api.post("/api/schedules/state", body).await?;
+                    }
+                    _ => {
+                        stored(&reach)?.set_schedule_paused(&job, &s(row, "expr"), paused)?;
+                    }
+                }
+            }
+            let exprs: Vec<String> = matched.iter().map(|r| s(r, "expr")).collect();
+            out.said(
+                &json!({ "ok": true, "job": job, "exprs": exprs }),
+                &format!("{job} {} {word}", exprs.join(", ")),
+            );
+            Ok(())
+        }
+    }
+}
+
+/// the store behind a reach that is not a server, without consuming it.
+fn stored(reach: &Reach) -> Result<Store, Fail> {
+    match reach {
+        Reach::Local(app) => Ok(app.open()?),
+        Reach::Store { store, .. } => Ok(store.clone()),
+        Reach::Server(_) => unreachable!("a server-mode write goes through the api"),
+    }
+}
 
 /// stop a run, or say plainly why this process cannot.
 ///
@@ -679,13 +1455,10 @@ fn cancel(store: &Store, id: &str, out: &Out) -> Result<(), Fail> {
                     format!("run {id} was claimed while this was taking it off the queue"),
                 ));
             }
-            if out.json {
-                out.object(&json!({ "run_id": id, "outcome": "canceled" }));
-            } else if out.quiet {
-                println!("{id}");
-            } else {
-                println!("canceled {id}, which had not started");
-            }
+            out.said(
+                &json!({ "run_id": id, "outcome": "canceled" }),
+                &format!("canceled {id}, which had not started"),
+            );
             Ok(())
         }
         RunStatus::Queued | RunStatus::Running => Err(Fail::new(
@@ -703,12 +1476,385 @@ fn cancel(store: &Store, id: &str, out: &Out) -> Result<(), Fail> {
     }
 }
 
+// ------------------------------------------------------------------ the api
+
+/// a running instance, reached over the http api it already serves.
+///
+/// there is no second protocol here and no new endpoint: everything the command
+/// line asks for over the network is something the ui already asks for, which
+/// is why `--server` works against an instance that predates this.
+struct Api {
+    base: String,
+    client: reqwest::Client,
+}
+
+impl Api {
+    fn new(url: &str) -> Api {
+        Api {
+            base: url.trim_end_matches('/').to_string(),
+            client: reqwest::Client::new(),
+        }
+    }
+
+    async fn get(&self, path: &str) -> Result<Value, Fail> {
+        self.answer(self.client.get(format!("{}{path}", self.base)))
+            .await
+    }
+
+    async fn post(&self, path: &str, body: Value) -> Result<Value, Fail> {
+        self.answer(self.client.post(format!("{}{path}", self.base)).json(&body))
+            .await
+    }
+
+    async fn answer(&self, request: reqwest::RequestBuilder) -> Result<Value, Fail> {
+        let response = request.send().await.map_err(|e| self.out_of_reach(&e))?;
+        let status = response.status();
+        let body: Value = response.json().await.unwrap_or(Value::Null);
+        if status.is_success() {
+            return Ok(body);
+        }
+        let message = match body["error"].as_str() {
+            Some(error) => error.to_string(),
+            None => format!("{} said {status}", self.base),
+        };
+        // the api's own vocabulary, kept: what it calls a bad request is what
+        // this calls a usage error, and a script switching between `--server`
+        // and the binary itself should not have to learn two tables
+        let code = match status.as_u16() {
+            400 | 404 | 422 => Exit::Usage,
+            502..=504 => Exit::Unreachable,
+            _ => Exit::Failed,
+        };
+        Err(Fail::new(code, message))
+    }
+
+    /// the server-sent event stream, one parsed `data:` payload at a time.
+    ///
+    /// hand-parsed rather than through a client library because the whole of
+    /// the format that matters here is two field names — and a dependency for
+    /// that would be a dependency in every build that turns this feature on.
+    async fn stream(&self, path: &str, mut each: impl FnMut(Value)) -> Result<(), Fail> {
+        let mut response = self
+            .client
+            .get(format!("{}{path}", self.base))
+            .send()
+            .await
+            .map_err(|e| self.out_of_reach(&e))?
+            .error_for_status()
+            .map_err(|e| self.out_of_reach(&e))?;
+        let mut buffer = String::new();
+        while let Some(chunk) = response.chunk().await.map_err(|e| self.out_of_reach(&e))? {
+            buffer.push_str(&String::from_utf8_lossy(&chunk));
+            // one message ends at a blank line; anything after the last one is
+            // a message still arriving and stays in the buffer
+            while let Some(end) = buffer.find("\n\n") {
+                let message: String = buffer.drain(..end + 2).collect();
+                for line in message.lines() {
+                    if let Some(payload) = line.strip_prefix("data:")
+                        && let Ok(value) = serde_json::from_str(payload.trim())
+                    {
+                        each(value);
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn out_of_reach(&self, e: &reqwest::Error) -> Fail {
+        Fail::new(
+            Exit::Unreachable,
+            format!("could not reach {}: {e}", self.base),
+        )
+    }
+}
+
+// ------------------------------------------------------------------ rendering
+
+// every command answers with one json object shaped exactly as the http api
+// shapes it, whichever of the three modes produced it, and the tables below are
+// renderings of that object rather than a second thing to keep in step with it.
+// so `--json` means the same thing pointed at your own binary as it does
+// pointed at a server, and a script does not have to care which it got.
+//
+// where a mode genuinely knows less — a run log has no registry — the keys it
+// cannot fill are **absent** rather than null or invented, and the table drops
+// the columns that would have shown them.
+
+fn render_runs(answer: &Value, out: &Out) {
+    let runs = list(answer, "runs");
+    if out.json {
+        out.object(answer);
+        return;
+    }
+    if out.quiet {
+        for run in &runs {
+            println!("{}", s(run, "id"));
+        }
+        return;
+    }
+    let mut table = Table::new(["RUN", "JOB", "STATUS", "TRIGGER", "STARTED", "TOOK"]);
+    for run in &runs {
+        let status = status_of(run);
+        table.row([
+            Cell::plain(s(run, "id")),
+            Cell::plain(s(run, "job")),
+            Cell::styled(s(run, "status"), status_color(status)),
+            Cell::plain(s(run, "trigger")),
+            Cell::plain(stamp(
+                run["started_at"].as_str().unwrap_or(&s(run, "created_at")),
+            )),
+            Cell::plain(took(run)),
+        ]);
+    }
+    table.print(out, "no runs");
+}
+
+fn render_show(answer: &Value, out: &Out) {
+    if out.json {
+        out.object(answer);
+        return;
+    }
+    let run = &answer["run"];
+    if out.quiet {
+        println!("{}", s(run, "id"));
+        return;
+    }
+    println!(
+        "{} {}  {}",
+        out.paint(&s(run, "job"), BOLD),
+        s(run, "id"),
+        out.paint(&s(run, "status"), status_color(status_of(run)))
+    );
+    println!("trigger  {}", s(run, "trigger"));
+    println!("created  {}", s(run, "created_at"));
+    if let Some(started) = run["started_at"].as_str() {
+        println!("started  {started}");
+    }
+    if let Some(finished) = run["finished_at"].as_str() {
+        println!("ended    {finished}  ({})", took(run));
+    }
+    if run["params"] != json!({}) {
+        println!("params   {}", run["params"]);
+    }
+    if let Some(tags) = run["tags"].as_object().filter(|t| !t.is_empty()) {
+        let tags: Vec<String> = tags.iter().map(|(k, v)| format!("{k}={v}")).collect();
+        println!("tags     {}", tags.join(" "));
+    }
+    if let Some(error) = run["error"].as_str() {
+        println!("error    {}", out.paint(error, RED));
+    }
+    println!();
+    // in the order they ran, not the order they are stored in: what a person
+    // reading a run wants first is where it got to
+    let mut ops = list(answer, "ops");
+    ops.sort_by_key(|op| op["started_at"].as_str().unwrap_or("~").to_string());
+    let mut table = Table::new(["OP", "STATUS", "ATTEMPTS", "TOOK", "ERROR"]);
+    for op in &ops {
+        table.row([
+            Cell::plain(s(op, "op")),
+            Cell::styled(s(op, "status"), op_color(&s(op, "status"))),
+            Cell::plain(op["attempts"].to_string()),
+            Cell::plain(elapsed(
+                op["started_at"].as_str(),
+                op["finished_at"].as_str(),
+            )),
+            Cell::plain(op["error"].as_str().unwrap_or_default()),
+        ]);
+    }
+    table.print(out, "no ops recorded");
+}
+
+fn render_jobs(answer: &Value, out: &Out) {
+    let jobs = list(answer, "jobs");
+    if out.json {
+        out.object(answer);
+        return;
+    }
+    if out.quiet {
+        for job in &jobs {
+            println!("{}", s(job, "name"));
+        }
+        return;
+    }
+    let mut table = Table::new(["JOB", "OPS", "SCHEDULE", "LAST RUN", "DESCRIPTION"]);
+    for job in &jobs {
+        let schedules: Vec<String> = list(job, "schedules")
+            .iter()
+            .map(|s_| match s_["paused"] == json!(true) {
+                true => format!("{} (paused)", s(s_, "expr")),
+                false => s(s_, "expr"),
+            })
+            .collect();
+        let last = &job["last_run"];
+        table.row([
+            Cell::plain(s(job, "name")),
+            Cell::plain(list(job, "ops").len().to_string()),
+            Cell::plain(schedules.join(", ")),
+            match last.is_object() {
+                true => Cell::styled(s(last, "status"), status_color(status_of(last))),
+                false => Cell::plain("-"),
+            },
+            Cell::plain(job["description"].as_str().unwrap_or_default()),
+        ]);
+    }
+    table.print(out, "no jobs");
+}
+
+fn render_assets(answer: &Value, out: &Out) {
+    let assets = list(answer, "assets");
+    if out.json {
+        out.object(answer);
+        return;
+    }
+    if out.quiet {
+        for asset in &assets {
+            println!("{}", s(asset, "name"));
+        }
+        return;
+    }
+    // "stale" is a claim about the registry, so the column only exists where
+    // one was there to make it
+    let known = assets.iter().any(|a| a.get("stale").is_some());
+    let mut table = Table::new(["ASSET", "STATE", "BUILT", "DEPS"]);
+    for asset in &assets {
+        let state = match (known, asset["stale"] == json!(true)) {
+            (false, _) => Cell::plain("-"),
+            (true, true) => Cell::styled("stale", YELLOW),
+            (true, false) => Cell::styled("fresh", GREEN),
+        };
+        table.row([
+            Cell::plain(s(asset, "name")),
+            state,
+            Cell::plain(match asset["built_at"].as_str() {
+                Some(at) => when(at),
+                None => "never".into(),
+            }),
+            Cell::plain(
+                list(asset, "deps")
+                    .iter()
+                    .map(|d| d.as_str().unwrap_or_default())
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            ),
+        ]);
+    }
+    table.print(out, "no assets");
+}
+
+fn render_schedules(answer: &Value, out: &Out) {
+    let schedules = list(answer, "schedules");
+    if out.json {
+        out.object(answer);
+        return;
+    }
+    if out.quiet {
+        for row in &schedules {
+            println!("{}", s(row, "job"));
+        }
+        return;
+    }
+    let mut table = Table::new(["JOB", "CRON", "TZ", "STATE", "NEXT FIRE"]);
+    for row in &schedules {
+        let paused = row["paused"] == json!(true);
+        table.row([
+            Cell::plain(s(row, "job")),
+            Cell::plain(s(row, "expr")),
+            Cell::plain(s(row, "tz")),
+            match paused {
+                true => Cell::styled("paused", YELLOW),
+                false => Cell::styled("active", GREEN),
+            },
+            Cell::plain(match (paused, row["next_fire"].as_str()) {
+                (false, Some(at)) => when(at),
+                _ => "-".into(),
+            }),
+        ]);
+    }
+    table.print(out, "no schedules");
+}
+
+fn render_queue(answer: &Value, out: &Out) {
+    let queued = list(answer, "queued");
+    if out.json {
+        out.object(answer);
+        return;
+    }
+    if out.quiet {
+        for entry in &queued {
+            println!("{}", s(&entry["run"], "id"));
+        }
+        return;
+    }
+    // the reason a run is waiting belongs to whoever owns the limits, so the
+    // column is here only when the answer came from something that does
+    let blamed = queued.iter().any(|q| q.get("blocked_by").is_some());
+    let mut table = match blamed {
+        true => Table::new(["#", "RUN", "JOB", "PRIORITY", "WAITING FOR"]),
+        false => Table::new(["#", "RUN", "JOB", "PRIORITY", "QUEUED"]),
+    };
+    for entry in &queued {
+        let run = &entry["run"];
+        table.row([
+            Cell::plain(entry["position"].to_string()),
+            Cell::plain(s(run, "id")),
+            Cell::plain(s(run, "job")),
+            Cell::plain(run["priority"].to_string()),
+            match blamed {
+                true => Cell::plain(s(&entry["blocked_by"], "reason")),
+                false => Cell::plain(stamp(&s(run, "created_at"))),
+            },
+        ]);
+    }
+    table.print(out, "the queue is empty");
+    println!("{} waiting", answer["depth"]);
+}
+
+fn render_events(answer: &Value, out: &Out) {
+    let events = list(answer, "events");
+    if out.json {
+        out.object(answer);
+        return;
+    }
+    // newest first is how the log is read and oldest first is how it is
+    // followed; a page printed newest-last would be a different order from the
+    // same command with --follow
+    for event in events.iter().rev() {
+        show_event(event, out);
+    }
+}
+
 // --------------------------------------------------------------------- helpers
 
 fn run_row(store: &Store, id: &str) -> Result<Run, Fail> {
     store
         .run(id)?
         .ok_or_else(|| Fail::usage(format!("unknown run: {id}")))
+}
+
+/// a string field, or `""` where there is none. every renderer below reads its
+/// answer this way: a missing key is a mode that does not know, and printing
+/// nothing is what not knowing looks like.
+fn s(value: &Value, key: &str) -> String {
+    value[key].as_str().unwrap_or_default().to_string()
+}
+
+/// an array field, or an empty one.
+fn list(value: &Value, key: &str) -> Vec<Value> {
+    value[key].as_array().cloned().unwrap_or_default()
+}
+
+fn status_of(run: &Value) -> RunStatus {
+    run["status"]
+        .as_str()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(RunStatus::Queued)
+}
+
+/// one json object from the command line, with the parse error attached to the
+/// flag that carried it.
+fn json_arg(text: &str) -> Result<Value, Fail> {
+    serde_json::from_str(text).map_err(|e| Fail::usage(format!("--params is one json object: {e}")))
 }
 
 /// `KEY=VALUE`, which is how a shell spells a pair without quoting anything.
@@ -726,6 +1872,55 @@ fn parse_tags(pairs: &[String]) -> Result<RunTags, Fail> {
         tags.insert(k, v);
     }
     Ok(tags)
+}
+
+/// the query string `GET /api/runs` takes, from the same flags the store read
+/// uses — so the two modes are filtering on the same thing.
+fn runs_query(args: &RunsArgs) -> Result<String, Fail> {
+    let mut query = vec![format!("limit={}", args.limit)];
+    if let Some(job) = &args.job {
+        query.push(format!("job={}", escape(job)));
+    }
+    if let Some(tag) = &args.tag {
+        split_pair(tag)?;
+        query.push(format!("tag={}", escape(tag)));
+    }
+    if let Some(since) = &args.since {
+        query.push(format!("since={}", escape(&instant(since)?.to_rfc3339())));
+    }
+    Ok(query.join("&"))
+}
+
+fn events_query(args: &EventsArgs) -> Result<String, Fail> {
+    let mut query = vec![format!("limit={}", args.limit)];
+    for (name, value) in [
+        ("kind", &args.kind),
+        ("subject", &args.subject),
+        ("level", &args.level),
+    ] {
+        if let Some(value) = value {
+            query.push(format!("{name}={}", escape(value)));
+        }
+    }
+    if let Some(since) = &args.since {
+        query.push(format!("since={}", escape(&instant(since)?.to_rfc3339())));
+    }
+    Ok(query.join("&"))
+}
+
+/// percent-encoding for the handful of characters a filter can carry that a
+/// query string cannot: an rfc3339 `+`, a tag's `=`, a space in a name.
+fn escape(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for byte in text.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(byte as char)
+            }
+            other => out.push_str(&format!("%{other:02X}")),
+        }
+    }
+    out
 }
 
 /// `2h`, `30m`, `7d` — or an rfc3339 instant, for a script that has one.
@@ -754,12 +1949,30 @@ fn bad_when(text: &str) -> Fail {
     ))
 }
 
-fn stamp(at: DateTime<Utc>) -> String {
-    at.format("%H:%M:%S").to_string()
+/// the clock time out of an rfc3339 stamp, or the stamp itself if it is not one.
+fn stamp(at: &str) -> String {
+    match DateTime::parse_from_rfc3339(at) {
+        Ok(t) => t.with_timezone(&Utc).format("%H:%M:%S").to_string(),
+        Err(_) => at.to_string(),
+    }
 }
 
-fn took(run: &Run) -> String {
-    match (run.started_at, run.finished_at) {
+/// the date and the clock, for a column where "yesterday" and "an hour ago"
+/// are different answers. [`stamp`] is the one for a run you are watching.
+fn when(at: &str) -> String {
+    match DateTime::parse_from_rfc3339(at) {
+        Ok(t) => t.with_timezone(&Utc).format("%Y-%m-%d %H:%M").to_string(),
+        Err(_) => at.to_string(),
+    }
+}
+
+fn took(run: &Value) -> String {
+    elapsed(run["started_at"].as_str(), run["finished_at"].as_str())
+}
+
+fn elapsed(from: Option<&str>, to: Option<&str>) -> String {
+    let parse = |t: &str| DateTime::parse_from_rfc3339(t).ok();
+    match (from.and_then(parse), to.and_then(parse)) {
         (Some(a), Some(b)) => secs((b - a).num_milliseconds()),
         _ => "-".into(),
     }
@@ -789,13 +2002,21 @@ fn status_color(status: RunStatus) -> &'static str {
     }
 }
 
-fn op_color(status: OpStatus) -> &'static str {
+fn op_color(status: &str) -> &'static str {
     match status {
-        OpStatus::Success => GREEN,
-        OpStatus::Failed => RED,
-        OpStatus::Canceled | OpStatus::Skipped => YELLOW,
-        OpStatus::Running => CYAN,
-        OpStatus::Pending => DIM,
+        "success" => GREEN,
+        "failed" => RED,
+        "canceled" | "skipped" => YELLOW,
+        "running" => CYAN,
+        _ => DIM,
+    }
+}
+
+fn level_color(level: Option<EventLevel>) -> &'static str {
+    match level {
+        Some(EventLevel::Error) => RED,
+        Some(EventLevel::Warn) => YELLOW,
+        _ => "",
     }
 }
 
@@ -830,7 +2051,7 @@ impl Out {
     }
 
     fn paint(&self, text: &str, style: &str) -> String {
-        match self.color {
+        match self.color && !style.is_empty() {
             true => format!("{style}{text}{RESET}"),
             false => text.to_string(),
         }
@@ -847,6 +2068,17 @@ impl Out {
         println!("{value}");
     }
 
+    /// something happened and there is not much to say about it: the object
+    /// under `--json`, the sentence otherwise, and nothing at all under
+    /// `--quiet`, which asked for an id and did not get one.
+    fn said(&self, answer: &Value, sentence: &str) {
+        if self.json {
+            self.object(answer);
+        } else if !self.quiet {
+            println!("{sentence}");
+        }
+    }
+
     /// a run was put on the queue.
     fn launched(&self, id: &str, job: &str) {
         if self.json {
@@ -860,17 +2092,17 @@ impl Out {
 
     /// a `--wait` run reached a terminal status. the failure line is stderr's
     /// job, next to the exit code it goes with.
-    fn settled(&self, run: &Run) {
+    fn settled(&self, run: &Value) {
         if self.json {
-            self.object(&json!(run));
+            self.object(run);
         } else if self.quiet {
-            println!("{}", run.id);
+            println!("{}", s(run, "id"));
         } else {
             println!(
                 "{}  {} {} in {}",
-                run.id,
-                run.job,
-                self.paint(run.status.as_str(), status_color(run.status)),
+                s(run, "id"),
+                s(run, "job"),
+                self.paint(&s(run, "status"), status_color(status_of(run))),
                 took(run)
             );
         }
@@ -881,33 +2113,28 @@ impl Out {
         if self.quiet {
             return;
         }
-        let style = match line.level {
-            Some(EventLevel::Error) => RED,
-            Some(EventLevel::Warn) => YELLOW,
-            _ => "",
+        eprintln!("{}", self.rendered(line, self.color_err));
+    }
+
+    /// one line of captured output, on stdout, where it is the answer.
+    fn log(&self, line: &Line) {
+        println!("{}", self.rendered(line, self.color));
+    }
+
+    fn rendered(&self, line: &Line, color: bool) -> String {
+        let paint = |text: &str, style: &str| match color && !style.is_empty() {
+            true => format!("{style}{text}{RESET}"),
+            false => text.to_string(),
         };
-        let (at, op, message) = match self.color_err {
-            true => (
-                format!("{DIM}{}{RESET}", stamp(line.at)),
-                line.op
-                    .as_ref()
-                    .map(|op| format!("{CYAN}{op}{RESET} "))
-                    .unwrap_or_default(),
-                match style.is_empty() {
-                    true => line.message.clone(),
-                    false => format!("{style}{}{RESET}", line.message),
-                },
-            ),
-            false => (
-                stamp(line.at),
-                line.op
-                    .as_ref()
-                    .map(|op| format!("{op} "))
-                    .unwrap_or_default(),
-                line.message.clone(),
-            ),
+        let op = match &line.op {
+            Some(op) => format!("{} ", paint(op, CYAN)),
+            None => String::new(),
         };
-        eprintln!("{at} {op}{message}");
+        format!(
+            "{} {op}{}",
+            paint(&stamp(&line.at), DIM),
+            paint(&line.message, level_color(line.level))
+        )
     }
 }
 
@@ -1092,5 +2319,52 @@ mod tests {
             ..plain()
         };
         assert_eq!(json.paint("success", GREEN), "success");
+    }
+
+    // a filter goes over the wire in a query string, and a `+` that arrived as
+    // a space would be an hour of runs nobody asked about
+    #[test]
+    fn a_query_escapes_what_a_url_cannot_carry() {
+        assert_eq!(
+            escape("2026-01-01T00:00:00+00:00"),
+            "2026-01-01T00%3A00%3A00%2B00%3A00"
+        );
+        assert_eq!(escape("env=prod"), "env%3Dprod");
+        assert_eq!(escape("orders_etl"), "orders_etl");
+    }
+
+    // both modes filter on the same thing, so the query the api gets is built
+    // from exactly the flags the store read uses
+    #[test]
+    fn the_runs_query_carries_every_filter() {
+        let query = runs_query(&RunsArgs {
+            job: Some("etl".into()),
+            tag: Some("env=prod".into()),
+            since: None,
+            limit: 5,
+        })
+        .unwrap();
+        assert!(query.contains("limit=5"), "{query}");
+        assert!(query.contains("job=etl"), "{query}");
+        assert!(query.contains("tag=env%3Dprod"), "{query}");
+
+        let bad = runs_query(&RunsArgs {
+            job: None,
+            tag: Some("prod".into()),
+            since: None,
+            limit: 5,
+        })
+        .unwrap_err();
+        assert_eq!(bad.code, Exit::Usage);
+    }
+
+    // a database holds no registry, and the sentence that says so is the whole
+    // of what makes that mode usable rather than baffling
+    #[test]
+    fn a_run_log_says_why_it_cannot_launch() {
+        let fail = no_registry("/tmp/hestan.db", "launching");
+        assert_eq!(fail.code, Exit::Unsupported);
+        assert!(fail.message.contains("no job definitions"), "{fail:?}");
+        assert!(fail.message.contains("--server"), "{fail:?}");
     }
 }
