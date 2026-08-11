@@ -189,15 +189,6 @@ struct Global {
     quiet: bool,
 }
 
-impl Global {
-    /// whether these flags point somewhere other than this process's own
-    /// deployment, which is what decides whether `serve` is even about this
-    /// binary.
-    fn elsewhere(&self) -> Option<&str> {
-        self.server.as_deref()
-    }
-}
-
 #[derive(Subcommand)]
 enum Command {
     /// launch a run of a job
@@ -468,7 +459,14 @@ pub async fn run(app: Hestan, addr: impl Into<SocketAddr>) -> Result<(), Error> 
     let command = match cli.command {
         // the promise at the top of this file
         None => return app.serve(addr).await,
-        Some(Command::Serve(args)) if cli.global.elsewhere().is_none() => {
+        // `serve` is still this binary serving, so it stays out of the
+        // dispatch below — but `--db` moves which run log it serves, exactly
+        // as it does for every other command
+        Some(Command::Serve(args)) if cli.global.server.is_none() => {
+            let app = match &cli.global.db {
+                Some(db) => app.db(db),
+                None => app,
+            };
             return app.serve(args.addr.unwrap_or(addr.into())).await;
         }
         Some(command) => command,
@@ -1260,6 +1258,9 @@ async fn logs(reach: Reach, args: LogsArgs, out: &Out) -> Result<(), Fail> {
         reach => {
             let store = reach.store()?;
             run_row(&store, &args.run)?;
+            // a runner over no jobs at all, because a log tail only ever
+            // reads: `Watched` is the two places a row can come from, and this
+            // is the local one
             Watched::Here(Runner::new([], store))
         }
     };

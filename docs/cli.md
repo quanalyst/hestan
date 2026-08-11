@@ -339,15 +339,20 @@ something more deliberate:
 
 ```bash
 #!/usr/bin/env bash
-set -euo pipefail
+set -uo pipefail    # not -e: the exit code is the answer, not a reason to stop
 
-orders run nightly_rollup --wait --timeout 3600
-case $? in
+# --quiet --wait: the run id on stdout, the run's own log on stderr
+run=$(orders --quiet run nightly_rollup --wait --timeout 3600)
+code=$?
+
+case $code in
   0) exit 0 ;;
-  4) page "nightly_rollup is still running an hour in" ;;
-  5) exit 75 ;;   # EX_TEMPFAIL: the database was unreachable, try again
-  *) page "nightly_rollup: $(orders --json show "$RUN" | jq -r .run.error)" ;;
+  3) exit 0 ;;                            # somebody canceled it on purpose
+  4) page "nightly_rollup is still going an hour in: $run" ;;
+  5) exit 75 ;;                           # EX_TEMPFAIL: unreachable, try later
+  *) page "nightly_rollup: $(orders --json show "$run" | jq -r .run.error)" ;;
 esac
+exit $code
 ```
 
 ## In a ci step
