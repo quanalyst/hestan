@@ -81,6 +81,17 @@ fn jobs() -> Vec<Job> {
             }))
             .build()
             .unwrap(),
+        // an isolated op re-executes this binary with no arguments, and no
+        // arguments is how the command line spells "serve"
+        #[cfg(unix)]
+        Job::builder("elsewhere")
+            .op(Op::new("apart", |ctx: OpCtx| async move {
+                ctx.info("ran in its own process");
+                Ok(json!({ "ok": true }))
+            })
+            .isolated())
+            .build()
+            .unwrap(),
         // a diamond, for the plan `explain` resolves: two ops that depend on
         // the first and not on each other
         Job::builder("diamond")
@@ -126,6 +137,12 @@ async fn cases(dir: &Path) {
         completing(dir),
     )
     .await;
+    #[cfg(unix)]
+    case(
+        "an_isolated_op_is_served_its_op_and_not_a_socket",
+        isolated_child(dir),
+    )
+    .await;
 }
 
 // ------------------------------------------------------------------ the cases
@@ -149,6 +166,26 @@ async fn succeeds(dir: &Path) {
         ran.stdout.contains("success"),
         "stdout said nothing about how it went: {:?}",
         ran.stdout
+    );
+}
+
+/// the guard `cli::run` takes before it looks at argv, asserted.
+///
+/// the child of an isolated op is this binary with no arguments, which is the
+/// mount's spelling of "serve". without the guard the child binds a socket,
+/// writes no terminal row, and the parent records an op that exited having
+/// done nothing — so this case fails by timing out rather than by a wrong
+/// answer, which is why it asks for a short wait.
+#[cfg(unix)]
+async fn isolated_child(dir: &Path) {
+    let db = db(dir, "isolated_child");
+    let ran = cli(&db, &["run", "elsewhere", "--wait", "--timeout", "30"]);
+    ran.assert(0);
+    assert!(
+        ran.stderr.contains("ran in its own process"),
+        "the isolated op's own line never came back, so the child did something \
+         other than run it: {:?}",
+        ran.stderr
     );
 }
 
