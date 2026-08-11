@@ -2743,13 +2743,6 @@ impl Store {
     }
 
     /// the newest seq anything has committed, or 0 on an empty log.
-    ///
-    /// what a follower turns into the ceiling it reads up to. on sqlite that is
-    /// this number directly: writers take the database's write lock and hold it
-    /// to commit, so no transaction can commit *below* one that already has and
-    /// seq order is commit order. on postgres several processes write at once
-    /// and it is not, so a follower lags this by one poll — see
-    /// [`Store::settles_in_order`](Self::settles_in_order).
     pub fn event_watermark(&self) -> Result<i64, Error> {
         let seq = self
             .conn()
@@ -2757,11 +2750,63 @@ impl Store {
         Ok(seq.flatten().unwrap_or(0))
     }
 
-    /// whether this backend allocates `seq` in commit order, which decides
-    /// whether a follower may read up to [the
-    /// watermark](Self::event_watermark) or has to stay a poll behind it.
+    /// whether this backend allocates `seq` in commit order.
+    ///
+    /// **sqlite: yes.** a writer takes the database's write lock at its first
+    /// write and holds it until it commits, so no transaction can commit below
+    /// one that already has. a follower may read straight up to
+    /// [`event_watermark`](Self::event_watermark) and cannot skip anything.
+    ///
+    /// **postgres: no.** several processes write at once, `seq` comes off a
+    /// sequence at insert, and a transaction holding 5 can commit after one
+    /// that took 6. a follower there uses [`settled_after`](Self::settled_after)
+    /// instead.
     pub fn settles_in_order(&self) -> bool {
         matches!(self.conn().dialect(), Dialect::Sqlite)
+    }
+
+    /// how far above `after` the log is unbroken, and what stopped it.
+    ///
+    /// this is what keeps a follower on a backend that does not settle in order
+    /// from skipping an event. a missing seq is one of two things and they look
+    /// identical from here: a transaction that has allocated it and not yet
+    /// committed, or one that aborted and never will. so a follower delivers up
+    /// to [`upto`](Settled::upto), waits on the gap for a bounded grace, and
+    /// steps over it only after that — which is the one assumption in the whole
+    /// mechanism, stated where it is made: **a transaction that appends an event
+    /// and takes longer than the grace to commit may be skipped.** hestan's are
+    /// a handful of statements each.
+    ///
+    /// `scan` bounds the walk. it also bounds what one poll may deliver, which
+    /// is fine: what is above it is still there next poll.
+    pub fn settled_after(&self, after: i64, scan: u32) -> Result<Settled, Error> {
+        let seqs: Vec<i64> = self.conn().query(
+            "SELECT seq FROM events WHERE seq > ?1 ORDER BY seq LIMIT ?2",
+            args![after, scan],
+            |r| r.int(0),
+        )?;
+        let mut upto = after;
+        let mut gap = None;
+        let mut after_gap = None;
+        for seq in seqs {
+            match gap {
+                // the first visible seq above the gap, which is where a
+                // follower that gives up on it resumes: one grace for a whole
+                // range of missing seqs rather than one per seq, and a range is
+                // exactly what a retention sweep leaves behind
+                Some(_) => {
+                    after_gap = Some(seq);
+                    break;
+                }
+                None if seq == upto + 1 => upto = seq,
+                None => gap = Some(upto + 1),
+            }
+        }
+        Ok(Settled {
+            upto,
+            gap,
+            after_gap,
+        })
     }
 
     /// append a materialization. the table is history, so a rebuild that came
@@ -3375,32 +3420,42 @@ impl Store {
                 error
             ],
         )?;
-        let level = match outcome {
-            SensorOutcome::Error => EventLevel::Error,
-            _ => EventLevel::Info,
-        };
-        write_event(
-            &mut tx,
-            &NewEvent::about(
-                SubjectKind::Sensor,
-                sensor,
-                EventKind::SensorTick,
-                match error {
-                    Some(why) => format!("{} — {why}", outcome.as_str()),
-                    None => format!("{}, {launched} launched", outcome.as_str()),
-                },
-            )
-            .level(level)
-            .data(json!({
-                "outcome": outcome,
-                "launched": launched,
-                "skipped": skipped,
-                "duration_ms": duration_ms,
-                "runs": runs,
-                "error": error,
-            })),
-            at,
-        )?;
+        // **a tick that did nothing is not an event.** every evaluation is a
+        // row in `sensor_ticks` and always was — that is the sensor's own
+        // health record, and the sensors page reads it. but a sensor polling
+        // every five seconds writes seventeen thousand of those a day, and an
+        // activity log in which they are 99% of the rows is one nobody can read
+        // anything else out of. so the log gets the ones that did something:
+        // launched a run, declined a keyed request, or failed.
+        let quiet = outcome == SensorOutcome::Fired && launched == 0 && skipped == 0;
+        if !quiet {
+            let level = match outcome {
+                SensorOutcome::Error => EventLevel::Error,
+                _ => EventLevel::Info,
+            };
+            write_event(
+                &mut tx,
+                &NewEvent::about(
+                    SubjectKind::Sensor,
+                    sensor,
+                    EventKind::SensorTick,
+                    match error {
+                        Some(why) => format!("{} — {why}", outcome.as_str()),
+                        None => format!("{}, {launched} launched", outcome.as_str()),
+                    },
+                )
+                .level(level)
+                .data(json!({
+                    "outcome": outcome,
+                    "launched": launched,
+                    "skipped": skipped,
+                    "duration_ms": duration_ms,
+                    "runs": runs,
+                    "error": error,
+                })),
+                at,
+            )?;
+        }
         tx.commit()?;
         Ok(())
     }
@@ -3639,6 +3694,21 @@ fn backfill_over(
         "launched": launched,
         "total": total,
     }))
+}
+
+/// how far a follower may read, from [`Store::settled_after`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Settled {
+    /// the highest seq with no hole between it and the cursor. everything up
+    /// to here has committed and nothing can appear underneath it.
+    pub upto: i64,
+    /// the seq that stopped the walk: allocated and not visible, so either
+    /// still committing or aborted. `None` when the log is unbroken.
+    pub gap: Option<i64>,
+    /// the next seq that *is* visible above the gap, when the scan reached one.
+    /// a follower giving up on the gap resumes here rather than one seq at a
+    /// time, so a pruned range costs one wait rather than one per row.
+    pub after_gap: Option<i64>,
 }
 
 /// bind one parameter and answer with its number, which is what a `?n` in the
@@ -4328,6 +4398,24 @@ mod tests {
             assert_eq!(ev.subject.as_deref(), Some("watch"));
             assert_eq!(ev.data.unwrap()["runs"], json!(["r1"]));
 
+            // an evaluation that looked and found nothing is a tick and not an
+            // event: a sensor polling every five seconds would otherwise be
+            // ninety-nine rows in a hundred of the log
+            let before = store.event_watermark().unwrap();
+            store
+                .record_sensor_tick("watch", SensorOutcome::Fired, 0, 0, 3, &[], None)
+                .unwrap();
+            assert_eq!(store.sensor_ticks(Some("watch"), 10).unwrap().len(), 2);
+            assert_eq!(store.event_watermark().unwrap(), before);
+            // one that declined a keyed request did something, and says so
+            store
+                .record_sensor_tick("watch", SensorOutcome::Fired, 0, 1, 3, &[], None)
+                .unwrap();
+            assert_eq!(
+                newest(&store, EventKind::SensorTick).data.unwrap()["skipped"],
+                json!(1)
+            );
+
             let id = store
                 .create_backfill("sales/orders", "a", "c", &["a".into(), "b".into()])
                 .unwrap();
@@ -4601,6 +4689,162 @@ mod tests {
             };
             assert_eq!(store.event_log(&q, 10).unwrap().len(), 1);
         });
+    }
+
+    /// read what has settled, the way a follower does: everything committed on
+    /// a backend that settles in order, and the unbroken run above the cursor
+    /// on one that does not.
+    ///
+    /// the stream's rule without the stream's grace timer, so a case can drive
+    /// it without a socket and without waiting two seconds to find out that a
+    /// gap it deliberately made is still there.
+    fn settled_batch(store: &Store, cursor: i64, limit: u32) -> Vec<Event> {
+        let ceiling = match store.settles_in_order() {
+            true => store.event_watermark().unwrap(),
+            false => store.settled_after(cursor, 10_000).unwrap().upto,
+        };
+        store
+            .event_tail(&EventQuery::default(), cursor, Some(ceiling), limit)
+            .unwrap()
+    }
+
+    // eight writers, a follower reading beside them, and then the whole table
+    // compared against what it saw: every seq exactly once, in order, none
+    // skipped and none twice, on both backends.
+    //
+    // this is the ordinary-operation case and it is worth knowing what it does
+    // *not* do: the window in which a real writer is mid-commit is microseconds
+    // wide, and a follower polling beside it lands in that window rarely enough
+    // that removing the rule below does not reliably fail this. the case under
+    // it forces the state instead, and that is the one with teeth.
+    #[test]
+    fn a_follower_reads_every_event_exactly_once_under_concurrent_writers() {
+        both(|db| {
+            let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let writers: Vec<_> = (0..8)
+                .map(|w| {
+                    let store = db.store();
+                    std::thread::spawn(move || {
+                        for i in 0..25 {
+                            store
+                                .record_materialization(
+                                    &format!("a{w}"),
+                                    Some(&format!("k{i}")),
+                                    "fp",
+                                    &json!({}),
+                                    None,
+                                    None,
+                                    None,
+                                )
+                                .unwrap();
+                        }
+                    })
+                })
+                .collect();
+
+            let seen = {
+                let (store, stop) = (db.store(), stop.clone());
+                std::thread::spawn(move || {
+                    let mut seen: Vec<i64> = Vec::new();
+                    let mut cursor = 0;
+                    // one pass after the writers are done, so the tail of the
+                    // log is read with everything committed
+                    let mut draining = false;
+                    loop {
+                        let batch = settled_batch(&store, cursor, 500);
+                        for ev in &batch {
+                            assert!(ev.seq > cursor, "the follower went backwards");
+                            cursor = ev.seq;
+                            seen.push(ev.seq);
+                        }
+                        if draining && batch.is_empty() {
+                            return seen;
+                        }
+                        draining = stop.load(std::sync::atomic::Ordering::SeqCst);
+                        std::thread::yield_now();
+                    }
+                })
+            };
+
+            for w in writers {
+                w.join().unwrap();
+            }
+            stop.store(true, std::sync::atomic::Ordering::SeqCst);
+            let seen = seen.join().unwrap();
+
+            let all: Vec<i64> = db
+                .store()
+                .event_log(&EventQuery::default(), 1000)
+                .unwrap()
+                .into_iter()
+                .rev()
+                .map(|e| e.seq)
+                .collect();
+            assert_eq!(all.len(), 200, "not every write landed");
+            assert_eq!(seen, all, "the follower skipped or repeated an event");
+        });
+    }
+
+    // and the state the case above can only make likely, made certain: one
+    // writer holding an uncommitted event while a later one commits over it.
+    //
+    // postgres only, and that is the finding rather than a gap: sqlite's
+    // writers hold the database's write lock until they commit, so this state
+    // is unreachable there and seq order is commit order.
+    #[cfg(feature = "postgres")]
+    #[test]
+    fn an_uncommitted_event_holds_the_follower_back_rather_than_being_skipped() {
+        let Some(pg) = Scratch::new() else {
+            return;
+        };
+        let store = pg.store();
+        let insert = "INSERT INTO events (subject_kind, subject, level, kind, message, ts)
+                      VALUES ('asset', ?1, 'info', 'asset_materialized', 'held', ?2)";
+        let (ready, is_ready) = std::sync::mpsc::channel();
+        let (release, released) = std::sync::mpsc::channel();
+        let holder = {
+            let url = pg.url.clone();
+            std::thread::spawn(move || {
+                let mut client = crate::pg::unmigrated(&url).unwrap();
+                let mut tx = client.transaction().unwrap();
+                tx.execute(insert, args!["first", Utc::now().to_rfc3339()])
+                    .unwrap();
+                ready.send(()).unwrap();
+                released.recv().unwrap();
+                tx.commit().unwrap();
+            })
+        };
+        is_ready.recv().unwrap();
+
+        // committed, and above the seq the holder is sitting on
+        store
+            .record_materialization("second", None, "fp", &json!({}), None, None, None)
+            .unwrap();
+
+        // a follower reading now must deliver neither: the visible one is above
+        // a seq that is still in flight, and taking it would strand the other
+        let mut cursor = 0;
+        for _ in 0..3 {
+            for ev in settled_batch(&store, cursor, 100) {
+                assert!(
+                    ev.subject.as_deref() != Some("second"),
+                    "the follower took an event over an uncommitted one"
+                );
+                cursor = ev.seq;
+            }
+        }
+
+        release.send(()).unwrap();
+        holder.join().unwrap();
+        // and once it commits, both arrive, in seq order
+        let mut seen: Vec<String> = Vec::new();
+        for _ in 0..3 {
+            for ev in settled_batch(&store, cursor, 100) {
+                cursor = ev.seq;
+                seen.push(ev.subject.clone().unwrap_or_default());
+            }
+        }
+        assert_eq!(seen, ["first", "second"]);
     }
 
     // a run's events go when its run does, and always did. what v17 added

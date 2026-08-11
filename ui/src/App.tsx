@@ -1,4 +1,5 @@
 import { Link, NavLink, Route, Routes } from "react-router-dom";
+import ActivityPage from "./ActivityPage";
 import AssetPage from "./AssetPage";
 import BackfillPage from "./BackfillPage";
 import AssetsPage from "./AssetsPage";
@@ -22,6 +23,7 @@ export default function App() {
             </NavLink>
             <NavLink to="/assets">Assets</NavLink>
             <NavLink to="/runs">Runs</NavLink>
+            <NavLink to="/activity">Activity</NavLink>
           </nav>
         </div>
       </header>
@@ -36,6 +38,7 @@ export default function App() {
           <Route path="/backfills/:id" element={<BackfillPage />} />
           <Route path="/runs" element={<RunsPage />} />
           <Route path="/runs/:id" element={<RunPage />} />
+          <Route path="/activity" element={<ActivityPage />} />
         </Routes>
       </main>
       <CommandPalette />

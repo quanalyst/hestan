@@ -26,6 +26,8 @@ failures. timestamps are rfc3339 strings in utc.
 | GET | `/api/runs` | run list with filters and paging |
 | GET | `/api/runs/{id}` | one run plus its op runs |
 | GET | `/api/runs/{id}/events` | the run's event log, cursored |
+| GET | `/api/events` | the whole log, newest first, filtered and cursored |
+| GET | `/api/events/stream` | the whole log as server-sent events, live, from a cursor |
 | GET | `/api/runs/{id}/logs` | what the run's ops printed, cursored |
 | GET | `/api/runs/{id}/logs/download` | the same as `text/plain`, to grep |
 | POST | `/api/runs/{id}/retry` | launch a fresh run with the same params |
@@ -478,9 +480,57 @@ everything.
 ```
 
 `op` is null for run-level events (`run_queued`, `run_started`, ...). `kind`
-and `data` are catalogued in [concepts](concepts.md); `op_expanded`
+and `data` are catalogued per kind in [events](events.md); `op_expanded`
 (`data: {"instances": n, "over": dep}`) is how many instances a mapped op made,
 and the only record it leaves when that number is zero.
+
+### The whole log
+
+`GET /api/events` returns `{"events": [...], "schema": 1}` — every event in the
+deployment, not only the ones about runs, **newest first**. this is the "what
+happened last night" query.
+
+| parameter | | |
+| --- | --- | --- |
+| `kind` | one kind exactly | an unknown word matches nothing rather than 400ing: a newer writer may write kinds this build has never heard of |
+| `subject_kind` | `run`, `job`, `asset`, `schedule`, `sensor`, `backfill`, `system` | same |
+| `subject` | one subject | on a run event this matches the run id, which is where a run event's subject lives |
+| `level` | `info`, `warn` or `error` | that level exactly; anything else is a 400 |
+| `since`, `until` | rfc3339 | `since` inclusive, `until` exclusive |
+| `before` | seq | exclusive: the cursor for the page below |
+| `limit` | default 100 | clamped to 1..=1000 |
+
+filters compose. an event carries `subject_kind` and `subject` beside the
+`run_id` a run event has, and `data` is [documented per kind](events.md).
+`schema` is the payload schema version and what it promises is written down
+there.
+
+pages go backwards: take the `seq` of the last row and pass it as `before`.
+
+### Following it live
+
+`GET /api/events/stream` is the same log and the same filters, as [server-sent
+events](https://developer.mozilla.org/en-US/docs/Web/API/Server-sent_events),
+plus `after=<seq>`. each message is one event with its `seq` as the SSE `id`,
+so a reconnecting `EventSource` resumes exactly where it stopped — `after` and
+the `Last-Event-ID` header both work, and `after` wins.
+
+with no cursor at all it starts from *now* rather than from the beginning of
+the log: opening a live feed means "from here", and the history is one call to
+`GET /api/events` away.
+
+two things about it are worth reading [events.md](events.md#following-the-log)
+for, because both are the kind of thing that is silent when it goes wrong:
+
+- `seq` is allocated on insert rather than on commit, so a naive follower would
+  skip events. this one does not, and what that costs on each backend is
+  written down there.
+- a consumer that stops reading is **dropped** rather than buffered, and told:
+
+```
+event: dropped
+data: {"count": 412, "through": 51233}
+```
 
 ## Captured output
 

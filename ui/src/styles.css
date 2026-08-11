@@ -1589,3 +1589,56 @@ table.plain-rows tbody tr:hover {
   flex-wrap: wrap;
   gap: 3px 16px;
 }
+
+/* the activity feed: one row per event across the whole deployment. the
+   subject and the kind are narrow fixed columns so the eye runs down them,
+   and the message takes whatever is left */
+.act-table td {
+  vertical-align: baseline;
+}
+
+.act-table td:first-child {
+  white-space: nowrap;
+}
+
+/* the level, as a word rather than a shade: monochrome cannot carry three
+   levels, and a middle dot for `info` keeps the column from being ragged */
+.act-level {
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.act-subject-kind,
+.act-kind {
+  white-space: nowrap;
+  font-size: 12px;
+}
+
+.act-op {
+  font-size: 12px;
+}
+
+/* a gap the stream reported, drawn as a break in the feed rather than as a
+   row that could be mistaken for an event */
+.act-gap td {
+  padding: 10px 0;
+  border-top: 1px dashed var(--hairline);
+  border-bottom: 1px dashed var(--hairline);
+  font-size: 12px;
+}
+
+.act-empty {
+  max-width: 52ch;
+  margin-top: 28px;
+}
+
+.act-empty p {
+  margin: 0 0 12px;
+}
+
+.act-foot {
+  margin-top: 20px;
+  font-size: 12px;
+}

@@ -188,6 +188,14 @@ downtime.
 whose [run key](sensors.md) was already claimed, which is a different fact from
 launching nothing.
 
+**a tick that did nothing gets no event.** every evaluation is still a row in
+`sensor_ticks` and the [sensors page](web-ui.md) still reads all of them — that
+is the sensor's health record. but a sensor polling every five seconds is
+seventeen thousand evaluations a day, and an activity log in which those are
+99% of the rows is one you cannot read anything else out of. so the log gets
+the ticks that *did* something: launched a run, declined a keyed request, or
+failed.
+
 ### Backfills
 
 `subject` is the backfill id, as a decimal string.
@@ -241,6 +249,125 @@ which is why hestan's own reader does not either — an unrecognised kind reads
 as `EventKind::Unknown("…")` carrying the stored word, rather than failing the
 query and taking the rest of the page with it. the same is true of
 `subject_kind`.
+
+## Asking
+
+`GET /api/events` is the whole log, newest first.
+
+```
+GET /api/events?since=2026-01-01T22:00:00Z&level=error&limit=100
+GET /api/events?subject_kind=asset&subject=sales/orders
+GET /api/events?kind=schedule_fired&subject=nightly
+GET /api/events?before=4182
+```
+
+every filter composes, and every one is optional:
+
+| parameter | what it narrows to |
+| --- | --- |
+| `kind` | one kind, exactly |
+| `subject_kind` | one of `run`, `job`, `asset`, `schedule`, `sensor`, `backfill`, `system` |
+| `subject` | one subject; on a run event this matches the run id |
+| `level` | that level exactly — three levels, and "show me the errors" is what anyone types |
+| `since`, `until` | rfc3339; `since` is inclusive, `until` exclusive |
+| `before` | seq, exclusive: the cursor for the next page back |
+| `limit` | default 100, max 1000 |
+
+pages go backwards: take the `seq` of the last row you got and pass it as
+`before`. an unfiltered first page plus `before` walks the whole log without
+skipping or repeating, because nothing is ever inserted below a seq that has
+already committed — see the next section for the one exception, at the very top
+of the log.
+
+a run's own log is still `GET /api/runs/{id}/events`, oldest first from a
+cursor, which is what the run page follows.
+
+## Following the log
+
+`GET /api/events/stream` is the same log as [server-sent
+events](https://developer.mozilla.org/en-US/docs/Web/API/Server-sent_events),
+live, taking the same filters plus `after=<seq>`:
+
+```
+GET /api/events/stream?after=4182&subject_kind=asset
+```
+
+each message is one event, with the event's `seq` as the SSE `id`, so a
+reconnecting consumer that sends `Last-Event-ID` (or passes `after=`) picks up
+exactly where it stopped and the gap is delivered before the live tail.
+
+### `seq` is allocated on insert, not on commit
+
+this is the one thing worth understanding before you write a consumer.
+
+both backends allocate `seq` when the row is inserted, not when its transaction
+commits. so a writer that has taken seq 5 and not yet committed is invisible
+while a writer that took 6 and did commit is not — and a follower that takes
+everything it can see and moves its cursor to 6 will **never come back for 5**.
+that is a real bug, it is silent, and it is the classic one for anything that
+tails an autoincrementing column.
+
+hestan does not skip, and how it avoids it differs by backend:
+
+- **sqlite**: it cannot happen. writers take the database's write lock and hold
+  it until they commit, so no transaction can commit below one that already
+  has. seq order *is* commit order, and the stream delivers up to the newest
+  seq immediately.
+- **postgres**: several processes write at once and seq order is not commit
+  order, so the stream delivers only the **unbroken run** above its cursor. a
+  missing seq stops it: that seq is either a transaction still committing or
+  one that aborted, and nothing outside the database can tell those apart. so
+  it waits on the hole for **two seconds** and steps over it after that — which
+  is the one assumption in the whole mechanism, and here it is: *a transaction
+  that appends an event and takes longer than two seconds to commit may be
+  skipped*. hestan's are a handful of statements each. a hole left by a
+  retention sweep is a whole range, and one wait covers the range rather than
+  each row in it.
+
+`GET /api/events` has the same exposure at the very top of the log and does
+*not* apply the rule: a page of the past is exact, and the newest page on
+postgres may be missing a row that is committing as you read it. it will be
+there on the next call, at a seq below the one you already have — which is why
+the stream exists, and why paging forward on `before` is not how you follow a
+log.
+
+### A consumer that falls behind is dropped, loudly
+
+the stream never buffers without bound. a slow consumer would otherwise turn
+into unbounded memory in the server, which is the failure mode that takes the
+orchestrator down along with the consumer.
+
+the queue between the reader and the socket holds 256 events. when it is full:
+
+- further events are **dropped**, and the cursor moves past them anyway.
+- how many were dropped is counted, and sent as a `dropped` SSE event as soon
+  as there is room:
+
+```
+event: dropped
+data: {"count": 412, "through": 51233}
+```
+
+- `through` is the seq the drop ran up to. a consumer that cares about what it
+  missed can fetch exactly that range from `GET /api/events` with `before` and
+  `since`, which is why the marker carries a seq rather than only a count.
+
+a gap that says it is a gap is worth something. a gap that does not is worse
+than nothing, which is the same reasoning the [capture layer](logs.md) drops
+under.
+
+## In the ui
+
+**Activity** is the whole log, one row per event, newest first: what it was
+about, what happened, and when. the filters are the api's — subject kind,
+level, and a find box over the message and the subject — and the feed follows
+the stream, so a run that starts while you are looking at it appears at the
+top.
+
+it is the one page that is not about a single thing. every other page answers
+"what is the state of this job / asset / run"; this one answers "what has this
+deployment been doing", which is the question you have at 3am and the one
+hestan could not previously answer at all.
 
 ## Retention
 

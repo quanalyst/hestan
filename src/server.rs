@@ -1,11 +1,14 @@
 use std::collections::{HashMap, HashSet};
+use std::convert::Infallible;
 use std::str::FromStr;
 use std::sync::Arc;
+use std::time::Duration as StdDuration;
 
 use axum::body::Bytes;
 use axum::extract::rejection::QueryRejection;
 use axum::extract::{Path, Query, State};
-use axum::http::{Method, StatusCode, Uri, header};
+use axum::http::{HeaderMap, Method, StatusCode, Uri, header};
+use axum::response::sse::{Event as SseEvent, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post, put};
 use axum::{Json, Router};
@@ -25,12 +28,13 @@ use crate::freshness::{self, asset_freshness};
 use crate::graph;
 use crate::job::Job;
 use crate::model::{
-    AssetCheckRow, CheckStatus, DeliveryState, Freshness, MetaPoint, OpRun, OpStatus, RunStatus,
-    RunTags, ScheduleRow, Trigger,
+    self, AssetCheckRow, CheckStatus, DeliveryState, EventLevel, Freshness, MetaPoint, OpRun,
+    OpStatus, RunStatus, RunTags, ScheduleRow, Trigger,
 };
 use crate::op;
 use crate::schedule;
 use crate::sensor::SensorState;
+use crate::store::{EventQuery, Store};
 
 static UI_DIST: Dir<'static> = include_dir!("$CARGO_MANIFEST_DIR/ui/dist");
 
@@ -118,6 +122,8 @@ pub(crate) fn router(state: AppState) -> Router {
         .route("/api/schedules/upcoming", get(upcoming_schedules))
         .route("/api/late", get(list_late))
         .route("/api/notifications", get(list_notifications))
+        .route("/api/events", get(list_events))
+        .route("/api/events/stream", get(stream_events))
         .fallback(static_ui)
         .with_state(state)
 }
@@ -1633,6 +1639,283 @@ async fn get_run(
         })
         .collect();
     Ok(Json(json!({ "run": run, "ops": ops })))
+}
+
+/// how many events `GET /api/events` returns by default, and the most it will
+/// return however large a `limit` asks for.
+const EVENT_PAGE: u32 = 100;
+const EVENT_PAGE_MAX: u32 = 1_000;
+
+/// how often the stream looks for new events, and — on postgres — how far it
+/// stays behind the newest committed seq. see [`stream_events`].
+const STREAM_POLL: StdDuration = StdDuration::from_secs(1);
+
+/// how many events wait on the socket before a stalled consumer starts losing
+/// them. bounded on purpose: a consumer that stopped reading must not turn into
+/// unbounded memory in the orchestrator, which would take down the thing every
+/// other consumer is watching.
+const STREAM_QUEUE: usize = 256;
+
+/// how many events one poll reads at a time. a follower resuming from an old
+/// cursor pages through the gap in these rather than in one query.
+const STREAM_BATCH: u32 = 500;
+
+/// the filters both event endpoints take. `kind` and `subject_kind` are open
+/// sets — a word this build does not know is a filter that matches nothing,
+/// rather than a 400 about a kind a newer writer is entitled to write.
+#[derive(Deserialize)]
+struct EventLogQuery {
+    kind: Option<String>,
+    subject_kind: Option<String>,
+    subject: Option<String>,
+    level: Option<String>,
+    since: Option<String>,
+    until: Option<String>,
+    /// seq, exclusive: the page-back cursor.
+    before: Option<i64>,
+    /// seq, exclusive: where a follower resumes from.
+    after: Option<i64>,
+    limit: Option<u32>,
+}
+
+impl EventLogQuery {
+    fn parse(&self) -> Result<EventQuery, ApiError> {
+        let word = |v: &Option<String>| v.clone().filter(|s| !s.is_empty());
+        let level = match word(&self.level) {
+            None => None,
+            Some(s) => Some(EventLevel::from_str(&s).map_err(|e| err(StatusCode::BAD_REQUEST, e))?),
+        };
+        Ok(EventQuery {
+            // infallible: `Unknown` carries the word through
+            kind: word(&self.kind).map(|s| s.parse().unwrap_or_else(|e| match e {})),
+            subject_kind: word(&self.subject_kind)
+                .map(|s| s.parse().unwrap_or_else(|e| match e {})),
+            subject: word(&self.subject),
+            level,
+            since: time_param(self.since.as_deref(), "since")?,
+            until: time_param(self.until.as_deref(), "until")?,
+            before: self.before,
+        })
+    }
+}
+
+/// the whole log, newest first: the "what happened last night" query.
+///
+/// cursored on `seq` — take the last row's seq and pass it as `before` for the
+/// page under it. filters compose, and every one of them is optional.
+async fn list_events(
+    State(st): State<AppState>,
+    q: Result<Query<EventLogQuery>, QueryRejection>,
+) -> Result<Json<Value>, ApiError> {
+    let Query(q) = q.map_err(bad_query)?;
+    let limit = q.limit.unwrap_or(EVENT_PAGE).clamp(1, EVENT_PAGE_MAX);
+    let events = st
+        .runner
+        .store()
+        .event_log(&q.parse()?, limit)
+        .map_err(internal)?;
+    Ok(Json(
+        json!({ "events": events, "schema": model::EVENT_SCHEMA }),
+    ))
+}
+
+/// the same log as server-sent events, live, from a cursor.
+///
+/// the cursor is `after=`, or the `Last-Event-ID` header a reconnecting
+/// `EventSource` sends on its own — so a consumer that drops off gets the gap
+/// before the live tail and misses nothing in between. each message carries the
+/// event's `seq` as its SSE id, which is what makes that work.
+///
+/// **the stream never delivers past what has settled.** `seq` is allocated on
+/// insert rather than on commit, so a writer holding seq 5 uncommitted is
+/// invisible while one that took 6 and committed is not — and a follower that
+/// took 6 and moved on would never come back for 5. sqlite cannot get there:
+/// its writers hold the database's write lock until they commit, so seq order
+/// is commit order and the stream reads up to the newest seq at once. postgres
+/// can, so there the stream reads only up to the watermark it saw a poll ago,
+/// and an event reaches a follower a second or so after it lands.
+///
+/// **a consumer that falls behind is dropped, and told.** the queue holds
+/// [`STREAM_QUEUE`]; past that the cursor moves on without it and the count is
+/// sent as a `dropped` event carrying the seq it ran through, so the gap can be
+/// fetched from `GET /api/events`. a gap that says it is a gap is worth
+/// something; one that does not is worse than nothing.
+async fn stream_events(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    q: Result<Query<EventLogQuery>, QueryRejection>,
+) -> Result<Sse<impl futures::Stream<Item = Result<SseEvent, Infallible>>>, ApiError> {
+    let Query(q) = q.map_err(bad_query)?;
+    let filter = q.parse()?;
+    // the header wins nothing and loses nothing: a client that passes `after`
+    // meant it, and one that reconnected on its own did not pass anything
+    let resume = q.after.or_else(|| {
+        headers
+            .get("last-event-id")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.parse().ok())
+    });
+    let store = st.runner.store().clone();
+    // where a follower with no cursor starts: now, not the beginning of the
+    // log. "show me what happens from here" is what opening a live feed means,
+    // and the whole history is one query away for anyone who wants it
+    let start = match resume {
+        Some(seq) => seq,
+        None => store.event_watermark().map_err(internal)?,
+    };
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<SseEvent, Infallible>>(STREAM_QUEUE);
+    tokio::spawn(async move {
+        follow(store, filter, start, tx).await;
+    });
+    let stream = futures::stream::unfold(rx, |mut rx| async move {
+        rx.recv().await.map(|item| (item, rx))
+    });
+    Ok(Sse::new(stream).keep_alive(KeepAlive::default()))
+}
+
+/// the task behind one stream: read what has settled, hand it over, repeat.
+async fn follow(
+    store: Store,
+    filter: EventQuery,
+    start: i64,
+    tx: tokio::sync::mpsc::Sender<Result<SseEvent, Infallible>>,
+) {
+    let mut cursor = start;
+    let mut waiting: Option<(i64, std::time::Instant)> = None;
+    let mut lost: Option<(u64, i64)> = None;
+    loop {
+        let ceiling = match ceiling(&store, cursor, &mut waiting) {
+            Ok(ceiling) => ceiling,
+            // a read that failed says nothing about the log; keep the cursor
+            // and try again rather than closing the stream
+            Err(e) => {
+                tracing::warn!("event stream: read failed: {e}");
+                None
+            }
+        };
+        if let Some(Step { ceiling, skip_to }) = ceiling {
+            while cursor < ceiling {
+                let batch = match store.event_tail(&filter, cursor, Some(ceiling), STREAM_BATCH) {
+                    Ok(batch) => batch,
+                    Err(e) => {
+                        tracing::warn!("event stream: read failed: {e}");
+                        break;
+                    }
+                };
+                if batch.is_empty() {
+                    // nothing this filter admits below the ceiling, and asking
+                    // again would be the same question
+                    cursor = ceiling;
+                    break;
+                }
+                for ev in &batch {
+                    cursor = ev.seq;
+                    let message = SseEvent::default()
+                        .id(ev.seq.to_string())
+                        .json_data(ev)
+                        .unwrap_or_else(|_| SseEvent::default().data("{}"));
+                    match tx.try_send(Ok(message)) {
+                        Ok(()) => {}
+                        // the consumer is behind: the cursor moves anyway, and
+                        // what it cost is counted and sent as soon as there is
+                        // room for it
+                        Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                            let (n, _) = lost.unwrap_or((0, 0));
+                            lost = Some((n + 1, ev.seq));
+                        }
+                        Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => return,
+                    }
+                }
+            }
+            // a gap this follower has waited out: step over the whole missing
+            // range at once rather than one seq at a time, since a range is
+            // what a retention sweep leaves and one seq is what an abort does
+            if let Some(skip_to) = skip_to {
+                cursor = cursor.max(skip_to);
+            }
+        }
+        if let Some((count, through)) = lost {
+            let marker = SseEvent::default()
+                .event("dropped")
+                .data(json!({ "count": count, "through": through }).to_string());
+            if tx.try_send(Ok(marker)).is_ok() {
+                lost = None;
+            }
+        }
+        if tx.is_closed() {
+            return;
+        }
+        tokio::time::sleep(STREAM_POLL).await;
+    }
+}
+
+/// how far this pass may read, and whether it is also stepping over a gap.
+struct Step {
+    ceiling: i64,
+    /// the cursor to jump to afterwards, when a gap has been waited out.
+    skip_to: Option<i64>,
+}
+
+/// how long a follower waits on a missing seq before deciding it is never
+/// coming.
+///
+/// a hole is a transaction still committing or one that aborted, and nothing
+/// can tell those apart from outside. waiting forever stalls the stream on
+/// every rolled-back write; not waiting at all skips events that were about to
+/// land. so: wait, bounded, and say in the docs that a transaction slower than
+/// this may be skipped. hestan's event-writing transactions are a handful of
+/// statements each.
+const SETTLE_GRACE: StdDuration = StdDuration::from_secs(2);
+
+/// how far ahead the gap walk looks, which also caps what one poll delivers.
+const SETTLE_SCAN: u32 = 2_000;
+
+/// what a follower may take this pass.
+///
+/// on a backend that [settles in order](Store::settles_in_order) that is
+/// everything committed, full stop. on one that does not, it is the unbroken
+/// run above the cursor — and the gap that ended it is remembered, so that the
+/// same gap seen for longer than [`SETTLE_GRACE`] is stepped over rather than
+/// stalling the stream forever on a rolled-back write.
+fn ceiling(
+    store: &Store,
+    cursor: i64,
+    waiting: &mut Option<(i64, std::time::Instant)>,
+) -> Result<Option<Step>, Error> {
+    if store.settles_in_order() {
+        let hi = store.event_watermark()?;
+        return Ok(Some(Step {
+            ceiling: hi,
+            skip_to: None,
+        }));
+    }
+    let settled = store.settled_after(cursor, SETTLE_SCAN)?;
+    let Some(gap) = settled.gap else {
+        *waiting = None;
+        return Ok(Some(Step {
+            ceiling: settled.upto,
+            skip_to: None,
+        }));
+    };
+    let since = match waiting {
+        Some((at, since)) if *at == gap => *since,
+        _ => {
+            let now = std::time::Instant::now();
+            *waiting = Some((gap, now));
+            now
+        }
+    };
+    let expired = since.elapsed() >= SETTLE_GRACE;
+    if expired {
+        tracing::debug!("event stream: seq {gap} never arrived; stepping over it");
+        *waiting = None;
+    }
+    Ok(Some(Step {
+        ceiling: settled.upto,
+        // resume at the next visible seq when the scan found one; otherwise
+        // just past the gap, and the next pass walks on from there
+        skip_to: expired.then(|| settled.after_gap.map_or(gap, |next| next - 1)),
+    }))
 }
 
 #[derive(Deserialize)]
@@ -4793,6 +5076,257 @@ mod tests {
         let (status, _, _) =
             request_text(router(st), Method::GET, "/api/runs/nope/logs/download").await;
         assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    // the "what happened last night" query: every filter narrows, they compose,
+    // and the page walks backwards on seq without skipping or repeating
+    #[tokio::test]
+    async fn the_event_log_filters_compose_and_the_cursor_pages() {
+        let st = state(vec![echo_job("etl")]);
+        let store = st.runner.store();
+        insert_run(&st, "r1", "etl", RunStatus::Running, json!({}));
+        for i in 0..5 {
+            store
+                .record_materialization(
+                    &format!("sales{i}"),
+                    None,
+                    "fp",
+                    &json!({}),
+                    None,
+                    None,
+                    None,
+                )
+                .unwrap();
+        }
+        store
+            .record_check(
+                "sales0",
+                None,
+                "not_empty",
+                "r1",
+                CheckStatus::Failed,
+                crate::Severity::Error,
+                Some("0 rows"),
+                None,
+            )
+            .unwrap();
+        store
+            .record_sensor_tick(
+                "watch",
+                crate::SensorOutcome::Fired,
+                1,
+                0,
+                3,
+                &["r1".into()],
+                None,
+            )
+            .unwrap();
+
+        let get = async |q: &str| {
+            let (status, body, _) =
+                request(router(st.clone()), Method::GET, &format!("/api/events{q}")).await;
+            assert_eq!(status, StatusCode::OK, "{q}");
+            body.unwrap()
+        };
+        let rows = |v: &Value| v["events"].as_array().unwrap().clone();
+
+        let all = get("").await;
+        assert_eq!(all["schema"], json!(crate::EVENT_SCHEMA));
+        // one queued run, five materializations, a check and a sensor tick
+        assert_eq!(rows(&all).len(), 8);
+        // newest first
+        assert_eq!(rows(&all)[0]["kind"], json!("sensor_tick"));
+
+        // each filter alone
+        assert_eq!(rows(&get("?subject_kind=asset").await).len(), 6);
+        assert_eq!(rows(&get("?kind=asset_materialized").await).len(), 5);
+        assert_eq!(rows(&get("?level=error").await).len(), 1);
+        assert_eq!(rows(&get("?subject=sales0").await).len(), 2);
+        // a run event is found by its run id, which is where its subject is
+        assert_eq!(rows(&get("?subject=r1").await).len(), 1);
+        // and they compose
+        assert_eq!(rows(&get("?subject_kind=asset&level=error").await).len(), 1);
+        assert_eq!(
+            rows(&get("?subject=sales0&kind=asset_materialized").await).len(),
+            1
+        );
+        // a kind no build knows is a filter that matches nothing, not a 400: a
+        // newer writer is entitled to write kinds this one has never heard of
+        assert!(rows(&get("?kind=quantum_entangled").await).is_empty());
+        // a level is a closed set of three and a typo in one is a mistake
+        let (status, _, _) = request(
+            router(st.clone()),
+            Method::GET,
+            "/api/events?level=critical",
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+
+        // the cursor: three pages of three, and the whole log comes back once
+        let mut seen: Vec<i64> = Vec::new();
+        let mut before = String::new();
+        loop {
+            let page = rows(&get(&format!("?limit=3{before}")).await);
+            if page.is_empty() {
+                break;
+            }
+            seen.extend(
+                page.iter()
+                    .map(|e| e.as_object().unwrap()["seq"].as_i64().unwrap()),
+            );
+            before = format!("&before={}", seen.last().unwrap());
+        }
+        assert_eq!(seen.len(), 8, "the cursor skipped or repeated");
+        assert!(seen.windows(2).all(|w| w[0] > w[1]), "out of order");
+        // and a filter composes with the cursor rather than resetting it
+        let first = rows(&get("?subject_kind=asset&limit=2").await);
+        let next = rows(
+            &get(&format!(
+                "?subject_kind=asset&limit=99&before={}",
+                first[1]["seq"]
+            ))
+            .await,
+        );
+        assert_eq!(next.len(), 4);
+        assert!(next.iter().all(|e| e["subject_kind"] == json!("asset")));
+    }
+
+    // a follower that drops off and comes back with its cursor gets the gap
+    // before the live tail, which is the whole point of the stream having one
+    #[tokio::test]
+    async fn a_stream_resumed_from_a_cursor_delivers_the_gap_then_follows() {
+        use futures::StreamExt;
+
+        let st = state(vec![echo_job("etl")]);
+        let store = st.runner.store();
+        let mat = |name: &str| {
+            store
+                .record_materialization(name, None, "fp", &json!({}), None, None, None)
+                .unwrap()
+        };
+        mat("before");
+        let cursor = store.event_watermark().unwrap();
+        // what happened while nobody was listening
+        mat("missed_one");
+        mat("missed_two");
+
+        let sse = stream_events(
+            State(st.clone()),
+            HeaderMap::new(),
+            Ok(Query(EventLogQuery {
+                kind: None,
+                subject_kind: Some("asset".into()),
+                subject: None,
+                level: None,
+                since: None,
+                until: None,
+                before: None,
+                after: Some(cursor),
+                limit: None,
+            })),
+        )
+        .await
+        .unwrap();
+        let mut body = sse.into_response().into_body().into_data_stream();
+
+        // the gap first, in order, each carrying its seq as the sse id
+        let mut text = String::new();
+        let deadline = tokio::time::Instant::now() + StdDuration::from_secs(10);
+        while !text.contains("missed_two") && tokio::time::Instant::now() < deadline {
+            match tokio::time::timeout(StdDuration::from_secs(2), body.next()).await {
+                Ok(Some(Ok(chunk))) => text.push_str(&String::from_utf8_lossy(&chunk)),
+                _ => break,
+            }
+        }
+        assert!(
+            text.contains("missed_one"),
+            "the gap was not delivered: {text}"
+        );
+        assert!(text.contains("missed_two"), "the gap stopped short: {text}");
+        assert!(!text.contains("\"before\""), "it replayed past the cursor");
+        assert!(text.contains("id: "), "no sse id to resume from");
+
+        // and then it follows: something written now arrives without reconnecting
+        mat("live");
+        let deadline = tokio::time::Instant::now() + StdDuration::from_secs(10);
+        while !text.contains("live") && tokio::time::Instant::now() < deadline {
+            match tokio::time::timeout(StdDuration::from_secs(3), body.next()).await {
+                Ok(Some(Ok(chunk))) => text.push_str(&String::from_utf8_lossy(&chunk)),
+                _ => break,
+            }
+        }
+        assert!(text.contains("\"live\""), "the live tail stopped: {text}");
+        // the filter applies to the stream exactly as it does to the query
+        store
+            .record_sensor_tick(
+                "watch",
+                crate::SensorOutcome::Fired,
+                1,
+                0,
+                1,
+                &["r1".into()],
+                None,
+            )
+            .unwrap();
+        assert!(!text.contains("sensor_tick"));
+    }
+
+    // a consumer that stops reading must not turn into unbounded memory in the
+    // orchestrator. it loses events instead, and is told how many and up to
+    // where — a gap that says it is a gap can be fetched back from the query
+    #[tokio::test]
+    async fn a_stalled_consumer_is_dropped_with_a_marker_rather_than_buffered() {
+        use futures::StreamExt;
+
+        let st = state(vec![echo_job("etl")]);
+        let store = st.runner.store();
+        let sse = stream_events(
+            State(st.clone()),
+            HeaderMap::new(),
+            Ok(Query(EventLogQuery {
+                kind: None,
+                subject_kind: None,
+                subject: None,
+                level: None,
+                since: None,
+                until: None,
+                before: None,
+                after: Some(0),
+                limit: None,
+            })),
+        )
+        .await
+        .unwrap();
+        let mut body = sse.into_response().into_body().into_data_stream();
+
+        // comfortably more than the queue holds, with nobody reading
+        for i in 0..(STREAM_QUEUE + 200) {
+            store
+                .record_materialization(&format!("a{i}"), None, "fp", &json!({}), None, None, None)
+                .unwrap();
+        }
+
+        let mut text = String::new();
+        let deadline = tokio::time::Instant::now() + StdDuration::from_secs(20);
+        while !text.contains("event: dropped") && tokio::time::Instant::now() < deadline {
+            match tokio::time::timeout(StdDuration::from_secs(5), body.next()).await {
+                Ok(Some(Ok(chunk))) => text.push_str(&String::from_utf8_lossy(&chunk)),
+                _ => break,
+            }
+        }
+        assert!(
+            text.contains("event: dropped"),
+            "nothing said it dropped any"
+        );
+        let marker = text
+            .split("event: dropped\ndata: ")
+            .nth(1)
+            .and_then(|rest| rest.split('\n').next())
+            .expect("the marker carries its data line");
+        let marker: Value = serde_json::from_str(marker).unwrap();
+        assert!(marker["count"].as_u64().unwrap() > 0);
+        // a seq rather than only a count, so the gap can be asked for exactly
+        assert!(marker["through"].as_i64().unwrap() > 0);
     }
 
     #[tokio::test]
