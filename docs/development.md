@@ -25,19 +25,23 @@ src/
   otel.rs       trace context across the isolated-op boundary (behind otel)
   isolate.rs    isolated ops: the parent, the child, the output capture
   capture.rs    the tracing layer (behind the capture feature)
+  cli.rs        the command line: argv, the three modes, doctor, explain (behind cli)
+  bin/hestan.rs the standalone operator binary (behind cli)
   error.rs      the Error enum
 ui/             react + vite app; ui/dist is committed and embedded
-examples/       demo.rs, assets.rs, http_source.rs (needs --features http)
+examples/       demo.rs and assets.rs (both mount the cli, so both need
+                --features cli), http_source.rs (needs --features http)
 tests/          pipeline.rs, assets.rs, isolation.rs, queue.rs; http_source.rs
-                and notify.rs (need the http feature); capture.rs (needs capture)
+                and notify.rs (need the http feature); capture.rs (needs
+                capture); cli.rs (needs cli)
 ```
 
 ## Gates
 
-`just check` runs exactly what ci runs. `http`, `capture`, `postgres` and
-`otel` each compile real extra code (and all but the first gate a test target
-via `required-features`), and the crate has to be clean without them as well
-as with them — so five configurations are checked rather than one:
+`just check` runs exactly what ci runs. `http`, `capture`, `postgres`, `otel`
+and `cli` each compile real extra code (and all but the first gate a test
+target via `required-features`), and the crate has to be clean without them as
+well as with them — so seven configurations are checked rather than one:
 
 ```
 cargo fmt --check
@@ -46,11 +50,15 @@ cargo clippy --all-targets --features http -- -D warnings
 cargo clippy --all-targets --features capture -- -D warnings
 cargo clippy --all-targets --features postgres -- -D warnings
 cargo clippy --all-targets --features otel -- -D warnings
+cargo clippy --all-targets --features cli -- -D warnings
+cargo clippy --all-targets --all-features -- -D warnings
 cargo test
 cargo test --features http
 cargo test --features capture
 cargo test --features postgres
 cargo test --features otel
+cargo test --features cli
+cargo test --all-features
 ```
 
 ci additionally runs the ui's own gates — `npm run lint`, `npm test` and
@@ -155,6 +163,14 @@ is a binary of its own for the same reason `tests/capture.rs` is one — see
 below. it asserts the shape (`hestan.run`, an `hestan.op` per attempt beneath
 it, events on the span they belong to) and exports nothing: turning that tree
 into otel spans is `tracing-opentelemetry`'s job.
+
+`tests/cli.rs` is the [command line](cli.md) as a process, and it is a binary
+of its own for a reason of its own: an exit code is not something a function
+call has. every case starts this same binary with argv, reads both of its
+streams and reads what it exited with, so each documented exit code is asserted
+against a real process rather than against a return value. the conditions
+`doctor` reports are constructed and asserted in `src/cli.rs` instead, where a
+bad timezone or a claim past its lease can be written straight into a store.
 
 `tests/capture.rs` is the [capture layer](logs.md) against a real subscriber,
 and it is a binary of its own for a reason worth knowing: `tracing` caches a

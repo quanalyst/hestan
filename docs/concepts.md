@@ -598,6 +598,12 @@ both validate params before the run row is written. if any op declared
 `Error::InvalidParams` and leaves no trace in the database. launching an
 unregistered job is `Error::UnknownJob`.
 
+the [command line](cli.md) spells the same two: `run <job>` enqueues and
+returns the id, and `run <job> --wait` executes it here and exits with what it
+did. the difference between them is a role — a process that enqueues and then
+exits must not be one that also executes, or the launch would kill what it
+launched — and `run --dry-run` runs the params check above and stops there.
+
 a schedule's params are checked earlier still. `schedule_with` (and
 `schedule_tz_with`) attach the params every cron fire launches with, and
 `Hestan::build` runs them through those same validators, so a schedule whose

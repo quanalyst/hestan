@@ -1,7 +1,24 @@
 # Embedding
 
 hestan is a library; the binary is yours. there are three levels of entry,
-each dropping a layer of machinery.
+each dropping a layer of machinery — and one that wraps the first, so the
+binary you already have gains a [command line](cli.md) over the registry inside
+it.
+
+## cli::run
+
+`hestan::cli::run(app, addr)`, behind `features = ["cli"]`, is
+[`serve`](#serve-run_once-runner) with argv in front of it. **with no arguments
+it is exactly `app.serve(addr)`** — the same address, the same loops, the same
+error if the socket will not bind — so swapping the call in a running
+deployment changes nothing about how it behaves. with arguments it launches,
+inspects and diagnoses against the jobs compiled into that binary. see
+[the command line](cli.md).
+
+it asks the [isolated-op](isolation.md) guard before it looks at argv, like
+every other entry point does, because an op subprocess is this binary
+re-executed with no arguments at all — and no arguments is how a command line
+spells "serve".
 
 ## serve, run_once, Runner
 

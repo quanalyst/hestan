@@ -17,6 +17,7 @@
 - [http sources](http-sources.md) — declarative REST pulls: the full `HttpSource` builder, fan-out, retry policy.
 - [notifications](notifications.md) — hooks: `on_run_finished`/`RunEvent`, `on_op_finished`/`OpEvent`, per-job scoping, `on_failure`/`RunFailure`, `on_late`/`LateEvent`, the webhook and slack helpers, and durable at-least-once delivery.
 - [launching](launching.md) — presets, params schemas, run tags, subset launches, and cloning a past run.
+- [the command line](cli.md) — `hestan::cli::run` in your own binary: the mount, the three ways to reach a deployment, every command, the exit codes a cron line reads, the output contract, `doctor`, `explain` and dynamic completion.
 - [web ui](web-ui.md) — page-by-page tour of the embedded ui and how it draws status.
 - [scaling](scaling.md) — the run queue, concurrency limits, priority, claims and leases, scheduler and worker roles, the compose example, and what several hosts needs.
 - [http api](http-api.md) — every endpoint, parameter, response shape, and error code.

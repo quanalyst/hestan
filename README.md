@@ -92,11 +92,43 @@ cargo run --example demo --features cli
 then open http://127.0.0.1:4000 — two jobs on short schedules, so runs
 (including a retried op and some dropped-row warnings) accumulate on their own.
 
-`cargo run --example assets` (from the repo root) serves a second instance
+`cargo run --example assets --features cli` (from the repo root) serves a second instance
 on http://127.0.0.1:4002: an asset pipeline over this repo's own `docs/`
 directory, where touching a file has the probe rebuild the totals within ten
 seconds, plus a sensor that launches an ingest job when `ingest.marker`
 appears.
+
+## A command line, in your binary
+
+your jobs are compiled in, so a command line over them needs nothing loaded and
+nothing configured to find them:
+
+```rust
+hestan::cli::run(app, ([127, 0, 0, 1], 4000)).await   // was: app.serve(addr).await
+```
+
+with no arguments that *is* `serve`, on the same address. with arguments it
+knows every job, asset, schedule and sensor by name:
+
+```
+$ orders run orders_etl --wait
+14:22:01 fetch_orders fetched 1,204 rows
+14:22:02 validate dropping bad row: {"id":3}
+14:22:03 run succeeded
+019ff1b7-8df6-7732-8f54-70fa61013409  orders_etl success in 1.5s
+$ echo $?      # 0 succeeded · 1 failed · 3 canceled · 4 timed out · 5 unreachable
+0
+```
+
+`run --wait` streams the run to stderr and exits with what it did, which is
+what a cron line needs. `--json` for one object, `--quiet` for the id alone.
+`doctor` answers "why is nothing running" from the store, the registry and the
+disk. `explain` resolves a real plan without running it, and shell completion
+of your own job names comes out of the registry at the moment you press tab —
+both only possible because the command line is the deployment. the same
+commands reach a run log directly (`--db`) or a running instance
+(`--server`), and `cargo install hestan --features cli` gives an operator a
+standalone binary for those two. [docs/cli.md](docs/cli.md).
 
 ## How it works
 
@@ -329,6 +361,7 @@ the details live in [docs/](docs/README.md):
 [scheduling](docs/scheduling.md), [http sources](docs/http-sources.md),
 [notifications](docs/notifications.md), [launching](docs/launching.md),
 [the web ui](docs/web-ui.md),
+[the command line](docs/cli.md),
 [the http api](docs/http-api.md), [storage](docs/storage.md),
 [scaling](docs/scaling.md), [embedding](docs/embedding.md), and
 [development](docs/development.md).
@@ -342,7 +375,9 @@ hestan = "0.1.0-alpha.2"
 ```
 
 the binary is yours: define jobs, then `Hestan::new()...serve(addr)`, or
-`run_once(job, params)` for headless one-off runs.
+`run_once(job, params)` for headless one-off runs. `features = ["cli"]` and
+`hestan::cli::run(app, addr)` in place of `serve` gives that binary a
+[command line](docs/cli.md) over the same registry.
 
 ## Developing the ui
 
