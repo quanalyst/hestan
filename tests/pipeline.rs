@@ -217,8 +217,10 @@ async fn typed_ops_roundtrip() {
 
     let events = runner.store().events(&run.id, 0).unwrap();
     assert_eq!(events[0].kind, EventKind::RunQueued);
+    // the payload names the type the op declared it returns, and says which
+    // attempt produced it — `meta` is null because this op reported no facts
     assert!(events.iter().any(|e| e.kind == EventKind::OpSuccess
-        && e.data == Some(json!({"output_type": "pipeline::Total"}))));
+        && e.data == Some(json!({"attempt": 1, "output_type": "pipeline::Total", "meta": null}))));
 }
 
 #[tokio::test]
@@ -2436,15 +2438,25 @@ async fn a_rule_declined_op_records_its_own_skip_event() {
             .unwrap_or_else(|| panic!("no skip event for {op}"))
             .clone()
     };
-    // the upstream-failure wording names the op that broke
+    // the upstream-failure wording names the op that broke, and so does its
+    // payload: propagation skips carry which upstream did it
     assert_eq!(skip("cut_off").message, "skipped: upstream boom failed");
-    assert_eq!(skip("cut_off").data, None);
+    assert_eq!(
+        skip("cut_off").data,
+        Some(json!({"reason": "skipped: upstream boom failed", "upstream": "boom"}))
+    );
     // the rule wording names the rule that was asked, and carries it
     assert_eq!(
         skip("idle").message,
         "skipped by rule any_failed: every dep succeeded"
     );
-    assert_eq!(skip("idle").data, Some(json!({"when": "any_failed"})));
+    assert_eq!(
+        skip("idle").data,
+        Some(json!({
+            "reason": "skipped by rule any_failed: every dep succeeded",
+            "when": "any_failed"
+        }))
+    );
 }
 
 // propagation must ask each candidate's rule instead of blanket-skipping a

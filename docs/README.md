@@ -6,6 +6,7 @@
 - [resources](resources.md) — values built once at startup and shared by every op: `Hestan::resource`, `ctx.resource::<T>`, `Op::requires`.
 - [op state](state.md) — persisted watermarks: `ctx.state`/`set_state`, the at-least-once commit order, the state endpoint.
 - [metadata](metadata.md) — typed facts an op attaches to what it produced: `ctx.meta`, the `Meta` variants, per-attempt staging, and where they surface.
+- [events](events.md) — the one log every subsystem writes to: the kinds, what each payload carries, where each event is written and which of them cannot be atomic, and the schema's stability.
 - [logs](logs.md) — what an op *printed*: subprocess capture, the `capture` feature's tracing layer, why an in-process `println!` is not captured, the caps, and the endpoints.
 - [isolation](isolation.md) — `Op::isolated()`: an op in its own process, what a dead child is recorded as, cancellation and timeouts that are kills, memory and cpu limits, and the honest cost.
 - [io managers](io-managers.md) — where op outputs live: the `IoManager` trait, `Inline`, `FileIo`, per-op managers, and where handles are resolved.

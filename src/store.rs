@@ -1213,7 +1213,12 @@ impl Store {
         // same transaction as the row, so a run never exists without its queued event
         write_event(
             &mut tx,
-            &NewEvent::run(&run.id, EventKind::RunQueued, "run queued"),
+            &NewEvent::run(&run.id, EventKind::RunQueued, "run queued").data(json!({
+                "job": run.job,
+                "trigger": run.trigger,
+                "priority": run.priority,
+                "tags": run.tags,
+            })),
             Utc::now(),
         )?;
         tx.commit()?;
@@ -4449,6 +4454,152 @@ mod tests {
                 store.events("failed", 0).unwrap().pop().unwrap().kind,
                 EventKind::RunFailed
             );
+        });
+    }
+
+    // an event log consumers cannot rely on is a log nobody consumes, so every
+    // kind's payload is documented and this is what holds the documentation to
+    // it: the keys `docs/events.md` promises, read back off the column
+    #[test]
+    fn every_payload_round_trips_the_keys_its_kind_promises() {
+        both(|db| {
+            let store = db.store();
+            store
+                .create_run(&mk_run("r1", "etl", Utc::now()), &["a".into()])
+                .unwrap();
+            let queued = store.events("r1", 0).unwrap().remove(0);
+            let data = queued.data.unwrap();
+            assert_eq!(data["job"], json!("etl"));
+            assert_eq!(data["trigger"], json!("schedule"));
+            assert_eq!(data["priority"], json!(0));
+
+            // the phase-19 tagged map, unchanged from what the op reported:
+            // a reader that already renders `Meta` renders this
+            let meta = json!({
+                "rows": {"count": 1_240},
+                "size": {"bytes": 4_096},
+                "took": {"duration_secs": 1.5},
+                "source": {"url": "https://example.invalid/x"},
+            });
+            store
+                .record_materialization("sales", None, "fp", &json!({}), None, None, Some(&meta))
+                .unwrap();
+            assert_eq!(
+                newest(&store, EventKind::AssetMaterialized).data.unwrap()["meta"],
+                meta
+            );
+            // and each of those tags still reads as the type it was written as
+            for (name, value) in meta.as_object().unwrap() {
+                assert!(
+                    crate::op::Meta::from_tagged(value).is_some(),
+                    "{name} stopped being a Meta"
+                );
+            }
+
+            let check_meta = json!({"rows": {"count": 0}});
+            store
+                .record_check(
+                    "sales",
+                    Some("2026-01-01"),
+                    "not_empty",
+                    "r1",
+                    CheckStatus::Failed,
+                    Severity::Error,
+                    Some("0 rows"),
+                    Some(&check_meta),
+                )
+                .unwrap();
+            let data = newest(&store, EventKind::CheckFailed).data.unwrap();
+            assert_eq!(data["severity"], json!("error"));
+            assert_eq!(data["status"], json!("failed"));
+            assert_eq!(data["partition"], json!("2026-01-01"));
+            assert_eq!(data["meta"], check_meta);
+
+            let id = store
+                .create_backfill("sales", "a", "b", &["a".into(), "b".into()])
+                .unwrap();
+            let data = newest(&store, EventKind::BackfillStarted).data.unwrap();
+            assert_eq!(data["total"], json!(2));
+            assert_eq!(data["asset"], json!("sales"));
+            store
+                .finish_backfill(id, "sales", BackfillStatus::Complete, 2, 2)
+                .unwrap();
+            let data = newest(&store, EventKind::BackfillFinished).data.unwrap();
+            assert_eq!(data["launched"], json!(2));
+            assert_eq!(data["status"], json!("complete"));
+
+            store
+                .record_tick(
+                    "etl",
+                    "0 * * * *",
+                    Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap(),
+                    TickOutcome::Skipped,
+                    false,
+                    None,
+                    Some("run still active"),
+                )
+                .unwrap();
+            let data = newest(&store, EventKind::ScheduleSkipped).data.unwrap();
+            assert_eq!(data["expr"], json!("0 * * * *"));
+            assert_eq!(data["scheduled_for"], json!("2026-01-01T00:00:00Z"));
+            assert_eq!(data["error"], json!("run still active"));
+            assert_eq!(data["run_id"], Value::Null);
+        });
+    }
+
+    // a payload written by a build that knows more kinds than this one. the
+    // whole page must still read: one unrecognised word breaking the query
+    // around it is exactly the failure a documented log cannot have
+    #[test]
+    fn a_kind_from_a_newer_writer_reads_rather_than_breaking_the_page() {
+        both(|db| {
+            let store = db.store();
+            store
+                .create_run(&mk_run("r1", "etl", Utc::now()), &[])
+                .unwrap();
+            store
+                .conn()
+                .execute(
+                    "INSERT INTO events (run_id, subject_kind, subject, level, kind, message, data, ts)
+                     VALUES (NULL, ?1, ?2, 'info', ?3, 'from the future', ?4, ?5)",
+                    args![
+                        "quantum",
+                        "q1",
+                        "quantum_entangled",
+                        r#"{"spin": "up"}"#,
+                        Utc::now().to_rfc3339()
+                    ],
+                )
+                .unwrap();
+
+            let log = store.event_log(&EventQuery::default(), 50).unwrap();
+            assert_eq!(
+                log.len(),
+                2,
+                "the row from the future took the page with it"
+            );
+            assert_eq!(
+                log[0].kind,
+                EventKind::Unknown("quantum_entangled".to_string())
+            );
+            assert_eq!(
+                log[0].subject_kind,
+                SubjectKind::Unknown("quantum".to_string())
+            );
+            assert_eq!(log[0].data, Some(json!({"spin": "up"})));
+            // it reads as itself on the way out too, rather than as a word this
+            // build made up to stand in for it
+            assert_eq!(log[0].kind.to_string(), "quantum_entangled");
+            assert_eq!(
+                serde_json::to_value(&log[0]).unwrap()["kind"],
+                json!("quantum_entangled")
+            );
+            // and it is filterable by the name it was written under
+            let q = EventQuery {
+                kind: Some("quantum_entangled".parse().unwrap()),
+                ..EventQuery::default()
+            };
+            assert_eq!(store.event_log(&q, 10).unwrap().len(), 1);
         });
     }
 

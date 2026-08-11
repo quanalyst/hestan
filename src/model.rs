@@ -93,6 +93,21 @@ pub enum EventLevel {
 }
 str_enum!(EventLevel { Info => "info", Warn => "warn", Error => "error" });
 
+/// which version of the [event](Event) payloads this build writes, reported by
+/// `GET /api/events` beside every page.
+///
+/// **what it promises while hestan is 0.x.** a key documented in
+/// `docs/events.md` keeps its name, its type and its meaning for as long as
+/// this number does not move. what may happen without it moving: a payload
+/// gains a key, a kind is added, and a key documented as optional is absent.
+/// what may not: a key changing type, a key changing meaning, or a kind
+/// changing what it is about. a consumer that reads the keys it knows and
+/// ignores the rest keeps working across the whole of 0.x; one that matches
+/// exhaustively on kinds does not, and that is why
+/// [`EventKind::Unknown`](EventKind::Unknown) exists on this side of the wire
+/// too.
+pub const EVENT_SCHEMA: u32 = 1;
+
 /// what an [`Event`] is about: which of hestan's tables the thing that happened
 /// lives in.
 ///

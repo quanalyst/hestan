@@ -1586,7 +1586,7 @@ async fn execute(
         EventLevel::Info,
         EventKind::RunStarted,
         "run started",
-        None,
+        Some(&json!({ "job": job.name(), "trigger": trigger })),
     ));
     // resolved once per run rather than per op: the set cannot change under a
     // run, and every attempt would otherwise rebuild it
@@ -1648,7 +1648,7 @@ async fn execute(
                         EventLevel::Warn,
                         EventKind::OpSkipped,
                         reason,
-                        Some(&json!({ "when": op.runs_when() })),
+                        Some(&json!({ "reason": reason, "when": op.runs_when() })),
                     ));
                     note(store.op_finished(&run_id, &name, OpStatus::Skipped, None, None, None));
                     statuses.insert(name.clone(), OpStatus::Skipped);
@@ -2202,12 +2202,28 @@ async fn execute(
         .as_ref()
         .map(|(op, msg)| format!("op {op} failed: {msg}"));
     // event first: anyone who reads a terminal status must also see this line
-    note(store.append_event(&run_id, None, level, kind, msg, None));
+    let ended_at = Utc::now();
+    note(store.append_event(
+        &run_id,
+        None,
+        level,
+        kind,
+        msg,
+        Some(&json!({
+            "job": job.name(),
+            "status": status,
+            "error": error,
+            "failed_op": first_failure.as_ref().map(|(op, _)| op),
+            "duration_secs": (ended_at - started_at).to_std().ok().map(|d| d.as_secs_f64()),
+        })),
+    ));
 
     // every terminal status fires, and the status says which — a hook that
     // only wants failures is what `on_failure` still is. the boot sweep does
-    // not come through here, so a restart after a crash replays nothing
-    let finished_at = Utc::now();
+    // not come through here, so a restart after a crash replays nothing.
+    // the same instant the event carried: a hook and the log disagreeing about
+    // how long a run took by a millisecond is a question nobody wants to answer
+    let finished_at = ended_at;
     let (failed_op, op_error) = match first_failure {
         Some((op, msg)) => (Some(op), Some(msg)),
         None => (None, None),
@@ -2425,7 +2441,7 @@ fn op_canceled(store: &Store, run_id: &str, name: &str) {
         EventLevel::Warn,
         EventKind::OpCanceled,
         "canceled",
-        None,
+        Some(&json!({ "reason": "canceled", "stopped": true })),
     ));
 }
 
@@ -2440,7 +2456,9 @@ fn op_killed(store: &Store, run_id: &str, name: &str, msg: &str) {
         EventLevel::Warn,
         EventKind::OpCanceled,
         msg,
-        None,
+        // the process was signalled, killed and reaped, so this one is a fact
+        // about the work having stopped rather than about having asked it to
+        Some(&json!({ "reason": msg, "stopped": true })),
     ));
     note(store.op_finished(run_id, name, OpStatus::Canceled, None, None, Some(msg)));
 }
@@ -2458,7 +2476,9 @@ fn op_unstopped(store: &Store, run_id: &str, name: &str, grace: Duration) {
         EventLevel::Warn,
         EventKind::OpCanceled,
         &msg,
-        None,
+        // `stopped` is the whole difference between this and the two above:
+        // the request is the fact, and whether the work stopped is not known
+        Some(&json!({ "reason": &msg, "stopped": false })),
     ));
     note(store.op_unstopped(run_id, name, &msg));
 }
@@ -2501,7 +2521,7 @@ async fn run_op(
         EventLevel::Info,
         EventKind::OpStarted,
         "starting",
-        None,
+        Some(&json!({ "attempt": attempt })),
     ));
     // Runner::with_pools refuses this at build time; a Runner assembled without
     // pools can still reach it, and running unlimited would quietly break the
@@ -2644,14 +2664,22 @@ async fn run_op(
         };
         let msg = match ended {
             Ended::Value(output) => {
-                let data = op.output_type().map(|t| json!({ "output_type": t }));
+                // the same tagged map the op run and any materialization of
+                // this build carry, so a reader following the log alone sees
+                // the rows and the bytes without going back for the op run
+                let meta = op::staged_meta(&new_meta);
+                let data = json!({
+                    "attempt": attempt,
+                    "output_type": op.output_type(),
+                    "meta": meta,
+                });
                 note(store.append_event(
                     &run_id,
                     Some(&name),
                     EventLevel::Info,
                     EventKind::OpSuccess,
                     "finished",
-                    data.as_ref(),
+                    Some(&data),
                 ));
                 told(OpStatus::Success, None);
                 return (
@@ -2659,7 +2687,7 @@ async fn run_op(
                     Outcome::Produced {
                         output,
                         state: new_state.lock().unwrap().take(),
-                        meta: op::staged_meta(&new_meta),
+                        meta,
                     },
                 );
             }
@@ -2685,11 +2713,9 @@ async fn run_op(
         } else {
             EventKind::OpFailed
         };
-        let data = if retrying {
-            json!({ "attempt": attempt })
-        } else {
-            json!({ "error": msg })
-        };
+        // both say which attempt and what went wrong: a retry that hid the
+        // error left the run page with "attempt 1 failed" and nowhere to look
+        let data = json!({ "attempt": attempt, "error": msg });
         note(store.append_event(
             &run_id,
             Some(&name),
@@ -2790,7 +2816,7 @@ fn skip_downstream(
                 EventLevel::Warn,
                 EventKind::OpSkipped,
                 reason,
-                None,
+                Some(&json!({ "reason": reason, "upstream": root })),
             ));
             note(store.op_finished(run_id, &name, OpStatus::Skipped, None, None, None));
             statuses.insert(name, OpStatus::Skipped);

@@ -51,6 +51,7 @@ pub use hooks::{FailureHook, OpEvent, OpHook, RunEvent, RunFailure, RunHook};
 pub use http::HttpSource;
 pub use io::{FileIo, Inline, IoKey, IoManager, IoResult};
 pub use job::{Graph, GraphBuilder, Job, JobBuilder};
+pub use model::EVENT_SCHEMA;
 pub use model::{
     AssetCheckRow, Backfill, BackfillStatus, Catchup, CheckStatus, DeliveryState, Event, EventKind,
     EventLevel, Freshness, FreshnessRow, HistoryEntry, LogStream, Materialization, MetaPoint,
