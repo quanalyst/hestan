@@ -35,6 +35,16 @@ pub enum Error {
     Timezone(String),
     #[error("db schema v{0} is newer than this build")]
     SchemaTooNew(u32),
+    /// `serve` refused an address anyone can reach with nothing checking who
+    /// is asking. see [`Auth`](crate::Auth).
+    #[error(
+        "refusing to serve {0}: that address is reachable from outside this machine and \
+         nothing here checks who is asking — this api launches runs, cancels them and \
+         changes limits. bind a loopback address, give it Hestan::auth(Auth::bearer(…)) \
+         or Hestan::auth(Auth::custom(…)), or say Hestan::auth(Auth::None) if something \
+         in front of hestan already checks identity"
+    )]
+    Unguarded(std::net::SocketAddr),
     #[error("invalid params for op {op}: {reason}")]
     InvalidParams { op: String, reason: String },
     #[error("resource {name}: {reason}")]

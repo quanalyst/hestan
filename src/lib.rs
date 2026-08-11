@@ -3,6 +3,9 @@
 
 mod app;
 mod asset;
+// who may drive this deployment, and the refusal that keeps an unguarded one
+// off any address but loopback
+pub mod auth;
 mod backfill;
 mod backoff;
 // the tracing layer a host composes into its own subscriber. optional because
@@ -50,6 +53,7 @@ mod store;
 
 pub use app::Hestan;
 pub use asset::{Asset, AssetCheck, CheckOutcome, CheckResult, MultiAsset};
+pub use auth::Auth;
 #[cfg(feature = "capture")]
 pub use capture::{CaptureLayer, capture_layer};
 pub use error::Error;

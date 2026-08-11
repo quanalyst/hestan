@@ -9,6 +9,7 @@ use serde_json::Value;
 use crate::asset::{
     Asset, AssetCheck, AssetRegistry, MultiAsset, asset_tag, mats_map, plan_target,
 };
+use crate::auth::{self, Auth};
 use crate::error::Error;
 use crate::executor::{Limits, Runner};
 use crate::freshness::{self, LateEvent, LateHook};
@@ -45,6 +46,9 @@ pub struct Hestan {
     io_default: Option<Arc<dyn IoManager>>,
     io_named: HashMap<String, Arc<dyn IoManager>>,
     db_path: String,
+    /// `None` is not "no authentication": it is nothing configured, which is
+    /// what [`up`](Hestan::up) refuses to serve on a reachable address.
+    auth: Option<Auth>,
     hooks: Vec<FailureHook>,
     run_hooks: Vec<RunHook>,
     op_hooks: Vec<OpHook>,
@@ -81,6 +85,7 @@ impl Default for Hestan {
             io_default: None,
             io_named: HashMap::new(),
             db_path: "hestan.db".into(),
+            auth: None,
             hooks: Vec::new(),
             run_hooks: Vec::new(),
             op_hooks: Vec::new(),
@@ -477,6 +482,30 @@ impl Hestan {
         self
     }
 
+    /// what checks who is asking, and what each of them may do.
+    ///
+    /// ```no_run
+    /// # use hestan::{Auth, Hestan};
+    /// # fn f(app: Hestan) -> Hestan {
+    /// app.auth(Auth::bearer(std::env::var("HESTAN_TOKEN").expect("a token")))
+    /// # }
+    /// ```
+    ///
+    /// unset — the default — is **not** "no authentication". it is "no
+    /// authenticator configured", and [`serve`](Self::serve) refuses to start
+    /// on any address but loopback under it, because this api launches runs
+    /// and cancels them and a warning about that is a warning somebody
+    /// scrolls past. loopback is untouched: one process talking to itself
+    /// configures nothing and behaves exactly as it always has.
+    ///
+    /// [`Auth::None`] is the deliberate way out, for a deployment fronted by
+    /// something that authenticates for it. see [`the module`](crate::auth)
+    /// for the two authenticators and the roles they hand out.
+    pub fn auth(mut self, auth: Auth) -> Self {
+        self.auth = Some(auth);
+        self
+    }
+
     /// how many bytes of [captured output](crate::Op::isolated) one *attempt*
     /// of one op may store before capture stops for it; default 1 MiB.
     ///
@@ -745,13 +774,26 @@ impl Hestan {
             self.run_op_subprocess(req).await
         }
         let role = self.role;
-        let built = self.build().await?;
-        // bind before spawning the loops: a bind failure must not leave detached
-        // tasks firing jobs into a server that never started
+        let auth = self.auth.clone();
+        // the socket first, before the store is opened and before a loop
+        // exists to abort: a deployment that is going to be refused should be
+        // refused having done nothing. a bind failure must not leave detached
+        // tasks firing jobs into a server that never started either, and this
+        // is that guarantee made earlier rather than given up
         let listener = match addr {
             Some(addr) => Some(tokio::net::TcpListener::bind(addr).await?),
             None => None,
         };
+        // and the guard on the address the listener is *holding*, not the one
+        // it was handed. today those are the same and this is the check that
+        // decides whether the control plane is reachable by strangers, so it
+        // goes on the one requests will arrive on
+        if let Some(listener) = &listener
+            && let Some(said) = auth::guard(listener.local_addr()?, auth.as_ref())?
+        {
+            tracing::warn!("{said}");
+        }
+        let built = self.build().await?;
         let sensor_infos: Vec<SensorInfo> = built
             .sensor_entries
             .iter()
@@ -1113,6 +1155,7 @@ mod tests {
     use crate::model::RunStatus;
     use crate::op::Op;
     use serde_json::json;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     #[derive(serde::Deserialize)]
     #[allow(dead_code)]
@@ -1423,6 +1466,96 @@ mod tests {
                 events.iter().map(|e| &e.message).collect::<Vec<_>>()
             );
         }
+    }
+
+    /// a port nothing is on, on `host`. the listener is dropped before the
+    /// address is handed back — the same small race every test that needs a
+    /// port it can name has, and the only way to know which port `serve`
+    /// bound before it has bound it.
+    fn free_port(host: &str) -> SocketAddr {
+        let listener = std::net::TcpListener::bind((host, 0)).unwrap();
+        listener.local_addr().unwrap()
+    }
+
+    /// serve in a task and read `/api/health` back, by hand: a default build
+    /// has no http client in it, and what is being asserted here is only that
+    /// something answered.
+    async fn health(app: Hestan, addr: SocketAddr) -> String {
+        let serving = tokio::spawn(app.serve(addr));
+        let mut answered = None;
+        for _ in 0..100 {
+            // whatever it bound to, the request comes from this machine
+            let Ok(mut socket) = tokio::net::TcpStream::connect(("127.0.0.1", addr.port())).await
+            else {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                continue;
+            };
+            socket
+                .write_all(
+                    b"GET /api/health HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+                )
+                .await
+                .unwrap();
+            let mut said = String::new();
+            socket.read_to_string(&mut said).await.unwrap();
+            answered = Some(said);
+            break;
+        }
+        serving.abort();
+        answered.expect("the server answered")
+    }
+
+    // the refusal, and it is the point of the whole arrangement: a deployment
+    // reachable by strangers with nothing checking who they are does not start
+    #[tokio::test]
+    async fn serve_refuses_an_address_anyone_can_reach_with_nothing_guarding_it() {
+        for host in ["0.0.0.0", "::"] {
+            let addr = free_port(host);
+            let err = Hestan::new()
+                .db(":memory:")
+                .serve(addr)
+                .await
+                .expect_err("an unguarded address served");
+            assert!(matches!(err, Error::Unguarded(_)), "{err}");
+            let said = err.to_string();
+            // the address it refused, and what to do instead
+            assert!(said.contains(&addr.to_string()), "{said}");
+            assert!(said.contains("Hestan::auth"), "{said}");
+            // and nothing is holding the port: it refused rather than served
+            assert!(
+                std::net::TcpListener::bind(addr).is_ok(),
+                "a refused serve left a listener on {addr}"
+            );
+        }
+    }
+
+    // and the case that must not have changed: one process, one machine,
+    // nothing configured
+    #[tokio::test]
+    async fn loopback_serves_with_nothing_configured_at_all() {
+        let said = health(Hestan::new().db(":memory:"), free_port("127.0.0.1")).await;
+        assert!(said.contains("200 OK"), "{said}");
+        assert!(said.contains("\"ok\":true"), "{said}");
+    }
+
+    #[tokio::test]
+    async fn an_authenticator_is_what_makes_a_reachable_address_servable() {
+        let addr = free_port("0.0.0.0");
+        let said = health(
+            Hestan::new().db(":memory:").auth(Auth::bearer("s3cret")),
+            addr,
+        )
+        .await;
+        assert!(said.contains("200 OK"), "{said}");
+
+        // the opt-out serves the same address, having said what it is leaning
+        // on — see `auth::guard`, where that sentence is asserted
+        let said = health(
+            Hestan::new().db(":memory:").auth(Auth::None),
+            free_port("0.0.0.0"),
+        )
+        .await;
+        assert!(said.contains("200 OK"), "{said}");
     }
 
     #[tokio::test]
