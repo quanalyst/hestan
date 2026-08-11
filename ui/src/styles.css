@@ -1642,3 +1642,40 @@ table.plain-rows tbody tr:hover {
   margin-top: 20px;
   font-size: 12px;
 }
+
+/* who this browser is, at the right of the header where it is out of the way
+   of the nav and still on every page */
+.whoami {
+  margin-left: auto;
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  font-size: 12px;
+}
+
+/* the token prompt: the only thing on the page, since nothing else can be
+   loaded until it is answered */
+.signin {
+  max-width: 44ch;
+  margin: 15vh auto 0;
+  padding: 0 32px;
+}
+
+.signin form {
+  display: flex;
+  gap: 10px;
+  margin: 18px 0 12px;
+}
+
+.signin input {
+  flex: 1;
+}
+
+.signin p {
+  margin: 0 0 12px;
+}
+
+/* said in words rather than in a colour, like every other state in this ui */
+.signin-refused {
+  font-weight: 500;
+}

@@ -3,6 +3,7 @@ import { Link, useParams } from "react-router-dom";
 import { get, HttpError, post, usePoll } from "./api";
 import { chunksOf, keyStates } from "./backfill";
 import type { ChunkStatus } from "./backfill";
+import { useMay } from "./role";
 import StatusDot from "./StatusDot";
 import { GlyphShape } from "./StatusGlyph";
 import type { Status } from "./StatusGlyph";
@@ -43,6 +44,7 @@ export default function BackfillPage() {
 }
 
 function BackfillView({ id }: { id: string }) {
+  const mayCancel = useMay("operator");
   const [backfill, setBackfill] = useState<Backfill | null>(null);
   const [runs, setRuns] = useState<Run[]>([]);
   const [missing, setMissing] = useState(false);
@@ -115,7 +117,7 @@ function BackfillView({ id }: { id: string }) {
                 {backfill.status}
               </span>
             </span>
-            {backfill.status === "running" && (
+            {mayCancel && backfill.status === "running" && (
               <button className="text-btn" onClick={cancel} disabled={canceling}>
                 cancel
               </button>

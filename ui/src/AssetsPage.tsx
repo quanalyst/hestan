@@ -1,6 +1,7 @@
 import { useState } from "react";
 import { Link, useNavigate, useSearchParams } from "react-router-dom";
 import { get, post, usePoll } from "./api";
+import { useMay } from "./role";
 import { StateGlyph } from "./AssetDetail";
 import AssetPanel from "./AssetPanel";
 import DagView from "./DagView";
@@ -127,6 +128,10 @@ function Checks({ checks }: { checks: CheckSummary }) {
 }
 
 export default function AssetsPage() {
+  // building an asset and cancelling a backfill are work; pausing a sensor is
+  // a decision about what the deployment does next
+  const mayBuild = useMay("operator");
+  const mayPause = useMay("admin");
   const nav = useNavigate();
   const [assets, setAssets] = useState<AssetSummary[] | null>(null);
   const [sensors, setSensors] = useState<SensorSummary[]>([]);
@@ -290,7 +295,7 @@ export default function AssetsPage() {
     <>
       <div className="page-head">
         <h1>Assets</h1>
-        {anyStale && (
+        {mayBuild && anyStale && (
           <div className="run-actions">
             <button onClick={buildStale} disabled={building}>
               build stale
@@ -511,7 +516,7 @@ export default function AssetsPage() {
                         </td>
                         <td className="row-action">
                           {/* sources are probed, never built — the endpoint 400s */}
-                          {a.kind !== "source" && (
+                          {mayBuild && a.kind !== "source" && (
                             <button
                               className="text-btn"
                               disabled={busyAsset === a.name}
@@ -594,7 +599,7 @@ export default function AssetsPage() {
                       {relTime(b.created_at)}
                     </td>
                     <td className="row-action">
-                      {b.status === "running" && (
+                      {mayBuild && b.status === "running" && (
                         <button className="text-btn" onClick={() => cancelBackfill(b.id)}>
                           cancel
                         </button>
@@ -665,9 +670,11 @@ export default function AssetsPage() {
                       )}
                     </td>
                     <td className="row-action">
-                      <button className="text-btn" onClick={() => setPaused(s.name, !s.paused)}>
-                        {s.paused ? "resume" : "pause"}
-                      </button>
+                      {mayPause && (
+                        <button className="text-btn" onClick={() => setPaused(s.name, !s.paused)}>
+                          {s.paused ? "resume" : "pause"}
+                        </button>
+                      )}
                     </td>
                   </tr>
                 );

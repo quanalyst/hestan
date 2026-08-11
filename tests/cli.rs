@@ -16,7 +16,7 @@ use std::process::{Command, Output};
 use std::time::{Duration, Instant};
 
 use hestan::prelude::*;
-use hestan::{EventQuery, Limits, Runner, Store, Trigger};
+use hestan::{Auth, EventQuery, Limits, Runner, Store, Trigger};
 
 /// where the process under test finds its run log. absent means "run the
 /// cases", which is how one binary is both halves of this.
@@ -24,6 +24,11 @@ const DB: &str = "HESTAN_CLI_DB";
 /// what a no-argument invocation is to serve on, since that is the address a
 /// host would have handed `cli::run`.
 const ADDR: &str = "HESTAN_CLI_ADDR";
+/// the token the deployment under test is configured with, where a case wants
+/// an authenticated one. absent means an open deployment, which is what every
+/// other case here serves.
+const TOKEN: &str = "HESTAN_CLI_TOKEN";
+const SECRET: &str = "tk-cli-4d1f7a-not-in-any-output";
 
 fn main() {
     let rt = tokio::runtime::Builder::new_multi_thread()
@@ -51,12 +56,16 @@ fn main() {
 /// the registry the process under test is built from — a job that works, one
 /// that does not, and one that takes longer than any case waits.
 fn app(db: &str) -> Hestan {
-    Hestan::new()
+    let app = Hestan::new()
         .jobs(jobs())
         // one at a time, so a case can hold the only slot and watch another
         // run queue up behind it
         .max_concurrent_runs(1)
-        .db(db)
+        .db(db);
+    match std::env::var(TOKEN) {
+        Ok(token) => app.auth(Auth::bearer(token)),
+        Err(_) => app,
+    }
 }
 
 #[derive(serde::Deserialize)]
@@ -129,6 +138,11 @@ async fn cases(dir: &Path) {
     case("nothing_is_styled_into_a_pipe", unstyled(dir)).await;
     case("no_arguments_serves", serves(dir)).await;
     case("each_mode_reaches_what_it_should", modes(dir)).await;
+    case(
+        "an_authenticated_server_is_reached_with_a_token_or_not_at_all",
+        authenticated(dir),
+    )
+    .await;
     case("a_follow_resumes_from_a_cursor", resumes(dir)).await;
     case("doctor_answers_why_nothing_is_running", diagnosed(dir)).await;
     case("a_dry_run_checks_the_params_and_creates_nothing", dry(dir)).await;
@@ -428,6 +442,96 @@ async fn modes(dir: &Path) {
     let _ = server.wait();
 }
 
+/// an authenticated deployment, from the outside: the token goes in a flag or
+/// in the environment, a command without one is refused with a code of its own,
+/// and `doctor` can say which kind of deployment this is before you have a
+/// credential for it.
+async fn authenticated(dir: &Path) {
+    let db = db(dir, "authenticated");
+    let addr = free_port();
+    let mut server = Command::new(exe())
+        .env(DB, &db)
+        .env(ADDR, addr.to_string())
+        .env(TOKEN, SECRET)
+        .spawn()
+        .expect("the deployment serves");
+    // whoami rather than health: health is a read, and reads need a viewer
+    wait_for("the ui to come up", || get(addr, "/api/whoami")).await;
+    let url = format!("http://{addr}");
+
+    // nothing to present, and the message is what to do about it rather than
+    // what happened
+    let refused = operator(&["--server", &url, "runs"]);
+    refused.assert(8);
+    assert!(refused.stderr.contains("HESTAN_TOKEN"), "{refused:?}");
+    assert!(refused.stderr.contains("--token"), "{refused:?}");
+
+    // the flag, and the variable a cron line uses instead so the secret is not
+    // in argv where `ps` shows it
+    operator(&["--server", &url, "--token", SECRET, "runs"]).assert(0);
+    operator_with(&[("HESTAN_TOKEN", SECRET)], &["--server", &url, "runs"]).assert(0);
+    // and the flag wins, so a shell with a variable set can still be pointed
+    // somewhere else
+    operator_with(
+        &[("HESTAN_TOKEN", "wrong")],
+        &["--server", &url, "--token", SECRET, "runs"],
+    )
+    .assert(0);
+
+    // a token it does not accept is the same refusal, and says nothing about
+    // how close it was
+    let wrong = operator(&["--server", &url, "--token", "wrong", "runs"]);
+    wrong.assert(8);
+    assert!(wrong.stderr.contains("refused this token"), "{wrong:?}");
+
+    // launching over the network is what the token is for
+    let launched = operator(&[
+        "--server", &url, "--token", SECRET, "run", "quick", "--wait",
+    ]);
+    launched.assert(0);
+
+    // doctor, pointed at a deployment it has no credential for, can still say
+    // whether it is guarded — which is the question you ask before you know
+    let blind = operator(&["--server", &url, "--json", "doctor"]);
+    blind.assert(0);
+    let value: Value = serde_json::from_str(&blind.stdout).expect("one json object");
+    let finding = &value["findings"][0];
+    assert_eq!(finding["check"], "auth");
+    assert!(
+        finding["says"].as_str().unwrap().contains("checks who"),
+        "{finding}"
+    );
+    // and it says what it could not see rather than calling it healthy
+    assert!(
+        !value["unchecked"].as_array().unwrap().is_empty(),
+        "{value}"
+    );
+
+    let known = operator(&["--server", &url, "--token", SECRET, "--json", "doctor"]);
+    known.assert(0);
+    let value: Value = serde_json::from_str(&known.stdout).expect("one json object");
+    assert!(
+        value["findings"][0]["says"]
+            .as_str()
+            .unwrap()
+            .contains("bearer"),
+        "{value}"
+    );
+
+    // an open deployment is a different answer, not a missing one
+    let open = operator(&["--server", "http://127.0.0.1:1", "doctor"]);
+    open.assert(5);
+
+    // and nothing the command line printed carries the token
+    for ran in [&refused, &wrong, &launched, &blind, &known] {
+        assert!(!ran.stdout.contains(SECRET), "{ran:?}");
+        assert!(!ran.stderr.contains(SECRET), "{ran:?}");
+    }
+
+    let _ = server.kill();
+    let _ = server.wait();
+}
+
 /// a follower given a cursor starts above it, which is what makes a dropped
 /// connection something you can pick back up rather than a hole.
 async fn resumes(dir: &Path) {
@@ -623,8 +727,18 @@ fn cli(db: &Path, args: &[&str]) -> Ran {
 /// the standalone `hestan`, which has no registry of its own: the binary an
 /// operator installs, run against whatever this case points it at.
 fn operator(args: &[&str]) -> Ran {
+    operator_with(&[], args)
+}
+
+/// the same, with variables set for that one command — which is how a cron
+/// line hands a secret to a process without putting it in argv.
+fn operator_with(env: &[(&str, &str)], args: &[&str]) -> Ran {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_hestan"));
+    for (name, value) in env {
+        command.env(name, value);
+    }
     Ran::of(
-        Command::new(env!("CARGO_BIN_EXE_hestan"))
+        command
             .args(args)
             .output()
             .expect("the standalone binary starts"),

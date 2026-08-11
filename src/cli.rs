@@ -41,6 +41,7 @@ use clap::{Args, CommandFactory, Parser, Subcommand};
 use serde_json::{Value, json};
 
 use crate::app::{Built, Hestan, Inspected};
+use crate::auth::Auth;
 use crate::error::Error;
 use crate::executor::Runner;
 use crate::job::Job;
@@ -86,6 +87,7 @@ const QUEUE_PAGE: u32 = 200;
 /// | 5 | the store or the server could not be reached |
 /// | 6 | this mode cannot serve this command, and the message says why |
 /// | 7 | `doctor` found something actionable |
+/// | 8 | the server refused this identity: no token, a token it does not accept, or a role that may not |
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum Exit {
@@ -97,6 +99,10 @@ pub enum Exit {
     Unreachable = 5,
     Unsupported = 6,
     Actionable = 7,
+    /// a code of its own because a cron line does different things about it:
+    /// work that failed is worth retrying and a credential that was refused is
+    /// worth telling somebody about, and 1 for both is 1 for neither.
+    Denied = 8,
 }
 
 /// why a command stopped: the line stderr gets, and the code the shell gets.
@@ -181,6 +187,10 @@ struct Global {
     /// drive a running instance over its http api
     #[arg(long, global = true, value_name = "URL")]
     server: Option<String>,
+    /// the token an authenticated `--server` wants; `HESTAN_TOKEN` is the
+    /// other way, and the better one
+    #[arg(long, global = true, value_name = "TOKEN")]
+    token: Option<String>,
     /// one json object on stdout; anything that streams is one object per line
     #[arg(long, global = true)]
     json: bool,
@@ -537,7 +547,7 @@ enum Reach {
 
 fn reach(app: Option<Hestan>, global: &Global) -> Result<Reach, Fail> {
     if let Some(url) = &global.server {
-        return Ok(Reach::Server(Api::new(url)));
+        return Ok(Reach::Server(Api::new(url, token(global))));
     }
     match (app, &global.db) {
         // a binary with the jobs in it keeps them whichever database it is
@@ -553,6 +563,25 @@ fn reach(app: Option<Hestan>, global: &Global) -> Result<Reach, Fail> {
              running instance. a binary with your jobs compiled into it needs neither",
         )),
     }
+}
+
+/// what to present to an authenticated server: `--token`, or `HESTAN_TOKEN`.
+///
+/// the environment is read here rather than by the argument parser, which can
+/// do it — because a parser that knows about an environment variable prints
+/// its **value** in `--help`, and a secret in a help screen is a secret in
+/// whatever collected that help screen. an empty variable is not a token: an
+/// unset one and one set to nothing are the same intention.
+///
+/// prefer the variable to the flag whatever this returns: an argument is
+/// visible in `ps` to every account on the machine, for as long as the process
+/// runs.
+fn token(global: &Global) -> Option<String> {
+    global.token.clone().or_else(|| {
+        std::env::var("HESTAN_TOKEN")
+            .ok()
+            .filter(|token| !token.is_empty())
+    })
 }
 
 impl Reach {
@@ -1573,33 +1602,56 @@ fn cancel(store: &Store, id: &str, out: &Out) -> Result<(), Fail> {
 struct Api {
     base: String,
     client: reqwest::Client,
+    /// what this presents, if anything. never printed: it reaches the
+    /// `Authorization` header and nothing else, and no error below quotes it.
+    token: Option<String>,
 }
 
 impl Api {
-    fn new(url: &str) -> Api {
+    fn new(url: &str, token: Option<String>) -> Api {
         Api {
             base: url.trim_end_matches('/').to_string(),
             client: reqwest::Client::new(),
+            token,
         }
     }
 
     async fn get(&self, path: &str) -> Result<Value, Fail> {
-        self.answer(self.client.get(format!("{}{path}", self.base)))
+        self.answer(self.request(self.client.get(self.url(path))))
             .await
     }
 
     async fn post(&self, path: &str, body: Value) -> Result<Value, Fail> {
-        self.answer(self.client.post(format!("{}{path}", self.base)).json(&body))
+        self.answer(self.request(self.client.post(self.url(path)).json(&body)))
             .await
+    }
+
+    fn url(&self, path: &str) -> String {
+        format!("{}{path}", self.base)
+    }
+
+    /// the credential goes on every request rather than on the ones that were
+    /// refused last time: a retry after a 401 is a second request in the log of
+    /// whatever is in front of the deployment, and reads need it too.
+    fn request(&self, request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        match &self.token {
+            Some(token) => request.bearer_auth(token),
+            None => request,
+        }
     }
 
     async fn answer(&self, request: reqwest::RequestBuilder) -> Result<Value, Fail> {
         let response = request.send().await.map_err(|e| self.out_of_reach(&e))?;
         let status = response.status();
         let body: Value = response.json().await.unwrap_or(Value::Null);
-        if status.is_success() {
-            return Ok(body);
+        match status.is_success() {
+            true => Ok(body),
+            false => Err(self.refused(status, &body)),
         }
+    }
+
+    /// what the server said no with, in this command line's vocabulary.
+    fn refused(&self, status: reqwest::StatusCode, body: &Value) -> Fail {
         let message = match body["error"].as_str() {
             Some(error) => error.to_string(),
             None => format!("{} said {status}", self.base),
@@ -1609,10 +1661,22 @@ impl Api {
         // and the binary itself should not have to learn two tables
         let code = match status.as_u16() {
             400 | 404 | 422 => Exit::Usage,
+            401 | 403 => Exit::Denied,
             502..=504 => Exit::Unreachable,
             _ => Exit::Failed,
         };
-        Err(Fail::new(code, message))
+        // what to do about it, which the server cannot know: it has no idea
+        // whether anything was sent or where it would have come from
+        let message = match (status.as_u16(), self.token.is_some()) {
+            (401, false) => format!(
+                "{message} — {} is authenticated: pass --token, or set HESTAN_TOKEN, which \
+                 keeps it out of ps",
+                self.base
+            ),
+            (401, true) => format!("{message} — {} refused this token", self.base),
+            _ => message,
+        };
+        Fail::new(code, message)
     }
 
     /// the server-sent event stream, one parsed `data:` payload at a time.
@@ -1622,13 +1686,18 @@ impl Api {
     /// that would be a dependency in every build that turns this feature on.
     async fn stream(&self, path: &str, mut each: impl FnMut(Value)) -> Result<(), Fail> {
         let mut response = self
-            .client
-            .get(format!("{}{path}", self.base))
+            .request(self.client.get(self.url(path)))
             .send()
             .await
-            .map_err(|e| self.out_of_reach(&e))?
-            .error_for_status()
             .map_err(|e| self.out_of_reach(&e))?;
+        // a stream that never opened says why in the same words a request that
+        // was refused does — a follow that was not authenticated is not a
+        // network that was not there
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.json().await.unwrap_or(Value::Null);
+            return Err(self.refused(status, &body));
+        }
         let mut buffer = String::new();
         while let Some(chunk) = response.chunk().await.map_err(|e| self.out_of_reach(&e))? {
             buffer.push_str(&String::from_utf8_lossy(&chunk));
@@ -2172,14 +2241,10 @@ async fn doctor(reach: Reach, out: &Out) -> Result<(), Fail> {
             (Some(app), None)
         }
         Reach::Store { store, target } => (None, Some((store, target))),
-        Reach::Server(_) => {
-            return Err(Fail::new(
-                Exit::Unsupported,
-                "doctor reads the store, the registry and the disk under them, and an http \
-                 api exposes none of the three — run it in the deployment's own binary, or \
-                 point --db at the database it is using",
-            ));
-        }
+        // over http there is exactly one question worth asking and exactly one
+        // endpoint that answers it without credentials, so this reports that
+        // and says plainly that it saw nothing else
+        Reach::Server(api) => return remote_doctor(&api, out).await,
     };
     let (store, target) = match (&app, &store) {
         (Some(app), _) => (&app.store, app.db.clone()),
@@ -2204,10 +2269,12 @@ async fn doctor(reach: Reach, out: &Out) -> Result<(), Fail> {
         Some(app) => {
             findings.extend(check_queue(app)?);
             findings.extend(check_retention(app));
+            findings.push(check_auth(app.auth.as_ref()));
         }
         None => unchecked.push(
-            "the queue and the retention policy, which are read off limits and a role that \
-             only the deployment's own binary carries",
+            "the queue, the retention policy and whether anything checks who is asking, \
+             which are read off limits, a role and an authenticator that only the \
+             deployment's own binary carries",
         ),
     }
     match disk_free(&target) {
@@ -2403,6 +2470,92 @@ fn check_retention(app: &Inspected) -> Vec<Finding> {
         "give the policy to the process that owns the schedules, which is the one \
          running under the scheduler or the default role",
     )]
+}
+
+/// whether anything checks who is asking.
+///
+/// not an error either way: a deployment on loopback is a deployment on one
+/// machine, and the refusal in `serve` already makes that the only thing it can
+/// be. what this is for is the deployment somebody is about to move — the
+/// answer to "is the thing I am about to put an address on guarded" should not
+/// be "read the source".
+fn check_auth(auth: Option<&Auth>) -> Finding {
+    match auth {
+        Some(Auth::Bearer(_)) => Finding::ok("auth", "one bearer token, and it is an admin"),
+        Some(Auth::Custom(_)) => Finding::ok("auth", "an authenticator of your own"),
+        Some(Auth::None) => Finding::note(
+            "auth",
+            "Auth::None: nothing here checks who is asking, deliberately",
+            "make sure what is in front of this still checks identity — that is what \
+             Auth::None asserts",
+        ),
+        None => Finding::note(
+            "auth",
+            "nothing checks who is asking, so serve will only bind loopback",
+            "Hestan::auth(Auth::bearer(…)) before giving this an address anyone can reach",
+        ),
+    }
+}
+
+/// what a deployment across the network can be asked without credentials.
+///
+/// one finding and a long list of things this could not see. that list is the
+/// point: a doctor that answered "everything looks fine" having read one
+/// endpoint would be worse than one that refused to run at all, which is what
+/// this used to do.
+async fn remote_doctor(api: &Api, out: &Out) -> Result<(), Fail> {
+    let asked = api.get("/api/whoami").await?;
+    let authenticated = asked["auth"].as_bool().unwrap_or(false);
+    let who = asked["identity"]["name"].as_str();
+    let finding = match (authenticated, who) {
+        (true, Some(name)) => Finding::ok(
+            "auth",
+            format!(
+                "it checks who is asking, and you are {name} ({})",
+                asked["identity"]["role"].as_str().unwrap_or("?")
+            ),
+        ),
+        (true, None) => Finding::note(
+            "auth",
+            "it checks who is asking, and does not know you",
+            "pass --token, or set HESTAN_TOKEN",
+        ),
+        (false, _) => Finding::note(
+            "auth",
+            "it checks nobody: anyone who can reach this address can launch runs on it",
+            "give it Hestan::auth(Auth::bearer(…)), or keep it on loopback",
+        ),
+    };
+    let unchecked = [
+        "the store, the schedules, the sensors, the leases, the queue, the retention \
+         policy and the disk, which an http api exposes none of — point --db at the \
+         database, or run doctor in the deployment's own binary",
+    ];
+    if out.json {
+        out.object(&json!({
+            "ok": true,
+            "findings": [finding.json()],
+            "unchecked": unchecked,
+        }));
+    } else if out.quiet {
+        if finding.level != Level::Ok {
+            println!("{} {}", finding.level.as_str(), finding.says);
+        }
+    } else {
+        println!(
+            "{:<5} {:<10} {}",
+            out.paint(finding.level.as_str(), finding.level.color()),
+            finding.check,
+            finding.says
+        );
+        if let Some(fix) = &finding.fix {
+            println!("      {:<10} {}", "", out.paint(fix, DIM));
+        }
+        for missed in unchecked {
+            println!("{:<5} {:<10} {missed}", "-", "not checked");
+        }
+    }
+    Ok(())
 }
 
 /// free space where the run log lives.
@@ -3266,6 +3419,7 @@ mod tests {
             limits: Limits::new(),
             retention: Retention::default(),
             role: Role::All,
+            auth: None,
             db: ":memory:".into(),
         }
     }
@@ -3395,6 +3549,29 @@ mod tests {
         let findings = check_retention(&app);
         assert_eq!(levels(&findings), [Level::Wrong]);
         assert!(findings[0].says.contains("worker"), "{}", findings[0].says);
+    }
+
+    // the question to ask before giving a deployment an address: is anything
+    // going to check who arrives on it
+    #[test]
+    fn doctor_says_whether_anything_checks_who_is_asking() {
+        let unguarded = check_auth(None);
+        assert_eq!(unguarded.level, Level::Note);
+        assert!(unguarded.says.contains("loopback"), "{}", unguarded.says);
+        assert!(unguarded.fix.unwrap().contains("Hestan::auth"));
+
+        let guarded = check_auth(Some(&Auth::bearer("s3cret")));
+        assert_eq!(guarded.level, Level::Ok);
+        assert!(guarded.says.contains("bearer"), "{}", guarded.says);
+        // and never the token, in a line that is on somebody's terminal and
+        // in whatever collected it
+        assert!(!guarded.says.contains("s3cret"), "{}", guarded.says);
+
+        // the opt-out is a claim about something else, so it is worth a line
+        // rather than a tick
+        let asserted = check_auth(Some(&Auth::None));
+        assert_eq!(asserted.level, Level::Note);
+        assert!(asserted.says.contains("Auth::None"), "{}", asserted.says);
     }
 
     // a full disk cannot be constructed in a test, so the two halves are

@@ -1,12 +1,19 @@
 import { useEffect, useRef, useState } from "react";
 import { Link } from "react-router-dom";
 import { get } from "./api";
+import { token } from "./identity";
 import type { Dropped, FeedRow, Filters } from "./activity";
 import { kindLabel, linkFor, matches, merge, subjectOf } from "./activity";
 import type { EventLevel, RunEvent } from "./types";
 import { clockTime, relTime, shortId } from "./util";
 
 const PAGE = 100;
+
+// how often an authenticated tab asks what has happened since, in place of the
+// stream it cannot authenticate. the command line follows the log on the same
+// interval and for the same reason: this is the whole system's log, and a
+// second of lag on it costs nothing.
+const FOLLOW_POLL = 1000;
 
 const SUBJECTS = ["all", "run", "job", "asset", "schedule", "sensor", "backfill", "system"] as const;
 const LEVELS = ["all", "info", "warn", "error"] as const;
@@ -103,19 +110,42 @@ export default function ActivityPage() {
   const [exhausted, setExhausted] = useState(false);
   const cursor = useRef<number | null>(null);
 
-  // one page of history, then the stream from its newest seq. the two halves
-  // are deliberate: the page is what happened, the stream is what happens, and
-  // starting the stream at the page's top is what makes them one list
+  // one page of history, then whatever happens next. the two halves are
+  // deliberate: the page is what happened, the follow is what happens, and
+  // starting the follow at the page's top is what makes them one list
   useEffect(() => {
     let source: EventSource | null = null;
+    let poll: ReturnType<typeof setInterval> | null = null;
     let stopped = false;
+    let newest = 0;
     get<{ events: RunEvent[] }>(`/api/events?limit=${PAGE}`)
       .then((r) => {
         if (stopped) return;
         setFeed(r.events.map((event) => ({ kind: "event", event }) as FeedRow));
         setExhausted(r.events.length < PAGE);
-        const newest = r.events[0]?.seq ?? 0;
+        newest = r.events[0]?.seq ?? 0;
         cursor.current = r.events[r.events.length - 1]?.seq ?? null;
+        // an EventSource cannot carry a header, and the only other way to hand
+        // a stream a token is to put it in the url — where it lands in the
+        // browser's history and in every access log between here and the
+        // deployment. so an authenticated tab polls instead: a second of lag
+        // on "what is happening" costs less than a credential in a log
+        if (token() !== null) {
+          const since = async () => {
+            try {
+              const r = await get<{ events: RunEvent[] }>(`/api/events?after=${newest}&limit=${PAGE}`);
+              setLive(true);
+              if (r.events.length === 0) return;
+              newest = Math.max(newest, ...r.events.map((e) => e.seq));
+              setFeed((f) => merge(f ?? [], r.events.map((event) => ({ kind: "event", event }) as FeedRow)));
+            } catch {
+              setLive(false);
+            }
+          };
+          void since();
+          poll = setInterval(() => void since(), FOLLOW_POLL);
+          return;
+        }
         source = new EventSource(`/api/events/stream?after=${newest}`);
         source.onopen = () => setLive(true);
         source.onerror = () => setLive(false);
@@ -132,6 +162,7 @@ export default function ActivityPage() {
     return () => {
       stopped = true;
       source?.close();
+      if (poll !== null) clearInterval(poll);
     };
   }, []);
 

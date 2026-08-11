@@ -6,6 +6,7 @@ import BackfillLauncher from "./BackfillLauncher";
 import type { KeyRange } from "./backfill";
 import { CHAIN_DEPTH, downstreamOf, linkKind, movedInputs, whenChanged } from "./lineage";
 import type { ChainLink } from "./lineage";
+import { useMay } from "./role";
 import { GlyphShape } from "./StatusGlyph";
 import type {
   AssetSummary,
@@ -212,6 +213,7 @@ export default function AssetPage() {
 }
 
 function AssetView({ name }: { name: string }) {
+  const mayBuild = useMay("operator");
   const nav = useNavigate();
   const [assets, setAssets] = useState<AssetSummary[] | null>(null);
   const [chain, setChain] = useState<ChainLink[] | null>(null);
@@ -324,7 +326,7 @@ function AssetView({ name }: { name: string }) {
               <StateGlyph stale={asset.stale} />
             </span>
             {/* sources are probed, never built — the endpoint 400s */}
-            {asset.kind !== "source" && (
+            {mayBuild && asset.kind !== "source" && (
               <button onClick={build} disabled={building}>
                 build
               </button>
@@ -389,6 +391,7 @@ function AssetView({ name }: { name: string }) {
         range={asset.partitions ? { value: range, onChange: setRange } : undefined}
         onShown={setShown}
         partitionAction={
+          mayBuild &&
           asset.partitions && (
             <BackfillLauncher
               asset={asset}

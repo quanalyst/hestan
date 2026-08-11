@@ -8,6 +8,7 @@ import MetaList from "./MetaList";
 import StatusDot from "./StatusDot";
 import { GlyphShape } from "./StatusGlyph";
 import { hits, logRows, marks } from "./log";
+import { useMay } from "./role";
 import type { Source } from "./log";
 import type {
   EventLevel,
@@ -119,6 +120,9 @@ export default function RunPage() {
 }
 
 function RunView({ id }: { id: string }) {
+  // cancelling, re-running and resuming are driving what is happening now,
+  // which is an operator's
+  const mayDrive = useMay("operator");
   const nav = useNavigate();
   const [run, setRun] = useState<Run | null>(null);
   const [ops, setOps] = useState<OpRun[]>([]);
@@ -377,30 +381,31 @@ function RunView({ id }: { id: string }) {
             >
               clone
             </button>
-            {done ? (
-              <>
-                <button
-                  className="text-btn"
-                  onClick={() => relaunch("re-run")}
-                  disabled={pending !== null}
-                >
-                  re-run
-                </button>
-                {resumable && (
+            {mayDrive &&
+              (done ? (
+                <>
                   <button
                     className="text-btn"
-                    onClick={() => relaunch("resume")}
+                    onClick={() => relaunch("re-run")}
                     disabled={pending !== null}
                   >
-                    resume
+                    re-run
                   </button>
-                )}
-              </>
-            ) : (
-              <button className="text-btn" onClick={cancel} disabled={canceling}>
-                cancel
-              </button>
-            )}
+                  {resumable && (
+                    <button
+                      className="text-btn"
+                      onClick={() => relaunch("resume")}
+                      disabled={pending !== null}
+                    >
+                      resume
+                    </button>
+                  )}
+                </>
+              ) : (
+                <button className="text-btn" onClick={cancel} disabled={canceling}>
+                  cancel
+                </button>
+              ))}
           </div>
           {resumable && preview && <p className="muted">resume: {plan(preview)}</p>}
           {resumable && previewError && <p className="muted">no resume: {previewError}</p>}
@@ -450,7 +455,7 @@ function RunView({ id }: { id: string }) {
         </div>
       )}
 
-      {done && opSel && (
+      {mayDrive && done && opSel && (
         <p className="muted dag-action">
           {fromError ? (
             `cannot re-run from ${opSel}: ${fromError}`

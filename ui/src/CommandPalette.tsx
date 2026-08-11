@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import type { KeyboardEvent as ReactKeyboardEvent, ReactNode } from "react";
 import { useNavigate } from "react-router-dom";
 import { get, post } from "./api";
+import { useMay } from "./role";
 import type { JobSummary, Run } from "./types";
 import { relTime, shortId } from "./util";
 
@@ -14,6 +15,7 @@ interface Item {
 }
 
 export default function CommandPalette() {
+  const mayPause = useMay("admin");
   const nav = useNavigate();
   const [open, setOpen] = useState(false);
   const [ready, setReady] = useState(false);
@@ -90,7 +92,12 @@ export default function CommandPalette() {
     },
   }));
 
-  const actionItems: Item[] = jobs.flatMap((j) =>
+  // pausing a schedule from the palette is the same decision it is on the job
+  // page, so it is the same role — and an action a role may not take is not
+  // offered rather than offered and refused
+  const actionItems: Item[] = !mayPause
+    ? []
+    : jobs.flatMap((j) =>
     j.schedules.map((s) => {
       const verb = s.paused ? "resume" : "pause";
       return {
@@ -104,8 +111,8 @@ export default function CommandPalette() {
         hay: `${verb} ${j.name} ${s.expr}`.toLowerCase(),
         perform: () => doSched(j.name, s.expr, !s.paused),
       };
-    }),
-  );
+      }),
+    );
 
   const tokens = q.trim().toLowerCase().split(/\s+/).filter(Boolean);
   const match = (it: Item) => tokens.every((t) => it.hay.includes(t));

@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { get, post } from "./api";
 import { backfillPlan, estimateMs, medianMs } from "./backfill";
+import { useMay } from "./role";
 import type { KeyRange } from "./backfill";
 import type { AssetSummary, Backfill, OpStat, PartitionEntry } from "./types";
 import { fmtDuration } from "./util";
@@ -46,6 +47,7 @@ export default function BackfillLauncher({
   // a backfill of this asset that is still going; the api refuses a second one
   running: Backfill | null;
 }) {
+  const mayBackfill = useMay("operator");
   const nav = useNavigate();
   const [onlyMissing, setOnlyMissing] = useState(true);
   const [stats, setStats] = useState<OpStat[] | null>(null);
@@ -80,6 +82,10 @@ export default function BackfillLauncher({
       setBusy(false);
     }
   };
+
+  // gated here as well as where this is mounted: a control that starts work
+  // asks what the role may, wherever somebody later decides to put it
+  if (!mayBackfill) return null;
 
   return (
     <div className="backfill-launch">

@@ -4,6 +4,7 @@ import { del, get, HttpError, post, put, usePoll } from "./api";
 import DagView from "./DagView";
 import DurationBars from "./DurationBars";
 import OpInspector from "./OpInspector";
+import { useMay } from "./role";
 import StatusDot from "./StatusDot";
 import { GlyphShape } from "./StatusGlyph";
 import type { Status } from "./StatusGlyph";
@@ -139,6 +140,10 @@ export default function JobPage() {
 }
 
 function JobView({ name }: { name: string }) {
+  // launching is an operator's; a preset and a paused schedule outlive the
+  // launch and are an admin's
+  const mayLaunch = useMay("operator");
+  const mayConfigure = useMay("admin");
   const nav = useNavigate();
   const [search] = useSearchParams();
   // the run this launchpad was opened from, if it was cloned out of one
@@ -367,115 +372,123 @@ function JobView({ name }: { name: string }) {
           {job.description && <p className="secondary">{job.description}</p>}
           {policy && <p className="muted">{policy}</p>}
         </div>
-        <div className="run-actions">
-          <div className="run-side">
-            {presets.length > 0 && (
-              <select
-                className="preset-select"
-                value={presets.some((p) => p.name === presetName) ? presetName : ""}
-                onChange={(e) => fillFrom(e.target.value)}
-              >
-                <option value="">preset…</option>
-                {presets.map((p) => (
-                  <option key={p.name} value={p.name}>
-                    {p.name}
-                  </option>
-                ))}
-              </select>
-            )}
-            <button onClick={() => launch()} disabled={launching || !paramsValid || tags === null}>
-              launch run
-            </button>
-          </div>
-          <button
-            className={paramsOpen ? "text-btn active" : "text-btn"}
-            onClick={() => setParamsOpen((o) => !o)}
-          >
-            params
-          </button>
-          {paramsOpen && (
-            <div className="params-block">
-              {paramTypes.length > 0 && (
-                <div className="params-label">
-                  params_type <span className="mono">{paramTypes.join(" · ")}</span>
-                </div>
-              )}
-              <textarea
-                className="params-input"
-                value={paramsText}
-                placeholder="{}"
-                spellCheck={false}
-                onChange={(e) => {
-                  setParamsText(e.target.value);
-                  setParamsError(null);
-                }}
-                onBlur={checkParams}
-              />
-              {!paramsValid && <p className="muted params-hint">invalid json</p>}
-              {paramsValid && paramsError && <p className="muted params-hint">{paramsError}</p>}
-              {/* a legend for the json above, not a replacement for it: the
-                  schema says what the fields are, the editor still says what
-                  they are set to */}
-              {Object.keys(fields).length > 0 && (
-                <div className="params-fields">
-                  {Object.entries(fields).map(([field, shape]) => (
-                    <div key={field} className="params-field">
-                      <span className="mono">{field}</span>
-                      <span className="muted">{fieldType(shape)}</span>
-                      {required.has(field) && <span className="muted">required</span>}
-                      {shape.description && (
-                        <span className="muted params-desc" title={shape.description}>
-                          {shape.description}
-                        </span>
-                      )}
-                    </div>
+        {!mayLaunch ? (
+          <p className="muted">launching needs an operator</p>
+        ) : (
+          <div className="run-actions">
+            <div className="run-side">
+              {presets.length > 0 && (
+                <select
+                  className="preset-select"
+                  value={presets.some((p) => p.name === presetName) ? presetName : ""}
+                  onChange={(e) => fillFrom(e.target.value)}
+                >
+                  <option value="">preset…</option>
+                  {presets.map((p) => (
+                    <option key={p.name} value={p.name}>
+                      {p.name}
+                    </option>
                   ))}
-                </div>
+                </select>
               )}
-              {strangers.length > 0 && (
-                <p className="muted params-hint">
-                  not in the schema: <span className="mono">{strangers.join(", ")}</span>
-                </p>
-              )}
-              <div className="params-label">tags</div>
-              <input
-                className="filter-input"
-                value={tagsText}
-                placeholder="env:prod, kind:smoke"
-                onChange={(e) => setTagsText(e.target.value)}
-              />
-              {tags === null && <p className="muted params-hint">tags are key:value, comma separated</p>}
-              <div className="preset-row">
+              <button onClick={() => launch()} disabled={launching || !paramsValid || tags === null}>
+                launch run
+              </button>
+            </div>
+            <button
+              className={paramsOpen ? "text-btn active" : "text-btn"}
+              onClick={() => setParamsOpen((o) => !o)}
+            >
+              params
+            </button>
+            {paramsOpen && (
+              <div className="params-block">
+                {paramTypes.length > 0 && (
+                  <div className="params-label">
+                    params_type <span className="mono">{paramTypes.join(" · ")}</span>
+                  </div>
+                )}
+                <textarea
+                  className="params-input"
+                  value={paramsText}
+                  placeholder="{}"
+                  spellCheck={false}
+                  onChange={(e) => {
+                    setParamsText(e.target.value);
+                    setParamsError(null);
+                  }}
+                  onBlur={checkParams}
+                />
+                {!paramsValid && <p className="muted params-hint">invalid json</p>}
+                {paramsValid && paramsError && <p className="muted params-hint">{paramsError}</p>}
+                {/* a legend for the json above, not a replacement for it: the
+                    schema says what the fields are, the editor still says what
+                    they are set to */}
+                {Object.keys(fields).length > 0 && (
+                  <div className="params-fields">
+                    {Object.entries(fields).map(([field, shape]) => (
+                      <div key={field} className="params-field">
+                        <span className="mono">{field}</span>
+                        <span className="muted">{fieldType(shape)}</span>
+                        {required.has(field) && <span className="muted">required</span>}
+                        {shape.description && (
+                          <span className="muted params-desc" title={shape.description}>
+                            {shape.description}
+                          </span>
+                        )}
+                      </div>
+                    ))}
+                  </div>
+                )}
+                {strangers.length > 0 && (
+                  <p className="muted params-hint">
+                    not in the schema: <span className="mono">{strangers.join(", ")}</span>
+                  </p>
+                )}
+                <div className="params-label">tags</div>
                 <input
                   className="filter-input"
-                  value={presetName}
-                  placeholder="preset name"
-                  onChange={(e) => {
-                    setPresetName(e.target.value);
-                    setPresetError(null);
-                  }}
+                  value={tagsText}
+                  placeholder="env:prod, kind:smoke"
+                  onChange={(e) => setTagsText(e.target.value)}
                 />
-                <button
-                  className="text-btn"
-                  onClick={savePreset}
-                  disabled={!presetName.trim() || !paramsValid}
-                >
-                  save
-                </button>
-                {presets.some((p) => p.name === presetName.trim()) && (
-                  <button className="text-btn" onClick={deletePreset}>
-                    delete
-                  </button>
+                {tags === null && <p className="muted params-hint">tags are key:value, comma separated</p>}
+                {mayConfigure && (
+                  <>
+                    <div className="preset-row">
+                      <input
+                        className="filter-input"
+                        value={presetName}
+                        placeholder="preset name"
+                        onChange={(e) => {
+                          setPresetName(e.target.value);
+                          setPresetError(null);
+                        }}
+                      />
+                      <button
+                        className="text-btn"
+                        onClick={savePreset}
+                        disabled={!presetName.trim() || !paramsValid}
+                      >
+                        save
+                      </button>
+                      {presets.some((p) => p.name === presetName.trim()) && (
+                        <button className="text-btn" onClick={deletePreset}>
+                          delete
+                        </button>
+                      )}
+                    </div>
+                    {presetError && <p className="muted params-hint">{presetError}</p>}
+                  </>
                 )}
               </div>
-              {presetError && <p className="muted params-hint">{presetError}</p>}
-            </div>
-          )}
-          {!paramsValid && !paramsOpen && <p className="muted">saved params are invalid json — open params to fix</p>}
-          {tags === null && !paramsOpen && <p className="muted">tags are not key:value — open params to fix</p>}
-          {cloneError && <p className="muted">clone failed: {cloneError}</p>}
-          {launchError && <p className="muted">launch failed: {launchError}</p>}
-        </div>
+            )}
+            {!paramsValid && !paramsOpen && <p className="muted">saved params are invalid json — open params to fix</p>}
+            {tags === null && !paramsOpen && <p className="muted">tags are not key:value — open params to fix</p>}
+            {cloneError && <p className="muted">clone failed: {cloneError}</p>}
+            {launchError && <p className="muted">launch failed: {launchError}</p>}
+          </div>
+        )}
       </div>
 
       <h2>graph</h2>
@@ -489,7 +502,7 @@ function JobView({ name }: { name: string }) {
           setOpSel((prev) => (prev === op ? null : op));
         }}
       />
-      {opSel && (
+      {mayLaunch && opSel && (
         <p className="muted dag-action">
           <button
             className="text-btn"
@@ -551,9 +564,11 @@ function JobView({ name }: { name: string }) {
               <span className="muted">
                 {s.paused ? "paused" : s.next_fire ? `next ${untilTime(s.next_fire)}` : "next —"}
               </span>
-              <button className="text-btn" onClick={() => setPaused(s.expr, !s.paused)}>
-                {s.paused ? "resume" : "pause"}
-              </button>
+              {mayConfigure && (
+                <button className="text-btn" onClick={() => setPaused(s.expr, !s.paused)}>
+                  {s.paused ? "resume" : "pause"}
+                </button>
+              )}
             </div>
             );
           })}

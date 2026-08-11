@@ -3,6 +3,7 @@ import type { MouseEvent as ReactMouseEvent } from "react";
 import { Link, useNavigate, useSearchParams } from "react-router-dom";
 import { get, HttpError, post, usePoll } from "./api";
 import StatusDot from "./StatusDot";
+import { useMay } from "./role";
 import type { Notification, QueueView, Run } from "./types";
 import { durationMs, fmtDuration, isTerminal, relTime, shortId } from "./util";
 
@@ -100,6 +101,10 @@ function Undelivered({ rows }: { rows: Notification[] }) {
 }
 
 export default function RunsPage() {
+  const mayDrive = useMay("operator");
+  // moving a run up the queue changes what the deployment does with work
+  // nobody asked about, which is an admin's
+  const mayOrder = useMay("admin");
   const nav = useNavigate();
   const [search] = useSearchParams();
   const job = search.get("job");
@@ -325,13 +330,15 @@ export default function RunsPage() {
                         {q.blocked_by ? q.blocked_by.reason : "starting now"}
                       </td>
                       <td className="row-action">
-                        <button
-                          className="text-btn"
-                          disabled={busyId === q.run.id}
-                          onClick={(e) => bump(e, q.run.id, q.run.priority)}
-                        >
-                          bump
-                        </button>
+                        {mayOrder && (
+                          <button
+                            className="text-btn"
+                            disabled={busyId === q.run.id}
+                            onClick={(e) => bump(e, q.run.id, q.run.priority)}
+                          >
+                            bump
+                          </button>
+                        )}
                         {rowErr?.id === q.run.id && (
                           <span className="muted row-err">{rowErr.msg}</span>
                         )}
@@ -443,7 +450,7 @@ export default function RunsPage() {
                         )}
                       </td>
                       <td className="row-action">
-                        {isTerminal(run.status) && (
+                        {mayDrive && isTerminal(run.status) && (
                           <button
                             className="text-btn"
                             disabled={busyId === run.id}
@@ -452,7 +459,7 @@ export default function RunsPage() {
                             re-run
                           </button>
                         )}
-                        {(run.status === "failed" || run.status === "canceled") && (
+                        {mayDrive && (run.status === "failed" || run.status === "canceled") && (
                           <button
                             className="text-btn"
                             disabled={busyId === run.id}

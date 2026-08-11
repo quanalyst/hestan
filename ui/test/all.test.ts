@@ -7,3 +7,4 @@ import "./lineage.test";
 import "./log.test";
 import "./markdown.test";
 import "./metalist.test";
+import "./role.test";

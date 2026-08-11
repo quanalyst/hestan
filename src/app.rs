@@ -1007,6 +1007,7 @@ impl Hestan {
             limits: self.limits,
             retention: self.retention,
             role: self.role,
+            auth: self.auth,
             db: self.db_path,
         })
     }
@@ -1135,6 +1136,11 @@ pub(crate) struct Inspected {
     pub(crate) limits: Limits,
     pub(crate) retention: Retention,
     pub(crate) role: Role,
+    /// what would check who is asking, if this served. `None` is nothing
+    /// configured — which is what `doctor` reports, since it is the difference
+    /// between a deployment that can be moved off loopback and one that
+    /// cannot.
+    pub(crate) auth: Option<Auth>,
     /// the path or url the store was opened at.
     pub(crate) db: String,
 }

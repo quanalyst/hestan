@@ -3,6 +3,7 @@ import { useNavigate } from "react-router-dom";
 import { get, post, usePoll } from "./api";
 import { keysInRange, rangeOf } from "./backfill";
 import type { KeyRange } from "./backfill";
+import { useMay } from "./role";
 import type { PartitionEntry } from "./types";
 import { relTime } from "./util";
 
@@ -39,6 +40,9 @@ export default function PartitionGrid({
   // the keys this grid is drawing, for a caller that has to reason about them
   onShown?: (shown: PartitionEntry[]) => void;
 }) {
+  // the grid is a picture of what is built, and it stays one for everybody;
+  // what a viewer does not get is the click that builds a key
+  const mayBuild = useMay("operator");
   const nav = useNavigate();
   const [parts, setParts] = useState<PartitionEntry[] | null>(null);
   const [total, setTotal] = useState(0);
@@ -113,7 +117,7 @@ export default function PartitionGrid({
               range.onChange({ from: p.key, to: p.key });
             }}
             onMouseEnter={() => extend(p.key)}
-            onClick={() => range === undefined && build(p.key)}
+            onClick={() => range === undefined && mayBuild && build(p.key)}
           />
         ))}
       </div>

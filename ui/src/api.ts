@@ -1,5 +1,6 @@
 import { useEffect } from "react";
 import type { DependencyList } from "react";
+import { token } from "./identity";
 
 export class HttpError extends Error {
   status: number;
@@ -21,8 +22,19 @@ async function detail(res: Response): Promise<string | null> {
   return null;
 }
 
+// the credential, on every request that has one to send. it goes in a header
+// and never in a url: a query string is in the browser's history, in every
+// proxy's access log and in the referrer of anything this page links to
+function headers(json: boolean): HeadersInit | undefined {
+  const held = token();
+  if (held === null) return json ? { "content-type": "application/json" } : undefined;
+  const sent: Record<string, string> = { authorization: `Bearer ${held}` };
+  if (json) sent["content-type"] = "application/json";
+  return sent;
+}
+
 export async function get<T>(path: string): Promise<T> {
-  const res = await fetch(path);
+  const res = await fetch(path, { headers: headers(false) });
   if (!res.ok) throw new HttpError(res.status, path, await detail(res));
   return res.json() as Promise<T>;
 }
@@ -30,7 +42,7 @@ export async function get<T>(path: string): Promise<T> {
 async function send<T>(method: string, path: string, body: string | undefined): Promise<T> {
   const res = await fetch(path, {
     method,
-    headers: body === undefined ? undefined : { "content-type": "application/json" },
+    headers: headers(body !== undefined),
     body,
   });
   if (!res.ok) throw new HttpError(res.status, path, await detail(res));
