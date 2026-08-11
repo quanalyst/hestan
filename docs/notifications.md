@@ -229,10 +229,13 @@ surprises people.
 ### Retry and giving up
 
 a hook that panics is a failed delivery. it retries on the same capped
-exponential backoff with full jitter that op retries use — 10s doubling to at
-most 30 minutes — for **eight attempts**, which is somewhere over two hours:
-long enough to cover a restart of whatever is on the other end, not long
-enough to keep trying a url that was wrong when it was typed.
+exponential backoff with full jitter that op retries use — 10s, doubling —
+for **eight attempts**, which is seven gaps and so at most about twenty
+minutes, and nearer ten once the jitter is counted: long enough to cover a
+restart of whatever is on the other end, not long enough to keep trying a url
+that was wrong when it was typed. (the pacing carries a 30-minute ceiling for
+the same reason op retries do; eight attempts never grow far enough to meet
+it.)
 
 past that hestan stops, and stops **loudly**. the row stays, `failed`, with
 the error that stopped it, and appears in `GET /api/notifications?state=failed`

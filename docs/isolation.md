@@ -73,10 +73,10 @@ that is a real constraint, and it is worth stating plainly:
   different database out of a flag the parent did not pass on, cannot host an
   op subprocess — the child will not find its op, and the parent will record
   that the op exited with a status and no result.
-- **the database must be reachable by path.** the child opens it by the path
-  your builder names. `":memory:"` is private to one connection, so an
-  isolated op against an in-memory store is a build error rather than a
-  mystery at run time.
+- **the database must be reachable from another process.** the child opens
+  the same target your builder named — a sqlite path or a `postgres://` url.
+  `":memory:"` is private to one connection, so an isolated op against an
+  in-memory store is a build error rather than a mystery at run time.
 - **unix only.** `isolated()` on another platform is a build error naming the
   platform. an isolation guarantee that quietly is not one is the worst option
   available, so there is no in-process fallback.
@@ -244,10 +244,12 @@ the child also rebuilds what the parent built: it opens the store and
 constructs every [resource](resources.md) your builder declares. a resource
 whose constructor takes two seconds makes every isolated op cost two seconds.
 
-and both processes write the same sqlite file, which is what the busy timeout
-on every connection is for. writes here are small and rare — a row and a few
-events per op — so this is not a throughput concern at the scale hestan is
-built for, but it is why isolation wants a real database file rather than a
+and both processes write the same run log. on sqlite that is one file two
+writers share, which is what the busy timeout on every connection is for; on
+postgres they are two ordinary clients of the same server and there is nothing
+to arrange. writes here are small and rare either way — a row and a few events
+per op — so this is not a throughput concern at the scale hestan is built for,
+but on sqlite it is why isolation wants a real database file rather than a
 tmpfs afterthought.
 
 reach for `isolated()` on the op that parses untrusted input, calls into a c

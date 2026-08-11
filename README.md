@@ -389,6 +389,18 @@ the binary is yours: define jobs, then `Hestan::new()...serve(addr)`, or
 `hestan::cli::run(app, addr)` in place of `serve` gives that binary a
 [command line](docs/cli.md) over the same registry.
 
+everything optional is off, because every one of them is a dependency somebody
+should get to decline:
+
+| feature | what it adds |
+| --- | --- |
+| `bundled` | **on by default**: compiles sqlite from source instead of linking the system library |
+| `postgres` | `Store::connect`, for a run log several processes share — [storage](docs/storage.md) |
+| `cli` | `hestan::cli::run`, and the standalone `hestan` binary — [the command line](docs/cli.md) |
+| `capture` | `hestan::capture_layer`, storing the `tracing` events ops emit — [logs](docs/logs.md) |
+| `otel` | `hestan::otel`, a run as a distributed trace |
+| `http` | `HttpSource` and the [notification](docs/notifications.md) helpers — [http sources](docs/http-sources.md) |
+
 ## Developing the ui
 
 `cd ui && npm run dev` starts the vite dev server, which proxies `/api` to

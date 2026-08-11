@@ -161,7 +161,10 @@ doing nothing.
 runs carry `tags` in their json, `{}` when untagged. the runs page has a tag
 box beside the other filters — served, unlike the rest, since a tag the page
 never fetched cannot be filtered for client-side — and shows each run's tags as
-muted `key:value` chips.
+muted `key:value` chips. from a terminal it is the same filter:
+`hestan runs --tag kind=smoke`, and `hestan run <job> --preset nightly
+--tag kind=smoke` is this whole page as one line ([the command
+line](cli.md)).
 
 ## Launching a subset of ops
 

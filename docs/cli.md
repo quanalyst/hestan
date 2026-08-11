@@ -250,7 +250,7 @@ thing it is about is worse than no check at all.
 
 ```
 $ orders doctor
-ok    store      sqlite at /var/lib/hestan.db, schema v17
+ok    store      sqlite at /var/lib/hestan.db, schema v18
 ok    schedules  2 of 2 parse
 note  schedules  paused, so they will not fire: warehouse_healthcheck
                  unpause schedule warehouse_healthcheck

@@ -42,7 +42,7 @@ not be there:
 
 resources are built during `Hestan::build`, **before the store is opened**. a
 constructor that returns `Err` aborts startup with
-`Error::Resource { name, reason }`, and no database file is created: a process
+`Error::Resource { name, reason }`, and the store is never opened: a process
 whose api client could not be built has nothing useful to serve, and should
 not leave a run log behind implying otherwise.
 

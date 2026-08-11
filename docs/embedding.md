@@ -23,16 +23,22 @@ spells "serve".
 ## serve, run_once, Runner
 
 `Hestan::new()...serve(addr)` is the full deal: open and migrate the
-database, sweep runs that a dead process left behind, sync the schedules
-and sensors tables to the code, start the in-process scheduler and the
-sensor loop, and serve the ui and api.
+database, sweep runs that a dead process left behind, sync the schedules and
+sensors tables to the code, start the loops this process's
+[role](scaling.md#roles) owns — the scheduler, the sensors, the backfill
+chunker, the freshness checker and the retention sweeper for a role that
+decides, the queue dispatcher for one that executes, and the lease loop
+whatever the role is — and serve the ui and api.
 `.retention(Retention::days(n))` folds one more step into that startup work:
 terminal runs older than `n` days are pruned before anything new launches, and
-a sweeper loop keeps pruning every hour after that (the default keeps
+the sweeper keeps pruning every hour after that (the default keeps
 everything — see [storage](storage.md#retention)).
 it binds the listener *before* spawning the loops, so a bind failure
 (port taken) can't leave a detached loop firing jobs into a server that never
-started. when serve returns, both loop tasks are aborted with it.
+started — and it is the **bound** address that is checked against the
+[authenticator](auth.md), so `serve` refuses `Error::Unguarded` on an address
+anyone can reach with nothing configured. when serve returns, every loop is
+aborted with it.
 
 `Hestan::new()...run_once(job, params)` builds the same way — including the
 crash sweep, the schedule/sensor sync and one retention sweep — but runs a

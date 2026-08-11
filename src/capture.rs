@@ -45,8 +45,9 @@ use crate::store::Store;
 /// how many captured events wait to be written before the layer starts
 /// dropping them.
 ///
-/// the emitting thread is an op doing its work and must never wait on sqlite,
-/// so this queue is bounded and a full one is a drop rather than a stall.
+/// the emitting thread is an op doing its work and must never wait on a
+/// database write, so this queue is bounded and a full one is a drop rather
+/// than a stall.
 /// four thousand is several seconds of a very chatty op at the rate a single
 /// writer sustains.
 const BUFFER: usize = 4_096;
@@ -183,7 +184,7 @@ where
             message: visitor.finish(),
         };
         // never blocks: the thread emitting this is an op doing its work, and
-        // making it wait on a sqlite write to say something would be a worse
+        // making it wait on a database write to say something would be a worse
         // bug than the missing line
         if let Err(TrySendError::Full(record) | TrySendError::Disconnected(record)) =
             self.events.try_send(record)

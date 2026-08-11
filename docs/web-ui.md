@@ -2,8 +2,9 @@
 
 the ui is a react bundle compiled into the binary; at deploy time the
 executable is all there is. it polls the [json api](http-api.md) and works
-entirely from real state. seven pages: jobs (the overview at `/`), a job page,
-the asset catalog, an asset page, runs, a run page, and a backfill page.
+entirely from real state. eight pages: jobs (the overview at `/`), a job page,
+the asset catalog, an asset page, runs, a run page, a backfill page, and the
+activity feed at `/activity`.
 
 ## Who is driving
 
@@ -520,6 +521,25 @@ fetches the whole thing as text, narrowed to the selected op if there is one.
 
 a line off a pipe has no level, so a level filter hides it rather than
 inventing one for it.
+
+## Activity
+
+the whole [event log](events.md) as one table at `/activity`, newest first —
+every run queued, asset materialized, check failed, schedule fired or skipped,
+sensor tick, backfill chunk, notification given up on and lease taken back.
+this is the page that answers "what happened last night" without knowing which
+run to open first.
+
+one page of history is fetched, then the feed **follows what happens next**,
+merged into the same list so there is no seam between the two. the header says
+`live` or `not following`, because a feed that quietly stopped updating is
+worse than one that says it has. `load older` walks back a page at a time.
+
+the filters — `about` (run, job, asset, schedule, sensor, backfill, system),
+`level`, and a text `find` over the message, kind and subject — narrow **what
+has been loaded**, not the query, which is why the load-older button says so
+while a filter is on. a gap the stream reports (a consumer that fell behind)
+is a row of its own rather than a silence.
 
 ## Command palette
 

@@ -1124,8 +1124,8 @@ impl Store {
     ///
     /// a fresh database is created at the current schema version in one go.
     /// there are no postgres databases in the world that predate this, so
-    /// there is nothing for the sqlite chain's sixteen steps to migrate and
-    /// walking them would only be a re-enactment.
+    /// there is nothing for the sqlite chain's accumulated steps to migrate
+    /// and walking them would only be a re-enactment.
     #[cfg(feature = "postgres")]
     #[cfg_attr(docsrs, doc(cfg(feature = "postgres")))]
     pub fn connect(url: &str) -> Result<Store, Error> {

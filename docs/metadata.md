@@ -33,7 +33,7 @@ without anything reading the value having to guess.
 | `Markdown(String)` | `{"markdown": "…"}` | [a rendered subset](#the-markdown-subset) |
 | `Json(Value)` | `{"json": …}` | a preformatted block |
 | `Table(MetaTable)` | `{"table": {…}}` | a small table |
-| `Bytes(u64)` | `{"bytes": 1288490188}` | `1.2 GB` |
+| `Bytes(u64)` | `{"bytes": 1152000000}` | `1.2 GB` |
 | `Duration(Duration)` | `{"duration_secs": 3.4}` | `3.4s` |
 | `Count(u64)` | `{"count": 1240}` | `1,240`, tabular |
 | `Path(String)` | `{"path": "/tmp/x.parquet"}` | monospace, basename emphasised |
@@ -47,7 +47,7 @@ or through a constructor that reads better at a call site:
 
 ```rust
 ctx.meta("rows", Meta::count(1_240));
-ctx.meta("size", Meta::bytes(1_288_490_188));
+ctx.meta("size", Meta::bytes(1_152_000_000));
 ctx.meta("output", Meta::path("/warehouse/orders.parquet"));
 ctx.meta("derived_from", Meta::asset_ref("raw_orders"));
 ```
@@ -59,7 +59,7 @@ to happen, so cast them yourself — or say which kind of number you meant, with
 ### Units are display types over one number
 
 `Bytes`, `Duration` and `Count` hold the same numbers `Int` and `Float` do.
-The difference is that the ui knows what they are in, so `1288490188` renders
+The difference is that the ui knows what they are in, so `1152000000` renders
 as `1.2 GB` and `3.4` as `3.4s` — and anything computing over metadata reads
 all five as one number, so a count that grew by 37 and a size that shrank by
 4% are the same arithmetic over different units. Byte sizes are printed in decimal

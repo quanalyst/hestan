@@ -22,8 +22,8 @@ pub struct IoKey {
 }
 
 /// where op outputs live. the default keeps them in the run log as json,
-/// which is wrong for anything bulky; a manager is how you move them
-/// somewhere that isn't sqlite while `op_runs.output` keeps a handle.
+/// which is wrong for anything bulky; a manager is how you move them out of
+/// the run log altogether while `op_runs.output` keeps a handle.
 ///
 /// ## The contract
 ///
@@ -69,8 +69,8 @@ const FILE_TAG: &str = "file";
 /// `{dir}/{run_id}/{op}.json`, with `{"$io": "file", "path": ".."}` recorded
 /// in the run log.
 ///
-/// nothing is ever cleaned up: [retention](crate::Store) prunes run rows, not
-/// files. point it at a directory you are willing to sweep.
+/// nothing is ever cleaned up: [retention](crate::Retention) prunes run rows,
+/// not files. point it at a directory you are willing to sweep.
 pub struct FileIo {
     dir: PathBuf,
 }

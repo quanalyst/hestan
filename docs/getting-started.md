@@ -26,8 +26,10 @@ or a sibling checkout, for hacking on both at once:
 hestan = { path = "../hestan" }
 ```
 
-add `features = ["http"]` to either form if you want [`HttpSource`](http-sources.md);
-everything else works without it.
+everything in this page works with no features turned on. the optional ones —
+a [command line](cli.md), a [postgres](storage.md) run log,
+[captured tracing events](logs.md), [traces](../README.md#how-it-works) and
+[http sources](http-sources.md) — are listed in the readme's feature table.
 
 ## A first job
 
@@ -69,8 +71,9 @@ the upstream op's output and `ctx.info` writes a log event into the run
 history. `.after(["extract"])` declares the edge, `.retries(2)` allows two
 extra attempts after a failure.
 
-`Hestan::new()` collects jobs and schedules. `.db` names the sqlite file
-(default `hestan.db`; `":memory:"` also works). `.serve` opens the database,
+`Hestan::new()` collects jobs and schedules. `.db` names the run log — a
+sqlite path (default `hestan.db`; `":memory:"` also works), or a `postgres://`
+url with the `postgres` feature on ([storage](storage.md)). `.serve` opens it,
 recovers any runs a previous process left behind, starts the in-process
 scheduler, and serves the ui and json api on the address — then runs until
 the process is killed. for a single headless run instead, swap it for

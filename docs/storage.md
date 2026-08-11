@@ -83,8 +83,8 @@ deliberate differences and no others:
 
 **a fresh database is created at the current version in one statement batch.**
 there are no postgres databases in the world that predate this backend, so
-there is nothing for the sqlite chain's sixteen steps to migrate and walking
-them would be a re-enactment; from here it is forward-only. postgres ddl is
+there is nothing for the sqlite chain's accumulated steps to migrate and
+walking them would be a re-enactment; from here it is forward-only. postgres ddl is
 transactional, so an interrupted first boot leaves the database exactly as
 found, and two processes booting against the same empty database take turns on
 an advisory lock rather than racing to create the same table. a database
@@ -434,15 +434,15 @@ thing twice; version 18 adds `runs.actor` and `events.actor`, the name of the
 [identity](auth.md) that asked for a run, a cancel, a pause or a backfill —
 null on every row written before it, and null on everything a schedule, a
 sensor or a loop did on its own, which is the same thing those rows always
-meant. an older file at
-any version opens straight into v17, rows intact — the v8 rebuild copies
-every keyed materialization across, where it becomes that asset's first
-history entry and stays its current one, and v9 leaves every existing row
-with a null partition, which is exactly what an unpartitioned asset is. every
-pending step
-and the version stamp run in one transaction
-(sqlite DDL is transactional), so a crash or failure mid-migration leaves
-the file exactly as it was found, never half-migrated. a database stamped
+meant.
+
+an older file at any version opens straight into the current one, rows intact
+— the v8 rebuild copies every keyed materialization across, where it becomes
+that asset's first history entry and stays its current one, and v9 leaves every
+existing row with a null partition, which is exactly what an unpartitioned
+asset is. every pending step and the version stamp run in one transaction
+(sqlite DDL is transactional), so a crash or failure mid-migration leaves the
+file exactly as it was found, never half-migrated. a database stamped
 with a version newer than the build refuses to open (`db schema v19 is newer
 than this build`) instead of quietly writing an older stamp over it.
 
@@ -488,8 +488,8 @@ a swept run's `running` op runs become `failed` with error
 `interrupted: process exited`, its `pending` op runs become `skipped`, a
 `run_failed` event (`run interrupted: process exited`) is appended, and the
 run itself is marked `failed` with a finish time and that same message as its
-`error`. terminal runs are untouched. constructing a `Runner` directly skips the sweep — it belongs to
-process startup, not to the executor.
+`error`. terminal runs are untouched. constructing a `Runner` directly skips
+the sweep — it belongs to process startup, not to the executor.
 
 the sweep only catches a claimer that was already gone when this process
 started. one that dies while everything is up is caught by the same test on a

@@ -4,7 +4,7 @@ there are two logs on a run page and they are not the same thing.
 
 the **run log** is hestan narrating: `run_started`, `op_retry`,
 `type_check_failed`, and whatever `ctx.info/warn/error` said. it is
-[events](concepts.md#events), it is structured, and it is what the run page
+[events](events.md), it is structured, and it is what the run page
 has always shown.
 
 **captured output** is what the op itself produced — the `println!` of a
@@ -149,7 +149,7 @@ matters because you hand `capture_layer` a `Store` you opened yourself: a cap
 that only covered the writers hestan happened to build would be a cap that
 quietly does not hold.
 
-the layer never makes the emitting thread wait on sqlite. events go into a
+the layer never makes the emitting thread wait on the store. events go into a
 bounded buffer and a writer thread stores them; if an op fills the buffer
 faster than it drains, the excess is **dropped and counted**, and one line
 says how many. a gap that says it is a gap is worth something; one that does
@@ -178,12 +178,13 @@ GET /api/runs/{id}/logs/download?op=
 the first is cursored on `id` exactly as the events endpoint is cursored on
 `seq` — oldest first, `after` is the last id you saw, default 500 lines and at
 most 2000. the second is `text/plain`, one line per line, because at some
-point everyone wants to grep it:
+point everyone wants to grep it — which is also what
+[`hestan logs <run>`](cli.md) reads, with `--follow` to stay on it:
 
 ```
 2026-08-08T10:00:01.412Z load #1 stdout connecting to the warehouse
 2026-08-08T10:00:02.008Z load #1 stderr timed out, retrying
-2026-08-08T10:00:04.114Z load #2 warn  retrying with a longer deadline
+2026-08-08T10:00:04.114Z load #2 warn retrying with a longer deadline
 ```
 
 ## Where it lives

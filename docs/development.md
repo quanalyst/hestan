@@ -32,17 +32,20 @@ src/
 ui/             react + vite app; ui/dist is committed and embedded
 examples/       demo.rs and assets.rs (both mount the cli, so both need
                 --features cli), http_source.rs (needs --features http)
-tests/          pipeline.rs, assets.rs, isolation.rs, queue.rs, auth.rs;
-                http_source.rs and notify.rs (need the http feature);
-                capture.rs (needs capture); cli.rs (needs cli)
+tests/          pipeline.rs, assets.rs, isolation.rs, queue.rs, auth.rs,
+                docs.rs; http_source.rs and notify.rs (need the http
+                feature); capture.rs (needs capture); otel.rs (needs otel);
+                cli.rs (needs cli)
 ```
 
 ## Gates
 
-`just check` runs exactly what ci runs. `http`, `capture`, `postgres`, `otel`
-and `cli` each compile real extra code (and all but the first gate a test
-target via `required-features`), and the crate has to be clean without them as
-well as with them — so seven configurations are checked rather than one:
+`just check` runs the gates ci runs. `http`, `capture`, `postgres`, `otel`
+and `cli` each compile real extra code, and all but `postgres` gate a test
+target of their own via `required-features` — postgres's extra coverage is the
+second half of the store suite instead. the crate has to be clean without any
+of them as well as with them, so seven configurations are checked rather than
+one:
 
 ```
 cargo fmt --check
@@ -64,12 +67,17 @@ cargo test --all-features
 
 ci additionally runs the ui's own gates — `npm run lint`, `npm test` and
 `npm run build` — and fails on a `ui/dist` diff, so a stale committed bundle
-can't ship.
+can't ship. two things it does that `just check` cannot: it sets
+`HESTAN_TEST_PG`, so the postgres half of the store suite actually runs
+(`just check-pg` is the local equivalent), and it compiles the whole thing on
+the msrv toolchain, so a newer language feature slipping in is caught here
+rather than by whoever is pinned.
 
-the other justfile recipes: `just demo` (the demo on :4000), `just assets`
-(the assets example on :4002), `just http-source`, `just ui-dev` (vite dev
-server), `just ui-test` (the markdown suite), `just ui-build` (rebuild
-`ui/dist` and touch `src/server.rs`), `just build`.
+the other justfile recipes: `just check-pg` (the store suite with a real
+postgres behind it), `just demo` (the demo on :4000), `just assets` (the
+assets example on :4002), `just http-source`, `just ui-dev` (vite dev server),
+`just ui-test` (the ui suites), `just ui-build` (rebuild `ui/dist` and touch
+`src/server.rs`), `just build`.
 
 ## The ui loop
 
@@ -125,12 +133,13 @@ worker processes racing one queue either way.
 migrations live in `src/store.rs` and run forward from `PRAGMA user_version`
 on every open. **this is the sqlite chain**; a postgres database is created
 whole at the current version by `src/pg.rs`, so a new step means editing that
-schema as well. to add v3:
+schema as well. to add the next one — call it vN, one past whatever
+`SCHEMA_VERSION` says today:
 
-1. write a `SCHEMA_V3` const with the DDL (`ALTER TABLE` / `CREATE TABLE`,
-   the same style as `SCHEMA_V2`).
-2. in `migrate`, add `if version < 3 { conn.execute_batch(SCHEMA_V3)?; }`
-   and bump the final `pragma_update` to 3.
+1. write a `SCHEMA_VN` const with the DDL (`ALTER TABLE` / `CREATE TABLE`,
+   the same style as the one below it).
+2. in `migrate`, add `if version < N { conn.execute_batch(SCHEMA_VN)?; }`
+   and bump the final `pragma_update` to N.
 3. add the same columns or tables to `SCHEMA` in `src/pg.rs`, and bump
    `SCHEMA_VERSION`. a fresh postgres database is stamped with it; an existing
    one needs a forward step of its own, in `pg::migrate`.
@@ -144,12 +153,16 @@ version 0 for anything.
 
 ## Tests
 
-unit tests sit at the bottom of the module they exercise: `graph.rs`
-(ordering, cycles), `job.rs` (graph flattening: prefixes, wiring, nesting,
-rejected shapes), `schedule.rs` (cron normalization, dow remap, windows),
-`store.rs` (lifecycle roundtrips, migrations, sweep, claims under real
-contention — [twice](#the-store-suite-runs-twice)), `server.rs` (handlers
-called directly with axum extractors — no live server needed).
+unit tests sit at the bottom of the module they exercise — most modules have
+some, and these are the ones worth knowing about: `graph.rs` (ordering,
+cycles), `job.rs` (graph flattening: prefixes, wiring, nesting, rejected
+shapes), `schedule.rs` (cron normalization, dow remap, windows), `op.rs` (the
+metadata tags, which are a wire format, and the delta arithmetic),
+`auth.rs` (every spelling of loopback, and what each role may), `store.rs`
+(lifecycle roundtrips, migrations, sweep, claims under real contention —
+[twice](#the-store-suite-runs-twice)), `server.rs` (handlers called directly
+with axum extractors — no live server needed, and the two scrapers that hold
+`docs/auth.md` and `docs/http-api.md` to the router).
 
 `tests/pipeline.rs` is the end-to-end executor suite against in-memory
 stores: output passing, diamond ordering, failure/skip, retries, panics,
@@ -191,8 +204,11 @@ registered as "nobody is interested" by whichever thread got there first, and
 the layer's cases would fail about one run in three.
 
 the ui has suites of its own under `ui/test/`, run with `npm test` (or
-`just ui-test`): the [markdown subset](metadata.md#the-markdown-subset)
-construct by construct with the injection cases asserted against the exact
-string react renders, the metadata row, and the run page's log merge. they
+`just ui-test`) and registered one import each in `ui/test/all.test.ts`: the
+[markdown subset](metadata.md#the-markdown-subset) construct by construct with
+the injection cases asserted against the exact string react renders, the
+metadata row, the run page's log merge, the activity feed's merge and filters,
+the backfill range arithmetic, the catalog's grouping and filters, the lineage
+walk, and what each role may see. they
 need no test framework and no browser — vite bundles them for node with the
 same config the app is built with, and `node:test` runs them.

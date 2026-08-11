@@ -88,8 +88,10 @@ Op::new("fetch", |ctx| async move {
 the check runs **before the run exists**: a launch whose params don't
 deserialize into `P` is rejected with `Error::InvalidParams` (http 400 from
 the launch and retry endpoints) and writes nothing to the database — no run
-row, no events, zero traces. every op that declared a params type is checked
-against the run's params, and the error names the op that rejected them.
+row, no events, zero traces. every op the run will actually execute is
+checked against its params, and the error names the op that rejected them —
+so a [subset launch](launching.md#launching-a-subset-of-ops) is judged by the
+ops in the subset and not by the ones it is skipping.
 
 ## Type names in the api and ui
 

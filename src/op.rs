@@ -204,7 +204,8 @@ impl Meta {
         })
     }
 
-    /// a size in bytes: `Meta::bytes(1_288_490_188)` reads as `1.2 GB`.
+    /// a size in bytes: `Meta::bytes(1_152_000_000)` reads as `1.2 GB`.
+    /// decimal units, the way storage and warehouses quote them.
     pub fn bytes(n: u64) -> Meta {
         Meta::Bytes(n)
     }

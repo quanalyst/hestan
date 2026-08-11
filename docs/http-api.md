@@ -9,6 +9,10 @@ or whose job has left the code, a resume of a run that succeeded, a cancel of
 a finished run, an asset build while one is already running), 500 for storage
 failures. timestamps are rfc3339 strings in utc.
 
+nothing below has to be reached with `curl`: `hestan --server <url> <command>`
+speaks this api and prints the same objects ([the command line](cli.md)). this
+page is for writing something that is not hestan.
+
 | method | path | purpose |
 | --- | --- | --- |
 | GET | `/api/health` | liveness, this process's instance id, and what it is holding |
@@ -42,7 +46,12 @@ failures. timestamps are rfc3339 strings in utc.
 | GET | `/api/assets/{name}/history` | one asset's recent materializations |
 | GET | `/api/assets/{name}/metadata/{key}` | one numeric metadata key over recent builds |
 | GET | `/api/assets/{name}/checks` | one asset's recent check results |
+| GET | `/api/assets/{name}/partitions` | one partitioned asset's keys, newest first |
 | POST | `/api/assets/build` | build everything stale as one run |
+| POST | `/api/assets/{name}/backfill` | materialize a range of one asset's partitions |
+| GET | `/api/backfills` | recorded backfills, newest first |
+| GET | `/api/backfills/{id}` | one backfill and the runs its chunks launched |
+| POST | `/api/backfills/{id}/cancel` | stop one partway |
 | GET | `/api/sensors` | every sensor with cursor and last tick |
 | POST | `/api/sensors/state` | pause or resume a sensor |
 | GET | `/api/sensors/ticks` | sensor evaluation history |
@@ -50,6 +59,8 @@ failures. timestamps are rfc3339 strings in utc.
 | POST | `/api/schedules/state` | pause or resume a schedule |
 | GET | `/api/schedules/ticks` | fire history |
 | GET | `/api/schedules/upcoming` | projected future fires |
+| GET | `/api/late` | everything past its declared freshness policy |
+| GET | `/api/notifications` | the durable notification queue |
 | GET | `/api/whoami` | whether this deployment checks who is asking, and who you are |
 
 ## Who may call it

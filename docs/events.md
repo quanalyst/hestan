@@ -11,6 +11,8 @@ stream at all. you could ask a run what it did. you could not ask the
 deployment.
 
 now every subsystem writes into one log, and each event says what it is about.
+`hestan events --follow` is that log in a terminal, and the Activity view is
+the same one in the ui.
 
 ## The shape of an event
 

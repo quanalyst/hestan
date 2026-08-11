@@ -229,8 +229,8 @@ partitions get built.
 with nothing named, a build targets the keys that are missing or stale, newest
 first, capped by `Partitions::build_limit` (default 31) — so an unbounded daily
 range cannot start a thousand instances by accident. `Hestan::build_asset` and
-`POST /api/assets/{name}/build` both work this way, which means the "a build
-always rebuilds its target" rule of unpartitioned assets reads slightly
+`POST /api/assets/{name}/build` both work this way, which means
+`build_asset`'s "a build always rebuilds its target" rule reads slightly
 differently here: a partitioned asset with nothing stale has no keys to target
 and builds nothing. name keys outright to rebuild regardless:
 
@@ -323,8 +323,9 @@ morning's catch-up reads as a single coherent run in the ui.
 
 `Hestan::build_asset(name)` is the headless form, like `run_once`: it always
 materializes the target itself (plus stale ancestors), so check staleness
-first if you only want conditional builds. that is what the http endpoint
-does.
+first if you only want conditional builds. **the http endpoint and
+`hestan build <asset>` do not** — both go through the same conditional path
+and answer `up_to_date` on a target that is already fresh.
 
 memoization is a property of the *plan*, not of the run: retrying an assets
 run (`POST /api/runs/{id}/retry`, or re-run in the ui) relaunches the whole
@@ -343,8 +344,9 @@ serialized. while any run of the `assets` job is active, the incremental
 build endpoints answer 409 (`asset build already running`) and the probe
 auto-build path skips launching, leaving the next tick to self-heal (below).
 
-the gate covers exactly those two paths. anything that reaches the executor
-by the ordinary run path launches regardless: a manual
+the gate covers four paths: the two build endpoints, the probe auto-build,
+and each chunk a [backfill](#backfills) launches. anything that reaches the
+executor by the ordinary run path launches regardless: a manual
 `POST /api/jobs/assets/runs`, a retry of an earlier assets run, and
 `build_asset` in a headless process. those are the documented escape
 hatches, and they cost what they cost — concurrent rebuilds can interleave,
@@ -404,12 +406,12 @@ path skips the write otherwise), so a source's history is already nothing but
 changes. derived assets append on every build, and a run of identical
 fingerprints is the record of work that found nothing new.
 
-history grows without bound, so it is capped rather than left to. at startup
-every asset is trimmed to its newest 200 entries; `Hestan::asset_history(n)`
-sets the number. the newest entry is never trimmed whatever `n` says — it is
-current state, and losing it would read as an asset that has never been
-built. unlike a [retention policy](storage.md#retention) this happens whether
-you ask or not.
+history grows without bound, so it is capped rather than left to grow. at
+startup every asset is trimmed to its newest 200 entries;
+`Hestan::asset_history(n)` sets the number. the newest entry is never trimmed
+whatever `n` says — it is current state, and losing it would read as an asset
+that has never been built. unlike a [retention policy](storage.md#retention)
+this happens whether you ask or not.
 
 that cap is the only thing that ever removes a materialization. run retention
 still does not: an asset keeps its latest value and fingerprint long after
@@ -482,8 +484,11 @@ plan rather than a separate pass, and it means a build costs nothing for the
 parts it skipped — which is the entire point of memoized builds.
 
 the consequence to know: a check that was added, or fixed, after an asset last
-built does not run until that asset builds again. `POST /api/assets/{name}/build`
-always rebuilds its target, so that is the way to force one.
+built does not run until that asset builds again — and the build endpoint will
+not do it, since it answers `up_to_date` on an asset nothing made stale. what
+forces one is `Hestan::build_asset(name)`, which always materializes its
+target; naming the keys outright on a partitioned asset, which skips the
+staleness gate; or `POST /api/jobs/assets/runs`, which rebuilds everything.
 
 ### Results
 

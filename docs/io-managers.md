@@ -1,8 +1,8 @@
 # IO managers
 
-op outputs are json in sqlite. that is right for `{"loaded": 4210}` and wrong
-for a dataframe, and the run log is the worst place to find out which one you
-have. an *io manager* makes persistence pluggable: the value goes wherever you
+op outputs are json in the run log, whichever backend it is on. that is right
+for `{"loaded": 4210}` and wrong for a dataframe, and the run log is the worst
+place to find out which one you have. an *io manager* makes persistence pluggable: the value goes wherever you
 say, and `op_runs.output` keeps a handle to it.
 
 ```rust

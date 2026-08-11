@@ -5779,6 +5779,71 @@ mod tests {
         assert_eq!(declared_routes().len(), 46);
     }
 
+    /// every `| METHOD | \`/api/path\` |` row of the table at the top of
+    /// `docs/http-api.md`, which is that page's index of the api.
+    fn documented_routes() -> Vec<(String, String)> {
+        include_str!("../docs/http-api.md")
+            .lines()
+            .filter_map(|line| {
+                let mut cells = line.strip_prefix("| ")?.split(" | ");
+                let method = cells.next()?;
+                let path = cells.next()?.trim().strip_prefix('`')?.strip_suffix('`')?;
+                ["GET", "POST", "PUT", "DELETE"]
+                    .contains(&method)
+                    .then(|| (method.to_string(), path.to_string()))
+            })
+            .collect()
+    }
+
+    /// which methods `router` serves a path under, read out of the same
+    /// declaration [`declared_routes`] reads.
+    fn declared_methods() -> Vec<(String, String)> {
+        let declaration = format!(".{}(", "route");
+        include_str!("server.rs")
+            .split(&declaration)
+            .skip(1)
+            .filter_map(|rest| {
+                let quoted = rest.trim_start().strip_prefix('"')?;
+                let (path, after) = quoted.split_once('"')?;
+                // one route's handlers run to the next call chained onto the
+                // router, which is what bounds this whether rustfmt kept the
+                // declaration on one line or wrapped it over four
+                let decl = after.split("\n        .").next()?;
+                Some(
+                    ["get", "post", "put", "delete"]
+                        .into_iter()
+                        .filter(|m| decl.contains(&format!("{m}(")))
+                        .map(|m| (m.to_uppercase(), path.to_string()))
+                        .collect::<Vec<_>>(),
+                )
+            })
+            .flatten()
+            .collect()
+    }
+
+    // the page and the router, against each other. a documented endpoint that
+    // no longer exists sends a reader somewhere that 404s, and one the router
+    // serves but the page never mentions is an api nobody can find — both are
+    // the same defect, and neither shows up in any other test
+    #[test]
+    fn the_http_api_page_documents_exactly_what_the_router_serves() {
+        let (declared, documented) = (declared_methods(), documented_routes());
+        let missing: Vec<&(String, String)> = declared
+            .iter()
+            .filter(|route| !documented.contains(route))
+            .collect();
+        assert!(missing.is_empty(), "served but undocumented: {missing:?}");
+        let stale: Vec<&(String, String)> = documented
+            .iter()
+            .filter(|route| !declared.contains(route))
+            .collect();
+        assert!(stale.is_empty(), "documented but not served: {stale:?}");
+        // and neither list is empty, so a scraper that stopped finding
+        // anything cannot pass by comparing nothing with nothing
+        assert_eq!(declared.len(), 47);
+        assert_eq!(documented.len(), 47);
+    }
+
     // a role that may not is 403 and says what it would take; nobody at all is
     // 401 and says nothing about the credential it did not accept
     #[tokio::test]

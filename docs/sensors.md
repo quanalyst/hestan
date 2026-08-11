@@ -235,7 +235,8 @@ one of those has to break the cycle.
 ## Pausing, ticks, sync
 
 `POST /api/sensors/state {"name", "paused"}` flips the flag (404 for an
-unknown name). a paused sensor is not evaluated: no tick, no cursor
+unknown name), and so do `hestan pause sensor <name>` and
+`hestan unpause sensor <name>` ([the command line](cli.md)). a paused sensor is not evaluated: no tick, no cursor
 movement. its schedule keeps ticking over regardless, so resuming picks up
 at the next interval rather than with a burst of catch-ups.
 
@@ -254,8 +255,9 @@ those four are what answer "is this sensor healthy" without reading the log —
 a sensor whose duration is climbing is a sensor about to hit its timeout, and
 `launched: 0, skipped: 3` is a different fact from launching nothing. the
 sensors table shows them all against each sensor's last tick.
-`GET /api/sensors/ticks?sensor=&limit=` reads it newest-first; at boot the
-table is pruned to the newest 5000, the same policy as schedule ticks.
+`GET /api/sensors/ticks?sensor=&limit=` reads it newest-first; the
+[retention sweep](storage.md#retention) prunes the table to the newest 5000 on
+every pass, the same policy as schedule ticks.
 
 at startup the sensors table is synced to the code like schedules are: new
 names inserted, undeclared rows dropped, surviving rows keeping their paused

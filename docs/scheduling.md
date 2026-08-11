@@ -170,7 +170,9 @@ json, and the ui shows it next to the trigger.
 `serve` runs one in-process scheduler task. each iteration reconciles every
 schedule's cursor (above), drains anything waiting, computes every schedule's
 next fire, sleeps until the earliest (capped at 60s so clock drift
-self-corrects within a minute), then fires everything that has come due.
+self-corrects within a minute, and at 2s while a
+[deferred](#overlap-policy) fire is waiting to drain), then fires everything
+that has come due.
 pause state is read from the database at fire time, not at startup. two
 schedules on the same job that share a fire instant launch one run, not two —
 the runner-up records a `skipped` tick, so the dedupe is visible in the fire
@@ -178,14 +180,17 @@ history rather than silent. each fire is recorded as a tick (below) whether
 the launch succeeded or not.
 
 expressions with no future fires left (a specific date now in the past)
-are dropped with a warning; once every schedule is exhausted the scheduler
-task exits. that's per-process state: an exhausted schedule comes back on
-restart if it has fires again.
+are dropped with a warning; once every schedule is exhausted **and nothing is
+still held**, the scheduler task exits — a held fire keeps it alive so that
+fire can still drain. that's per-process state: an exhausted schedule comes
+back on restart if it has fires again.
 
 ## Pause and resume
 
 each `(job, expression)` pair has a persisted paused flag, toggled from the ui
-(job page, or the command palette) or via
+(job page, or the command palette), from a terminal with
+`hestan pause schedule <job> [--expr CRON]` and `hestan unpause schedule`
+([the command line](cli.md)), or via
 `POST /api/schedules/state {"job": ..., "expr": ..., "paused": true}`. a
 paused schedule is skipped at fire time and records **no tick**. the flag
 lives in the database and survives restarts; on startup hestan syncs the
@@ -261,8 +266,9 @@ the same thing unless the declaration changed across the restart.
 
 pausing a schedule drops its waiting fire (recorded as a `skipped` tick), and
 so does deleting the schedule from the code — nothing else knows what params it
-should have launched with. the tick log is pruned to the newest 5000 rows at
-startup, which matters under skip (a schedule firing into a long run writes one
+should have launched with. the tick log is pruned to the newest 5000 rows by
+the [retention sweep](storage.md#retention) — at startup and every hour after
+it — which matters under skip (a schedule firing into a long run writes one
 skipped tick per fire) and is also the one way a held fire can be forgotten: a
 `deferred` tick pruned away is a fire nobody is waiting for any more.
 

@@ -195,9 +195,10 @@ const DELIVER_BATCH: u32 = 50;
 
 /// how many attempts a notification gets before hestan stops trying.
 ///
-/// with the growth below that is somewhere over two hours of retrying, which
-/// covers a restart of whatever is on the other end and does not cover a url
-/// that was wrong when it was typed. past it the row stays, failed, with the
+/// eight attempts is seven gaps, so with the growth below that is about
+/// twenty minutes of retrying at the outside and nearer ten once the jitter
+/// is counted — which covers a restart of whatever is on the other end and
+/// does not cover a url that was wrong when it was typed. past it the row stays, failed, with the
 /// error that stopped it: giving up **loudly** is the whole difference from
 /// the best-effort dispatch this exists beside.
 const MAX_ATTEMPTS: u32 = 8;
@@ -205,6 +206,10 @@ const MAX_ATTEMPTS: u32 = 8;
 /// the first retry gap, doubled per attempt up to [`RETRY_MAX`] with full
 /// jitter — the same pacing an op's retries use, for the same reason: a
 /// hundred notifications for the same outage must not retry in lockstep.
+///
+/// the ceiling is the shared one rather than a reachable limit here:
+/// [`MAX_ATTEMPTS`] runs out at a 640-second gap, so nothing this loop
+/// schedules ever meets it.
 const RETRY_BASE: Duration = Duration::from_secs(10);
 const RETRY_MAX: Duration = Duration::from_secs(30 * 60);
 

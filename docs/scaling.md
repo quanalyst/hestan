@@ -6,18 +6,18 @@ live. a container and a pod are packaging around that one mechanism, not new
 execution paths — which is why there is no kubernetes executor here, and no
 docker executor, and no celery integration.
 
-Read [what this does not do](#what-this-does-not-do) first if you are sizing
+read [what this does not do](#what-this-does-not-do) first if you are sizing
 hestan for a deployment. the limits are real and stated rather than papered
 over.
 
 ## The queue
 
-A launch is a request, not a start. `launch()` writes a `queued` run and
+a launch is a request, not a start. `launch()` writes a `queued` run and
 returns its id exactly as it always did; a **dispatcher** decides when it
-starts. With no limits declared that is the same instant and nothing about
-hestan looks different. With limits declared, the run waits.
+starts. with no limits declared that is the same instant and nothing about
+hestan looks different. with limits declared, the run waits.
 
-The queue is the `runs` table — a queued run is one with `claimed_by IS NULL`
+the queue is the `runs` table — a queued run is one with `claimed_by IS NULL`
 — so it survives a restart, and anything that can reach the database can pull
 from it.
 
@@ -27,12 +27,14 @@ Hestan::new()
     .max_concurrent_runs(8)          // across the whole deployment
     .tag_limit("env", "prod", 2)     // whatever the jobs are
     .priority(0)                     // the default position in the queue
+    // a reachable address needs an authenticator, or `serve` refuses it
+    .auth(Auth::bearer(std::env::var("HESTAN_TOKEN")?))
     .serve(([0, 0, 0, 0], 4000))
     .await
 ```
 
 `GET /api/queue` reports the depth, each waiting run's position, and what is
-holding it back. The runs page shows the same thing with a bump button.
+holding it back. the runs page shows the same thing with a bump button.
 
 ### Limits
 
@@ -43,94 +45,94 @@ holding it back. The runs page shows the same thing with a bump button.
 | `Hestan::tag_limit(k, v, n)` | every run carrying that [tag](launching.md#run-tags) | stored, shared |
 | `Hestan::slots(n)` | **this process** | in memory, per process |
 
-Every one of them counts runs that are **executing** — claimed and not
-finished. A run sitting on the queue costs nothing and counts as nothing.
+every one of them counts runs that are **executing** — claimed and not
+finished. a run sitting on the queue costs nothing and counts as nothing.
 
-`slots` is the odd one out and the one people forget. The others say how much
+`slots` is the odd one out and the one people forget. the others say how much
 work the deployment does at once; `slots` says how much of it lands in this
-container. Without it the first worker to look at the queue claims all of it
+container. without it the first worker to look at the queue claims all of it
 and the worker beside it has nothing to do — a worker should take what it can
 run, not what it can see.
 
-Limits are read at the top of every dispatch pass, so raising one drains the
+limits are read at the top of every dispatch pass, so raising one drains the
 queue it was holding back without a restart.
 
 ### Limits are not overlap policies
 
-They answer different questions and it is worth being clear which you want.
+they answer different questions and it is worth being clear which you want.
 
-[`Overlap`](scheduling.md#overlap-policies) decides whether a scheduled fire
+[`Overlap`](scheduling.md#overlap-policy) decides whether a scheduled fire
 should **exist at all** while its job still has a run outstanding — a policy
-about the work. A concurrency limit decides how many runs **execute at once**
+about the work. a concurrency limit decides how many runs **execute at once**
 — a policy about the machine.
 
-Concretely: a queued run counts as outstanding for overlap, so a job with
+concretely: a queued run counts as outstanding for overlap, so a job with
 `Overlap::Skip` whose runs are being held back by a limit does not pile up a
-fire per minute behind them. That is deliberate. `Overlap::Skip` exists to
+fire per minute behind them. that is deliberate. `Overlap::Skip` exists to
 prevent exactly that pile-up, and a limit is not a reason to start ignoring
-it. The same reasoning gates backfill chunking and the asset build endpoints:
+it. the same reasoning gates backfill chunking and the asset build endpoints:
 "is there a run of this outstanding" is the question, and a queued run is
 outstanding.
 
 ### Priority
 
 `Hestan::priority(n)` sets the default and `{"priority": n}` overrides it per
-launch. Higher goes first, ties broken by creation time. Negatives are legal
+launch. higher goes first, ties broken by creation time. negatives are legal
 and are how a deployment says "these are the background ones".
 
 **Priority is a preference, not an order.** The dispatcher skips a run a limit
-would block and starts the next one that fits. So a high-priority `env:prod`
+would block and starts the next one that fits. so a high-priority `env:prod`
 run waiting on its tag limit does not hold up an unrelated low-priority run
-behind it. The alternative is head-of-line blocking, where one blocked run
+behind it. the alternative is head-of-line blocking, where one blocked run
 stops a queue that has capacity sitting idle, and that is the worse trade —
 but it does mean the start order is not the priority order, and you should not
 build anything on the assumption that it is.
 
 ## Claims and leases
 
-A queued run must be startable by exactly one claimer, and a claimer that dies
+a queued run must be startable by exactly one claimer, and a claimer that dies
 must not strand it forever.
 
-Claiming is a compare-and-set:
+claiming is a compare-and-set:
 
 ```sql
 UPDATE runs SET claimed_by = ?, claimed_at = ?, lease_until = ?
 WHERE id = ? AND claimed_by IS NULL AND status = 'queued'
 ```
 
-One winner by construction, whoever else is looking at the same row. That
+one winner by construction, whoever else is looking at the same row. that
 holds on both backends and is what makes a race here a thing that resolves
 rather than a thing to avoid.
 
-How the two get there differs, and it is the reason to run this on
+how the two get there differs, and it is the reason to run this on
 [postgres](storage.md#postgres). sqlite serializes writers for us: an
 immediate transaction is the only one there is, which is a complete guarantee
-on one host and none at all across several. Postgres reserves the one run a
+on one host and none at all across several. postgres reserves the one run a
 dispatcher decided on with `SELECT ... FOR UPDATE SKIP LOCKED`, so several
 dispatchers walk the same queue at the same moment and come away with
 different runs, none of them waiting on any other.
 
-Counting capacity and spending it have to be one decision either way. One
+counting capacity and spending it have to be one decision either way. one
 transaction is enough for that on sqlite; on postgres it is not, because two
 transactions each read the same last free slot from their own snapshot and
-both fill it. So **when a limit is in force — and only then** — postgres
-claimers take turns on an advisory lock for the length of one claim. With no
+both fill it. so **when a limit is in force — and only then** — postgres
+claimers take turns on an advisory lock for the length of one claim. with no
 limits declared, which is the default, dispatchers never meet.
 
 `claimed_by` is the claimer's **instance id**: eight hex digits, made once per
 process, reported by `GET /api/health` along with the runs that process is
-currently holding. Three workers and one run is a question you can answer.
+currently holding. three workers and one run is a question you can answer.
 
-A claimer renews `lease_until` every 15 seconds and the lease is good for 60,
+a claimer renews `lease_until` every 15 seconds and the lease is good for 60,
 so four beats have to be missed before anything is taken — a slow store is not
-a dead process. A run whose lease has expired is reclaimed by whichever
+a dead process. a run whose lease has expired is reclaimed by whichever
 process notices: its ops are marked with `claimer went away`, naming the
 claimer, and then
 
 - **`Reclaim::Fail`** (the default) fails the run and fires the failure hooks.
   A run that got halfway may have done half its side effects; doing them again
   quietly is worse than a stall somebody has to look at.
-- **`Reclaim::Requeue`** puts it back on the queue for another claimer. Right
+- **`Reclaim::Requeue`** puts it back on the queue for another claimer. right
   when the work is idempotent and available beats exact.
 
 ```rust
@@ -139,14 +141,14 @@ Hestan::new().reclaim(Reclaim::Requeue)
 
 ### Boot recovery respects a live claim
 
-The startup sweep used to mark every `queued` or `running` run failed, on the
+the startup sweep used to mark every `queued` or `running` run failed, on the
 assumption that the process starting up was the only one there had ever been.
-With a claimable queue that assumption is destructive: a second process
+with a claimable queue that assumption is destructive: a second process
 starting would fail a live one's in-flight runs, mid-run.
 
-It is now a mechanism rather than an assumption. A run is swept only if its
+it is now a mechanism rather than an assumption. a run is swept only if its
 lease has expired, or if it is `running` with no claim at all (which can only
-be a row written before the queue existed). A **queued run nobody has claimed
+be a row written before the queue existed). a **queued run nobody has claimed
 is left where it is** — that row is not a casualty, it is the queue.
 
 ## Roles
@@ -169,29 +171,29 @@ them independently is two of every scheduled run — there is no lock that would
 stop it. **Any number of processes may be `Worker`**; that is the entire point
 of a claimable queue.
 
-The [retention sweep](storage.md#retention) is on the same side of that line
+the [retention sweep](storage.md#retention) is on the same side of that line
 and for a sharper reason: a worker owns none of the history, and one pruning
-the scheduler's runs is data loss nothing reports. So is
+the scheduler's runs is data loss nothing reports. so is
 [notification delivery](notifications.md#durable-delivery) — two processes
 delivering would send every alert twice — which means the hooks want
 registering on the process that decides.
 
 `Hestan::work(addr)` is `role(Role::Worker)` with the address made optional,
-because a worker may want no socket at all. Give it one and you get the same
+because a worker may want no socket at all. give it one and you get the same
 ui, which is worth having for `/api/health`.
 
-Every role runs the lease loop, including a scheduler holding nothing:
+every role runs the lease loop, including a scheduler holding nothing:
 noticing a dead claimer cannot be the dead claimer's job.
 
-Every process must build the **same registry**. A worker executes runs a
+every process must build the **same registry**. a worker executes runs a
 scheduler wrote, and the two have to agree about what a job is; a run whose
 job this process does not define is left on the queue and reported as blocked
-rather than claimed and failed. In practice this means one binary started with
+rather than claimed and failed. in practice this means one binary started with
 different roles, which is what the compose file below does.
 
 ### A queue worker is not an op subprocess
 
-Two mechanisms in hestan spawn processes and they are not the same thing.
+two mechanisms in hestan spawn processes and they are not the same thing.
 
 | | [op subprocess](isolation.md) | queue worker |
 | --- | --- | --- |
@@ -200,7 +202,7 @@ Two mechanisms in hestan spawn processes and they are not the same thing.
 | claims | nothing | whole runs, off the queue |
 | purpose | containment: a segfault costs one op | throughput: more hands |
 
-A queue worker spawns op subprocesses like any other hestan process does. The
+a queue worker spawns op subprocesses like any other hestan process does. the
 environment variables that mark an op subprocess are `HESTAN_ISOLATED_RUN` and
 `HESTAN_ISOLATED_OP`, and every entry point checks for them first.
 
@@ -214,24 +216,24 @@ docker compose up --build
 open http://localhost:4000
 ```
 
-The ui asks for a token the first time, because the compose file binds
+the ui asks for a token the first time, because the compose file binds
 `0.0.0.0` and publishes the port: `serve` refuses a reachable address with
 nothing checking who is asking, so the file sets `HESTAN_TOKEN` and the demo
 picks it up. it is `demo-token-change-me`, which is what a token in a compose
 file deserves to be called — [auth.md](auth.md) has where a real one comes
 from.
 
-Watch the queued section on the runs page fill and drain, and `claimed_by` on
-a run say which worker took it. Both workers have `HESTAN_SLOTS=2` and the
+watch the queued section on the runs page fill and drain, and `claimed_by` on
+a run say which worker took it. both workers have `HESTAN_SLOTS=2` and the
 deployment has `HESTAN_MAX_CONCURRENT_RUNS=4`.
 
-It is one image. The scheduler and the workers differ only by `HESTAN_ROLE`,
+it is one image. the scheduler and the workers differ only by `HESTAN_ROLE`,
 because they must build the same registry.
 
 ## Several hosts
 
-Everything above works on one host with the default sqlite file: several
-containers, one volume, and the compose example just above. Past one host you
+everything above works on one host with the default sqlite file: several
+containers, one volume, and the compose example just above. past one host you
 need
 a store every host can reach, and that is what the
 [postgres backend](storage.md#postgres) is:
@@ -240,24 +242,24 @@ a store every host can reach, and that is what the
 Hestan::new().db("postgres://user:pw@db.internal/hestan").work(None).await
 ```
 
-built with `--features postgres`. Nothing else about a deployment changes. The
+built with `--features postgres`. nothing else about a deployment changes. the
 queue, the claims, the leases and the roles were always backend-agnostic and
 they still are — one scheduler, any number of workers, the same registry in
 every process.
 
 **What is proven and what merely follows.** hestan's suite runs the queue
 cases twice: worker processes racing one sqlite file, and worker processes
-racing one postgres schema, asserting in both that no run executed twice. Both
-of those are several *processes* against one database. Nobody has run hestan's
+racing one postgres schema, asserting in both that no run executed twice. both
+of those are several *processes* against one database. nobody has run hestan's
 workers on several *hosts*, because the machine the suite runs on is one
 machine — and a process on another host differs from a process on this one
-only in which socket it opens. It follows, and the difference between "it
+only in which socket it opens. it follows, and the difference between "it
 follows" and "it was run" is the difference this paragraph exists to keep.
 
-Two things do still hold whatever the backend. **Exactly one process may be
+two things do still hold whatever the backend. **Exactly one process may be
 `All` or `Scheduler`** — postgres does not change that, because two processes
 independently deciding to fire a schedule is two runs and there is no lock
-that would stop it. And **sqlite is still right** for one host: it needs no
+that would stop it. and **sqlite is still right** for one host: it needs no
 server, and reaching for postgres to run one container is a database to
 operate for nothing.
 
@@ -268,7 +270,7 @@ not going to imply otherwise.** hestan ships one mechanism for moving work
 off-box rather than several, and a pod running
 `HESTAN_ROLE=worker` against a shared postgres is what "the kubernetes
 executor" would have been — that is the mechanism, and there is no operator, no
-pod template and no autoscaler around it. Celery has no Rust analogue worth
+pod template and no autoscaler around it. celery has no rust analogue worth
 porting; the queue and the workers above are the equivalent capability, and
 calling them that is more useful than an integration page for something that is
 not there.

@@ -65,7 +65,7 @@ schedule ("it was due at 09:00 and nothing has succeeded since"); a policy
 anchors on age ("nothing has succeeded for 24 hours"), which is meaningful for
 an asset built by a sensor, a probe or a hand, with no cron anywhere.
 
-freshness is also not [staleness](assets.md#staleness). stale means a dep
+freshness is also not [staleness](assets.md#provable-staleness). stale means a dep
 moved; late means time passed. an asset can be fresh and stale (a dep changed
 a minute ago), or late and not stale (nothing upstream moved, and nothing
 rebuilt it either).
