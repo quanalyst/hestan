@@ -1499,7 +1499,8 @@ async fn paused(reach: Reach, what: What, paused: bool, out: &Out) -> Result<(),
         }
         (What::Sensor { name }, reach) => {
             let store = reach.store()?;
-            if !store.set_sensor_paused(&name, paused)? {
+            // no actor: see the schedule arm below
+            if !store.set_sensor_paused(&name, paused, None)? {
                 return Err(Fail::usage(format!("unknown sensor: {name}")));
             }
             out.said(&json!({ "ok": true }), &format!("sensor {name} {word}"));
@@ -1530,8 +1531,12 @@ async fn paused(reach: Reach, what: What, paused: bool, out: &Out) -> Result<(),
                     Reach::Server(api) => {
                         api.post("/api/schedules/state", body).await?;
                     }
+                    // no actor: a command line against a database has nobody
+                    // to name. whoever ran it is a fact about a shell, not an
+                    // identity anything checked — and a name nothing checked
+                    // is worse in an audit trail than no name at all
                     _ => {
-                        stored(&reach)?.set_schedule_paused(&job, &s(row, "expr"), paused)?;
+                        stored(&reach)?.set_schedule_paused(&job, &s(row, "expr"), paused, None)?;
                     }
                 }
             }
@@ -1565,7 +1570,8 @@ fn cancel(store: &Store, id: &str, out: &Out) -> Result<(), Fail> {
     let run = run_row(store, id)?;
     match run.status {
         RunStatus::Queued if run.claimed_by.is_none() => {
-            if !store.cancel_queued(id)? {
+            // no actor, for the reason `pause` gives above
+            if !store.cancel_queued(id, None)? {
                 return Err(Fail::new(
                     Exit::Failed,
                     format!("run {id} was claimed while this was taking it off the queue"),
@@ -3460,10 +3466,10 @@ mod tests {
 
         assert!(
             store
-                .set_schedule_paused("nightly", "0 2 * * *", true)
+                .set_schedule_paused("nightly", "0 2 * * *", true, None)
                 .unwrap()
         );
-        assert!(store.set_sensor_paused("inbox", true).unwrap());
+        assert!(store.set_sensor_paused("inbox", true, None).unwrap());
         let schedules = check_schedules(&store).unwrap();
         assert_eq!(levels(&schedules), [Level::Ok, Level::Note]);
         assert!(schedules[1].says.contains("nightly"));

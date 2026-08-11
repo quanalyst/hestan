@@ -228,6 +228,7 @@ mod tests {
                     claimed_by: None,
                     claimed_at: None,
                     lease_until: None,
+                    actor: None,
                 },
                 &["noop".to_string()],
             )

@@ -53,9 +53,11 @@ these are fixed and each one means one thing:
 | 5 | the store or the server could not be reached |
 | 6 | this mode cannot serve this command, and the message says why |
 | 7 | `doctor` found something actionable |
+| 8 | the server refused this identity: no token, one it does not accept, or a role that may not |
 
-5 and 1 are deliberately different answers: "nothing was reachable" is worth a
-retry and "the work went wrong" is worth a person. 3 is not a failure — a run
+5, 8 and 1 are deliberately different answers: "nothing was reachable" is worth
+a retry, "it would not have me" is worth a person with the secret, and "the
+work went wrong" is worth a person with the pipeline. 3 is not a failure — a run
 somebody stopped is not a run that broke — so a cron line that pages on 1 and
 2 will not page when you cancel something by hand.
 
@@ -122,6 +124,36 @@ than filling it in: `--db assets` has no staleness column because staleness is
 a claim about a registry, and `--db queue` has no "waiting for" column because
 the blame belongs to whoever owns the limits. an absent key is a mode saying it
 does not know; there are no invented nulls.
+
+### Reaching an authenticated one
+
+a deployment that [checks who is asking](auth.md) wants a token, and there are
+two ways to hand it one:
+
+```
+$ hestan --server https://hestan.internal --token "$(cat /run/secrets/hestan)" runs
+$ HESTAN_TOKEN=… hestan --server https://hestan.internal runs
+```
+
+**prefer the variable.** an argument is visible in `ps` to every account on the
+machine for as long as the process runs; a variable is not. the flag wins where
+both are set, so a shell with one exported can still be pointed somewhere else.
+hestan reads the variable itself rather than letting the argument parser do it,
+because a parser that knows about an environment variable prints its **value**
+in `--help`.
+
+nothing to present, or a token it does not accept, is exit 8 and a line saying
+what to do:
+
+```
+$ hestan --server https://hestan.internal runs
+error: authentication required: present your credentials — https://hestan.internal
+is authenticated: pass --token, or set HESTAN_TOKEN, which keeps it out of ps
+```
+
+a role that may not is exit 8 as well, with the server's own sentence about
+what it would have taken. `--db` and the embedded mode take no token: neither
+of them is talking to a server.
 
 ### The standalone binary
 
@@ -254,9 +286,12 @@ be, which is what makes the other two believable.
 `--json` gives `{"ok": bool, "findings": [...], "unchecked": [...]}` with a
 `fix` on everything actionable.
 
-doctor is not available over `--server`: it reads the store, the registry and
-the disk under them, and an http api exposes none of the three. point `--db` at
-the database, or run it in the deployment's own binary.
+over `--server` doctor answers the one question http can, and says plainly that
+it saw nothing else: whether the deployment [checks who is
+asking](auth.md), and — with a token — who it makes you. the store, the
+schedules, the sensors, the leases, the queue, the retention policy and the
+disk are listed as not checked, because an api exposes none of them. point
+`--db` at the database, or run it in the deployment's own binary, for the rest.
 
 ## explain
 
@@ -350,6 +385,7 @@ case $code in
   3) exit 0 ;;                            # somebody canceled it on purpose
   4) page "nightly_rollup is still going an hour in: $run" ;;
   5) exit 75 ;;                           # EX_TEMPFAIL: unreachable, try later
+  8) page "nightly_rollup: the deployment refused this token" ;;
   *) page "nightly_rollup: $(orders --json show "$run" | jq -r .run.error)" ;;
 esac
 exit $code
@@ -378,9 +414,10 @@ and against a deployment that is already running somewhere:
 
 ## What it does not do
 
-- **`--server` cannot `doctor` or `explain`.** both read things an api does not
-  expose — the registry, the role, the disk. the message says so and points at
-  the two modes that can.
+- **`--server` cannot `explain`, and can only half `doctor`.** both read things
+  an api does not expose — the registry, the role, the disk. `explain` says so
+  and points at the two modes that can; `doctor` answers what it can reach and
+  lists the rest as not checked.
 - **`--db` cannot launch, `explain`, or list jobs** in a binary your jobs are
   not compiled into. a run log records what ran; it holds no definitions.
 - **`cancel` cannot stop a run executing in another process.** see above: there

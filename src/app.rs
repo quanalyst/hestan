@@ -1423,6 +1423,7 @@ mod tests {
             claimed_by: None,
             claimed_at: None,
             lease_until: None,
+            actor: None,
         };
         store
             .create_run(&planted("mine"), &["quick".to_string()])
@@ -1592,7 +1593,7 @@ mod tests {
         let store = Store::open(&path).unwrap();
         assert!(
             store
-                .set_schedule_paused("report", "0 9 * * *", true)
+                .set_schedule_paused("report", "0 9 * * *", true, None)
                 .unwrap()
         );
         drop(store);

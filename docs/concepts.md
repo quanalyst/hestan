@@ -59,6 +59,13 @@ for one still queued or running, since a fresh copy of a live run would only
 double it. manual launches stay ungated: that is the documented escape hatch
 when an overlapping run is really wanted.
 
+an *identity* is who asked, where a person did and something
+[checked](auth.md): a name and a role — viewer, operator or admin. it lands on
+the run as `actor` and on every event the request caused, so `manual` becomes
+"manual, by ada". a deployment with no authenticator records no actor rather
+than a fabricated one, which is exactly what it knows: a person asked, and
+nothing was checking who.
+
 an *asset* is an op with identity: a persisted latest value, a fingerprint,
 and explicit lineage on other assets, which makes staleness provable and
 builds incremental — stale ancestors plus the target, fresh values seeded.

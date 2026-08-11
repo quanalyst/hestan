@@ -188,6 +188,10 @@ pub enum EventKind {
     BackfillChunk,
     BackfillFinished,
     BackfillCanceled,
+    /// a schedule was paused or unpaused; `paused` in the payload says which.
+    SchedulePaused,
+    /// a sensor was paused or unpaused, the same way.
+    SensorPaused,
     NotificationDelivered,
     /// a notification hestan has stopped trying to deliver.
     NotificationFailed,
@@ -277,6 +281,8 @@ open_enum!(EventKind {
     BackfillChunk => "backfill_chunk",
     BackfillFinished => "backfill_finished",
     BackfillCanceled => "backfill_canceled",
+    SchedulePaused => "schedule_paused",
+    SensorPaused => "sensor_paused",
     NotificationDelivered => "notification_delivered",
     NotificationFailed => "notification_failed",
     RetentionPruned => "retention_pruned",
@@ -499,6 +505,16 @@ pub struct Run {
     /// how long the claim is good for. the claimer renews it on a heartbeat;
     /// past it, the claim is reclaimable by anyone. `None` once the run is over.
     pub lease_until: Option<DateTime<Utc>>,
+    /// who asked for this run, where a person did: the name of the
+    /// [`Identity`](crate::Identity) the api recognized, and never a
+    /// credential.
+    ///
+    /// `None` on everything a schedule, a sensor, a backfill or a freshness
+    /// policy launched on its own — and on every launch through an
+    /// unauthenticated deployment, which has nobody to name. an empty name is
+    /// not "system": `Trigger::Manual` with no actor means a person asked and
+    /// nothing was checking who.
+    pub actor: Option<String>,
 }
 
 /// what happens to a run whose claimer stopped renewing its lease.
@@ -656,6 +672,10 @@ pub struct Event {
     /// the payload, documented per kind in `docs/events.md`.
     pub data: Option<Value>,
     pub ts: DateTime<Utc>,
+    /// who caused this, where a person did — the same name the run row
+    /// carries, and `None` everywhere a loop did it on its own. see
+    /// [`Run::actor`].
+    pub actor: Option<String>,
 }
 
 impl Event {

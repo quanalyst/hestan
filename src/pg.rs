@@ -73,7 +73,8 @@ CREATE TABLE runs (
     claimed_by TEXT COLLATE "C",
     claimed_at TEXT COLLATE "C",
     lease_until TEXT COLLATE "C",
-    plan TEXT COLLATE "C"
+    plan TEXT COLLATE "C",
+    actor TEXT COLLATE "C"
 );
 CREATE INDEX runs_job_created ON runs(job, created_at DESC);
 CREATE INDEX runs_queue ON runs(status, claimed_by, priority DESC, created_at);
@@ -101,7 +102,8 @@ CREATE TABLE events (
     kind TEXT COLLATE "C" NOT NULL DEFAULT 'log',
     data TEXT COLLATE "C",
     subject_kind TEXT COLLATE "C" NOT NULL DEFAULT 'run',
-    subject TEXT COLLATE "C"
+    subject TEXT COLLATE "C",
+    actor TEXT COLLATE "C"
 );
 CREATE INDEX events_run ON events(run_id, seq);
 CREATE INDEX events_subject ON events(subject_kind, subject, seq DESC);
@@ -428,6 +430,14 @@ fn bound<'a>(args: &'a [Val<'a>]) -> Vec<&'a (dyn ToSql + Sync)> {
 /// row, and a column added with a constant default has been catalog-only since
 /// postgres 11. only the index reads the table, and it reads it once. sqlite
 /// has no `ALTER COLUMN` and rebuilds the whole thing.
+/// who did it, on the two tables that record something somebody asked for.
+/// two nullable columns: catalog-only on both backends, and null is what every
+/// row written before this says.
+const MIGRATE_V18: &str = r#"
+ALTER TABLE runs ADD COLUMN actor TEXT COLLATE "C";
+ALTER TABLE events ADD COLUMN actor TEXT COLLATE "C";
+"#;
+
 const MIGRATE_V17: &str = r#"
 ALTER TABLE events ALTER COLUMN run_id DROP NOT NULL;
 ALTER TABLE events ADD COLUMN subject_kind TEXT COLLATE "C" NOT NULL DEFAULT 'run';
@@ -466,6 +476,9 @@ fn migrate(client: &mut Client) -> Result<(), Error> {
             }
             if version < 17 {
                 tx.batch(MIGRATE_V17)?;
+            }
+            if version < 18 {
+                tx.batch(MIGRATE_V18)?;
             }
             if version != SCHEMA_VERSION {
                 tx.execute(

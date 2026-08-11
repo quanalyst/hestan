@@ -384,6 +384,9 @@ pub struct Runner {
     // woken whenever a run reaches a terminal status, which is what `run` waits
     // on instead of polling
     settled: Arc<Notify>,
+    // who this handle is acting for, where somebody is. set by `as_actor` and
+    // nothing else, so a runner that was never told is one that records nobody
+    actor: Option<Arc<str>>,
 }
 
 impl Runner {
@@ -434,6 +437,7 @@ impl Runner {
             slots: usize::MAX,
             dispatching: Arc::new(Mutex::new(())),
             settled: Arc::new(Notify::new()),
+            actor: None,
         }
     }
 
@@ -708,6 +712,31 @@ impl Runner {
     /// the limit declared for `name`, for reporting it back.
     pub fn pool_limit(&self, name: &str) -> Option<usize> {
         self.pools.get(name).map(|p| p.limit)
+    }
+
+    /// the same runner, launching and cancelling **as** somebody.
+    ///
+    /// what it changes is what gets written down: the run row's actor, the
+    /// events for what this handle does, and nothing else — a role was already
+    /// checked before anything got here, and this is the audit trail rather
+    /// than a second gate.
+    ///
+    /// `None` gives a handle that records nobody, which is what an
+    /// unauthenticated deployment and every internal loop use. an empty name
+    /// is not "system": a run nobody can be named for says so by having no
+    /// actor at all.
+    ///
+    /// cheap, like every other clone of a runner.
+    pub fn as_actor(&self, name: Option<&str>) -> Runner {
+        Runner {
+            actor: name.map(Arc::from),
+            ..self.clone()
+        }
+    }
+
+    /// who this handle acts for.
+    pub fn actor(&self) -> Option<&str> {
+        self.actor.as_deref()
     }
 
     /// put a run of `job` on the queue.
@@ -1255,7 +1284,7 @@ impl Runner {
         // and if the claim does, the sender below is there to signal
         if run.status == RunStatus::Queued
             && run.claimed_by.is_none()
-            && self.store.cancel_queued(run_id)?
+            && self.store.cancel_queued(run_id, self.actor())?
         {
             self.active.lock().unwrap().remove(run_id);
             self.settled.notify_waiters();
@@ -1263,6 +1292,11 @@ impl Runner {
         }
         match self.active.lock().unwrap().get(run_id) {
             Some(tx) => {
+                // the run's own terminal event is written by whatever is
+                // executing it, and that is not this call and has no idea who
+                // asked — so the asking is a line of its own, and it is the
+                // line with the name on it
+                note(self.store.cancel_requested(run_id, self.actor()));
                 let _ = tx.send(true);
                 Ok(CancelOutcome::Requested)
             }
@@ -1367,6 +1401,7 @@ impl Runner {
             claimed_by: None,
             claimed_at: None,
             lease_until: None,
+            actor: self.actor.as_deref().map(str::to_string),
         };
         // a mapped op is never a row of its own: its instances are the record,
         // and how many there are is not known until its dep has produced
@@ -3482,6 +3517,7 @@ mod tests {
             claimed_by: None,
             claimed_at: None,
             lease_until: None,
+            actor: None,
         };
         store.create_run(&run, &["work".to_string()]).unwrap();
     }

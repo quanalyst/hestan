@@ -1,7 +1,7 @@
 # one scheduler, two workers, one run log.
 #
 #     docker compose up --build
-#     open http://localhost:4000        # the scheduler's ui
+#     open http://localhost:4000        # the scheduler's ui, token below
 #
 # the scheduler fires the demo's schedules and enqueues runs; it executes
 # none of them. the two workers claim runs off the queue and run them. watch
@@ -21,6 +21,12 @@ services:
       HESTAN_ROLE: scheduler
       HESTAN_ADDR: 0.0.0.0:4000
       HESTAN_DB: /var/lib/hestan/hestan.db
+      # 0.0.0.0 plus a published port is reachable from your network, and
+      # `serve` refuses that with nothing checking who is asking. so: a token,
+      # which the ui asks for once and keeps for the tab. a real deployment
+      # reads this out of a secret rather than a compose file — see
+      # docs/auth.md, which also has the version where your own proxy decides
+      HESTAN_TOKEN: demo-token-change-me
       # how much this deployment runs at once, across both workers
       HESTAN_MAX_CONCURRENT_RUNS: "4"
     ports:
@@ -38,6 +44,7 @@ services:
       HESTAN_ROLE: worker
       HESTAN_ADDR: 0.0.0.0:4000
       HESTAN_DB: /var/lib/hestan/hestan.db
+      HESTAN_TOKEN: demo-token-change-me
       # how much of it lands in *this* container. without a cap the first
       # worker to look claims the whole queue and the other has nothing to do
       HESTAN_SLOTS: "2"

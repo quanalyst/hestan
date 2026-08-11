@@ -35,6 +35,8 @@ export type EventKind =
   | "backfill_chunk"
   | "backfill_finished"
   | "backfill_canceled"
+  | "schedule_paused"
+  | "sensor_paused"
   | "notification_delivered"
   | "notification_failed"
   | "retention_pruned"
@@ -204,6 +206,10 @@ export interface Run {
   claimed_by: string | null;
   claimed_at: string | null;
   lease_until: string | null;
+  // who asked for this run, where a person did and something checked who they
+  // were. null on everything a schedule, a sensor or a backfill launched, and
+  // on every launch through a deployment with no authentication
+  actor: string | null;
 }
 
 // why a queued run is not executing: which limit, and the sentence to show
@@ -331,6 +337,8 @@ export interface RunEvent {
   message: string;
   data: unknown;
   ts: string;
+  // who caused this, on the events a person caused; null everywhere else
+  actor: string | null;
 }
 
 export type LogStream = "stdout" | "stderr";

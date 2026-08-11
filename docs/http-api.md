@@ -50,6 +50,40 @@ failures. timestamps are rfc3339 strings in utc.
 | POST | `/api/schedules/state` | pause or resume a schedule |
 | GET | `/api/schedules/ticks` | fire history |
 | GET | `/api/schedules/upcoming` | projected future fires |
+| GET | `/api/whoami` | whether this deployment checks who is asking, and who you are |
+
+## Who may call it
+
+a deployment with no [authenticator](auth.md) configured answers everybody, and
+`serve` will only bind loopback under it. one with an authenticator wants a
+credential on every call but two:
+
+```
+$ curl -H 'Authorization: Bearer '"$HESTAN_TOKEN" https://hestan.internal/api/runs
+```
+
+- **401** — no credential, or one this deployment does not recognize. it says
+  nothing about what was wrong with it. an `Auth::bearer` deployment sends
+  `WWW-Authenticate: Bearer` with it.
+- **403** — an identity that may not do this, and the message says what it
+  would have taken: `{"error": "this needs operator, and vic is a viewer"}`.
+
+what each role may is the [roles table](auth.md#the-roles): every `GET` is a
+viewer's, launching and cancelling and building are an operator's, and pausing,
+priority and presets are an admin's. anything not in that table needs an
+operator if it is not a `GET`.
+
+`GET /api/whoami` needs nothing, because it is what the ui and `hestan doctor`
+ask *before* they hold anything to present:
+
+```json
+{ "auth": true, "identity": { "name": "ada", "role": "admin" } }
+```
+
+`auth` is whether this deployment checks at all; `identity` is `null` when it
+does and does not recognize you — a 200, not a 401. the ui's own files
+(`/`, `/assets/…`) need no credential either, or the page that asks for one
+could not load.
 
 ## Job summaries
 
@@ -364,9 +398,17 @@ so a value may hold one; anything that is not a `key:value` pair is a 400
   "priority": 0,
   "claimed_by": "3f2a91cc",
   "claimed_at": "2026-08-07T12:00:00Z",
-  "lease_until": null
+  "lease_until": null,
+  "actor": "ada"
 }
 ```
+
+`actor` is who asked for this run, where a person did and the deployment
+checked who they were — the name of the [identity](auth.md), never a
+credential. it is null on everything a schedule, a sensor, a backfill or a
+freshness policy launched, and on every launch through a deployment with no
+authenticator: `"trigger": "manual"` with no actor means a person asked and
+nothing was checking who.
 
 a failed run's `error` names the first op that terminally failed, as
 `"op publish failed: warehouse connection reset"` — the same pair an
@@ -475,7 +517,8 @@ everything.
   "kind": "op_retry",
   "message": "attempt 1 failed: warehouse connection reset",
   "data": { "attempt": 1 },
-  "ts": "2026-08-07T12:00:02Z"
+  "ts": "2026-08-07T12:00:02Z",
+  "actor": null
 }
 ```
 

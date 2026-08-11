@@ -3,8 +3,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
-use hestan::Role;
 use hestan::prelude::*;
+use hestan::{Auth, Role};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -188,6 +188,15 @@ async fn main() -> Result<(), hestan::Error> {
         .max_concurrent_runs(env_num("HESTAN_MAX_CONCURRENT_RUNS").unwrap_or(4))
         .slots(env_num("HESTAN_SLOTS").unwrap_or(2))
         .db(env("HESTAN_DB").unwrap_or_else(|| "demo.db".into()));
+
+    // the compose file binds 0.0.0.0 and publishes the port, which `serve`
+    // refuses to do unguarded — so it sets a token, and this is where a
+    // deployment picks one up. from the environment rather than a literal: a
+    // token in argv is a token in `ps` and a token in source is a token in git
+    let app = match env("HESTAN_TOKEN") {
+        Some(token) => app.auth(Auth::bearer(token)),
+        None => app,
+    };
 
     let addr: SocketAddr = env("HESTAN_ADDR")
         .unwrap_or_else(|| "127.0.0.1:4000".into())

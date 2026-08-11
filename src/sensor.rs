@@ -1451,6 +1451,7 @@ mod tests {
             claimed_by: None,
             claimed_at: None,
             lease_until: None,
+            actor: None,
         };
         store.create_run(&active, &[]).unwrap();
         evaluate(&entry, &runner, &reg).await;
@@ -1546,7 +1547,7 @@ mod tests {
     async fn loop_skips_paused_sensors_and_resumes() {
         let store = Store::open(":memory:").unwrap();
         store.sync_sensors(&["counter".into()]).unwrap();
-        store.set_sensor_paused("counter", true).unwrap();
+        store.set_sensor_paused("counter", true, None).unwrap();
         let runner = echo_runner(store.clone());
         let calls = Arc::new(AtomicU32::new(0));
         let counter = calls.clone();
@@ -1571,7 +1572,7 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), 0);
         assert!(store.sensor_ticks(Some("counter"), 10).unwrap().is_empty());
 
-        store.set_sensor_paused("counter", false).unwrap();
+        store.set_sensor_paused("counter", false, None).unwrap();
         tokio::time::sleep(Duration::from_millis(150)).await;
         handle.abort();
         assert!(calls.load(Ordering::SeqCst) > 0);
@@ -1832,7 +1833,7 @@ mod tests {
             publish_chain("chain").every(Duration::from_millis(20)),
         );
         evaluate(&entry, &runner, &AssetRegistry::empty()).await;
-        store.set_sensor_paused("run:chain", true).unwrap();
+        store.set_sensor_paused("run:chain", true, None).unwrap();
         finish(&runner, "etl", json!({})).await;
 
         let handle = tokio::spawn(run_sensors(
@@ -1844,7 +1845,7 @@ mod tests {
         assert!(published(&store).is_empty());
         let paused_ticks = store.sensor_ticks(Some("run:chain"), 10).unwrap().len();
 
-        store.set_sensor_paused("run:chain", false).unwrap();
+        store.set_sensor_paused("run:chain", false, None).unwrap();
         for _ in 0..100 {
             if !published(&store).is_empty() {
                 break;

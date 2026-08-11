@@ -81,6 +81,9 @@ function EventRow({ event }: { event: RunEvent }) {
       <td>
         {event.message}
         {event.op !== null && <span className="muted act-op"> {event.op}</span>}
+        {/* who asked for it, where the deployment knew: the other half of an
+            audit trail is being able to read it without opening the run */}
+        {event.actor !== null && <span className="muted act-op"> by {event.actor}</span>}
       </td>
     </tr>
   );

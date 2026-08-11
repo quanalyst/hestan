@@ -2,20 +2,29 @@
 
 ## The threat model
 
-hestan runs your code and serves an unauthenticated control plane.
+hestan runs your code and serves a control plane. the api is not read-only: it
+launches runs with caller-supplied params, retries and cancels runs, triggers
+asset builds, starts backfills, moves queue positions, and pauses or resumes
+schedules and sensors.
 
-there is no authentication, no authorization, and no csrf protection on the
-ui or the json api under `/api`. the api is not read-only: it launches runs
-with caller-supplied params, retries and cancels runs, triggers asset builds,
-and pauses or resumes schedules and sensors. anyone who can reach the port
-can do all of that.
+**with no authenticator configured, `serve` binds loopback and refuses
+anything else.** that is a refusal rather than a warning, and it is the whole
+of what stands between "one process on one machine" and "a button on the
+internet that runs arbitrary jobs".
 
-so: **bind to loopback.** `serve(([127, 0, 0, 1], 4000))` is the documented
-form for a reason. binding `0.0.0.0` — or publishing the container port, or
-putting it behind a reverse proxy that doesn't authenticate — hands remote
-callers the ability to execute the job code you registered, with arguments
-they choose. if it needs to be reachable, terminate authentication in front
-of it and never expose the port directly.
+an address anyone can reach needs an [authenticator](docs/auth.md):
+`Auth::bearer(token)` for one shared admin token, compared in constant time and
+never logged, or `Auth::custom(|req| …)` to hand the decision to something that
+already knows who your people are. three roles — viewer, operator, admin — with
+the endpoint-by-endpoint mapping in the docs. `Auth::None` turns the refusal
+off for a deployment fronted by something that authenticates for it, and says
+so at startup.
+
+**there is still no csrf protection**, no user store, no sessions and no
+per-job permissions, and hestan serves plain http — terminate tls in front of
+it, or a bearer token on a network you do not control is a bearer token anyone
+on that network can read. `docs/auth.md` has a section on what this
+deliberately is not.
 
 two smaller notes:
 

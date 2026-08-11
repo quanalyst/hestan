@@ -14,8 +14,11 @@ this is `0.1.0-alpha.2`. under 0.x the api changes without a deprecation cycle,
 so read the changelog before bumping. it has not been run in production, and
 the gaps that are known are listed under [not here yet](#not-here-yet).
 
-the ui and json api have no authentication. bind them to loopback — see
-[SECURITY.md](SECURITY.md).
+the ui and json api are unauthenticated by default, and `serve` refuses to
+bind anything but loopback under that default. giving it an address anyone can
+reach means giving it an [authenticator](docs/auth.md) — one token, or your
+own check — and there is no user store, no session and no per-job permission
+model behind it. see [SECURITY.md](SECURITY.md).
 
 ## Quickstart
 
@@ -330,6 +333,12 @@ standalone binary for those two. [docs/cli.md](docs/cli.md).
   button with a reason rather than an error after the click
 - the web ui is a prebuilt react bundle embedded in the binary; it polls the
   json api under `/api`
+- **an address anyone can reach needs an authenticator, and `serve` refuses to
+  start without one**: `Auth::bearer(token)` for one shared secret, or
+  `Auth::custom(|req| …)` to compose the identities you already have. three
+  roles — viewer reads, operator drives runs, admin changes how the deployment
+  behaves — and a control a role may not use is not rendered in the ui rather
+  than rendered and answering 403. see [docs/auth.md](docs/auth.md)
 
 ## More than one process
 
@@ -362,6 +371,7 @@ the details live in [docs/](docs/README.md):
 [notifications](docs/notifications.md), [launching](docs/launching.md),
 [the web ui](docs/web-ui.md),
 [the command line](docs/cli.md),
+[authentication](docs/auth.md),
 [the http api](docs/http-api.md), [storage](docs/storage.md),
 [scaling](docs/scaling.md), [embedding](docs/embedding.md), and
 [development](docs/development.md).

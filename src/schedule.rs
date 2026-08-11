@@ -1028,7 +1028,9 @@ mod tests {
         let store = Store::open(":memory:").unwrap();
         let runner = crate::Runner::new([nap_job("etl", 5, Overlap::Skip)], store.clone());
         let (_, now) = down_for(&store, 4, Catchup::All { limit: 10 });
-        store.set_schedule_paused("etl", HOURLY, true).unwrap();
+        store
+            .set_schedule_paused("etl", HOURLY, true, None)
+            .unwrap();
         let entry = hourly_entry("etl", Catchup::All { limit: 10 });
 
         catch_up(&entry, &runner, stored(&store).get(&entry.key()), now);

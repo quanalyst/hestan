@@ -135,6 +135,18 @@ pub(crate) fn router(state: AppState) -> Router {
         .with_state(state)
 }
 
+/// who the [guard](guard) recognized, for the handlers that write down who did
+/// it.
+///
+/// absent on every request through a deployment with no authenticator, which
+/// is what an unauthenticated launch records: nobody, rather than a name
+/// nothing checked.
+type Who = Option<axum::Extension<Identity>>;
+
+fn actor(who: &Who) -> Option<&str> {
+    who.as_ref().map(|axum::Extension(id)| id.name.as_str())
+}
+
 /// the endpoints that need an [admin](Access), by the route each request
 /// matched.
 ///
@@ -515,6 +527,7 @@ fn params_body(body: &Bytes) -> Result<Value, ApiError> {
 async fn launch_run(
     State(st): State<AppState>,
     Path(name): Path<String>,
+    who: Who,
     body: Bytes,
 ) -> Result<(StatusCode, Json<Value>), ApiError> {
     let body: LaunchBody = if body.is_empty() {
@@ -551,11 +564,13 @@ async fn launch_run(
         }
     };
     let tags = body.tags.unwrap_or_default();
+    // "manual, by whom": the run row carries the name from here on, and
+    // `Trigger::Manual` with no actor means a person asked and nothing was
+    // checking who
+    let runner = st.runner.as_actor(actor(&who));
     let launched = match body.ops {
-        None => st
-            .runner
-            .launch_prioritized(&name, params, Trigger::Manual, tags, body.priority),
-        Some(ops) => launch_subset(&st, &name, ops, params, tags, body.priority)?,
+        None => runner.launch_prioritized(&name, params, Trigger::Manual, tags, body.priority),
+        Some(ops) => launch_subset(&st, &runner, &name, ops, params, tags, body.priority)?,
     };
     match launched {
         Ok(run_id) => Ok((StatusCode::ACCEPTED, Json(json!({ "run_id": run_id })))),
@@ -583,6 +598,7 @@ async fn launch_run(
 /// the launch's, handled with every other launch's.
 fn launch_subset(
     st: &AppState,
+    runner: &Runner,
     name: &str,
     ops: Vec<String>,
     params: Value,
@@ -603,7 +619,7 @@ fn launch_subset(
     }
     // the job's external names are seeded by every launch, subset or not: they
     // are not ops and no selection can contain them
-    Ok(st.runner.launch_subset(
+    Ok(runner.launch_subset(
         name,
         subset,
         job.external_seeds(),
@@ -794,8 +810,9 @@ async fn job_state(
 async fn cancel_run(
     State(st): State<AppState>,
     Path(id): Path<String>,
+    who: Who,
 ) -> Result<(StatusCode, Json<Value>), ApiError> {
-    match st.runner.cancel(&id) {
+    match st.runner.as_actor(actor(&who)).cancel(&id) {
         Ok(CancelOutcome::Requested) => Ok((StatusCode::ACCEPTED, Json(json!({ "ok": true })))),
         Ok(CancelOutcome::Unknown) => Err(err(StatusCode::NOT_FOUND, format!("unknown run: {id}"))),
         Ok(CancelOutcome::AlreadyFinished) => Err(err(
@@ -1210,6 +1227,7 @@ fn build_body(body: &Bytes) -> Result<BuildBody, ApiError> {
 async fn build_one_asset(
     State(st): State<AppState>,
     Path(name): Path<String>,
+    who: Who,
     body: Bytes,
 ) -> Result<(StatusCode, Json<Value>), ApiError> {
     let body = build_body(&body)?;
@@ -1220,7 +1238,7 @@ async fn build_one_asset(
         return Err(err(StatusCode::BAD_REQUEST, "no partitions named"));
     }
     let keys = body.partitions.unwrap_or_default();
-    match crate::asset::build_one(&st.runner, &st.assets, &name, &keys) {
+    match crate::asset::build_one(&st.runner.as_actor(actor(&who)), &st.assets, &name, &keys) {
         Ok(Some(run_id)) => Ok((StatusCode::ACCEPTED, Json(json!({ "run_id": run_id })))),
         // nothing to do is not a refusal, and a 202 with no run id would be a
         // caller waiting on something that was never launched
@@ -1252,12 +1270,13 @@ struct BackfillBody {
 async fn start_backfill(
     State(st): State<AppState>,
     Path(name): Path<String>,
+    who: Who,
     body: Bytes,
 ) -> Result<(StatusCode, Json<Value>), ApiError> {
     let body: BackfillBody = serde_json::from_slice(&body)
         .map_err(|e| err(StatusCode::BAD_REQUEST, format!("bad body: {e}")))?;
     let backfill = backfill::start(
-        &st.runner,
+        &st.runner.as_actor(actor(&who)),
         &st.assets,
         &name,
         &body.from,
@@ -1307,8 +1326,9 @@ async fn get_backfill(
 async fn cancel_backfill(
     State(st): State<AppState>,
     Path(id): Path<i64>,
+    who: Who,
 ) -> Result<Json<Value>, ApiError> {
-    match backfill::cancel(&st.runner, id).map_err(bad_plan)? {
+    match backfill::cancel(&st.runner.as_actor(actor(&who)), id).map_err(bad_plan)? {
         true => Ok(Json(json!({ "canceled": true }))),
         false => Err(err(
             StatusCode::CONFLICT,
@@ -1319,6 +1339,7 @@ async fn cancel_backfill(
 
 async fn build_all_assets(
     State(st): State<AppState>,
+    who: Who,
 ) -> Result<(StatusCode, Json<Value>), ApiError> {
     build_gate(&st)?;
     let mats = mats_map(st.runner.store()).map_err(internal)?;
@@ -1326,7 +1347,12 @@ async fn build_all_assets(
     let Some(plan) = plan_all(&st.assets, &mats) else {
         return Ok((StatusCode::OK, Json(json!({ "up_to_date": true }))));
     };
-    match launch_plan(&st.runner, plan, Trigger::Build, RunTags::new()) {
+    match launch_plan(
+        &st.runner.as_actor(actor(&who)),
+        plan,
+        Trigger::Build,
+        RunTags::new(),
+    ) {
         Ok(run_id) => Ok((StatusCode::ACCEPTED, Json(json!({ "run_ids": [run_id] })))),
         Err(e) => Err(internal(e)),
     }
@@ -1368,12 +1394,13 @@ struct SensorStateBody {
 
 async fn set_sensor_state(
     State(st): State<AppState>,
+    who: Who,
     Json(body): Json<SensorStateBody>,
 ) -> Result<Json<Value>, ApiError> {
     let known = st
         .runner
         .store()
-        .set_sensor_paused(&body.name, body.paused)
+        .set_sensor_paused(&body.name, body.paused, actor(&who))
         .map_err(internal)?;
     if !known {
         return Err(err(
@@ -1442,12 +1469,13 @@ struct ScheduleStateBody {
 
 async fn set_schedule_state(
     State(st): State<AppState>,
+    who: Who,
     Json(body): Json<ScheduleStateBody>,
 ) -> Result<Json<Value>, ApiError> {
     let known = st
         .runner
         .store()
-        .set_schedule_paused(&body.job, &body.expr, body.paused)
+        .set_schedule_paused(&body.job, &body.expr, body.paused, actor(&who))
         .map_err(internal)?;
     if !known {
         return Err(err(
@@ -1614,6 +1642,7 @@ async fn list_runs(
 async fn retry_run(
     State(st): State<AppState>,
     Path(id): Path<String>,
+    who: Who,
 ) -> Result<(StatusCode, Json<Value>), ApiError> {
     let run = st
         .runner
@@ -1625,7 +1654,11 @@ async fn retry_run(
     if matches!(run.status, RunStatus::Queued | RunStatus::Running) {
         return Err(err(StatusCode::CONFLICT, format!("run still active: {id}")));
     }
-    match st.runner.launch(&run.job, run.params, Trigger::Retry) {
+    match st
+        .runner
+        .as_actor(actor(&who))
+        .launch(&run.job, run.params, Trigger::Retry)
+    {
         Ok(run_id) => Ok((StatusCode::ACCEPTED, Json(json!({ "run_id": run_id })))),
         // the run exists but its job left the code since; a launch 404 would lie
         Err(Error::UnknownJob(job)) => Err(err(
@@ -1675,10 +1708,15 @@ fn resume_error(e: Error) -> ApiError {
 async fn resume_run(
     State(st): State<AppState>,
     Path(id): Path<String>,
+    who: Who,
     body: Bytes,
 ) -> Result<(StatusCode, Json<Value>), ApiError> {
     let from = resume_from_body(&body)?;
-    match st.runner.resume_from(&id, Some(&from)) {
+    match st
+        .runner
+        .as_actor(actor(&who))
+        .resume_from(&id, Some(&from))
+    {
         Ok(run_id) => Ok((StatusCode::ACCEPTED, Json(json!({ "run_id": run_id })))),
         Err(e) => Err(resume_error(e)),
     }
@@ -2147,6 +2185,7 @@ mod tests {
             claimed_by: None,
             claimed_at: None,
             lease_until: None,
+            actor: None,
         };
         st.runner.store().create_run(&run, &[]).unwrap();
         run
@@ -2174,6 +2213,7 @@ mod tests {
                 claimed_by: None,
                 claimed_at: None,
                 lease_until: None,
+                actor: None,
             };
             st.runner.store().create_run(&run, &[]).unwrap();
         }
@@ -2230,6 +2270,7 @@ mod tests {
                 claimed_by: None,
                 claimed_at: None,
                 lease_until: None,
+                actor: None,
             };
             st.runner.store().create_run(&run, &[]).unwrap();
         }
@@ -2297,6 +2338,7 @@ mod tests {
                 claimed_by: None,
                 claimed_at: None,
                 lease_until: None,
+                actor: None,
             };
             st.runner.store().create_run(&run, &[]).unwrap();
         }
@@ -2399,6 +2441,7 @@ mod tests {
                 claimed_by: None,
                 claimed_at: None,
                 lease_until: None,
+                actor: None,
             };
             store.create_run(&run, &["a".into(), "b".into()]).unwrap();
             store.op_started(&run.id, "a", 1).unwrap();
@@ -2509,6 +2552,7 @@ mod tests {
             claimed_by: None,
             claimed_at: None,
             lease_until: None,
+            actor: None,
         };
         store.create_run(&run, &ops).unwrap();
         for op in &ops {
@@ -2782,6 +2826,7 @@ mod tests {
         let (status, Json(body)) = launch_run(
             State(st.clone()),
             Path("report".into()),
+            None,
             raw(r#"{"params": {"days": "seven", "region": "eu"}}"#),
         )
         .await
@@ -2817,6 +2862,7 @@ mod tests {
         let (status, _) = launch_run(
             State(st.clone()),
             Path("report".into()),
+            None,
             raw(r#"{"params": {"days": 7}}"#),
         )
         .await
@@ -2937,6 +2983,7 @@ mod tests {
         let (status, Json(body)) = launch_run(
             State(st.clone()),
             Path("report".into()),
+            None,
             raw(r#"{"preset": "nightly"}"#),
         )
         .await
@@ -2950,6 +2997,7 @@ mod tests {
         let (status, Json(body)) = launch_run(
             State(st.clone()),
             Path("report".into()),
+            None,
             raw(r#"{"preset": "ghost"}"#),
         )
         .await
@@ -2968,6 +3016,7 @@ mod tests {
         let (status, _) = launch_run(
             State(st),
             Path("nope".into()),
+            None,
             raw(r#"{"preset": "nightly"}"#),
         )
         .await
@@ -2979,7 +3028,7 @@ mod tests {
     async fn a_launch_carries_its_tags_and_the_runs_filter_finds_them() {
         let st = state(vec![echo_job("etl")]);
         let launch =
-            |body: &'static str| launch_run(State(st.clone()), Path("etl".into()), raw(body));
+            |body: &'static str| launch_run(State(st.clone()), Path("etl".into()), None, raw(body));
 
         let (_, Json(body)) = launch(r#"{"tags": {"kind": "smoke", "who": "me"}}"#)
             .await
@@ -3075,6 +3124,7 @@ mod tests {
         let (status, Json(body)) = launch_run(
             State(st.clone()),
             Path("etl".into()),
+            None,
             raw(r#"{"ops": ["d"], "tags": {"kind": "partial"}}"#),
         )
         .await
@@ -3094,6 +3144,7 @@ mod tests {
         let (_, Json(body)) = launch_run(
             State(st.clone()),
             Path("etl".into()),
+            None,
             raw(r#"{"ops": ["a", "b"]}"#),
         )
         .await
@@ -3104,7 +3155,7 @@ mod tests {
         );
 
         // and a launch that names no ops at all is still the whole job
-        let (_, Json(body)) = launch_run(State(st.clone()), Path("etl".into()), raw("{}"))
+        let (_, Json(body)) = launch_run(State(st.clone()), Path("etl".into()), None, raw("{}"))
             .await
             .unwrap();
         assert_eq!(
@@ -3122,6 +3173,7 @@ mod tests {
         let (status, Json(body)) = launch_run(
             State(st.clone()),
             Path("etl".into()),
+            None,
             raw(r#"{"ops": ["c"]}"#),
         )
         .await
@@ -3146,6 +3198,7 @@ mod tests {
         let (status, Json(body)) = launch_run(
             State(st.clone()),
             Path("etl".into()),
+            None,
             raw(r#"{"ops": ["ghost"]}"#),
         )
         .await
@@ -3161,16 +3214,25 @@ mod tests {
 
         // an empty selection is a request that names nothing, not one that
         // names everything
-        let (status, Json(body)) =
-            launch_run(State(st.clone()), Path("etl".into()), raw(r#"{"ops": []}"#))
-                .await
-                .unwrap_err();
+        let (status, Json(body)) = launch_run(
+            State(st.clone()),
+            Path("etl".into()),
+            None,
+            raw(r#"{"ops": []}"#),
+        )
+        .await
+        .unwrap_err();
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(body["error"], "no ops named");
 
-        let (status, _) = launch_run(State(st), Path("nope".into()), raw(r#"{"ops": ["a"]}"#))
-            .await
-            .unwrap_err();
+        let (status, _) = launch_run(
+            State(st),
+            Path("nope".into()),
+            None,
+            raw(r#"{"ops": ["a"]}"#),
+        )
+        .await
+        .unwrap_err();
         assert_eq!(status, StatusCode::NOT_FOUND);
     }
 
@@ -3180,6 +3242,7 @@ mod tests {
         let (_, Json(body)) = launch_run(
             State(st.clone()),
             Path("etl".into()),
+            None,
             raw(r#"{"params": {"n": 5}, "tags": {"kind": "smoke"}}"#),
         )
         .await
@@ -3194,7 +3257,7 @@ mod tests {
             json!({"job": "etl", "params": {"n": 5}, "tags": {"kind": "smoke"}})
         );
         // an untagged run clones as an untagged one, not as a null
-        let (_, Json(plain)) = launch_run(State(st.clone()), Path("etl".into()), raw("{}"))
+        let (_, Json(plain)) = launch_run(State(st.clone()), Path("etl".into()), None, raw("{}"))
             .await
             .unwrap();
         let Json(body) = clone_run(
@@ -3226,7 +3289,7 @@ mod tests {
     #[tokio::test]
     async fn cloning_a_run_whose_job_is_gone_says_so() {
         let st = state(vec![echo_job("etl")]);
-        let (_, Json(body)) = launch_run(State(st.clone()), Path("etl".into()), raw("{}"))
+        let (_, Json(body)) = launch_run(State(st.clone()), Path("etl".into()), None, raw("{}"))
             .await
             .unwrap();
         let id = body["run_id"].as_str().unwrap().to_string();
@@ -3248,7 +3311,8 @@ mod tests {
         assert_eq!(status, StatusCode::CONFLICT);
         assert_eq!(body["error"], "job no longer defined: etl");
         // which is what a retry of that run says too, so the two agree
-        let (retry_status, Json(retry_body)) = retry_run(State(gone), Path(id)).await.unwrap_err();
+        let (retry_status, Json(retry_body)) =
+            retry_run(State(gone), Path(id), None).await.unwrap_err();
         assert_eq!(retry_status, status);
         assert_eq!(retry_body["error"], body["error"]);
     }
@@ -3264,6 +3328,7 @@ mod tests {
         let (status, Json(body)) = launch_run(
             State(st.clone()),
             Path("report".into()),
+            None,
             raw(r#"{"preset": "nightly", "params": {"days": 1}}"#),
         )
         .await
@@ -3749,14 +3814,14 @@ mod tests {
             .unwrap();
         let st = state(vec![slow]);
 
-        let (status, Json(body)) = cancel_run(State(st.clone()), Path("nope".into()))
+        let (status, Json(body)) = cancel_run(State(st.clone()), Path("nope".into()), None)
             .await
             .unwrap_err();
         assert_eq!(status, StatusCode::NOT_FOUND);
         assert_eq!(body["error"], "unknown run: nope");
 
         insert_run(&st, "done", "slow", RunStatus::Success, json!({}));
-        let (status, Json(body)) = cancel_run(State(st.clone()), Path("done".into()))
+        let (status, Json(body)) = cancel_run(State(st.clone()), Path("done".into()), None)
             .await
             .unwrap_err();
         assert_eq!(status, StatusCode::CONFLICT);
@@ -3765,7 +3830,7 @@ mod tests {
         // a queued run nobody has claimed is cancellable whoever asks: it is a
         // row on the queue, and taking it off is the whole of stopping it
         insert_run(&st, "waiting", "slow", RunStatus::Queued, json!({}));
-        let (status, _) = cancel_run(State(st.clone()), Path("waiting".into()))
+        let (status, _) = cancel_run(State(st.clone()), Path("waiting".into()), None)
             .await
             .unwrap();
         assert_eq!(status, StatusCode::ACCEPTED);
@@ -3777,7 +3842,7 @@ mod tests {
         // a running row with no live executor, as a restart leaves behind: the
         // signal has nowhere to go, and saying so beats pretending
         insert_run(&st, "stale", "slow", RunStatus::Running, json!({}));
-        let (status, _) = cancel_run(State(st.clone()), Path("stale".into()))
+        let (status, _) = cancel_run(State(st.clone()), Path("stale".into()), None)
             .await
             .unwrap_err();
         assert_eq!(status, StatusCode::CONFLICT);
@@ -3786,7 +3851,7 @@ mod tests {
             .runner
             .launch("slow", json!({}), Trigger::Manual)
             .unwrap();
-        let (status, Json(body)) = cancel_run(State(st), Path(id)).await.unwrap();
+        let (status, Json(body)) = cancel_run(State(st), Path(id), None).await.unwrap();
         assert_eq!(status, StatusCode::ACCEPTED);
         assert_eq!(body, json!({"ok": true}));
     }
@@ -3803,7 +3868,7 @@ mod tests {
             .unwrap();
         st.runner
             .store()
-            .set_schedule_paused("health", "0 * * * *", true)
+            .set_schedule_paused("health", "0 * * * *", true, None)
             .unwrap();
 
         let Json(body) = upcoming_schedules(State(st), Ok(Query(UpcomingQuery { window: None })))
@@ -3827,7 +3892,7 @@ mod tests {
             .unwrap()
             .id;
 
-        let (status, Json(body)) = retry_run(State(st.clone()), Path(id.clone()))
+        let (status, Json(body)) = retry_run(State(st.clone()), Path(id.clone()), None)
             .await
             .unwrap();
         assert_eq!(status, StatusCode::ACCEPTED);
@@ -3841,7 +3906,9 @@ mod tests {
     #[tokio::test]
     async fn retry_unknown_run_404() {
         let st = state(vec![]);
-        let (status, Json(body)) = retry_run(State(st), Path("nope".into())).await.unwrap_err();
+        let (status, Json(body)) = retry_run(State(st), Path("nope".into()), None)
+            .await
+            .unwrap_err();
         assert_eq!(status, StatusCode::NOT_FOUND);
         assert_eq!(body["error"], "unknown run: nope");
     }
@@ -3851,21 +3918,21 @@ mod tests {
         let st = state(vec![echo_job("etl")]);
         insert_run(&st, "r1", "etl", RunStatus::Queued, json!({}));
 
-        let (status, Json(body)) = retry_run(State(st.clone()), Path("r1".into()))
+        let (status, Json(body)) = retry_run(State(st.clone()), Path("r1".into()), None)
             .await
             .unwrap_err();
         assert_eq!(status, StatusCode::CONFLICT);
         assert_eq!(body["error"], "run still active: r1");
 
         st.runner.store().run_started("r1", Utc::now()).unwrap();
-        let (status, Json(body)) = retry_run(State(st.clone()), Path("r1".into()))
+        let (status, Json(body)) = retry_run(State(st.clone()), Path("r1".into()), None)
             .await
             .unwrap_err();
         assert_eq!(status, StatusCode::CONFLICT);
         assert_eq!(body["error"], "run still active: r1");
 
         insert_run(&st, "g1", "ghost", RunStatus::Running, json!({}));
-        let (status, Json(body)) = retry_run(State(st.clone()), Path("g1".into()))
+        let (status, Json(body)) = retry_run(State(st.clone()), Path("g1".into()), None)
             .await
             .unwrap_err();
         assert_eq!(status, StatusCode::CONFLICT);
@@ -3875,7 +3942,7 @@ mod tests {
             .store()
             .run_finished("r1", RunStatus::Failed, None, Utc::now(), None)
             .unwrap();
-        let (status, Json(body)) = retry_run(State(st.clone()), Path("r1".into()))
+        let (status, Json(body)) = retry_run(State(st.clone()), Path("r1".into()), None)
             .await
             .unwrap();
         assert_eq!(status, StatusCode::ACCEPTED);
@@ -3892,7 +3959,9 @@ mod tests {
     async fn retry_undefined_job_409() {
         let st = state(vec![]);
         insert_run(&st, "r1", "ghost", RunStatus::Failed, json!({}));
-        let (status, Json(body)) = retry_run(State(st), Path("r1".into())).await.unwrap_err();
+        let (status, Json(body)) = retry_run(State(st), Path("r1".into()), None)
+            .await
+            .unwrap_err();
         assert_eq!(status, StatusCode::CONFLICT);
         assert_eq!(body["error"], "job no longer defined: ghost");
     }
@@ -3917,7 +3986,9 @@ mod tests {
             RunStatus::Failed,
             json!({"threshold": "high"}),
         );
-        let (status, Json(body)) = retry_run(State(st), Path("r1".into())).await.unwrap_err();
+        let (status, Json(body)) = retry_run(State(st), Path("r1".into()), None)
+            .await
+            .unwrap_err();
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert!(body["error"].as_str().unwrap().contains("invalid params"));
     }
@@ -3954,6 +4025,7 @@ mod tests {
             claimed_by: None,
             claimed_at: None,
             lease_until: None,
+            actor: None,
         };
         let ops: Vec<String> = ops.iter().map(|o| o.to_string()).collect();
         st.runner.store().create_run(&run, &ops).unwrap();
@@ -3969,9 +4041,10 @@ mod tests {
             .unwrap();
         assert_eq!(failed.status, RunStatus::Failed);
 
-        let (status, Json(body)) = resume_run(State(st.clone()), Path(failed.id.clone()), raw(""))
-            .await
-            .unwrap();
+        let (status, Json(body)) =
+            resume_run(State(st.clone()), Path(failed.id.clone()), None, raw(""))
+                .await
+                .unwrap();
         assert_eq!(status, StatusCode::ACCEPTED);
         let new_id = body["run_id"].as_str().unwrap();
         let run = st.runner.store().run(new_id).unwrap().unwrap();
@@ -3993,6 +4066,7 @@ mod tests {
         let (status, Json(body)) = resume_run(
             State(st.clone()),
             Path(failed.id.clone()),
+            None,
             raw(r#"{"from": ["a"]}"#),
         )
         .await
@@ -4010,7 +4084,7 @@ mod tests {
     async fn resume_endpoint_statuses() {
         let st = state(vec![echo_job("etl")]);
         let resume = |st: &AppState, id: &str, b: &'static str| {
-            resume_run(State(st.clone()), Path(id.into()), raw(b))
+            resume_run(State(st.clone()), Path(id.into()), None, raw(b))
         };
 
         let (status, Json(b)) = resume(&st, "nope", "").await.unwrap_err();
@@ -4173,6 +4247,7 @@ mod tests {
             claimed_by: None,
             claimed_at: None,
             lease_until: None,
+            actor: None,
         };
         st.runner.store().create_run(&stale, &[]).unwrap();
         let s = job_summary(job, st.runner.store(), |p| st.runner.pool_limit(p)).unwrap();
@@ -4187,7 +4262,7 @@ mod tests {
 
         st.runner
             .store()
-            .set_schedule_paused("etl", "0,1 0 1 1 *", true)
+            .set_schedule_paused("etl", "0,1 0 1 1 *", true, None)
             .unwrap();
         let s = job_summary(job, st.runner.store(), |p| st.runner.pool_limit(p)).unwrap();
         assert_eq!(s["interval_secs"], json!(null));
@@ -4439,7 +4514,7 @@ mod tests {
             .unwrap();
 
         let (_, Json(body)) =
-            build_one_asset(State(st.clone()), Path("stats".into()), Bytes::new())
+            build_one_asset(State(st.clone()), Path("stats".into()), None, Bytes::new())
                 .await
                 .unwrap();
         let run_id = body["run_id"].as_str().unwrap().to_string();
@@ -4448,7 +4523,7 @@ mod tests {
         assert_eq!(run.trigger, Trigger::Build);
         assert_eq!(run.tags["asset"], "stats");
 
-        let (_, Json(body)) = build_all_assets(State(st.clone())).await.unwrap();
+        let (_, Json(body)) = build_all_assets(State(st.clone()), None).await.unwrap();
         let all_id = body["run_ids"][0].as_str().unwrap().to_string();
         wait_success(&st, &all_id).await;
         assert!(
@@ -4484,7 +4559,7 @@ mod tests {
             .store()
             .record_materialization("docs", None, "d1", &json!({}), None, None, None)
             .unwrap();
-        let (status, Json(body)) = build_all_assets(State(st.clone())).await.unwrap();
+        let (status, Json(body)) = build_all_assets(State(st.clone()), None).await.unwrap();
         assert_eq!(status, StatusCode::ACCEPTED);
         let run_id = body["run_ids"][0].as_str().unwrap();
         wait_success(&st, run_id).await;
@@ -4611,7 +4686,7 @@ mod tests {
             .record_materialization("docs", None, "d1", &json!({}), None, None, None)
             .unwrap();
 
-        let (status, Json(body)) = build_all_assets(State(st.clone())).await.unwrap();
+        let (status, Json(body)) = build_all_assets(State(st.clone()), None).await.unwrap();
         assert_eq!(status, StatusCode::ACCEPTED);
         wait_success(&st, body["run_ids"][0].as_str().unwrap()).await;
 
@@ -4679,7 +4754,7 @@ mod tests {
     async fn build_endpoint_statuses() {
         let st = asset_state();
         let (status, Json(body)) =
-            build_one_asset(State(st.clone()), Path("nope".into()), Bytes::new())
+            build_one_asset(State(st.clone()), Path("nope".into()), None, Bytes::new())
                 .await
                 .unwrap_err();
         assert_eq!(status, StatusCode::NOT_FOUND);
@@ -4692,7 +4767,7 @@ mod tests {
             .unwrap();
 
         let (status, Json(body)) =
-            build_one_asset(State(st.clone()), Path("totals".into()), Bytes::new())
+            build_one_asset(State(st.clone()), Path("totals".into()), None, Bytes::new())
                 .await
                 .unwrap();
         assert_eq!(status, StatusCode::ACCEPTED);
@@ -4703,20 +4778,20 @@ mod tests {
         assert_eq!(run.trigger, Trigger::Build);
 
         let (status, Json(body)) =
-            build_one_asset(State(st.clone()), Path("totals".into()), Bytes::new())
+            build_one_asset(State(st.clone()), Path("totals".into()), None, Bytes::new())
                 .await
                 .unwrap();
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body, json!({"up_to_date": true}));
 
         let (status, Json(body)) =
-            build_one_asset(State(st.clone()), Path("docs".into()), Bytes::new())
+            build_one_asset(State(st.clone()), Path("docs".into()), None, Bytes::new())
                 .await
                 .unwrap_err();
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(body["error"], "sources are probed, never built");
 
-        let (status, Json(body)) = build_all_assets(State(st)).await.unwrap();
+        let (status, Json(body)) = build_all_assets(State(st), None).await.unwrap();
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body, json!({"up_to_date": true}));
     }
@@ -4760,6 +4835,7 @@ mod tests {
         let (status, Json(body)) = build_one_asset(
             State(st.clone()),
             Path("daily".into()),
+            None,
             Bytes::from(r#"{"partitions":["nope"]}"#),
         )
         .await
@@ -4773,6 +4849,7 @@ mod tests {
         let (status, _) = build_one_asset(
             State(st.clone()),
             Path("daily".into()),
+            None,
             Bytes::from(r#"{"partitions": 7}"#),
         )
         .await
@@ -4782,6 +4859,7 @@ mod tests {
         let (status, Json(body)) = build_one_asset(
             State(st.clone()),
             Path("daily".into()),
+            None,
             Bytes::from(r#"{"partitions":["k2"]}"#),
         )
         .await
@@ -4832,6 +4910,7 @@ mod tests {
         let (status, Json(body)) = start_backfill(
             State(st.clone()),
             Path("daily".into()),
+            None,
             Bytes::from(r#"{"from":"k1","to":"k3"}"#),
         )
         .await
@@ -4846,6 +4925,7 @@ mod tests {
         let (status, Json(body)) = start_backfill(
             State(st.clone()),
             Path("daily".into()),
+            None,
             Bytes::from(r#"{"from":"k1","to":"k2"}"#),
         )
         .await
@@ -4866,10 +4946,12 @@ mod tests {
         assert_eq!(body["runs"].as_array().unwrap().len(), 1);
         assert_eq!(body["runs"][0]["job"], "assets");
 
-        let Json(body) = cancel_backfill(State(st.clone()), Path(id)).await.unwrap();
+        let Json(body) = cancel_backfill(State(st.clone()), Path(id), None)
+            .await
+            .unwrap();
         assert_eq!(body, json!({"canceled": true}));
         // cancelling twice says what happened rather than lying
-        let (status, _) = cancel_backfill(State(st.clone()), Path(id))
+        let (status, _) = cancel_backfill(State(st.clone()), Path(id), None)
             .await
             .unwrap_err();
         assert_eq!(status, StatusCode::CONFLICT);
@@ -4877,6 +4959,7 @@ mod tests {
         let (status, _) = start_backfill(
             State(st.clone()),
             Path("daily".into()),
+            None,
             Bytes::from(r#"{"from":"k1","to":"nope"}"#),
         )
         .await
@@ -4886,6 +4969,7 @@ mod tests {
         let (status, _) = start_backfill(
             State(st.clone()),
             Path("ghost".into()),
+            None,
             Bytes::from(r#"{"from":"k1","to":"k2"}"#),
         )
         .await
@@ -4906,12 +4990,12 @@ mod tests {
         // an assets run planted as live, without an executor behind it
         insert_run(&st, "b1", "assets", RunStatus::Running, json!({}));
         let (status, Json(body)) =
-            build_one_asset(State(st.clone()), Path("totals".into()), Bytes::new())
+            build_one_asset(State(st.clone()), Path("totals".into()), None, Bytes::new())
                 .await
                 .unwrap_err();
         assert_eq!(status, StatusCode::CONFLICT);
         assert_eq!(body["error"], "asset build already running");
-        let (status, Json(body)) = build_all_assets(State(st.clone())).await.unwrap_err();
+        let (status, Json(body)) = build_all_assets(State(st.clone()), None).await.unwrap_err();
         assert_eq!(status, StatusCode::CONFLICT);
         assert_eq!(body["error"], "asset build already running");
         assert_eq!(
@@ -4923,18 +5007,20 @@ mod tests {
             1
         );
         // the more specific answer wins: a source is a 400 even while a build is live
-        let (status, _) = build_one_asset(State(st.clone()), Path("docs".into()), Bytes::new())
-            .await
-            .unwrap_err();
+        let (status, _) =
+            build_one_asset(State(st.clone()), Path("docs".into()), None, Bytes::new())
+                .await
+                .unwrap_err();
         assert_eq!(status, StatusCode::BAD_REQUEST);
 
         st.runner
             .store()
             .run_finished("b1", RunStatus::Success, None, Utc::now(), None)
             .unwrap();
-        let (status, _) = build_one_asset(State(st.clone()), Path("totals".into()), Bytes::new())
-            .await
-            .unwrap();
+        let (status, _) =
+            build_one_asset(State(st.clone()), Path("totals".into()), None, Bytes::new())
+                .await
+                .unwrap();
         assert_eq!(status, StatusCode::ACCEPTED);
     }
 
@@ -4992,6 +5078,7 @@ mod tests {
 
         let Json(ok) = set_sensor_state(
             State(st.clone()),
+            None,
             Json(SensorStateBody {
                 name: "watch".into(),
                 paused: true,
@@ -5002,6 +5089,7 @@ mod tests {
         assert_eq!(ok, json!({"ok": true}));
         let (status, Json(body)) = set_sensor_state(
             State(st.clone()),
+            None,
             Json(SensorStateBody {
                 name: "nope".into(),
                 paused: true,
@@ -5583,6 +5671,21 @@ mod tests {
         asked(st, method, path, who).await.0
     }
 
+    /// the newest event of one kind, for the cases that assert what the log
+    /// says about who did something.
+    fn newest_event(st: &AppState, kind: model::EventKind) -> model::Event {
+        let q = EventQuery {
+            kind: Some(kind.clone()),
+            ..EventQuery::default()
+        };
+        st.runner
+            .store()
+            .event_log(&q, 1)
+            .unwrap()
+            .pop()
+            .unwrap_or_else(|| panic!("no {kind} event"))
+    }
+
     fn refused(status: StatusCode) -> bool {
         status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN
     }
@@ -5739,6 +5842,87 @@ mod tests {
         // and `doctor` read to know they need nothing
         let (_, body, _) = request(router(state(vec![])), Method::GET, "/api/whoami").await;
         assert_eq!(body.unwrap()["auth"], false);
+    }
+
+    // the audit trail: what the log says about who asked, and what it says
+    // when nobody was checked
+    #[tokio::test]
+    async fn what_a_person_asks_for_is_recorded_under_their_name() {
+        let st = guarded(people());
+        st.runner
+            .store()
+            .sync_schedules(&[Schedule::new("etl", "0 * * * *")])
+            .unwrap();
+
+        let (status, body) =
+            asked(&st, "POST", "/api/jobs/etl/runs", Some(("x-user", "ada"))).await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+        let run_id = body["run_id"].as_str().unwrap().to_string();
+        // on the run row, which is what makes `manual` mean "manual, by ada"
+        let run = st.runner.store().run(&run_id).unwrap().unwrap();
+        assert_eq!(run.trigger, Trigger::Manual);
+        assert_eq!(run.actor.as_deref(), Some("ada"));
+        // and on the event written with it
+        let queued = &st.runner.store().events(&run_id, 0).unwrap()[0];
+        assert_eq!(queued.kind, model::EventKind::RunQueued);
+        assert_eq!(queued.actor.as_deref(), Some("ada"));
+
+        // a pause is a decision, and the log names whoever made it
+        let Json(body) = set_schedule_state(
+            State(st.clone()),
+            Some(axum::Extension(Identity::admin("ada"))),
+            Json(ScheduleStateBody {
+                job: "etl".into(),
+                expr: "0 * * * *".into(),
+                paused: true,
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(body["ok"], true);
+        let paused = newest_event(&st, model::EventKind::SchedulePaused);
+        assert_eq!(paused.actor.as_deref(), Some("ada"));
+        assert_eq!(paused.about(), Some("etl"));
+
+        // and a cancel says who asked for it. a run still on the queue is
+        // taken off it here, so its terminal event is this call's to write
+        insert_run(&st, "queued", "etl", RunStatus::Queued, json!({}));
+        let (status, _) = asked(
+            &st,
+            "POST",
+            "/api/runs/queued/cancel",
+            Some(("x-user", "ola")),
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+        let canceled = st
+            .runner
+            .store()
+            .events("queued", 0)
+            .unwrap()
+            .into_iter()
+            .find(|e| e.kind == model::EventKind::RunCanceled)
+            .expect("the run was taken off the queue");
+        assert_eq!(canceled.actor.as_deref(), Some("ola"));
+
+        // an unauthenticated deployment records no actor rather than a
+        // fabricated one: an empty name is not "system"
+        let open = state(vec![echo_job("etl")]);
+        let (status, body) = asked(&open, "POST", "/api/jobs/etl/runs", None).await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+        let run_id = body["run_id"].as_str().unwrap();
+        assert_eq!(
+            open.runner.store().run(run_id).unwrap().unwrap().actor,
+            None
+        );
+        assert!(
+            open.runner
+                .store()
+                .events(run_id, 0)
+                .unwrap()
+                .iter()
+                .all(|e| e.actor.is_none())
+        );
     }
 
     // nothing configured serves exactly as it did before any of this existed

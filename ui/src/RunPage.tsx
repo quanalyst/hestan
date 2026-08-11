@@ -346,7 +346,10 @@ function RunView({ id }: { id: string }) {
             <span className="mono secondary">{shortId(run.id)}</span>
           </h1>
           <p className="muted">
-            {run.trigger} · created {relTime(run.created_at)}
+            {run.trigger}
+            {/* "manual, by whom": absent on everything a loop launched, and on
+                every launch through a deployment that checks nobody */}
+            {run.actor && <> by {run.actor}</>} · created {relTime(run.created_at)}
             {/* the hour this run stands for, which is not when it started once
                 a schedule is catching up or a held fire drains */}
             {run.scheduled_for && (

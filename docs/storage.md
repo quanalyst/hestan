@@ -133,7 +133,8 @@ CREATE TABLE runs (
     claimed_by TEXT,                    -- added in v14
     claimed_at TEXT,                    -- added in v14
     lease_until TEXT,                   -- added in v14
-    plan TEXT                           -- added in v14
+    plan TEXT,                          -- added in v14
+    actor TEXT                          -- added in v18
 );
 CREATE INDEX runs_job_created ON runs(job, created_at DESC);
 CREATE INDEX runs_queue ON runs(status, claimed_by, priority DESC, created_at);
@@ -163,7 +164,8 @@ CREATE TABLE events (
     kind TEXT NOT NULL DEFAULT 'log',   -- added in v2
     data TEXT,                          -- added in v2
     subject_kind TEXT NOT NULL DEFAULT 'run',  -- added in v17
-    subject TEXT                        -- added in v17
+    subject TEXT,                       -- added in v17
+    actor TEXT                          -- added in v18
 );
 CREATE INDEX events_run ON events(run_id, seq);
 CREATE INDEX events_subject ON events(subject_kind, subject, seq DESC);
@@ -428,7 +430,11 @@ which is what stops the log being only about runs ([events](events.md)) —
 every existing row is a run event and is stamped `subject_kind = 'run'`, and
 `subject` stays null on a run event because the run is already `run_id` and
 copying it would rewrite the largest table in the database to say the same
-thing twice. an older file at
+thing twice; version 18 adds `runs.actor` and `events.actor`, the name of the
+[identity](auth.md) that asked for a run, a cancel, a pause or a backfill —
+null on every row written before it, and null on everything a schedule, a
+sensor or a loop did on its own, which is the same thing those rows always
+meant. an older file at
 any version opens straight into v17, rows intact — the v8 rebuild copies
 every keyed materialization across, where it becomes that asset's first
 history entry and stays its current one, and v9 leaves every existing row
@@ -437,7 +443,7 @@ pending step
 and the version stamp run in one transaction
 (sqlite DDL is transactional), so a crash or failure mid-migration leaves
 the file exactly as it was found, never half-migrated. a database stamped
-with a version newer than the build refuses to open (`db schema v18 is newer
+with a version newer than the build refuses to open (`db schema v19 is newer
 than this build`) instead of quietly writing an older stamp over it.
 
 **v17 is the one step where the two backends do genuinely different amounts of

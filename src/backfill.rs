@@ -60,7 +60,9 @@ pub(crate) fn start(
         let verdict = &staleness(registry, &mats)[asset];
         keys.retain(|key| verdict.parts.get(key).is_none_or(|s| s.stale));
     }
-    let id = runner.store().create_backfill(asset, from, to, &keys)?;
+    let id = runner
+        .store()
+        .create_backfill(asset, from, to, &keys, runner.actor())?;
     let backfill = runner
         .store()
         .backfill(id)?

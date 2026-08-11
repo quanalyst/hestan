@@ -25,7 +25,8 @@ now every subsystem writes into one log, and each event says what it is about.
   "kind": "asset_materialized",
   "message": "sales/orders[2026-01-01] materialized",
   "data": { "partition": "2026-01-01", "fingerprint": "9f2c…", "run_id": "018f…", "meta": { "rows": { "count": 1240 } } },
-  "ts": "2026-01-01T03:14:07Z"
+  "ts": "2026-01-01T03:14:07Z",
+  "actor": null
 }
 ```
 
@@ -47,6 +48,12 @@ now every subsystem writes into one log, and each event says what it is about.
 - **`level`** is `info`, `warn` or `error`, and it is not the same claim as the
   kind: a check that failed at severity `warn` is a `check_failed` at level
   `warn`, because the run it belongs to succeeded.
+- **`actor`** is who caused it, on the events a person caused and something
+  [checked who they were](auth.md): a launch, a cancel, a pause, a backfill.
+  it is the identity's **name** and never a credential, and it is null on
+  everything a loop did on its own — and on everything at all in a deployment
+  with no authenticator, which has nobody to name. an empty name is not
+  "system".
 
 ## Where an event is written, and why that is the whole design
 
@@ -195,6 +202,18 @@ seventeen thousand evaluations a day, and an activity log in which those are
 99% of the rows is one you cannot read anything else out of. so the log gets
 the ticks that *did* something: launched a run, declined a keyed request, or
 failed.
+
+### Schedules and sensors, paused
+
+| kind | level | payload |
+| --- | --- | --- |
+| `schedule_paused` | info | `expr`, `paused` |
+| `sensor_paused` | info | `paused` |
+
+one kind for both directions: `paused: false` is a resume. `subject` is the job
+for a schedule and the sensor's name for a sensor, and `actor` is whoever asked
+— a paused schedule outlives whoever paused it, which is exactly why the log
+says who.
 
 ### Backfills
 

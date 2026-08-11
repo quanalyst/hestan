@@ -25,15 +25,16 @@ src/
   otel.rs       trace context across the isolated-op boundary (behind otel)
   isolate.rs    isolated ops: the parent, the child, the output capture
   capture.rs    the tracing layer (behind the capture feature)
+  auth.rs       who may drive this: the refusal, the two authenticators, the roles
   cli.rs        the command line: argv, the three modes, doctor, explain (behind cli)
   bin/hestan.rs the standalone operator binary (behind cli)
   error.rs      the Error enum
 ui/             react + vite app; ui/dist is committed and embedded
 examples/       demo.rs and assets.rs (both mount the cli, so both need
                 --features cli), http_source.rs (needs --features http)
-tests/          pipeline.rs, assets.rs, isolation.rs, queue.rs; http_source.rs
-                and notify.rs (need the http feature); capture.rs (needs
-                capture); cli.rs (needs cli)
+tests/          pipeline.rs, assets.rs, isolation.rs, queue.rs, auth.rs;
+                http_source.rs and notify.rs (need the http feature);
+                capture.rs (needs capture); cli.rs (needs cli)
 ```
 
 ## Gates
@@ -163,6 +164,15 @@ is a binary of its own for the same reason `tests/capture.rs` is one — see
 below. it asserts the shape (`hestan.run`, an `hestan.op` per attempt beneath
 it, events on the span they belong to) and exports nothing: turning that tree
 into otel spans is `tracing-opentelemetry`'s job.
+
+`tests/auth.rs` is a binary of its own for a third reason: it has to be both
+halves of what it tests. a child process serves an
+[authenticated](auth.md) deployment with every tracing line on its stdout, and
+the parent drives that deployment over http and then greps both of the child's
+streams, every response it sent, every event and run row, and every byte of the
+database file for the token. a credential that is checked correctly and then
+written into a log line is a credential in a log aggregator, and hestan cannot
+take it back out.
 
 `tests/cli.rs` is the [command line](cli.md) as a process, and it is a binary
 of its own for a reason of its own: an exit code is not something a function

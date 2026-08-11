@@ -19,6 +19,7 @@
 - [launching](launching.md) — presets, params schemas, run tags, subset launches, and cloning a past run.
 - [the command line](cli.md) — `hestan::cli::run` in your own binary: the mount, the three ways to reach a deployment, every command, the exit codes a cron line reads, the output contract, `doctor`, `explain` and dynamic completion.
 - [web ui](web-ui.md) — page-by-page tour of the embedded ui and how it draws status.
+- [authentication](auth.md) — the refusal that keeps an unguarded deployment off a public address, the two authenticators, the three roles endpoint by endpoint, where the ui keeps a token and what that does not protect against, the audit trail, and what this deliberately is not.
 - [scaling](scaling.md) — the run queue, concurrency limits, priority, claims and leases, scheduler and worker roles, the compose example, and what several hosts needs.
 - [http api](http-api.md) — every endpoint, parameter, response shape, and error code.
 - [storage](storage.md) — the two backends and how to choose, the schema, migrations, and crash recovery.

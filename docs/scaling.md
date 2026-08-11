@@ -214,6 +214,13 @@ docker compose up --build
 open http://localhost:4000
 ```
 
+The ui asks for a token the first time, because the compose file binds
+`0.0.0.0` and publishes the port: `serve` refuses a reachable address with
+nothing checking who is asking, so the file sets `HESTAN_TOKEN` and the demo
+picks it up. it is `demo-token-change-me`, which is what a token in a compose
+file deserves to be called — [auth.md](auth.md) has where a real one comes
+from.
+
 Watch the queued section on the runs page fill and drain, and `claimed_by` on
 a run say which worker took it. Both workers have `HESTAN_SLOTS=2` and the
 deployment has `HESTAN_MAX_CONCURRENT_RUNS=4`.

@@ -28,6 +28,7 @@ const event = (
   message,
   data: null,
   ts,
+  actor: null,
 });
 
 const printed = (

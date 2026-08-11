@@ -26,6 +26,7 @@ const ev = (
   message,
   data: null,
   ts: "2026-01-01T00:00:00Z",
+  actor: null,
 });
 
 const row = (e: RunEvent): FeedRow => ({ kind: "event", event: e });

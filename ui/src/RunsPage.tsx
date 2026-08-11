@@ -431,7 +431,10 @@ export default function RunsPage() {
                         {run.job}
                         <TagChips tags={run.tags} />
                       </td>
-                      <td>{run.trigger}</td>
+                      <td>
+                        {run.trigger}
+                        {run.actor && <span className="muted"> {run.actor}</span>}
+                      </td>
                       <td className="muted">{relTime(run.started_at ?? run.created_at)}</td>
                       <td className="num">
                         {fmtDuration(d)}

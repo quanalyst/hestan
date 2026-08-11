@@ -5,6 +5,32 @@ executable is all there is. it polls the [json api](http-api.md) and works
 entirely from real state. seven pages: jobs (the overview at `/`), a job page,
 the asset catalog, an asset page, runs, a run page, and a backfill page.
 
+## Who is driving
+
+on a deployment with no [authentication](auth.md) — which is the loopback
+default — the ui is what it always was: it asks nobody who you are and offers
+everything.
+
+on one that checks, the ui asks `/api/whoami` before anything else and shows a
+token prompt if it holds nothing the deployment recognizes. the token lives in
+`sessionStorage`, scoped to the tab and dropped when it closes; the prompt says
+what that does not protect against, and
+[auth.md](auth.md#where-the-token-lives-and-what-that-does-not-protect-against)
+says it at length. who you are sits at the right of the header —
+`ada · admin` — with a way to forget the token where the tab is holding one.
+
+**a control your role may not use is not rendered.** a viewer's job page says
+`launching needs an operator` where the launch controls would be; cancel,
+re-run, resume, build, backfill, pause, presets and the queue's `bump` are
+absent the same way, and the palette does not offer the actions it would
+refuse. a button that answers 403 teaches people that the ui lies about what
+they can do.
+
+one thing changes shape rather than disappearing: the activity feed **polls**
+instead of following the live stream when the tab holds a token, because an
+`EventSource` cannot carry a header and the alternative is a credential in a
+url — and so in a log, and in the browser's history.
+
 ## The status language
 
 the ui is monochrome, so shape carries state — grey level alone never does:
@@ -498,8 +524,8 @@ inventing one for it.
 ## Command palette
 
 `cmd-k` / `ctrl-k` anywhere. it searches jobs (name and description), the 50
-most recent runs (id, job, status, trigger), and schedule actions — pause and
-resume for every schedule. the query is tokenized; every token must match.
+most recent runs (id, job, status, trigger), and — for an admin — schedule
+actions, pause and resume for every schedule. the query is tokenized; every token must match.
 arrows move, enter performs, escape closes, tab is trapped so focus stays in
 the input. a failed action (say, resuming a schedule that no longer exists)
 prints the server's error at the foot of the palette.
