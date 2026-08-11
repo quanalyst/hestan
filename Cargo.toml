@@ -21,6 +21,11 @@ cron = "0.17"
 futures = "0.3"
 include_dir = "0.7"
 mime_guess = "2"
+# the `otel` feature only: the opentelemetry context types, the w3c propagator
+# that carries one across a process boundary, and the tracing bridge that reads
+# a span's context out of the host's subscriber. no exporter, no provider
+opentelemetry = { version = "0.32", optional = true }
+opentelemetry_sdk = { version = "0.32", optional = true, default-features = false, features = ["trace"] }
 reqwest = { version = "0.12", optional = true, default-features = false, features = ["json", "rustls-tls"] }
 rusqlite = "0.32"
 serde = { version = "1", features = ["derive"] }
@@ -30,6 +35,7 @@ thiserror = "2"
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "net", "time", "sync", "macros", "process", "signal", "io-util"] }
 tokio-postgres = { version = "0.7", optional = true }
 tracing = "0.1"
+tracing-opentelemetry = { version = "0.33", optional = true, default-features = false }
 # the `capture` feature only: the Layer trait the host composes hestan's
 # capture layer into its own subscriber with
 tracing-subscriber = { version = "0.3", optional = true, default-features = false, features = ["registry", "std"] }
@@ -61,6 +67,11 @@ capture = ["dep:tracing-subscriber"]
 # a shared run log on a postgres server, for the deployments sqlite's one-host
 # file cannot serve. sqlite stays the default and needs no server
 postgres = ["dep:tokio-postgres"]
+# a run as a distributed trace: `hestan::otel`, and the w3c context an isolated
+# op's subprocess is handed so its spans nest under the op that spawned it. off
+# by default, and it installs nothing — the host composes the layer and owns
+# the exporter, exactly as it does for `capture`
+otel = ["dep:opentelemetry", "dep:opentelemetry_sdk", "dep:tracing-opentelemetry"]
 
 [[example]]
 name = "http_source"
@@ -80,6 +91,11 @@ required-features = ["http"]
 [[test]]
 name = "capture"
 required-features = ["capture"]
+
+# and the span shape a run has on the trace bus, for the same reason
+[[test]]
+name = "otel"
+required-features = ["otel"]
 
 # an isolated op re-executes `current_exe()`, so this target needs a `main` of
 # its own that rebuilds the same jobs — see the comment at the top of the file

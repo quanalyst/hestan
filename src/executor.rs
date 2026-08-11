@@ -1565,8 +1565,49 @@ pub(crate) async fn run_dispatcher(runner: Runner) {
     }
 }
 
+/// one run, inside one span.
+///
+/// the span is the root of the tree `docs/events.md` calls a trace: every
+/// attempt below opens a child of it. it costs nothing when nothing is
+/// subscribed, and it is what the `otel` feature exports. it is passed *into*
+/// the work as well as wrapped around it because `tokio::spawn` carries no
+/// span into the task it starts, and every op runs in one.
 #[allow(clippy::too_many_arguments)]
 async fn execute(
+    job: Job,
+    run_id: String,
+    params: Value,
+    trigger: Trigger,
+    scheduled_for: Option<DateTime<Utc>>,
+    runner: Runner,
+    cancel: watch::Receiver<bool>,
+    pending: Vec<String>,
+    seeded: HashMap<String, Value>,
+) {
+    let run_span = tracing::info_span!(
+        "hestan.run",
+        run_id = %run_id,
+        job = %job.name(),
+        trigger = %trigger
+    );
+    execute_in_span(
+        job,
+        run_id,
+        params,
+        trigger,
+        scheduled_for,
+        runner,
+        cancel,
+        pending,
+        seeded,
+        run_span.clone(),
+    )
+    .instrument(run_span)
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn execute_in_span(
     job: Job,
     run_id: String,
     params: Value,
@@ -1576,6 +1617,7 @@ async fn execute(
     mut cancel: watch::Receiver<bool>,
     pending: Vec<String>,
     seeded: HashMap<String, Value>,
+    run_span: tracing::Span,
 ) {
     let store = runner.store.clone();
     let started_at = Utc::now();
@@ -1886,23 +1928,31 @@ async fn execute(
                 );
                 continue;
             }
-            let handle = tasks.spawn(run_op(
-                op,
-                name.clone(),
-                instances.get(&name).map(|i| i.element.clone()),
-                job.name().to_string(),
-                run_id.clone(),
-                params.clone(),
-                scheduled_for,
-                Arc::new(inputs),
-                Arc::new(dep_statuses),
-                invocation,
-                runner.resources.clone(),
-                store.clone(),
-                runner.pools.clone(),
-                op_hooks.clone(),
-                cancel.clone(),
-            ));
+            // instrumented as well as parented: what `run_op` itself writes to the
+            // run log is hestan narrating the run, and belongs on the run's own
+            // span. what the op body says belongs on the attempt's, and gets
+            // there because the body is instrumented with that one
+            let handle = tasks.spawn(
+                run_op(
+                    op,
+                    name.clone(),
+                    instances.get(&name).map(|i| i.element.clone()),
+                    job.name().to_string(),
+                    run_id.clone(),
+                    params.clone(),
+                    scheduled_for,
+                    Arc::new(inputs),
+                    Arc::new(dep_statuses),
+                    invocation,
+                    runner.resources.clone(),
+                    store.clone(),
+                    runner.pools.clone(),
+                    op_hooks.clone(),
+                    cancel.clone(),
+                    run_span.clone(),
+                )
+                .instrument(run_span.clone()),
+            );
             if !op_isolated {
                 abortable.insert(handle.id(), handle.clone());
             }
@@ -2504,6 +2554,11 @@ async fn run_op(
     pools: Pools,
     hooks: Arc<Vec<OpHook>>,
     cancel: watch::Receiver<bool>,
+    // the run this op belongs to, as a span. every attempt opens a child of it,
+    // which is what makes a run a tree rather than a pile of unrelated spans —
+    // `tokio::spawn` carries no span into the task it starts, so it is passed
+    // rather than inherited
+    run_span: tracing::Span,
 ) -> OpOutcome {
     // loaded once, before attempt 1: every retry sees the same starting state
     let state = Arc::new(match store.op_state(&job, &name) {
@@ -2545,6 +2600,20 @@ async fn run_op(
         },
     };
     loop {
+        // one span per attempt, and a retry gets its own rather than a second
+        // annotation on the first: two attempts of an op are two spans of
+        // different lengths and that is what a waterfall has to show. it is
+        // also the span `capture_layer` reads its three fields off, and — for
+        // an isolated op — the span whose context the child is handed.
+        //
+        // costs nothing when nothing is subscribed, which is the ordinary case.
+        let span = tracing::info_span!(
+            parent: &run_span,
+            "hestan.op",
+            run_id = %run_id,
+            op = %name,
+            attempt
+        );
         // fresh buffers per attempt: a failed attempt's staged state and
         // metadata must not leak into the one that works
         let new_state = Arc::new(Mutex::new(None));
@@ -2599,7 +2668,10 @@ async fn run_op(
                 // the body runs in a child, which owns the whole of what an
                 // attempt is: its own timeout, its own kill
                 Some(invocation) => {
-                    isolated(&op, &run_id, &name, attempt, invocation, &store, &cancel).await
+                    isolated(
+                        &op, &run_id, &name, attempt, invocation, &store, &cancel, &span,
+                    )
+                    .await
                 }
                 None => {
                     // the call sits inside the async block, so a closure that panics
@@ -2610,13 +2682,10 @@ async fn run_op(
                     // an op: `capture_layer` stores events whose span context
                     // carries these three fields and ignores everything else,
                     // which is how a library captures its ops' logging without
-                    // touching the host application's. it costs nothing when
-                    // nothing is subscribed
-                    let span =
-                        tracing::info_span!("hestan.op", run_id = %run_id, op = %name, attempt);
+                    // touching the host application's
                     let call = AssertUnwindSafe(async { op.call(ctx).await })
                         .catch_unwind()
-                        .instrument(span);
+                        .instrument(span.clone());
                     let caught = match op.timeout_after() {
                         None => Ok(call.await),
                         Some(limit) => match tokio::time::timeout(limit, call).await {
@@ -2763,14 +2832,17 @@ async fn isolated(
     invocation: &Value,
     store: &Store,
     cancel: &watch::Receiver<bool>,
+    // this attempt's span. the child is handed its trace context, which is the
+    // only way a subprocess's spans can nest under the op that spawned it
+    span: &tracing::Span,
 ) -> Ended {
     #[cfg(unix)]
     {
-        crate::isolate::attempt(op, run_id, name, attempt, invocation, store, cancel).await
+        crate::isolate::attempt(op, run_id, name, attempt, invocation, store, cancel, span).await
     }
     #[cfg(not(unix))]
     {
-        let _ = (op, run_id, attempt, invocation, store, cancel);
+        let _ = (op, run_id, attempt, invocation, store, cancel, span);
         Ended::Failed(format!(
             "op {name} is isolated, which hestan supports on unix only"
         ))

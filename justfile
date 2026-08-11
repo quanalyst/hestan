@@ -5,10 +5,12 @@ check:
     cargo clippy --all-targets --features http -- -D warnings
     cargo clippy --all-targets --features capture -- -D warnings
     cargo clippy --all-targets --features postgres -- -D warnings
+    cargo clippy --all-targets --features otel -- -D warnings
     cargo test
     cargo test --features http
     cargo test --features capture
     cargo test --features postgres
+    cargo test --features otel
 
 # the same, with the postgres half of the store suite actually running
 check-pg url="postgres://hestan:hestan@localhost/hestan_test":

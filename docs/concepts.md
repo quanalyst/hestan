@@ -22,12 +22,23 @@ an *op run* row: status
 (`pending | running | success | failed | skipped | canceled`), attempt count,
 start/finish times, and the output or error.
 
-*events* are the append-only log attached to a run. each carries a level
-(`info | warn | error`), a kind, a message, and optional structured json
-`data`. the kinds: `run_queued`, `run_started`, `run_success`, `run_failed`,
-`run_canceled`, `op_started`, `op_expanded`, `op_retry`, `op_success`,
-`op_failed`, `op_skipped`, `op_canceled`, `type_check_failed`, and `log` — the last is
-what `ctx.info/warn/error` emit.
+*events* are the append-only log of the whole deployment. each carries a level
+(`info | warn | error`), a kind, a message, optional structured json `data`,
+and — this is the part that stopped being about runs in v17 — a **subject**:
+`subject_kind` is one of `run`, `job`, `asset`, `schedule`, `sensor`,
+`backfill` or `system`, and `subject` names which one. so an asset
+materialized, a schedule that fired or was skipped, a sensor tick, a backfill's
+chunks, an alert nobody received and a lease reclaimed from a dead worker are
+all in the same log the run kinds are, and "what happened last night" is one
+query.
+
+a run's own kinds are `run_queued`, `run_started`, `run_success`, `run_failed`,
+`run_canceled`, `run_reclaimed`, `op_started`, `op_expanded`, `op_retry`,
+`op_success`, `op_failed`, `op_skipped`, `op_canceled`, `type_check_failed`,
+and `log` — the last is what `ctx.info/warn/error` emit. [events](events.md)
+has every kind, what each payload carries, where each one is written and which
+of them cannot be atomic, how to query and follow the log, and how a run maps
+onto a distributed trace.
 
 *captured output* is the other log, and a different thing: what the op itself
 printed rather than what hestan said about it. an [isolated op](isolation.md)'s

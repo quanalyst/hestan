@@ -3863,8 +3863,36 @@ impl<'a> NewEvent<'a> {
     }
 }
 
+/// hestan's own run log, mirrored onto the `tracing` bus as it is written.
+///
+/// this is what "an event becomes a span event" means, and it is the whole of
+/// it: the event lands on whatever span is current where it was written, which
+/// for anything an op says is that attempt's `hestan.op` and for hestan's own
+/// narration of a run is that run's `hestan.run`. a host with an otel layer
+/// composed sees them on the spans; a host with none pays a level check.
+///
+/// `crate::logs::TRACE_TARGET` rather than the module path, because
+/// [`CaptureLayer`](crate::CaptureLayer) has to be able to tell hestan talking
+/// about the op from the op talking.
+fn trace_event(ev: &NewEvent<'_>) {
+    let (kind, subject) = (ev.kind.as_str(), ev.subject.as_deref().or(ev.run_id));
+    let message = ev.message.as_ref();
+    match ev.level {
+        EventLevel::Info => {
+            tracing::info!(target: crate::logs::TRACE_TARGET, kind, subject, "{message}");
+        }
+        EventLevel::Warn => {
+            tracing::warn!(target: crate::logs::TRACE_TARGET, kind, subject, "{message}");
+        }
+        EventLevel::Error => {
+            tracing::error!(target: crate::logs::TRACE_TARGET, kind, subject, "{message}");
+        }
+    }
+}
+
 /// append one event, inside whatever the caller is already in.
 fn write_event(tx: &mut impl Exec, ev: &NewEvent<'_>, at: DateTime<Utc>) -> Result<(), Error> {
+    trace_event(ev);
     tx.execute(
         "INSERT INTO events (run_id, subject_kind, subject, op, level, kind, message, data, ts)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",

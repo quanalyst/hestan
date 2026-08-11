@@ -38,7 +38,7 @@ use tracing::{Event, Level, Subscriber};
 use tracing_subscriber::layer::{Context, Layer};
 use tracing_subscriber::registry::LookupSpan;
 
-use crate::logs::{Attempt, Budget, HESTAN, Source};
+use crate::logs::{Attempt, Budget, HESTAN, Source, TRACE_TARGET};
 use crate::model::EventLevel;
 use crate::store::Store;
 
@@ -160,6 +160,12 @@ where
     /// the first attempt it finds, so an op that opens spans of its own inside
     /// its body still attributes to the attempt those spans are under.
     fn on_event(&self, event: &Event<'_>, ctx: Context<'_, S>) {
+        // hestan narrating its own run log onto the trace bus. it is already
+        // stored, as an event; storing it again as captured output would put
+        // every line of the run log twice on the run page
+        if event.metadata().target() == TRACE_TARGET {
+            return;
+        }
         let Some(mut scope) = ctx.event_scope(event) else {
             return;
         };

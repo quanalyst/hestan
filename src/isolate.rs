@@ -40,6 +40,7 @@ use serde_json::{Value, json};
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::{Child, Command};
 use tokio::sync::watch;
+use tracing::Instrument;
 
 use crate::error::Error;
 use crate::executor::{CANCEL_GRACE, Ended, note, panic_payload};
@@ -91,6 +92,7 @@ pub(crate) enum Worked {
 /// killed it, because that containment is the entire point of running it
 /// elsewhere. what it printed before dying is kept either way, and is usually
 /// the only thing that says what it was doing.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn attempt(
     op: &Op,
     run_id: &str,
@@ -99,6 +101,7 @@ pub(crate) async fn attempt(
     invocation: &Value,
     store: &Store,
     cancel: &watch::Receiver<bool>,
+    span: &tracing::Span,
 ) -> Ended {
     // this op may have spent the last minute waiting for a pool permit, and the
     // run may have been canceled in it. starting a process now would be work
@@ -115,7 +118,18 @@ pub(crate) async fn attempt(
         Ok(exe) => exe,
         Err(e) => return Ended::Failed(format!("could not find this binary to re-execute: {e}")),
     };
-    let mut child = match Command::new(&exe)
+    let mut command = Command::new(&exe);
+    // the trace context of the attempt that is spawning this, so the child's
+    // spans nest under it rather than starting a trace of their own. empty
+    // unless the `otel` feature is on *and* the host composed a layer, and an
+    // empty carrier is nothing to pass — see `crate::otel`
+    #[cfg(feature = "otel")]
+    for (key, value) in crate::otel::carry(span) {
+        command.env(key, value);
+    }
+    #[cfg(not(feature = "otel"))]
+    let _ = span;
+    let mut child = match command
         .env(RUN_VAR, run_id)
         .env(OP_VAR, name)
         // both pipes, and both drained below: what the child prints is the op's
@@ -503,6 +517,26 @@ pub(crate) async fn run_one_op(
         store: store.clone(),
     };
 
+    // the same span the parent opens around an in-process attempt, and — with
+    // the `otel` feature — a child of the parent's, taken from the trace
+    // context in this process's environment. that is the whole of what makes a
+    // subprocess's spans land under the op that spawned it rather than in a
+    // trace of their own; `crate::otel` says what it does not do.
+    let span = tracing::info_span!(
+        "hestan.op",
+        run_id = %req.run_id,
+        op = %req.op,
+        // which attempt this child is: the parent wrote it on the op run row
+        // before spawning, and the child has no other way to know
+        attempt = store
+            .op_run(&req.run_id, &req.op)
+            .ok()
+            .flatten()
+            .map_or(1, |o| o.attempts),
+    );
+    #[cfg(feature = "otel")]
+    crate::otel::adopt(&span);
+
     // last, so what the limits cap is the body and not the loading of its
     // inputs — and refused outright if they cannot be applied, since an op that
     // ran uncapped believing otherwise is the one outcome worth nobody's time
@@ -511,6 +545,7 @@ pub(crate) async fn run_one_op(
         Ok(()) => {
             let called = AssertUnwindSafe(async { op.call(ctx).await })
                 .catch_unwind()
+                .instrument(span)
                 .await;
             match called {
                 Ok(Ok(output)) => Ok(output),

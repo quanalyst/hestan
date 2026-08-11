@@ -155,15 +155,18 @@ CREATE TABLE op_runs (
 
 CREATE TABLE events (
     seq INTEGER PRIMARY KEY AUTOINCREMENT,
-    run_id TEXT NOT NULL,
+    run_id TEXT,                        -- nullable since v17
     op TEXT,
     level TEXT NOT NULL,
     message TEXT NOT NULL,
     ts TEXT NOT NULL,
     kind TEXT NOT NULL DEFAULT 'log',   -- added in v2
-    data TEXT                           -- added in v2
+    data TEXT,                          -- added in v2
+    subject_kind TEXT NOT NULL DEFAULT 'run',  -- added in v17
+    subject TEXT                        -- added in v17
 );
 CREATE INDEX events_run ON events(run_id, seq);
+CREATE INDEX events_subject ON events(subject_kind, subject, seq DESC);
 
 CREATE TABLE schedules (
     job TEXT NOT NULL,
@@ -419,8 +422,14 @@ memory, and whoever claims the run may not be that process; version 15 adds
 the `op_logs` table ([logs](logs.md)), empty for every run that finished
 before there was anywhere to put what an op printed; version 16 adds the
 `notifications` table ([durable delivery](notifications.md#durable-delivery)),
-which stays empty unless a process asks for it. an older file at
-any version opens straight into v16, rows intact — the v8 rebuild copies
+which stays empty unless a process asks for it; version 17 makes
+`events.run_id` nullable and adds `events.subject_kind` and `events.subject`,
+which is what stops the log being only about runs ([events](events.md)) —
+every existing row is a run event and is stamped `subject_kind = 'run'`, and
+`subject` stays null on a run event because the run is already `run_id` and
+copying it would rewrite the largest table in the database to say the same
+thing twice. an older file at
+any version opens straight into v17, rows intact — the v8 rebuild copies
 every keyed materialization across, where it becomes that asset's first
 history entry and stays its current one, and v9 leaves every existing row
 with a null partition, which is exactly what an unpartitioned asset is. every
@@ -428,8 +437,25 @@ pending step
 and the version stamp run in one transaction
 (sqlite DDL is transactional), so a crash or failure mid-migration leaves
 the file exactly as it was found, never half-migrated. a database stamped
-with a version newer than the build refuses to open (`db schema v17 is newer
+with a version newer than the build refuses to open (`db schema v18 is newer
 than this build`) instead of quietly writing an older stamp over it.
+
+**v17 is the one step where the two backends do genuinely different amounts of
+work,** and it is worth knowing which way round. sqlite has no
+`ALTER TABLE ... ALTER COLUMN`, so dropping a `NOT NULL` means rebuilding the
+table and copying every row — on a database with a year of events in it that is
+the expensive part of the upgrade, and it happens inside the one transaction
+like everything else, so an interrupted one leaves the file as it was found.
+postgres drops the constraint and adds two defaulted columns in the catalog and
+touches no row at all; only the new index reads the table. a large postgres
+database migrates in about as long as it takes to build one index, and a large
+sqlite one takes as long as it takes to copy the table.
+
+postgres has a forward chain of its own as of v17. before it, a postgres
+database was always created whole at the current version — there had never been
+an older one to move — so `pg::migrate` only ever stamped or refused. it now
+reads the stamp and applies the steps above it, in order, in one transaction,
+exactly as the sqlite chain does.
 
 one wrinkle: databases written before the migration mechanism existed carry
 the v1 tables at `user_version` 0. open detects that case (version 0 with a
@@ -542,9 +568,13 @@ day forever — and delivered [notifications](notifications.md) older than it.
 undelivered notifications stay at any age: one that never got through is not
 history, it is something outstanding.
 
-two tick logs are trimmed by the same sweep whether or not a retention policy
-is configured, because both grow with time rather than with what you keep:
-`schedule_ticks` and `sensor_ticks` are each capped at their newest 5000 rows.
+three logs are trimmed by the same sweep whether or not a retention policy is
+configured, because all of them grow with time rather than with what you keep:
+`schedule_ticks` and `sensor_ticks` are each capped at their newest 5000 rows,
+and the [events](events.md) that belong to no run — everything v17 added — at
+their newest 50,000. a run's own events go when the run does and always did;
+what is new is that an asset built every five minutes writes a row nothing
+would otherwise ever collect.
 `asset_materializations` is capped *per asset*, and `asset_checks` per
 `(asset, check)`, at the newest 200 each — or whatever
 `Hestan::asset_history(n)` says — and those two are trimmed at startup. the

@@ -195,9 +195,22 @@ appears.
   itself forward via `PRAGMA user_version`, and runs whose claimer went away
   are marked failed on the next start — while a run another process is holding
   a live lease on is left exactly alone
-- events are structured: each carries a `kind` (`run_queued`, `op_retry`,
-  `type_check_failed`, ...) and optional json data alongside the
-  human-readable message; `ctx.info/warn/error` emit `kind=log`
+- **one event log for the whole deployment**, not just for runs. each event
+  carries a `kind`, a documented json payload, and a *subject* — an asset, a
+  schedule, a sensor, a backfill, a job, a run, or hestan itself — so "what
+  happened last night" is one query: `GET /api/events?since=…&level=error`.
+  each is written by the subsystem that does the work **in the transaction
+  that does it**, because an event written next to the row instead is a claim
+  a crash can falsify; the three places with no transaction to join are named
+  in [docs/events.md](docs/events.md) with the window each leaves.
+  `GET /api/events/stream` follows it live from a cursor, and the ui has an
+  Activity view over it
+- **a run is a distributed trace**, with `--features otel`: the run is a span,
+  each attempt is a span beneath it, a retry is its own span, and an
+  [isolated op](docs/isolation.md)'s subprocess is handed the w3c trace context
+  so its spans nest under the op that spawned it — across the fork, which is
+  the part nothing else does. hestan installs no exporter and no subscriber:
+  you compose `tracing-opentelemetry` into yours, exactly as with `capture`
 - **what an op *printed* is captured too**, and the two cases differ on
   purpose. an isolated op is a subprocess, so its stdout and stderr are piped
   and stored whole — `println!`, a linked c library, all of it — with both
@@ -310,7 +323,7 @@ the details live in [docs/](docs/README.md):
 [typed io](docs/typed-io.md), [resources](docs/resources.md),
 [io managers](docs/io-managers.md), [op state](docs/state.md),
 [isolation](docs/isolation.md),
-[metadata](docs/metadata.md), [logs](docs/logs.md),
+[metadata](docs/metadata.md), [events](docs/events.md), [logs](docs/logs.md),
 [assets](docs/assets.md), [freshness](docs/freshness.md),
 [sensors](docs/sensors.md),
 [scheduling](docs/scheduling.md), [http sources](docs/http-sources.md),

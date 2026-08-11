@@ -22,6 +22,7 @@ src/
   http.rs       HttpSource (behind the http feature)
   notify.rs     webhook/slack failure hooks (behind the http feature)
   logs.rs       what an op printed: the op_logs writers and their cap
+  otel.rs       trace context across the isolated-op boundary (behind otel)
   isolate.rs    isolated ops: the parent, the child, the output capture
   capture.rs    the tracing layer (behind the capture feature)
   error.rs      the Error enum
@@ -33,10 +34,10 @@ tests/          pipeline.rs, assets.rs, isolation.rs, queue.rs; http_source.rs
 
 ## Gates
 
-`just check` runs exactly what ci runs. `http`, `capture` and `postgres` each
-compile real extra code (and each of the first two gates a test target via
-`required-features`), and the crate has to be clean without them as well as
-with them — so four configurations are checked rather than one:
+`just check` runs exactly what ci runs. `http`, `capture`, `postgres` and
+`otel` each compile real extra code (and all but the first gate a test target
+via `required-features`), and the crate has to be clean without them as well
+as with them — so five configurations are checked rather than one:
 
 ```
 cargo fmt --check
@@ -44,10 +45,12 @@ cargo clippy --all-targets -- -D warnings
 cargo clippy --all-targets --features http -- -D warnings
 cargo clippy --all-targets --features capture -- -D warnings
 cargo clippy --all-targets --features postgres -- -D warnings
+cargo clippy --all-targets --features otel -- -D warnings
 cargo test
 cargo test --features http
 cargo test --features capture
 cargo test --features postgres
+cargo test --features otel
 ```
 
 ci additionally runs the ui's own gates — `npm run lint`, `npm test` and
@@ -146,6 +149,12 @@ typed io, params rejection, op state, cancellation, failure hooks.
 http retry policy, fan-out, and `bearer_env`; `tests/notify.rs` does the
 same for the webhook and slack hooks. both only exist under
 `--features http`.
+
+`tests/otel.rs` is the span tree a run opens, against a real subscriber, and it
+is a binary of its own for the same reason `tests/capture.rs` is one — see
+below. it asserts the shape (`hestan.run`, an `hestan.op` per attempt beneath
+it, events on the span they belong to) and exports nothing: turning that tree
+into otel spans is `tracing-opentelemetry`'s job.
 
 `tests/capture.rs` is the [capture layer](logs.md) against a real subscriber,
 and it is a binary of its own for a reason worth knowing: `tracing` caches a

@@ -27,6 +27,10 @@ mod model;
 #[cfg(feature = "http")]
 pub mod notify;
 mod op;
+// a run as a distributed trace. optional because it is a dependency on the
+// opentelemetry crates, and off because hestan installs no exporter
+#[cfg(feature = "otel")]
+pub mod otel;
 mod partition;
 // a shared run log on a postgres server. optional because sqlite is the right
 // default for one process and needs no server at all
@@ -65,7 +69,7 @@ pub use resource::ResourceCtx;
 pub use retention::Retention;
 pub use schedule::Schedule;
 pub use sensor::{RunRequest, RunStatusSensor, RunSummary, Sensor, SensorCtx};
-pub use store::{EventQuery, Store};
+pub use store::{EventQuery, Settled, Store};
 
 pub mod prelude {
     pub use crate::{

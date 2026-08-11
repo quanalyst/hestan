@@ -369,6 +369,94 @@ it is the one page that is not about a single thing. every other page answers
 deployment been doing", which is the question you have at 3am and the one
 hestan could not previously answer at all.
 
+## The same run, as a trace
+
+a run is already a causal tree: a run, its ops, an attempt each, and for an
+[isolated op](isolation.md) a subprocess under that. that is what a distributed
+trace is, and the optional `otel` feature emits it as one — so a pipeline shows
+up in Grafana or Jaeger beside the services it calls, rather than in a tab of
+its own.
+
+```toml
+hestan = { version = "0.1", features = ["otel"] }
+```
+
+**hestan installs nothing.** no subscriber, no tracer provider, no exporter,
+no environment variable of its own. it opens `tracing` spans with the right
+shape and the right fields; the host composes
+[`tracing-opentelemetry`](https://docs.rs/tracing-opentelemetry) into the
+subscriber it was going to build anyway — the same arrangement the
+[capture layer](logs.md) uses, and for the same reason.
+
+```rust
+use tracing_subscriber::prelude::*;
+
+tracing_subscriber::registry()
+    .with(tracing_subscriber::fmt::layer())
+    .with(tracing_opentelemetry::layer().with_tracer(your_tracer))
+    .init();
+```
+
+### What maps to what
+
+| hestan | span |
+| --- | --- |
+| a run | `hestan.run`, the root, with `run_id`, `job`, `trigger` |
+| one attempt of an op | `hestan.op` beneath it, with `run_id`, `op`, `attempt` |
+| a retry | another `hestan.op` with the next `attempt` — its own span, not an annotation on the first |
+| an event | a span event: on the attempt's span for anything the op body said, on the run's for hestan's own narration |
+
+the span fields are exactly the ones the capture layer reads, because they are
+the same spans. a build with both features composes both layers and each takes
+what it wants; the capture layer ignores the `hestan::events` target the run
+log is mirrored under, so nothing is stored twice.
+
+### Across the process boundary
+
+an isolated op runs in a subprocess, and a subprocess is where every other
+orchestrator's trace stops. hestan hands the child its parent attempt's
+[w3c trace context](https://www.w3.org/TR/trace-context/) in the environment —
+`traceparent`, and `tracestate` if there is one — and the child parents its own
+`hestan.op` span to it. so spans the child's code opens nest under the op that
+spawned them, in the same trace, across the fork.
+
+that is the part nothing else does, and here is exactly how far it goes.
+
+### What it does not do
+
+**a child's spans are exported only if the child's binary exports.** an
+isolated op re-executes *your* binary; the tracer provider in that process is
+the one your `main` built. hestan can hand the child a parent, and does. it
+cannot give it an exporter.
+
+- child composes an otel layer → its spans nest correctly under the parent's
+  `hestan.op`. this is the case worth having.
+- child composes nothing → no child spans at all. the parent's `hestan.op`
+  still covers the whole of the child's execution, because hestan times the
+  subprocess, so the trace is complete at op granularity and missing only what
+  happened inside.
+
+**hestan will not flush the child's exporter.** a batch exporter that has not
+shipped when the child exits loses those spans, and short-lived processes are
+exactly where that bites. the provider belongs to the host, so the host's child
+path has to flush before `main` returns. hestan reaching into a provider it
+does not own to do it would be a library taking over an application's
+telemetry, which is the thing this whole design refuses.
+
+**a context is only carried when there is one.** with the feature on and no
+layer composed, `carry` produces nothing and the child is handed nothing —
+rather than a synthesised trace id that leads nowhere.
+
+**nothing outside a run is traced.** a schedule firing, a sensor evaluating, a
+retention sweep: those are events in the log and they are not spans. a trace is
+a run and the work under it; the rest of the log is the log.
+
+**the versions have to match.** `opentelemetry` and `tracing-opentelemetry` do
+not promise compatibility across releases, and a host on a different major of
+either will not compile against this. hestan tracks the current pair
+(`opentelemetry` 0.32, `tracing-opentelemetry` 0.33) and says so here rather
+than pretending the constraint is not there.
+
 ## Retention
 
 a run's events are deleted with the run, by [retention](storage.md), and always

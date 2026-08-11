@@ -42,6 +42,15 @@ pub(crate) const CLIPPED: &str = "… [truncated]";
 /// marker for the ui.
 pub(crate) const HESTAN: &str = "hestan";
 
+/// the target hestan's own [run-log events](crate::Event) are mirrored onto the
+/// `tracing` bus under, so that a host composing an otel layer gets them as
+/// span events.
+///
+/// a target of its own because [`CaptureLayer`](crate::CaptureLayer) has to
+/// ignore exactly these: the run log is already the run log, and storing it
+/// again as captured output would print every line of it twice on the run page.
+pub(crate) const TRACE_TARGET: &str = "hestan::events";
+
 /// how much one attempt may store, for this process.
 ///
 /// process-wide rather than per [`Store`], and that is not laziness. the two
