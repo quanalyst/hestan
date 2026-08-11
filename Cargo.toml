@@ -17,6 +17,10 @@ all-features = true
 axum = "0.8"
 chrono = { version = "0.4", features = ["serde"] }
 chrono-tz = "0.10"
+# the `cli` feature only: argv, the help text and the usage errors. optional
+# because a library has no business owning a process's arguments until it is
+# handed them
+clap = { version = "4", optional = true, features = ["derive"] }
 cron = "0.17"
 futures = "0.3"
 include_dir = "0.7"
@@ -60,6 +64,10 @@ default = ["bundled"]
 # compiles sqlite from source; disable to link the system library
 bundled = ["rusqlite/bundled"]
 http = ["dep:reqwest"]
+# a command line in your own binary: `hestan::cli::run`, and the standalone
+# `hestan` binary beside it. off by default because a deployment that only
+# serves should not compile a parser it never calls
+cli = ["dep:clap"]
 # `hestan::capture_layer`, for a host that wants the tracing events its ops
 # emit on the run page. off by default: it is the host's subscriber, and
 # hestan does not install one
@@ -72,6 +80,10 @@ postgres = ["dep:tokio-postgres"]
 # by default, and it installs nothing — the host composes the layer and owns
 # the exporter, exactly as it does for `capture`
 otel = ["dep:opentelemetry", "dep:opentelemetry_sdk", "dep:tracing-opentelemetry"]
+
+[[example]]
+name = "demo"
+required-features = ["cli"]
 
 [[example]]
 name = "http_source"
@@ -108,3 +120,11 @@ harness = false
 [[test]]
 name = "queue"
 harness = false
+
+# every case in the cli suite is this same binary started with argv and watched
+# for what it exits with, which is not something a function call has — so it
+# needs a `main` of its own that can be the command line
+[[test]]
+name = "cli"
+harness = false
+required-features = ["cli"]

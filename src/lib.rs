@@ -9,6 +9,11 @@ mod backoff;
 // hestan installs no subscriber and will not make anyone depend on one
 #[cfg(feature = "capture")]
 mod capture;
+// the command line this binary already knows everything to serve. optional
+// because it is a dependency on an argument parser, and because owning argv is
+// something a host asks for rather than something a library takes
+#[cfg(feature = "cli")]
+pub mod cli;
 mod error;
 mod executor;
 mod freshness;

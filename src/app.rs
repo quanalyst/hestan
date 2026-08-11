@@ -906,7 +906,7 @@ impl Hestan {
     /// not to be confused with [`work`](Self::work), the queue worker, which
     /// is long-lived and claims whole runs.
     #[cfg(unix)]
-    async fn run_op_subprocess(mut self, req: crate::isolate::Request) -> ! {
+    pub(crate) async fn run_op_subprocess(mut self, req: crate::isolate::Request) -> ! {
         let code = match self.ran_op_subprocess(req).await {
             Ok(crate::isolate::Worked::Success) => 0,
             Ok(crate::isolate::Worked::Failed) => 1,
@@ -934,7 +934,22 @@ impl Hestan {
         crate::isolate::run_one_op(&req, &jobs, &store, &io, &resources).await
     }
 
-    async fn build(mut self) -> Result<Built, Error> {
+    /// the store this app is configured with, opened and migrated and
+    /// otherwise left entirely alone.
+    ///
+    /// that is the whole difference from [`build`](Self::build), and the reason
+    /// there are two ways in. a process starting up is entitled to tidy the
+    /// database it is about to own — fail what a dead process left running,
+    /// sync the schedules, sweep retention. a command line asking what ran last
+    /// night is not, and a cron line running one every minute would be doing
+    /// all of it sixty times an hour on behalf of a process that exits
+    /// immediately.
+    #[cfg(feature = "cli")]
+    pub(crate) fn open(&self) -> Result<Store, Error> {
+        Store::at(&self.db_path)
+    }
+
+    pub(crate) async fn build(mut self) -> Result<Built, Error> {
         let (jobs, registry) = self.lower()?;
         let schedules = std::mem::take(&mut self.schedules);
         let mut entries = Vec::new();
@@ -1046,10 +1061,10 @@ async fn delivered(runner: &Runner) {
     }
 }
 
-struct Built {
-    runner: Runner,
+pub(crate) struct Built {
+    pub(crate) runner: Runner,
     entries: Vec<ScheduleEntry>,
-    registry: Arc<AssetRegistry>,
+    pub(crate) registry: Arc<AssetRegistry>,
     sensor_entries: Vec<SensorEntry>,
     late_hooks: Vec<LateHook>,
     retention: Retention,

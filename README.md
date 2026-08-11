@@ -86,7 +86,7 @@ the value lowercased, with anything outside `[a-z0-9_]` replaced by `_`.
 ## Running the demo
 
 ```
-cargo run --example demo
+cargo run --example demo --features cli
 ```
 
 then open http://127.0.0.1:4000 — two jobs on short schedules, so runs

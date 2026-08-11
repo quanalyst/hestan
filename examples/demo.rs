@@ -38,7 +38,19 @@ struct PublishIn {
 
 #[tokio::main]
 async fn main() -> Result<(), hestan::Error> {
-    tracing_subscriber::fmt().init();
+    // stderr, not stdout: this binary has a command line, and a command line's
+    // stdout belongs to the answer. a log line landing in the middle of
+    // `--json` output is a parse error in whatever was reading it.
+    //
+    // and filtered from RUST_LOG, because hestan traces the same events that
+    // `run --wait` streams: serving, you want them, and waiting on one run you
+    // already have them once. `RUST_LOG=warn` is the second copy turned off
+    tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
+        )
+        .init();
 
     let flaky = Arc::new(AtomicU32::new(0));
 
@@ -187,10 +199,10 @@ async fn main() -> Result<(), hestan::Error> {
         Some("worker") => app.work(Some(addr)).await,
         Some("scheduler") => app.role(Role::Scheduler).serve(addr).await,
         Some(other) => panic!("HESTAN_ROLE is scheduler, worker or unset, not {other}"),
-        None => {
-            println!("hestan demo ui: http://{addr}");
-            app.serve(addr).await
-        }
+        // the whole mount: with no arguments this is `app.serve(addr)` and the
+        // demo is what it always was, and with any it is a command line over
+        // the registry two hundred lines above
+        None => hestan::cli::run(app, addr).await,
     }
 }
 

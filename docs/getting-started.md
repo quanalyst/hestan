@@ -81,7 +81,7 @@ the process is killed. for a single headless run instead, swap it for
 from the hestan repo itself:
 
 ```
-cargo run --example demo
+cargo run --example demo --features cli
 ```
 
 then open http://127.0.0.1:4000. the demo registers two jobs on short
