@@ -323,6 +323,9 @@ pub struct CheckResult {
 }
 
 impl CheckResult {
+    /// it passed. hang a [`meta`](CheckResult::meta) on it to record what it
+    /// saw — a check that reports the number it was satisfied by is worth more
+    /// three months later than one that only ever says yes.
     pub fn pass() -> CheckResult {
         CheckResult {
             passed: true,
@@ -400,6 +403,8 @@ impl AssetCheck {
         self
     }
 
+    /// what it was declared as. checks are identified by `(asset, name)`, so
+    /// renaming one starts its history over.
     pub fn name(&self) -> &str {
         &self.name
     }

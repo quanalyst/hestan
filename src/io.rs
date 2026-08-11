@@ -11,7 +11,10 @@ pub type IoResult = Result<Value, Box<dyn std::error::Error + Send + Sync>>;
 /// which op's output is being persisted or read back.
 #[derive(Debug, Clone)]
 pub struct IoKey {
+    /// the run whose output this is. a manager that lays out storage by run
+    /// can delete a run's outputs with one prefix.
     pub run_id: String,
+    /// the job that run was of.
     pub job: String,
     /// the op's name — `{op}[{i}]` for one fan-out instance, since each
     /// instance persists its own output.
@@ -73,6 +76,8 @@ pub struct FileIo {
 }
 
 impl FileIo {
+    /// outputs under `dir`. the directory is created as runs need it, and
+    /// nothing here ever removes one.
     pub fn new(dir: impl Into<PathBuf>) -> FileIo {
         FileIo { dir: dir.into() }
     }

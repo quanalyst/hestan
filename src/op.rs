@@ -34,6 +34,8 @@ pub struct MetaColumn {
 }
 
 impl MetaColumn {
+    /// a column with no declared type, which is what a bare `"orders"` in a
+    /// column list becomes.
     pub fn new(name: impl Into<String>) -> MetaColumn {
         MetaColumn {
             name: name.into(),
@@ -51,10 +53,13 @@ impl MetaColumn {
         }
     }
 
+    /// the heading.
     pub fn name(&self) -> &str {
         &self.name
     }
 
+    /// the type label, if the op gave one. `None` renders as a column with no
+    /// type rather than as a guess.
     pub fn ty(&self) -> Option<&str> {
         self.ty.as_deref()
     }
@@ -94,10 +99,14 @@ pub struct MetaTable {
 }
 
 impl MetaTable {
+    /// the headings, in order.
     pub fn columns(&self) -> &[MetaColumn] {
         &self.columns
     }
 
+    /// the rows, each exactly as wide as [`columns`](Self::columns) — padded
+    /// and truncated at construction, so nothing reading this has to decide
+    /// what a ragged row means.
     pub fn rows(&self) -> &[Vec<Value>] {
         &self.rows
     }
@@ -124,13 +133,20 @@ impl MetaTable {
 /// [`count`](Meta::count) or [`bytes`](Meta::bytes).
 #[derive(Debug, Clone, PartialEq)]
 pub enum Meta {
+    /// a whole number that is not a count of anything — a year, an id, a
+    /// difference that may be negative.
     Int(i64),
+    /// a real number: a ratio, a rate, a score.
     Float(f64),
+    /// a short string, rendered as it is.
     Text(String),
+    /// a link, rendered as one. hestan does not check that it resolves.
     Url(String),
     /// markdown source, rendered by the ui as a
     /// [documented subset](../docs/metadata.md#the-markdown-subset).
     Markdown(String),
+    /// arbitrary structure, rendered as a collapsed tree. the escape hatch:
+    /// anything with a variant of its own reads better as that variant.
     Json(Value),
     /// a sample of rows with named columns; build it with [`Meta::table`].
     Table(MetaTable),
@@ -198,10 +214,15 @@ impl Meta {
         Meta::Count(n)
     }
 
+    /// an elapsed time: `Meta::duration(elapsed)` reads as `3.4s`. a
+    /// `Duration` converts on its own, so this is for where inference needs
+    /// help.
     pub fn duration(d: Duration) -> Meta {
         Meta::Duration(d)
     }
 
+    /// a filesystem path. a `&str` becomes [`Text`](Meta::Text) on its own, so
+    /// a path has to say it is one.
     pub fn path(p: impl Into<String>) -> Meta {
         Meta::Path(p.into())
     }
@@ -499,16 +520,27 @@ impl Retry {
 /// why a typed accessor on [`OpCtx`] came up empty.
 #[derive(Debug, thiserror::Error)]
 pub enum InputError {
+    /// no dep of that name produced anything this op can see — usually a
+    /// typo, or a dep the job wires under a different name than the body
+    /// expects.
     #[error("no input from op {0}")]
     Missing(String),
+    /// the value is there and does not deserialize into the type asked for.
     #[error("type mismatch: {0}")]
     Mismatch(String),
+    /// nothing was declared under that name for this process to hand over.
     #[error("no resource named {0}")]
     NoResource(String),
+    /// the resource exists and is something else. a resource is stored under
+    /// its concrete type, so asking for the wrong one is caught here rather
+    /// than downcast into a `None`.
     #[error("resource {name} is a {got}, not a {want}")]
     ResourceType {
+        /// the name that was asked for.
         name: String,
+        /// the type declared under it.
         got: &'static str,
+        /// the type the call asked for.
         want: &'static str,
     },
 }
@@ -553,6 +585,18 @@ pub struct Op {
 }
 
 impl Op {
+    /// an op called `name` that runs `f`.
+    ///
+    /// the closure is `Fn`, not `FnOnce`: an op is a definition, and the same
+    /// one is invoked again on a retry, again on the next run, and once per
+    /// element when it [fans out](Self::mapped). anything it needs to keep
+    /// hold of has to be cloned in or reached through
+    /// [`ctx`](OpCtx) — a resource, the state from last time, an input from a
+    /// dep.
+    ///
+    /// it returns json rather than a type because that json is what the run
+    /// log stores and what downstream ops are handed. [`typed`](Self::typed)
+    /// is the same op with the conversion done for you.
     pub fn new<F, Fut>(name: impl Into<String>, f: F) -> Op
     where
         F: Fn(OpCtx) -> Fut + Send + Sync + 'static,
@@ -1002,10 +1046,15 @@ impl Op {
         self
     }
 
+    /// what it is called in its job: the name deps refer to, the name the ui
+    /// shows, and the name its rows are written under. flattened inside a
+    /// [`Graph`](crate::Graph) instance, where it reads `{instance}.{op}`.
     pub fn name(&self) -> &str {
         &self.name
     }
 
+    /// what it waits on, in job-level names — see [`after`](Self::after).
+    /// order is what was declared, and means nothing beyond that.
     pub fn deps(&self) -> &[String] {
         &self.deps
     }
@@ -1026,6 +1075,8 @@ impl Op {
         self.io.as_deref()
     }
 
+    /// how many **extra** attempts it gets past the first, from
+    /// [`retries`](Self::retries). 0 is the default, and means one attempt.
     pub fn max_retries(&self) -> u32 {
         self.retries
     }
@@ -1057,14 +1108,20 @@ impl Op {
         self.cpu_limit
     }
 
+    /// the rust type a [`typed`](Self::typed) op deserializes its inputs into,
+    /// as `type_name` spells it. a label for the ui and the events — nothing
+    /// parses it. `None` on an untyped op.
     pub fn input_type(&self) -> Option<&'static str> {
         self.input_type
     }
 
+    /// the type a [`typed`](Self::typed) op returns, on the same terms.
     pub fn output_type(&self) -> Option<&'static str> {
         self.output_type
     }
 
+    /// the type [`params`](Self::params) validates the run params against, on
+    /// the same terms.
     pub fn params_type(&self) -> Option<&'static str> {
         self.params_type
     }
@@ -1178,6 +1235,9 @@ pub struct OpCtx {
 }
 
 impl OpCtx {
+    /// the run this invocation belongs to. the one identifier that ties
+    /// whatever the op does to the row somebody will read afterwards — worth
+    /// putting in the external systems it writes to.
     pub fn run_id(&self) -> &str {
         &self.run_id
     }
@@ -1224,6 +1284,8 @@ impl OpCtx {
         }
     }
 
+    /// the job being run. the same op definition can be in more than one job,
+    /// so this is not a constant even inside one body.
     pub fn job(&self) -> &str {
         &self.job
     }
@@ -1241,6 +1303,9 @@ impl OpCtx {
         self.element.as_ref()
     }
 
+    /// what the run was launched with, raw. every op of the run gets the same
+    /// object — params belong to the run, not to one op.
+    /// [`params_as`](Self::params_as) is the typed reading.
     pub fn params(&self) -> &Value {
         &self.params
     }
@@ -1447,14 +1512,27 @@ impl OpCtx {
         staged_meta(&self.new_meta)
     }
 
+    /// say something in the run log, attributed to this op.
+    ///
+    /// this is the op *speaking*: a row in the [event log](crate::Event) that
+    /// survives the process and is queryable by run, op and level. it is not
+    /// the same as a `println!` or a `tracing::info!`, which are the op's
+    /// *output* — see `docs/logs.md` for which of the two ends up where.
+    ///
+    /// a write that fails is dropped with a warning rather than failing the
+    /// op: a lost log line is not worth losing the work over.
     pub fn info(&self, msg: impl AsRef<str>) {
         self.log(EventLevel::Info, msg.as_ref());
     }
 
+    /// [`info`](Self::info) at warn level, for something worth noticing that
+    /// stopped nothing.
     pub fn warn(&self, msg: impl AsRef<str>) {
         self.log(EventLevel::Warn, msg.as_ref());
     }
 
+    /// [`info`](Self::info) at error level. it records; it does not fail the
+    /// op — return an `Err` for that.
     pub fn error(&self, msg: impl AsRef<str>) {
         self.log(EventLevel::Error, msg.as_ref());
     }

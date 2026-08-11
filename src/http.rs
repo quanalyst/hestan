@@ -67,6 +67,8 @@ impl HttpSource {
         self
     }
 
+    /// a header sent with every request. fixed at declaration — for a
+    /// credential that may be rotated, use [`bearer_env`](Self::bearer_env).
     pub fn header(mut self, k: &'static str, v: impl Into<String>) -> Self {
         self.headers.push((k, v.into()));
         self
@@ -80,6 +82,8 @@ impl HttpSource {
         self
     }
 
+    /// a query parameter sent on every request, the same for all of them —
+    /// [`query_each`](Self::query_each) is the one that varies.
     pub fn query(mut self, k: impl Into<String>, v: impl Into<String>) -> Self {
         self.query.push((k.into(), v.into()));
         self

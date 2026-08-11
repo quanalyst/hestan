@@ -120,6 +120,8 @@ impl Hestan {
         self
     }
 
+    /// register several jobs at once, for a deployment that builds its
+    /// registry somewhere else and hands it over.
     pub fn jobs(mut self, jobs: impl IntoIterator<Item = Job>) -> Self {
         self.jobs.extend(jobs);
         self
@@ -473,10 +475,13 @@ impl Hestan {
     /// for tests and keeps nothing.
     ///
     /// a target beginning `postgres://` or `postgresql://` is a
-    /// [postgres](crate::Store::connect) database and anything else is a
-    /// sqlite path. this one string is what an [isolated
-    /// op](crate::Op::isolated)'s child process and every queue worker is
-    /// handed, so every process reaches the same database.
+    /// [postgres][pg] database and anything else is a sqlite path. this one
+    /// string is what an [isolated op](crate::Op::isolated)'s child process
+    /// and every queue worker is handed, so every process reaches the same
+    /// database.
+    ///
+    #[cfg_attr(feature = "postgres", doc = "[pg]: crate::Store::connect")]
+    #[cfg_attr(not(feature = "postgres"), doc = "[pg]: crate::Store")]
     pub fn db(mut self, target: impl Into<String>) -> Self {
         self.db_path = target.into();
         self
@@ -518,9 +523,12 @@ impl Hestan {
     /// usually worth reading.
     ///
     /// the limit covers every capture in this process, the `capture` feature's
-    /// [layer](crate::capture_layer) included — the host composes that with a
-    /// store handle of its own, and a cap that only reached the writers hestan
-    /// happened to build would be a cap that quietly does not hold.
+    /// [layer][cap] included — the host composes that with a store handle of
+    /// its own, and a cap that only reached the writers hestan happened to
+    /// build would be a cap that quietly does not hold.
+    ///
+    #[cfg_attr(feature = "capture", doc = "[cap]: crate::capture_layer")]
+    #[cfg_attr(not(feature = "capture"), doc = "[cap]: crate")]
     pub fn log_limit(mut self, bytes: u64) -> Self {
         self.log_bytes = bytes;
         self
@@ -646,8 +654,8 @@ impl Hestan {
     ///
     /// a run the boot sweep marked failed does not fire: nothing executed it,
     /// and a restart after a crash should not replay a morning of old failures
-    /// into an alert channel. [`JobBuilder::on_run_finished`] is the same hook
-    /// scoped to one job.
+    /// into an alert channel. [`JobBuilder::on_run_finished`](crate::JobBuilder::on_run_finished)
+    /// is the same hook scoped to one job.
     pub fn on_run_finished(mut self, hook: impl Fn(RunEvent) + Send + Sync + 'static) -> Self {
         self.run_hooks.push(Arc::new(hook));
         self
@@ -662,7 +670,8 @@ impl Hestan {
     /// [`status`](OpEvent::status) are how it says so. an op skipped by its
     /// [trigger rule](crate::When) produces nothing: there was no attempt.
     ///
-    /// [`JobBuilder::on_op_finished`] is the same hook scoped to one job.
+    /// [`JobBuilder::on_op_finished`](crate::JobBuilder::on_op_finished) is the
+    /// same hook scoped to one job.
     pub fn on_op_finished(mut self, hook: impl Fn(OpEvent) + Send + Sync + 'static) -> Self {
         self.op_hooks.push(Arc::new(hook));
         self

@@ -91,13 +91,27 @@ const QUEUE_PAGE: u32 = 200;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum Exit {
+    /// it did what was asked.
     Ok = 0,
+    /// the work failed, or the command could not do what was asked. the code a
+    /// shell reads as plain failure, and the one to retry.
     Failed = 1,
+    /// the command line was wrong. no work was attempted, so retrying it does
+    /// the same thing.
     Usage = 2,
+    /// the run was canceled — somebody's decision, not a fault.
     Canceled = 3,
+    /// `--timeout` ran out. the run is still going; this says nothing about
+    /// how it ends.
     Timeout = 4,
+    /// the store or the server could not be reached. the deployment, not the
+    /// work.
     Unreachable = 5,
+    /// this mode cannot serve this command — a launch against `--db`, say —
+    /// and the message says which mode would.
     Unsupported = 6,
+    /// `doctor` found something worth acting on. a code of its own so a check
+    /// in ci can tell "something is wrong here" from "I could not look".
     Actionable = 7,
     /// a code of its own because a cron line does different things about it:
     /// work that failed is worth retrying and a credential that was refused is

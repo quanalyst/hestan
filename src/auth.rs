@@ -64,12 +64,20 @@ use crate::error::Error;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Access {
+    /// read anything, change nothing.
     Viewer,
+    /// that, plus the things that drive work: launch, cancel, retry, resume,
+    /// build, backfill.
     Operator,
+    /// that, plus the things that change how the deployment behaves — pausing
+    /// a schedule, moving a limit, editing a preset — as opposed to what it is
+    /// doing right now.
     Admin,
 }
 
 impl Access {
+    /// `viewer`, `operator` or `admin`: what the api sends and what a custom
+    /// authenticator's own config is likely to be written in.
     pub fn as_str(&self) -> &'static str {
         match self {
             Access::Viewer => "viewer",
@@ -94,11 +102,15 @@ impl std::fmt::Display for Access {
 /// nothing.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct Identity {
+    /// what goes in the audit trail. use something a person would recognize
+    /// six months later in an event log — never the credential itself.
     pub name: String,
+    /// what they may do.
     pub role: Access,
 }
 
 impl Identity {
+    /// somebody, with a role.
     pub fn new(name: impl Into<String>, role: Access) -> Identity {
         Identity {
             name: name.into(),
@@ -106,14 +118,17 @@ impl Identity {
         }
     }
 
+    /// somebody who may only read.
     pub fn viewer(name: impl Into<String>) -> Identity {
         Identity::new(name, Access::Viewer)
     }
 
+    /// somebody who may drive work but not change the deployment.
     pub fn operator(name: impl Into<String>) -> Identity {
         Identity::new(name, Access::Operator)
     }
 
+    /// somebody who may do anything the api offers.
     pub fn admin(name: impl Into<String>) -> Identity {
         Identity::new(name, Access::Admin)
     }

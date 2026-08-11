@@ -18,9 +18,15 @@ use crate::model::{OpStatus, RunStatus, Trigger};
 /// replay a morning of old failures into an alert channel.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RunEvent {
+    /// the run, for anything that wants to link back to it.
     pub run_id: String,
+    /// which job it was of.
     pub job: String,
+    /// what caused the run — worth filtering on: a failed retry and a failed
+    /// nightly are usually not the same page.
     pub trigger: Trigger,
+    /// how it ended. this is the field a hook that only wants failures
+    /// filters on.
     pub status: RunStatus,
     /// the first op that terminally failed this run; `None` unless one did.
     pub failed_op: Option<String>,
@@ -30,6 +36,8 @@ pub struct RunEvent {
     /// when the run began executing. `None` for a run that never got that far
     /// — one whose claimer went away before it started, say.
     pub started_at: Option<DateTime<Utc>>,
+    /// when it reached its terminal status, which is a moment before this hook
+    /// was called.
     pub finished_at: DateTime<Utc>,
     /// how long it executed for, which is not how long it existed for: a run
     /// held on the queue by a limit was not running while it waited.
@@ -47,31 +55,55 @@ pub struct RunEvent {
 /// ever spawned, produces nothing at all — there was no attempt.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct OpEvent {
+    /// the run this attempt belonged to.
     pub run_id: String,
+    /// the job that run was of.
     pub job: String,
+    /// the op, by its flattened name — `{instance}.{op}` inside a
+    /// [`Graph`](crate::Graph), `{op}[{i}]` for one fan-out instance.
     pub op: String,
     /// which attempt this was, counting from 1.
     pub attempt: u32,
+    /// how this attempt ended. a `failed` attempt with another to come and the
+    /// one that ends the op look identical here — `attempt` against
+    /// [`Op::max_retries`](crate::Op::max_retries) is the difference.
     pub status: OpStatus,
+    /// what it failed with; `None` unless it did.
     pub error: Option<String>,
     /// when **this attempt** started, which on a retry is later than the
     /// `started_at` on the op run row: that one keeps the first attempt's.
     pub started_at: DateTime<Utc>,
+    /// when this attempt ended.
     pub finished_at: DateTime<Utc>,
+    /// how long this attempt took — the retries before it are their own
+    /// events, with their own durations.
     #[serde(rename = "duration_secs", with = "secs")]
     pub duration: Duration,
 }
 
 /// what a failure hook receives when a run finishes failed.
+///
+/// the older, narrower shape of [`RunEvent`], kept because
+/// [`on_failure`](crate::Hestan::on_failure) and the built-in
+/// [notifiers][n] are written against it. it is dispatched as a run hook that
+/// filters on the status, so there is one path an event can be missed from
+/// rather than two.
+///
+#[cfg_attr(feature = "http", doc = "[n]: crate::notify")]
+#[cfg_attr(not(feature = "http"), doc = "[n]: crate")]
 #[derive(Debug, Clone, Serialize)]
 pub struct RunFailure {
+    /// the run that failed.
     pub run_id: String,
+    /// which job it was of.
     pub job: String,
+    /// what caused the run.
     pub trigger: Trigger,
     /// the first op that terminally failed this run.
     pub failed_op: Option<String>,
     /// that op's error message.
     pub error: Option<String>,
+    /// when the run failed.
     pub finished_at: DateTime<Utc>,
 }
 

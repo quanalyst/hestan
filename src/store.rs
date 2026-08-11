@@ -2177,6 +2177,9 @@ impl Store {
         Ok(())
     }
 
+    /// every stored schedule, by job then expression. what is here is what a
+    /// past start declared, so a process that has not synced its own
+    /// declarations yet still reports the previous ones.
     pub fn schedules(&self) -> Result<Vec<ScheduleRow>, Error> {
         self.conn().query(
             "SELECT job, expr, tz, paused, params, catchup, cursor
@@ -2283,6 +2286,7 @@ impl Store {
         )
     }
 
+    /// one [preset](Preset) by `(job, name)`.
     pub fn preset(&self, job: &str, name: &str) -> Result<Option<Preset>, Error> {
         self.conn().query_opt(
             "SELECT job, name, params, created_at FROM presets WHERE job = ?1 AND name = ?2",
@@ -2510,6 +2514,8 @@ impl Store {
         Ok(())
     }
 
+    /// recent [schedule ticks](Tick), newest first, for one job or for all of
+    /// them. this is the log that says why a schedule did *not* fire.
     pub fn ticks(&self, job: Option<&str>, limit: u32) -> Result<Vec<Tick>, Error> {
         match job {
             Some(job) => self.conn().query(
@@ -2527,6 +2533,8 @@ impl Store {
         }
     }
 
+    /// one run by id, or `None` if this store has never had it — or has
+    /// pruned it.
     pub fn run(&self, id: &str) -> Result<Option<Run>, Error> {
         self.conn().query_opt(
             &format!("SELECT {RUN_COLS} FROM runs WHERE id = ?1"),
@@ -2535,6 +2543,14 @@ impl Store {
         )
     }
 
+    /// a page of runs, newest first, narrowed by whichever of the filters are
+    /// set.
+    ///
+    /// `before` with `before_id` is the **cursor**, and they belong together:
+    /// several runs can share a `created_at`, so a page that asked only for
+    /// "older than this timestamp" would skip the rest of that instant. pass
+    /// the last row of the previous page as both, and no run is seen twice or
+    /// missed. `since` is a window rather than a cursor.
     // created_at is always rfc3339 utc, so the comparisons below are plain string
     // ordering; `before_id` only refines `before`, never stands alone
     #[allow(clippy::too_many_arguments)]
@@ -2637,6 +2653,8 @@ impl Store {
         Ok(ts.flatten())
     }
 
+    /// every op row of one run, by op name. a row exists per op from the
+    /// moment the run is created, so this is the plan as much as the record.
     pub fn op_runs(&self, run_id: &str) -> Result<Vec<OpRun>, Error> {
         self.conn().query(
             "SELECT run_id, op, status, attempts, started_at, finished_at, output, metadata, error,
@@ -3366,6 +3384,7 @@ impl Store {
         Ok(id)
     }
 
+    /// one [backfill](Backfill) by id, with its progress as of now.
     pub fn backfill(&self, id: i64) -> Result<Option<Backfill>, Error> {
         self.conn().query_opt(
             "SELECT id, asset, from_key, to_key, partition_keys, run_ids, total, launched,
@@ -3540,6 +3559,8 @@ impl Store {
         Ok(())
     }
 
+    /// every stored sensor, by name — the paused flags and the cursors, not
+    /// the closures, which live in code.
     pub fn sensors(&self) -> Result<Vec<SensorRow>, Error> {
         self.conn().query(
             "SELECT name, paused, cursor, updated_at FROM sensors ORDER BY name",
@@ -3674,6 +3695,9 @@ impl Store {
         Ok(())
     }
 
+    /// recent [sensor ticks](SensorTick), newest first, for one sensor or for
+    /// all of them. a sensor that is running and finding nothing looks quite
+    /// unlike one that is not running, and this is where the difference is.
     pub fn sensor_ticks(&self, sensor: Option<&str>, limit: u32) -> Result<Vec<SensorTick>, Error> {
         let mut conn = self.conn();
         let opt = conn.dialect().text_param();
@@ -3959,7 +3983,11 @@ fn bind<'a>(args: &mut Vec<Val<'a>>, v: Val<'a>) -> usize {
 /// narrows, an unset one does not, and they compose.
 #[derive(Debug, Default, Clone)]
 pub struct EventQuery {
+    /// exactly this kind. an [`Unknown`](EventKind::Unknown) carrying a word
+    /// this build does not know is a legitimate filter, and matches it.
     pub kind: Option<EventKind>,
+    /// everything about one sort of thing: every asset event, every schedule
+    /// event.
     pub subject_kind: Option<SubjectKind>,
     /// what it is about, matched the way [`Event::about`] reports it: a run
     /// event has no `subject` of its own and is found by its run id.
@@ -3967,7 +3995,10 @@ pub struct EventQuery {
     /// this level exactly, not this level and worse: three levels and a
     /// filter that means "show me the errors" is the one anybody types.
     pub level: Option<EventLevel>,
+    /// at or after this, by the writer's clock rather than by `seq` — which
+    /// is a window and not a cursor. `before` is the cursor.
     pub since: Option<DateTime<Utc>>,
+    /// strictly before this, on the same terms.
     pub until: Option<DateTime<Utc>>,
     /// only what is below this seq, which is how a page asks for the one
     /// before it.

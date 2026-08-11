@@ -1,6 +1,15 @@
 //! dag-based job orchestration: ops wired into jobs, cron schedules, assets and
 //! sensors, a run log on sqlite or postgres, and an embedded web ui.
 
+// a public item with no rustdoc is a gap nothing reports: the build stays
+// green, the docs page grows a bare signature, and the number only ever goes
+// up. so it is an error, under every feature combination — a feature-gated
+// item is exactly the one nobody notices is bare
+#![deny(missing_docs)]
+// and a link to an item that was renamed is worse than no link: it reads as a
+// promise that the thing on the other end still exists
+#![deny(rustdoc::broken_intra_doc_links)]
+
 mod app;
 mod asset;
 // who may drive this deployment, and the refusal that keeps an unguarded one
@@ -9,9 +18,11 @@ pub mod auth;
 mod backfill;
 mod backoff;
 // the tracing layer a host composes into its own subscriber. optional because
-// hestan installs no subscriber and will not make anyone depend on one
+// hestan installs no subscriber and will not make anyone depend on one. public
+// so that what it deliberately does not capture is written somewhere a reader
+// lands on, rather than in a private module rustdoc never renders
 #[cfg(feature = "capture")]
-mod capture;
+pub mod capture;
 // the command line this binary already knows everything to serve. optional
 // because it is a dependency on an argument parser, and because owning argv is
 // something a host asks for rather than something a library takes
@@ -80,6 +91,13 @@ pub use schedule::Schedule;
 pub use sensor::{RunRequest, RunStatusSensor, RunSummary, Sensor, SensorCtx};
 pub use store::{EventQuery, Settled, Store};
 
+/// what a file that defines jobs, ops and assets needs, in one import.
+///
+/// deliberately small: the types you name when writing a pipeline, plus
+/// `serde_json`'s [`Value`](serde_json::Value) and
+/// [`json!`](serde_json::json), which every op body ends up touching. the
+/// configuration surface — [`Auth`], [`Limits`], [`Retention`], [`Store`] —
+/// is not here, because that is written once in `main` and reads better named.
 pub mod prelude {
     pub use crate::{
         Asset, AssetCheck, Catchup, CheckResult, Graph, Hestan, Job, Meta, MultiAsset, Op, OpCtx,

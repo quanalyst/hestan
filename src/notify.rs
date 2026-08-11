@@ -1,3 +1,19 @@
+//! the `http` feature: two ready-made hooks, for the deployment that wants an
+//! alert somewhere before it wants an integration.
+//!
+//! every hook hestan has takes a plain closure, and these are closures — there
+//! is nothing here you could not have written, and nothing that knows more
+//! than a hook does. what they save is the http client, the ten-second
+//! timeout, the decision not to follow redirects, and the wording of the one
+//! line a person actually reads.
+//!
+//! **delivery is best-effort by default.** a post that fails is logged and
+//! gone: the process that recorded the event may not survive to retry it, and
+//! a hook that blocked the executor to guarantee delivery would be worse than
+//! a missed alert. [`durable_notifications`](crate::Hestan::durable_notifications)
+//! is the other arrangement — the event is written down first and delivered by
+//! a loop that retries.
+
 use std::sync::OnceLock;
 use std::time::Duration;
 

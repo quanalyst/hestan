@@ -7,32 +7,67 @@
 /// `Conflict` is something already under way that this would collide with.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
+    /// a declaration that does not describe anything executable: a cycle, a
+    /// dep on a name nothing produces, two ops under one name, a fan-out with
+    /// nothing to fan out over. every job, graph and asset registration is
+    /// checked before a single row is written, so this is a startup failure
+    /// rather than a run that gets halfway.
     #[error("invalid job graph: {0}")]
     Graph(String),
+    /// no job of that name in this process. a run of it may well exist — the
+    /// run log outlives the code that defined the job.
     #[error("unknown job: {0}")]
     UnknownJob(String),
+    /// no run with that id in this store.
     #[error("unknown run: {0}")]
     UnknownRun(String),
+    /// the run has not finished, and what was asked for only makes sense once
+    /// it has.
     #[error("run still active: {0}")]
     RunActive(String),
+    /// only a failed run can be resumed: succeeding again from a partial state
+    /// is not something hestan can promise means anything.
     #[error("run did not fail: {0}")]
     RunNotFailed(String),
+    /// there is nothing left for a resume to execute, which usually means the
+    /// run was already resumed and it worked.
     #[error("nothing to resume: every op of run {0} already succeeded")]
     NothingToResume(String),
+    /// a resume needs the outputs of the ops it is not re-running, and
+    /// somewhere back along the chain of resumes they are gone — pruned by
+    /// [retention](crate::Retention), or never recorded.
     #[error("broken resume chain: {0}")]
     ResumeChain(String),
+    /// no asset of that name is registered in this process.
     #[error("unknown asset: {0}")]
     UnknownAsset(String),
+    /// no backfill with that id.
     #[error("unknown backfill: {0}")]
     UnknownBackfill(i64),
+    /// something already under way that this would collide with — the 409 of
+    /// the api, and the reason a second build of the same assets is refused
+    /// rather than queued.
     #[error("{0}")]
     Conflict(String),
+    /// two jobs registered under one name. also what a user job called
+    /// `assets` collides with, since registering any asset defines one.
     #[error("duplicate job: {0}")]
     DuplicateJob(String),
+    /// a cron expression the parser rejected, quoted back with what it
+    /// objected to.
     #[error("bad cron expression {expr:?}: {reason}")]
-    Cron { expr: String, reason: String },
+    Cron {
+        /// the expression as it was written.
+        expr: String,
+        /// what the parser objected to.
+        reason: String,
+    },
+    /// a timezone name the tz database does not have.
     #[error("unknown timezone: {0}")]
     Timezone(String),
+    /// the database was migrated by a newer hestan. refused rather than opened
+    /// read-only or migrated backwards: this build cannot know what the newer
+    /// one meant by the columns it added, and guessing corrupts a run log.
     #[error("db schema v{0} is newer than this build")]
     SchemaTooNew(u32),
     /// `serve` refused an address anyone can reach with nothing checking who
@@ -45,12 +80,34 @@ pub enum Error {
          in front of hestan already checks identity"
     )]
     Unguarded(std::net::SocketAddr),
+    /// the launch params failed the check an op declared with
+    /// [`Op::params`](crate::Op::params). raised before the run row is
+    /// written, so a launch that cannot possibly work leaves no run behind to
+    /// explain.
     #[error("invalid params for op {op}: {reason}")]
-    InvalidParams { op: String, reason: String },
+    InvalidParams {
+        /// the op whose check rejected them.
+        op: String,
+        /// what it objected to.
+        reason: String,
+    },
+    /// an op asked for a resource nothing declared, or one declared as another
+    /// type.
     #[error("resource {name}: {reason}")]
-    Resource { name: String, reason: String },
+    Resource {
+        /// the resource, by the name the op asked for.
+        name: String,
+        /// what was wrong with it.
+        reason: String,
+    },
+    /// sqlite said no. a writer waiting behind another writer is not this: the
+    /// connection carries a busy timeout, so contention costs latency rather
+    /// than an error.
     #[error("storage: {0}")]
     Sqlite(#[from] rusqlite::Error),
+    /// postgres said no, flattened: the constraint and the column are in the
+    /// error's source chain, and a message that dropped them would say
+    /// nothing at all.
     #[cfg(feature = "postgres")]
     #[error("storage: {}", chain(.0))]
     Postgres(#[from] tokio_postgres::Error),
@@ -63,6 +120,9 @@ pub enum Error {
     /// the `postgres` feature compiled in.
     #[error("unsupported database: {0}")]
     UnsupportedDb(String),
+    /// the filesystem: a database path that cannot be opened, an
+    /// [`IoManager`](crate::IoManager)'s directory, a listener that could not
+    /// take its address.
     #[error(transparent)]
     Io(#[from] std::io::Error),
 }

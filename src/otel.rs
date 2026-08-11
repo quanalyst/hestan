@@ -10,7 +10,7 @@
 //! fields, and the host composes
 //! [`tracing-opentelemetry`](https://docs.rs/tracing-opentelemetry) into the
 //! subscriber it was going to build anyway — the same arrangement
-//! [`capture_layer`](crate::capture_layer) uses, for the same reason: the
+//! [`capture_layer`][cap] uses, for the same reason: the
 //! subscriber belongs to the application, not to a library inside it.
 //!
 //! ```no_run
@@ -41,7 +41,7 @@
 //! | an event | a span event on the `hestan.op` it belongs to, or on `hestan.run` for a run-level one |
 //!
 //! the field names are exactly the ones
-//! [`capture_layer`](crate::capture_layer) reads, because they are the same
+//! [`capture_layer`][cap] reads, because they are the same
 //! spans. a build with both features composes both layers and each takes what
 //! it wants.
 //!
@@ -71,6 +71,9 @@
 //! is no `hestan::otel::init`, no exporter helper and no environment variable
 //! hestan reads. those are the host's, and a library that shipped its own
 //! would be one more thing to fight with the host's.
+//!
+#![cfg_attr(feature = "capture", doc = "[cap]: crate::capture_layer")]
+#![cfg_attr(not(feature = "capture"), doc = "[cap]: crate")]
 
 use std::collections::HashMap;
 

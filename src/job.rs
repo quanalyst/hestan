@@ -35,6 +35,8 @@ pub struct Job {
 }
 
 impl Job {
+    /// start building a job called `name`. nothing is checked until
+    /// [`build`](JobBuilder::build), which is where the dag is validated.
     pub fn builder(name: impl Into<String>) -> JobBuilder {
         JobBuilder {
             name: name.into(),
@@ -51,22 +53,33 @@ impl Job {
         }
     }
 
+    /// what it is registered under. every run row, schedule and api path
+    /// refers to a job by this, so renaming a job orphans its history.
     pub fn name(&self) -> &str {
         &self.name
     }
 
+    /// the line the ui shows under the name, from
+    /// [`JobBuilder::description`].
     pub fn description(&self) -> Option<&str> {
         self.description.as_deref()
     }
 
+    /// every op, including the ones a [`Graph`] instance flattened into the
+    /// job — declaration order, not execution order.
     pub fn ops(&self) -> &[Op] {
         &self.ops
     }
 
+    /// one op by its flattened name, which for an op inside a graph instance
+    /// is `{instance}.{op}`.
     pub fn op(&self, name: &str) -> Option<&Op> {
         self.ops.iter().find(|o| o.name() == name)
     }
 
+    /// how many of this job's ops may execute at once inside one run, from
+    /// [`JobBuilder::max_parallel`]. `None` is as many as the dag allows,
+    /// which for a wide fan-out can be a lot.
     pub fn max_parallel(&self) -> Option<usize> {
         self.max_parallel
     }
@@ -78,6 +91,9 @@ impl Job {
         self.max_concurrent_runs
     }
 
+    /// what a schedule of this job does when it fires while a run is still
+    /// outstanding, from [`JobBuilder::overlap`]. it gates scheduled fires
+    /// only — a manual launch is never held back.
     pub fn overlap(&self) -> Overlap {
         self.overlap
     }
@@ -438,6 +454,9 @@ struct Instance {
 }
 
 impl Graph {
+    /// start building a reusable subgraph called `name`. the name is a label
+    /// for error messages — what an instance is called in a job comes from
+    /// [`JobBuilder::graph`], not from here.
     pub fn builder(name: impl Into<String>) -> GraphBuilder {
         GraphBuilder {
             name: name.into(),
@@ -449,11 +468,14 @@ impl Graph {
         }
     }
 
+    /// what it was declared as.
     pub fn name(&self) -> &str {
         &self.name
     }
 }
 
+/// builds a [`Graph`]. the ops, which of them take the instance's inputs, and
+/// which one's output is the instance's output.
 pub struct GraphBuilder {
     name: String,
     ops: Vec<Op>,
@@ -465,6 +487,8 @@ pub struct GraphBuilder {
 }
 
 impl GraphBuilder {
+    /// add an op. its deps are inner names — a graph knows nothing about the
+    /// job it will be instantiated in.
     pub fn op(mut self, op: Op) -> Self {
         self.ops.push(op);
         self
@@ -774,6 +798,9 @@ fn flatten(job: &str, ops: Vec<Op>, instances: Vec<Instance>) -> Result<Vec<Op>,
     Ok(out)
 }
 
+/// builds a [`Job`]. every misuse is collected and reported by
+/// [`build`](JobBuilder::build), so the chain itself never panics and never
+/// returns a `Result` you have to unwrap between calls.
 pub struct JobBuilder {
     name: String,
     description: Option<String>,
@@ -789,11 +816,14 @@ pub struct JobBuilder {
 }
 
 impl JobBuilder {
+    /// a line about what this job is for, shown beside its name in the ui.
     pub fn description(mut self, d: impl Into<String>) -> Self {
         self.description = Some(d.into());
         self
     }
 
+    /// add an op. order does not matter — an op may name a dep declared after
+    /// it, since the dag is resolved at [`build`](Self::build).
     pub fn op(mut self, op: Op) -> Self {
         self.ops.push(op);
         self

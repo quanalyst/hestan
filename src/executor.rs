@@ -72,6 +72,9 @@ pub struct Limits {
 }
 
 impl Limits {
+    /// no limits at all, which is also the default: build one up with
+    /// [`global`](Limits::global), [`job`](Limits::job) and
+    /// [`tag`](Limits::tag).
     pub fn new() -> Limits {
         Limits::default()
     }
@@ -128,14 +131,22 @@ impl Limits {
 /// why a queued run is not starting right now.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Blocked {
+    /// the deployment-wide cap is full.
     Global(usize),
+    /// this job's own cap is full.
     Job {
+        /// the job that is at its limit — this run's job.
         job: String,
+        /// what that limit is.
         limit: usize,
     },
+    /// a cap on one tag value is full, and the run carries that tag.
     Tag {
+        /// the tag key the limit is on.
         key: String,
+        /// the value of it this run carries.
         value: String,
+        /// what that limit is.
         limit: usize,
     },
     /// nothing here can run it: this process does not define the job. a run
@@ -239,6 +250,8 @@ impl InFlight {
 
 /// one queued run as the queue view reports it.
 pub struct Queued {
+    /// the run row itself, so a queue view needs no second read to show what
+    /// is waiting.
     pub run: Run,
     /// 1 for the head of the queue.
     pub position: usize,
@@ -390,6 +403,15 @@ pub struct Runner {
 }
 
 impl Runner {
+    /// a runner over `jobs`, writing to `store`.
+    ///
+    /// this is the layer under [`Hestan`](crate::Hestan): no schedules, no
+    /// sensors, no server, and nothing running in the background until
+    /// something asks it to. reach for it when you want to execute a job from
+    /// your own code and nothing else.
+    ///
+    /// no pools are declared, so an op that names one fails at run time —
+    /// [`with_pools`](Runner::with_pools) is the constructor for that.
     pub fn new(jobs: impl IntoIterator<Item = Job>, store: Store) -> Runner {
         Runner::with_failure_hooks(jobs, store, Vec::new())
     }
@@ -548,9 +570,9 @@ impl Runner {
     }
 
     /// change what the dispatcher enforces, live. the next pass reads it — and
-    /// there is a pass whenever a run finishes and every
-    /// [`DISPATCH_POLL`] besides — so raising a limit drains the queue it was
-    /// holding back without a restart.
+    /// there is a pass whenever a run finishes, and one every half second
+    /// besides — so raising a limit drains the queue it was holding back
+    /// without a restart.
     pub fn set_limits(&self, limits: Limits) {
         *self.limits.lock().unwrap() = limits;
         self.dispatch();
@@ -701,10 +723,14 @@ impl Runner {
         all
     }
 
+    /// the run log this runner writes to, for reading it back. cloning it is
+    /// cheap and shares the same connection.
     pub fn store(&self) -> &Store {
         &self.store
     }
 
+    /// what this process can execute, by name. a run of a job that is not in
+    /// here can be read and cannot be started.
     pub fn jobs(&self) -> &HashMap<String, Job> {
         &self.jobs
     }
@@ -742,7 +768,7 @@ impl Runner {
     /// put a run of `job` on the queue.
     ///
     /// launching is a request, not a start: the run row exists when this
-    /// returns and the [dispatcher](Runner::dispatch) starts it as soon as no
+    /// returns and the dispatcher starts it as soon as no
     /// [limit](Limits) says otherwise, which with no limits declared is the
     /// same instant. the caller never blocks either way — what comes back is
     /// the run id, exactly as it always did.

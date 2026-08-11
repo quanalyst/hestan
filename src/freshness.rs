@@ -21,11 +21,14 @@ const CHECK_EVERY: Duration = Duration::from_secs(60);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum LateKind {
+    /// an asset, measured from its last materialization.
     Asset,
+    /// a job, measured from its last successful run.
     Job,
 }
 
 impl LateKind {
+    /// `asset` or `job`, as the api and the notification bodies spell it.
     pub fn as_str(&self) -> &'static str {
         match self {
             LateKind::Asset => "asset",
@@ -39,7 +42,10 @@ impl LateKind {
 /// crossing, not one per poll — the crossing is the news.
 #[derive(Debug, Clone, Serialize)]
 pub struct LateEvent {
+    /// which side of the api this is about, since a job and an asset may share
+    /// a name.
     pub kind: LateKind,
+    /// the job or the asset, by name.
     pub name: String,
     /// how far past the policy's deadline it is, the moment it crossed.
     #[serde(rename = "late_by_secs", serialize_with = "as_secs")]

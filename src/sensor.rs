@@ -33,7 +33,11 @@ use crate::store::RunKey;
 ///     .key("2026-08-09");
 /// ```
 pub struct RunRequest {
+    /// the job to launch, by name. a name this process does not define fails
+    /// the evaluation rather than being quietly dropped.
     pub job: String,
+    /// what to launch it with; `{}` unless [`params`](Self::params) said
+    /// otherwise.
     pub params: Value,
     /// the [run key](Self::key) this request launches under; `None` is the
     /// at-least-once default.
@@ -93,6 +97,27 @@ pub struct Sensor {
 }
 
 impl Sensor {
+    /// a sensor called `name`, evaluated every `every`.
+    ///
+    /// `every` is the gap between evaluations rather than a schedule: nothing
+    /// is aligned to the clock, and an evaluation that overruns simply delays
+    /// the next one instead of stacking up behind it. the closure is expected
+    /// to return an empty vec nearly always — that is the normal outcome of
+    /// looking and finding nothing.
+    ///
+    /// ```no_run
+    /// # use hestan::{RunRequest, Sensor, SensorCtx};
+    /// # use std::time::Duration;
+    /// Sensor::new("new_files", Duration::from_secs(30), |ctx: SensorCtx| async move {
+    ///     let seen: u64 = ctx.cursor_as()?.unwrap_or(0);
+    ///     let latest = seen; // whatever looking at the world says
+    ///     if latest == seen {
+    ///         return Ok(vec![]);
+    ///     }
+    ///     ctx.set_cursor(serde_json::json!(latest));
+    ///     Ok(vec![RunRequest::new("ingest").key(latest.to_string())])
+    /// });
+    /// ```
     pub fn new<F, Fut>(name: impl Into<String>, every: Duration, f: F) -> Sensor
     where
         F: Fn(SensorCtx) -> Fut + Send + Sync + 'static,
@@ -125,6 +150,8 @@ impl Sensor {
         self
     }
 
+    /// what it was declared as: its identity in the store, in the api and in
+    /// the ui, and what its cursor is keyed by.
     pub fn name(&self) -> &str {
         &self.name
     }
@@ -152,11 +179,20 @@ const MAX_CONCURRENT_EVALS: usize = 8;
 /// when — not the params blob or the resume chain.
 #[derive(Debug, Clone, Serialize)]
 pub struct RunSummary {
+    /// the run that finished — what a request launched in response should
+    /// carry as its [key](RunRequest::key) if it must happen once per run.
     pub id: String,
+    /// which job it was of, which is what most of these closures branch on.
     pub job: String,
+    /// how it ended. always terminal: a run-status sensor is only shown runs
+    /// that are over.
     pub status: RunStatus,
+    /// what caused that run, so a sensor can ignore the runs it caused itself.
     pub trigger: Trigger,
+    /// when it began executing.
     pub started_at: Option<DateTime<Utc>>,
+    /// when it ended. never `None` here, since the sensor reads by finish
+    /// time; the shape follows the run row.
     pub finished_at: Option<DateTime<Utc>>,
     /// the first op that terminally failed, named; `None` unless it failed.
     pub error: Option<String>,
