@@ -45,6 +45,7 @@ use crate::error::Error;
 use crate::executor::Runner;
 use crate::job::Job;
 use crate::model::{EventLevel, Role, Run, RunStatus, RunTags, Trigger};
+use crate::retention::Retention;
 use crate::store::{EventQuery, Store};
 
 /// how often the wait loop looks for new lines and for a settled status.
@@ -239,8 +240,42 @@ enum Command {
     Priority(PriorityArgs),
     /// what happened, across every subsystem
     Events(EventsArgs),
+    /// one command that answers "why is nothing running"
+    Doctor,
+    /// the plan a run would follow, without running it
+    Explain(ExplainArgs),
+    /// a completion script for your shell
+    Completions(CompletionsArgs),
+    /// the names this binary can complete, which is what those scripts ask for
+    #[command(name = "__complete", hide = true)]
+    Complete {
+        #[arg(value_enum)]
+        what: Names,
+    },
     /// the ui and whatever loops this process's role owns
     Serve(ServeArgs),
+}
+
+#[derive(Args)]
+struct ExplainArgs {
+    /// the job whose plan to resolve
+    job: String,
+    /// validate these params against the schema while you are here
+    #[arg(long, value_name = "JSON", conflicts_with = "preset")]
+    params: Option<String>,
+    /// validate a stored preset's params instead
+    #[arg(long, value_name = "NAME")]
+    preset: Option<String>,
+}
+
+#[derive(Args)]
+struct CompletionsArgs {
+    #[arg(value_enum)]
+    shell: Shell,
+    /// the command the script completes, if this binary is installed as
+    /// something other than what it was invoked as
+    #[arg(long, value_name = "NAME")]
+    name: Option<String>,
 }
 
 /// the two things that can be paused. spelled as a subcommand rather than a
@@ -281,6 +316,10 @@ struct RunArgs {
     /// stop waiting after this many seconds; the run carries on without you
     #[arg(long, value_name = "SECS", requires = "wait")]
     timeout: Option<u64>,
+    /// check the params against the schema and print the plan, and launch
+    /// nothing at all
+    #[arg(long = "dry-run", conflicts_with = "wait")]
+    dry_run: bool,
 }
 
 #[derive(Args)]
@@ -457,9 +496,19 @@ pub async fn standalone() -> Result<(), Error> {
 
 /// run the command and turn whatever it says into an exit code.
 async fn finish(reach: Result<Reach, Fail>, command: Command, out: &Out) -> Result<(), Error> {
-    let done = match reach {
-        Ok(reach) => dispatch(reach, command, out).await,
-        Err(fail) => Err(fail),
+    let done = match command {
+        // neither of these looks at a deployment: one writes a script and the
+        // other lists this parser's own subcommands, and both have to work in a
+        // shell that has not been told where anything is
+        Command::Completions(args) => {
+            completions(args.shell, &args.name.unwrap_or_else(invoked_as), out);
+            Ok(())
+        }
+        Command::Complete { what } => complete(reach, what, out),
+        command => match reach {
+            Ok(reach) => dispatch(reach, command, out).await,
+            Err(fail) => Err(fail),
+        },
     };
     match done {
         Ok(()) => Ok(()),
@@ -821,6 +870,21 @@ async fn dispatch(reach: Reach, command: Command, out: &Out) -> Result<(), Fail>
 
         Command::Events(args) => events(reach, args, out).await,
 
+        Command::Doctor => doctor(reach, out).await,
+
+        Command::Explain(args) => explain(
+            reach,
+            &args.job,
+            args.params.as_deref(),
+            args.preset.as_deref(),
+            out,
+        ),
+
+        // handled before a deployment is reached for
+        Command::Completions(_) | Command::Complete { .. } => {
+            unreachable!("dispatched by `finish`")
+        }
+
         Command::Serve(args) => match reach {
             Reach::Local(app) => {
                 let addr = args.addr.ok_or_else(|| {
@@ -862,6 +926,18 @@ fn launching_role(wait: bool) -> Role {
 
 async fn launch(reach: Reach, args: RunArgs, out: &Out) -> Result<(), Fail> {
     let tags = parse_tags(&args.tags)?;
+    // before anything is opened for writing: a dry run resolves exactly the
+    // plan a launch would and validates exactly the params a launch would,
+    // through the same two calls, and then stops
+    if args.dry_run {
+        return explain(
+            reach,
+            &args.job,
+            args.params.as_deref(),
+            args.preset.as_deref(),
+            out,
+        );
+    }
     let timeout = args.timeout.map(Duration::from_secs);
     let (id, watched) = match reach {
         Reach::Server(api) => {
@@ -1192,6 +1268,16 @@ async fn logs(reach: Reach, args: LogsArgs, out: &Out) -> Result<(), Fail> {
         if out.json {
             out.object(&json!({ "logs": lines }));
             return Ok(());
+        }
+        // on stderr, so a pipe still gets exactly the lines and a person still
+        // gets the answer: an op that ran in this process and printed is not
+        // captured anywhere, and looking at an empty page is how people find
+        // that out
+        if lines.is_empty() && !out.quiet {
+            eprintln!(
+                "no captured output: only an isolated op's subprocess and the `capture` \
+                 feature's layer write any (docs/logs.md)"
+            );
         }
         for line in &lines {
             out.log(&Line::log(line));
@@ -1982,6 +2068,788 @@ fn secs(ms: i64) -> String {
     format!("{:.1}s", ms as f64 / 1000.0)
 }
 
+// ---------------------------------------------------------------------- doctor
+
+/// how much free space is little enough to say something about.
+///
+/// a ratio rather than a size, because "500mb left" means nothing without
+/// knowing whether that is 90% of the disk or 0.4% of it — and because the
+/// thing that fills a disk is a run log growing at whatever rate this
+/// deployment writes.
+const DISK_LOW: f64 = 0.10;
+
+/// what one check found.
+///
+/// three levels rather than two, and the middle one earns its place: a paused
+/// schedule is the answer to "why is nothing running" and is also something
+/// somebody chose on purpose. reporting it as an error would make `doctor`
+/// exit non-zero forever in a deployment that is exactly as it was meant to
+/// be, and a check nobody can satisfy is a check everybody learns to ignore.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Level {
+    Ok,
+    Note,
+    Wrong,
+}
+
+impl Level {
+    fn as_str(self) -> &'static str {
+        match self {
+            Level::Ok => "ok",
+            Level::Note => "note",
+            Level::Wrong => "wrong",
+        }
+    }
+
+    fn color(self) -> &'static str {
+        match self {
+            Level::Ok => GREEN,
+            Level::Note => YELLOW,
+            Level::Wrong => RED,
+        }
+    }
+}
+
+struct Finding {
+    level: Level,
+    check: &'static str,
+    says: String,
+    /// what to do about it. only ever on something actionable — a fix beside
+    /// an `ok` would be advice about nothing.
+    fix: Option<String>,
+}
+
+impl Finding {
+    fn ok(check: &'static str, says: impl Into<String>) -> Finding {
+        Finding {
+            level: Level::Ok,
+            check,
+            says: says.into(),
+            fix: None,
+        }
+    }
+
+    fn note(check: &'static str, says: impl Into<String>, fix: impl Into<String>) -> Finding {
+        Finding {
+            level: Level::Note,
+            check,
+            says: says.into(),
+            fix: Some(fix.into()),
+        }
+    }
+
+    fn wrong(check: &'static str, says: impl Into<String>, fix: impl Into<String>) -> Finding {
+        Finding {
+            level: Level::Wrong,
+            check,
+            says: says.into(),
+            fix: Some(fix.into()),
+        }
+    }
+
+    fn json(&self) -> Value {
+        json!({
+            "level": self.level.as_str(),
+            "check": self.check,
+            "says": self.says,
+            "fix": self.fix,
+        })
+    }
+}
+
+/// one command that answers "why is nothing running".
+///
+/// **every check here looks at something.** a check that cannot see what it is
+/// about does not report that everything is fine — it is not run at all, and
+/// the checks a mode could not make are listed at the end under their own
+/// heading. an `ok` line means something was read and was as it should be,
+/// which is the only thing that makes the other lines worth believing.
+async fn doctor(reach: Reach, out: &Out) -> Result<(), Fail> {
+    let (app, store) = match reach {
+        Reach::Local(app) => {
+            let app = app.inspect()?;
+            (Some(app), None)
+        }
+        Reach::Store { store, target } => (None, Some((store, target))),
+        Reach::Server(_) => {
+            return Err(Fail::new(
+                Exit::Unsupported,
+                "doctor reads the store, the registry and the disk under them, and an http \
+                 api exposes none of the three — run it in the deployment's own binary, or \
+                 point --db at the database it is using",
+            ));
+        }
+    };
+    let (store, target) = match (&app, &store) {
+        (Some(app), _) => (&app.store, app.db.clone()),
+        (_, Some((store, target))) => (store, target.clone()),
+        _ => unreachable!("one of the two is always there"),
+    };
+
+    let mut findings = Vec::new();
+    let mut unchecked: Vec<&str> = Vec::new();
+    findings.push(Finding::ok(
+        "store",
+        format!(
+            "{} at {target}, schema v{}",
+            store.backend(),
+            store.schema_version()?
+        ),
+    ));
+    findings.extend(check_schedules(store)?);
+    findings.extend(check_sensors(store)?);
+    findings.extend(check_leases(store, Utc::now())?);
+    match &app {
+        Some(app) => {
+            findings.extend(check_queue(app)?);
+            findings.extend(check_retention(app));
+        }
+        None => unchecked.push(
+            "the queue and the retention policy, which are read off limits and a role that \
+             only the deployment's own binary carries",
+        ),
+    }
+    match disk_free(&target) {
+        Some((free, total)) => findings.push(check_disk(&target, free, total)),
+        None => unchecked.push("free disk space, which is a question about a local file"),
+    }
+
+    let wrong = findings.iter().any(|f| f.level == Level::Wrong);
+    if out.json {
+        out.object(&json!({
+            "ok": !wrong,
+            "findings": findings.iter().map(Finding::json).collect::<Vec<_>>(),
+            "unchecked": unchecked,
+        }));
+    } else if out.quiet {
+        for finding in findings.iter().filter(|f| f.level != Level::Ok) {
+            println!("{} {}", finding.level.as_str(), finding.says);
+        }
+    } else {
+        for finding in &findings {
+            println!(
+                "{:<5} {:<10} {}",
+                out.paint(finding.level.as_str(), finding.level.color()),
+                finding.check,
+                finding.says
+            );
+            if let Some(fix) = &finding.fix {
+                println!("      {:<10} {}", "", out.paint(fix, DIM));
+            }
+        }
+        for missed in &unchecked {
+            println!("{:<5} {:<10} {missed}", "-", "not checked");
+        }
+    }
+    match wrong {
+        true => Err(Fail::new(Exit::Actionable, "something above is actionable")),
+        false => Ok(()),
+    }
+}
+
+/// every cron in the table, parsed the way the scheduler parses it.
+///
+/// the rows outlive the code that wrote them — a process syncs them at boot and
+/// a database can hold rows from a deployment that has since changed — so an
+/// expression or a timezone that no longer resolves is a schedule that silently
+/// never fires again. that is what this looks for, by parsing every one.
+fn check_schedules(store: &Store) -> Result<Vec<Finding>, Fail> {
+    let rows = store.schedules()?;
+    if rows.is_empty() {
+        return Ok(vec![Finding::ok("schedules", "none defined")]);
+    }
+    let mut findings = Vec::new();
+    let mut parsed = 0;
+    for row in &rows {
+        match crate::schedule::parse(&row.job, &row.expr, &row.tz) {
+            Ok(_) => parsed += 1,
+            Err(e) => findings.push(Finding::wrong(
+                "schedules",
+                format!("{} {:?} will never fire: {e}", row.job, row.expr),
+                "fix the expression or the timezone where the schedule is declared, \
+                 then restart so the table is synced",
+            )),
+        }
+    }
+    let paused: Vec<&str> = rows
+        .iter()
+        .filter(|r| r.paused)
+        .map(|r| r.job.as_str())
+        .collect();
+    if parsed > 0 {
+        findings.insert(
+            0,
+            Finding::ok("schedules", format!("{parsed} of {} parse", rows.len())),
+        );
+    }
+    if !paused.is_empty() {
+        findings.push(Finding::note(
+            "schedules",
+            format!("paused, so they will not fire: {}", paused.join(", ")),
+            format!("unpause schedule {}", paused[0]),
+        ));
+    }
+    Ok(findings)
+}
+
+fn check_sensors(store: &Store) -> Result<Vec<Finding>, Fail> {
+    let rows = store.sensors()?;
+    if rows.is_empty() {
+        return Ok(Vec::new());
+    }
+    let paused: Vec<&str> = rows
+        .iter()
+        .filter(|r| r.paused)
+        .map(|r| r.name.as_str())
+        .collect();
+    if paused.is_empty() {
+        return Ok(vec![Finding::ok(
+            "sensors",
+            format!("{} defined, none paused", rows.len()),
+        )]);
+    }
+    Ok(vec![Finding::note(
+        "sensors",
+        format!("paused, so they evaluate nothing: {}", paused.join(", ")),
+        format!("unpause sensor {}", paused[0]),
+    )])
+}
+
+/// runs held by a claimer that stopped renewing.
+fn check_leases(store: &Store, now: DateTime<Utc>) -> Result<Vec<Finding>, Fail> {
+    let stalled = store.stalled_claims(now)?;
+    if stalled.is_empty() {
+        return Ok(vec![Finding::ok("leases", "every claim is current")]);
+    }
+    let oldest = &stalled[0];
+    Ok(vec![Finding::wrong(
+        "leases",
+        format!(
+            "{} run(s) held past their lease by processes that stopped renewing it, \
+             the oldest {} claimed by {}",
+            stalled.len(),
+            oldest.id,
+            oldest.claimed_by.as_deref().unwrap_or("(unknown)")
+        ),
+        "any hestan process runs the lease loop that reclaims these — start one, \
+         and they are failed or requeued as `reclaim` says",
+    )])
+}
+
+/// what is waiting, and whether anything is going to take it.
+///
+/// the second half is the one worth having. a run that no limit is holding back
+/// and that nobody has claimed is a run waiting for a process that executes,
+/// and a deployment where every process was started as a scheduler has exactly
+/// that and no other symptom.
+fn check_queue(app: &Inspected) -> Result<Vec<Finding>, Fail> {
+    let defined = app.jobs.iter().map(|j| j.name().to_string()).collect();
+    let answer = crate::server::queue_json(&app.store, &app.limits, &defined)?;
+    let queued = list(&answer, "queued");
+    if queued.is_empty() {
+        return Ok(vec![Finding::ok("queue", "nothing waiting")]);
+    }
+    let (blocked, free): (Vec<&Value>, Vec<&Value>) = queued
+        .iter()
+        .partition(|q| q["blocked_by"].is_object() || q.get("blocked_by").is_none());
+    let mut findings = Vec::new();
+    if !free.is_empty() {
+        findings.push(Finding::wrong(
+            "queue",
+            format!(
+                "{} run(s) are queued with nothing holding them back, so no process is \
+                 taking them off the queue",
+                free.len()
+            ),
+            "start a process whose role executes — `serve` with the default role, or \
+             `work` — against this database",
+        ));
+    }
+    if !blocked.is_empty() {
+        let reason = s(&blocked[0]["blocked_by"], "reason");
+        findings.push(Finding::note(
+            "queue",
+            format!("{} run(s) are waiting on a limit: {reason}", blocked.len()),
+            "raise the limit, or wait for what is executing to finish",
+        ));
+    }
+    Ok(findings)
+}
+
+/// a retention policy in a process that will never run it.
+///
+/// sweeping is a decision, so only a role that decides does it. a deployment
+/// where the process carrying the policy is a worker has a policy that has
+/// never deleted anything and never will, and the only symptom is a database
+/// that keeps growing.
+fn check_retention(app: &Inspected) -> Vec<Finding> {
+    if app.retention == Retention::default() {
+        return vec![Finding::ok("retention", "no policy: nothing is deleted")];
+    }
+    if app.role.decides() {
+        return vec![Finding::ok(
+            "retention",
+            format!("a policy, and this role ({}) sweeps", app.role),
+        )];
+    }
+    vec![Finding::wrong(
+        "retention",
+        format!(
+            "a retention policy is configured but this process is a {}, and only a role \
+             that decides sweeps — nothing here will ever delete anything",
+            app.role
+        ),
+        "give the policy to the process that owns the schedules, which is the one \
+         running under the scheduler or the default role",
+    )]
+}
+
+/// free space where the run log lives.
+fn check_disk(target: &str, free: u64, total: u64) -> Finding {
+    let left = free as f64 / total.max(1) as f64;
+    let says = format!(
+        "{} free of {} where {target} lives ({:.0}%)",
+        bytes(free),
+        bytes(total),
+        left * 100.0
+    );
+    match left < DISK_LOW {
+        true => Finding {
+            level: Level::Wrong,
+            check: "disk",
+            says,
+            fix: Some(
+                "a run log that cannot be written to stops the deployment: free space, \
+                 or set a retention policy so it stops growing"
+                    .into(),
+            ),
+        },
+        false => Finding::ok("disk", says),
+    }
+}
+
+/// free and total bytes on the filesystem holding `target`, or `None` where the
+/// question does not apply — a `postgres://` url is a server's disk and not
+/// this machine's, and saying nothing beats reporting the wrong one.
+#[cfg(unix)]
+fn disk_free(target: &str) -> Option<(u64, u64)> {
+    if target.contains("://") || target == ":memory:" {
+        return None;
+    }
+    let dir = std::path::Path::new(target)
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(std::path::Path::new("."));
+    let path = std::ffi::CString::new(dir.as_os_str().as_encoded_bytes()).ok()?;
+    // SAFETY: `path` is a valid nul-terminated string and `stats` is written
+    // only on success, which is what the return value reports
+    let stats = unsafe {
+        let mut stats: libc::statvfs = std::mem::zeroed();
+        (libc::statvfs(path.as_ptr(), &mut stats) == 0).then_some(stats)?
+    };
+    let unit = stats.f_frsize as u64;
+    Some((stats.f_bavail as u64 * unit, stats.f_blocks as u64 * unit))
+}
+
+#[cfg(not(unix))]
+fn disk_free(_target: &str) -> Option<(u64, u64)> {
+    None
+}
+
+fn bytes(n: u64) -> String {
+    const UNITS: [&str; 5] = ["b", "kb", "mb", "gb", "tb"];
+    let mut size = n as f64;
+    let mut unit = 0;
+    while size >= 1024.0 && unit + 1 < UNITS.len() {
+        size /= 1024.0;
+        unit += 1;
+    }
+    match unit {
+        0 => format!("{n}b"),
+        _ => format!("{size:.1}{}", UNITS[unit]),
+    }
+}
+
+// --------------------------------------------------------------------- explain
+
+/// the plan, without running it.
+///
+/// this is the command the mount pays for. the dag, what is parallel, which
+/// pools gate it and where isolation applies are all properties of the ops
+/// themselves — so answering takes a registry, and the registry is compiled
+/// into the binary this ran from. nothing is loaded and nothing is asked.
+fn explain(
+    reach: Reach,
+    job: &str,
+    params: Option<&str>,
+    preset: Option<&str>,
+    out: &Out,
+) -> Result<(), Fail> {
+    let app = match reach {
+        Reach::Local(app) => app.inspect()?,
+        Reach::Store { target, .. } => return Err(no_registry(&target, "explaining a plan")),
+        Reach::Server(_) => {
+            return Err(Fail::new(
+                Exit::Unsupported,
+                "a plan is a property of the job definitions, which live in the binary \
+                 they were compiled into — run explain there",
+            ));
+        }
+    };
+    let job = app
+        .jobs
+        .iter()
+        .find(|j| j.name() == job)
+        .ok_or_else(|| Fail::usage(format!("unknown job: {job}")))?;
+
+    // the params first, because a plan that could not launch is not a plan.
+    // exactly the check a launch runs, so a dry run that passes here and a
+    // launch that fails there cannot happen
+    let params: Value = match (params, preset) {
+        (Some(text), _) => json_arg(text)?,
+        (None, Some(preset)) => {
+            app.store
+                .preset(job.name(), preset)?
+                .ok_or_else(|| {
+                    Fail::usage(format!("unknown preset: {preset} on job {}", job.name()))
+                })?
+                .params
+        }
+        (None, None) => json!({}),
+    };
+    if let Some((op, reason)) = job.params_error(&params) {
+        return Err(Fail::from(Error::InvalidParams { op, reason }));
+    }
+
+    let stages = stages(job);
+    let pools: Vec<Value> = job
+        .ops()
+        .iter()
+        .filter_map(|op| op.pool_name())
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .map(|name| {
+            let limit = app.pools.iter().find(|(p, _)| p == name).map(|(_, l)| *l);
+            json!({ "name": name, "limit": limit })
+        })
+        .collect();
+    let answer = json!({
+        "job": job.name(),
+        "description": job.description(),
+        "params": params,
+        "max_parallel": job.max_parallel(),
+        "pools": pools,
+        "stages": stages.iter().enumerate().map(|(i, stage)| json!({
+            "stage": i + 1,
+            "ops": stage.iter().map(|op| json!({
+                "name": op.name(),
+                "deps": op.deps(),
+                "when": op.runs_when(),
+                "pool": op.pool_name(),
+                "isolated": op.is_isolated(),
+                "retries": op.max_retries(),
+                "timeout_secs": op.timeout_after().map(|d| d.as_secs_f64()),
+                "mapped_over": op.mapped_over(),
+            })).collect::<Vec<_>>(),
+        })).collect::<Vec<_>>(),
+    });
+    if out.json {
+        out.object(&answer);
+        return Ok(());
+    }
+    if out.quiet {
+        for stage in &stages {
+            for op in stage {
+                println!("{}", op.name());
+            }
+        }
+        return Ok(());
+    }
+    println!(
+        "{}{}",
+        out.paint(job.name(), BOLD),
+        match job.description() {
+            Some(d) => format!(" — {d}"),
+            None => String::new(),
+        }
+    );
+    let parallel = match job.max_parallel() {
+        Some(n) => format!(", at most {n} at once"),
+        None => String::new(),
+    };
+    println!(
+        "{} ops in {} stages{parallel}",
+        job.ops().len(),
+        stages.len()
+    );
+    if !pools.is_empty() {
+        let gates: Vec<String> = pools
+            .iter()
+            .map(|p| match p["limit"].as_u64() {
+                Some(limit) => format!("{} (limit {limit})", s(p, "name")),
+                None => format!("{} (not declared)", s(p, "name")),
+            })
+            .collect();
+        println!("pools    {}", gates.join(", "));
+    }
+    println!();
+    for (i, stage) in stages.iter().enumerate() {
+        // the stage is what runs together: every op in it has its dependencies
+        // behind it and none on each other
+        let together = match stage.len() > 1 {
+            true => out.paint(&format!("  ({} in parallel)", stage.len()), DIM),
+            false => String::new(),
+        };
+        println!("{}{together}", out.paint(&format!("stage {}", i + 1), BOLD));
+        for op in stage {
+            let mut notes: Vec<String> = Vec::new();
+            if op.runs_when() != crate::model::When::AllSucceeded {
+                notes.push(format!("runs {}", op.runs_when()));
+            }
+            if let Some(pool) = op.pool_name() {
+                notes.push(format!("pool {pool}"));
+            }
+            if op.is_isolated() {
+                notes.push("isolated".into());
+            }
+            if let Some(dep) = op.mapped_over() {
+                notes.push(format!("one per item of {dep}"));
+            }
+            if op.max_retries() > 0 {
+                notes.push(format!("retries {}", op.max_retries()));
+            }
+            if let Some(after) = op.timeout_after() {
+                notes.push(format!("timeout {}s", after.as_secs()));
+            }
+            let line = format!("  {:<24} {}", op.name(), out.paint(&notes.join(", "), DIM));
+            println!("{}", line.trim_end());
+        }
+    }
+    Ok(())
+}
+
+/// the ops in dependency order, grouped into the stages a run goes through.
+///
+/// an op's stage is one past the deepest of its deps, so everything in a stage
+/// has its dependencies behind it and none on each other — which is exactly the
+/// set the executor is free to run at once, subject to `max_parallel` and
+/// whatever pools they take from.
+fn stages(job: &Job) -> Vec<Vec<&crate::op::Op>> {
+    let mut depth: HashMap<&str, usize> = HashMap::new();
+    // the job's own topological order, so a dep is always resolved before the
+    // op that names it
+    let ordered: Vec<&crate::op::Op> = job.order().iter().filter_map(|name| job.op(name)).collect();
+    for op in &ordered {
+        let deepest = op
+            .deps()
+            .iter()
+            .filter_map(|dep| depth.get(dep.as_str()))
+            .max()
+            .map_or(0, |d| d + 1);
+        depth.insert(op.name(), deepest);
+    }
+    let mut stages: Vec<Vec<&crate::op::Op>> = Vec::new();
+    for op in ordered {
+        let at = depth[op.name()];
+        while stages.len() <= at {
+            stages.push(Vec::new());
+        }
+        stages[at].push(op);
+    }
+    stages
+}
+
+// ----------------------------------------------------------------- completions
+
+/// the shells `completions` writes a script for.
+#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+enum Shell {
+    Bash,
+    Zsh,
+    Fish,
+}
+
+/// what `__complete` will answer with, which is what the scripts below ask for.
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum Names {
+    Commands,
+    Jobs,
+    Assets,
+    Schedules,
+    Sensors,
+    Runs,
+}
+
+/// the name this process was invoked as, which is what a completion script
+/// completes unless `--name` says otherwise.
+fn invoked_as() -> String {
+    std::env::args()
+        .next()
+        .and_then(|arg0| {
+            std::path::Path::new(&arg0)
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+        })
+        .unwrap_or_else(|| "hestan".into())
+}
+
+/// the names this binary can complete, printed one per line.
+///
+/// **this is why the mount is worth having.** a completion script for an
+/// orchestrator normally has to bake in a list at build time or ask a server
+/// over the network, because nothing on the command line knows what your
+/// pipelines are called. here the registry is in the process: answering is a
+/// process start and a `Vec` walk, which is fast enough to sit under a tab key.
+fn complete(reach: Result<Reach, Fail>, what: Names, out: &Out) -> Result<(), Fail> {
+    let names: Vec<String> = match what {
+        // the parser's own, which needs no deployment at all: a shell asking
+        // what the subcommands are must get an answer before it has been told
+        // where anything is
+        Names::Commands => Cli::command()
+            .get_subcommands()
+            .filter(|c| !c.is_hide_set())
+            .map(|c| c.get_name().to_string())
+            .collect(),
+        Names::Jobs => reach?
+            .inspect()?
+            .jobs
+            .iter()
+            .map(|j| j.name().to_string())
+            .collect(),
+        Names::Assets => reach?
+            .inspect()?
+            .registry
+            .topo()
+            .map(|meta| meta.name.clone())
+            .collect(),
+        // out of the table rather than the registry: a schedule can be paused
+        // and a sensor can be one a probe added, and either way the row is the
+        // thing the commands take
+        Names::Schedules => {
+            let mut jobs: Vec<String> = reach?
+                .store()?
+                .schedules()?
+                .into_iter()
+                .map(|s| s.job)
+                .collect();
+            jobs.dedup();
+            jobs
+        }
+        Names::Sensors => reach?
+            .store()?
+            .sensors()?
+            .into_iter()
+            .map(|s| s.name)
+            .collect(),
+        Names::Runs => reach?
+            .store()?
+            .runs(None, None, None, None, None, 50)?
+            .into_iter()
+            .map(|r| r.id)
+            .collect(),
+    };
+    if out.json {
+        out.object(&json!({ "names": names }));
+        return Ok(());
+    }
+    for name in names {
+        println!("{name}");
+    }
+    Ok(())
+}
+
+/// a completion script for `shell`, naming this binary.
+///
+/// the scripts are written out rather than generated from the parser, because
+/// the interesting half is not the flags: it is that every name comes from
+/// `__complete`, run against this binary, at the moment you press tab. a job
+/// added this morning completes this afternoon with nothing regenerated.
+fn completions(shell: Shell, name: &str, out: &Out) {
+    // stdout, whatever the flags say: a completion script is the answer here,
+    // and `eval "$(myapp completions bash)"` is how it is used
+    let _ = out;
+    print!("{}", completion_script(shell, name));
+}
+
+fn completion_script(shell: Shell, name: &str) -> String {
+    // a shell function's name has to be an identifier, and a binary's name does
+    // not have to be one
+    let ident: String = name
+        .chars()
+        .map(|c| match c.is_alphanumeric() {
+            true => c,
+            false => '_',
+        })
+        .collect();
+    match shell {
+        Shell::Bash => format!(
+            r#"# {name} completion, from the binary itself: every name below is asked for
+# at the moment you press tab, so nothing here goes stale.
+_{ident}_complete() {{
+    local cur prev what
+    cur="${{COMP_WORDS[COMP_CWORD]}}"
+    prev="${{COMP_WORDS[COMP_CWORD-1]}}"
+    case "$prev" in
+        run|explain) what=jobs ;;
+        build|backfill) what=assets ;;
+        show|logs|cancel|retry|resume|priority) what=runs ;;
+        sensor) what=sensors ;;
+        schedule) what=schedules ;;
+        *) what=commands ;;
+    esac
+    COMPREPLY=( $(compgen -W "$("$1" __complete "$what" 2>/dev/null)" -- "$cur") )
+}}
+complete -F _{ident}_complete {name}
+"#
+        ),
+        Shell::Zsh => format!(
+            r#"#compdef {name}
+# {name} completion, from the binary itself: every name below is asked for
+# at the moment you press tab, so nothing here goes stale.
+_{ident}() {{
+    local what=commands
+    case "${{words[CURRENT-1]}}" in
+        run|explain) what=jobs ;;
+        build|backfill) what=assets ;;
+        show|logs|cancel|retry|resume|priority) what=runs ;;
+        sensor) what=sensors ;;
+        schedule) what=schedules ;;
+    esac
+    local -a names
+    names=( ${{(f)"$(${{words[1]}} __complete $what 2>/dev/null)"}} )
+    compadd -- $names
+}}
+compdef _{ident} {name}
+"#
+        ),
+        Shell::Fish => format!(
+            r#"# {name} completion, from the binary itself: every name below is asked for
+# at the moment you press tab, so nothing here goes stale.
+function __{ident}_complete
+    set -l tokens (commandline -opc)
+    set -l what commands
+    if test (count $tokens) -gt 1
+        switch $tokens[-1]
+            case run explain
+                set what jobs
+            case build backfill
+                set what assets
+            case show logs cancel retry resume priority
+                set what runs
+            case sensor
+                set what sensors
+            case schedule
+                set what schedules
+        end
+    end
+    {name} __complete $what 2>/dev/null
+end
+complete -c {name} -f -a '(__{ident}_complete)'
+"#
+        ),
+    }
+}
+
 // ---------------------------------------------------------- the output contract
 
 const BOLD: &str = "\x1b[1m";
@@ -2366,5 +3234,265 @@ mod tests {
         assert_eq!(fail.code, Exit::Unsupported);
         assert!(fail.message.contains("no job definitions"), "{fail:?}");
         assert!(fail.message.contains("--server"), "{fail:?}");
+    }
+
+    // ------------------------------------------------------------ doctor
+
+    // every case below constructs the condition and asserts the check finds
+    // it, because a check that cannot see what it is about is worse than no
+    // check: it reports that everything is fine, forever, about nothing.
+
+    use crate::asset::AssetRegistry;
+    use crate::executor::Limits;
+    use crate::job::Job;
+    use crate::op::Op;
+    use crate::schedule::Schedule;
+    use std::sync::Arc;
+
+    fn job(name: &str) -> Job {
+        Job::builder(name)
+            .op(Op::new("only", |_| async { Ok(json!(null)) }))
+            .build()
+            .unwrap()
+    }
+
+    fn app(store: Store, jobs: Vec<Job>) -> Inspected {
+        Inspected {
+            jobs,
+            registry: Arc::new(AssetRegistry::empty()),
+            store,
+            pools: Vec::new(),
+            limits: Limits::new(),
+            retention: Retention::default(),
+            role: Role::All,
+            db: ":memory:".into(),
+        }
+    }
+
+    fn levels(findings: &[Finding]) -> Vec<Level> {
+        findings.iter().map(|f| f.level).collect()
+    }
+
+    #[test]
+    fn doctor_finds_a_cron_or_a_timezone_the_scheduler_cannot_use() {
+        let store = Store::open(":memory:").unwrap();
+        store
+            .sync_schedules(&[
+                Schedule::new("good", "*/5 * * * *"),
+                Schedule::new("lost", "*/5 * * * *").tz("Mars/Olympus"),
+            ])
+            .unwrap();
+        let findings = check_schedules(&store).unwrap();
+        assert_eq!(levels(&findings), [Level::Ok, Level::Wrong]);
+        assert!(findings[1].says.contains("lost"), "{}", findings[1].says);
+        assert!(
+            findings[1].says.contains("never fire"),
+            "{}",
+            findings[1].says
+        );
+        assert!(findings[1].fix.is_some());
+    }
+
+    #[test]
+    fn doctor_finds_a_paused_schedule_and_a_paused_sensor() {
+        let store = Store::open(":memory:").unwrap();
+        store
+            .sync_schedules(&[Schedule::new("nightly", "0 2 * * *")])
+            .unwrap();
+        store.sync_sensors(&["inbox".to_string()]).unwrap();
+        assert_eq!(levels(&check_schedules(&store).unwrap()), [Level::Ok]);
+        assert_eq!(levels(&check_sensors(&store).unwrap()), [Level::Ok]);
+
+        assert!(
+            store
+                .set_schedule_paused("nightly", "0 2 * * *", true)
+                .unwrap()
+        );
+        assert!(store.set_sensor_paused("inbox", true).unwrap());
+        let schedules = check_schedules(&store).unwrap();
+        assert_eq!(levels(&schedules), [Level::Ok, Level::Note]);
+        assert!(schedules[1].says.contains("nightly"));
+        let sensors = check_sensors(&store).unwrap();
+        assert_eq!(levels(&sensors), [Level::Note]);
+        assert!(sensors[0].fix.as_deref() == Some("unpause sensor inbox"));
+    }
+
+    // a claimer that stopped renewing leaves rows nothing else will notice,
+    // which is exactly the case where a lease loop is not running either
+    #[test]
+    fn doctor_finds_a_run_held_past_its_lease() {
+        let store = Store::open(":memory:").unwrap();
+        let runner = Runner::new([job("etl")], store.clone()).with_role(Role::Scheduler, 1);
+        runner.launch("etl", json!({}), Trigger::Manual).unwrap();
+        assert_eq!(
+            levels(&check_leases(&store, Utc::now()).unwrap()),
+            [Level::Ok]
+        );
+
+        // claimed under a lease with no time on it at all, which is what a
+        // process that died the instant after claiming leaves behind
+        let defined = std::collections::HashSet::from(["etl".to_string()]);
+        store
+            .claim_next("gone", Duration::from_secs(0), &Limits::new(), &defined)
+            .unwrap()
+            .expect("the run was there to claim");
+        let findings = check_leases(&store, Utc::now() + chrono::Duration::seconds(1)).unwrap();
+        assert_eq!(levels(&findings), [Level::Wrong]);
+        assert!(findings[0].says.contains("gone"), "{}", findings[0].says);
+    }
+
+    // the finding worth having: a run nothing is holding back and nothing is
+    // taking, which is a deployment where every process was started as a
+    // scheduler and has no other symptom at all
+    #[test]
+    fn doctor_finds_a_queue_that_nothing_is_taking_and_one_a_limit_is_holding() {
+        let store = Store::open(":memory:").unwrap();
+        let runner = Runner::new([job("etl")], store.clone()).with_role(Role::Scheduler, 1);
+        let mut app = app(store.clone(), vec![job("etl")]);
+        assert_eq!(levels(&check_queue(&app).unwrap()), [Level::Ok]);
+
+        runner.launch("etl", json!({}), Trigger::Manual).unwrap();
+        let findings = check_queue(&app).unwrap();
+        assert_eq!(levels(&findings), [Level::Wrong]);
+        assert!(
+            findings[0].says.contains("nothing holding them back"),
+            "{}",
+            findings[0].says
+        );
+
+        // and a limit that really is holding one back is a note rather than a
+        // fault: the limit is doing what it was set to do
+        runner.launch("etl", json!({}), Trigger::Manual).unwrap();
+        let defined = std::collections::HashSet::from(["etl".to_string()]);
+        let one = Limits::new().global(1);
+        store
+            .claim_next("worker", Duration::from_secs(60), &one, &defined)
+            .unwrap()
+            .expect("one of the two was claimable");
+        app.limits = one;
+        let findings = check_queue(&app).unwrap();
+        assert_eq!(levels(&findings), [Level::Note]);
+        assert!(findings[0].says.contains("limit"), "{}", findings[0].says);
+    }
+
+    // a policy in a process that will never run it: the database grows and
+    // nothing anywhere says why
+    #[test]
+    fn doctor_finds_a_retention_policy_a_worker_will_never_sweep() {
+        let store = Store::open(":memory:").unwrap();
+        let mut app = app(store, Vec::new());
+        assert_eq!(levels(&check_retention(&app)), [Level::Ok]);
+
+        app.retention = Retention::days(7);
+        assert_eq!(
+            levels(&check_retention(&app)),
+            [Level::Ok],
+            "a role that decides sweeps"
+        );
+
+        app.role = Role::Worker;
+        let findings = check_retention(&app);
+        assert_eq!(levels(&findings), [Level::Wrong]);
+        assert!(findings[0].says.contains("worker"), "{}", findings[0].says);
+    }
+
+    // a full disk cannot be constructed in a test, so the two halves are
+    // tested apart: the reading, against a directory that exists, and the
+    // verdict, against numbers
+    #[test]
+    fn doctor_reads_the_disk_and_calls_a_nearly_full_one_wrong() {
+        let dir = std::env::temp_dir().join("hestan-doctor-disk.db");
+        let (free, total) = disk_free(&dir.display().to_string()).expect("a local path has a disk");
+        assert!(total > 0 && free <= total, "free {free} of {total}");
+        assert_eq!(
+            disk_free("postgres://host/db"),
+            None,
+            "a server's disk is not ours"
+        );
+        assert_eq!(disk_free(":memory:"), None);
+
+        assert_eq!(check_disk("/x.db", 500, 1000).level, Level::Ok);
+        let nearly = check_disk("/x.db", 1, 1000);
+        assert_eq!(nearly.level, Level::Wrong);
+        assert!(nearly.says.contains("0%"), "{}", nearly.says);
+    }
+
+    #[test]
+    fn bytes_are_readable_at_every_scale() {
+        assert_eq!(bytes(512), "512b");
+        assert_eq!(bytes(2048), "2.0kb");
+        assert_eq!(bytes(5 * 1024 * 1024 * 1024), "5.0gb");
+    }
+
+    // ----------------------------------------------------------- explain
+
+    // a diamond: one op, two that depend on it and not on each other, and one
+    // that waits for both. the stage in the middle is the parallel pair, and
+    // getting that wrong is the whole way an explain can lie
+    #[test]
+    fn explain_orders_a_diamond_and_puts_the_parallel_pair_in_one_stage() {
+        let diamond = Job::builder("diamond")
+            .op(Op::new("fetch", |_| async { Ok(json!(null)) }))
+            .op(Op::new("left", |_| async { Ok(json!(null)) }).after(["fetch"]))
+            .op(Op::new("right", |_| async { Ok(json!(null)) }).after(["fetch"]))
+            .op(Op::new("join", |_| async { Ok(json!(null)) }).after(["left", "right"]))
+            .build()
+            .unwrap();
+        let stages = stages(&diamond);
+        let names: Vec<Vec<&str>> = stages
+            .iter()
+            .map(|stage| stage.iter().map(|op| op.name()).collect())
+            .collect();
+        assert_eq!(names.len(), 3, "{names:?}");
+        assert_eq!(names[0], ["fetch"]);
+        assert_eq!(names[2], ["join"]);
+        let mut middle = names[1].clone();
+        middle.sort_unstable();
+        assert_eq!(middle, ["left", "right"], "the parallel pair is one stage");
+    }
+
+    // a chain is three stages of one, which is the same rule saying the
+    // opposite thing
+    #[test]
+    fn explain_puts_a_chain_in_one_stage_each() {
+        let chain = Job::builder("chain")
+            .op(Op::new("a", |_| async { Ok(json!(null)) }))
+            .op(Op::new("b", |_| async { Ok(json!(null)) }).after(["a"]))
+            .op(Op::new("c", |_| async { Ok(json!(null)) }).after(["b"]))
+            .build()
+            .unwrap();
+        assert_eq!(
+            stages(&chain).iter().map(Vec::len).collect::<Vec<_>>(),
+            [1, 1, 1]
+        );
+    }
+
+    // ------------------------------------------------------- completions
+
+    // the point of the mount, as a test: the script asks the binary, so the
+    // names cannot be stale, and the subcommand it asks with is a real one
+    #[test]
+    fn a_completion_script_asks_this_binary_for_every_name() {
+        for shell in [Shell::Bash, Shell::Zsh, Shell::Fish] {
+            let script = completion_script(shell, "myapp");
+            assert!(script.contains("__complete"), "{script}");
+            assert!(script.contains("myapp"), "{script}");
+            for what in ["jobs", "assets", "runs", "sensors", "schedules", "commands"] {
+                assert!(script.contains(what), "{shell:?} never asks for {what}");
+            }
+        }
+    }
+
+    // and the hidden subcommand the scripts call is not in the list they offer
+    #[test]
+    fn the_completion_hook_is_not_itself_a_suggestion() {
+        let names: Vec<String> = Cli::command()
+            .get_subcommands()
+            .filter(|c| !c.is_hide_set())
+            .map(|c| c.get_name().to_string())
+            .collect();
+        assert!(names.contains(&"doctor".to_string()));
+        assert!(names.contains(&"explain".to_string()));
+        assert!(!names.contains(&"__complete".to_string()), "{names:?}");
     }
 }

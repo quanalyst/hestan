@@ -69,7 +69,15 @@ struct Totals {
 
 #[tokio::main]
 async fn main() -> Result<(), hestan::Error> {
-    tracing_subscriber::fmt().init();
+    // stderr and RUST_LOG, for the reason the demo says: this binary has a
+    // command line, its stdout belongs to the answer, and hestan's own events
+    // are what `--wait` is already streaming
+    tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
+        )
+        .init();
 
     let docs_dir = Asset::source("docs_dir")
         .probe(|| async { docs_fingerprint() })

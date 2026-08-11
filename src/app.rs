@@ -962,6 +962,9 @@ impl Hestan {
             store,
             pools: self.pools,
             limits: self.limits,
+            retention: self.retention,
+            role: self.role,
+            db: self.db_path,
         })
     }
 
@@ -1087,6 +1090,10 @@ pub(crate) struct Inspected {
     pub(crate) store: Store,
     pub(crate) pools: Vec<(String, usize)>,
     pub(crate) limits: Limits,
+    pub(crate) retention: Retention,
+    pub(crate) role: Role,
+    /// the path or url the store was opened at.
+    pub(crate) db: String,
 }
 
 pub(crate) struct Built {

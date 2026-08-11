@@ -1470,6 +1470,52 @@ impl Store {
     /// either have to invent them, and report a queue that nothing is holding
     /// back, or report every job as undefined because this process defines
     /// none. saying only what it knows is the third option.
+    /// runs whose claimer stopped saying it was still there: claimed, not
+    /// terminal, and past the lease it was holding them under.
+    ///
+    /// a deployment with a process running is already reclaiming these on its
+    /// lease loop, so finding any means either that the loop is behind or that
+    /// nothing is running one — and the second is the case where they sit there
+    /// forever, which is exactly the thing worth being told about.
+    #[cfg(any(test, feature = "cli"))]
+    pub(crate) fn stalled_claims(&self, now: DateTime<Utc>) -> Result<Vec<Run>, Error> {
+        self.conn().query(
+            &format!(
+                "SELECT {RUN_COLS} FROM runs
+                 WHERE claimed_by IS NOT NULL AND status IN ('queued', 'running')
+                   AND lease_until IS NOT NULL AND lease_until < ?1
+                 ORDER BY lease_until"
+            ),
+            args![now.to_rfc3339()],
+            run_from_row,
+        )
+    }
+
+    /// the schema version this database is at, which after an open is always
+    /// the one this build writes — the number is worth reporting rather than
+    /// checking, since a database from the future refuses to open at all.
+    #[cfg(any(test, feature = "cli"))]
+    pub(crate) fn schema_version(&self) -> Result<u32, Error> {
+        let mut conn = self.conn();
+        let sql = match conn.dialect() {
+            Dialect::Sqlite => "PRAGMA user_version",
+            #[cfg(feature = "postgres")]
+            Dialect::Postgres => "SELECT version FROM schema_version",
+        };
+        let version = conn.query_opt(sql, args![], |r| r.int(0))?;
+        Ok(version.unwrap_or_default() as u32)
+    }
+
+    /// which backend this is and where, for a line that says what was opened.
+    #[cfg(any(test, feature = "cli"))]
+    pub(crate) fn backend(&self) -> &'static str {
+        match self.conn().dialect() {
+            Dialect::Sqlite => "sqlite",
+            #[cfg(feature = "postgres")]
+            Dialect::Postgres => "postgres",
+        }
+    }
+
     #[cfg(any(test, feature = "cli"))]
     pub(crate) fn queue_rows(&self, limit: u32) -> Result<Vec<Run>, Error> {
         let rows = queued(&mut self.conn(), limit)?;
@@ -7168,6 +7214,11 @@ mod tests {
                 store.queue(&Limits::new(), &defined, 10).unwrap()[0].run.id,
                 "r1"
             );
+            // what the doctor reads: this database says which backend it is
+            // and what version it is at, on either of them
+            assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
+            assert!(["sqlite", "postgres"].contains(&store.backend()));
+
             // the same order to a reader that owns no limits and so says
             // nothing about what is holding anything back
             let rows = store.queue_rows(10).unwrap();
@@ -7183,6 +7234,15 @@ mod tests {
             assert_eq!(claimed.claimed_by.as_deref(), Some("alpha"));
             assert_eq!(store.queue_depth().unwrap(), 2);
             assert_eq!(store.held_by("alpha").unwrap(), ["r1"]);
+            // a claim is not stalled while its lease has time on it, and is
+            // once it does not — which is the only way a claimer that went away
+            // can be told from one that is working
+            let now = Utc::now();
+            assert!(store.stalled_claims(now).unwrap().is_empty());
+            let later = now + chrono::Duration::seconds(31);
+            let stalled = store.stalled_claims(later).unwrap();
+            assert_eq!(stalled.len(), 1);
+            assert_eq!(stalled[0].id, "r1");
             // by then the priority has been spent
             let err = store.set_run_priority("r1", 9).unwrap_err();
             assert!(matches!(err, Error::RunActive(_)), "{err}");

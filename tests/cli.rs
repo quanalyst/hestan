@@ -59,6 +59,12 @@ fn app(db: &str) -> Hestan {
         .db(db)
 }
 
+#[derive(serde::Deserialize)]
+#[allow(dead_code)]
+struct Window {
+    days: u32,
+}
+
 fn jobs() -> Vec<Job> {
     vec![
         Job::builder("quick")
@@ -73,6 +79,20 @@ fn jobs() -> Vec<Job> {
             .op(Op::new("explode", |_| async {
                 Err::<Value, _>("the warehouse said no".into())
             }))
+            .build()
+            .unwrap(),
+        // a diamond, for the plan `explain` resolves: two ops that depend on
+        // the first and not on each other
+        Job::builder("diamond")
+            .op(Op::new("fetch", |_| async { Ok(json!(null)) }))
+            .op(Op::new("left", |_| async { Ok(json!(null)) }).after(["fetch"]))
+            .op(Op::new("right", |_| async { Ok(json!(null)) }).after(["fetch"]))
+            .op(Op::new("join", |_| async { Ok(json!(null)) }).after(["left", "right"]))
+            .build()
+            .unwrap(),
+        // and a job with a params schema, for the dry run to reject against
+        Job::builder("windowed")
+            .op(Op::new("render", |_| async { Ok(json!(null)) }).params::<Window>())
             .build()
             .unwrap(),
         Job::builder("slow")
@@ -99,6 +119,13 @@ async fn cases(dir: &Path) {
     case("no_arguments_serves", serves(dir)).await;
     case("each_mode_reaches_what_it_should", modes(dir)).await;
     case("a_follow_resumes_from_a_cursor", resumes(dir)).await;
+    case("doctor_answers_why_nothing_is_running", diagnosed(dir)).await;
+    case("a_dry_run_checks_the_params_and_creates_nothing", dry(dir)).await;
+    case(
+        "completion_comes_from_the_registry_in_this_binary",
+        completing(dir),
+    )
+    .await;
 }
 
 // ------------------------------------------------------------------ the cases
@@ -404,6 +431,111 @@ async fn resumes(dir: &Path) {
         seqs.windows(2).all(|w| w[0] < w[1]),
         "out of order: {seqs:?}"
     );
+}
+
+/// doctor, end to end: a healthy deployment says so and exits 0, and one with
+/// a run nobody is going to take says which and exits 7. the conditions
+/// themselves are each constructed and asserted in `src/cli.rs`; what this adds
+/// is that the exit code follows.
+async fn diagnosed(dir: &Path) {
+    let db = db(dir, "doctor");
+    cli(&db, &["run", "quick", "--wait"]).assert(0);
+    let healthy = cli(&db, &["doctor"]);
+    healthy.assert(0);
+    assert!(healthy.stdout.contains("ok    store"), "{healthy:?}");
+    assert!(
+        healthy.stdout.contains("disk"),
+        "no disk check: {healthy:?}"
+    );
+
+    // a launch with nothing running to execute it, which is the question
+    // doctor exists to answer
+    cli(&db, &["run", "quick"]).assert(0);
+    let stuck = cli(&db, &["doctor"]);
+    stuck.assert(7);
+    assert!(
+        stuck.stdout.contains("nothing holding them back"),
+        "{stuck:?}"
+    );
+
+    let machine = cli(&db, &["--json", "doctor"]);
+    machine.assert(7);
+    let value: Value = serde_json::from_str(&machine.stdout).expect("one json object");
+    assert_eq!(value["ok"], false);
+    let wrong: Vec<&Value> = value["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|f| f["level"] == "wrong")
+        .collect();
+    assert_eq!(wrong.len(), 1, "{:?}", value["findings"]);
+    assert!(wrong[0]["fix"].is_string(), "a finding with no fix");
+}
+
+/// the params a dry run checks are the ones a launch would check, and nothing
+/// it does reaches the run log.
+async fn dry(dir: &Path) {
+    let db = db(dir, "dry");
+    let before = cli(&db, &["--quiet", "runs", "--limit", "500"])
+        .stdout
+        .lines()
+        .count();
+
+    let bad = cli(
+        &db,
+        &[
+            "run",
+            "windowed",
+            "--params",
+            "{\"days\":\"lots\"}",
+            "--dry-run",
+        ],
+    );
+    bad.assert(2);
+    assert!(bad.stderr.contains("invalid params"), "{bad:?}");
+
+    let good = cli(&db, &["--json", "run", "diamond", "--dry-run"]);
+    good.assert(0);
+    let plan: Value = serde_json::from_str(&good.stdout).expect("one json object");
+    let stages = plan["stages"].as_array().expect("stages");
+    assert_eq!(stages.len(), 3, "{stages:?}");
+    let mut middle: Vec<&str> = stages[1]["ops"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|op| op["name"].as_str().unwrap())
+        .collect();
+    middle.sort_unstable();
+    assert_eq!(middle, ["left", "right"], "the parallel pair is one stage");
+
+    let after = cli(&db, &["--quiet", "runs", "--limit", "500"])
+        .stdout
+        .lines()
+        .count();
+    assert_eq!(before, after, "a dry run reached the run log");
+}
+
+/// the claim the mount makes, tested: the names a shell completes come out of
+/// the registry compiled into this binary, at the moment they are asked for.
+async fn completing(dir: &Path) {
+    let db = db(dir, "completions");
+    let script = cli(&db, &["completions", "bash"]);
+    script.assert(0);
+    assert!(script.stdout.contains("__complete"), "{script:?}");
+    assert!(script.stdout.contains("what=jobs"), "{script:?}");
+
+    let names = cli(&db, &["__complete", "jobs"]);
+    names.assert(0);
+    let listed: Vec<&str> = names.stdout.lines().collect();
+    assert!(listed.contains(&"quick"), "{listed:?}");
+    assert!(listed.contains(&"diamond"), "{listed:?}");
+
+    // and the subcommands, which a shell has to be able to ask for before it
+    // has been told where any deployment is
+    let commands = operator(&["__complete", "commands"]);
+    commands.assert(0);
+    assert!(commands.stdout.contains("doctor"), "{commands:?}");
+    assert!(!commands.stdout.contains("__complete"), "{commands:?}");
 }
 
 // ---------------------------------------------------------------- the harness
