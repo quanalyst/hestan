@@ -568,6 +568,19 @@ visit per run: the jobs with runs are walked by a loose index scan over
 `runs_job_created`, and each job's doomed rows are a range seek on the same
 index.
 
+**what a pruned run wrote goes first.** before the rows are deleted, every
+registered [io manager](io-managers.md) is asked to drop each doomed run —
+`FileIo` and `ParquetIo` remove `{dir}/{run_id}` whole, and the default
+`Inline` has nothing to drop, since its outputs *are* the rows. the order is
+the point: a run row is the only record that the run existed, so deleting it
+first and crashing in between would leave files nothing could ever name
+again. this way round a crash leaves rows pointing at outputs that are gone,
+for runs that are already past retention and go on the next sweep. a manager
+that fails to drop something is logged and the rows are pruned anyway — a
+file left behind is a smaller problem than a sweep that stops. the io
+managers' page has [the whole of it](io-managers.md#what-retention-takes),
+including what to know before pointing a manager at a directory.
+
 the sweep also takes [sensor run keys](sensors.md) older than the age cutoff —
 nothing else collects them, and a sensor keyed by the day would keep a row per
 day forever — and delivered [notifications](notifications.md) older than it.
@@ -606,8 +619,12 @@ within a run, dependents are handed handles and resolve them as they are
 spawned; a resume and an asset build resolve the handles they seed the same
 way. the executor still never reads *outputs* back from sqlite during a run —
 it carries them — but it does read them back on a resume, which is where a
-pruned run breaks a chain (`get` is asked for a value the manager may no
-longer have; `FileIo` cleans up nothing, so this is on you to sweep).
+pruned run breaks a chain: the rows that held those handles are gone, and so
+is what they pointed at, because the sweep took both.
+
+every one of those calls is made on tokio's blocking pool rather than on the
+task driving the run, so a manager talking to something slow costs the op it
+is persisting and not the ops beside it.
 
 two tables are keyed by names instead of run ids and hold current state
 rather than history. `op_state`: one json value per `(job, op)`, upserted

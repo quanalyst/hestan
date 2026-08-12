@@ -22,6 +22,8 @@ pub trait IoManager: Send + Sync + 'static {
     fn put(&self, key: &IoKey, value: Value) -> IoResult;
     /// resolve a handle back to the value
     fn get(&self, key: &IoKey, handle: &Value) -> IoResult;
+    /// drop everything stored for one run — retention calls this
+    fn drop_run(&self, run_id: &str, job: &str) -> IoDropped;
 }
 
 pub struct IoKey { pub run_id: String, pub job: String, pub op: String }
@@ -30,7 +32,7 @@ pub struct IoKey { pub run_id: String, pub job: String, pub op: String }
 `IoKey::op` is `{op}[{i}]` for one fan-out instance, since each instance
 persists its own output.
 
-two rules:
+three rules:
 
 - **round-trip.** `get(key, put(key, v))` must be `v`.
 - **`get` must be total.** it is called on every value a run hands an op, and
@@ -40,13 +42,26 @@ two rules:
   by op. anything a manager did not produce, it returns unchanged. `Inline`
   does that with everything; `FileIo` does it with anything that is not one of
   its own `$io` handles.
+- **`drop_run` is idempotent.** a run that wrote nothing and a run an earlier
+  sweep already collected are both `Ok(())` — [what retention
+  takes](#what-retention-takes) is the whole of why.
 
 resolve from the **handle**, not from the key. the key is context — useful for
 laying out storage in `put`, and for logging — but a handle read back on a
 resume carries the run id of the run that wrote it, not the one reading it.
 
-both calls are synchronous and run on the run's own task, so a manager that
-talks to something slow should say so.
+`drop_run` has **no default**, so adding a manager of your own is a decision
+you make rather than one that gets made by omission: a no-op default would
+compile and leak every file the manager has ever written. `Inline` returns
+`Ok(())` because an inline output is the run log row retention is deleting.
+
+all three calls are synchronous, and hestan makes them on tokio's blocking
+pool rather than on the task driving the run. write them as ordinary blocking
+code: a manager may take as long as the storage behind it takes, and the ops
+beside it keep running. the one exception is `Runner::resume_plan`, which
+resolves an earlier run's outputs on the thread that called it, exactly as it
+does its store reads — that whole api is synchronous, and nothing is
+executing while a resume is being planned.
 
 ## FileIo
 
@@ -66,8 +81,9 @@ the handle is an object rather than a bare path so anything reading
 `op_runs.output` — including the ui — can tell a reference from a value at a
 glance.
 
-**nothing is ever cleaned up.** [retention](storage.md) prunes run rows, not
-files. point `FileIo` at a directory you are willing to sweep.
+[retention](storage.md#retention) takes the files with the rows: pruning a
+run removes `{dir}/{run_id}` whole. what is never collected is a run no
+policy deletes — see [what retention takes](#what-retention-takes).
 
 ## What a name may be
 
@@ -148,12 +164,12 @@ two things do not survive the round trip, and neither can:
 **what it is not**: a directory of files, exactly as `FileIo` is one. no
 partitioned datasets, no compaction, no manifest, no object store — one op
 writes one file and the op downstream reads that file. anything more is a
-table format, which is a different thing to be. and nothing is cleaned up
-here either. names land where `FileIo`'s do and are refused on the same
-terms.
+table format, which is a different thing to be. names land where `FileIo`'s
+do, are refused on the same terms, and are collected on the same terms.
 
-both calls run on the run's own task, since that is what the trait says. a
-file worth minutes of io is worth doing inside the op.
+reading and writing happen on the blocking pool rather than on the run's own
+task, as every manager call does, so a file worth minutes of io costs the op
+that wrote it and not the ops beside it.
 
 ## What a handle says about what it stored
 
@@ -227,6 +243,49 @@ could not persist the output: nowhere to put it
 the op run is `failed` with no output, its downstream is skipped, and the run
 fails. recording success for a value that was never stored would strand the
 next resume, which would seed a handle to nothing.
+
+## What retention takes
+
+a run's rows are the only record that the run existed. so when
+[retention](storage.md#retention) prunes a run it asks **every registered
+manager** to drop what that run stored, and it does that **before** deleting
+the rows:
+
+1. read the ids this job's policy may no longer keep
+2. `drop_run(run_id, job)` on every manager, for each of them
+3. delete the rows
+
+that order is not arbitrary. rows first, and a crash in between loses the
+ids: nothing is left that knows which files to collect, and the leak is
+permanent. files first, and a crash leaves rows pointing at outputs that are
+gone — for runs already past retention, which the next sweep deletes anyway.
+which is also why `drop_run` has to be idempotent: it will be asked twice.
+
+every manager rather than the one each op selected, because which manager
+wrote a given run's outputs is a question about a job the sweeping process
+may no longer define. a manager that stored nothing for that run does
+nothing, which is what makes asking all of them cheap.
+
+a manager that **cannot** drop something is logged and the sweep carries on,
+to the rest of that job's rows and to the next job. a file left behind is one
+run's worth of waste that whoever owns the directory can still find; a sweep
+that stopped there would grow the database forever behind one unwritable
+directory, and go on doing it every hour.
+
+three things follow, and all three are worth knowing before you point a
+manager at a directory:
+
+- **only what a policy deletes is collected.** with no `Retention`
+  configured nothing is pruned and nothing is dropped, so the directory grows
+  exactly as the run log does.
+- **the process that decides is the process that deletes** — see
+  [roles](scaling.md#roles). the directory has to be on *its* filesystem: a
+  scheduler that cannot see the disk the workers wrote to cannot collect it.
+- **the whole run goes at once.** `{run_id}/{op}` means one directory per
+  run for both bundled managers, and the sweep removes it whole — after
+  checking that it is under the manager's own directory, by the same rule a
+  `put` is checked by. a path computed from a run id and removed without that
+  check would be a much worse bug than the leak it was fixing.
 
 ## In the ui
 

@@ -174,8 +174,10 @@ json. that is right for `{"rows": 12}` and wrong for the rows themselves.
   which is the format this kind of work already uses — and records the row
   count and the file size as metadata without the op asking.
 
-both are a directory of files. neither is a data lake, and neither cleans up
-after itself; [retention](storage.md#retention) prunes run rows, not files.
+both are a directory of files, and neither is a data lake.
+[retention](storage.md#retention) takes a pruned run's files with its rows,
+so what grows there is the history your policy keeps — and with no policy
+configured, all of it.
 
 the other half of the answer is that the value does not have to travel through
 hestan at all. an op that loads a table into your warehouse can return
