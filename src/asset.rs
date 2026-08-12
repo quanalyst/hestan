@@ -177,6 +177,21 @@ impl Asset {
         self
     }
 
+    /// the name this asset is registered and materialized under.
+    ///
+    /// worth having for assets you did not name yourself: a
+    /// [dbt project](crate::dbt) hands back a vec of them, and this is how you
+    /// find the one you want to say something more about.
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// what it is made of, in declaration order — the same names
+    /// [`from`](Asset::from) and [`from_named`](Asset::from_named) took.
+    pub fn deps(&self) -> &[String] {
+        &self.deps
+    }
+
     /// extra attempts for the materializing op (default 0).
     pub fn retries(mut self, n: u32) -> Asset {
         self.retries = n;

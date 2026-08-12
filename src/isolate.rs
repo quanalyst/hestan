@@ -37,7 +37,6 @@ use std::time::Duration;
 
 use futures::FutureExt;
 use serde_json::{Value, json};
-use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::{Child, Command};
 use tokio::sync::watch;
 use tracing::Instrument;
@@ -46,8 +45,8 @@ use crate::error::Error;
 use crate::executor::{CANCEL_GRACE, Ended, note, panic_payload};
 use crate::io::{Io, IoKey};
 use crate::job::Job;
-use crate::logs::{Attempt, Budget, Source, Split};
-use crate::model::{EventKind, EventLevel, LogStream, OpStatus};
+use crate::logs::{Attempt, capture_child};
+use crate::model::{EventKind, EventLevel, OpStatus};
 use crate::op::{self, Cancel, Op, OpCtx};
 use crate::resource::Resources;
 use crate::store::Store;
@@ -152,7 +151,7 @@ pub(crate) async fn attempt(
         }
     };
     let pid = child.id();
-    let capture = capturing(&mut child, store, &Attempt::new(run_id, name, attempt));
+    let capture = capture_child(&mut child, store, &Attempt::new(run_id, name, attempt));
     if let Some(pid) = pid {
         note(store.op_spawned(run_id, name, pid));
         note(store.append_event(
@@ -180,111 +179,24 @@ pub(crate) async fn attempt(
             // the kill first and the drain after it: a pipe reaches its end
             // when the process holding the far side of it is gone
             let ended = stopped(&mut child, pid, None).await;
-            capture.finish().await;
+            capture.finish(CANCEL_GRACE).await;
             return ended;
         }
         () = &mut expiry => {
             let limit = op.timeout_after().expect("the expiry arm cannot fire without a limit");
             let ended = stopped(&mut child, pid, Some(limit)).await;
-            capture.finish().await;
+            capture.finish(CANCEL_GRACE).await;
             return ended;
         }
     };
     // before the row is read, so a run page showing a finished op is showing
     // everything that op printed
-    capture.finish().await;
+    capture.finish(CANCEL_GRACE).await;
     let status = match exited {
         Ok(status) => status,
         Err(e) => return Ended::Failed(format!("could not wait for the op subprocess: {e}")),
     };
     recorded(store, run_id, name).unwrap_or_else(|| Ended::Failed(no_result(op, &status)))
-}
-
-/// the two tasks reading one child's pipes.
-struct Capture(Vec<tokio::task::JoinHandle<()>>);
-
-/// start reading both of a child's pipes, into rows under `at`.
-///
-/// **both, concurrently, always.** reading stdout to its end first and stderr
-/// afterwards would leave stderr's pipe buffer — 64 KiB on linux — to fill,
-/// and a child blocked writing into a full pipe never exits, so the parent
-/// waits forever for a process waiting for the parent. it looks like a slow op
-/// under load and like nothing at all in a test with a chatty op, which is
-/// exactly the kind of bug that ships. one task per pipe rules it out by
-/// construction rather than by ordering the reads carefully.
-fn capturing(child: &mut Child, store: &Store, at: &Attempt) -> Capture {
-    // one budget for the pair: the cap is on what the attempt produced, not on
-    // which pipe it came out of
-    let budget = Arc::new(Mutex::new(Budget::new()));
-    let mut tasks = Vec::new();
-    if let Some(pipe) = child.stdout.take() {
-        tasks.push(tokio::spawn(drain(
-            pipe,
-            LogStream::Stdout,
-            store.clone(),
-            at.clone(),
-            budget.clone(),
-        )));
-    }
-    if let Some(pipe) = child.stderr.take() {
-        tasks.push(tokio::spawn(drain(
-            pipe,
-            LogStream::Stderr,
-            store.clone(),
-            at.clone(),
-            budget.clone(),
-        )));
-    }
-    Capture(tasks)
-}
-
-impl Capture {
-    /// wait for both readers to reach the end of their pipe.
-    ///
-    /// called once the child has exited or been killed, so both pipes are
-    /// closed and both tasks are already finishing. the exception is a
-    /// grandchild the op left behind holding an inherited pipe open, and a
-    /// lost tail of output is a far better outcome there than an op run that
-    /// never ends — so this waits the same grace a kill does, then stops.
-    async fn finish(self) {
-        let stop: Vec<_> = self.0.iter().map(|t| t.abort_handle()).collect();
-        if tokio::time::timeout(CANCEL_GRACE, futures::future::join_all(self.0))
-            .await
-            .is_err()
-        {
-            for task in stop {
-                task.abort();
-            }
-        }
-    }
-}
-
-/// read one pipe to its end, storing each line as it arrives.
-///
-/// this keeps reading after the [cap](Budget) is reached rather than dropping
-/// the pipe: the lines stop being stored, but a child writing into a pipe
-/// nobody reads blocks, and an op that stopped mid-print because it was too
-/// chatty would be hestan breaking it.
-async fn drain(
-    mut pipe: impl AsyncRead + Unpin,
-    stream: LogStream,
-    store: Store,
-    at: Attempt,
-    budget: Arc<Mutex<Budget>>,
-) {
-    let mut split = Split::default();
-    let mut buf = [0u8; 8 * 1024];
-    // a read error on a pipe means the far end is gone, which is the same end
-    // of stream a clean zero is
-    while let Ok(read @ 1..) = pipe.read(&mut buf).await {
-        let mut budget = budget.lock().unwrap();
-        split.feed(&buf[..read], |line| {
-            budget.line(&store, &at, Source::Stream(stream), line);
-        });
-    }
-    // a child that died mid-line still said what it managed to say
-    let mut budget = budget.lock().unwrap();
-    split.finish(|line| budget.line(&store, &at, Source::Stream(stream), line));
 }
 
 /// what the child recorded, if it recorded anything.

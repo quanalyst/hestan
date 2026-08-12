@@ -99,6 +99,10 @@ otel = ["dep:opentelemetry", "dep:opentelemetry_sdk", "dep:tracing-opentelemetry
 # rather than as json. off by default because arrow and parquet are a large
 # dependency to hand a deployment whose outputs are `{"loaded": 4210}`
 parquet = ["dep:arrow", "dep:parquet"]
+# `hestan::dbt`: a dbt project's models as assets, read out of the manifest dbt
+# compiled. no dependency of its own — a manifest is json — and off by default
+# because most deployments have no dbt project to read
+dbt = []
 
 # the operator's binary: the store and server modes with no registry of its
 # own, for inspecting a database or driving a running instance. behind the
@@ -143,6 +147,11 @@ required-features = ["otel"]
 [[test]]
 name = "parquet"
 required-features = ["parquet"]
+
+# a dbt project's models built as assets, with something standing in for dbt
+[[test]]
+name = "dbt"
+required-features = ["dbt"]
 
 # an isolated op re-executes `current_exe()`, so this target needs a `main` of
 # its own that rebuilds the same jobs — see the comment at the top of the file

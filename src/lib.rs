@@ -55,6 +55,7 @@
 //! | `otel` | `hestan::otel`, a run as a distributed trace |
 //! | `http` | `hestan::HttpSource`, pulling a rest api on a schedule, and `hestan::notify` |
 //! | `parquet` | `hestan::ParquetIo`, op outputs stored as parquet files |
+//! | `dbt` | `hestan::dbt`, a dbt project's models as assets |
 //! | `bundled` | **on** by default: compiles sqlite from source rather than linking the system one |
 
 // `doc(cfg(..))` puts "available on crate feature x" on the items that need
@@ -90,6 +91,12 @@ pub mod capture;
 #[cfg(feature = "cli")]
 #[cfg_attr(docsrs, doc(cfg(feature = "cli")))]
 pub mod cli;
+// a dbt project's models as assets, from the manifest dbt compiled. optional
+// because it is a whole other tool's dag and most deployments do not have one
+// — no dependency of its own, though: a manifest is json
+#[cfg(feature = "dbt")]
+#[cfg_attr(docsrs, doc(cfg(feature = "dbt")))]
+pub mod dbt;
 mod error;
 mod executor;
 mod freshness;
@@ -132,6 +139,9 @@ pub use auth::{Access, Auth, Identity};
 #[cfg(feature = "capture")]
 #[cfg_attr(docsrs, doc(cfg(feature = "capture")))]
 pub use capture::{CaptureLayer, capture_layer};
+#[cfg(feature = "dbt")]
+#[cfg_attr(docsrs, doc(cfg(feature = "dbt")))]
+pub use dbt::Dbt;
 pub use error::Error;
 pub use executor::{Blocked, CancelOutcome, Limits, Queued, ResumePlan, Runner};
 pub use freshness::{LateEvent, LateHook, LateKind};

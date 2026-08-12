@@ -1,0 +1,164 @@
+{
+  "metadata": {
+    "dbt_schema_version": "https://schemas.getdbt.com/dbt/manifest/v12.json",
+    "dbt_version": "1.9.1",
+    "generated_at": "2026-08-11T03:00:00.000000Z",
+    "invocation_id": "8e0e2b17-6b5f-4b0e-9b3b-9f2a6a2b7c11",
+    "project_name": "shop",
+    "adapter_type": "postgres"
+  },
+  "nodes": {
+    "model.shop.stg_orders": {
+      "unique_id": "model.shop.stg_orders",
+      "resource_type": "model",
+      "name": "stg_orders",
+      "package_name": "shop",
+      "path": "staging/stg_orders.sql",
+      "original_file_path": "models/staging/stg_orders.sql",
+      "database": "analytics",
+      "schema": "shop_staging",
+      "alias": "stg_orders",
+      "tags": [],
+      "config": { "enabled": true, "materialized": "view" },
+      "checksum": { "name": "sha256", "checksum": "8c2f0d9f5b4a" },
+      "depends_on": { "macros": [], "nodes": ["source.shop.raw.orders"] }
+    },
+    "model.shop.orders_daily": {
+      "unique_id": "model.shop.orders_daily",
+      "resource_type": "model",
+      "name": "orders_daily",
+      "package_name": "shop",
+      "path": "marts/orders_daily.sql",
+      "original_file_path": "models/marts/orders_daily.sql",
+      "database": "analytics",
+      "schema": "shop",
+      "alias": "orders_daily",
+      "tags": ["daily"],
+      "config": { "enabled": true, "materialized": "table" },
+      "checksum": { "name": "sha256", "checksum": "1a7b3c5d7e9f" },
+      "depends_on": { "macros": ["macro.dbt.date_trunc"], "nodes": ["model.shop.stg_orders"] }
+    },
+    "model.shop.orders_by_region": {
+      "unique_id": "model.shop.orders_by_region",
+      "resource_type": "model",
+      "name": "orders_by_region",
+      "package_name": "shop",
+      "path": "marts/orders_by_region.sql",
+      "original_file_path": "models/marts/orders_by_region.sql",
+      "database": "analytics",
+      "schema": "shop",
+      "alias": "orders_by_region",
+      "tags": [],
+      "config": { "enabled": true, "materialized": "table" },
+      "checksum": { "name": "sha256", "checksum": "2b8c4d6e8f0a" },
+      "depends_on": {
+        "macros": [],
+        "nodes": ["model.shop.stg_orders", "seed.shop.region_codes"]
+      }
+    },
+    "model.shop.orders_summary": {
+      "unique_id": "model.shop.orders_summary",
+      "resource_type": "model",
+      "name": "orders_summary",
+      "package_name": "shop",
+      "path": "marts/orders_summary.sql",
+      "original_file_path": "models/marts/orders_summary.sql",
+      "database": "analytics",
+      "schema": "shop",
+      "alias": "orders_summary",
+      "tags": [],
+      "config": { "enabled": true, "materialized": "table" },
+      "checksum": { "name": "sha256", "checksum": "3c9d5e7f9a1b" },
+      "depends_on": {
+        "macros": [],
+        "nodes": ["model.shop.orders_daily", "model.shop.orders_by_region"]
+      }
+    },
+    "seed.shop.region_codes": {
+      "unique_id": "seed.shop.region_codes",
+      "resource_type": "seed",
+      "name": "region_codes",
+      "package_name": "shop",
+      "path": "region_codes.csv",
+      "original_file_path": "seeds/region_codes.csv",
+      "database": "analytics",
+      "schema": "shop",
+      "alias": "region_codes",
+      "config": { "enabled": true, "materialized": "seed" },
+      "depends_on": { "macros": [], "nodes": [] }
+    },
+    "test.shop.not_null_stg_orders_id.4f2a1c": {
+      "unique_id": "test.shop.not_null_stg_orders_id.4f2a1c",
+      "resource_type": "test",
+      "name": "not_null_stg_orders_id",
+      "package_name": "shop",
+      "path": "not_null_stg_orders_id.sql",
+      "original_file_path": "models/staging/schema.yml",
+      "config": { "enabled": true, "materialized": "test", "severity": "ERROR" },
+      "depends_on": { "macros": ["macro.dbt.test_not_null"], "nodes": ["model.shop.stg_orders"] }
+    },
+    "operation.shop.shop-on-run-start-0": {
+      "unique_id": "operation.shop.shop-on-run-start-0",
+      "resource_type": "operation",
+      "name": "shop-on-run-start-0",
+      "package_name": "shop",
+      "path": "hooks/shop-on-run-start-0.sql",
+      "original_file_path": "./dbt_project.yml",
+      "config": { "enabled": true, "materialized": "view" },
+      "depends_on": { "macros": [], "nodes": [] }
+    }
+  },
+  "sources": {
+    "source.shop.raw.orders": {
+      "unique_id": "source.shop.raw.orders",
+      "resource_type": "source",
+      "name": "orders",
+      "source_name": "raw",
+      "package_name": "shop",
+      "path": "models/staging/sources.yml",
+      "original_file_path": "models/staging/sources.yml",
+      "database": "analytics",
+      "schema": "raw",
+      "identifier": "orders",
+      "loader": "fivetran",
+      "config": { "enabled": true }
+    },
+    "source.shop.raw.shipments": {
+      "unique_id": "source.shop.raw.shipments",
+      "resource_type": "source",
+      "name": "shipments",
+      "source_name": "raw",
+      "package_name": "shop",
+      "path": "models/staging/sources.yml",
+      "original_file_path": "models/staging/sources.yml",
+      "database": "analytics",
+      "schema": "raw",
+      "identifier": "shipments",
+      "config": { "enabled": true }
+    }
+  },
+  "disabled": {
+    "model.shop.orders_legacy": [
+      {
+        "unique_id": "model.shop.orders_legacy",
+        "resource_type": "model",
+        "name": "orders_legacy",
+        "package_name": "shop",
+        "config": { "enabled": false, "materialized": "table" },
+        "depends_on": { "macros": [], "nodes": ["model.shop.stg_orders"] }
+      }
+    ]
+  },
+  "macros": {},
+  "docs": {},
+  "exposures": {},
+  "metrics": {},
+  "groups": {},
+  "selectors": {},
+  "parent_map": {},
+  "child_map": {},
+  "group_map": {},
+  "saved_queries": {},
+  "semantic_models": {},
+  "unit_tests": {}
+}

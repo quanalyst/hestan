@@ -8,6 +8,7 @@ check:
     cargo clippy --all-targets --features otel -- -D warnings
     cargo clippy --all-targets --features cli -- -D warnings
     cargo clippy --all-targets --features parquet -- -D warnings
+    cargo clippy --all-targets --features dbt -- -D warnings
     cargo clippy --all-targets --all-features -- -D warnings
     cargo test
     cargo test --features http
@@ -16,6 +17,7 @@ check:
     cargo test --features otel
     cargo test --features cli
     cargo test --features parquet
+    cargo test --features dbt
     cargo test --all-features
 
 # the same, with the postgres half of the store suite actually running

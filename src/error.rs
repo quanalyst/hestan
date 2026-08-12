@@ -121,6 +121,19 @@ pub enum Error {
     /// the `postgres` feature compiled in.
     #[error("unsupported database: {0}")]
     UnsupportedDb(String),
+    /// a dbt manifest that cannot become assets: it could not be read, it is
+    /// not the json a manifest is, its schema version is not one this build
+    /// [reads](crate::dbt), or two of its nodes would be one asset. every one
+    /// of them is a startup failure, before a run of anything exists.
+    #[cfg(feature = "dbt")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "dbt")))]
+    #[error("dbt manifest {path}: {reason}")]
+    Dbt {
+        /// the manifest, as it was named.
+        path: String,
+        /// what was wrong with it.
+        reason: String,
+    },
     /// the filesystem: a database path that cannot be opened, an
     /// [`IoManager`](crate::IoManager)'s directory, a listener that could not
     /// take its address.

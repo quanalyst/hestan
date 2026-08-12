@@ -402,6 +402,7 @@ should get to decline:
 | `otel` | `hestan::otel`, a run as a distributed trace |
 | `http` | `HttpSource` and the [notification](docs/notifications.md) helpers — [http sources](docs/http-sources.md) |
 | `parquet` | `ParquetIo`, op outputs stored as parquet files — [io managers](docs/io-managers.md) |
+| `dbt` | `hestan::dbt`, a dbt project's models as assets — [dbt](docs/dbt.md) |
 
 ## Developing the ui
 
