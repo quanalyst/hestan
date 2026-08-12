@@ -180,8 +180,11 @@ impl Asset {
     /// the name this asset is registered and materialized under.
     ///
     /// worth having for assets you did not name yourself: a
-    /// [dbt project](crate::dbt) hands back a vec of them, and this is how you
+    /// [dbt project][dbt] hands back a vec of them, and this is how you
     /// find the one you want to say something more about.
+    ///
+    #[cfg_attr(feature = "dbt", doc = "[dbt]: crate::dbt")]
+    #[cfg_attr(not(feature = "dbt"), doc = "[dbt]: crate")]
     pub fn name(&self) -> &str {
         &self.name
     }
