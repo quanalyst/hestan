@@ -69,6 +69,35 @@ glance.
 **nothing is ever cleaned up.** [retention](storage.md) prunes run rows, not
 files. point `FileIo` at a directory you are willing to sweep.
 
+## What a name may be
+
+`{run_id}` and `{op}` go into a path, and the rule is that the file lands
+under the directory the manager was given. that is the whole rule — it is not
+"no separators", because an [asset](assets.md) name is already a path:
+`sales/orders` is a directory and a file here, exactly as the catalog groups
+it on the same prefix. one fan-out instance keeps its `fetch[0]` too.
+
+what is refused is a name that would leave the directory. every part of both
+halves of the key has to be an ordinary path component, so `..` anywhere, a
+name that starts at the root, a name that is only dots, and an empty name all
+fail the op the way any other failed `put` does:
+
+```
+could not persist the output: op "../escape" does not name a file under the io directory
+```
+
+refused rather than quietly rewritten, because a name silently spelled
+differently is a file nobody looking for it finds. both bundled managers
+answer this the same way, since a key that is a file for one and an error for
+the other would be two answers to one question.
+
+two things this does not do. a `get` resolves the path **in the handle**
+rather than recomputing one, so outputs written before the directory was
+moved still read back — the handle is the record of where the value actually
+went. and a symlink already inside the directory pointing out of it is
+outside what a name check can see: an io directory somebody else can write to
+is a problem no orchestrator can spell its way out of.
+
 ## ParquetIo
 
 behind `--features parquet`, for the case json is wrong about: an op that
@@ -120,7 +149,8 @@ two things do not survive the round trip, and neither can:
 partitioned datasets, no compaction, no manifest, no object store — one op
 writes one file and the op downstream reads that file. anything more is a
 table format, which is a different thing to be. and nothing is cleaned up
-here either.
+here either. names land where `FileIo`'s do and are refused on the same
+terms.
 
 both calls run on the run's own task, since that is what the trait says. a
 file worth minutes of io is worth doing inside the op.

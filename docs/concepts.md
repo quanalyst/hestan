@@ -79,6 +79,36 @@ outputs land there too by default, which is wrong for anything bulky;
 [io managers](io-managers.md) move them somewhere else and keep a handle in
 the run log.
 
+## Where a duplicate name is refused
+
+a name in a declaration is claimed once. a second claim is a build error and
+not a preference, because the alternative is a deployment that depends on the
+order things were handed over — which of two jobs called `nightly` the
+scheduler fires is not something a warning in a log can settle.
+
+| name | claimed within | refused by, and what it says |
+| --- | --- | --- |
+| op | its job | `Job::builder(..).build()` — `invalid job graph: duplicate op extract` |
+| job | the process | `serve`, `run_once` and `Runner::new` — `duplicate job: nightly` (`Error::DuplicateJob`) |
+| asset | the process | asset registration — `invalid job graph: assets: duplicate op sales/orders` |
+| multi-asset | the process | `invalid job graph: duplicate multi-asset split_orders` |
+| check | its asset | `invalid job graph: duplicate check row_count on asset orders` |
+| sensor | the process | `invalid job graph: duplicate sensor watch` |
+| schedule | its `(job, expression)` pair | `invalid job graph: schedule 0 3 * * * on job nightly is declared twice` |
+| pool | the process | `invalid job graph: pool eia_api is declared twice` |
+
+every one of them is raised before a row is written, so a definition that
+cannot be read one way does not get as far as running.
+
+two schedules on one job are **not** a duplicate: that is a job with two
+expressions, both of which fire, and two of them landing on the same minute
+launch one run rather than two. the pair is the key because the run log keys a
+schedule on it — a second declaration of the same pair was never a second
+schedule, only that row carrying whichever timezone and params came last.
+
+a job named `assets` collides with the internal job that
+[asset builds](assets.md) run as, and reads as the duplicate it is.
+
 ## OpCtx
 
 each op invocation gets a context carrying the run id, the run params, and the

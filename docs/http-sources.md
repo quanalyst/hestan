@@ -45,6 +45,7 @@ Hestan::new()
 | `.max_parallel(n)` | unlimited | cap concurrent requests when fanning out; below 1 means 1 |
 | `.overlap(o)` | skip | overlap policy for the generated job (see [scheduling](scheduling.md)) |
 | `.timeout(d)` | 30s | per-request timeout |
+| `.max_body(bytes)` | 64 MiB | the most of one response body this holds in memory |
 
 ## Fan-out naming
 
@@ -68,7 +69,8 @@ another attempt:
 - transport errors (connect failures, timeouts, body-read errors), 429, and
   any 5xx are retried, up to `.retries(n)` extra attempts.
 - any other non-2xx fails the op immediately — a 404 or 403 never improves.
-- a body that isn't valid json fails immediately, as does a missing or empty
+- a body that isn't valid json fails immediately, as does a body past
+  [the ceiling](#how-much-of-a-response-is-held), a missing or empty
   `bearer_env` variable, or a request that can't be built at all (a header
   value with a newline, say) — deterministic failures that no retry fixes.
 
@@ -86,6 +88,40 @@ errors carry their full cause chain.
 because the loop retries internally, the lowered op itself has `retries` 0 —
 the op run's `attempts` column reads 1 even when the request was retried. the
 retry history is in the warn events.
+
+## How much of a response is held
+
+a response arrives in this process's memory, so how much of one is a number
+worth naming rather than a number the server picks.
+
+`.max_body(bytes)` is the ceiling on a successful body, **64 MiB by default**
+— generous on purpose, because a paged json api answering with several
+megabytes is the ordinary case this exists to serve and 5,000-row pages are
+normal. raise it for an api that answers with more than that in one page;
+lower it for one that has no business answering with much at all.
+
+past the ceiling the op fails with the url and the limit:
+
+```
+body from https://api.example.com/orders is past the 65536 byte limit (HttpSource::max_body)
+```
+
+and the body is **not** parsed. what hit the ceiling is not a smaller valid
+document, and a json error there would send you looking at the api's
+formatting instead of at its size. the failure is fatal rather than retried:
+the same request fetches the same body.
+
+the ceiling is applied while the body arrives rather than to a body already
+read, so what is held past it is one socket read. a `content-length` the
+server sent is refused before any of the body is read at all; a response with
+no `content-length` — chunked, streaming — or with one that does not match
+what follows it is stopped by the read itself, so neither the header's
+absence nor its honesty changes the outcome.
+
+a **failed** response has a much smaller ceiling and no knob: the error
+message quotes the first 200 characters of the body, so about 4 KiB of it is
+read and the rest is never asked for. a server answering 500 with a gigabyte
+of html costs this process the two lines it prints.
 
 ## expect_json
 
