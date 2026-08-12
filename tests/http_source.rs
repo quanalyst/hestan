@@ -10,12 +10,39 @@ use axum::routing::get;
 use hestan::prelude::*;
 use hestan::{Error, EventLevel, HttpSource, RunStatus, Runner, Store, Trigger};
 use serde::{Deserialize, Serialize};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
 async fn serve(app: Router) -> String {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    format!("http://{addr}")
+}
+
+/// a server that answers with bytes axum would never write: a content-length
+/// that does not describe the body, a body that never arrives.
+///
+/// the connection is held open afterwards rather than closed, so a client that
+/// reads further than it needs to waits for its own timeout instead of finding
+/// an eof — which is what makes "it stopped reading" something a test can
+/// assert rather than hope for.
+async fn serve_raw(response: Vec<u8>) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        while let Ok((mut sock, _)) = listener.accept().await {
+            let response = response.clone();
+            tokio::spawn(async move {
+                // the request has to be taken off the socket before the answer
+                // goes back down it
+                let mut req = [0u8; 1024];
+                let _ = sock.read(&mut req).await;
+                let _ = sock.write_all(&response).await;
+                tokio::time::sleep(Duration::from_secs(30)).await;
+            });
+        }
+    });
     format!("http://{addr}")
 }
 
@@ -134,6 +161,183 @@ async fn client_error_fails_fast() {
     let error = ops[0].error.as_deref().unwrap();
     assert!(error.contains("404"), "{error}");
     assert!(error.contains("nothing here"), "{error}");
+}
+
+#[tokio::test]
+async fn an_error_body_far_larger_than_the_snippet_is_read_only_that_far() {
+    // content-length promises a gigabyte and 256 KiB of it turns up. an
+    // attempt that read to the end of what it was promised would sit on the
+    // held-open connection until the timeout, so having the snippet at all is
+    // what says it stopped where the snippet stops
+    let mut response =
+        b"HTTP/1.1 500 Internal Server Error\r\ncontent-length: 1073741824\r\n\r\n".to_vec();
+    response.extend(b"boom: the database is on fire\n");
+    response.extend(vec![b'x'; 256 * 1024]);
+    let base = serve_raw(response).await;
+
+    let src = HttpSource::get(format!("{base}/boom"))
+        .name("boom")
+        .retries(0)
+        .timeout(Duration::from_secs(5));
+    let runner = Runner::new(
+        [src.into_job("boom").unwrap()],
+        Store::open(":memory:").unwrap(),
+    );
+    let run = runner
+        .run("boom", json!({}), Trigger::Manual)
+        .await
+        .unwrap();
+
+    assert_eq!(run.status, RunStatus::Failed);
+    let ops = runner.store().op_runs(&run.id).unwrap();
+    let error = ops[0].error.as_deref().unwrap();
+    assert!(error.contains("500"), "{error}");
+    assert!(error.contains("boom: the database is on fire"), "{error}");
+    // and the padding is not in it: what gets printed is what gets held
+    assert!(error.chars().count() < 300, "{error}");
+}
+
+#[tokio::test]
+async fn a_content_length_past_the_ceiling_is_refused_before_the_body_is_read() {
+    // headers and then nothing at all. the body never arrives, so an attempt
+    // that waited to see how big it really was would fail on the timeout
+    let response =
+        b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 1073741824\r\n\r\n"
+            .to_vec();
+    let base = serve_raw(response).await;
+
+    let src = HttpSource::get(format!("{base}/pages"))
+        .name("pages")
+        .max_body(64 * 1024)
+        .retries(0)
+        .timeout(Duration::from_secs(5));
+    let runner = Runner::new(
+        [src.into_job("pages").unwrap()],
+        Store::open(":memory:").unwrap(),
+    );
+    let run = runner
+        .run("pages", json!({}), Trigger::Manual)
+        .await
+        .unwrap();
+
+    assert_eq!(run.status, RunStatus::Failed);
+    let ops = runner.store().op_runs(&run.id).unwrap();
+    let error = ops[0].error.as_deref().unwrap();
+    assert!(error.contains("content-length 1073741824"), "{error}");
+    assert!(
+        error.contains("65536") && error.contains("/pages"),
+        "{error}"
+    );
+}
+
+#[tokio::test]
+async fn a_body_past_the_ceiling_with_no_content_length_fails_naming_the_limit() {
+    let hits = Arc::new(AtomicU32::new(0));
+    let h = hits.clone();
+    let app = Router::new().route(
+        "/pages",
+        get(move || {
+            let h = h.clone();
+            async move {
+                h.fetch_add(1, Ordering::SeqCst);
+                // chunked, so there is no length to refuse it by up front, and
+                // endless, so the ceiling is the only thing that can end it
+                let chunks =
+                    futures::stream::repeat_with(|| Ok::<_, std::io::Error>(vec![b'0'; 8 * 1024]));
+                axum::body::Body::from_stream(chunks)
+            }
+        }),
+    );
+    let base = serve(app).await;
+
+    let src = HttpSource::get(format!("{base}/pages"))
+        .name("pages")
+        .max_body(64 * 1024)
+        .retries(3)
+        .retry_delay(Duration::from_millis(10))
+        .timeout(Duration::from_secs(5));
+    let runner = Runner::new(
+        [src.into_job("pages").unwrap()],
+        Store::open(":memory:").unwrap(),
+    );
+    let run = runner
+        .run("pages", json!({}), Trigger::Manual)
+        .await
+        .unwrap();
+
+    assert_eq!(run.status, RunStatus::Failed);
+    let ops = runner.store().op_runs(&run.id).unwrap();
+    let error = ops[0].error.as_deref().unwrap();
+    assert!(
+        error.contains("65536") && error.contains("/pages"),
+        "{error}"
+    );
+    // the same request would fetch the same body, so it is not retried
+    assert_eq!(hits.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn a_body_under_the_ceiling_is_unaffected() {
+    let rows: Value = json!(
+        (0..1_000)
+            .map(|i| json!({ "i": i }))
+            .collect::<Vec<Value>>()
+    );
+    let payload = rows.clone();
+    let app = Router::new().route(
+        "/rows",
+        get(move || {
+            let payload = payload.clone();
+            async move { axum::Json(payload) }
+        }),
+    );
+    let base = serve(app).await;
+
+    let src = HttpSource::get(format!("{base}/rows"))
+        .name("rows")
+        .max_body(64 * 1024);
+    let runner = Runner::new(
+        [src.into_job("rows").unwrap()],
+        Store::open(":memory:").unwrap(),
+    );
+    let run = runner
+        .run("rows", json!({}), Trigger::Manual)
+        .await
+        .unwrap();
+
+    assert_eq!(run.status, RunStatus::Success);
+    let ops = runner.store().op_runs(&run.id).unwrap();
+    assert_eq!(ops[0].output, Some(rows));
+}
+
+#[tokio::test]
+async fn a_content_length_that_understates_the_body_cannot_get_past_the_ceiling() {
+    // the header says twenty bytes and 64 KiB follow them, against a ceiling
+    // of one. what the response framing says is one document is what gets
+    // parsed either way — a header that lies cannot make it more than that
+    let mut response =
+        b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 20\r\n\r\n".to_vec();
+    response.extend(b"[1,2,3,4,5,6,7,8,9]\n");
+    response.extend(vec![b'x'; 64 * 1024]);
+    let base = serve_raw(response).await;
+
+    let src = HttpSource::get(format!("{base}/short"))
+        .name("short")
+        .max_body(1024)
+        .retries(0)
+        .timeout(Duration::from_secs(5));
+    let runner = Runner::new(
+        [src.into_job("short").unwrap()],
+        Store::open(":memory:").unwrap(),
+    );
+    let run = runner
+        .run("short", json!({}), Trigger::Manual)
+        .await
+        .unwrap();
+
+    assert_eq!(run.status, RunStatus::Success);
+    let ops = runner.store().op_runs(&run.id).unwrap();
+    assert_eq!(ops[0].output, Some(json!([1, 2, 3, 4, 5, 6, 7, 8, 9])));
 }
 
 #[tokio::test]

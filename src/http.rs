@@ -13,6 +13,14 @@ use crate::op::{Op, OpCtx, OpResult};
 const MAX_BACKOFF: Duration = Duration::from_secs(30);
 // a server-sent retry-after can say anything; never sleep longer than this
 const MAX_RETRY_AFTER: Duration = Duration::from_secs(300);
+// generous on purpose: a paged json api answering with several megabytes is
+// the ordinary case this exists to serve, so the ceiling is here for the
+// gigabyte rather than for the megabyte
+const DEFAULT_MAX_BODY: usize = 64 * 1024 * 1024;
+// what a failed response is worth holding: 200 characters get printed, four
+// bytes to a character at the widest, and an error page that starts with
+// whitespace loses some of them to the trim
+const ERROR_PEEK: usize = 4 * 1024;
 
 type ParseFn = dyn Fn(Value) -> Result<Value, String> + Send + Sync;
 
@@ -37,6 +45,7 @@ pub struct HttpSource {
     retries: u32,
     retry_delay: Duration,
     timeout: Duration,
+    max_body: usize,
     max_parallel: Option<usize>,
     overlap: Option<Overlap>,
 }
@@ -55,6 +64,7 @@ impl HttpSource {
             expect: None,
             retries: 2,
             retry_delay: Duration::from_secs(1),
+            max_body: DEFAULT_MAX_BODY,
             max_parallel: None,
             overlap: None,
             timeout: Duration::from_secs(30),
@@ -160,6 +170,24 @@ impl HttpSource {
         self
     }
 
+    /// the most of one response body this will hold in memory, in bytes
+    /// (default 64 MiB). raise it for an api that answers with more than that
+    /// in one page; lower it for one that has no business answering with much
+    /// at all.
+    ///
+    /// past the ceiling the op fails naming the url and the limit, and the
+    /// body is not parsed: what hit the ceiling is not a smaller valid
+    /// document, and a json error there would send the reader looking in the
+    /// wrong place. the failure is fatal rather than retried — the same
+    /// request gets the same body.
+    ///
+    /// a `content-length` the server sent is checked before the body is read
+    /// at all; without one the read itself is what stops.
+    pub fn max_body(mut self, bytes: usize) -> Self {
+        self.max_body = bytes;
+        self
+    }
+
     /// lower into plain ops: one op named `{name}`, or with
     /// [`query_each`](Self::query_each) one per value named `{name}_{value}`,
     /// where the value is lowercased and every char outside `[a-z0-9_]`
@@ -256,6 +284,7 @@ impl HttpSource {
             expect: self.expect.clone(),
             retries: self.retries,
             retry_delay: self.retry_delay,
+            max_body: self.max_body,
         });
         // the request loop owns retrying, so the op itself keeps retries 0
         let op = Op::new(name, move |ctx| {
@@ -278,6 +307,7 @@ struct Request {
     expect: Option<TypedParse>,
     retries: u32,
     retry_delay: Duration,
+    max_body: usize,
 }
 
 enum Failure {
@@ -334,7 +364,7 @@ impl Request {
             }
             req = req.header("authorization", format!("Bearer {token}"));
         }
-        let resp = req.send().await.map_err(request_failure)?;
+        let mut resp = req.send().await.map_err(request_failure)?;
         let status = resp.status();
         if !status.is_success() {
             let retry_after = if matches!(status.as_u16(), 429 | 503) {
@@ -346,7 +376,11 @@ impl Request {
             } else {
                 None
             };
-            let body = resp.text().await.unwrap_or_default();
+            // only as far as the snippet prints: a server answering 500 with a
+            // gigabyte of html is not a gigabyte this process has to hold to
+            // read two lines of it
+            let (body, _) = read_capped(&mut resp, ERROR_PEEK).await.unwrap_or_default();
+            let body = String::from_utf8_lossy(&body);
             let msg = format!("{status} from {}: {}", self.url, snippet(&body));
             // 429 and 5xx are worth another try; other client errors never improve
             return Err(if status.as_u16() == 429 || status.is_server_error() {
@@ -359,7 +393,34 @@ impl Request {
                 Failure::Fatal(msg.into())
             });
         }
-        let bytes = resp.bytes().await.map_err(request_failure)?;
+        // a length the server declared refuses the body before a byte of it is
+        // read; one it did not declare is why the read below counts as well
+        if let Some(len) = resp.content_length()
+            && len > self.max_body as u64
+        {
+            return Err(Failure::Fatal(
+                format!(
+                    "content-length {len} from {} is past the {} byte limit \
+                     (HttpSource::max_body)",
+                    self.url, self.max_body
+                )
+                .into(),
+            ));
+        }
+        let (bytes, past) = read_capped(&mut resp, self.max_body)
+            .await
+            .map_err(request_failure)?;
+        if past {
+            // not truncated and parsed: what hit the ceiling is not a smaller
+            // valid document, and the json error would point at the wrong thing
+            return Err(Failure::Fatal(
+                format!(
+                    "body from {} is past the {} byte limit (HttpSource::max_body)",
+                    self.url, self.max_body
+                )
+                .into(),
+            ));
+        }
         let value: Value = serde_json::from_slice(&bytes)
             .map_err(|e| Failure::Fatal(format!("bad json from {}: {e}", self.url).into()))?;
         let value = match &self.expect {
@@ -369,6 +430,26 @@ impl Request {
         ctx.info(format!("{status}, {} bytes", bytes.len()));
         Ok(value)
     }
+}
+
+/// as much of the body as `cap` allows, and whether there was more behind it.
+///
+/// the cap has to be applied here, while the response is arriving:
+/// `Response::bytes` has assembled the whole thing by the time it returns, so
+/// a ceiling on what it hands back is a ceiling on nothing. what is held past
+/// the cap is one chunk of it, which is a socket read rather than a body.
+async fn read_capped(
+    resp: &mut reqwest::Response,
+    cap: usize,
+) -> Result<(Vec<u8>, bool), reqwest::Error> {
+    let mut body = Vec::new();
+    while let Some(chunk) = resp.chunk().await? {
+        body.extend_from_slice(&chunk);
+        if body.len() > cap {
+            return Ok((body, true));
+        }
+    }
+    Ok((body, false))
 }
 
 // builder errors are deterministic: retrying rebuilds the same broken request
