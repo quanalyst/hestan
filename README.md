@@ -153,7 +153,12 @@ standalone binary for those two. [docs/cli.md](docs/cli.md).
   keep going
 - op outputs are pluggable: `Hestan::io(FileIo::new(dir))` moves them out of
   the run log and leaves a `{"$io": ..}` handle in it, with `Op::io(name)`
-  for per-op managers. the default `Inline` is exactly today's behaviour
+  for per-op managers. the default `Inline` is exactly today's behaviour, and
+  `ParquetIo` (behind `--features parquet`) stores an op's rows as one parquet
+  file, recording how many rows and how many bytes without the op asking. see
+  [connecting to your data](docs/connecting.md) for the whole seam between an
+  op and the system it reads: a client called from an op, a pool as a
+  resource, secrets out of the environment, and why hestan wraps nobody's sdk
 - resources are built once at startup and shared by every op:
   `Hestan::resource("api", |_| async { Ok(ApiClient::new()?) })` plus
   `ctx.resource::<ApiClient>("api")?`, with `Op::requires(["api"])` turning a
@@ -333,6 +338,12 @@ standalone binary for those two. [docs/cli.md](docs/cli.md).
   button with a reason rather than an error after the click
 - the web ui is a prebuilt react bundle embedded in the binary; it polls the
   json api under `/api`
+- **a dbt project's models are assets**, behind `--features dbt`:
+  `Dbt::from_manifest("target/manifest.json")` reads the dag dbt already
+  compiled and produces one asset per model with dbt's own lineage, each
+  building by invoking `dbt run --select <model>` with its output captured on
+  the run page. your dbt and your profile, invoked — see
+  [docs/dbt.md](docs/dbt.md)
 - **an address anyone can reach needs an authenticator, and `serve` refuses to
   start without one**: `Auth::bearer(token)` for one shared secret, or
   `Auth::custom(|req| …)` to compose the identities you already have. three
@@ -367,7 +378,7 @@ the details live in [docs/](docs/README.md):
 [io managers](docs/io-managers.md), [op state](docs/state.md),
 [isolation](docs/isolation.md),
 [metadata](docs/metadata.md), [events](docs/events.md), [logs](docs/logs.md),
-[assets](docs/assets.md), [freshness](docs/freshness.md),
+[assets](docs/assets.md), [dbt](docs/dbt.md), [freshness](docs/freshness.md),
 [sensors](docs/sensors.md),
 [scheduling](docs/scheduling.md), [http sources](docs/http-sources.md),
 [notifications](docs/notifications.md), [launching](docs/launching.md),

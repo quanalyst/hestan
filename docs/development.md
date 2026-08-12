@@ -9,7 +9,8 @@ src/
   op.rs         Op, OpCtx, OpResult, typed io
   job.rs        Job and JobBuilder (dag validation), Graph and graph flattening
   graph.rs      topo order (kahn's) and transitive-downstream
-  io.rs         IoManager, Inline, FileIo, the per-op manager table
+  io.rs         IoManager, Inline, FileIo, ParquetIo (behind parquet),
+                the per-op manager table
   resource.rs   process-wide resources and their constructors
   executor.rs   Runner and the run loop: concurrency, retries, skips, subset runs
   asset.rs      Asset, the registry, staleness/planning, the materializing wrapper
@@ -21,7 +22,9 @@ src/
   model.rs      Run/OpRun/Event/Tick/Materialization rows and the status enums
   http.rs       HttpSource (behind the http feature)
   notify.rs     webhook/slack failure hooks (behind the http feature)
-  logs.rs       what an op printed: the op_logs writers and their cap
+  logs.rs       what an op printed: the op_logs writers, the subprocess
+                pipe reader they share, and their cap
+  dbt.rs        a dbt manifest as assets (behind the dbt feature)
   otel.rs       trace context across the isolated-op boundary (behind otel)
   isolate.rs    isolated ops: the parent, the child, the output capture
   capture.rs    the tracing layer (behind the capture feature)
@@ -35,17 +38,19 @@ examples/       demo.rs and assets.rs (both mount the cli, so both need
 tests/          pipeline.rs, assets.rs, isolation.rs, queue.rs, auth.rs,
                 docs.rs; http_source.rs and notify.rs (need the http
                 feature); capture.rs (needs capture); otel.rs (needs otel);
-                cli.rs (needs cli)
+                cli.rs (needs cli); parquet.rs (needs parquet); dbt.rs
+                (needs dbt), over the fixture manifest in
+                tests/fixtures/dbt/
 ```
 
 ## Gates
 
-`just check` runs the gates ci runs. `http`, `capture`, `postgres`, `otel`
-and `cli` each compile real extra code, and all but `postgres` gate a test
-target of their own via `required-features` — postgres's extra coverage is the
-second half of the store suite instead. the crate has to be clean without any
-of them as well as with them, so seven configurations are checked rather than
-one:
+`just check` runs the gates ci runs. `http`, `capture`, `postgres`, `otel`,
+`cli`, `parquet` and `dbt` each compile real extra code, and all but
+`postgres` gate a test target of their own via `required-features` —
+postgres's extra coverage is the second half of the store suite instead. the
+crate has to be clean without any of them as well as with them, so nine
+configurations are checked rather than one:
 
 ```
 cargo fmt --check
@@ -55,6 +60,8 @@ cargo clippy --all-targets --features capture -- -D warnings
 cargo clippy --all-targets --features postgres -- -D warnings
 cargo clippy --all-targets --features otel -- -D warnings
 cargo clippy --all-targets --features cli -- -D warnings
+cargo clippy --all-targets --features parquet -- -D warnings
+cargo clippy --all-targets --features dbt -- -D warnings
 cargo clippy --all-targets --all-features -- -D warnings
 cargo test
 cargo test --features http
@@ -62,6 +69,8 @@ cargo test --features capture
 cargo test --features postgres
 cargo test --features otel
 cargo test --features cli
+cargo test --features parquet
+cargo test --features dbt
 cargo test --all-features
 ```
 
@@ -162,7 +171,11 @@ metadata tags, which are a wire format, and the delta arithmetic),
 (lifecycle roundtrips, migrations, sweep, claims under real contention —
 [twice](#the-store-suite-runs-twice)), `server.rs` (handlers called directly
 with axum extractors — no live server needed, and the two scrapers that hold
-`docs/auth.md` and `docs/http-api.md` to the router).
+`docs/auth.md` and `docs/http-api.md` to the router), `io.rs` (both bundled
+managers, and the parquet round trip value for value), `dbt.rs` (the manifest
+parse and the asset graph, against the committed fixture), `app.rs` (the third
+scraper: the worked postgres example in `docs/connecting.md` is the doctest on
+`Hestan::resource`, character for character).
 
 `tests/pipeline.rs` is the end-to-end executor suite against in-memory
 stores: output passing, diamond ordering, failure/skip, retries, panics,
@@ -171,6 +184,13 @@ typed io, params rejection, op state, cancellation, failure hooks.
 http retry policy, fan-out, and `bearer_env`; `tests/notify.rs` does the
 same for the webhook and slack hooks. both only exist under
 `--features http`.
+
+`tests/parquet.rs` is the parquet manager where a unit test cannot put it —
+between two ops of a run, across a resume, and under a retention sweep.
+`tests/dbt.rs` builds the fixture project's models as assets with a shell
+script standing in for dbt, because **dbt is not installed here and must not
+need to be**: everything on hestan's side of that boundary is asserted, and
+nothing pretends to test that dbt builds a warehouse. both need their feature.
 
 `tests/otel.rs` is the span tree a run opens, against a real subscriber, and it
 is a binary of its own for the same reason `tests/capture.rs` is one — see

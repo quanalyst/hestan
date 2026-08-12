@@ -69,6 +69,78 @@ glance.
 **nothing is ever cleaned up.** [retention](storage.md) prunes run rows, not
 files. point `FileIo` at a directory you are willing to sweep.
 
+## ParquetIo
+
+behind `--features parquet`, for the case json is wrong about: an op that
+returns **rows**.
+
+```toml
+hestan = { version = "0.1.0-alpha.2", features = ["parquet"] }
+```
+
+```rust
+Hestan::new().io_named("parquet", ParquetIo::new("/var/lib/hestan/parquet"))
+```
+
+it writes `{dir}/{run_id}/{op}.parquet` and records
+
+```json
+{ "$io": "parquet", "path": "/var/lib/hestan/parquet/019.../extract.parquet",
+  "rows": 41233, "bytes": 918444 }
+```
+
+what it stores is **a table**: a json array whose elements are objects, one
+per row — which is what an op returns when it returns rows, including a
+[typed](typed-io.md) op returning a `Vec<T>`. the column types come from the
+values: whole numbers as `int64`, fractions as `float64`, then `utf8`, `bool`,
+lists, structs, and a column that is null the whole way down as parquet's null
+type. the op downstream reads the same rows back.
+
+`null` passes straight through — an op that produced nothing has no table to
+write, and null is already its own handle. **anything else is an error**, not
+a quiet fallback to json:
+
+```
+could not persist the output: parquet stores a table: an array of row objects, not an object
+```
+
+which fails the op, exactly as any other failed `put` does. an op whose output
+went somewhere it did not ask for is a value nobody finds again. this is
+usually a *named* manager selected by the ops that produce tables, rather than
+the default for every op in a deployment.
+
+two things do not survive the round trip, and neither can:
+
+- a column mixing whole numbers and fractions is one `float64` column, so `1`
+  reads back as `1.0`. a parquet column has one type; json does not.
+- a key missing from one row reads back as an explicit `null`, because a table
+  has the same columns in every row.
+
+**what it is not**: a directory of files, exactly as `FileIo` is one. no
+partitioned datasets, no compaction, no manifest, no object store — one op
+writes one file and the op downstream reads that file. anything more is a
+table format, which is a different thing to be. and nothing is cleaned up
+here either.
+
+both calls run on the run's own task, since that is what the trait says. a
+file worth minutes of io is worth doing inside the op.
+
+## What a handle says about what it stored
+
+a manager knows two things the op does not, because the op returned a value
+rather than a file: how many rows were stored and how big the thing holding
+them is. a handle carrying `rows` or `bytes` gets them recorded as
+[`Meta::Count` and `Meta::Bytes`](metadata.md) on the op run, so they show on
+the run page and in the trend beside every previous build:
+
+```json
+{ "rows": { "count": 41233 }, "bytes": { "bytes": 918444 } }
+```
+
+it is a rule about handles rather than one about parquet, so a manager of your
+own gets it by putting either key in what `put` returns. anything the op
+staged under the same name wins — an op that said `rows` meant its own rows.
+
 ## Per-op managers
 
 `Hestan::io_named(name, manager)` registers one under a name, and

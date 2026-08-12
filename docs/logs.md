@@ -21,6 +21,7 @@ and the split is the whole design:
 | --------------------------------------- | --------------------------------------------- | --------------------------------------- |
 | [isolated](isolation.md) (a subprocess)  | **everything**, verbatim, both pipes           | always on, no configuration             |
 | in process                               | its `tracing` events, with level and target    | the `capture` feature's layer, opt in    |
+| a process hestan itself spawned          | **everything**, verbatim, both pipes           | always on — a [dbt](dbt.md) model's `dbt run` is one |
 
 ## Why an in-process `println!` is not captured
 
@@ -46,7 +47,9 @@ so there the answer is simply everything.
 
 nothing to switch on. an [isolated op](isolation.md)'s parent pipes the
 child's stdout and stderr, reads both, tags each line with its stream, and
-stores it under that attempt.
+stores it under that attempt. so does anything else hestan starts a process
+for — a [dbt](dbt.md) model's `dbt run --select` goes through the same reader,
+under the same caps.
 
 both pipes are drained **concurrently**, by a task each. this is not a
 detail: reading stdout to its end and stderr afterwards leaves stderr's pipe
