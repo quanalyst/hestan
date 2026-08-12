@@ -401,6 +401,7 @@ should get to decline:
 | `capture` | `hestan::capture_layer`, storing the `tracing` events ops emit — [logs](docs/logs.md) |
 | `otel` | `hestan::otel`, a run as a distributed trace |
 | `http` | `HttpSource` and the [notification](docs/notifications.md) helpers — [http sources](docs/http-sources.md) |
+| `parquet` | `ParquetIo`, op outputs stored as parquet files — [io managers](docs/io-managers.md) |
 
 ## Developing the ui
 

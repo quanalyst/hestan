@@ -54,6 +54,7 @@
 //! | `capture` | `hestan::capture_layer`, storing the `tracing` events ops emit |
 //! | `otel` | `hestan::otel`, a run as a distributed trace |
 //! | `http` | `hestan::HttpSource`, pulling a rest api on a schedule, and `hestan::notify` |
+//! | `parquet` | `hestan::ParquetIo`, op outputs stored as parquet files |
 //! | `bundled` | **on** by default: compiles sqlite from source rather than linking the system one |
 
 // `doc(cfg(..))` puts "available on crate feature x" on the items that need
@@ -138,6 +139,9 @@ pub use hooks::{FailureHook, OpEvent, OpHook, RunEvent, RunFailure, RunHook};
 #[cfg(feature = "http")]
 #[cfg_attr(docsrs, doc(cfg(feature = "http")))]
 pub use http::HttpSource;
+#[cfg(feature = "parquet")]
+#[cfg_attr(docsrs, doc(cfg(feature = "parquet")))]
+pub use io::ParquetIo;
 pub use io::{FileIo, Inline, IoKey, IoManager, IoResult};
 pub use job::{Graph, GraphBuilder, Job, JobBuilder};
 pub use model::EVENT_SCHEMA;

@@ -572,12 +572,15 @@ pub(crate) async fn run_one_op(
     });
     match produced {
         Ok(handle) => {
+            // what the manager knows about what it stored, beside what the op
+            // staged — the same rule the parent applies to an in-process op
+            let meta = crate::io::handle_meta(&handle, op::staged_meta(&new_meta));
             store.op_finished(
                 &req.run_id,
                 &req.op,
                 OpStatus::Success,
                 Some(&handle),
-                op::staged_meta(&new_meta).as_ref(),
+                meta.as_ref(),
                 None,
             )?;
             // state second: a crash between the writes re-runs the op, never

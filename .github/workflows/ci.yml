@@ -35,12 +35,14 @@ jobs:
       - run: cargo clippy --all-targets --features postgres -- -D warnings
       - run: cargo clippy --all-targets --features otel -- -D warnings
       - run: cargo clippy --all-targets --features cli -- -D warnings
+      - run: cargo clippy --all-targets --features parquet -- -D warnings
       - run: cargo clippy --all-targets --all-features -- -D warnings
       - run: cargo test
       - run: cargo test --features http
       - run: cargo test --features capture
       - run: cargo test --features otel
       - run: cargo test --features cli
+      - run: cargo test --features parquet
       # the store suite's postgres half runs against this and skips itself
       # without it; see docs/development.md
       - run: cargo test --features postgres

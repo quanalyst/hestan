@@ -19,6 +19,10 @@ all-features = true
 rustdoc-args = ["--cfg", "docsrs"]
 
 [dependencies]
+# the `parquet` feature only: json rows become arrow arrays on the way into a
+# file and json rows again on the way out. `json` is the only part of arrow
+# hestan uses — no csv reader, no ipc, no compute kernels
+arrow = { version = "57.3", optional = true, default-features = false, features = ["json"] }
 axum = "0.8"
 chrono = { version = "0.4", features = ["serde"] }
 chrono-tz = "0.10"
@@ -35,6 +39,12 @@ mime_guess = "2"
 # a span's context out of the host's subscriber. no exporter, no provider
 opentelemetry = { version = "0.32", optional = true }
 opentelemetry_sdk = { version = "0.32", optional = true, default-features = false, features = ["trace"] }
+# the `parquet` feature only, and pinned to the same major as arrow because the
+# two are one project released together. snappy is the only codec compiled in:
+# it is what a parquet reader everywhere already handles, and the other four
+# would each be a c library or a megabyte of tables for files hestan writes and
+# reads back itself
+parquet = { version = "57.3", optional = true, default-features = false, features = ["arrow", "snap"] }
 reqwest = { version = "0.12", optional = true, default-features = false, features = ["json", "rustls-tls"] }
 rusqlite = "0.32"
 serde = { version = "1", features = ["derive"] }
@@ -85,6 +95,10 @@ postgres = ["dep:tokio-postgres"]
 # by default, and it installs nothing — the host composes the layer and owns
 # the exporter, exactly as it does for `capture`
 otel = ["dep:opentelemetry", "dep:opentelemetry_sdk", "dep:tracing-opentelemetry"]
+# `hestan::ParquetIo`, an io manager that stores op outputs as parquet files
+# rather than as json. off by default because arrow and parquet are a large
+# dependency to hand a deployment whose outputs are `{"loaded": 4210}`
+parquet = ["dep:arrow", "dep:parquet"]
 
 # the operator's binary: the store and server modes with no registry of its
 # own, for inspecting a database or driving a running instance. behind the
@@ -124,6 +138,11 @@ required-features = ["capture"]
 [[test]]
 name = "otel"
 required-features = ["otel"]
+
+# the parquet manager between two ops of a run, which needs the manager
+[[test]]
+name = "parquet"
+required-features = ["parquet"]
 
 # an isolated op re-executes `current_exe()`, so this target needs a `main` of
 # its own that rebuilds the same jobs — see the comment at the top of the file

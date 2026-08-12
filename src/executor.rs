@@ -2055,6 +2055,9 @@ async fn execute_in_span(
                         let key = io_key(&run_id, &job, &name);
                         match runner.io.manager(unit.io_name()).put(&key, output) {
                             Ok(handle) => {
+                                // what the manager knows about what it stored,
+                                // beside what the op staged
+                                let meta = crate::io::handle_meta(&handle, meta);
                                 note(store.op_finished(
                                     &run_id,
                                     &name,
@@ -2218,6 +2221,7 @@ async fn execute_in_span(
                             let key = io_key(&run_id, &job, &name);
                             match runner.io.manager(unit.io_name()).put(&key, output) {
                                 Ok(handle) => {
+                                    let meta = crate::io::handle_meta(&handle, meta);
                                     note(store.op_finished(
                                         &run_id,
                                         &name,
