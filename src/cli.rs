@@ -1317,7 +1317,7 @@ async fn logs(reach: Reach, args: LogsArgs, out: &Out) -> Result<(), Fail> {
             // a runner over no jobs at all, because a log tail only ever
             // reads: `Watched` is the two places a row can come from, and this
             // is the local one
-            Watched::Here(Runner::new([], store))
+            Watched::Here(Runner::new([], store)?)
         }
     };
     if !args.follow {
@@ -3510,7 +3510,9 @@ mod tests {
     #[test]
     fn doctor_finds_a_run_held_past_its_lease() {
         let store = Store::open(":memory:").unwrap();
-        let runner = Runner::new([job("etl")], store.clone()).with_role(Role::Scheduler, 1);
+        let runner = Runner::new([job("etl")], store.clone())
+            .unwrap()
+            .with_role(Role::Scheduler, 1);
         runner.launch("etl", json!({}), Trigger::Manual).unwrap();
         assert_eq!(
             levels(&check_leases(&store, Utc::now()).unwrap()),
@@ -3535,7 +3537,9 @@ mod tests {
     #[test]
     fn doctor_finds_a_queue_that_nothing_is_taking_and_one_a_limit_is_holding() {
         let store = Store::open(":memory:").unwrap();
-        let runner = Runner::new([job("etl")], store.clone()).with_role(Role::Scheduler, 1);
+        let runner = Runner::new([job("etl")], store.clone())
+            .unwrap()
+            .with_role(Role::Scheduler, 1);
         let mut app = app(store.clone(), vec![job("etl")]);
         assert_eq!(levels(&check_queue(&app).unwrap()), [Level::Ok]);
 

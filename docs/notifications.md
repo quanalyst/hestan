@@ -16,7 +16,7 @@ tokio's blocking pool, so a hook may block outright (sleep, sync http, a
 database write) without stalling the executor or other runs, and a panicking
 one is caught and logged as a warning without touching the others. driving
 `Runner` directly, the same hooks go in through
-`Runner::new(jobs, store).with_hooks(run_hooks, op_hooks)`, and
+`Runner::new(jobs, store)?.with_hooks(run_hooks, op_hooks)`, and
 `Runner::with_pools(jobs, store, hooks, pools)` adds
 [concurrency pools](concepts.md#concurrency-pools).
 

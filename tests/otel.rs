@@ -149,7 +149,7 @@ fn a_run_is_a_tree_of_spans_with_its_events_on_them() {
     let seen = Recorder::default();
     let subscriber = tracing_subscriber::registry().with(seen.clone());
     let fails = Arc::new(std::sync::atomic::AtomicU32::new(1));
-    let runner = Runner::new([flaky_job(fails)], Store::open(":memory:").unwrap());
+    let runner = Runner::new([flaky_job(fails)], Store::open(":memory:").unwrap()).unwrap();
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()

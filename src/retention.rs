@@ -262,7 +262,8 @@ mod tests {
                 job("chatty"),
             ],
             store.clone(),
-        );
+        )
+        .unwrap();
 
         sweep(&runner, &Retention::days(7), Utc::now());
         assert_eq!(ids(&store), ["kept"]);
@@ -275,13 +276,17 @@ mod tests {
     fn a_worker_never_prunes() {
         let store = Store::open(":memory:").unwrap();
         plant(&store, "old", "chatty", 30);
-        let worker = Runner::new([job("chatty")], store.clone()).with_role(Role::Worker, 4);
+        let worker = Runner::new([job("chatty")], store.clone())
+            .unwrap()
+            .with_role(Role::Worker, 4);
 
         sweep(&worker, &Retention::days(7), Utc::now());
         assert_eq!(ids(&store), ["old"], "a worker pruned the scheduler's runs");
 
         // and the same registry under a role that decides does prune it
-        let scheduler = Runner::new([job("chatty")], store.clone()).with_role(Role::Scheduler, 4);
+        let scheduler = Runner::new([job("chatty")], store.clone())
+            .unwrap()
+            .with_role(Role::Scheduler, 4);
         sweep(&scheduler, &Retention::days(7), Utc::now());
         assert!(ids(&store).is_empty());
     }
@@ -292,7 +297,7 @@ mod tests {
     #[tokio::test]
     async fn the_interval_sweep_prunes_a_run_that_appeared_after_boot() {
         let store = Store::open(":memory:").unwrap();
-        let runner = Runner::new([job("chatty")], store.clone());
+        let runner = Runner::new([job("chatty")], store.clone()).unwrap();
         let loop_handle = tokio::spawn(run_sweeper(
             runner,
             Retention::days(7),

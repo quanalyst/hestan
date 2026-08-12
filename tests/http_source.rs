@@ -66,7 +66,8 @@ async fn success_typed() {
     let runner = Runner::new(
         [src.into_job("pull").unwrap()],
         Store::open(":memory:").unwrap(),
-    );
+    )
+    .unwrap();
     assert_eq!(
         runner.jobs()["pull"].op("pull").unwrap().output_type(),
         Some("http_source::Payload")
@@ -107,7 +108,8 @@ async fn retries_then_succeeds() {
     let runner = Runner::new(
         [src.into_job("flaky").unwrap()],
         Store::open(":memory:").unwrap(),
-    );
+    )
+    .unwrap();
     let run = runner
         .run("flaky", json!({}), Trigger::Manual)
         .await
@@ -149,7 +151,8 @@ async fn client_error_fails_fast() {
     let runner = Runner::new(
         [src.into_job("gone").unwrap()],
         Store::open(":memory:").unwrap(),
-    );
+    )
+    .unwrap();
     let run = runner
         .run("gone", json!({}), Trigger::Manual)
         .await
@@ -182,7 +185,8 @@ async fn an_error_body_far_larger_than_the_snippet_is_read_only_that_far() {
     let runner = Runner::new(
         [src.into_job("boom").unwrap()],
         Store::open(":memory:").unwrap(),
-    );
+    )
+    .unwrap();
     let run = runner
         .run("boom", json!({}), Trigger::Manual)
         .await
@@ -214,7 +218,8 @@ async fn a_content_length_past_the_ceiling_is_refused_before_the_body_is_read() 
     let runner = Runner::new(
         [src.into_job("pages").unwrap()],
         Store::open(":memory:").unwrap(),
-    );
+    )
+    .unwrap();
     let run = runner
         .run("pages", json!({}), Trigger::Manual)
         .await
@@ -259,7 +264,8 @@ async fn a_body_past_the_ceiling_with_no_content_length_fails_naming_the_limit()
     let runner = Runner::new(
         [src.into_job("pages").unwrap()],
         Store::open(":memory:").unwrap(),
-    );
+    )
+    .unwrap();
     let run = runner
         .run("pages", json!({}), Trigger::Manual)
         .await
@@ -299,7 +305,8 @@ async fn a_body_under_the_ceiling_is_unaffected() {
     let runner = Runner::new(
         [src.into_job("rows").unwrap()],
         Store::open(":memory:").unwrap(),
-    );
+    )
+    .unwrap();
     let run = runner
         .run("rows", json!({}), Trigger::Manual)
         .await
@@ -329,7 +336,8 @@ async fn a_content_length_that_understates_the_body_cannot_get_past_the_ceiling(
     let runner = Runner::new(
         [src.into_job("short").unwrap()],
         Store::open(":memory:").unwrap(),
-    );
+    )
+    .unwrap();
     let run = runner
         .run("short", json!({}), Trigger::Manual)
         .await
@@ -370,7 +378,8 @@ async fn fan_out_names() {
     let runner = Runner::new(
         [src.into_job("regions").unwrap()],
         Store::open(":memory:").unwrap(),
-    );
+    )
+    .unwrap();
     let run = runner
         .run("regions", json!({}), Trigger::Manual)
         .await
@@ -408,7 +417,8 @@ async fn bearer_env() {
     let runner = Runner::new(
         [src.into_job("private").unwrap()],
         Store::open(":memory:").unwrap(),
-    );
+    )
+    .unwrap();
     let run = runner
         .run("private", json!({}), Trigger::Manual)
         .await
@@ -440,7 +450,8 @@ async fn huge_retry_after_capped() {
     let runner = Runner::new(
         [src.into_job("limited").unwrap()],
         Store::open(":memory:").unwrap(),
-    );
+    )
+    .unwrap();
     let id = runner
         .launch("limited", json!({}), Trigger::Manual)
         .unwrap();
@@ -486,7 +497,8 @@ async fn builder_error_fails_fast_with_cause() {
     let runner = Runner::new(
         [src.into_job("broken").unwrap()],
         Store::open(":memory:").unwrap(),
-    );
+    )
+    .unwrap();
     let run = runner
         .run("broken", json!({}), Trigger::Manual)
         .await
@@ -524,7 +536,8 @@ async fn empty_bearer_env_fatal() {
     let runner = Runner::new(
         [src.into_job("private").unwrap()],
         Store::open(":memory:").unwrap(),
-    );
+    )
+    .unwrap();
     let run = runner
         .run("private", json!({}), Trigger::Manual)
         .await

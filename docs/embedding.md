@@ -51,10 +51,10 @@ stale ancestors.
 
 `Runner::new(jobs, store)` is the bare executor: no sweep, no schedule sync,
 no server. `launch` and `run` as described in [concepts](concepts.md), with
-`runner.store()` for reading history back. one behavioral difference from
-`Hestan`: registering two jobs with the same name in a `Runner` keeps the
-last and logs a warning, while `Hestan` refuses to build
-(`Error::DuplicateJob`).
+`runner.store()` for reading history back. it returns
+`Result<Runner, Error>`, and two jobs of one name is `Error::DuplicateJob` —
+the same answer `Hestan` gives, since which one you would have got otherwise
+depends on the order they were handed over.
 
 `Runner::new` declares no [concurrency pools](concepts.md#concurrency-pools),
 so an op with `.pool(name)` fails at run time with
@@ -75,7 +75,7 @@ use hestan::{OpStatus, RunStatus, Runner, Store, Trigger};
 
 #[tokio::test]
 async fn etl_handles_bad_rows() {
-    let runner = Runner::new([my_etl_job()], Store::open(":memory:").unwrap());
+    let runner = Runner::new([my_etl_job()], Store::open(":memory:").unwrap()).unwrap();
     let run = runner.run("etl", json!({}), Trigger::Manual).await.unwrap();
 
     assert_eq!(run.status, RunStatus::Success);

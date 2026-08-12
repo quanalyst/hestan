@@ -38,7 +38,7 @@ async fn linear_job_passes_outputs() {
         .build()
         .unwrap();
 
-    let runner = Runner::new([job], Store::open(":memory:").unwrap());
+    let runner = Runner::new([job], Store::open(":memory:").unwrap()).unwrap();
     let run = runner.run("etl", json!({}), Trigger::Manual).await.unwrap();
 
     assert_eq!(run.status, RunStatus::Success);
@@ -94,7 +94,7 @@ async fn failure_skips_downstream_and_fails_run() {
         .build()
         .unwrap();
 
-    let runner = Runner::new([job], Store::open(":memory:").unwrap());
+    let runner = Runner::new([job], Store::open(":memory:").unwrap()).unwrap();
     let run = runner
         .run("brittle", json!({}), Trigger::Manual)
         .await
@@ -131,7 +131,7 @@ async fn retries_then_succeeds() {
         .build()
         .unwrap();
 
-    let runner = Runner::new([job], Store::open(":memory:").unwrap());
+    let runner = Runner::new([job], Store::open(":memory:").unwrap()).unwrap();
     let run = runner
         .run("flaky", json!({}), Trigger::Manual)
         .await
@@ -150,7 +150,7 @@ async fn unknown_job_errors() {
         .op(Op::new("noop", |_| async { Ok(json!(null)) }))
         .build()
         .unwrap();
-    let runner = Runner::new([job], Store::open(":memory:").unwrap());
+    let runner = Runner::new([job], Store::open(":memory:").unwrap()).unwrap();
     let err = runner
         .launch("nope", json!({}), Trigger::Manual)
         .unwrap_err();
@@ -204,7 +204,7 @@ async fn typed_ops_roundtrip() {
         Some("pipeline::Total")
     );
 
-    let runner = Runner::new([job], Store::open(":memory:").unwrap());
+    let runner = Runner::new([job], Store::open(":memory:").unwrap()).unwrap();
     let run = runner
         .run("typed", json!({}), Trigger::Manual)
         .await
@@ -240,7 +240,7 @@ async fn type_mismatch_fails_op_with_event() {
         .build()
         .unwrap();
 
-    let runner = Runner::new([job], Store::open(":memory:").unwrap());
+    let runner = Runner::new([job], Store::open(":memory:").unwrap()).unwrap();
     let run = runner
         .run("typed", json!({}), Trigger::Manual)
         .await
@@ -283,7 +283,7 @@ async fn invalid_params_rejected_before_launch() {
         .build()
         .unwrap();
 
-    let runner = Runner::new([job], Store::open(":memory:").unwrap());
+    let runner = Runner::new([job], Store::open(":memory:").unwrap()).unwrap();
     let err = runner
         .launch("gated", json!({"threshold": "high"}), Trigger::Manual)
         .unwrap_err();
@@ -323,7 +323,7 @@ async fn panicking_op_retries_like_an_error() {
         .retries(1))
         .build()
         .unwrap();
-    let runner = Runner::new([job], Store::open(":memory:").unwrap());
+    let runner = Runner::new([job], Store::open(":memory:").unwrap()).unwrap();
     let run = runner
         .run("jumpy", json!({}), Trigger::Manual)
         .await
@@ -356,7 +356,7 @@ async fn eager_panic_goes_through_retry_policy() {
         .retries(1))
         .build()
         .unwrap();
-    let runner = Runner::new([job], Store::open(":memory:").unwrap());
+    let runner = Runner::new([job], Store::open(":memory:").unwrap()).unwrap();
     let run = runner
         .run("eager", json!({}), Trigger::Manual)
         .await
@@ -382,7 +382,7 @@ async fn skip_event_commits_before_status() {
         .op(Op::new("never", |_| async { Ok(json!(null)) }).after(["boom"]))
         .build()
         .unwrap();
-    let runner = Runner::new([job], Store::open(":memory:").unwrap());
+    let runner = Runner::new([job], Store::open(":memory:").unwrap()).unwrap();
     let run = runner
         .run("brittle", json!({}), Trigger::Manual)
         .await
@@ -421,7 +421,7 @@ async fn max_parallel_caps_in_flight_ops() {
             }
         }));
     }
-    let runner = Runner::new([builder.build().unwrap()], Store::open(":memory:").unwrap());
+    let runner = Runner::new([builder.build().unwrap()], Store::open(":memory:").unwrap()).unwrap();
     let run = runner
         .run("wide", json!({}), Trigger::Manual)
         .await
@@ -451,7 +451,7 @@ async fn watermark_persists_across_runs() {
         }))
         .build()
         .unwrap();
-    let runner = Runner::new([job], Store::open(":memory:").unwrap());
+    let runner = Runner::new([job], Store::open(":memory:").unwrap()).unwrap();
 
     let r1 = runner.run("inc", json!({}), Trigger::Manual).await.unwrap();
     assert_eq!(r1.status, RunStatus::Success);
@@ -476,7 +476,7 @@ async fn failed_op_commits_no_state() {
         }))
         .build()
         .unwrap();
-    let runner = Runner::new([job], Store::open(":memory:").unwrap());
+    let runner = Runner::new([job], Store::open(":memory:").unwrap()).unwrap();
     let run = runner
         .run("stateful", json!({}), Trigger::Manual)
         .await
@@ -504,7 +504,7 @@ async fn failed_attempt_state_dropped_on_retry() {
         .retry_delay(Duration::from_millis(10)))
         .build()
         .unwrap();
-    let runner = Runner::new([job], Store::open(":memory:").unwrap());
+    let runner = Runner::new([job], Store::open(":memory:").unwrap()).unwrap();
     let run = runner
         .run("wobbly", json!({}), Trigger::Manual)
         .await
@@ -532,7 +532,7 @@ async fn every_metadata_variant_round_trips_on_the_op_run() {
         .op(Op::new("quiet", |_| async { Ok(json!(null)) }))
         .build()
         .unwrap();
-    let runner = Runner::new([job], Store::open(":memory:").unwrap());
+    let runner = Runner::new([job], Store::open(":memory:").unwrap()).unwrap();
     let run = runner
         .run("report", json!({}), Trigger::Manual)
         .await
@@ -578,7 +578,7 @@ async fn failed_attempt_metadata_dropped_on_retry() {
         .retry_delay(Duration::from_millis(10)))
         .build()
         .unwrap();
-    let runner = Runner::new([job], Store::open(":memory:").unwrap());
+    let runner = Runner::new([job], Store::open(":memory:").unwrap()).unwrap();
     let run = runner
         .run("wobbly", json!({}), Trigger::Manual)
         .await
@@ -602,7 +602,7 @@ async fn cancel_stops_running_and_pending_ops() {
         .op(Op::new("tail", |_| async { Ok(json!(null)) }).after(["long"]))
         .build()
         .unwrap();
-    let runner = Runner::new([job], Store::open(":memory:").unwrap());
+    let runner = Runner::new([job], Store::open(":memory:").unwrap()).unwrap();
     let id = runner.launch("slow", json!({}), Trigger::Manual).unwrap();
     {
         let (runner, id) = (runner.clone(), id.clone());
@@ -650,7 +650,7 @@ async fn cancel_unknown_and_finished_runs() {
         .op(Op::new("noop", |_| async { Ok(json!(null)) }))
         .build()
         .unwrap();
-    let runner = Runner::new([job], Store::open(":memory:").unwrap());
+    let runner = Runner::new([job], Store::open(":memory:").unwrap()).unwrap();
     assert_eq!(runner.cancel("nope").unwrap(), CancelOutcome::Unknown);
 
     let run = runner
@@ -679,7 +679,8 @@ async fn failure_hook_fires_once_with_details() {
         .op(Op::new("boom", |_| async { Err("no good".into()) }).after(["ok"]))
         .build()
         .unwrap();
-    let runner = Runner::with_failure_hooks([job], Store::open(":memory:").unwrap(), vec![hook]);
+    let runner =
+        Runner::with_failure_hooks([job], Store::open(":memory:").unwrap(), vec![hook]).unwrap();
     let run = runner
         .run("brittle", json!({}), Trigger::Manual)
         .await
@@ -748,7 +749,8 @@ async fn blocking_hook_does_not_stall_other_runs() {
         [brittle, napper],
         Store::open(":memory:").unwrap(),
         vec![hook],
-    );
+    )
+    .unwrap();
 
     // both in flight: brittle fires the hook well inside the napper's 50ms window
     let started = std::time::Instant::now();
@@ -787,7 +789,8 @@ async fn no_hook_on_success_or_cancel() {
         .build()
         .unwrap();
     let runner =
-        Runner::with_failure_hooks([quick, slow], Store::open(":memory:").unwrap(), vec![hook]);
+        Runner::with_failure_hooks([quick, slow], Store::open(":memory:").unwrap(), vec![hook])
+            .unwrap();
 
     let run = runner
         .run("quick", json!({}), Trigger::Manual)
@@ -840,6 +843,7 @@ async fn every_terminal_status_reaches_the_run_hook_exactly_once() {
         .build()
         .unwrap();
     let runner = Runner::new([quick, brittle, slow], Store::open(":memory:").unwrap())
+        .unwrap()
         .with_hooks(vec![hook], Vec::new());
 
     runner
@@ -906,8 +910,9 @@ async fn an_op_hook_fires_per_attempt_with_the_attempt_number() {
         .retry_delay(Duration::from_millis(1)))
         .build()
         .unwrap();
-    let runner =
-        Runner::new([job], Store::open(":memory:").unwrap()).with_hooks(Vec::new(), vec![hook]);
+    let runner = Runner::new([job], Store::open(":memory:").unwrap())
+        .unwrap()
+        .with_hooks(Vec::new(), vec![hook]);
 
     let run = runner
         .run("flaky", json!({}), Trigger::Manual)
@@ -959,7 +964,7 @@ async fn a_job_scoped_hook_never_sees_another_jobs_runs() {
         .op(Op::new("load", |_| async { Ok(json!(null)) }))
         .build()
         .unwrap();
-    let runner = Runner::new([watched, other], Store::open(":memory:").unwrap());
+    let runner = Runner::new([watched, other], Store::open(":memory:").unwrap()).unwrap();
 
     runner
         .run("backfill", json!({}), Trigger::Manual)
@@ -992,6 +997,7 @@ async fn a_panicking_op_hook_leaves_the_run_alone() {
         .build()
         .unwrap();
     let runner = Runner::new([job], Store::open(":memory:").unwrap())
+        .unwrap()
         .with_hooks(Vec::new(), vec![Arc::new(|_| panic!("bad hook")), hook]);
 
     let run = runner.run("etl", json!({}), Trigger::Manual).await.unwrap();
@@ -1012,8 +1018,9 @@ async fn ops_skipped_by_a_rule_reach_no_op_hook() {
             .when(When::AnyFailed))
         .build()
         .unwrap();
-    let runner =
-        Runner::new([job], Store::open(":memory:").unwrap()).with_hooks(Vec::new(), vec![hook]);
+    let runner = Runner::new([job], Store::open(":memory:").unwrap())
+        .unwrap()
+        .with_hooks(Vec::new(), vec![hook]);
 
     let run = runner.run("etl", json!({}), Trigger::Manual).await.unwrap();
     assert_eq!(run.status, RunStatus::Failed);
@@ -1139,7 +1146,7 @@ async fn max_parallel_zero_still_makes_progress() {
         .op(Op::new("b", |_| async { Ok(json!(2)) }).after(["a"]))
         .build()
         .unwrap();
-    let runner = Runner::new([job], Store::open(":memory:").unwrap());
+    let runner = Runner::new([job], Store::open(":memory:").unwrap()).unwrap();
     let run = runner
         .run("narrow", json!({}), Trigger::Manual)
         .await
@@ -1225,7 +1232,7 @@ async fn resume_reruns_only_the_failed_subset() {
         fixed,
         ..
     } = chain();
-    let runner = Runner::new([job], Store::open(":memory:").unwrap());
+    let runner = Runner::new([job], Store::open(":memory:").unwrap()).unwrap();
     let first = runner
         .run("chain", json!({}), Trigger::Manual)
         .await
@@ -1247,7 +1254,7 @@ async fn resume_seeds_the_recorded_upstream_output() {
     let Chain {
         job, b_saw, fixed, ..
     } = chain();
-    let runner = Runner::new([job], Store::open(":memory:").unwrap());
+    let runner = Runner::new([job], Store::open(":memory:").unwrap()).unwrap();
     let first = runner
         .run("chain", json!({}), Trigger::Manual)
         .await
@@ -1275,7 +1282,7 @@ async fn resume_seeds_the_recorded_upstream_output() {
 #[tokio::test]
 async fn resumed_run_records_trigger_params_and_parent() {
     let Chain { job, fixed, .. } = chain();
-    let runner = Runner::new([job], Store::open(":memory:").unwrap());
+    let runner = Runner::new([job], Store::open(":memory:").unwrap()).unwrap();
     let first = runner
         .run("chain", json!({"n": 5}), Trigger::Manual)
         .await
@@ -1320,7 +1327,7 @@ async fn chained_resume_seeds_from_two_runs_back() {
         .op(step("four", Some("three"), None))
         .build()
         .unwrap();
-    let runner = Runner::new([job], Store::open(":memory:").unwrap());
+    let runner = Runner::new([job], Store::open(":memory:").unwrap()).unwrap();
 
     let first = runner
         .run("steps", json!({}), Trigger::Manual)
@@ -1368,7 +1375,7 @@ async fn resume_from_reruns_the_chosen_op_and_downstream() {
         fixed,
     } = chain();
     fixed.store(true, Ordering::SeqCst);
-    let runner = Runner::new([job], Store::open(":memory:").unwrap());
+    let runner = Runner::new([job], Store::open(":memory:").unwrap()).unwrap();
     let first = runner
         .run("chain", json!({}), Trigger::Manual)
         .await
@@ -1403,7 +1410,7 @@ async fn resume_rejects_unknown_active_and_successful_runs() {
         }))
         .build()
         .unwrap();
-    let runner = Runner::new([job, slow], Store::open(":memory:").unwrap());
+    let runner = Runner::new([job, slow], Store::open(":memory:").unwrap()).unwrap();
 
     let err = runner.resume("nope").unwrap_err();
     assert!(matches!(err, Error::UnknownRun(_)), "{err}");
@@ -1434,7 +1441,7 @@ async fn resume_rejects_unknown_active_and_successful_runs() {
 async fn resume_refuses_a_changed_graph() {
     let store = Store::open(":memory:").unwrap();
     let Chain { job, .. } = chain();
-    let runner = Runner::new([job], store.clone());
+    let runner = Runner::new([job], store.clone()).unwrap();
     let first = runner
         .run("chain", json!({}), Trigger::Manual)
         .await
@@ -1450,6 +1457,7 @@ async fn resume_refuses_a_changed_graph() {
         .build()
         .unwrap();
     let err = Runner::new([grown], store.clone())
+        .unwrap()
         .resume(&first.id)
         .unwrap_err();
     assert!(matches!(err, Error::Graph(_)), "{err}");
@@ -1461,6 +1469,7 @@ async fn resume_refuses_a_changed_graph() {
         .build()
         .unwrap();
     let err = Runner::new([shrunk], store.clone())
+        .unwrap()
         .resume(&first.id)
         .unwrap_err();
     assert!(err.to_string().contains("only in the run: b, c"), "{err}");
@@ -1530,7 +1539,7 @@ async fn cancel_stops_polling_blocking_work_and_owns_up_to_the_rest() {
         .build()
         .unwrap();
 
-    let runner = Runner::new([job], Store::open(":memory:").unwrap());
+    let runner = Runner::new([job], Store::open(":memory:").unwrap()).unwrap();
     let id = runner
         .launch("blocking", json!({}), Trigger::Manual)
         .unwrap();
@@ -1690,7 +1699,7 @@ async fn an_undeclared_pool_is_refused() {
     assert!(err.to_string().contains("declared twice"), "{err}");
 
     // a runner assembled without pools at all must not quietly run unlimited
-    let runner = Runner::new([job()], Store::open(":memory:").unwrap());
+    let runner = Runner::new([job()], Store::open(":memory:").unwrap()).unwrap();
     let run = runner
         .run("pull", json!({}), Trigger::Manual)
         .await
@@ -1734,7 +1743,7 @@ async fn op_timeout_fires_retries_and_trips_the_cancel_signal() {
         .build()
         .unwrap();
 
-    let runner = Runner::new([job], Store::open(":memory:").unwrap());
+    let runner = Runner::new([job], Store::open(":memory:").unwrap()).unwrap();
     let run = runner
         .run("hung", json!({}), Trigger::Manual)
         .await
@@ -1776,7 +1785,8 @@ async fn a_failed_run_names_the_failing_op_in_its_error() {
         [brittle, clean],
         Store::open(":memory:").unwrap(),
         vec![hook],
-    );
+    )
+    .unwrap();
 
     let run = runner
         .run("brittle", json!({}), Trigger::Manual)
@@ -1860,7 +1870,7 @@ async fn fan_out_runs_one_instance_per_element_in_element_order() {
         tokio::time::sleep(Duration::from_millis(u64::from(page) * 40)).await;
         Ok(json!({ "page": page }))
     });
-    let runner = Runner::new([job], Store::open(":memory:").unwrap());
+    let runner = Runner::new([job], Store::open(":memory:").unwrap()).unwrap();
     let run = runner
         .run("fanout", json!({}), Trigger::Manual)
         .await
@@ -1903,7 +1913,7 @@ async fn a_mapped_op_hands_downstream_its_outputs_in_element_order() {
         .after(["process"]))
         .build()
         .unwrap();
-    let runner = Runner::new([job], Store::open(":memory:").unwrap());
+    let runner = Runner::new([job], Store::open(":memory:").unwrap()).unwrap();
     let run = runner
         .run("ordered", json!({}), Trigger::Manual)
         .await
@@ -1917,7 +1927,7 @@ async fn a_mapped_op_hands_downstream_its_outputs_in_element_order() {
 #[tokio::test]
 async fn an_empty_array_fans_out_to_nothing_and_downstream_still_runs() {
     let job = fanout_job(json!([]), doubling);
-    let runner = Runner::new([job], Store::open(":memory:").unwrap());
+    let runner = Runner::new([job], Store::open(":memory:").unwrap()).unwrap();
     let run = runner
         .run("fanout", json!({}), Trigger::Manual)
         .await
@@ -1933,7 +1943,7 @@ async fn an_empty_array_fans_out_to_nothing_and_downstream_still_runs() {
 #[tokio::test]
 async fn mapping_over_a_non_array_fails_the_op_and_skips_downstream() {
     let job = fanout_job(json!("not a list"), doubling);
-    let runner = Runner::new([job], Store::open(":memory:").unwrap());
+    let runner = Runner::new([job], Store::open(":memory:").unwrap()).unwrap();
     let run = runner
         .run("fanout", json!({}), Trigger::Manual)
         .await
@@ -1959,7 +1969,7 @@ async fn one_failed_instance_fails_the_run_and_skips_downstream() {
         }
         Ok(json!(page))
     });
-    let runner = Runner::new([job], Store::open(":memory:").unwrap());
+    let runner = Runner::new([job], Store::open(":memory:").unwrap()).unwrap();
     let run = runner
         .run("fanout", json!({}), Trigger::Manual)
         .await
@@ -1982,7 +1992,7 @@ async fn one_failed_instance_fails_the_run_and_skips_downstream() {
 #[tokio::test]
 async fn an_element_that_does_not_deserialize_names_its_instance() {
     let job = fanout_job(json!([1, "two", 3]), doubling);
-    let runner = Runner::new([job], Store::open(":memory:").unwrap());
+    let runner = Runner::new([job], Store::open(":memory:").unwrap()).unwrap();
     let run = runner
         .run("fanout", json!({}), Trigger::Manual)
         .await
@@ -2029,7 +2039,7 @@ async fn instances_respect_max_parallel() {
         .build()
         .unwrap();
 
-    let runner = Runner::new([job], Store::open(":memory:").unwrap());
+    let runner = Runner::new([job], Store::open(":memory:").unwrap()).unwrap();
     let run = runner
         .run("capped", json!({}), Trigger::Manual)
         .await
@@ -2099,7 +2109,7 @@ async fn a_resume_re_expands_a_mapped_op_and_reuses_a_whole_one() {
         .build()
         .unwrap();
 
-    let runner = Runner::new([job], Store::open(":memory:").unwrap());
+    let runner = Runner::new([job], Store::open(":memory:").unwrap()).unwrap();
     let first = runner
         .run("resumable", json!({}), Trigger::Manual)
         .await
@@ -2156,7 +2166,7 @@ async fn a_partly_failed_mapped_op_re_expands_on_resume() {
         .build()
         .unwrap();
 
-    let runner = Runner::new([job], Store::open(":memory:").unwrap());
+    let runner = Runner::new([job], Store::open(":memory:").unwrap()).unwrap();
     let first = runner
         .run("flaky", json!({}), Trigger::Manual)
         .await
@@ -2188,7 +2198,7 @@ async fn canceling_a_run_stops_and_records_every_instance() {
         .over("pages"))
         .build()
         .unwrap();
-    let runner = Runner::new([job], Store::open(":memory:").unwrap());
+    let runner = Runner::new([job], Store::open(":memory:").unwrap()).unwrap();
     let id = runner.launch("slow", json!({}), Trigger::Manual).unwrap();
     {
         let (runner, id) = (runner.clone(), id.clone());
@@ -2280,7 +2290,7 @@ async fn an_instance_reads_its_other_deps_whole() {
         .build()
         .unwrap();
 
-    let runner = Runner::new([job], Store::open(":memory:").unwrap());
+    let runner = Runner::new([job], Store::open(":memory:").unwrap()).unwrap();
     let run = runner
         .run("mixed", json!({}), Trigger::Manual)
         .await
@@ -2314,7 +2324,7 @@ async fn an_instance_retries_on_its_own_like_a_static_op() {
         .build()
         .unwrap();
 
-    let runner = Runner::new([job], Store::open(":memory:").unwrap());
+    let runner = Runner::new([job], Store::open(":memory:").unwrap()).unwrap();
     let run = runner
         .run("retried", json!({}), Trigger::Manual)
         .await
@@ -2357,7 +2367,7 @@ async fn always_op_runs_after_a_failure_and_reports_dep_statuses() {
         .build()
         .unwrap();
 
-    let runner = Runner::new([job], Store::open(":memory:").unwrap());
+    let runner = Runner::new([job], Store::open(":memory:").unwrap()).unwrap();
     let run = runner
         .run("nightly", json!({}), Trigger::Manual)
         .await
@@ -2392,7 +2402,7 @@ async fn any_failed_is_skipped_when_everything_succeeded() {
         .build()
         .unwrap();
 
-    let runner = Runner::new([job], Store::open(":memory:").unwrap());
+    let runner = Runner::new([job], Store::open(":memory:").unwrap()).unwrap();
     let run = runner
         .run("watched", json!({}), Trigger::Manual)
         .await
@@ -2423,7 +2433,7 @@ async fn a_rule_declined_op_records_its_own_skip_event() {
         .build()
         .unwrap();
 
-    let runner = Runner::new([job], Store::open(":memory:").unwrap());
+    let runner = Runner::new([job], Store::open(":memory:").unwrap()).unwrap();
     let run = runner
         .run("mixed", json!({}), Trigger::Manual)
         .await
@@ -2486,7 +2496,7 @@ async fn skip_propagation_stops_at_a_rule_that_still_runs() {
             .unwrap()
     };
 
-    let runner = Runner::new([build(true)], Store::open(":memory:").unwrap());
+    let runner = Runner::new([build(true)], Store::open(":memory:").unwrap()).unwrap();
     let run = runner
         .run("chain", json!({}), Trigger::Manual)
         .await
@@ -2508,7 +2518,7 @@ async fn skip_propagation_stops_at_a_rule_that_still_runs() {
     assert_eq!(out, Some(json!("swept")));
 
     // and when the op that stopped it fails, its own downstream is cut off
-    let runner = Runner::new([build(false)], Store::open(":memory:").unwrap());
+    let runner = Runner::new([build(false)], Store::open(":memory:").unwrap()).unwrap();
     let run = runner
         .run("chain", json!({}), Trigger::Manual)
         .await
@@ -2550,7 +2560,7 @@ async fn always_on_a_mapped_op_whose_array_never_arrived_runs_zero_instances() {
         .build()
         .unwrap();
 
-    let runner = Runner::new([job], Store::open(":memory:").unwrap());
+    let runner = Runner::new([job], Store::open(":memory:").unwrap()).unwrap();
     let run = runner
         .run("fanned", json!({}), Trigger::Manual)
         .await
@@ -2612,7 +2622,7 @@ async fn two_graph_instances_run_independently_end_to_end() {
         .build()
         .unwrap();
 
-    let runner = Runner::new([job], Store::open(":memory:").unwrap());
+    let runner = Runner::new([job], Store::open(":memory:").unwrap()).unwrap();
     let run = runner
         .run("nightly", json!({}), Trigger::Manual)
         .await
@@ -2676,7 +2686,7 @@ async fn a_nested_graph_with_fan_out_runs_flattened() {
         .build()
         .unwrap();
 
-    let runner = Runner::new([job], Store::open(":memory:").unwrap());
+    let runner = Runner::new([job], Store::open(":memory:").unwrap()).unwrap();
     let run = runner
         .run("nightly", json!({}), Trigger::Manual)
         .await

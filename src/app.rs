@@ -1101,11 +1101,20 @@ impl Hestan {
         let (jobs, registry) = self.lower()?;
         let schedules = std::mem::take(&mut self.schedules);
         let mut entries = Vec::new();
+        let mut pairs: HashSet<(&str, &str)> = HashSet::new();
         for s in &schedules {
             let (job, expr) = (&s.job, &s.expr);
             let Some(defined) = jobs.iter().find(|j| j.name() == job) else {
                 return Err(Error::UnknownJob(job.clone()));
             };
+            // the store keys a schedule on the pair, so a second declaration of
+            // one is not a second schedule: it is that row with whichever
+            // timezone and params came last on it, and both entries firing
+            if !pairs.insert((job.as_str(), expr.as_str())) {
+                return Err(Error::Graph(format!(
+                    "schedule {expr} on job {job} is declared twice"
+                )));
+            }
             // the same validators a launch runs, at startup: a schedule whose
             // params no op accepts is a build error, not a 3am tick that fails
             if let Some((op, reason)) = defined.params_error(&s.params) {
@@ -1346,6 +1355,55 @@ mod tests {
         assert_eq!(run.status, RunStatus::Success);
     }
 
+    // through build, which is the path serve takes, rather than only through
+    // the runner underneath it
+    #[tokio::test]
+    async fn two_jobs_of_one_name_are_refused_at_build() {
+        let err = Hestan::new()
+            .job(windowed("report"))
+            .job(windowed("report"))
+            .db(":memory:")
+            .run_once("report", json!({"days": 7}))
+            .await
+            .err()
+            .unwrap();
+        assert!(
+            matches!(err, Error::DuplicateJob(ref name) if name == "report"),
+            "{err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn one_schedule_declared_twice_is_refused_at_build() {
+        let good = json!({"days": 7});
+        let err = Hestan::new()
+            .job(windowed("report"))
+            .schedule_with("report", "0 9 * * *", good.clone())
+            .schedule_tz_with("report", "0 9 * * *", "Europe/Lisbon", good.clone())
+            .db(":memory:")
+            .run_once("report", good.clone())
+            .await
+            .err()
+            .unwrap();
+        assert!(
+            err.to_string()
+                .contains("schedule 0 9 * * * on job report is declared twice"),
+            "{err}"
+        );
+
+        // two expressions on one job are a different thing entirely, and stay
+        // one job with two schedules
+        let run = Hestan::new()
+            .job(windowed("report"))
+            .schedule_with("report", "0 9 * * *", good.clone())
+            .schedule_with("report", "0 21 * * *", good.clone())
+            .db(":memory:")
+            .run_once("report", good)
+            .await
+            .unwrap();
+        assert_eq!(run.status, RunStatus::Success);
+    }
+
     // a schedule that could never launch is a startup error, not a tick that
     // fails forever at 3am
     #[tokio::test]
@@ -1498,6 +1556,7 @@ mod tests {
         // and a launch that names a default's key overrides it for that run
         let store = Store::open(&path).unwrap();
         let runner = Runner::new(vec![windowed("report")], store.clone())
+            .unwrap()
             .with_run_tags(RunTags::from([("env".to_string(), "prod".to_string())]));
         let id = runner
             .launch_tagged(

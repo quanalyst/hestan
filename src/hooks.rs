@@ -413,6 +413,7 @@ mod tests {
 
     fn runner(store: Store, hook: RunHook) -> Runner {
         Runner::new(Vec::new(), store)
+            .unwrap()
             .with_hooks(vec![hook], Vec::new())
             .with_durable_notifications()
     }

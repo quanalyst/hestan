@@ -199,7 +199,9 @@ fn marks() -> PathBuf {
 /// deployment, in this process, so a case can put work on the queue and be sure
 /// nothing here took it.
 fn enqueuer(db: &str) -> Runner {
-    Runner::new(jobs(), open(db)).with_role(Role::Scheduler, 1)
+    Runner::new(jobs(), open(db))
+        .unwrap()
+        .with_role(Role::Scheduler, 1)
 }
 
 async fn cases(db: &str) {

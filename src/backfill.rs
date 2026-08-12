@@ -221,7 +221,7 @@ mod tests {
     }
 
     fn runner_for(reg: &AssetRegistry, store: Store) -> Runner {
-        Runner::new([reg.lower_job().unwrap()], store)
+        Runner::new([reg.lower_job().unwrap()], store).unwrap()
     }
 
     async fn settle(runner: &Runner, reg: &AssetRegistry) {

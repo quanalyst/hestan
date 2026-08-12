@@ -1972,7 +1972,7 @@ mod tests {
         .from(&s);
         let b = Asset::new("b", |_| async { Ok(json!("b")) }).from(&a);
         let reg = AssetRegistry::new(vec![s, a, b], Vec::new(), Vec::new()).unwrap();
-        let runner = Runner::new([reg.lower_job().unwrap()], store.clone());
+        let runner = Runner::new([reg.lower_job().unwrap()], store.clone()).unwrap();
         store
             .record_materialization("s", None, "s-fp", &json!({}), None, None, None)
             .unwrap();
@@ -2024,7 +2024,7 @@ mod tests {
         })
         .from(&a);
         let reg = AssetRegistry::new(vec![s, a, b], Vec::new(), Vec::new()).unwrap();
-        let runner = Runner::new([reg.lower_job().unwrap()], store.clone());
+        let runner = Runner::new([reg.lower_job().unwrap()], store.clone()).unwrap();
         // the source was probed before this build
         store
             .record_materialization("s", None, "s-fp", &json!({}), None, None, None)
@@ -2062,7 +2062,7 @@ mod tests {
         });
         let quiet = Asset::new("quiet", |_| async { Ok(json!(null)) });
         let reg = AssetRegistry::new(vec![counted, quiet], Vec::new(), Vec::new()).unwrap();
-        let runner = Runner::new([reg.lower_job().unwrap()], store.clone());
+        let runner = Runner::new([reg.lower_job().unwrap()], store.clone()).unwrap();
         let run = build_all(&reg, &runner).await;
 
         let reported = json!({
@@ -2097,7 +2097,7 @@ mod tests {
         });
         let hashed = Asset::new("hashed", |_| async { Ok(json!({"data": [1, 2]})) });
         let reg = AssetRegistry::new(vec![pinned, hashed], Vec::new(), Vec::new()).unwrap();
-        let runner = Runner::new([reg.lower_job().unwrap()], store.clone());
+        let runner = Runner::new([reg.lower_job().unwrap()], store.clone()).unwrap();
         build_all(&reg, &runner).await;
 
         assert_eq!(
@@ -2129,7 +2129,7 @@ mod tests {
         })
         .from(&a);
         let reg = AssetRegistry::new(vec![s, a, b], Vec::new(), Vec::new()).unwrap();
-        let runner = Runner::new([reg.lower_job().unwrap()], store.clone());
+        let runner = Runner::new([reg.lower_job().unwrap()], store.clone()).unwrap();
         store
             .record_materialization("s", None, "s-fp", &json!({}), None, None, None)
             .unwrap();
@@ -2182,7 +2182,7 @@ mod tests {
         let s = Asset::source("s");
         let a = Asset::new("a", |_| async { Ok(json!(1)) }).from(&s);
         let reg = AssetRegistry::new(vec![s, a], Vec::new(), Vec::new()).unwrap();
-        let runner = Runner::new([reg.lower_job().unwrap()], store.clone());
+        let runner = Runner::new([reg.lower_job().unwrap()], store.clone()).unwrap();
         let run = runner
             .run(ASSETS_JOB, json!({}), crate::model::Trigger::Manual)
             .await
@@ -2239,7 +2239,7 @@ mod tests {
             rows_check("has_many", "a", 100).severity(Severity::Warn),
         ];
         let reg = AssetRegistry::new(vec![a], Vec::new(), checks).unwrap();
-        let runner = Runner::new([reg.lower_job().unwrap()], store.clone());
+        let runner = Runner::new([reg.lower_job().unwrap()], store.clone()).unwrap();
         let run = build_all(&reg, &runner).await;
 
         // one passed, one failed, and the warn failure did not fail the run
@@ -2267,7 +2267,7 @@ mod tests {
         let a = Asset::new("a", |_| async { Ok(json!({"rows": 3})) });
         let reg = AssetRegistry::new(vec![a], Vec::new(), vec![rows_check("has_many", "a", 100)])
             .unwrap();
-        let runner = Runner::new([reg.lower_job().unwrap()], store.clone());
+        let runner = Runner::new([reg.lower_job().unwrap()], store.clone()).unwrap();
         let run = build_all(&reg, &runner).await;
         assert_eq!(run.status, RunStatus::Failed);
         assert!(
@@ -2303,7 +2303,7 @@ mod tests {
             vec![rows_check("has_many", "a", 100)],
         )
         .unwrap();
-        let runner = Runner::new([reg.lower_job().unwrap()], store.clone());
+        let runner = Runner::new([reg.lower_job().unwrap()], store.clone()).unwrap();
         let run = build_all(&reg, &runner).await;
 
         assert_eq!(run.status, RunStatus::Failed);
@@ -2333,7 +2333,7 @@ mod tests {
             rows_check("has_rows", "b", 1),
         ];
         let reg = AssetRegistry::new(vec![s, a, b], Vec::new(), checks).unwrap();
-        let runner = Runner::new([reg.lower_job().unwrap()], store.clone());
+        let runner = Runner::new([reg.lower_job().unwrap()], store.clone()).unwrap();
         store
             .record_materialization("s", None, "s-fp", &json!({}), None, None, None)
             .unwrap();
@@ -2425,7 +2425,7 @@ mod tests {
     async fn one_op_materializes_every_asset_it_produces() {
         let store = Store::open(":memory:").unwrap();
         let reg = AssetRegistry::new(Vec::new(), vec![split()], Vec::new()).unwrap();
-        let runner = Runner::new([reg.lower_job().unwrap()], store.clone());
+        let runner = Runner::new([reg.lower_job().unwrap()], store.clone()).unwrap();
         let run = build_all(&reg, &runner).await;
         assert_eq!(run.status, RunStatus::Success);
 
@@ -2466,7 +2466,7 @@ mod tests {
         })
         .produces(["orders_clean", "orders_rejected"]);
         let reg = AssetRegistry::new(Vec::new(), vec![short], Vec::new()).unwrap();
-        let runner = Runner::new([reg.lower_job().unwrap()], store.clone());
+        let runner = Runner::new([reg.lower_job().unwrap()], store.clone()).unwrap();
         let run = build_all(&reg, &runner).await;
 
         assert_eq!(run.status, RunStatus::Failed);
@@ -2486,7 +2486,7 @@ mod tests {
         let flat = MultiAsset::new("split_orders", |_| async { Ok(json!("done")) })
             .produces(["orders_clean", "orders_rejected"]);
         let reg = AssetRegistry::new(Vec::new(), vec![flat], Vec::new()).unwrap();
-        let runner = Runner::new([reg.lower_job().unwrap()], store.clone());
+        let runner = Runner::new([reg.lower_job().unwrap()], store.clone()).unwrap();
         let run = build_all(&reg, &runner).await;
         assert!(
             run.error
@@ -2507,7 +2507,7 @@ mod tests {
         })
         .from_named("orders_clean");
         let reg = AssetRegistry::new(vec![report], vec![split()], Vec::new()).unwrap();
-        let runner = Runner::new([reg.lower_job().unwrap()], store.clone());
+        let runner = Runner::new([reg.lower_job().unwrap()], store.clone()).unwrap();
         let run = build_all(&reg, &runner).await;
         assert_eq!(run.status, RunStatus::Success);
         assert_eq!(
@@ -2606,7 +2606,7 @@ mod tests {
         })
         .produces(["orders_clean", "orders_rejected"]);
         let reg = AssetRegistry::new(Vec::new(), vec![tagged], Vec::new()).unwrap();
-        let runner = Runner::new([reg.lower_job().unwrap()], store.clone());
+        let runner = Runner::new([reg.lower_job().unwrap()], store.clone()).unwrap();
         let run = build_all(&reg, &runner).await;
         assert_eq!(run.status, RunStatus::Success);
 
@@ -2637,7 +2637,7 @@ mod tests {
             vec![rows_check("has_rows", "orders_clean", 1)],
         )
         .unwrap();
-        let runner = Runner::new([reg.lower_job().unwrap()], store.clone());
+        let runner = Runner::new([reg.lower_job().unwrap()], store.clone()).unwrap();
         let run = build_all(&reg, &runner).await;
         assert_eq!(run.status, RunStatus::Success);
         let results = store.asset_checks("orders_clean", None, 10).unwrap();
@@ -2750,7 +2750,7 @@ mod tests {
     async fn a_build_materializes_only_the_keys_it_targets() {
         let store = Store::open(":memory:").unwrap();
         let reg = AssetRegistry::new(vec![keyed("a")], Vec::new(), Vec::new()).unwrap();
-        let runner = Runner::new([reg.lower_job().unwrap()], store.clone());
+        let runner = Runner::new([reg.lower_job().unwrap()], store.clone()).unwrap();
         let m = mats_map(&store).unwrap();
         let plan = plan_partitions(&reg, &m, &["a".into()], &on("a", ["k2"])).unwrap();
         let run = build_plan(&runner, plan).await;
@@ -2796,7 +2796,7 @@ mod tests {
         .from_named("a")
         .partitioned(Partitions::keys(["k1", "k2", "k3"]));
         let reg = AssetRegistry::new(vec![a, b], Vec::new(), Vec::new()).unwrap();
-        let runner = Runner::new([reg.lower_job().unwrap()], store.clone());
+        let runner = Runner::new([reg.lower_job().unwrap()], store.clone()).unwrap();
 
         let m = mats_map(&store).unwrap();
         let plan = plan_partitions(&reg, &m, &["b".into()], &on("b", ["k2"])).unwrap();
@@ -2895,7 +2895,7 @@ mod tests {
         .partitioned(Partitions::keys(["k1", "k2", "k3"]));
         let reg =
             AssetRegistry::new(vec![a], Vec::new(), vec![rows_check("has_rows", "a", 1)]).unwrap();
-        let runner = Runner::new([reg.lower_job().unwrap()], store.clone());
+        let runner = Runner::new([reg.lower_job().unwrap()], store.clone()).unwrap();
         let m = mats_map(&store).unwrap();
         let plan = plan_partitions(&reg, &m, &["a".into()], &on("a", ["k2"])).unwrap();
         let run = build_plan(&runner, plan).await;
@@ -2957,7 +2957,7 @@ mod tests {
         assert!(op.output_type().unwrap().ends_with("Out"));
 
         let store = Store::open(":memory:").unwrap();
-        let runner = Runner::new([job], store.clone());
+        let runner = Runner::new([job], store.clone()).unwrap();
         build_all(&reg, &runner).await;
         assert_eq!(
             store.materialization("t", None).unwrap().unwrap().value,

@@ -252,6 +252,7 @@ async fn usage(dir: &Path) {
 async fn canceled(dir: &Path) {
     let db = db(dir, "canceled");
     let runner = Runner::new(jobs(), Store::open(db.to_str().unwrap()).unwrap())
+        .unwrap()
         .with_limits(Limits::new().global(1), 0);
     let holding = runner.launch("slow", json!({}), Trigger::Manual).unwrap();
     wait_for("the case to hold the only slot", || {

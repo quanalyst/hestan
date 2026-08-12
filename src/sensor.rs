@@ -1159,7 +1159,7 @@ mod tests {
             ))
             .build()
             .unwrap();
-        Runner::new([job], store)
+        Runner::new([job], store).unwrap()
     }
 
     async fn wait_terminal(runner: &Runner, id: &str) -> RunStatus {
@@ -1386,7 +1386,7 @@ mod tests {
         store.sync_sensors(&["probe:docs".into()]).unwrap();
         let fp = Arc::new(Mutex::new("one".to_string()));
         let reg = probe_registry(fp.clone());
-        let runner = Runner::new([reg.lower_job().unwrap()], store.clone());
+        let runner = Runner::new([reg.lower_job().unwrap()], store.clone()).unwrap();
         let entry = probe_entry(&reg, "docs");
 
         evaluate(&entry, &runner, &reg).await;
@@ -1470,7 +1470,7 @@ mod tests {
         .from(&a)
         .auto();
         let reg = Arc::new(AssetRegistry::new(vec![s, a, b], Vec::new(), Vec::new()).unwrap());
-        let runner = Runner::new([reg.lower_job().unwrap()], store.clone());
+        let runner = Runner::new([reg.lower_job().unwrap()], store.clone()).unwrap();
         let entry = probe_entry(&reg, "s");
 
         evaluate(&entry, &runner, &reg).await;
@@ -1497,7 +1497,7 @@ mod tests {
         store.sync_sensors(&["probe:docs".into()]).unwrap();
         let fp = Arc::new(Mutex::new("one".to_string()));
         let reg = probe_registry(fp.clone());
-        let runner = Runner::new([reg.lower_job().unwrap()], store.clone());
+        let runner = Runner::new([reg.lower_job().unwrap()], store.clone()).unwrap();
         let entry = probe_entry(&reg, "docs");
 
         // an assets run planted as live, without an executor behind it
@@ -1589,7 +1589,7 @@ mod tests {
                 .is_empty()
         );
 
-        let runner = Runner::new([reg.lower_job().unwrap()], store.clone());
+        let runner = Runner::new([reg.lower_job().unwrap()], store.clone()).unwrap();
         evaluate(&entry, &runner, &reg).await;
         let ticks = store.sensor_ticks(Some("probe:docs"), 10).unwrap();
         assert_eq!(ticks[0].outcome, SensorOutcome::Fired);
@@ -1668,7 +1668,7 @@ mod tests {
             }))
             .build()
             .unwrap();
-        Runner::new([etl, publish], store)
+        Runner::new([etl, publish], store).unwrap()
     }
 
     fn chain_entry(name: &str, sensor: RunStatusSensor) -> SensorEntry {
@@ -2000,7 +2000,7 @@ mod tests {
 
         // a runner that has never heard of the job: the launch fails, and a key
         // recorded here would drop this work forever
-        let broken = Runner::new(Vec::<Job>::new(), store.clone());
+        let broken = Runner::new(Vec::<Job>::new(), store.clone()).unwrap();
         evaluate(&entry, &broken, &reg).await;
         let ticks = store.sensor_ticks(Some("watch"), 10).unwrap();
         assert_eq!(ticks[0].outcome, SensorOutcome::Error);

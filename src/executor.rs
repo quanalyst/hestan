@@ -412,7 +412,11 @@ impl Runner {
     ///
     /// no pools are declared, so an op that names one fails at run time —
     /// [`with_pools`](Runner::with_pools) is the constructor for that.
-    pub fn new(jobs: impl IntoIterator<Item = Job>, store: Store) -> Runner {
+    ///
+    /// two jobs under one name is [`Error::DuplicateJob`]: which of them you
+    /// would have got depends on the order they were handed over, and a
+    /// deployment running the other one is not something a warning fixes.
+    pub fn new(jobs: impl IntoIterator<Item = Job>, store: Store) -> Result<Runner, Error> {
         Runner::with_failure_hooks(jobs, store, Vec::new())
     }
 
@@ -426,19 +430,22 @@ impl Runner {
     ///
     /// no pools are declared, so an op that names one fails at run time; use
     /// [`Runner::with_pools`] (or `Hestan::pool`) when any op does.
+    ///
+    /// two jobs under one name is [`Error::DuplicateJob`], exactly as it is
+    /// for [`Runner::new`].
     pub fn with_failure_hooks(
         jobs: impl IntoIterator<Item = Job>,
         store: Store,
         hooks: Vec<FailureHook>,
-    ) -> Runner {
+    ) -> Result<Runner, Error> {
         let mut map = HashMap::new();
         for job in jobs {
             let name = job.name().to_string();
             if map.insert(name.clone(), job).is_some() {
-                tracing::warn!("duplicate job {name:?}: keeping the last one registered");
+                return Err(Error::DuplicateJob(name));
             }
         }
-        Runner {
+        Ok(Runner {
             jobs: Arc::new(map),
             store,
             active: Arc::new(Mutex::new(HashMap::new())),
@@ -460,7 +467,7 @@ impl Runner {
             dispatching: Arc::new(Mutex::new(())),
             settled: Arc::new(Notify::new()),
             actor: None,
-        }
+        })
     }
 
     /// the hooks every job's events reach, on top of any a
@@ -641,7 +648,7 @@ impl Runner {
             };
             declared.insert(name, pool);
         }
-        let runner = Runner::with_failure_hooks(jobs, store, hooks);
+        let runner = Runner::with_failure_hooks(jobs, store, hooks)?;
         // every op that names a pool must find it, or the limit it was written
         // to respect would silently not exist
         for job in runner.jobs.values() {
@@ -3001,12 +3008,51 @@ mod tests {
         panic!("run {id} never reached a terminal status");
     }
 
+    // which of the two you got used to depend on the order they were handed
+    // over, and an orchestration definition does not get to be ambiguous about
+    // what a name means
+    #[test]
+    fn two_jobs_under_one_name_are_refused_rather_than_ranked() {
+        let err = Runner::new(
+            [sleepy_job("etl", 1), sleepy_job("etl", 2)],
+            Store::open(":memory:").unwrap(),
+        )
+        .err()
+        .unwrap();
+        assert!(
+            matches!(err, Error::DuplicateJob(ref name) if name == "etl"),
+            "{err}"
+        );
+
+        // and every constructor above it answers the same way, because they
+        // are all the same registration
+        let err = Runner::with_pools(
+            [sleepy_job("etl", 1), sleepy_job("etl", 2)],
+            Store::open(":memory:").unwrap(),
+            Vec::new(),
+            [("api".to_string(), 2)],
+        )
+        .err()
+        .unwrap();
+        assert!(matches!(err, Error::DuplicateJob(_)), "{err}");
+
+        // two names, no argument
+        assert!(
+            Runner::new(
+                [sleepy_job("etl", 1), sleepy_job("report", 2)],
+                Store::open(":memory:").unwrap(),
+            )
+            .is_ok()
+        );
+    }
+
     #[tokio::test]
     async fn cancel_registry_registers_at_launch_and_drains() {
         let runner = Runner::new(
             [sleepy_job("slow", 30_000)],
             Store::open(":memory:").unwrap(),
-        );
+        )
+        .unwrap();
         let id = runner.launch("slow", json!({}), Trigger::Manual).unwrap();
         assert_eq!(runner.active.lock().unwrap().len(), 1);
         assert_eq!(runner.cancel(&id).unwrap(), CancelOutcome::Requested);
@@ -3019,7 +3065,8 @@ mod tests {
         let runner = Runner::new(
             [sleepy_job("slow", 30_000)],
             Store::open(":memory:").unwrap(),
-        );
+        )
+        .unwrap();
         let id = runner.launch("slow", json!({}), Trigger::Manual).unwrap();
         for _ in 0..300 {
             if runner.store().run(&id).unwrap().unwrap().status == RunStatus::Running {
@@ -3043,7 +3090,7 @@ mod tests {
             .op(Op::new("check", |_| async { Ok(json!(null)) }).params::<Gate>())
             .build()
             .unwrap();
-        let runner = Runner::new([job], Store::open(":memory:").unwrap());
+        let runner = Runner::new([job], Store::open(":memory:").unwrap()).unwrap();
         let err = runner
             .launch("gated", json!({"threshold": "high"}), Trigger::Manual)
             .unwrap_err();
@@ -3063,7 +3110,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("hestan.db");
         let path = path.to_str().unwrap();
-        let runner = Runner::new([sleepy_job("slow", 1)], Store::open(path).unwrap());
+        let runner = Runner::new([sleepy_job("slow", 1)], Store::open(path).unwrap()).unwrap();
         // sabotage the insert out from under the store
         let conn = rusqlite::Connection::open(path).unwrap();
         conn.execute_batch("DROP TABLE runs").unwrap();
@@ -3114,7 +3161,7 @@ mod tests {
 
     #[tokio::test]
     async fn subset_rejects_unsatisfied_deps() {
-        let runner = Runner::new([abc_job()], Store::open(":memory:").unwrap());
+        let runner = Runner::new([abc_job()], Store::open(":memory:").unwrap()).unwrap();
         let err = runner
             .launch_subset(
                 "abc",
@@ -3172,7 +3219,7 @@ mod tests {
 
     #[tokio::test]
     async fn subset_runs_only_its_ops_with_seeded_inputs() {
-        let runner = Runner::new([abc_job()], Store::open(":memory:").unwrap());
+        let runner = Runner::new([abc_job()], Store::open(":memory:").unwrap()).unwrap();
         let run = runner
             .run_subset(
                 "abc",
@@ -3246,6 +3293,7 @@ mod tests {
             [gated("etl", gate.clone(), started.clone())],
             Store::open(":memory:").unwrap(),
         )
+        .unwrap()
         .with_limits(Limits::new().global(1), 0);
 
         let first = runner.launch("etl", who("a"), Trigger::Manual).unwrap();
@@ -3288,6 +3336,7 @@ mod tests {
             ],
             Store::open(":memory:").unwrap(),
         )
+        .unwrap()
         .with_limits(Limits::new(), 0);
 
         runner.launch("etl", who("etl-1"), Trigger::Manual).unwrap();
@@ -3331,6 +3380,7 @@ mod tests {
             ],
             Store::open(":memory:").unwrap(),
         )
+        .unwrap()
         .with_limits(Limits::new().tag("env", "prod", 1), 0);
 
         let prod = || RunTags::from([("env".to_string(), "prod".to_string())]);
@@ -3372,6 +3422,7 @@ mod tests {
             [gated("etl", gate.clone(), started.clone())],
             Store::open(":memory:").unwrap(),
         )
+        .unwrap()
         .with_limits(Limits::new().global(1), 0);
 
         runner.launch("etl", who("first"), Trigger::Manual).unwrap();
@@ -3416,6 +3467,7 @@ mod tests {
             ],
             Store::open(":memory:").unwrap(),
         )
+        .unwrap()
         .with_limits(Limits::new().job("etl", 1), 0);
 
         runner.launch("etl", who("etl-1"), Trigger::Manual).unwrap();
@@ -3465,6 +3517,7 @@ mod tests {
             [gated("etl", gate.clone(), started.clone())],
             Store::open(":memory:").unwrap(),
         )
+        .unwrap()
         .with_limits(Limits::new().global(1), 0);
 
         runner.launch("etl", who("a"), Trigger::Manual).unwrap();
@@ -3503,6 +3556,7 @@ mod tests {
             [gated("etl", gate.clone(), started.clone())],
             Store::open(":memory:").unwrap(),
         )
+        .unwrap()
         .with_limits(Limits::new().global(1), 0);
 
         let running = runner.launch("etl", who("a"), Trigger::Manual).unwrap();
@@ -3687,7 +3741,7 @@ mod tests {
         let (_, store) = file_store(&dir);
         plant_queued(&store, "mine", "etl");
         plant_queued(&store, "theirs", "etl");
-        let runner = Runner::new([sleepy_job("etl", 30_000)], store.clone());
+        let runner = Runner::new([sleepy_job("etl", 30_000)], store.clone()).unwrap();
         let stale = Utc::now() - chrono::Duration::seconds(5);
         store
             .plant_claim("mine", runner.instance(), Some(stale))
@@ -3724,7 +3778,7 @@ mod tests {
             .unwrap();
         store.run_started("stalled", Utc::now()).unwrap();
         store.op_started("stalled", "work", 1).unwrap();
-        let runner = Runner::new([sleepy_job("etl", 30_000)], store.clone());
+        let runner = Runner::new([sleepy_job("etl", 30_000)], store.clone()).unwrap();
 
         runner.heartbeat();
 
@@ -3752,8 +3806,9 @@ mod tests {
             )
             .unwrap();
         store.run_started("stalled", Utc::now()).unwrap();
-        let runner =
-            Runner::new([sleepy_job("etl", 1)], store.clone()).with_reclaim(Reclaim::Requeue);
+        let runner = Runner::new([sleepy_job("etl", 1)], store.clone())
+            .unwrap()
+            .with_reclaim(Reclaim::Requeue);
 
         // heartbeat reclaims and then dispatches, so this process picks the run
         // straight back up — which is what requeue is for
@@ -3784,8 +3839,9 @@ mod tests {
     async fn a_scheduler_enqueues_and_a_worker_executes() {
         let dir = tempfile::tempdir().unwrap();
         let (_, store) = file_store(&dir);
-        let scheduler =
-            Runner::new([sleepy_job("etl", 1)], store.clone()).with_role(Role::Scheduler, 1);
+        let scheduler = Runner::new([sleepy_job("etl", 1)], store.clone())
+            .unwrap()
+            .with_role(Role::Scheduler, 1);
 
         let id = scheduler.launch("etl", json!({}), Trigger::Manual).unwrap();
         tokio::time::sleep(Duration::from_millis(80)).await;
@@ -3798,7 +3854,9 @@ mod tests {
         assert_eq!(queued.claimed_by, None);
         assert_eq!(scheduler.queue_depth().unwrap(), 1);
 
-        let worker = Runner::new([sleepy_job("etl", 1)], store.clone()).with_role(Role::Worker, 4);
+        let worker = Runner::new([sleepy_job("etl", 1)], store.clone())
+            .unwrap()
+            .with_role(Role::Worker, 4);
         worker.dispatch();
         assert_eq!(wait_terminal(&worker, &id).await, RunStatus::Success);
         assert_eq!(
@@ -3817,6 +3875,7 @@ mod tests {
             [gated("etl", gate.clone(), started.clone())],
             Store::open(":memory:").unwrap(),
         )
+        .unwrap()
         .with_role(Role::Worker, 2);
 
         for n in ["a", "b", "c", "d", "e"] {
@@ -3836,7 +3895,7 @@ mod tests {
     // not the launcher start it
     #[tokio::test]
     async fn a_subset_launch_records_the_plan_it_will_execute() {
-        let runner = Runner::new([abc_job()], Store::open(":memory:").unwrap());
+        let runner = Runner::new([abc_job()], Store::open(":memory:").unwrap()).unwrap();
         let run = runner
             .run_subset(
                 "abc",
@@ -3863,7 +3922,8 @@ mod tests {
 
     #[tokio::test]
     async fn cancel_registry_empty_after_normal_finish() {
-        let runner = Runner::new([sleepy_job("quick", 1)], Store::open(":memory:").unwrap());
+        let runner =
+            Runner::new([sleepy_job("quick", 1)], Store::open(":memory:").unwrap()).unwrap();
         let run = runner
             .run("quick", json!({}), Trigger::Manual)
             .await

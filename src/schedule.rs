@@ -596,7 +596,8 @@ mod tests {
     #[tokio::test]
     async fn skip_policy_holds_to_one_run_and_records_ticks() {
         let store = Store::open(":memory:").unwrap();
-        let runner = crate::Runner::new([nap_job("slow", 2500, Overlap::Skip)], store.clone());
+        let runner =
+            crate::Runner::new([nap_job("slow", 2500, Overlap::Skip)], store.clone()).unwrap();
         let entry = parse("slow", "* * * * * *", "UTC").unwrap();
         let sched = tokio::spawn(run_scheduler(vec![entry], runner));
         tokio::time::sleep(Duration::from_millis(2600)).await;
@@ -618,7 +619,8 @@ mod tests {
     #[tokio::test]
     async fn queue_policy_defers_then_catches_up() {
         let store = Store::open(":memory:").unwrap();
-        let runner = crate::Runner::new([nap_job("q", 1500, Overlap::Queue)], store.clone());
+        let runner =
+            crate::Runner::new([nap_job("q", 1500, Overlap::Queue)], store.clone()).unwrap();
         let entry = parse("q", "* * * * * *", "UTC").unwrap();
         let sched = tokio::spawn(run_scheduler(vec![entry], runner));
         tokio::time::sleep(Duration::from_millis(4500)).await;
@@ -665,7 +667,8 @@ mod tests {
     async fn same_instant_twin_schedules_fire_once_and_record_skip() {
         let store = Store::open(":memory:").unwrap();
         // Allow, so any skipped tick can only come from the same-pass dedupe
-        let runner = crate::Runner::new([nap_job("twin", 10, Overlap::Allow)], store.clone());
+        let runner =
+            crate::Runner::new([nap_job("twin", 10, Overlap::Allow)], store.clone()).unwrap();
         let e1 = parse("twin", "* * * * * *", "UTC").unwrap();
         let e2 = parse("twin", "*/1 * * * * *", "UTC").unwrap();
         let sched = tokio::spawn(run_scheduler(vec![e1, e2], runner));
@@ -695,7 +698,8 @@ mod tests {
     async fn a_fire_launches_with_the_schedules_params() {
         let store = Store::open(":memory:").unwrap();
         let seen = Arc::new(Mutex::new(Vec::new()));
-        let runner = crate::Runner::new([echo_params_job("p", seen.clone())], store.clone());
+        let runner =
+            crate::Runner::new([echo_params_job("p", seen.clone())], store.clone()).unwrap();
         let entry = parse("p", "* * * * * *", "UTC")
             .unwrap()
             .with_params(json!({"region": "eu"}));
@@ -714,7 +718,8 @@ mod tests {
     #[tokio::test]
     async fn a_deferred_fire_keeps_the_params_it_was_held_with() {
         let store = Store::open(":memory:").unwrap();
-        let runner = crate::Runner::new([nap_job("q", 1500, Overlap::Queue)], store.clone());
+        let runner =
+            crate::Runner::new([nap_job("q", 1500, Overlap::Queue)], store.clone()).unwrap();
         let entry = parse("q", "* * * * * *", "UTC")
             .unwrap()
             .with_params(json!({"batch": 7}));
@@ -780,7 +785,7 @@ mod tests {
     #[tokio::test]
     async fn downtime_with_skip_fires_nothing_and_advances_the_cursor() {
         let store = Store::open(":memory:").unwrap();
-        let runner = crate::Runner::new([nap_job("etl", 5, Overlap::Skip)], store.clone());
+        let runner = crate::Runner::new([nap_job("etl", 5, Overlap::Skip)], store.clone()).unwrap();
         let (_, now) = down_for(&store, 3, Catchup::Skip);
         let entry = hourly_entry("etl", Catchup::Skip);
 
@@ -811,7 +816,7 @@ mod tests {
     #[tokio::test]
     async fn downtime_with_one_fires_only_the_latest_missed() {
         let store = Store::open(":memory:").unwrap();
-        let runner = crate::Runner::new([nap_job("etl", 5, Overlap::Skip)], store.clone());
+        let runner = crate::Runner::new([nap_job("etl", 5, Overlap::Skip)], store.clone()).unwrap();
         let (_, now) = down_for(&store, 3, Catchup::One);
         let entry = hourly_entry("etl", Catchup::One);
 
@@ -832,7 +837,7 @@ mod tests {
     #[tokio::test]
     async fn downtime_with_all_fires_each_missed_occurrence_oldest_first() {
         let store = Store::open(":memory:").unwrap();
-        let runner = crate::Runner::new([nap_job("etl", 5, Overlap::Skip)], store.clone());
+        let runner = crate::Runner::new([nap_job("etl", 5, Overlap::Skip)], store.clone()).unwrap();
         let (_, now) = down_for(&store, 3, Catchup::All { limit: 10 });
         let entry = hourly_entry("etl", Catchup::All { limit: 10 });
         let at = |h: i64| now - chrono::Duration::minutes(30) - chrono::Duration::hours(h);
@@ -877,7 +882,7 @@ mod tests {
     #[tokio::test]
     async fn catchup_all_drops_the_oldest_past_the_cap_and_says_which() {
         let store = Store::open(":memory:").unwrap();
-        let runner = crate::Runner::new([nap_job("etl", 5, Overlap::Skip)], store.clone());
+        let runner = crate::Runner::new([nap_job("etl", 5, Overlap::Skip)], store.clone()).unwrap();
         let (_, now) = down_for(&store, 6, Catchup::All { limit: 2 });
         let entry = hourly_entry("etl", Catchup::All { limit: 2 });
         let at = |h: i64| now - chrono::Duration::minutes(30) - chrono::Duration::hours(h);
@@ -918,7 +923,7 @@ mod tests {
             }))
             .build()
             .unwrap();
-        let runner = crate::Runner::new([job], store.clone());
+        let runner = crate::Runner::new([job], store.clone()).unwrap();
         let (_, now) = down_for(&store, 1, Catchup::One);
         let entry = hourly_entry("etl", Catchup::One);
 
@@ -961,7 +966,8 @@ mod tests {
             .set_schedule_cursor("etl", HOURLY, now - chrono::Duration::hours(3))
             .unwrap();
         let entry = hourly_entry("etl", Catchup::One);
-        let runner = crate::Runner::new([nap_job("etl", 5, Overlap::Queue)], store.clone());
+        let runner =
+            crate::Runner::new([nap_job("etl", 5, Overlap::Queue)], store.clone()).unwrap();
         catch_up(&entry, &runner, stored(&store).get(&entry.key()), now);
         // process one's own run finishes before it dies: the boot sweep in
         // process two respects a live claim now, and a run left mid-flight in
@@ -992,7 +998,8 @@ mod tests {
         // the boot sweep a real restart runs, so the run process one left
         // mid-flight is not mistaken for one still going
         store.fail_interrupted().unwrap();
-        let runner = crate::Runner::new([nap_job("etl", 5, Overlap::Queue)], store.clone());
+        let runner =
+            crate::Runner::new([nap_job("etl", 5, Overlap::Queue)], store.clone()).unwrap();
         store
             .sync_schedules(&[Schedule::new("etl", HOURLY).catchup(Catchup::One)])
             .unwrap();
@@ -1026,7 +1033,7 @@ mod tests {
     #[tokio::test]
     async fn pausing_advances_the_cursor_without_firing() {
         let store = Store::open(":memory:").unwrap();
-        let runner = crate::Runner::new([nap_job("etl", 5, Overlap::Skip)], store.clone());
+        let runner = crate::Runner::new([nap_job("etl", 5, Overlap::Skip)], store.clone()).unwrap();
         let (_, now) = down_for(&store, 4, Catchup::All { limit: 10 });
         store
             .set_schedule_paused("etl", HOURLY, true, None)
@@ -1172,7 +1179,8 @@ mod tests {
     async fn an_unreadable_paused_flag_holds_every_schedule() {
         let store = Store::open(":memory:").unwrap();
         let seen = Arc::new(Mutex::new(Vec::new()));
-        let runner = crate::Runner::new([echo_params_job("etl", seen.clone())], store.clone());
+        let runner =
+            crate::Runner::new([echo_params_job("etl", seen.clone())], store.clone()).unwrap();
         let entry = parse("etl", "* * * * * *", "UTC").unwrap();
         // the paused flag lives in this table, so nothing can be read about it
         store.drop_table("schedules").unwrap();

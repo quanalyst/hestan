@@ -32,7 +32,7 @@ fn turn() -> std::sync::MutexGuard<'static, ()> {
 /// so a test has to install one to see anything at all.
 fn run_under_capture(store: &Store, job: Job) -> String {
     let _turn = turn();
-    let runner = Runner::new(vec![job], store.clone());
+    let runner = Runner::new(vec![job], store.clone()).unwrap();
     let subscriber = tracing_subscriber::registry().with(hestan::capture_layer(store));
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -97,7 +97,8 @@ fn the_hosts_own_logging_is_not_captured() {
             Ok(json!("done"))
         }))],
         store.clone(),
-    );
+    )
+    .unwrap();
     let _turn = turn();
     let subscriber = tracing_subscriber::registry().with(hestan::capture_layer(&store));
     let rt = tokio::runtime::Builder::new_current_thread()

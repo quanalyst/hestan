@@ -2157,7 +2157,7 @@ mod tests {
     }
 
     fn state(jobs: Vec<Job>) -> AppState {
-        let runner = Runner::new(jobs, Store::open(":memory:").unwrap());
+        let runner = Runner::new(jobs, Store::open(":memory:").unwrap()).unwrap();
         AppState {
             jobs: Arc::new(runner.jobs().clone()),
             runner,
@@ -3297,7 +3297,7 @@ mod tests {
         wait_success(&st, &id).await;
 
         // the same store, a process that no longer defines the job
-        let runner = Runner::new(Vec::<Job>::new(), st.runner.store().clone());
+        let runner = Runner::new(Vec::<Job>::new(), st.runner.store().clone()).unwrap();
         let gone = AppState {
             jobs: Arc::new(runner.jobs().clone()),
             runner,
@@ -3737,6 +3737,7 @@ mod tests {
             .build()
             .unwrap();
         let runner = Runner::new([slow], Store::open(":memory:").unwrap())
+            .unwrap()
             .with_limits(crate::executor::Limits::new().global(1), 0);
         let st = AppState {
             jobs: Arc::new(runner.jobs().clone()),
@@ -4479,7 +4480,8 @@ mod tests {
         let runner = Runner::new(
             [registry.lower_job().unwrap()],
             Store::open(":memory:").unwrap(),
-        );
+        )
+        .unwrap();
         AppState {
             jobs: Arc::new(runner.jobs().clone()),
             runner,
@@ -4673,7 +4675,8 @@ mod tests {
         let runner = Runner::new(
             [registry.lower_job().unwrap()],
             Store::open(":memory:").unwrap(),
-        );
+        )
+        .unwrap();
         let st = AppState {
             jobs: Arc::new(runner.jobs().clone()),
             runner,
@@ -4805,7 +4808,8 @@ mod tests {
         let runner = Runner::new(
             [registry.lower_job().unwrap()],
             Store::open(":memory:").unwrap(),
-        );
+        )
+        .unwrap();
         AppState {
             jobs: Arc::new(runner.jobs().clone()),
             runner,

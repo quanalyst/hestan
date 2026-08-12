@@ -85,7 +85,8 @@ async fn webhook_posts_run_failure_json() {
         [failing_job()],
         Store::open(":memory:").unwrap(),
         vec![Arc::new(notify::webhook(format!("{base}/hook")))],
-    );
+    )
+    .unwrap();
     let run = runner
         .run("brittle", json!({}), Trigger::Manual)
         .await
@@ -110,7 +111,8 @@ async fn slack_message_shape() {
         [failing_job()],
         Store::open(":memory:").unwrap(),
         vec![Arc::new(notify::slack(format!("{base}/hook")))],
-    );
+    )
+    .unwrap();
     let run = runner
         .run("brittle", json!({}), Trigger::Manual)
         .await
@@ -161,7 +163,8 @@ async fn webhook_does_not_follow_redirects() {
         [failing_job()],
         Store::open(":memory:").unwrap(),
         vec![Arc::new(notify::webhook(format!("{base}/hook")))],
-    );
+    )
+    .unwrap();
     let run = runner
         .run("brittle", json!({}), Trigger::Manual)
         .await

@@ -303,7 +303,7 @@ mod tests {
     #[test]
     fn a_job_is_fresh_late_or_never_against_its_last_success() {
         let store = Store::open(":memory:").unwrap();
-        let runner = Runner::new([hourly_job("etl")], store.clone());
+        let runner = Runner::new([hourly_job("etl")], store.clone()).unwrap();
         let reg = AssetRegistry::empty();
         let now = Utc::now();
 
@@ -334,7 +334,7 @@ mod tests {
         let reg = registry(vec![
             Asset::new("report", |_| async { Ok(json!(1)) }).fresh_within(HOUR),
         ]);
-        let runner = Runner::new([reg.lower_job().unwrap()], store.clone());
+        let runner = Runner::new([reg.lower_job().unwrap()], store.clone()).unwrap();
         let now = Utc::now();
 
         assert_eq!(
@@ -361,7 +361,7 @@ mod tests {
                 .partitioned(Partitions::keys(["a", "b", "c"]))
                 .fresh_within(HOUR),
         ]);
-        let runner = Runner::new([reg.lower_job().unwrap()], store.clone());
+        let runner = Runner::new([reg.lower_job().unwrap()], store.clone()).unwrap();
         let now = Utc::now();
 
         let fresh = now - chrono::Duration::minutes(5);
@@ -383,7 +383,7 @@ mod tests {
     #[test]
     fn the_hook_fires_once_per_transition_and_again_after_a_relapse() {
         let store = Store::open(":memory:").unwrap();
-        let runner = Runner::new([hourly_job("etl")], store.clone());
+        let runner = Runner::new([hourly_job("etl")], store.clone()).unwrap();
         let reg = AssetRegistry::empty();
         let now = Utc::now();
 
@@ -429,7 +429,7 @@ mod tests {
         let now = Utc::now();
 
         let store = Store::open(&path).unwrap();
-        let runner = Runner::new([hourly_job("etl")], store.clone());
+        let runner = Runner::new([hourly_job("etl")], store.clone()).unwrap();
         plant_success(&store, "etl", now - chrono::Duration::hours(2));
         assert_eq!(check_once(&runner, &AssetRegistry::empty(), now).len(), 1);
         let since = store.freshness_states().unwrap()[0].since;
@@ -438,7 +438,7 @@ mod tests {
         drop(store);
 
         let store = Store::open(&path).unwrap();
-        let runner = Runner::new([hourly_job("etl")], store.clone());
+        let runner = Runner::new([hourly_job("etl")], store.clone()).unwrap();
         assert!(
             check_once(
                 &runner,
@@ -454,7 +454,7 @@ mod tests {
     #[tokio::test]
     async fn the_checker_hands_each_crossing_to_the_hooks() {
         let store = Store::open(":memory:").unwrap();
-        let runner = Runner::new([hourly_job("etl")], store.clone());
+        let runner = Runner::new([hourly_job("etl")], store.clone()).unwrap();
         let seen: Arc<Mutex<Vec<LateEvent>>> = Arc::new(Mutex::new(Vec::new()));
         let sink = seen.clone();
         let hooks: Arc<Vec<LateHook>> = Arc::new(vec![Arc::new(move |e: LateEvent| {
@@ -490,7 +490,7 @@ mod tests {
             .op(Op::new("noop", |_| async { Ok(json!(null)) }))
             .build()
             .unwrap();
-        let runner = Runner::new([plain], store.clone());
+        let runner = Runner::new([plain], store.clone()).unwrap();
         let handle = tokio::spawn(run_checker(
             runner,
             Arc::new(AssetRegistry::empty()),
