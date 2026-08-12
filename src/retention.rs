@@ -3,6 +3,7 @@ use std::time::Duration;
 use chrono::{DateTime, Utc};
 
 use crate::executor::Runner;
+use crate::io::Io;
 
 /// how often a sweep comes round unless
 /// [`retention_interval`](crate::Hestan::retention_interval) says otherwise.
@@ -146,7 +147,22 @@ pub(crate) fn sweep(runner: &Runner, policy: &Retention, now: DateTime<Utc>) {
             .get(job)
             .and_then(|j| j.retention())
             .unwrap_or(*policy);
-        match store.prune_job_runs(job, &theirs, now) {
+        let doomed = match store.doomed_runs(job, &theirs, now) {
+            Ok(doomed) if doomed.is_empty() => continue,
+            Ok(doomed) => doomed,
+            Err(e) => {
+                tracing::warn!(job = %job, "retention: reading what to prune failed: {e}");
+                continue;
+            }
+        };
+        // what the runs wrote before the rows that say they wrote it, and the
+        // order is the whole of why this works. a run row is the only record
+        // that the run existed: delete it first and a crash in between leaves
+        // files nothing can ever name again. this way round a crash leaves
+        // rows pointing at outputs that are gone — for runs already past
+        // retention, which the next sweep deletes anyway.
+        drop_outputs(runner.io(), job, &doomed);
+        match store.delete_runs(job, &doomed, now) {
             Ok(n) => removed += n,
             Err(e) => tracing::warn!(job = %job, "retention sweep failed: {e}"),
         }
@@ -173,6 +189,23 @@ pub(crate) fn sweep(runner: &Runner, policy: &Retention, now: DateTime<Utc>) {
     }
 }
 
+/// hand every registered manager the runs about to be deleted.
+///
+/// a manager that cannot drop one is logged and the sweep carries on to the
+/// rows. a file left behind is one run's worth of waste that the directory's
+/// owner can still find and remove; a sweep that stopped at it would grow the
+/// database forever behind one unwritable directory, and go on doing it every
+/// hour without ever getting further.
+fn drop_outputs(io: &Io, job: &str, runs: &[String]) {
+    for manager in io.all() {
+        for run in runs {
+            if let Err(e) = manager.drop_run(run, job) {
+                tracing::warn!(run = %run, "retention: dropping what the run wrote failed: {e}");
+            }
+        }
+    }
+}
+
 /// the sweeper loop: its own task beside the scheduler, sweeping on `every`.
 ///
 /// the loop is the whole point of this being a phase. retention used to run
@@ -186,18 +219,29 @@ pub(crate) async fn run_sweeper(runner: Runner, policy: Retention, every: Durati
     ticker.tick().await;
     loop {
         ticker.tick().await;
-        sweep(&runner, &policy, Utc::now());
+        // off the runtime, for the reason every io manager call is: a sweep
+        // is store writes and now file deletes, and the ops of this process's
+        // runs should not be queued behind either
+        let (runner, policy) = (runner.clone(), policy);
+        if let Err(e) =
+            tokio::task::spawn_blocking(move || sweep(&runner, &policy, Utc::now())).await
+        {
+            tracing::warn!("retention: the sweep did not finish: {e}");
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Arc, Mutex};
+
     use super::*;
+    use crate::io::{IoDropped, IoKey, IoManager, IoResult};
     use crate::job::Job;
     use crate::model::{Role, Run, RunStatus, RunTags, Trigger};
     use crate::op::Op;
     use crate::store::Store;
-    use serde_json::json;
+    use serde_json::{Value, json};
 
     fn job(name: &str) -> Job {
         Job::builder(name)
@@ -289,6 +333,83 @@ mod tests {
             .with_role(Role::Scheduler, 4);
         sweep(&scheduler, &Retention::days(7), Utc::now());
         assert!(ids(&store).is_empty());
+    }
+
+    /// a manager that records which runs it was asked to drop, and whether the
+    /// run's row was still in the log when it was asked — which is the whole
+    /// of what "files before rows" means from a manager's side.
+    struct Records {
+        store: Store,
+        dropped: Mutex<Vec<(String, bool)>>,
+    }
+
+    impl IoManager for Records {
+        fn put(&self, _key: &IoKey, value: Value) -> IoResult {
+            Ok(value)
+        }
+        fn get(&self, _key: &IoKey, handle: &Value) -> IoResult {
+            Ok(handle.clone())
+        }
+        fn drop_run(&self, run_id: &str, _job: &str) -> IoDropped {
+            let still_a_run = self.store.run(run_id).unwrap().is_some();
+            self.dropped
+                .lock()
+                .unwrap()
+                .push((run_id.to_string(), still_a_run));
+            Ok(())
+        }
+    }
+
+    /// a manager that cannot drop anything: an unwritable directory, a bucket
+    /// this process has no credentials for, a disk that is gone.
+    struct Fails;
+
+    impl IoManager for Fails {
+        fn put(&self, _key: &IoKey, value: Value) -> IoResult {
+            Ok(value)
+        }
+        fn get(&self, _key: &IoKey, handle: &Value) -> IoResult {
+            Ok(handle.clone())
+        }
+        fn drop_run(&self, _run_id: &str, _job: &str) -> IoDropped {
+            Err("the bucket said no".into())
+        }
+    }
+
+    // what a run wrote goes before the rows that name it, because the rows are
+    // the only thing that knows the run existed. and a manager that cannot
+    // drop its half does not hold up the other: a file left behind is one
+    // run's waste, while a sweep that stopped would grow the database forever
+    #[test]
+    fn the_sweep_drops_what_a_run_wrote_first_and_prunes_it_anyway_if_that_fails() {
+        let store = Store::open(":memory:").unwrap();
+        plant(&store, "old", "chatty", 30);
+        plant(&store, "recent", "chatty", 1);
+        let records = Arc::new(Records {
+            store: store.clone(),
+            dropped: Mutex::new(Vec::new()),
+        });
+        let runner = Runner::with_io(
+            [job("chatty")],
+            store.clone(),
+            Vec::new(),
+            Vec::new(),
+            records.clone(),
+            [("archive".to_string(), Arc::new(Fails) as Arc<dyn IoManager>)],
+        )
+        .unwrap();
+
+        sweep(&runner, &Retention::days(7), Utc::now());
+
+        // the failing manager took nothing with it
+        assert_eq!(ids(&store), ["recent"]);
+        // asked about the run that went and nothing else, while that run was
+        // still a row — which is what makes the order provable rather than
+        // asserted about a comment
+        assert_eq!(
+            *records.dropped.lock().unwrap(),
+            [("old".to_string(), true)]
+        );
     }
 
     // the whole point of the loop: a run that appeared after boot is pruned by

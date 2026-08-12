@@ -710,6 +710,17 @@ macro_rules! args {
 #[cfg(feature = "postgres")]
 pub(crate) use args;
 
+/// `?1, ?2, ..` for `n` values, which is how a list of ids goes into an `IN`.
+///
+/// the ids are still bound rather than pasted in: everything else in this file
+/// binds its values, and a list is not the place to start making an exception.
+fn placeholders(n: usize) -> String {
+    (1..=n)
+        .map(|i| format!("?{i}"))
+        .collect::<Vec<String>>()
+        .join(", ")
+}
+
 impl<'a> From<&'a str> for Val<'a> {
     fn from(v: &'a str) -> Val<'a> {
         Val::Text(Cow::Borrowed(v))
@@ -2368,27 +2379,27 @@ impl Store {
         )
     }
 
-    /// delete what one job's [policy](Retention) says it may no longer keep,
-    /// with each run's op_runs, events and captured output.
+    /// which of one job's runs its [policy](Retention) says it may no longer
+    /// keep, newest first.
+    ///
+    /// read out before anything is deleted, because the rows are the only
+    /// record that these runs existed: the sweep drops what each of them wrote
+    /// through the [io managers](crate::IoManager) first and deletes them
+    /// second.
     ///
     /// non-terminal runs survive at any age. a queued run older than the cutoff
     /// is a queue problem and not a retention one, and a [reclaimed](Reclaim)
     /// run is back on the queue rather than terminal, so what its first claimer
-    /// captured is still there when the second one finishes it. `op_state` is
-    /// never touched — a watermark outlives every run that wrote it.
-    ///
-    /// one transaction per job rather than one for the sweep: a run and its
-    /// children still go together, and a database with fifty jobs in it does
-    /// not hold the write lock for the length of all fifty.
-    pub(crate) fn prune_job_runs(
+    /// captured is still there when the second one finishes it.
+    pub(crate) fn doomed_runs(
         &self,
         job: &str,
         policy: &Retention,
         now: DateTime<Utc>,
-    ) -> Result<usize, Error> {
+    ) -> Result<Vec<String>, Error> {
         let cutoffs = policy.cutoffs(now);
         if !cutoffs.any() {
-            return Ok(0);
+            return Ok(Vec::new());
         }
         // a null cutoff is no age policy at all: every comparison against it is
         // null, so nothing matches, which is the direction an absent setting
@@ -2403,29 +2414,68 @@ impl Store {
                    ORDER BY created_at DESC LIMIT ?4)";
         let success = cutoffs.success.map(|t| t.to_rfc3339());
         let failed = cutoffs.failed.map(|t| t.to_rfc3339());
-        let mut conn = self.conn();
-        let mut tx = conn.begin()?;
-        // children first: the transaction should make it moot, the order makes it true anyway
-        for table in ["op_runs", "events", "op_logs"] {
-            tx.execute(
-                &format!("DELETE FROM {table} WHERE run_id IN ({DOOMED})"),
-                args![
-                    job,
-                    success.as_deref(),
-                    failed.as_deref(),
-                    cutoffs.keep_last
-                ],
-            )?;
-        }
-        let removed = tx.execute(
-            &format!("DELETE FROM runs WHERE id IN ({DOOMED})"),
+        self.conn().query(
+            DOOMED,
             args![
                 job,
                 success.as_deref(),
                 failed.as_deref(),
                 cutoffs.keep_last
             ],
-        )?;
+            |r| r.text(0),
+        )
+    }
+
+    /// delete `runs` of `job`, with each one's op_runs, events and captured
+    /// output.
+    ///
+    /// by id rather than by policy, so the runs whose outputs the sweep just
+    /// dropped are exactly the runs it deletes: one that came due in between
+    /// keeps its rows and goes on the next pass, with its files, rather than
+    /// losing the second half of the pair. `op_state` is never touched — a
+    /// watermark outlives every run that wrote it.
+    ///
+    /// one transaction per job rather than one for the sweep: a run and its
+    /// children still go together, and a database with fifty jobs in it does
+    /// not hold the write lock for the length of all fifty.
+    pub(crate) fn delete_runs(
+        &self,
+        job: &str,
+        runs: &[String],
+        now: DateTime<Utc>,
+    ) -> Result<usize, Error> {
+        // both backends cap how many values one statement may bind, and the
+        // first sweep of a database with a year of history in it is not a
+        // small number of runs. one transaction still, so the job's history
+        // goes whole or not at all
+        const BATCH: usize = 500;
+        if runs.is_empty() {
+            return Ok(0);
+        }
+        let mut conn = self.conn();
+        let mut tx = conn.begin()?;
+        let mut removed = 0;
+        for batch in runs.chunks(BATCH) {
+            let list = placeholders(batch.len());
+            let mut binds: Vec<Val<'_>> = batch.iter().map(Val::from).collect();
+            // children first: the transaction should make it moot, the order makes it true anyway
+            for table in ["op_runs", "events", "op_logs"] {
+                tx.execute(
+                    &format!("DELETE FROM {table} WHERE run_id IN ({list})"),
+                    &binds,
+                )?;
+            }
+            // the job as well as the id, so a caller that mixed two jobs'
+            // runs cannot delete under the name of one of them
+            binds.push(Val::from(job));
+            removed += tx.execute(
+                &format!(
+                    "DELETE FROM runs WHERE id IN ({list}) AND job = ?{}",
+                    batch.len() + 1
+                ),
+                &binds,
+            )?;
+        }
         // in the same transaction as the deletes, and only when there were
         // some: a sweep that took nothing is not an event, and this one runs
         // every hour against every job that has ever had a run
@@ -2449,7 +2499,7 @@ impl Store {
     /// trim the events that belong to no run down to the newest `keep`.
     ///
     /// run events are deleted with their run by
-    /// [`prune_job_runs`](Self::prune_job_runs) and always were. everything
+    /// [`delete_runs`](Self::delete_runs) and always were. everything
     /// v17 added belongs to no run, so nothing collected it: an asset built
     /// every five minutes writes a row here forever. a count cap rather than
     /// the retention policy's age, for the same reason the two tick logs have
@@ -4820,9 +4870,7 @@ mod tests {
                     args!["r1", (Utc::now() - chrono::Duration::days(30)).to_rfc3339()],
                 )
                 .unwrap();
-            let removed = store
-                .prune_job_runs("etl", &Retention::days(7), Utc::now())
-                .unwrap();
+            let removed = prune(&store, &Retention::days(7));
             assert_eq!(removed, 1);
             let ev = newest(&store, EventKind::RetentionPruned);
             assert_eq!(ev.subject_kind, SubjectKind::Job);
@@ -5380,13 +5428,17 @@ mod tests {
 
     /// the whole-store sweep, for cases that are about one policy rather than
     /// about which job got which. `retention::sweep` is the same walk with the
-    /// per-job overrides resolved.
+    /// per-job overrides resolved and the io managers asked in between.
     fn prune(store: &Store, policy: &Retention) -> usize {
+        let now = Utc::now();
         store
             .run_jobs()
             .unwrap()
             .iter()
-            .map(|job| store.prune_job_runs(job, policy, Utc::now()).unwrap())
+            .map(|job| {
+                let doomed = store.doomed_runs(job, policy, now).unwrap();
+                store.delete_runs(job, &doomed, now).unwrap()
+            })
             .sum()
     }
 

@@ -5,9 +5,9 @@ use std::time::Duration;
 
 use hestan::prelude::*;
 use hestan::{
-    CancelOutcome, DeliveryState, Error, EventKind, FailureHook, FileIo, Graph, IoKey, IoManager,
-    IoResult, Meta, OpEvent, OpHook, OpStatus, Run, RunEvent, RunFailure, RunHook, RunStatus,
-    Runner, Store, Trigger, When,
+    CancelOutcome, DeliveryState, Error, EventKind, FailureHook, FileIo, Graph, IoDropped, IoKey,
+    IoManager, IoResult, Meta, OpEvent, OpHook, OpStatus, Retention, Run, RunEvent, RunFailure,
+    RunHook, RunStatus, Runner, Store, Trigger, When,
 };
 use serde::{Deserialize, Serialize};
 
@@ -2923,6 +2923,9 @@ impl IoManager for Refuses {
     fn get(&self, _key: &IoKey, handle: &Value) -> IoResult {
         Ok(handle.clone())
     }
+    fn drop_run(&self, _run_id: &str, _job: &str) -> IoDropped {
+        Ok(())
+    }
 }
 
 fn file_backed(dir: &std::path::Path, jobs: Vec<Job>) -> Runner {
@@ -3238,6 +3241,9 @@ impl IoManager for Blocks {
         stuck(&self.0.get_blocked, &self.0.get_open)?;
         Ok(handle.clone())
     }
+    fn drop_run(&self, _run_id: &str, _job: &str) -> IoDropped {
+        Ok(())
+    }
 }
 
 /// block this thread until `open`, saying on `blocked` that it is waiting. a
@@ -3312,4 +3318,60 @@ async fn a_manager_that_blocks_does_not_stop_the_rest_of_the_run() {
     // and the value still arrived downstream through the same manager
     let after = rows.iter().find(|o| o.op == "after").unwrap();
     assert_eq!(after.output, Some(json!({"rows": 3})));
+}
+
+// the same thing `ParquetIo` is held to in tests/parquet.rs: retention takes
+// what the run wrote with the rows that name it, and takes nothing belonging
+// to a run it kept
+#[tokio::test]
+async fn retention_takes_what_the_run_wrote_and_leaves_the_runs_it_keeps() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("hestan.db");
+    let db = db.to_str().unwrap();
+    let io_dir = dir.path().join("io");
+    let boot = || {
+        Hestan::new()
+            .io(FileIo::new(&io_dir))
+            .job(chain_job("etl"))
+            .db(db)
+    };
+
+    let first = boot().run_once("etl", json!({})).await.unwrap();
+    let second = boot().run_once("etl", json!({})).await.unwrap();
+    assert!(io_dir.join(&first.id).join("extract.json").exists());
+
+    // days(0) takes every terminal run already in the past and keep_last(1)
+    // holds the newest of them back, so the startup sweep takes exactly the
+    // first run — before this third one launches
+    let third = boot()
+        .retention(Retention::days(0).keep_last(1))
+        .run_once("etl", json!({}))
+        .await
+        .unwrap();
+    assert_eq!(third.status, RunStatus::Success);
+
+    let store = Store::open(db).unwrap();
+    assert!(store.run(&first.id).unwrap().is_none(), "the run survived");
+    assert!(
+        !io_dir.join(&first.id).exists(),
+        "what the run wrote outlived it"
+    );
+    assert!(
+        store.run(&second.id).unwrap().is_some(),
+        "the wrong run went"
+    );
+    assert!(io_dir.join(&second.id).join("extract.json").exists());
+
+    // and a run whose files somebody else already took is pruned like any
+    // other: a sweep has to be able to come round again
+    std::fs::remove_dir_all(io_dir.join(&second.id)).unwrap();
+    boot()
+        .retention(Retention::days(0))
+        .run_once("etl", json!({}))
+        .await
+        .unwrap();
+    assert!(
+        store.run(&second.id).unwrap().is_none(),
+        "the row stayed behind a directory that was already gone"
+    );
 }

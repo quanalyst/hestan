@@ -147,12 +147,14 @@ async fn a_handle_written_by_the_run_before_survives_a_resume() {
     assert!(!dir.path().join(&second.id).exists());
 }
 
-// what retention does about the files is: nothing. this is `FileIo`'s
-// behaviour and `ParquetIo` matches it deliberately rather than growing a
-// second answer — see `docs/io-managers.md`, which says so where somebody
-// choosing a directory will read it
+// retention takes the file with the run. the run row is the only record of
+// which files the run wrote, so a sweep that took the row and left the file
+// would be leaving something nothing could ever find again — and this is
+// `FileIo`'s behaviour too, asserted beside it in `tests/pipeline.rs`, because
+// a run collected under one manager and left under the other would be two
+// answers to one question
 #[tokio::test]
-async fn retention_takes_the_run_and_leaves_the_file_behind() {
+async fn retention_takes_the_file_with_the_run() {
     let dir = tempfile::tempdir().unwrap();
     let db = dir.path().join("hestan.db");
     let db = db.to_str().unwrap();
@@ -170,20 +172,35 @@ async fn retention_takes_the_run_and_leaves_the_file_behind() {
     };
 
     let first = boot().run_once("etl", json!({})).await.unwrap();
+    let second = boot().run_once("etl", json!({})).await.unwrap();
     let path = io_dir.join(&first.id).join("extract.parquet");
     assert!(path.exists(), "no file at {path:?}");
 
-    // days(0) prunes everything terminal that is already in the past, and the
-    // sweep runs at startup
-    let second = boot()
-        .retention(Retention::days(0))
+    // days(0) takes everything terminal that is already in the past and
+    // keep_last(1) holds the newest of them back, so this prunes exactly the
+    // first run. the sweep runs at startup, before the third run launches
+    let third = boot()
+        .retention(Retention::days(0).keep_last(1))
         .run_once("etl", json!({}))
         .await
         .unwrap();
-    assert_eq!(second.status, RunStatus::Success);
+    assert_eq!(third.status, RunStatus::Success);
     let store = Store::open(db).unwrap();
     assert!(store.run(&first.id).unwrap().is_none(), "the run survived");
-    assert!(path.exists(), "the file went with the run row");
+    assert!(!path.exists(), "the file outlived the run row");
+    assert!(
+        !io_dir.join(&first.id).exists(),
+        "the run's directory outlived it"
+    );
+
+    // the run the policy kept still has everything it wrote: a sweep that took
+    // a live run's file would be worse than the leak it is fixing
+    assert!(
+        store.run(&second.id).unwrap().is_some(),
+        "the wrong run went"
+    );
+    let kept = io_dir.join(&second.id).join("extract.parquet");
+    assert!(kept.exists(), "no file at {kept:?}");
 }
 
 /// the run again once it has reached a terminal status.

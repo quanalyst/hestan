@@ -152,7 +152,7 @@ pub use http::HttpSource;
 #[cfg(feature = "parquet")]
 #[cfg_attr(docsrs, doc(cfg(feature = "parquet")))]
 pub use io::ParquetIo;
-pub use io::{FileIo, Inline, IoKey, IoManager, IoResult};
+pub use io::{FileIo, Inline, IoDropped, IoKey, IoManager, IoResult};
 pub use job::{Graph, GraphBuilder, Job, JobBuilder};
 pub use model::EVENT_SCHEMA;
 pub use model::{

@@ -10,6 +10,10 @@ use crate::op::Meta;
 /// what an [`IoManager`] returns from `put` and takes back in `get`.
 pub type IoResult = Result<Value, Box<dyn std::error::Error + Send + Sync>>;
 
+/// what an [`IoManager`] returns from `drop_run`: nothing kept, or why what
+/// the run wrote is still there.
+pub type IoDropped = Result<(), Box<dyn std::error::Error + Send + Sync>>;
+
 /// which op's output is being persisted or read back.
 #[derive(Debug, Clone)]
 pub struct IoKey {
@@ -39,7 +43,11 @@ pub struct IoKey {
 /// and a job can mix managers op by op. anything it did not produce, it must
 /// return unchanged — which is exactly what [`Inline`] does with everything.
 ///
-/// both are synchronous, and hestan calls them on tokio's blocking pool
+/// `drop_run` is the other end of `put`: [retention](crate::Retention) calls
+/// it as it prunes a run, and it is the only thing that ever collects what a
+/// manager wrote.
+///
+/// all three are synchronous, and hestan calls them on tokio's blocking pool
 /// rather than on the task driving the run: a manager may take as long as the
 /// storage behind it takes, and the ops beside it keep running. write them as
 /// ordinary blocking code.
@@ -53,6 +61,28 @@ pub trait IoManager: Send + Sync + 'static {
     fn put(&self, key: &IoKey, value: Value) -> IoResult;
     /// resolve a handle back to the value.
     fn get(&self, key: &IoKey, handle: &Value) -> IoResult;
+    /// drop everything this manager stored for one run.
+    ///
+    /// [retention](crate::Retention) calls this as it prunes a run, and it
+    /// calls it **before** deleting the rows: those rows are the only record
+    /// that the run existed, so what is not dropped here is something nothing
+    /// will ever be able to name again.
+    ///
+    /// a key is `{run_id}/{op}`, so a whole run is one prefix — one directory
+    /// for both bundled file managers, and nothing at all for [`Inline`],
+    /// which stored nothing of its own. `job` is here for a manager whose
+    /// layout starts with it; both bundled ones ignore it, exactly as their
+    /// `put` ignores [`IoKey::job`].
+    ///
+    /// it must be **idempotent**: a run that wrote nothing, and one whose
+    /// outputs an earlier sweep already took, are both `Ok(())`. a sweep comes
+    /// round every hour, and the second pass over the same run must not be an
+    /// error forever.
+    ///
+    /// there is deliberately no default. a no-op one would compile for every
+    /// manager that already exists and quietly go on leaking every file each
+    /// of them has ever written, which is the bug this method is here to fix.
+    fn drop_run(&self, run_id: &str, job: &str) -> IoDropped;
 }
 
 /// the default: outputs are their own handles, so they land in the run log
@@ -66,6 +96,12 @@ impl IoManager for Inline {
 
     fn get(&self, _key: &IoKey, handle: &Value) -> IoResult {
         Ok(handle.clone())
+    }
+
+    // an inline output is the run log's own row, and retention is deleting
+    // that row itself
+    fn drop_run(&self, _run_id: &str, _job: &str) -> IoDropped {
+        Ok(())
     }
 }
 
@@ -81,7 +117,7 @@ impl IoManager for Inline {
 /// both managers call this rather than each carrying a copy, because two
 /// answers to one question is how the two of them drift.
 fn contained(dir: &Path, key: &IoKey, ext: &str) -> Result<PathBuf, String> {
-    let mut path = dir.join(relative("run id", &key.run_id)?);
+    let mut path = run_dir(dir, &key.run_id)?;
     let mut file = relative("op", &key.op)?.into_os_string();
     // pushed onto the name rather than set as an extension, so an op called
     // `orders.2024` keeps what is after its dot
@@ -89,6 +125,29 @@ fn contained(dir: &Path, key: &IoKey, ext: &str) -> Result<PathBuf, String> {
     file.push(ext);
     path.push(file);
     Ok(path)
+}
+
+/// the directory holding everything one run wrote under `dir`, or why that run
+/// id does not name one.
+///
+/// the same check a written file's path gets, against a name out of the same
+/// key — and this one matters more, because a sweep removes this path whole. a
+/// `rm -rf` of a directory nothing verified is a worse bug than the files it
+/// was collecting.
+fn run_dir(dir: &Path, run_id: &str) -> Result<PathBuf, String> {
+    Ok(dir.join(relative("run id", run_id)?))
+}
+
+/// remove what one run wrote under `dir`.
+///
+/// a directory that is not there is the answer rather than an error: the run
+/// wrote nothing, or a sweep already took it, and retention has to be able to
+/// come round again.
+fn dropped(dir: &Path, run_id: &str) -> IoDropped {
+    match fs::remove_dir_all(run_dir(dir, run_id)?) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e.into()),
+        _ => Ok(()),
+    }
 }
 
 /// `name` as a relative path of ordinary components, or why it is not one.
@@ -125,15 +184,17 @@ const FILE_TAG: &str = "file";
 /// is a directory and a file under the run's. a name that would land outside
 /// `dir` fails the op instead, which is the only thing refused here.
 ///
-/// nothing is ever cleaned up: [retention](crate::Retention) prunes run rows,
-/// not files. point it at a directory you are willing to sweep.
+/// [retention](crate::Retention) takes the files with the rows: pruning a run
+/// removes `{dir}/{run_id}` whole. a run no policy ever deletes keeps its
+/// files, so a deployment that configured no retention still grows here
+/// forever.
 pub struct FileIo {
     dir: PathBuf,
 }
 
 impl FileIo {
-    /// outputs under `dir`. the directory is created as runs need it, and
-    /// nothing here ever removes one.
+    /// outputs under `dir`. the directory is created as runs need it, and a
+    /// run's own goes when [retention](crate::Retention) prunes the run.
     pub fn new(dir: impl Into<PathBuf>) -> FileIo {
         FileIo { dir: dir.into() }
     }
@@ -160,6 +221,10 @@ impl IoManager for FileIo {
             return Ok(handle.clone());
         };
         Ok(serde_json::from_slice(&fs::read(path)?)?)
+    }
+
+    fn drop_run(&self, run_id: &str, _job: &str) -> IoDropped {
+        dropped(&self.dir, run_id)
     }
 }
 
@@ -252,9 +317,9 @@ const PARQUET_TAG: &str = "parquet";
 /// file and the op downstream reads that file. anything more is a table
 /// format, which is a different thing to be.
 ///
-/// and **nothing is ever cleaned up**: [retention](crate::Retention) prunes
-/// run rows, not files, so a pruned run leaves its parquet behind exactly as
-/// `FileIo` leaves its json. point it at a directory you are willing to sweep.
+/// [retention](crate::Retention) collects these exactly as it collects
+/// `FileIo`'s json — pruning a run removes `{dir}/{run_id}` whole — and, for
+/// exactly the same reason, a run no policy ever deletes keeps its files.
 ///
 /// reading and writing happen on the blocking pool rather than on the task
 /// driving the run, as every [`IoManager`] call does, so a file worth minutes
@@ -267,8 +332,8 @@ pub struct ParquetIo {
 
 #[cfg(feature = "parquet")]
 impl ParquetIo {
-    /// outputs under `dir`. the directory is created as runs need it, and
-    /// nothing here ever removes one.
+    /// outputs under `dir`. the directory is created as runs need it, and a
+    /// run's own goes when [retention](crate::Retention) prunes the run.
     pub fn new(dir: impl Into<PathBuf>) -> ParquetIo {
         ParquetIo { dir: dir.into() }
     }
@@ -305,6 +370,10 @@ impl IoManager for ParquetIo {
             return Ok(handle.clone());
         };
         Ok(parquet_impl::read(path.as_ref())?)
+    }
+
+    fn drop_run(&self, run_id: &str, _job: &str) -> IoDropped {
+        dropped(&self.dir, run_id)
     }
 }
 
@@ -449,6 +518,16 @@ impl Io {
             .unwrap_or(&self.default)
             .clone()
     }
+
+    /// every manager registered, the default included.
+    ///
+    /// which of them wrote a given run's outputs is a question about a job
+    /// this process may no longer define, so a retention sweep asks all of
+    /// them. dropping a run is idempotent, so one that stored nothing for it
+    /// does nothing, and one registered twice under two names is asked twice.
+    pub(crate) fn all(&self) -> impl Iterator<Item = &Arc<dyn IoManager>> {
+        std::iter::once(&self.default).chain(self.named.values())
+    }
 }
 
 /// persist an op's output, off the async runtime.
@@ -569,6 +648,61 @@ mod tests {
             .map(|e| e.unwrap().file_name())
             .collect();
         assert_eq!(beside, ["io"]);
+    }
+
+    #[test]
+    fn dropping_a_run_takes_its_directory_and_leaves_every_other_run_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let io = FileIo::new(dir.path());
+        for run in ["r1", "r2"] {
+            for op in ["extract", "sales/orders"] {
+                io.put(&key(run, op), json!({"op": op})).unwrap();
+            }
+        }
+
+        io.drop_run("r1", "j").unwrap();
+        assert!(!dir.path().join("r1").exists());
+        assert!(dir.path().join("r2").join("extract.json").exists());
+        assert!(
+            dir.path()
+                .join("r2")
+                .join("sales")
+                .join("orders.json")
+                .exists()
+        );
+
+        // twice is not an error, and neither is a run that wrote nothing: a
+        // sweep comes round again and must not fail every hour forever
+        io.drop_run("r1", "j").unwrap();
+        io.drop_run("never-ran", "j").unwrap();
+    }
+
+    // the sweep computes this directory from a run id and then removes it
+    // whole, so the answer has to be the one `put` gives for the same name
+    #[test]
+    fn dropping_a_run_refuses_a_run_id_that_names_a_directory_outside() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("io");
+        let beside = dir.path().join("beside");
+        fs::create_dir_all(&beside).unwrap();
+        fs::write(beside.join("keep"), b"not the io directory's").unwrap();
+
+        let checked = |name: &str, allowed: bool, dropped: IoDropped| match allowed {
+            true => dropped.unwrap_or_else(|e| panic!("{name:?}: {e}")),
+            false => {
+                let err = dropped.err().unwrap().to_string();
+                assert!(err.contains("does not name a file"), "{name:?}: {err}");
+            }
+        };
+        let file = FileIo::new(&root);
+        #[cfg(feature = "parquet")]
+        let parquet = ParquetIo::new(&root);
+        for (name, allowed) in names() {
+            checked(name, allowed, file.drop_run(name, "j"));
+            #[cfg(feature = "parquet")]
+            checked(name, allowed, parquet.drop_run(name, "j"));
+        }
+        assert!(beside.join("keep").exists(), "the sweep left the directory");
     }
 
     // a run mixes managers and seeds values that never went through one
@@ -704,6 +838,22 @@ mod tests {
                     "tags: List(Utf8)",
                 ]
             );
+        }
+
+        // the same answer `FileIo` gives, because a run collected under one
+        // manager and left behind under the other is two answers to one
+        // question
+        #[test]
+        fn dropping_a_run_takes_its_parquet_with_its_directory() {
+            let dir = tempfile::tempdir().unwrap();
+            let io = ParquetIo::new(dir.path());
+            io.put(&key("r1", "extract"), json!([{"a": 1}])).unwrap();
+            io.put(&key("r2", "extract"), json!([{"a": 2}])).unwrap();
+
+            io.drop_run("r1", "j").unwrap();
+            assert!(!dir.path().join("r1").exists());
+            assert!(dir.path().join("r2").join("extract.parquet").exists());
+            io.drop_run("r1", "j").unwrap();
         }
 
         // a run mixes managers and seeds values that never went through one

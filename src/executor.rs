@@ -742,6 +742,13 @@ impl Runner {
         &self.jobs
     }
 
+    /// the managers this runner persists op outputs through. retention reaches
+    /// for them as it prunes: a run's rows are the only record of what it
+    /// wrote.
+    pub(crate) fn io(&self) -> &Io {
+        &self.io
+    }
+
     /// the limit declared for `name`, for reporting it back.
     pub fn pool_limit(&self, name: &str) -> Option<usize> {
         self.pools.get(name).map(|p| p.limit)
