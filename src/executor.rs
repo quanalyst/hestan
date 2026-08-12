@@ -2713,6 +2713,37 @@ async fn run_op(
         // one more stop signal per attempt, flipped by this attempt's timeout;
         // the run's own cancel channel is the other half
         let (expired, on_expiry) = watch::channel(false);
+        // this attempt's own start, which on a retry is later than the one on
+        // the op run row: that column keeps the first attempt's. before the
+        // pool, so an attempt that queued for a slot reports how long it
+        // really took to get anywhere
+        let began = Utc::now();
+        // admitted before anything of the attempt runs, and handed to the ctx
+        // rather than kept on this stack: an abort takes the stack and leaves
+        // blocking work the body started, so a slot released with the stack is
+        // released while the thing it admitted is still calling the api the
+        // pool was declared to protect. see `op::Slot`
+        let slot: Option<op::Slot> = match &pool {
+            None => None,
+            Some((pool, sem)) => Some(Arc::new(match sem.clone().try_acquire_owned() {
+                Ok(permit) => permit,
+                Err(_) => {
+                    // otherwise a queued op is just an op sitting in `running`
+                    note(store.append_event(
+                        &run_id,
+                        Some(&name),
+                        EventLevel::Info,
+                        EventKind::Log,
+                        &format!("waiting for a {pool} pool permit"),
+                        None,
+                    ));
+                    sem.clone()
+                        .acquire_owned()
+                        .await
+                        .expect("pool semaphores are never closed")
+                }
+            })),
+        };
         let ctx = OpCtx {
             cancel: Cancel {
                 run: cancel.clone(),
@@ -2734,75 +2765,64 @@ async fn run_op(
             new_meta: new_meta.clone(),
             new_per_asset: Arc::new(Mutex::new(BTreeMap::new())),
             store: store.clone(),
+            slot: slot.clone(),
         };
-        // this attempt's own start, which on a retry is later than the one on
-        // the op run row: that column keeps the first attempt's
-        let began = Utc::now();
-        // the permit is scoped to this block, so a retry sleep never sits on
-        // the resource it backed off from — and an isolated op holds it for as
-        // long as its child runs, since the child is the work
-        let ended = {
-            let _permit = match &pool {
-                None => None,
-                Some((pool, sem)) => Some(match sem.clone().try_acquire_owned() {
-                    Ok(permit) => permit,
-                    Err(_) => {
-                        // otherwise a queued op is just an op sitting in `running`
-                        ctx.info(format!("waiting for a {pool} pool permit"));
-                        sem.clone()
-                            .acquire_owned()
-                            .await
-                            .expect("pool semaphores are never closed")
-                    }
-                }),
-            };
-            match &invocation {
-                // the body runs in a child, which owns the whole of what an
-                // attempt is: its own timeout, its own kill
-                Some(invocation) => {
-                    isolated(
-                        &op, &run_id, &name, attempt, invocation, &store, &cancel, &span,
-                    )
-                    .await
-                }
-                None => {
-                    // the call sits inside the async block, so a closure that panics
-                    // before returning its future is caught by the retry policy too.
-                    //
-                    // the span is entered across every await of the body, and
-                    // it is the whole of how a tracing event is attributed to
-                    // an op: `capture_layer` stores events whose span context
-                    // carries these three fields and ignores everything else,
-                    // which is how a library captures its ops' logging without
-                    // touching the host application's
-                    let call = AssertUnwindSafe(async { op.call(ctx).await })
-                        .catch_unwind()
-                        .instrument(span.clone());
-                    let caught = match op.timeout_after() {
-                        None => Ok(call.await),
-                        Some(limit) => match tokio::time::timeout(limit, call).await {
-                            Ok(caught) => Ok(caught),
-                            // dropping the future stops an async op here; a blocking
-                            // one only stops if it polls, so flip the flag it polls
-                            Err(_) => {
-                                let _ = expired.send(true);
-                                Err(limit)
-                            }
-                        },
-                    };
-                    match caught {
-                        Ok(Ok(Ok(output))) => Ended::Value(output),
-                        Ok(Ok(Err(e))) => Ended::Failed(e.to_string()),
-                        // as_ref, not &: &Box<dyn Any> would downcast against the box
-                        Ok(Err(panic)) => Ended::Failed(match panic_payload(panic.as_ref()) {
-                            Some(s) => format!("op panicked: {s}"),
-                            None => "op panicked".to_string(),
-                        }),
-                        Err(limit) => Ended::Failed(format!("timed out after {limit:?}")),
-                    }
+        let ended = match &invocation {
+            // the body runs in a child, which owns the whole of what an
+            // attempt is: its own timeout, its own kill
+            Some(invocation) => {
+                let ended = isolated(
+                    &op, &run_id, &name, attempt, invocation, &store, &cancel, &span,
+                )
+                .await;
+                // the child was the work and it has been watched to stop,
+                // so this ctx went nowhere: dropping it here is what keeps
+                // a retry backoff off the slot
+                drop(ctx);
+                ended
+            }
+            None => {
+                // the call sits inside the async block, so a closure that panics
+                // before returning its future is caught by the retry policy too.
+                //
+                // the span is entered across every await of the body, and
+                // it is the whole of how a tracing event is attributed to
+                // an op: `capture_layer` stores events whose span context
+                // carries these three fields and ignores everything else,
+                // which is how a library captures its ops' logging without
+                // touching the host application's
+                let call = AssertUnwindSafe(async { op.call(ctx).await })
+                    .catch_unwind()
+                    .instrument(span.clone());
+                let caught = match op.timeout_after() {
+                    None => Ok(call.await),
+                    Some(limit) => match tokio::time::timeout(limit, call).await {
+                        Ok(caught) => Ok(caught),
+                        // dropping the future stops an async op here; a blocking
+                        // one only stops if it polls, so flip the flag it polls
+                        Err(_) => {
+                            let _ = expired.send(true);
+                            Err(limit)
+                        }
+                    },
+                };
+                match caught {
+                    Ok(Ok(Ok(output))) => Ended::Value(output),
+                    Ok(Ok(Err(e))) => Ended::Failed(e.to_string()),
+                    // as_ref, not &: &Box<dyn Any> would downcast against the box
+                    Ok(Err(panic)) => Ended::Failed(match panic_payload(panic.as_ref()) {
+                        Some(s) => format!("op panicked: {s}"),
+                        None => "op panicked".to_string(),
+                    }),
+                    Err(limit) => Ended::Failed(format!("timed out after {limit:?}")),
                 }
             }
         };
+        // this attempt is over as far as this task is concerned, so let go of
+        // the slot: a retry never sits on the resource it backed off from. the
+        // slot is only free once the body's ctx has gone too, which is what
+        // holds it for blocking work that outlived the abort
+        drop(slot);
         // one event per attempt however it went, and before the retry policy
         // has had its say: three attempts of an op that worked on the third is
         // three facts, and a hook that wants the last one filters on `status`

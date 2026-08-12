@@ -7,7 +7,7 @@ use futures::future::BoxFuture;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
-use tokio::sync::watch;
+use tokio::sync::{OwnedSemaphorePermit, watch};
 
 use crate::backoff;
 use crate::model::{EventKind, EventLevel, OpStatus, When};
@@ -935,6 +935,16 @@ impl Op {
     /// with `Hestan::pool` and shared by every job in the process, so they
     /// cap what a job's own `max_parallel` cannot: concurrent use of one
     /// external resource. naming an undeclared pool fails the build.
+    ///
+    /// "ends" means the work stopped, not that hestan stopped waiting for it.
+    /// a canceled run abandons an op at its next await point, and blocking
+    /// work carries on — so the permit is held by the [`OpCtx`] the body was
+    /// handed rather than by the task, and goes back when the last holder of
+    /// that ctx lets go. blocking work already has to keep its ctx to see a
+    /// cancel at all ([`is_cancelled`](OpCtx::is_cancelled)), and keeping it
+    /// is what keeps the pool's count true; work that keeps nothing of
+    /// hestan's is work hestan cannot see the end of, and an op that never
+    /// stops holds its permit until the process does.
     pub fn pool(mut self, name: impl Into<String>) -> Op {
         self.pool = Some(name.into());
         self
@@ -1219,6 +1229,15 @@ pub(crate) struct Cancel {
     pub(crate) attempt: watch::Receiver<bool>,
 }
 
+/// the [pool](Op::pool) slot one attempt was admitted into.
+///
+/// it rides the [`OpCtx`] rather than the task's stack, and that is the whole
+/// of what makes it honest: a cancel aborts the task, the stack goes with it,
+/// and blocking work the body carried its ctx into is still running when it
+/// does. shared, so the slot goes back when the last holder of that ctx lets
+/// go — which is the last moment hestan can see the work at all.
+pub(crate) type Slot = Arc<OwnedSemaphorePermit>;
+
 // resolves the first time `rx` holds true; parks forever if it never can
 pub(crate) async fn flipped(mut rx: watch::Receiver<bool>) {
     loop {
@@ -1263,6 +1282,11 @@ pub struct OpCtx {
     /// produces several.
     pub(crate) new_per_asset: AssetBuf,
     pub(crate) store: Store,
+    /// the pool slot this attempt holds, if its op takes from one. carried here
+    /// so that work the body handed this ctx to keeps the slot for as long as
+    /// it runs — see [`Slot`]. nothing reads it: being here is the whole job.
+    #[allow(dead_code)]
+    pub(crate) slot: Option<Slot>,
 }
 
 impl OpCtx {
@@ -1632,6 +1656,7 @@ mod tests {
             new_meta: Arc::new(Mutex::new(BTreeMap::new())),
             new_per_asset: Arc::new(Mutex::new(BTreeMap::new())),
             store: Store::open(":memory:").unwrap(),
+            slot: None,
         }
     }
 

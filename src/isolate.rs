@@ -427,6 +427,9 @@ pub(crate) async fn run_one_op(
         new_meta: new_meta.clone(),
         new_per_asset: Arc::new(Mutex::new(BTreeMap::new())),
         store: store.clone(),
+        // the parent holds this op's pool slot for as long as this process
+        // lives, which is the whole of the child's work
+        slot: None,
     };
 
     // the same span the parent opens around an in-process attempt, and — with

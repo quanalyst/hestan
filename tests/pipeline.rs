@@ -1669,6 +1669,146 @@ async fn a_pool_caps_ops_across_two_overlapping_jobs() {
     );
 }
 
+// one op per job, so the two can only overlap through the pool they share
+fn one_slot_job(name: &str, op: Op) -> Job {
+    Job::builder(name).op(op.pool("solo")).build().unwrap()
+}
+
+fn takes_the_slot(started: &Arc<AtomicBool>) -> Job {
+    let started = started.clone();
+    one_slot_job(
+        "next",
+        Op::new("call", move |_: OpCtx| {
+            let started = started.clone();
+            async move {
+                started.store(true, Ordering::SeqCst);
+                Ok(json!(null))
+            }
+        }),
+    )
+}
+
+fn one_slot_runner(jobs: [Job; 2]) -> Runner {
+    Runner::with_pools(
+        jobs,
+        Store::open(":memory:").unwrap(),
+        vec![],
+        [("solo".to_string(), 1)],
+    )
+    .unwrap()
+}
+
+// a pool caps what is calling the api, not what is waiting to be told it has
+// stopped. a cancel aborts the op's task at its next await, and blocking work
+// the body started is still running when it does — so the slot has to outlive
+// the task. it does because blocking work holds the ctx it polls for the
+// cancel, and the slot rides that ctx.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_pool_slot_is_held_until_the_work_it_admitted_stops() {
+    let calling = Arc::new(AtomicBool::new(false));
+    let finish = Arc::new(AtomicBool::new(false));
+    let started = Arc::new(AtomicBool::new(false));
+    let (busy, until) = (calling.clone(), finish.clone());
+    let blocker = one_slot_job(
+        "long_call",
+        Op::new("call", move |ctx: OpCtx| {
+            let (busy, until) = (busy.clone(), until.clone());
+            async move {
+                tokio::task::spawn_blocking(move || {
+                    busy.store(true, Ordering::SeqCst);
+                    // one chunk of an api call, which polling cannot interrupt
+                    // half way through: the cancel is only seen after it. the
+                    // ceiling is so that a failing assertion below reports
+                    // rather than leaving a thread nobody can join
+                    for _ in 0..1_000 {
+                        if until.load(Ordering::SeqCst) {
+                            break;
+                        }
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    let stopping = ctx.is_cancelled();
+                    busy.store(false, Ordering::SeqCst);
+                    stopping
+                })
+                .await?;
+                Ok(json!(null))
+            }
+        }),
+    );
+
+    let runner = one_slot_runner([blocker, takes_the_slot(&started)]);
+    let id = runner
+        .launch("long_call", json!({}), Trigger::Manual)
+        .unwrap();
+    {
+        let calling = calling.clone();
+        wait_until(move || calling.load(Ordering::SeqCst)).await;
+    }
+    assert_eq!(runner.cancel(&id).unwrap(), CancelOutcome::Requested);
+
+    // the run is over and its task is gone; the call it made is not
+    let next = runner.launch("next", json!({}), Trigger::Manual).unwrap();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(
+        calling.load(Ordering::SeqCst),
+        "the blocking call ended before the test could prove anything"
+    );
+    assert!(
+        !started.load(Ordering::SeqCst),
+        "a second op entered a pool of one while the first was still calling"
+    );
+    let waited = runner.store().events(&next, 0).unwrap();
+    assert!(
+        waited
+            .iter()
+            .any(|e| e.message.contains("waiting for a solo")),
+        "the second op was not waiting on the pool at all"
+    );
+
+    // and it is a slot, not a leak: the call ends, and the next op gets in
+    finish.store(true, Ordering::SeqCst);
+    assert_eq!(settled(&runner, &next).await.status, RunStatus::Success);
+    assert!(started.load(Ordering::SeqCst));
+}
+
+// the other half of the same rule: an op that yields is aborted as promptly as
+// it ever was, and its slot goes back with it rather than waiting on anything.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_canceled_op_that_yields_gives_its_slot_back_at_once() {
+    let running = Arc::new(AtomicBool::new(false));
+    let started = Arc::new(AtomicBool::new(false));
+    let live = running.clone();
+    let blocker = one_slot_job(
+        "sleeper",
+        Op::new("call", move |_: OpCtx| {
+            let live = live.clone();
+            async move {
+                live.store(true, Ordering::SeqCst);
+                tokio::time::sleep(Duration::from_secs(60)).await;
+                Ok(json!(null))
+            }
+        }),
+    );
+
+    let runner = one_slot_runner([blocker, takes_the_slot(&started)]);
+    let id = runner
+        .launch("sleeper", json!({}), Trigger::Manual)
+        .unwrap();
+    {
+        let running = running.clone();
+        wait_until(move || running.load(Ordering::SeqCst)).await;
+    }
+    let asked = std::time::Instant::now();
+    assert_eq!(runner.cancel(&id).unwrap(), CancelOutcome::Requested);
+    let next = runner.launch("next", json!({}), Trigger::Manual).unwrap();
+    assert_eq!(settled(&runner, &next).await.status, RunStatus::Success);
+    assert!(
+        asked.elapsed() < Duration::from_secs(2),
+        "the slot took {:?} to come back",
+        asked.elapsed()
+    );
+}
+
 #[tokio::test]
 async fn an_undeclared_pool_is_refused() {
     let job = || {
