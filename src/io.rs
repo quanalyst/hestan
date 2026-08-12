@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
 use serde_json::{Value, json};
@@ -62,6 +62,49 @@ impl IoManager for Inline {
     }
 }
 
+/// where a manager that writes one file per op puts it —
+/// `{dir}/{run_id}/{op}.{ext}` — or why that key does not name a file under
+/// `dir` at all.
+///
+/// an asset's name is already a path: `sales/orders` is a directory and a
+/// file here, and the catalog groups on the same prefix. so what is refused is
+/// a name that leaves `dir`, not a name with a separator in it — every part of
+/// both halves of the key has to be an ordinary path component.
+///
+/// both managers call this rather than each carrying a copy, because two
+/// answers to one question is how the two of them drift.
+fn contained(dir: &Path, key: &IoKey, ext: &str) -> Result<PathBuf, String> {
+    let mut path = dir.join(relative("run id", &key.run_id)?);
+    let mut file = relative("op", &key.op)?.into_os_string();
+    // pushed onto the name rather than set as an extension, so an op called
+    // `orders.2024` keeps what is after its dot
+    file.push(".");
+    file.push(ext);
+    path.push(file);
+    Ok(path)
+}
+
+/// `name` as a relative path of ordinary components, or why it is not one.
+fn relative(what: &str, name: &str) -> Result<PathBuf, String> {
+    let refused = || format!("{what} {name:?} does not name a file under the io directory");
+    let mut out = PathBuf::new();
+    for part in Path::new(name).components() {
+        match part {
+            // an instance's `[` and `]` are fine on every filesystem hestan
+            // runs on, and so is the `/` an asset name carries
+            Component::Normal(part) => out.push(part),
+            // `./x` is `x`; every other kind either climbs out of the
+            // directory or starts somewhere else entirely
+            Component::CurDir => {}
+            _ => return Err(refused()),
+        }
+    }
+    match out.as_os_str().is_empty() {
+        true => Err(refused()),
+        false => Ok(out),
+    }
+}
+
 /// the tag on a [`FileIo`] handle. a handle is an object rather than a bare
 /// path so anything reading `op_runs.output` can tell a reference from a
 /// value at a glance — including the ui.
@@ -70,6 +113,10 @@ const FILE_TAG: &str = "file";
 /// outputs written to one json file per op under `dir`, as
 /// `{dir}/{run_id}/{op}.json`, with `{"$io": "file", "path": ".."}` recorded
 /// in the run log.
+///
+/// an op named for an asset takes the asset's name with it, so `sales/orders`
+/// is a directory and a file under the run's. a name that would land outside
+/// `dir` fails the op instead, which is the only thing refused here.
 ///
 /// nothing is ever cleaned up: [retention](crate::Retention) prunes run rows,
 /// not files. point it at a directory you are willing to sweep.
@@ -84,16 +131,14 @@ impl FileIo {
         FileIo { dir: dir.into() }
     }
 
-    fn path(&self, key: &IoKey) -> PathBuf {
-        // an instance's `[` and `]` are fine on every filesystem hestan runs
-        // on, and keeping the op's own name is worth more than sanitizing
-        self.dir.join(&key.run_id).join(format!("{}.json", key.op))
+    fn path(&self, key: &IoKey) -> Result<PathBuf, String> {
+        contained(&self.dir, key, "json")
     }
 }
 
 impl IoManager for FileIo {
     fn put(&self, key: &IoKey, value: Value) -> IoResult {
-        let path = self.path(key);
+        let path = self.path(key)?;
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
@@ -182,6 +227,10 @@ const PARQUET_TAG: &str = "parquet";
 /// error rather than a silent fallback to json: an op stored somewhere it did
 /// not ask for is a value nobody finds again.
 ///
+/// names land where [`FileIo`]'s do, and are refused on the same terms: an
+/// asset called `sales/orders` is a directory and a file under the run's, and
+/// a name that would leave `dir` fails the op.
+///
 /// two things do not survive the round trip and neither can:
 ///
 /// - a column mixing whole numbers and fractions is one `float64` column, so
@@ -217,10 +266,8 @@ impl ParquetIo {
         ParquetIo { dir: dir.into() }
     }
 
-    fn path(&self, key: &IoKey) -> PathBuf {
-        self.dir
-            .join(&key.run_id)
-            .join(format!("{}.parquet", key.op))
+    fn path(&self, key: &IoKey) -> Result<PathBuf, String> {
+        contained(&self.dir, key, "parquet")
     }
 }
 
@@ -230,8 +277,8 @@ impl IoManager for ParquetIo {
         if value.is_null() {
             return Ok(value);
         }
+        let path = self.path(key)?;
         let rows = parquet_impl::rows(&value)?;
-        let path = self.path(key);
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
@@ -405,6 +452,25 @@ mod tests {
         }
     }
 
+    /// every name the managers have to agree about, and whether a file may be
+    /// written for it. the property is that the file lands under the directory
+    /// the manager was given — not that the name is a boring one, since an
+    /// asset's name is a path and the catalog reads it as one.
+    fn names() -> [(&'static str, bool); 10] {
+        [
+            ("extract", true),
+            ("sales/orders", true),
+            ("fetch[0]", true),
+            ("./deep/nested", true),
+            ("orders.2024", true),
+            ("../escape", false),
+            ("sales/../../escape", false),
+            ("/etc/hestan", false),
+            ("..", false),
+            ("", false),
+        ]
+    }
+
     #[test]
     fn inline_is_the_identity_both_ways() {
         let io = Inline;
@@ -428,6 +494,36 @@ mod tests {
         assert_eq!(handle["path"], path.to_string_lossy().as_ref());
         assert!(path.exists(), "no file at {path:?}");
         assert_eq!(io.get(&k, &handle).unwrap(), v);
+    }
+
+    #[test]
+    fn file_io_writes_under_its_own_directory_whatever_the_key_says() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("io");
+        let io = FileIo::new(&root);
+        for (name, allowed) in names() {
+            // both halves of the key, because a run id is a path component too
+            for k in [key(name, "extract"), key("r1", name)] {
+                let v = json!({ "name": name });
+                if !allowed {
+                    let err = io.put(&k, v).err().unwrap().to_string();
+                    assert!(err.contains("does not name a file"), "{k:?}: {err}");
+                    continue;
+                }
+                let handle = io
+                    .put(&k, v.clone())
+                    .unwrap_or_else(|e| panic!("{k:?}: {e}"));
+                let path = PathBuf::from(handle["path"].as_str().unwrap());
+                assert!(path.starts_with(&root), "{k:?} wrote {path:?}");
+                assert_eq!(io.get(&k, &handle).unwrap(), v);
+            }
+        }
+        // and the directory it was given is the only thing that grew
+        let beside: Vec<_> = fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(beside, ["io"]);
     }
 
     // a run mixes managers and seeds values that never went through one
@@ -632,6 +728,36 @@ mod tests {
             fs::write(&blocked, b"not a directory").unwrap();
             let io = ParquetIo::new(dir.path());
             assert!(io.put(&key("blocked", "a"), json!([{"a": 1}])).is_err());
+        }
+
+        // the same table the json manager is held to, because a key that is a
+        // file here and an error there is two answers to one question
+        #[test]
+        fn parquet_writes_under_its_own_directory_whatever_the_key_says() {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path().join("io");
+            let io = ParquetIo::new(&root);
+            for (name, allowed) in names() {
+                for k in [key(name, "extract"), key("r1", name)] {
+                    let v = json!([{ "name": name }]);
+                    if !allowed {
+                        let err = io.put(&k, v).err().unwrap().to_string();
+                        assert!(err.contains("does not name a file"), "{k:?}: {err}");
+                        continue;
+                    }
+                    let handle = io
+                        .put(&k, v.clone())
+                        .unwrap_or_else(|e| panic!("{k:?}: {e}"));
+                    let path = PathBuf::from(handle["path"].as_str().unwrap());
+                    assert!(path.starts_with(&root), "{k:?} wrote {path:?}");
+                    assert_eq!(io.get(&k, &handle).unwrap(), v);
+                }
+            }
+            let beside: Vec<_> = fs::read_dir(dir.path())
+                .unwrap()
+                .map(|e| e.unwrap().file_name())
+                .collect();
+            assert_eq!(beside, ["io"]);
         }
     }
 }
