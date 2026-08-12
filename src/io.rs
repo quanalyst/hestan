@@ -39,8 +39,15 @@ pub struct IoKey {
 /// and a job can mix managers op by op. anything it did not produce, it must
 /// return unchanged — which is exactly what [`Inline`] does with everything.
 ///
-/// both are synchronous and run on the run's own task, so a manager that
-/// talks to something slow should say so in its docs.
+/// both are synchronous, and hestan calls them on tokio's blocking pool
+/// rather than on the task driving the run: a manager may take as long as the
+/// storage behind it takes, and the ops beside it keep running. write them as
+/// ordinary blocking code.
+///
+/// the one place that is still not true is the synchronous half of the api —
+/// [`Runner::resume_plan`](crate::Runner::resume_plan) resolves an earlier
+/// run's outputs on the thread that called it, exactly as it does its store
+/// reads.
 pub trait IoManager: Send + Sync + 'static {
     /// persist a value, returning the handle stored in `op_runs.output`.
     fn put(&self, key: &IoKey, value: Value) -> IoResult;
@@ -249,9 +256,9 @@ const PARQUET_TAG: &str = "parquet";
 /// run rows, not files, so a pruned run leaves its parquet behind exactly as
 /// `FileIo` leaves its json. point it at a directory you are willing to sweep.
 ///
-/// reading and writing happen on the run's own task, since that is what the
-/// [`IoManager`] contract is. a file worth minutes of io is worth doing in the
-/// op instead.
+/// reading and writing happen on the blocking pool rather than on the task
+/// driving the run, as every [`IoManager`] call does, so a file worth minutes
+/// of io costs the op that wrote it and not the ops beside it.
 #[cfg(feature = "parquet")]
 #[cfg_attr(docsrs, doc(cfg(feature = "parquet")))]
 pub struct ParquetIo {
@@ -433,10 +440,48 @@ impl Io {
     /// the manager for an op that selected `name`, or the default. an
     /// unknown name cannot get here — the build refuses it — but falling back
     /// beats panicking in a run loop.
-    pub(crate) fn manager(&self, name: Option<&str>) -> &dyn IoManager {
+    ///
+    /// handed back owned rather than borrowed, because the call to it outlives
+    /// this borrow: it goes to the blocking pool, and what runs there has to
+    /// own everything it touches.
+    pub(crate) fn manager(&self, name: Option<&str>) -> Arc<dyn IoManager> {
         name.and_then(|n| self.named.get(n))
             .unwrap_or(&self.default)
-            .as_ref()
+            .clone()
+    }
+}
+
+/// persist an op's output, off the async runtime.
+///
+/// `put` is `std::fs::write` in both bundled managers and an upload to
+/// somewhere in most of the ones you would write. the run's own task is the
+/// one thread that must not be waiting on that — every op of the run is
+/// dispatched from it, and on a single-threaded runtime it is every op of
+/// every other run too — so the call goes to the blocking pool and the task
+/// awaits its result.
+pub(crate) async fn put(io: &Io, name: Option<&str>, key: IoKey, value: Value) -> IoResult {
+    let manager = io.manager(name);
+    offload(move || manager.put(&key, value)).await
+}
+
+/// resolve a handle back to the value, off the async runtime for the reason
+/// [`put`] is.
+pub(crate) async fn get(io: &Io, name: Option<&str>, key: IoKey, handle: Value) -> IoResult {
+    let manager = io.manager(name);
+    offload(move || manager.get(&key, &handle)).await
+}
+
+/// one manager call on the blocking pool.
+///
+/// a manager that panics fails the op it was called for rather than taking the
+/// run's task down with it: the panic happens on a pool thread now, and the
+/// only thing above it is this. the same arm covers a runtime shutting down
+/// under a call in flight, which is the other way a blocking task ends without
+/// answering.
+async fn offload(call: impl FnOnce() -> IoResult + Send + 'static) -> IoResult {
+    match tokio::task::spawn_blocking(call).await {
+        Ok(result) => result,
+        Err(e) => Err(format!("the io manager did not finish: {e}").into()),
     }
 }
 

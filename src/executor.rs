@@ -1522,6 +1522,11 @@ type InstanceRows = BTreeMap<usize, (String, OpStatus, Option<Value>)>;
 /// differ on a re-run, so anything less has to expand again from scratch. a
 /// mapped op with no rows at all — never reached, or expanded over an empty
 /// array — is absent here, which resume planning reads the same way.
+///
+/// the one manager call hestan makes on its caller's own thread, because
+/// [`resume_plan`](Runner::resume_plan) is synchronous and reads its store the
+/// same way. it is not a run's task: nothing is executing while a resume is
+/// being planned.
 fn fold_instances(
     io: &Io,
     job: &Job,
@@ -1794,17 +1799,17 @@ async fn execute_in_span(
                 // same zero-instance fan-out an empty array gives, output `[]`.
                 // the array itself is an op output like any other, so it is
                 // fetched back through its manager before it can be counted.
-                let elements = match outputs.get(&over) {
+                let elements = match outputs.get(&over).cloned() {
                     None => Ok(Some(Vec::new())),
-                    Some(held) => {
-                        resolve(&runner.io, &job, &run_id, &over, held).map(|v| match v {
+                    Some(held) => resolve(&runner.io, &job, &run_id, &over, held)
+                        .await
+                        .map(|v| match v {
                             Value::Array(a) => Some(a),
                             other => {
                                 expanded_over = Some(json_type(&other));
                                 None
                             }
-                        })
-                    }
+                        }),
                 };
                 let elements = match elements {
                     Ok(Some(elements)) => Some(elements),
@@ -1945,13 +1950,13 @@ async fn execute_in_span(
             let mut dep_json: serde_json::Map<String, Value> = serde_json::Map::new();
             for dep in op.deps() {
                 let seen = op.dep_alias(dep).to_string();
-                if let Some(handle) = outputs.get(dep) {
+                if let Some(handle) = outputs.get(dep).cloned() {
                     if op.is_isolated() {
-                        held.insert(dep.clone(), handle.clone());
+                        held.insert(dep.clone(), handle);
                     } else {
                         // `outputs` carries handles, so this is where a dep's
                         // output is actually fetched back
-                        match resolve(&runner.io, &job, &run_id, dep, handle) {
+                        match resolve(&runner.io, &job, &run_id, dep, handle).await {
                             Ok(v) => {
                                 inputs.entry(seen.clone()).or_insert(v);
                             }
@@ -2060,7 +2065,7 @@ async fn execute_in_span(
                         // is a lie the next run would trip over
                         let unit = unit_op(&job, &instances, &name);
                         let key = io_key(&run_id, &job, &name);
-                        match runner.io.manager(unit.io_name()).put(&key, output) {
+                        match crate::io::put(&runner.io, unit.io_name(), key, output).await {
                             Ok(handle) => {
                                 // what the manager knows about what it stored,
                                 // beside what the op staged
@@ -2122,17 +2127,20 @@ async fn execute_in_span(
                     }
                 };
                 match persisted {
-                    Ok(handle) => collect(
-                        name,
-                        handle,
-                        &runner.io,
-                        &job,
-                        &run_id,
-                        &instances,
-                        &mut fanouts,
-                        &mut outputs,
-                        &mut statuses,
-                    ),
+                    Ok(handle) => {
+                        collect(
+                            name,
+                            handle,
+                            &runner.io,
+                            &job,
+                            &run_id,
+                            &instances,
+                            &mut fanouts,
+                            &mut outputs,
+                            &mut statuses,
+                        )
+                        .await
+                    }
                     Err(msg) => {
                         if first_failure.is_none() {
                             first_failure = Some((name.clone(), msg));
@@ -2226,7 +2234,7 @@ async fn execute_in_span(
                             // failed if it cannot be
                             let unit = unit_op(&job, &instances, &name);
                             let key = io_key(&run_id, &job, &name);
-                            match runner.io.manager(unit.io_name()).put(&key, output) {
+                            match crate::io::put(&runner.io, unit.io_name(), key, output).await {
                                 Ok(handle) => {
                                     let meta = crate::io::handle_meta(&handle, meta);
                                     note(store.op_finished(
@@ -2443,7 +2451,7 @@ fn admits(op: &Op, statuses: &HashMap<String, OpStatus>) -> Result<(), &'static 
 // an instance's output goes into its parent's slot; the mapped op's own
 // output appears, in element order, once every instance has landed
 #[allow(clippy::too_many_arguments)]
-fn collect(
+async fn collect(
     name: String,
     handle: Value,
     io: &Io,
@@ -2468,22 +2476,23 @@ fn collect(
         // the collected array is a value, not a handle: a mapped op has no
         // row and never put anything of its own, so the instances' handles
         // are resolved here rather than left for downstream to puzzle over
-        let manager = io.manager(job.op(&instance.parent).and_then(Op::io_name));
+        let named = job.op(&instance.parent).and_then(Op::io_name);
         let mut collected: Vec<Value> = Vec::with_capacity(fan.slots.len());
         for (index, slot) in std::mem::take(&mut fan.slots).into_iter().enumerate() {
             let handle = slot.expect("every instance filled its slot");
+            let op = fan.names[index].clone();
             let key = IoKey {
                 run_id: run_id.to_string(),
                 job: job.name().to_string(),
-                op: fan.names[index].clone(),
+                op: op.clone(),
             };
-            match manager.get(&key, &handle) {
+            match crate::io::get(io, named, key, handle).await {
                 Ok(v) => collected.push(v),
                 Err(e) => {
                     // the whole fan-out is unusable, and saying so beats
                     // handing downstream an array with a hole in it
                     tracing::warn!(
-                        run = %run_id, op = %key.op, "instance output unreadable: {e}"
+                        run = %run_id, op = %op, "instance output unreadable: {e}"
                     );
                     fan.failed = true;
                     return;
@@ -2507,10 +2516,10 @@ fn io_key(run_id: &str, job: &Job, op: &str) -> IoKey {
 /// receives comes through here, whether it was produced by this run, seeded
 /// from a resume, or memoized by an asset build — which is why a manager's
 /// `get` has to pass through anything it did not write.
-fn resolve(io: &Io, job: &Job, run_id: &str, op: &str, held: &Value) -> Result<Value, String> {
-    let manager = io.manager(job.op(op).and_then(Op::io_name));
-    manager
-        .get(&io_key(run_id, job, op), held)
+async fn resolve(io: &Io, job: &Job, run_id: &str, op: &str, held: Value) -> Result<Value, String> {
+    let name = job.op(op).and_then(Op::io_name);
+    crate::io::get(io, name, io_key(run_id, job, op), held)
+        .await
         .map_err(|e| e.to_string())
 }
 

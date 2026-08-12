@@ -3212,3 +3212,104 @@ async fn fan_out_under_file_io_collects_values_not_handles() {
         r#"{"sum":6}"#
     );
 }
+
+/// two gates the manager blocks on, each announcing that it is stuck before
+/// it waits — so the op that opens one can be sure it did not open it early.
+#[derive(Default)]
+struct Gates {
+    put_blocked: AtomicBool,
+    put_open: AtomicBool,
+    get_blocked: AtomicBool,
+    get_open: AtomicBool,
+}
+
+/// a manager whose calls block until another op of the same run has run.
+/// nothing here is a timing assertion: the only way out of a `put` is another
+/// op making progress, which it cannot do if this call is on the task driving
+/// the run.
+struct Blocks(Arc<Gates>);
+
+impl IoManager for Blocks {
+    fn put(&self, _key: &IoKey, value: Value) -> IoResult {
+        stuck(&self.0.put_blocked, &self.0.put_open)?;
+        Ok(value)
+    }
+    fn get(&self, _key: &IoKey, handle: &Value) -> IoResult {
+        stuck(&self.0.get_blocked, &self.0.get_open)?;
+        Ok(handle.clone())
+    }
+}
+
+/// block this thread until `open`, saying on `blocked` that it is waiting. a
+/// bounded wait, so a run that cannot get past this fails the test with a
+/// sentence rather than hanging the suite.
+fn stuck(blocked: &AtomicBool, open: &AtomicBool) -> Result<(), String> {
+    blocked.store(true, Ordering::SeqCst);
+    for _ in 0..1000 {
+        if open.load(Ordering::SeqCst) {
+            return Ok(());
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    Err("nothing else in the run ran while the manager was blocked".into())
+}
+
+// a manager doing something slow must not stop the rest of the run. the ops
+// here are the proof rather than a stopwatch: `slow` cannot be persisted until
+// `opens_the_put` has run, and `after`'s input cannot be fetched until
+// `opens_the_get` has, so a manager called on the run's own task deadlocks
+// until the wait above gives up
+#[tokio::test]
+async fn a_manager_that_blocks_does_not_stop_the_rest_of_the_run() {
+    let gates = Arc::new(Gates::default());
+    // an op that waits for the manager to be stuck on one gate, then opens it
+    let opener =
+        |name: &'static str, gates: &Arc<Gates>, pick: fn(&Gates) -> (&AtomicBool, &AtomicBool)| {
+            let gates = gates.clone();
+            Op::new(name, move |_| {
+                let gates = gates.clone();
+                async move {
+                    let (blocked, open) = pick(&gates);
+                    wait_until(|| blocked.load(Ordering::SeqCst)).await;
+                    open.store(true, Ordering::SeqCst);
+                    Ok(json!(null))
+                }
+            })
+        };
+
+    let job = Job::builder("etl")
+        .op(Op::new("slow", |_| async { Ok(json!({"rows": 3})) }))
+        .op(opener("opens_the_put", &gates, |g| {
+            (&g.put_blocked, &g.put_open)
+        }))
+        .op(opener("opens_the_get", &gates, |g| {
+            (&g.get_blocked, &g.get_open)
+        }))
+        .op(Op::new("after", |ctx: OpCtx| async move {
+            Ok(ctx.input("slow").cloned().unwrap())
+        })
+        .after(["slow"]))
+        .build()
+        .unwrap();
+
+    let runner = Runner::with_io(
+        vec![job],
+        Store::open(":memory:").unwrap(),
+        Vec::new(),
+        Vec::new(),
+        Arc::new(Blocks(gates.clone())),
+        Vec::new(),
+    )
+    .unwrap();
+    let run = runner.run("etl", json!({}), Trigger::Manual).await.unwrap();
+
+    let rows = runner.store().op_runs(&run.id).unwrap();
+    let why: Vec<String> = rows.iter().filter_map(|o| o.error.clone()).collect();
+    assert_eq!(run.status, RunStatus::Success, "{why:?}");
+    // both calls really did block, so neither passed by being quick
+    assert!(gates.put_blocked.load(Ordering::SeqCst));
+    assert!(gates.get_blocked.load(Ordering::SeqCst));
+    // and the value still arrived downstream through the same manager
+    let after = rows.iter().find(|o| o.op == "after").unwrap();
+    assert_eq!(after.output, Some(json!({"rows": 3})));
+}

@@ -388,7 +388,7 @@ pub(crate) async fn run_one_op(
         )));
     }
 
-    let (inputs, dep_statuses) = handed_over(op, job, io, store, &req.run_id)?;
+    let (inputs, dep_statuses) = handed_over(op, job, io, store, &req.run_id).await?;
     let state = Arc::new(store.op_state(job.name(), &req.op)?);
     let new_state = Arc::new(Mutex::new(None));
     let new_meta = Arc::new(Mutex::new(BTreeMap::new()));
@@ -472,16 +472,19 @@ pub(crate) async fn run_one_op(
     // persisted before the success is recorded, in the order the run's own task
     // uses: a row claiming an output that was never stored is a lie the next
     // run trips over
-    let produced = produced.and_then(|output| {
-        let key = IoKey {
-            run_id: req.run_id.clone(),
-            job: run.job.clone(),
-            op: req.op.clone(),
-        };
-        io.manager(op.io_name())
-            .put(&key, output)
-            .map_err(|e| format!("could not persist the output: {e}"))
-    });
+    let produced = match produced {
+        Err(e) => Err(e),
+        Ok(output) => {
+            let key = IoKey {
+                run_id: req.run_id.clone(),
+                job: run.job.clone(),
+                op: req.op.clone(),
+            };
+            crate::io::put(io, op.io_name(), key, output)
+                .await
+                .map_err(|e| format!("could not persist the output: {e}"))
+        }
+    };
     match produced {
         Ok(handle) => {
             // what the manager knows about what it stored, beside what the op
@@ -579,7 +582,7 @@ fn apply_limits(op: &Op) -> Result<(), String> {
 /// dep statuses an [`OpCtx`] carries. `executor::invocation` writes it.
 type HandedOver = (HashMap<String, Value>, HashMap<String, OpStatus>);
 
-fn handed_over(
+async fn handed_over(
     op: &Op,
     job: &Job,
     io: &Io,
@@ -597,12 +600,12 @@ fn handed_over(
         // the name this body calls the dep, which differs from the job-level
         // one only inside a flattened graph instance
         let seen = op.dep_alias(dep).to_string();
-        if let Some(handle) = held.and_then(|h| h.get(dep)) {
+        if let Some(handle) = held.and_then(|h| h.get(dep)).cloned() {
             // resolved here rather than by the parent: an op reading a gigabyte
             // should read it in the process that wants it
-            let value = io
-                .manager(job.op(dep).and_then(Op::io_name))
-                .get(&io_key(run_id, job, dep), handle)
+            let name = job.op(dep).and_then(Op::io_name);
+            let value = crate::io::get(io, name, io_key(run_id, job, dep), handle)
+                .await
                 .map_err(|e| Error::Graph(format!("could not read the output of {dep}: {e}")))?;
             inputs.insert(seen.clone(), value);
         }
