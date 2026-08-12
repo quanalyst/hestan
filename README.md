@@ -363,6 +363,7 @@ the details live in [docs/](docs/README.md):
 [choosing](docs/choosing.md) (which of these do you want),
 [concepts](docs/concepts.md) (execution semantics),
 [typed io](docs/typed-io.md), [resources](docs/resources.md),
+[connecting to your data](docs/connecting.md),
 [io managers](docs/io-managers.md), [op state](docs/state.md),
 [isolation](docs/isolation.md),
 [metadata](docs/metadata.md), [events](docs/events.md), [logs](docs/logs.md),

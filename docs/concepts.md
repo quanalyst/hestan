@@ -248,7 +248,9 @@ that fails aborts startup with `Error::Resource { name, reason }` rather than
 leaving a half-live server. `Op::requires` turns a name nobody registered into
 a build error instead of a run that gets halfway. resources live for the
 process — no per-run scoping, no teardown hooks. the model has
-[its own page](resources.md).
+[its own page](resources.md), and [connecting to your data](connecting.md) is
+the worked version of it: a pool built once, the credential out of the
+environment, and the reason there is no client of anybody's wrapped in here.
 
 ## Concurrency pools
 

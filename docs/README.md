@@ -10,6 +10,7 @@
 - [events](events.md) — the one log every subsystem writes to: the kinds, what each payload carries, where each event is written and which of them cannot be atomic, and the schema's stability.
 - [logs](logs.md) — what an op *printed*: subprocess capture, the `capture` feature's tracing layer, why an in-process `println!` is not captured, the caps, and the endpoints.
 - [isolation](isolation.md) — `Op::isolated()`: an op in its own process, what a dead child is recorded as, cancellation and timeouts that are kills, memory and cpu limits, and the honest cost.
+- [connecting to your data](connecting.md) — the seam between an op and the system it reads: a client in an op, a pool as a resource, secrets from the environment, retries and timeouts, and why hestan wraps nobody's sdk.
 - [io managers](io-managers.md) — where op outputs live: the `IoManager` trait, `Inline`, `FileIo`, per-op managers, and where handles are resolved.
 - [assets](assets.md) — fingerprints, provable staleness, memoized builds, serialized builds, probes, and `.auto()`.
 - [freshness](freshness.md) — declared policies: `fresh_within`, fresh/late/never, `on_late` alerts, and how a policy relates to `overdue` and to staleness.

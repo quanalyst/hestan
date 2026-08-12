@@ -329,6 +329,60 @@ impl Hestan {
     /// declaring it with [`Op::requires`](crate::Op::requires) turns a
     /// missing name into a build error. declaring the same name twice is
     /// [`Error::Resource`].
+    ///
+    /// # A database, worked through
+    ///
+    /// hestan wraps no database client. the client is
+    /// [`tokio_postgres`](https://docs.rs/tokio-postgres)'s, the query is
+    /// yours, and what hestan owns is when it runs and what is recorded about
+    /// it. `docs/connecting.md` is the long version, and holds this example
+    /// to what compiles here.
+    ///
+    /// ```
+    /// use hestan::prelude::*;
+    /// use tokio_postgres::{Client, NoTls};
+    ///
+    /// #[tokio::main]
+    /// async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// #   let Ok(test_url) = std::env::var("HESTAN_TEST_PG") else { return Ok(()) };
+    /// #   let (setup, driver) = tokio_postgres::connect(&test_url, NoTls).await?;
+    /// #   tokio::spawn(driver);
+    /// #   setup.batch_execute("create table if not exists orders (id int)").await?;
+    ///     let nightly = Job::builder("nightly")
+    ///         .op(Op::new("count_orders", |ctx: OpCtx| async move {
+    ///             let db = ctx.resource::<Client>("warehouse")?;
+    ///             let row = db.query_one("select count(*) from orders", &[]).await?;
+    ///             let rows: i64 = row.get(0);
+    ///             ctx.meta("rows", Meta::count(rows as u64));
+    ///             Ok(json!({ "rows": rows }))
+    ///         })
+    ///         .requires(["warehouse"])
+    ///         .retries(3))
+    ///         .build()?;
+    ///
+    ///     let run = Hestan::new()
+    ///         // connected once, shared by every op, and never a param: params
+    ///         // are stored on the run and served over the api
+    ///         .resource("warehouse", |_| async {
+    /// #           let url = std::env::var("HESTAN_TEST_PG")?;
+    /// #           /*
+    ///             let url = std::env::var("WAREHOUSE_URL")?;
+    /// #           */
+    ///             let (client, driver) = tokio_postgres::connect(&url, NoTls).await?;
+    ///             // the driver owns the socket and has to be polled by
+    ///             // somebody; the client is the handle the ops share
+    ///             tokio::spawn(driver);
+    ///             Ok(client)
+    ///         })
+    ///         .job(nightly)
+    ///         .db(":memory:")
+    ///         .run_once("nightly", json!({}))
+    ///         .await?;
+    ///
+    ///     assert_eq!(run.status, RunStatus::Success);
+    ///     Ok(())
+    /// }
+    /// ```
     pub fn resource<T, F, Fut>(mut self, name: impl Into<String>, f: F) -> Self
     where
         T: Any + Send + Sync,
@@ -1199,6 +1253,50 @@ mod tests {
     #[allow(dead_code)]
     struct Window {
         days: u32,
+    }
+
+    /// the worked postgres example on [`Hestan::resource`], as a reader of the
+    /// rendered docs sees it: the fenced block around the one query in it,
+    /// with the doctest's hidden lines dropped.
+    fn worked_example() -> String {
+        let src = include_str!("app.rs");
+        // the query is in the example and nowhere else, so the fence it sits
+        // between is the example's
+        let query = src
+            .find("select count(*) from orders")
+            .expect("the example");
+        let fence = "    /// ```\n";
+        let start = src[..query].rfind(fence).expect("an opening fence") + fence.len();
+        let end = query + src[query..].find(fence).expect("a closing fence");
+        src[start..end]
+            .lines()
+            .map(|line| {
+                line.trim_start_matches("    ///")
+                    .strip_prefix(' ')
+                    .unwrap_or("")
+            })
+            .filter(|line| !line.trim_start().starts_with("# "))
+            .collect::<Vec<&str>>()
+            .join("\n")
+    }
+
+    // the page shows the example and the doctest runs it, so they have to be
+    // the same text. a docs page carrying code nothing compiles is the one
+    // that tells you to call a method that was renamed two releases ago —
+    // which no test here would otherwise catch, since markdown compiles fine
+    #[test]
+    fn the_connecting_page_shows_exactly_the_example_the_doctest_runs() {
+        let example = worked_example();
+        assert!(
+            example.contains("tokio_postgres::connect") && example.lines().count() > 20,
+            "the example was not scraped: {example}"
+        );
+        // and nothing hidden leaked into what the page is held to
+        assert!(!example.contains("HESTAN_TEST_PG"), "{example}");
+        assert!(
+            include_str!("../docs/connecting.md").contains(&example),
+            "docs/connecting.md no longer holds this example:\n{example}"
+        );
     }
 
     fn windowed(name: &str) -> Job {

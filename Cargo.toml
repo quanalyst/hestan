@@ -67,6 +67,11 @@ libc = "0.2"
 
 [dev-dependencies]
 tempfile = "3"
+# the worked example in `Hestan::resource` connects to a real postgres, and it
+# is a doctest rather than a snippet — so the client it calls has to be here
+# whether or not the `postgres` feature is on. hestan does not wrap it: that is
+# the point the example is making
+tokio-postgres = "0.7"
 tower = { version = "0.5", features = ["util"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
