@@ -4091,4 +4091,25 @@ mod tests {
             CancelOutcome::AlreadyFinished
         );
     }
+
+    // a lock under a run is the ordinary case, and the run should not be able
+    // to tell: every write it makes goes back for it, and what comes out the
+    // other end is the run that happened
+    #[tokio::test]
+    async fn a_store_that_stumbles_twice_costs_the_run_nothing() {
+        let store = Store::open(":memory:").unwrap();
+        let runner = Runner::new([abc_job()], store.clone()).unwrap();
+        store.fail_writes(2);
+
+        let run = runner.run("abc", json!({}), Trigger::Manual).await.unwrap();
+
+        assert_eq!(run.status, RunStatus::Success);
+        let ops = store.op_runs(&run.id).unwrap();
+        assert_eq!(ops.len(), 3);
+        assert!(ops.iter().all(|o| o.status == OpStatus::Success), "{ops:?}");
+        // nothing was lost on the way there, which is the difference between
+        // a write that was tried again and a write that was let go
+        assert_eq!(store.health().unrecorded_writes(), 0);
+        assert_eq!(store.health().dropped_writes(), 0);
+    }
 }

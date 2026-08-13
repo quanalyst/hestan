@@ -1137,6 +1137,107 @@ pub(crate) fn note(write: BestEffort) {
     }
 }
 
+/// how many times a critical write is attempted before hestan stops believing
+/// the store is about to take it.
+///
+/// four rather than more: what is being waited out here is a lock or a
+/// stumble, and past a second of them the run is better off stopping than
+/// holding a claim it may not be able to close. sqlite has already spent its
+/// [`BUSY_TIMEOUT`] inside each of these attempts before returning at all.
+const WRITE_ATTEMPTS: u32 = 4;
+
+/// the first gap between attempts, doubled per attempt up to [`WRITE_MAX`]
+/// with full jitter — the same pacing an op's retries and the notification
+/// loop's use, and for the same reason: a hundred ops that lost the same lock
+/// must not come back for it on the same millisecond.
+const WRITE_BASE: Duration = Duration::from_millis(50);
+const WRITE_MAX: Duration = Duration::from_secs(1);
+
+/// whether a failed write is worth another attempt.
+///
+/// **every error this says yes to is one the backend raised on a live
+/// connection, having already undone the transaction.** that is what makes a
+/// retry safe rather than lucky: `op_finished` appends materializations and
+/// events beside the row it updates, and repeating that after a *partial*
+/// apply would record a build twice. there is no partial apply to repeat —
+/// sqlite's commit is atomic and rusqlite rolls back a transaction it could
+/// not commit, and postgres aborts the transaction it reports a serialization
+/// failure or a deadlock for.
+///
+/// the one failure that leaves the outcome genuinely unknown is a connection
+/// that died: a commit may have been executed and its acknowledgement lost.
+/// **that is the case hestan does not retry.** it would also be futile — a
+/// [postgres store](crate::pg) is one connection with no pool behind it and
+/// no reconnect, so nothing this process writes will land again — but futility
+/// is not the reason. the reason is that a retry there is the one that can
+/// double-apply.
+///
+/// where the backend leaves room to be unsure, the answer is yes, because the
+/// cost of a needless retry is fifty milliseconds and the cost of not trying
+/// is a run nobody can close.
+fn transient(e: &Error) -> bool {
+    match e {
+        Error::Sqlite(e) => sqlite_transient(e),
+        #[cfg(feature = "postgres")]
+        Error::Postgres(e) => postgres_transient(e),
+        // a column that does not parse, a database from a later build, a
+        // target this build cannot open: none of them is about this moment,
+        // and none of them is reachable from a write in any case
+        Error::Column(..) | Error::SchemaTooNew(_) | Error::UnsupportedDb(_) => false,
+        // which leaves the filesystem, where a call that failed once may
+        // perfectly well work now
+        _ => true,
+    }
+}
+
+/// sqlite's side of [`transient`]: everything but the codes that mean the same
+/// statement will say the same thing.
+fn sqlite_transient(e: &rusqlite::Error) -> bool {
+    use rusqlite::ErrorCode;
+    match e {
+        rusqlite::Error::SqliteFailure(e, _) => !matches!(
+            e.code,
+            ErrorCode::ConstraintViolation
+                | ErrorCode::TypeMismatch
+                | ErrorCode::ApiMisuse
+                | ErrorCode::NotADatabase
+                | ErrorCode::DatabaseCorrupt
+                | ErrorCode::DiskFull
+                | ErrorCode::ReadOnly
+                | ErrorCode::PermissionDenied
+                | ErrorCode::TooBig
+                | ErrorCode::ParameterOutOfRange
+        ),
+        // a parameter hestan bound wrongly or a column it read wrongly: this
+        // crate's own bug, and it will still be one in fifty milliseconds
+        _ => false,
+    }
+}
+
+/// postgres's side of [`transient`]: a sqlstate the server answered with,
+/// minus the classes that are about the statement rather than the moment.
+///
+/// no sqlstate at all means the server did not answer — the connection, the
+/// protocol, a value this client could not encode — and that is the case
+/// [`transient`] refuses on principle.
+#[cfg(feature = "postgres")]
+fn postgres_transient(e: &tokio_postgres::Error) -> bool {
+    if e.is_closed() {
+        return false;
+    }
+    match e.code() {
+        None => false,
+        Some(state) => {
+            // 08 connection, 22 data, 23 integrity, 42 syntax and access, and
+            // a disk that is full whatever class it is filed under
+            !matches!(
+                state.code().get(..2),
+                Some("08") | Some("22") | Some("23") | Some("42")
+            ) && state != &tokio_postgres::error::SqlState::DISK_FULL
+        }
+    }
+}
+
 /// what this process has seen one store do.
 ///
 /// counters rather than a verdict: a store either takes a write or it does
@@ -1287,17 +1388,33 @@ impl Store {
     /// that knows which one this is; `write` is the call itself rather than
     /// its result, because a failure here is worth another attempt.
     ///
+    /// a [transient](transient) failure is tried again, up to
+    /// [`WRITE_ATTEMPTS`] times, on the same pacing an op's retries use. every
+    /// write reachable from here is safe to repeat — see the note on
+    /// [`transient`] for why that is a property of which errors are retried
+    /// rather than a hope about which writes are idempotent.
+    ///
     /// every caller has to say what it does when a write did not land, and the
     /// answer is never "carry on as if it had" — `docs/concepts.md` is what
     /// hestan promises about writes, and what it stops promising here.
     pub(crate) async fn landed(&self, what: &str, write: impl Fn() -> Result<(), Error>) -> bool {
-        match write() {
-            Ok(()) => true,
-            Err(e) => {
+        let mut attempt = 0;
+        loop {
+            let e = match write() {
+                Ok(()) => return true,
+                Err(e) => e,
+            };
+            if attempt + 1 == WRITE_ATTEMPTS || !transient(&e) {
                 tracing::error!("{what} could not be written: {e}");
                 self.health.unrecorded();
-                false
+                return false;
             }
+            tracing::warn!("{what} did not land, trying again: {e}");
+            tokio::time::sleep(crate::backoff::jittered_exponential(
+                WRITE_BASE, attempt, WRITE_MAX,
+            ))
+            .await;
+            attempt += 1;
         }
     }
 
@@ -8990,6 +9107,178 @@ mod tests {
             compiled(dir, "kept", &as_declared("op_finished", false))
                 .status
                 .success()
+        );
+    }
+
+    /// a write that fails `n` times, then does what `then` does, counting the
+    /// attempts it took.
+    fn flaky(
+        n: u64,
+        tries: &AtomicU64,
+        then: impl Fn() -> Result<(), Error>,
+    ) -> impl Fn() -> Result<(), Error> {
+        move || match tries.fetch_add(1, Ordering::SeqCst) < n {
+            true => Err(Error::Sqlite(rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error::new(5),
+                Some("database is locked".to_string()),
+            ))),
+            false => then(),
+        }
+    }
+
+    // a lock is the ordinary way a write fails and it is over in milliseconds,
+    // so the write goes back for it rather than the run stopping over one
+    #[tokio::test]
+    async fn a_write_that_was_locked_out_twice_lands_on_the_third_try() {
+        let store = Store::open(":memory:").unwrap();
+        store
+            .create_run(&mk_run("r1", "etl", Utc::now()), &["a".to_string()])
+            .unwrap();
+        let tries = AtomicU64::new(0);
+        let landed = store
+            .landed(
+                "op_finished",
+                flaky(2, &tries, || {
+                    store.op_finished("r1", "a", OpStatus::Success, None, None, None, &[])
+                }),
+            )
+            .await;
+
+        assert!(landed);
+        assert_eq!(tries.load(Ordering::SeqCst), 3);
+        // and what landed is the write, once
+        let row = store.op_run("r1", "a").unwrap().unwrap();
+        assert_eq!(row.status, OpStatus::Success);
+        assert_eq!(store.health().unrecorded_writes(), 0);
+    }
+
+    // and a store that is not coming back is given a bounded number of
+    // chances: a run holding its claim while it waits is a run nothing else
+    // can take either
+    #[tokio::test]
+    async fn a_store_that_never_takes_the_write_is_not_waited_on_forever() {
+        let store = Store::open(":memory:").unwrap();
+        let tries = AtomicU64::new(0);
+        let began = std::time::Instant::now();
+        let landed = store
+            .landed("op_finished", flaky(u64::MAX, &tries, || Ok(())))
+            .await;
+
+        assert!(!landed);
+        assert_eq!(tries.load(Ordering::SeqCst), u64::from(WRITE_ATTEMPTS));
+        assert!(
+            began.elapsed() < Duration::from_secs(5),
+            "it waited too long"
+        );
+        assert_eq!(store.health().unrecorded_writes(), 1);
+    }
+
+    // a statement the database refuses is not a lock: the same call will be
+    // refused the same way, and three more of them is three more of nothing
+    #[tokio::test]
+    async fn a_write_the_database_will_never_take_is_not_repeated() {
+        let store = Store::open(":memory:").unwrap();
+        let tries = AtomicU64::new(0);
+        let landed = store
+            .landed("op_finished", || {
+                tries.fetch_add(1, Ordering::SeqCst);
+                Err(Error::Sqlite(rusqlite::Error::SqliteFailure(
+                    rusqlite::ffi::Error::new(19),
+                    Some("constraint failed".to_string()),
+                )))
+            })
+            .await;
+
+        assert!(!landed);
+        assert_eq!(tries.load(Ordering::SeqCst), 1);
+    }
+
+    // the one failure whose outcome hestan cannot know. a connection that died
+    // may have carried a commit the server ran and the acknowledgement of it
+    // nobody received — so going back for it is the one retry that could
+    // record a build twice, and it is the one retry hestan does not make
+    #[cfg(feature = "postgres")]
+    #[tokio::test]
+    async fn a_connection_that_died_is_not_retried_because_its_write_may_have_landed() {
+        let Some(pg) = Scratch::new() else {
+            return;
+        };
+        let store = pg.store();
+        store
+            .create_run(&mk_run("r1", "etl", Utc::now()), &["a".to_string()])
+            .unwrap();
+        let built = Built {
+            asset: "orders".to_string(),
+            partition: None,
+            fingerprint: "fp".to_string(),
+            inputs: json!({}),
+            value: None,
+            meta: None,
+        };
+
+        // this store's own backend, told to go away by another connection
+        let pid = store
+            .conn()
+            .query("SELECT pg_backend_pid()::bigint", args![], |r| r.int(0))
+            .unwrap()[0];
+        let killer = pg.store();
+        // pasted rather than bound: a backend id this test just read back is
+        // not a value anybody typed, and `pg_terminate_backend` takes an int4
+        killer
+            .conn()
+            .query(
+                &format!("SELECT pg_terminate_backend({pid})"),
+                args![],
+                |_| Ok(()),
+            )
+            .unwrap();
+
+        let tries = AtomicU64::new(0);
+        let landed = store
+            .landed("op_finished", || {
+                tries.fetch_add(1, Ordering::SeqCst);
+                store.op_finished(
+                    "r1",
+                    "a",
+                    OpStatus::Success,
+                    None,
+                    None,
+                    None,
+                    std::slice::from_ref(&built),
+                )
+            })
+            .await;
+        assert!(!landed);
+        assert!(
+            tries.load(Ordering::SeqCst) < u64::from(WRITE_ATTEMPTS),
+            "a dead connection was retried to exhaustion"
+        );
+
+        // and nothing this process writes lands again, which is the whole of
+        // why a retry could not have doubled anything up: the materialization
+        // is not there once, let alone twice
+        assert!(
+            !store
+                .landed("op_finished", || store.op_finished(
+                    "r1",
+                    "a",
+                    OpStatus::Success,
+                    None,
+                    None,
+                    None,
+                    std::slice::from_ref(&built)
+                ))
+                .await
+        );
+        assert!(
+            killer
+                .materializations("orders", None, 10)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            killer.op_run("r1", "a").unwrap().unwrap().status,
+            OpStatus::Pending
         );
     }
 
