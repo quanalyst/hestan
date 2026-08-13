@@ -611,6 +611,15 @@ file left behind is a smaller problem than a sweep that stops. the io
 managers' page has [the whole of it](io-managers.md#what-retention-takes),
 including what to know before pointing a manager at a directory.
 
+**a pruned run is an unreplayable one**, and that is worth knowing while
+choosing a policy rather than afterwards. [replay](replay.md) re-runs ops of
+an old run on the values that run recorded, so a sweep that takes the rows and
+the files takes the inputs with them — the replay is refused, naming the op
+whose input is gone, rather than run on a hole. `failed_days` is the knob that
+matters here, since a failure is what anybody replays: `Retention::days(30)
+.failed_days(180)` keeps six months of the runs worth re-running and a month
+of the ones that worked.
+
 the sweep also takes [sensor run keys](sensors.md) older than the age cutoff —
 nothing else collects them, and a sensor keyed by the day would keep a row per
 day forever — and delivered [notifications](notifications.md) older than it.

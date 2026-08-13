@@ -52,11 +52,12 @@ captured and why.
 the *trigger* records why a run exists: `manual` (launch endpoint,
 `run_once`), `schedule` (the cron scheduler), `retry` (the re-run endpoint),
 `resume` (the [resume endpoint](#resume), which continues an earlier run),
-`build` (an [asset build](assets.md): the endpoints, `build_asset`, and
-probe-driven auto builds), or `sensor` (a [sensor](sensors.md) evaluation
-asked for it). retry and resume are for finished runs — the api answers 409
-for one still queued or running, since a fresh copy of a live run would only
-double it. manual launches stay ungated: that is the documented escape hatch
+`replay` (the [replay endpoint](replay.md), which re-runs ops of an earlier
+run on the inputs it gave them), `build` (an [asset build](assets.md): the
+endpoints, `build_asset`, and probe-driven auto builds), or `sensor` (a
+[sensor](sensors.md) evaluation asked for it). retry, resume and replay are
+for finished runs — the api answers 409 for one still queued or running, since
+a fresh copy of a live run would only double it. manual launches stay ungated: that is the documented escape hatch
 when an overlapping run is really wanted.
 
 an *identity* is who asked, where a person did and something
@@ -537,6 +538,33 @@ run that only ever covered part of the graph — an [asset build](assets.md)
 records rows for its plan alone. a resume is also refused when nothing is
 left to re-run, and when a chosen op's input was never produced by any run
 in the chain.
+
+## Replay
+
+`runner.replay(run_id)` (or `POST /api/runs/{id}/replay`) launches a new run
+that re-runs ops of a finished one **on the inputs that run gave them**: every
+dep of the replayed ops is seeded from what the original recorded, so the op
+reads byte for byte what it read then. it is the question "does my fix work on
+the input that broke it".
+
+```rust
+let id = runner.replay(&broken)?;                              // the ops that failed
+let id = runner.replay_ops(&broken, Some(&["load".into()]))?;  // or exactly these
+```
+
+it is the opposite of a resume, and the difference is worth holding onto: a
+resume re-runs what did **not** succeed together with everything downstream,
+and a replay re-runs what **did**, exactly the ops named and nothing below
+them. the new run carries the original's params, trigger `replay`, and a
+`replay_of` — a column of its own beside `resumed_from`, because a run log
+that could not tell the two apart could not say which of two opposite things
+happened. the original run is not written to.
+
+what a replay does not reproduce — today's code, today's resources, today's
+clock, today's answer from anything the op fetches itself — and the
+[retention](storage.md#retention) horizon past which a run cannot be replayed
+at all are [its own page](replay.md), and are the difference between a result
+you can trust and one that misleads you.
 
 ## Reusable graphs
 

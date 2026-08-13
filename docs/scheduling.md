@@ -161,8 +161,8 @@ Op::new("pull", |ctx: OpCtx| async move {
 ```
 
 it is set on scheduled fires, caught-up fires and held fires that later drain,
-and it is `None` on a manual launch, a retry, a resume, an asset build and a
-sensor fire — all of which stand for nothing but themselves. it is on the run
+and it is `None` on a manual launch, a retry, a resume, a replay, an asset
+build and a sensor fire — all of which stand for nothing but themselves. it is on the run
 json, and the ui shows it next to the trigger.
 
 ## The scheduler loop

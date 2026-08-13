@@ -19,6 +19,7 @@
 - [scheduling](scheduling.md) — cron syntax, timezones, the durable cursor, missed-fire catch-up, pause/resume, ticks, and the scheduler loop.
 - [http sources](http-sources.md) — declarative REST pulls: the full `HttpSource` builder, fan-out, retry policy.
 - [notifications](notifications.md) — hooks: `on_run_finished`/`RunEvent`, `on_op_finished`/`OpEvent`, per-job scoping, `on_failure`/`RunFailure`, `on_late`/`LateEvent`, the webhook and slack helpers, and durable at-least-once delivery.
+- [replay](replay.md) — re-running ops of a finished run on the inputs it gave them: what it is for, what it reproduces, the four things it does not, the retention horizon, and the three ways in.
 - [launching](launching.md) — presets, params schemas, run tags, subset launches, and cloning a past run.
 - [the command line](cli.md) — `hestan::cli::run` in your own binary: the mount, the three ways to reach a deployment, every command, the exit codes a cron line reads, the output contract, `doctor`, `explain` and dynamic completion.
 - [web ui](web-ui.md) — page-by-page tour of the embedded ui and how it draws status.

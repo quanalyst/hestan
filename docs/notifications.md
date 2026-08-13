@@ -27,7 +27,7 @@ one is caught and logged as a warning without touching the others. driving
 | `run_id` | the run |
 | `job` | its job name |
 | `status` | `success`, `failed` or `canceled` |
-| `trigger` | why the run existed: `manual`, `schedule`, `retry`, `resume`, `build`, or `sensor` |
+| `trigger` | why the run existed: `manual`, `schedule`, `retry`, `resume`, `replay`, `build`, or `sensor` |
 | `failed_op` | the first op that exhausted its attempts; `None` unless one did |
 | `error` | that op's final error message |
 | `started_at` | when it began executing; `None` for a run that never got that far |

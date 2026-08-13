@@ -48,7 +48,8 @@ three rules:
 
 resolve from the **handle**, not from the key. the key is context — useful for
 laying out storage in `put`, and for logging — but a handle read back on a
-resume carries the run id of the run that wrote it, not the one reading it.
+resume or a [replay](replay.md) carries the run id of the run that wrote it,
+not the one reading it.
 
 `drop_run` has **no default**, so adding a manager of your own is a decision
 you make rather than one that gets made by omission: a no-op default would
@@ -58,10 +59,11 @@ compile and leak every file the manager has ever written. `Inline` returns
 all three calls are synchronous, and hestan makes them on tokio's blocking
 pool rather than on the task driving the run. write them as ordinary blocking
 code: a manager may take as long as the storage behind it takes, and the ops
-beside it keep running. the one exception is `Runner::resume_plan`, which
-resolves an earlier run's outputs on the thread that called it, exactly as it
-does its store reads — that whole api is synchronous, and nothing is
-executing while a resume is being planned.
+beside it keep running. the exceptions are `Runner::resume_plan` and
+`Runner::replay_plan`, which resolve an earlier run's outputs on the thread
+that called them, exactly as they do their store reads — that whole api is
+synchronous, and nothing is executing while a resume or a replay is being
+planned.
 
 ## FileIo
 
@@ -226,6 +228,11 @@ path, not just the happy one:
 - **resume.** seeds come from an earlier run's `op_runs.output`, which are
   handles; resuming across a `FileIo`-backed op reads the file the first run
   wrote.
+- **[replay](replay.md).** the same seeds, read twice: once when the replay is
+  planned, to refuse a run whose values are gone rather than launch one that
+  cannot reproduce anything, and once by the op that reads the input. a
+  manager whose `get` is expensive pays for that, and the alternative is a run
+  that fails halfway through claiming to be a reproduction.
 - **asset builds.** a memoized build seeds a fresh dep from its
   materialization. that value never went through `put` — asset
   materializations record the asset's value, not an op handle — so it arrives

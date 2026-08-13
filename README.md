@@ -230,6 +230,17 @@ standalone binary for those two. [docs/cli.md](docs/cli.md).
   itself forward via `PRAGMA user_version`, and runs whose claimer went away
   are marked failed on the next start — while a run another process is holding
   a live lease on is left exactly alone
+- **an op that failed two months ago can be re-run on the input that broke
+  it**: `runner.replay(&run)` launches a new run of the ops that failed,
+  seeded with what that run recorded, so the fix is tested against the value
+  rather than against one reconstructed by hand. exactly those ops and nothing
+  downstream — a resume is the opposite operation, re-running what did *not*
+  succeed, and both are still there and told apart in the run log. the
+  original run is never written to. what a replay does not reproduce is
+  written down rather than left to be discovered: today's code, today's
+  resources, today's clock, and today's answer from anything the op fetches
+  itself — and a run whose values retention has taken is refused, naming the
+  op whose input is gone, rather than run on a hole ([replay](docs/replay.md))
 - **one event log for the whole deployment**, not just for runs. each event
   carries a `kind`, a documented json payload, and a *subject* — an asset, a
   schedule, a sensor, a backfill, a job, a run, or hestan itself — so "what
@@ -376,7 +387,8 @@ the details live in [docs/](docs/README.md):
 [assets](docs/assets.md), [dbt](docs/dbt.md), [freshness](docs/freshness.md),
 [sensors](docs/sensors.md),
 [scheduling](docs/scheduling.md), [http sources](docs/http-sources.md),
-[notifications](docs/notifications.md), [launching](docs/launching.md),
+[notifications](docs/notifications.md), [replay](docs/replay.md),
+[launching](docs/launching.md),
 [the web ui](docs/web-ui.md),
 [the command line](docs/cli.md),
 [authentication](docs/auth.md),
