@@ -122,7 +122,7 @@ behind `--features parquet`, for the case json is wrong about: an op that
 returns **rows**.
 
 ```toml
-hestan = { version = "0.1.0-beta.1", features = ["parquet"] }
+hestan = { version = "0.1.0-beta.2", features = ["parquet"] }
 ```
 
 ```rust

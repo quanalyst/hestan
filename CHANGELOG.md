@@ -2,6 +2,16 @@
 
 ## unreleased
 
+## 0.1.0-beta.2
+
+replay: re-run a past run's ops on the inputs they actually had, for reproducing a
+failure on the value that caused it. the original run is never written to, and a run
+whose values retention has taken is refused by name rather than replayed on a hole.
+schema v19.
+
+**breaking**: `Trigger` gains a `Replay` variant. the enum is not `#[non_exhaustive]`,
+so an exhaustive `match` on it needs one more arm.
+
 - **a run can be replayed: its ops re-run on the inputs it gave them.** an op failed in production two months ago and you have a fix, and the question worth answering is whether the fix works on the input that broke it rather than on one reconstructed by hand. `runner.replay(&run)` launches a new run of the ops that run recorded as failed, with every dep of them seeded from what it recorded, so the op reads byte for byte what it read then; `replay_ops` names the ops instead. `POST /api/runs/{id}/replay`, `hestan replay <run> [--op ..]`, and a control on the run page beside resume's
 - **it is the opposite operation to a resume, and the run log can say which happened.** a resume re-runs what did *not* succeed together with everything downstream of it; a replay re-runs what *did*, exactly the ops named and nothing below them. so a replay is its own trigger and its own column — `replay_of` beside `resumed_from`, schema v19 — rather than a second meaning for the one that was there. one column meaning either would have left the history unable to answer which of two opposite things somebody did, and would have let the resume planner walk into a replay's lineage as if it were a continuation
 - **the original run is not written to.** not a status, not an event, not a materialization, not a byte of what its io manager wrote: it is history, and a replay is a new run. the test asserts that by holding the whole of the run — its row, its op runs and every event of it — as text before and after, so a column added next year is covered by it without anybody remembering to add it

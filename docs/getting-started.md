@@ -20,7 +20,7 @@ the setup. to track the repository instead of the release — a tag, or a
 sibling checkout for hacking on both at once:
 
 ```toml
-hestan = { git = "https://github.com/quanalyst/hestan", tag = "v0.1.0-beta.1" }
+hestan = { git = "https://github.com/quanalyst/hestan", tag = "v0.1.0-beta.2" }
 hestan = { path = "../hestan" }
 ```
 
