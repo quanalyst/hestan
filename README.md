@@ -10,7 +10,7 @@ more than one machine.
 
 ## Alpha
 
-this is `0.1.0-alpha.2`. under 0.x the api changes without a deprecation cycle,
+this is `0.1.0-beta.1`. under 0.x the api changes without a deprecation cycle,
 so read the changelog before bumping. it has not been run in production, and
 the gaps that are known are listed under [not here yet](#not-here-yet).
 
@@ -24,7 +24,7 @@ model behind it. see [SECURITY.md](SECURITY.md).
 
 ```toml
 [dependencies]
-hestan = "0.1.0-alpha.2"
+hestan = "0.1.0-beta.1"
 tokio = { version = "1", features = ["full"] }
 ```
 
@@ -76,7 +76,7 @@ Hestan::new()
 ```
 
 ```toml
-hestan = { version = "0.1.0-alpha.2", features = ["http"] }
+hestan = { version = "0.1.0-beta.1", features = ["http"] }
 ```
 
 transport errors, 429s, and 5xx responses are retried with capped exponential
@@ -394,7 +394,7 @@ release notes are in [CHANGELOG.md](CHANGELOG.md).
 
 ```toml
 [dependencies]
-hestan = "0.1.0-alpha.2"
+hestan = "0.1.0-beta.1"
 ```
 
 the binary is yours: define jobs, then `Hestan::new()...serve(addr)`, or

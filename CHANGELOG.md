@@ -2,6 +2,17 @@
 
 ## unreleased
 
+## 0.1.0-beta.1
+
+feature-complete and hardened: every finding from the external review is closed, and the
+storage, web interface, developer-experience and integration surfaces are done. still 0.x,
+so a breaking change is still possible without a deprecation cycle — pin an exact version.
+`IoManager` is the one place a further break is likely, since an asset's value does not yet
+go through it.
+
+**breaking since alpha.2**: `Runner::new` and `Runner::with_failure_hooks` return
+`Result<Runner, Error>`; `IoManager` gains a required `drop_run`.
+
 - **a run never reports an outcome the store did not take.** the executor let every store write go through one function that logged a warning and carried on, and forty of its call sites were in the run loop — twenty-one of them the run's own record of itself. a dropped `op_finished` left the op row `running` while the run carried on and finished `success`: hestan reporting a result the run log does not hold, which the next resume then builds on and the asset catalog then trusts. the fix is the twenty-one call sites; the point of the phase is that the twenty-second cannot be written
 - an event write returns a `BestEffort` and `note` takes one of those and nothing else, so `note(store.op_finished(..))` is a **type error**. only the store module can make one, and only in a signature that says so — which means **a store write added next year is critical by default**, because it returns `Result` like everything else and `note` will not take it. four writes are declared best-effort and each is a decision rather than a leftover: the event log, captured op output, an isolated op's pid (the parent holds the handle it stops the child with either way), and the audit line beside a cancel signal. the property is put to rustc rather than described: a test builds two source files out of the signatures the store actually declares — `note`'s parameter and each write's return type, both scraped, so a signature that moves moves the test with it — and asserts that an event compiles, that an op's terminal row does not, that it was refused as a *type* error rather than a typo, and that the same write not noted compiles fine
 - **a critical write that fails is retried**: four attempts, capped exponential with full jitter on the same `backoff` an op's retries use, under a second in the worst case. what makes that safe is which errors are retried rather than which writes are made — `op_finished` appends materializations and their events beside the row it updates, and repeating it after a *partial* apply would record a build twice. there is no partial apply to repeat: sqlite's commit is atomic and rusqlite rolls back a transaction it could not commit, and postgres aborts the transaction it reports a serialization failure or a deadlock for. every error hestan retries is one a live backend raised, having already undone the work
