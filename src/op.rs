@@ -12,7 +12,7 @@ use tokio::sync::{OwnedSemaphorePermit, watch};
 use crate::backoff;
 use crate::model::{EventKind, EventLevel, OpStatus, When};
 use crate::resource::{self, Resources};
-use crate::store::Store;
+use crate::store::{Built, Store};
 
 /// what an op body returns: json output on success, any error on failure.
 pub type OpResult = Result<Value, Box<dyn std::error::Error + Send + Sync>>;
@@ -467,6 +467,17 @@ pub(crate) struct AssetStage {
 
 /// one attempt's per-asset staging, keyed by asset name.
 pub(crate) type AssetBuf = Arc<Mutex<BTreeMap<String, AssetStage>>>;
+
+/// what one attempt has built, in the order the body produced it. staged like
+/// state and metadata are, and for the same reason: what the body knows is
+/// worth nothing until whoever knows the attempt survived writes it down.
+pub(crate) type BuiltBuf = Arc<Mutex<Vec<Built>>>;
+
+/// everything an attempt staged as built, leaving the buffer empty — a retry
+/// stages its own or none.
+pub(crate) fn staged_builds(buf: &BuiltBuf) -> Vec<Built> {
+    std::mem::take(&mut buf.lock().unwrap())
+}
 
 /// a metadata map as it is stored, or `None` when it is empty — which is a
 /// null column, not an empty object.
@@ -1281,6 +1292,9 @@ pub struct OpCtx {
     /// fingerprints and metadata staged for one named asset, for an op that
     /// produces several.
     pub(crate) new_per_asset: AssetBuf,
+    /// what this attempt has built, waiting for the transaction that records
+    /// the op finishing.
+    pub(crate) built: BuiltBuf,
     pub(crate) store: Store,
     /// the pool slot this attempt holds, if its op takes from one. carried here
     /// so that work the body handed this ctx to keeps the slot for as long as
@@ -1567,6 +1581,14 @@ impl OpCtx {
         staged_meta(&self.new_meta)
     }
 
+    /// stage one asset as built by this attempt. it is written when the op is
+    /// recorded as having succeeded, and dropped with the attempt otherwise —
+    /// an asset is built when the op that built it succeeded, not when its
+    /// body reached the end of the work.
+    pub(crate) fn stage_build(&self, built: Built) {
+        self.built.lock().unwrap().push(built);
+    }
+
     /// say something in the run log, attributed to this op.
     ///
     /// this is the op *speaking*: a row in the [event log](crate::Event) that
@@ -1655,6 +1677,7 @@ mod tests {
             new_fingerprint: Arc::new(Mutex::new(None)),
             new_meta: Arc::new(Mutex::new(BTreeMap::new())),
             new_per_asset: Arc::new(Mutex::new(BTreeMap::new())),
+            built: Arc::new(Mutex::new(Vec::new())),
             store: Store::open(":memory:").unwrap(),
             slot: None,
         }

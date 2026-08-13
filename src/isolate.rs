@@ -392,6 +392,7 @@ pub(crate) async fn run_one_op(
     let state = Arc::new(store.op_state(job.name(), &req.op)?);
     let new_state = Arc::new(Mutex::new(None));
     let new_meta = Arc::new(Mutex::new(BTreeMap::new()));
+    let built = Arc::new(Mutex::new(Vec::new()));
     // the parent's SIGTERM lands here as ordinary cancellation, so an op that
     // polls `ctx.is_cancelled()` stops cleanly and one that ignores it is
     // killed a few seconds later. the attempt half never flips: the parent owns
@@ -426,6 +427,9 @@ pub(crate) async fn run_one_op(
         new_fingerprint: Arc::new(Mutex::new(None)),
         new_meta: new_meta.clone(),
         new_per_asset: Arc::new(Mutex::new(BTreeMap::new())),
+        // an asset op is never isolated, so this is empty — but it is read
+        // where the parent reads it, so it stays true if one ever is
+        built: built.clone(),
         store: store.clone(),
         // the parent holds this op's pool slot for as long as this process
         // lives, which is the whole of the child's work
@@ -500,6 +504,7 @@ pub(crate) async fn run_one_op(
                 Some(&handle),
                 meta.as_ref(),
                 None,
+                &op::staged_builds(&built),
             )?;
             // state second: a crash between the writes re-runs the op, never
             // skips it
@@ -527,6 +532,7 @@ pub(crate) async fn run_one_op(
                 None,
                 None,
                 Some(&msg),
+                &[],
             )?;
             Ok(Worked::Failed)
         }

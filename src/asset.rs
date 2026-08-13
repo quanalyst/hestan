@@ -14,7 +14,7 @@ use crate::job::Job;
 use crate::model::{CheckStatus, Materialization, RunTags, Severity, Trigger};
 use crate::op::{self, Meta, Op, OpCtx};
 use crate::partition::Partitions;
-use crate::store::Store;
+use crate::store::{Built, Store};
 
 /// the internal job every asset build runs under.
 pub(crate) const ASSETS_JOB: &str = "assets";
@@ -983,8 +983,11 @@ fn json_type(v: &Value) -> &'static str {
     }
 }
 
-// the materialization write lives inside the op body, so a crash before
-// op_finished re-runs the op next build — at-least-once, like op state
+// the body computes what only the body can know and stages it; the executor
+// writes it in the transaction that records the op succeeding. so a build
+// that fails, is cancelled, times out, panics or cannot be persisted leaves
+// no materialization, and the next run rebuilds it — at-least-once, like op
+// state
 fn wrap_op(reg: &AssetRegistry, meta: &OpMeta) -> Op {
     let inner = meta.op.clone();
     let name = meta.name.clone();
@@ -1033,15 +1036,14 @@ fn wrap_op(reg: &AssetRegistry, meta: &OpMeta) -> Op {
                     (None, 1) => ctx.staged_meta(),
                     (None, _) => None,
                 };
-                ctx.store.record_materialization(
-                    asset,
-                    key.as_deref(),
-                    &fingerprint,
-                    &inputs,
-                    Some(value),
-                    Some(ctx.run_id()),
-                    meta.as_ref(),
-                )?;
+                ctx.stage_build(Built {
+                    asset: asset.to_string(),
+                    partition: key.clone(),
+                    fingerprint,
+                    inputs: inputs.clone(),
+                    value: Some(value.clone()),
+                    meta,
+                });
             }
             Ok(output)
         }
@@ -1940,6 +1942,19 @@ mod tests {
             .unwrap()
     }
 
+    /// for the cases that launch rather than run, because they cancel or
+    /// interfere with what the run is doing while it does it.
+    async fn settled(runner: &Runner, id: &str) -> crate::model::Run {
+        for _ in 0..1_000 {
+            let run = runner.store().run(id).unwrap().unwrap();
+            if !matches!(run.status, RunStatus::Queued | RunStatus::Running) {
+                return run;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("run {id} never settled");
+    }
+
     async fn build_target(reg: &AssetRegistry, runner: &Runner, target: &str) -> crate::model::Run {
         let m = mats_map(runner.store()).unwrap();
         let plan = plan_target(reg, &m, target).unwrap();
@@ -2048,6 +2063,189 @@ mod tests {
         let m = mats_map(&store).unwrap();
         let st = staleness(&reg, &m);
         assert!(st.values().all(|s| !s.stale));
+    }
+
+    /// a manager with nowhere to put anything, which is the last thing that
+    /// can go wrong between an asset body returning and the op being recorded
+    /// as having succeeded.
+    struct Refuses;
+
+    impl crate::io::IoManager for Refuses {
+        fn put(&self, _key: &crate::IoKey, _value: Value) -> crate::IoResult {
+            Err("nowhere to put it".into())
+        }
+        fn get(&self, _key: &crate::IoKey, handle: &Value) -> crate::IoResult {
+            Ok(handle.clone())
+        }
+        fn drop_run(&self, _run_id: &str, _job: &str) -> crate::IoDropped {
+            Ok(())
+        }
+    }
+
+    // the value was computed and its fingerprint taken, and then the output
+    // went nowhere. a materialization here would say the asset is current
+    // while nothing holds what it is current with, and the next build would
+    // read that and skip it.
+    #[tokio::test]
+    async fn a_build_whose_output_cannot_be_stored_records_nothing() {
+        let store = Store::open(":memory:").unwrap();
+        let a = Asset::new("a", |_| async { Ok(json!({"rows": 3})) });
+        let reg = AssetRegistry::new(vec![a], Vec::new(), Vec::new()).unwrap();
+        let runner = Runner::with_io(
+            [reg.lower_job().unwrap()],
+            store.clone(),
+            Vec::new(),
+            Vec::new(),
+            Arc::new(Refuses),
+            Vec::new(),
+        )
+        .unwrap();
+
+        let run = build_all(&reg, &runner).await;
+        assert_eq!(run.status, RunStatus::Failed);
+        let op = &store.op_runs(&run.id).unwrap()[0];
+        assert_eq!(op.status, OpStatus::Failed);
+        assert!(
+            op.error.as_deref().unwrap_or_default().contains("persist"),
+            "{:?}",
+            op.error
+        );
+        assert!(
+            store.materialization("a", None).unwrap().is_none(),
+            "an asset nobody stored the value of was recorded as built"
+        );
+        // and it is still what the next build is for
+        let m = mats_map(&store).unwrap();
+        assert!(staleness(&reg, &m)["a"].stale);
+    }
+
+    // an attempt that never reached the end of the work has nothing to say
+    // about what was built, however it ended.
+    #[tokio::test]
+    async fn a_build_that_fails_or_panics_records_nothing_and_its_retry_records_one() {
+        let store = Store::open(":memory:").unwrap();
+        let attempts = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let counted = attempts.clone();
+        let broken = Asset::new("broken", |_| async { Err("no data".into()) });
+        let panicky = Asset::new("panicky", |_| async { panic!("mid-build") });
+        // fails once, then works: the value it built the second time is the
+        // one entry, and the attempt that failed left nothing behind it
+        let flaky = Asset::new("flaky", move |_| {
+            let counted = counted.clone();
+            async move {
+                match counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst) {
+                    0 => Err("not yet".into()),
+                    _ => Ok(json!({"rows": 1})),
+                }
+            }
+        })
+        .retries(1);
+        let reg = AssetRegistry::new(vec![broken, panicky, flaky], Vec::new(), Vec::new()).unwrap();
+        let runner = Runner::new([reg.lower_job().unwrap()], store.clone()).unwrap();
+
+        let run = build_all(&reg, &runner).await;
+        assert_eq!(run.status, RunStatus::Failed);
+        for asset in ["broken", "panicky"] {
+            assert!(
+                store.materialization(asset, None).unwrap().is_none(),
+                "{asset} was recorded as built"
+            );
+        }
+        assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert_eq!(store.materializations("flaky", None, 10).unwrap().len(), 1);
+        assert_eq!(
+            store.materialization("flaky", None).unwrap().unwrap().value,
+            Some(json!({"rows": 1}))
+        );
+    }
+
+    // a cancelled run stops its ops where they stand, and an op that was
+    // stopped built nothing — whatever it had computed by then.
+    #[tokio::test]
+    async fn a_canceled_build_records_nothing() {
+        let store = Store::open(":memory:").unwrap();
+        let running = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let started = running.clone();
+        let slow = Asset::new("slow", move |ctx: OpCtx| {
+            let started = started.clone();
+            async move {
+                started.store(true, std::sync::atomic::Ordering::SeqCst);
+                ctx.cancelled().await;
+                // the abort lands on this await, so the value is computed and
+                // never returned — which is every op that is stopped mid-work
+                tokio::time::sleep(Duration::from_secs(30)).await;
+                Ok(json!({"rows": 1}))
+            }
+        });
+        let reg = AssetRegistry::new(vec![slow], Vec::new(), Vec::new()).unwrap();
+        let runner = Runner::new([reg.lower_job().unwrap()], store.clone()).unwrap();
+
+        let m = mats_map(&store).unwrap();
+        let plan = plan_all(&reg, &m).expect("something stale");
+        let id = runner
+            .launch_subset(
+                ASSETS_JOB,
+                plan.ops.into_iter().collect(),
+                plan.seeds,
+                json!({}),
+                Trigger::Build,
+                None,
+                RunTags::new(),
+                None,
+            )
+            .unwrap();
+        while !running.load(std::sync::atomic::Ordering::SeqCst) {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        runner.cancel(&id).unwrap();
+
+        let run = settled(&runner, &id).await;
+        assert_eq!(run.status, RunStatus::Canceled);
+        assert_eq!(
+            store.op_run(&id, "slow").unwrap().unwrap().status,
+            OpStatus::Canceled
+        );
+        assert!(store.materialization("slow", None).unwrap().is_none());
+    }
+
+    // several assets out of one op are one fact about one op run, so the
+    // history gains all of them or none. asserted rather than described: a
+    // trigger refuses one insert, and everything the op wrote goes back with
+    // it — the other materialization and the op run's own terminal row.
+    #[tokio::test]
+    async fn a_multi_asset_records_all_of_its_outputs_or_none_of_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hestan.db");
+        let path = path.to_str().unwrap();
+        let store = Store::open(path).unwrap();
+        rusqlite::Connection::open(path)
+            .unwrap()
+            .execute_batch(
+                "CREATE TRIGGER refuse_rejected BEFORE INSERT ON asset_materializations
+                 WHEN NEW.asset = 'rejected'
+                 BEGIN SELECT RAISE(ABORT, 'this insert is refused'); END",
+            )
+            .unwrap();
+
+        let split = MultiAsset::new("split", |_| async {
+            Ok(json!({"clean": {"rows": 2}, "rejected": {"rows": 1}}))
+        })
+        .produces(["clean", "rejected"]);
+        let reg = AssetRegistry::new(Vec::new(), vec![split], Vec::new()).unwrap();
+        let runner = Runner::new([reg.lower_job().unwrap()], store.clone()).unwrap();
+        let run = build_all(&reg, &runner).await;
+
+        for asset in ["clean", "rejected"] {
+            assert!(
+                store.materialization(asset, None).unwrap().is_none(),
+                "{asset} was recorded on its own"
+            );
+        }
+        // the op run row is where it was before the write: the same
+        // transaction carried both, so neither landed
+        let op = store.op_run(&run.id, "split").unwrap().unwrap();
+        assert_eq!(op.status, OpStatus::Running);
+        assert_eq!(op.finished_at, None);
     }
 
     #[tokio::test]

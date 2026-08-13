@@ -21,7 +21,7 @@ use crate::model::{
 };
 use crate::op::{self, Cancel, MetaBuf, Op, OpCtx};
 use crate::resource::{self, Resources};
-use crate::store::{RunKey, Store};
+use crate::store::{Built, RunKey, Store};
 
 /// how far back a resume follows `resumed_from` links. resuming a resume is
 /// normal; a chain this long is a bug, and the walk says so instead of looping.
@@ -317,6 +317,9 @@ enum Outcome {
         output: Value,
         state: Option<Value>,
         meta: Option<Value>,
+        /// what an asset op built, for the transaction that records this op
+        /// finishing. empty for every other op.
+        built: Vec<Built>,
     },
     /// an isolated op whose child persisted its own output and wrote its own
     /// terminal row: the run takes the handle and writes nothing.
@@ -1776,7 +1779,15 @@ async fn execute_in_span(
                         reason,
                         Some(&json!({ "reason": reason, "when": op.runs_when() })),
                     ));
-                    note(store.op_finished(&run_id, &name, OpStatus::Skipped, None, None, None));
+                    note(store.op_finished(
+                        &run_id,
+                        &name,
+                        OpStatus::Skipped,
+                        None,
+                        None,
+                        None,
+                        &[],
+                    ));
                     statuses.insert(name.clone(), OpStatus::Skipped);
                     let reason = format!("skipped: upstream {name} was skipped");
                     skip_downstream(
@@ -1994,7 +2005,15 @@ async fn execute_in_span(
                     &msg,
                     Some(&json!({ "error": &msg })),
                 ));
-                note(store.op_finished(&run_id, &name, OpStatus::Failed, None, None, Some(&msg)));
+                note(store.op_finished(
+                    &run_id,
+                    &name,
+                    OpStatus::Failed,
+                    None,
+                    None,
+                    Some(&msg),
+                    &[],
+                ));
                 if first_failure.is_none() {
                     first_failure = Some((name.clone(), msg));
                 }
@@ -2066,6 +2085,7 @@ async fn execute_in_span(
                         output,
                         state,
                         meta,
+                        built,
                     } => {
                         // persisted before the success is recorded: a row
                         // saying success with an output that was never stored
@@ -2077,6 +2097,9 @@ async fn execute_in_span(
                                 // what the manager knows about what it stored,
                                 // beside what the op staged
                                 let meta = crate::io::handle_meta(&handle, meta);
+                                // and whatever it built, in that same write:
+                                // the output is stored, so the row that says
+                                // the asset is current is now true
                                 note(store.op_finished(
                                     &run_id,
                                     &name,
@@ -2084,6 +2107,7 @@ async fn execute_in_span(
                                     Some(&handle),
                                     meta.as_ref(),
                                     None,
+                                    &built,
                                 ));
                                 // state second: a crash between the writes
                                 // re-runs the op, never skips it
@@ -2102,6 +2126,8 @@ async fn execute_in_span(
                                     &msg,
                                     Some(&json!({ "error": &msg })),
                                 ));
+                                // and `built` goes with the attempt: an asset
+                                // whose value nothing stored was not built
                                 note(store.op_finished(
                                     &run_id,
                                     &name,
@@ -2109,6 +2135,7 @@ async fn execute_in_span(
                                     None,
                                     None,
                                     Some(&msg),
+                                    &[],
                                 ));
                                 Err(msg)
                             }
@@ -2122,6 +2149,7 @@ async fn execute_in_span(
                             None,
                             None,
                             Some(&msg),
+                            &[],
                         ));
                         Err(msg)
                     }
@@ -2180,7 +2208,15 @@ async fn execute_in_span(
                     &msg,
                     Some(&json!({ "error": msg })),
                 ));
-                note(store.op_finished(&run_id, &name, OpStatus::Failed, None, None, Some(&msg)));
+                note(store.op_finished(
+                    &run_id,
+                    &name,
+                    OpStatus::Failed,
+                    None,
+                    None,
+                    Some(&msg),
+                    &[],
+                ));
                 if first_failure.is_none() {
                     first_failure = Some((name.clone(), msg));
                 }
@@ -2235,10 +2271,12 @@ async fn execute_in_span(
                             output,
                             state,
                             meta,
+                            built,
                         } => {
                             // won the race against the abort, so it is
                             // persisted like any other success — or recorded
-                            // failed if it cannot be
+                            // failed if it cannot be, and what it built goes
+                            // or stays with that row either way
                             let unit = unit_op(&job, &instances, &name);
                             let key = io_key(&run_id, &job, &name);
                             match crate::io::put(&runner.io, unit.io_name(), key, output).await {
@@ -2251,6 +2289,7 @@ async fn execute_in_span(
                                         Some(&handle),
                                         meta.as_ref(),
                                         None,
+                                        &built,
                                     ));
                                     if let Some(state) = state {
                                         note(store.set_op_state(job.name(), &name, &state));
@@ -2265,6 +2304,7 @@ async fn execute_in_span(
                                         None,
                                         None,
                                         Some(&msg),
+                                        &[],
                                     ));
                                 }
                             }
@@ -2280,6 +2320,7 @@ async fn execute_in_span(
                                 None,
                                 None,
                                 Some(&msg),
+                                &[],
                             ));
                         }
                         Outcome::Killed(msg) => op_killed(&store, &run_id, &name, &msg),
@@ -2307,6 +2348,7 @@ async fn execute_in_span(
                         None,
                         None,
                         Some(&msg),
+                        &[],
                     ));
                 }
             }
@@ -2576,6 +2618,7 @@ fn op_canceled(store: &Store, run_id: &str, name: &str) {
         None,
         None,
         Some("canceled"),
+        &[],
     ));
     note(store.append_event(
         run_id,
@@ -2602,7 +2645,7 @@ fn op_killed(store: &Store, run_id: &str, name: &str, msg: &str) {
         // about the work having stopped rather than about having asked it to
         Some(&json!({ "reason": msg, "stopped": true })),
     ));
-    note(store.op_finished(run_id, name, OpStatus::Canceled, None, None, Some(msg)));
+    note(store.op_finished(run_id, name, OpStatus::Canceled, None, None, Some(msg), &[]));
 }
 
 // canceled, but only the request is a fact: the op never joined, so it gets no
@@ -2706,10 +2749,11 @@ async fn run_op(
             op = %name,
             attempt
         );
-        // fresh buffers per attempt: a failed attempt's staged state and
-        // metadata must not leak into the one that works
+        // fresh buffers per attempt: a failed attempt's staged state,
+        // metadata and asset builds must not leak into the one that works
         let new_state = Arc::new(Mutex::new(None));
         let new_meta: MetaBuf = Arc::new(Mutex::new(BTreeMap::new()));
+        let built: op::BuiltBuf = Arc::new(Mutex::new(Vec::new()));
         // one more stop signal per attempt, flipped by this attempt's timeout;
         // the run's own cancel channel is the other half
         let (expired, on_expiry) = watch::channel(false);
@@ -2764,6 +2808,7 @@ async fn run_op(
             new_fingerprint: Arc::new(Mutex::new(None)),
             new_meta: new_meta.clone(),
             new_per_asset: Arc::new(Mutex::new(BTreeMap::new())),
+            built: built.clone(),
             store: store.clone(),
             slot: slot.clone(),
         };
@@ -2869,6 +2914,10 @@ async fn run_op(
                         output,
                         state: new_state.lock().unwrap().take(),
                         meta,
+                        // what the body says it built, which is not yet a fact
+                        // about anything: the run writes it when the output is
+                        // stored and the op run says success
+                        built: op::staged_builds(&built),
                     },
                 );
             }
@@ -3002,7 +3051,7 @@ fn skip_downstream(
                 reason,
                 Some(&json!({ "reason": reason, "upstream": root })),
             ));
-            note(store.op_finished(run_id, &name, OpStatus::Skipped, None, None, None));
+            note(store.op_finished(run_id, &name, OpStatus::Skipped, None, None, None, &[]));
             statuses.insert(name, OpStatus::Skipped);
         } else {
             i += 1;

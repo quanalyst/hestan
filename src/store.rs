@@ -2004,6 +2004,15 @@ impl Store {
     /// the op's terminal write. `metadata` is whatever the successful attempt
     /// staged with `ctx.meta`, committed here so an op run never claims facts
     /// about work that did not finish.
+    ///
+    /// `built` is what an [asset](crate::Asset) op produced, and it goes in
+    /// this transaction for the same reason: a materialization says the asset
+    /// is current, which is a claim about an op that succeeded and an output
+    /// that was stored. written before this and the claim outlives every way
+    /// the op can still fail; written after it and a crash in the gap leaves a
+    /// build nothing recorded. an op that produces several assets writes all
+    /// of them here or none of them.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn op_finished(
         &self,
         run_id: &str,
@@ -2012,16 +2021,20 @@ impl Store {
         output: Option<&Value>,
         metadata: Option<&Value>,
         error: Option<&str>,
+        built: &[Built],
     ) -> Result<(), Error> {
+        let at = Utc::now();
+        let mut conn = self.conn();
+        let mut tx = conn.begin()?;
         // pid goes with it: the row says where an op is running, and nothing is
         // running once this write lands
-        self.conn().execute(
+        tx.execute(
             "UPDATE op_runs SET status = ?1, finished_at = ?2, output = ?3, metadata = ?4,
                  error = ?5, pid = NULL
              WHERE run_id = ?6 AND op = ?7",
             args![
                 status.as_str(),
-                Utc::now().to_rfc3339(),
+                at.to_rfc3339(),
                 output.map(|v| v.to_string()),
                 metadata.map(|v| v.to_string()),
                 error,
@@ -2029,6 +2042,10 @@ impl Store {
                 op,
             ],
         )?;
+        for one in built {
+            write_materialization(&mut tx, one, Some(run_id), at)?;
+        }
+        tx.commit()?;
         Ok(())
     }
 
@@ -3079,17 +3096,16 @@ impl Store {
         })
     }
 
-    /// append a materialization. the table is history, so a rebuild that came
-    /// out fingerprint-identical is still an entry — that a build happened and
-    /// that it changed anything are different facts.
+    /// append a materialization outside any op's terminal write: a
+    /// [source](crate::AssetBuilder::source) asset a probe found new bytes
+    /// for, and the fixtures the suites build histories out of. a build an op
+    /// did goes through [`op_finished`](Store::op_finished) instead, which is
+    /// the whole difference between a row that observes something and a row
+    /// that asserts an op succeeded.
     ///
-    /// `partition` is the key one build of a [partitioned
-    /// asset](crate::Partitions) produced, and `None` for every unpartitioned
-    /// one: history, staleness and seeding are all per `(asset, partition)`.
-    ///
-    /// the [event](EventKind::AssetMaterialized) goes in the same transaction:
-    /// "this asset was built" is exactly what this row is, and an event written
-    /// beside it would be a second copy that a crash can disagree with.
+    /// the table is history, so a rebuild that came out fingerprint-identical
+    /// is still an entry — that a build happened and that it changed anything
+    /// are different facts.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn record_materialization(
         &self,
@@ -3102,44 +3118,17 @@ impl Store {
         metadata: Option<&Value>,
     ) -> Result<(), Error> {
         let at = Utc::now();
+        let built = Built {
+            asset: asset.to_string(),
+            partition: partition.map(str::to_string),
+            fingerprint: fingerprint.to_string(),
+            inputs: inputs.clone(),
+            value: value.cloned(),
+            meta: metadata.cloned(),
+        };
         let mut conn = self.conn();
         let mut tx = conn.begin()?;
-        tx.execute(
-            "INSERT INTO asset_materializations
-                 (asset, partition, fingerprint, inputs, value, run_id, built_at, metadata)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-            args![
-                asset,
-                partition,
-                fingerprint,
-                inputs.to_string(),
-                value.map(|v| v.to_string()),
-                run_id,
-                at.to_rfc3339(),
-                metadata.map(|v| v.to_string()),
-            ],
-        )?;
-        let message = match partition {
-            None => format!("{asset} materialized"),
-            Some(key) => format!("{asset}[{key}] materialized"),
-        };
-        let event = NewEvent::about(
-            SubjectKind::Asset,
-            asset,
-            EventKind::AssetMaterialized,
-            message,
-        )
-        .data(json!({
-            "partition": partition,
-            "fingerprint": fingerprint,
-            // where it happened, which is not what it is about — a probe
-            // materializes outside any run and this is null there
-            "run_id": run_id,
-            // what the build reported, exactly as the op run carries it: the
-            // rows, the bytes and the seconds are already tagged `Meta`
-            "meta": metadata,
-        }));
-        write_event(&mut tx, &event, at)?;
+        write_materialization(&mut tx, &built, run_id, at)?;
         tx.commit()?;
         Ok(())
     }
@@ -4260,6 +4249,79 @@ fn write_event(tx: &mut impl Exec, ev: &NewEvent<'_>, at: DateTime<Utc>) -> Resu
     Ok(())
 }
 
+/// one asset build on its way into the history, everything about it that only
+/// the op body could know.
+///
+/// staged by the body that computed it — the fingerprint, what it was built
+/// from, the value, what the build reported — and written by whoever knows the
+/// build actually landed. for an op that is
+/// [`op_finished`](Store::op_finished), in the transaction that records the op
+/// succeeding, because "this asset is current" is not a separate fact from
+/// "the op that built it worked".
+pub(crate) struct Built {
+    pub(crate) asset: String,
+    /// the key one build of a [partitioned asset](crate::Partitions) produced,
+    /// and `None` for every unpartitioned one: history, staleness and seeding
+    /// are all per `(asset, partition)`.
+    pub(crate) partition: Option<String>,
+    pub(crate) fingerprint: String,
+    pub(crate) inputs: Value,
+    pub(crate) value: Option<Value>,
+    pub(crate) meta: Option<Value>,
+}
+
+/// insert one materialization and the [event](EventKind::AssetMaterialized)
+/// that says so, inside the caller's transaction.
+///
+/// the event goes in that transaction rather than beside it for the reason
+/// every other event does: "this asset was built" is exactly what this row is,
+/// and a second copy written next to it is a copy a crash can disagree with.
+fn write_materialization(
+    tx: &mut impl Exec,
+    built: &Built,
+    run_id: Option<&str>,
+    at: DateTime<Utc>,
+) -> Result<(), Error> {
+    let partition = built.partition.as_deref();
+    tx.execute(
+        "INSERT INTO asset_materializations
+             (asset, partition, fingerprint, inputs, value, run_id, built_at, metadata)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        args![
+            built.asset.as_str(),
+            partition,
+            built.fingerprint.as_str(),
+            built.inputs.to_string(),
+            built.value.as_ref().map(|v| v.to_string()),
+            run_id,
+            at.to_rfc3339(),
+            built.meta.as_ref().map(|v| v.to_string()),
+        ],
+    )?;
+    let message = match partition {
+        None => format!("{} materialized", built.asset),
+        Some(key) => format!("{}[{key}] materialized", built.asset),
+    };
+    let event = NewEvent::about(
+        SubjectKind::Asset,
+        built.asset.as_str(),
+        EventKind::AssetMaterialized,
+        message,
+    )
+    .data(json!({
+        "partition": partition,
+        "fingerprint": built.fingerprint,
+        // where it happened, which is not what it is about — a probe
+        // materializes outside any run and this is null there
+        "run_id": run_id,
+        // what the build reported, exactly as the op run carries it: the
+        // rows, the bytes and the seconds are already tagged `Meta`
+        "meta": built.meta,
+    }));
+    write_event(tx, &event, at)?;
+    Ok(())
+}
+
 /// insert one notification, due immediately. inside whatever transaction the
 /// caller is already in — that is the only way it is worth anything.
 fn queue_note(tx: &mut impl Exec, payload: &Value, at: DateTime<Utc>) -> Result<(), Error> {
@@ -4579,10 +4641,11 @@ mod tests {
                     Some(&json!({"rows": 3})),
                     Some(&json!({"rows": {"int": 3}})),
                     None,
+                    &[],
                 )
                 .unwrap();
             store
-                .op_finished("r1", "b", OpStatus::Failed, None, None, Some("boom"))
+                .op_finished("r1", "b", OpStatus::Failed, None, None, Some("boom"), &[])
                 .unwrap();
             store
                 .run_finished("r1", RunStatus::Failed, None, Utc::now(), None)
@@ -5870,7 +5933,7 @@ mod tests {
             store.create_run(&done, &["a".into()]).unwrap();
             store.run_started("done", Utc::now()).unwrap();
             store
-                .op_finished("done", "a", OpStatus::Success, None, None, None)
+                .op_finished("done", "a", OpStatus::Success, None, None, None, &[])
                 .unwrap();
             store
                 .run_finished("done", RunStatus::Success, None, Utc::now(), None)
@@ -6503,7 +6566,7 @@ mod tests {
         );
         // and the terminal write hands the process back
         store
-            .op_finished("r1", "a", OpStatus::Success, None, None, None)
+            .op_finished("r1", "a", OpStatus::Success, None, None, None, &[])
             .unwrap();
         assert_eq!(store.op_run("r1", "a").unwrap().unwrap().pid, None);
     }
@@ -7152,6 +7215,64 @@ mod tests {
         });
     }
 
+    // an asset build is written by the transaction that records the op, so
+    // that write is the one both backends have to be run through
+    #[test]
+    fn an_ops_terminal_write_carries_what_it_built() {
+        both(|db| {
+            let store = db.store();
+            let run = mk_run("r1", "assets", Utc::now());
+            store.create_run(&run, &["split".into()]).unwrap();
+            store.op_started("r1", "split", 1).unwrap();
+            let built = |asset: &str, rows: i64| Built {
+                asset: asset.to_string(),
+                partition: Some("2024-01-01".to_string()),
+                fingerprint: format!("{asset}-fp"),
+                inputs: json!({ "source": "s-fp" }),
+                value: Some(json!({ "rows": rows })),
+                meta: Some(json!({ "rows": { "int": rows } })),
+            };
+            store
+                .op_finished(
+                    "r1",
+                    "split",
+                    OpStatus::Success,
+                    Some(&json!("out")),
+                    None,
+                    None,
+                    &[built("clean", 2), built("rejected", 1)],
+                )
+                .unwrap();
+
+            let op = store.op_run("r1", "split").unwrap().unwrap();
+            assert_eq!(op.status, OpStatus::Success);
+            for (asset, rows) in [("clean", 2), ("rejected", 1)] {
+                let m = store
+                    .materialization(asset, Some("2024-01-01"))
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(m.fingerprint, format!("{asset}-fp"));
+                assert_eq!(m.inputs, json!({ "source": "s-fp" }));
+                assert_eq!(m.value, Some(json!({ "rows": rows })));
+                assert_eq!(m.run_id.as_deref(), Some("r1"));
+                assert_eq!(m.metadata, Some(json!({ "rows": { "int": rows } })));
+            }
+            // the rows, and the events that announce them, in the one write
+            let q = EventQuery {
+                kind: Some(EventKind::AssetMaterialized),
+                ..EventQuery::default()
+            };
+            let mut said: Vec<String> = store
+                .event_log(&q, 10)
+                .unwrap()
+                .into_iter()
+                .filter_map(|e| e.subject)
+                .collect();
+            said.sort();
+            assert_eq!(said, ["clean", "rejected"]);
+        });
+    }
+
     fn record(store: &Store, asset: &str, fp: &str) {
         store
             .record_materialization(asset, None, fp, &json!({}), None, None, None)
@@ -7257,6 +7378,7 @@ mod tests {
                         None,
                         reported.map(meta).as_ref(),
                         None,
+                        &[],
                     )
                     .unwrap();
             }
@@ -7264,7 +7386,15 @@ mod tests {
             let other = mk_run("x", "elsewhere", at(9));
             store.create_run(&other, &["load".into()]).unwrap();
             store
-                .op_finished("x", "load", OpStatus::Success, None, Some(&meta(999)), None)
+                .op_finished(
+                    "x",
+                    "load",
+                    OpStatus::Success,
+                    None,
+                    Some(&meta(999)),
+                    None,
+                    &[],
+                )
                 .unwrap();
 
             let now = mk_run("r9", "etl", at(9));
@@ -7822,6 +7952,7 @@ mod tests {
                         None,
                         reported.as_ref(),
                         None,
+                        &[],
                     )
                     .unwrap();
             }
@@ -7966,7 +8097,7 @@ mod tests {
 
             // and the terminal write hands the process back
             store
-                .op_finished("r1", "a", OpStatus::Success, None, None, None)
+                .op_finished("r1", "a", OpStatus::Success, None, None, None, &[])
                 .unwrap();
             assert_eq!(store.op_run("r1", "a").unwrap().unwrap().pid, None);
         });

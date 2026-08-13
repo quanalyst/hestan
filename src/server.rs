@@ -2448,21 +2448,29 @@ mod tests {
         }
         // oldest run succeeded end to end
         store
-            .op_finished("r0", "a", OpStatus::Success, None, None, None)
+            .op_finished("r0", "a", OpStatus::Success, None, None, None, &[])
             .unwrap();
         store.op_started("r0", "b", 1).unwrap();
         store
-            .op_finished("r0", "b", OpStatus::Success, None, None, None)
+            .op_finished("r0", "b", OpStatus::Success, None, None, None, &[])
             .unwrap();
         // the two newer runs failed at a, skipping b (never started). the
         // first of them still reported facts before it failed
         for (id, msg) in [("r1", "db locked"), ("r2", "timeout")] {
             let meta = (id == "r1").then(|| json!({"rows": {"count": 4}}));
             store
-                .op_finished(id, "a", OpStatus::Failed, None, meta.as_ref(), Some(msg))
+                .op_finished(
+                    id,
+                    "a",
+                    OpStatus::Failed,
+                    None,
+                    meta.as_ref(),
+                    Some(msg),
+                    &[],
+                )
                 .unwrap();
             store
-                .op_finished(id, "b", OpStatus::Skipped, None, None, None)
+                .op_finished(id, "b", OpStatus::Skipped, None, None, None, &[])
                 .unwrap();
         }
 
@@ -2559,7 +2567,15 @@ mod tests {
             store.op_started(&run.id, op, 1).unwrap();
         }
         store
-            .op_finished(&run.id, "fetch[0]", OpStatus::Success, None, None, None)
+            .op_finished(
+                &run.id,
+                "fetch[0]",
+                OpStatus::Success,
+                None,
+                None,
+                None,
+                &[],
+            )
             .unwrap();
         store
             .op_finished(
@@ -2569,10 +2585,19 @@ mod tests {
                 None,
                 None,
                 Some("no"),
+                &[],
             )
             .unwrap();
         store
-            .op_finished(&run.id, "keys[extra]", OpStatus::Success, None, None, None)
+            .op_finished(
+                &run.id,
+                "keys[extra]",
+                OpStatus::Success,
+                None,
+                None,
+                None,
+                &[],
+            )
             .unwrap();
 
         let Json(body) = op_stats(
@@ -4130,6 +4155,7 @@ mod tests {
                 Some(&json!(1)),
                 None,
                 None,
+                &[],
             )
             .unwrap();
         let (status, Json(b)) = resume(&st, "clean", "").await.unwrap_err();

@@ -1703,7 +1703,7 @@ fn one_slot_runner(jobs: [Job; 2]) -> Runner {
 // the body started is still running when it does — so the slot has to outlive
 // the task. it does because blocking work holds the ctx it polls for the
 // cancel, and the slot rides that ctx.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_pool_slot_is_held_until_the_work_it_admitted_stops() {
     let calling = Arc::new(AtomicBool::new(false));
     let finish = Arc::new(AtomicBool::new(false));
@@ -1773,7 +1773,7 @@ async fn a_pool_slot_is_held_until_the_work_it_admitted_stops() {
 
 // the other half of the same rule: an op that yields is aborted as promptly as
 // it ever was, and its slot goes back with it rather than waiting on anything.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_canceled_op_that_yields_gives_its_slot_back_at_once() {
     let running = Arc::new(AtomicBool::new(false));
     let started = Arc::new(AtomicBool::new(false));
