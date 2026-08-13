@@ -1043,8 +1043,26 @@ impl Runner {
     }
 
     /// the runs this process is executing, by id.
+    ///
+    /// the claim it has given up on is not one of them: the row still names
+    /// this process and it is not executing it, which is the difference a
+    /// reader has to be able to see.
     pub(crate) fn holding(&self) -> Result<Vec<String>, Error> {
-        self.store.held_by(self.claimer)
+        let given_up = self.abandoned.lock().unwrap();
+        Ok(self
+            .store
+            .held_by(self.claimer)?
+            .into_iter()
+            .filter(|id| !given_up.contains(id))
+            .collect())
+    }
+
+    /// the runs this process claimed and could not record, waiting on a
+    /// reclaimer. empty in every deployment whose store is working.
+    pub(crate) fn given_up(&self) -> Vec<String> {
+        let mut ids: Vec<String> = self.abandoned.lock().unwrap().iter().cloned().collect();
+        ids.sort();
+        ids
     }
 
     /// one turn of the lease loop: say this process is still here, then take

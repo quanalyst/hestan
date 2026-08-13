@@ -2295,6 +2295,7 @@ async fn doctor(reach: Reach, out: &Out) -> Result<(), Fail> {
             store.schema_version()?
         ),
     ));
+    findings.push(check_store_writes(store));
     findings.extend(check_schedules(store)?);
     findings.extend(check_sensors(store)?);
     findings.extend(check_leases(store, Utc::now())?);
@@ -2345,6 +2346,30 @@ async fn doctor(reach: Reach, out: &Out) -> Result<(), Fail> {
     match wrong {
         true => Err(Fail::new(Exit::Actionable, "something above is actionable")),
         false => Ok(()),
+    }
+}
+
+/// whether the store would take a write, asked without making one.
+///
+/// the claim it makes is exactly as small as it is: a transaction opened for
+/// writing and rolled back says the database took a write lock a moment ago,
+/// which is what a run needs and is not the same as the store being well. it
+/// is the half of "why is nothing being recorded" that a command line can
+/// answer from outside the deployment — a file whose permissions changed, a
+/// disk mounted read-only, another writer holding the lock past the busy
+/// timeout, a postgres nobody can reach. what this process has *seen* a store
+/// do is the other half, and only a running deployment has that: it is on
+/// `GET /api/health`, and [`remote_doctor`] is what reads it.
+fn check_store_writes(store: &Store) -> Finding {
+    match store.writable() {
+        Ok(()) => Finding::ok("writes", "the store took a write lock and gave it back"),
+        Err(e) => Finding::wrong(
+            "writes",
+            format!("the store will not take a write: {e}"),
+            "nothing can be recorded about a run until this is fixed, and a process that \
+             finds it mid-run stops rather than reporting an outcome nothing holds — \
+             check permissions, free space, and whether another writer is holding the lock",
+        ),
     }
 }
 
@@ -2559,36 +2584,89 @@ async fn remote_doctor(api: &Api, out: &Out) -> Result<(), Fail> {
             "give it Hestan::auth(Auth::bearer(…)), or keep it on loopback",
         ),
     };
-    let unchecked = [
-        "the store, the schedules, the sensors, the leases, the queue, the retention \
-         policy and the disk, which an http api exposes none of — point --db at the \
-         database, or run doctor in the deployment's own binary",
+    let mut findings = vec![finding];
+    let mut unchecked = vec![
+        "the schedules, the sensors, the leases, the queue, the retention policy and \
+         the disk, which an http api exposes none of — point --db at the database, or \
+         run doctor in the deployment's own binary",
     ];
+    // the one thing only the running process knows: what its store has
+    // actually done with the writes it made. behind the guard, so a doctor
+    // with no credential says it could not look rather than that all is well
+    match api.get("/api/health").await {
+        Ok(health) => findings.push(check_remote_store(&health)),
+        Err(_) => unchecked.push(
+            "whether its store is taking writes, which is behind the guard — pass \
+             --token, or set HESTAN_TOKEN",
+        ),
+    }
+
+    let wrong = findings.iter().any(|f| f.level == Level::Wrong);
     if out.json {
         out.object(&json!({
-            "ok": true,
-            "findings": [finding.json()],
+            "ok": !wrong,
+            "findings": findings.iter().map(Finding::json).collect::<Vec<_>>(),
             "unchecked": unchecked,
         }));
     } else if out.quiet {
-        if finding.level != Level::Ok {
+        for finding in findings.iter().filter(|f| f.level != Level::Ok) {
             println!("{} {}", finding.level.as_str(), finding.says);
         }
     } else {
-        println!(
-            "{:<5} {:<10} {}",
-            out.paint(finding.level.as_str(), finding.level.color()),
-            finding.check,
-            finding.says
-        );
-        if let Some(fix) = &finding.fix {
-            println!("      {:<10} {}", "", out.paint(fix, DIM));
+        for finding in &findings {
+            println!(
+                "{:<5} {:<10} {}",
+                out.paint(finding.level.as_str(), finding.level.color()),
+                finding.check,
+                finding.says
+            );
+            if let Some(fix) = &finding.fix {
+                println!("      {:<10} {}", "", out.paint(fix, DIM));
+            }
         }
         for missed in unchecked {
             println!("{:<5} {:<10} {missed}", "-", "not checked");
         }
     }
-    Ok(())
+    match wrong {
+        true => Err(Fail::new(Exit::Actionable, "something above is actionable")),
+        false => Ok(()),
+    }
+}
+
+/// what a deployment says about its own store on `GET /api/health`.
+///
+/// a process that cannot record what its runs do has stopped claiming new ones
+/// and is leaving what it holds for a reclaimer, so this is the difference
+/// between "nothing is running" and "nothing is running and nobody knows what
+/// happened to the last of it".
+fn check_remote_store(health: &Value) -> Finding {
+    let store = &health["store"];
+    let dropped = store["dropped_writes"].as_u64().unwrap_or(0);
+    let unrecorded = store["unrecorded_writes"].as_u64().unwrap_or(0);
+    if store["writing"].as_bool() == Some(false) {
+        return Finding::wrong(
+            "writes",
+            format!(
+                "its store is refusing writes: {unrecorded} run outcome(s) and {dropped} \
+                 event(s) have gone unrecorded, and it has stopped claiming runs"
+            ),
+            "it will start again on its own when a write lands — the lease loop tries \
+             every 15 seconds — so this is about the database rather than about hestan",
+        );
+    }
+    if unrecorded > 0 || dropped > 0 {
+        return Finding::note(
+            "writes",
+            format!(
+                "its store is taking writes now, having lost {unrecorded} run outcome(s) \
+                 and {dropped} event(s) since this process started"
+            ),
+            "a run it could not record is left for a reclaimer: look for run_reclaimed \
+             in the event log around then",
+        );
+    }
+    Finding::ok("writes", "its store has taken every write it has made")
 }
 
 /// free space where the run log lives.
@@ -3630,6 +3708,60 @@ mod tests {
         let nearly = check_disk("/x.db", 1, 1000);
         assert_eq!(nearly.level, Level::Wrong);
         assert!(nearly.says.contains("0%"), "{}", nearly.says);
+    }
+
+    // the check a command line can make from outside a deployment: whether the
+    // database it is pointed at would take a write at all
+    #[test]
+    fn doctor_says_whether_the_store_would_take_a_write() {
+        let store = Store::open(":memory:").unwrap();
+        let taken = check_store_writes(&store);
+        assert_eq!(taken.level, Level::Ok);
+        assert!(taken.says.contains("write lock"), "{}", taken.says);
+
+        // and a database that will not is actionable, since nothing can be
+        // recorded about any run until it is fixed
+        store.refuse_writes().unwrap();
+        let refused = check_store_writes(&store);
+        assert_eq!(refused.level, Level::Wrong);
+        assert!(
+            refused.says.contains("will not take a write"),
+            "{}",
+            refused.says
+        );
+        assert!(refused.fix.is_some());
+    }
+
+    // and the half only the deployment knows, read back off its own health
+    // endpoint: a store that is refusing writes is actionable, one that lost
+    // something and recovered is worth a line, and neither is silence
+    #[test]
+    fn doctor_reads_a_deployments_own_account_of_its_store() {
+        let well = json!({
+            "ok": true,
+            "store": {"writing": true, "dropped_writes": 0, "unrecorded_writes": 0},
+        });
+        assert_eq!(check_remote_store(&well).level, Level::Ok);
+
+        let recovered = json!({
+            "ok": true,
+            "store": {"writing": true, "dropped_writes": 4, "unrecorded_writes": 1},
+        });
+        let note = check_remote_store(&recovered);
+        assert_eq!(note.level, Level::Note);
+        assert!(note.says.contains("1 run outcome(s)"), "{}", note.says);
+
+        let failing = json!({
+            "ok": false,
+            "store": {"writing": false, "dropped_writes": 0, "unrecorded_writes": 2},
+        });
+        let wrong = check_remote_store(&failing);
+        assert_eq!(wrong.level, Level::Wrong);
+        assert!(wrong.says.contains("stopped claiming"), "{}", wrong.says);
+
+        // an api that says nothing about its store — an older deployment — is
+        // not reported as broken
+        assert_eq!(check_remote_store(&json!({"ok": true})).level, Level::Ok);
     }
 
     #[test]

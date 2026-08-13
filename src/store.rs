@@ -1292,13 +1292,11 @@ impl Health {
 
     /// how many events, log lines and other best-effort writes this store has
     /// lost.
-    #[cfg(test)]
     pub(crate) fn dropped_writes(&self) -> u64 {
         self.dropped.load(Ordering::Relaxed)
     }
 
     /// how many times something a run did could not be written down.
-    #[cfg(test)]
     pub(crate) fn unrecorded_writes(&self) -> u64 {
         self.unrecorded.load(Ordering::Relaxed)
     }
@@ -1879,6 +1877,27 @@ impl Store {
         };
         let version = conn.query_opt(sql, args![], |r| r.int(0))?;
         Ok(version.unwrap_or_default() as u32)
+    }
+
+    /// whether this database would take a write, asked without making one.
+    ///
+    /// a transaction opened for writing and rolled back: on sqlite that takes
+    /// the write lock, so it answers for the file's permissions *and* for
+    /// another writer holding it past the [busy timeout](BUSY_TIMEOUT); on
+    /// postgres it answers for the connection. neither leaves a row behind,
+    /// which is what lets `doctor` ask it of a live deployment's database.
+    ///
+    /// this is the question a process that has not written anything yet cannot
+    /// answer from its [health](Store::health) — those counters are what *this*
+    /// process has seen, and a command line that just started has seen nothing.
+    #[cfg(any(test, feature = "cli"))]
+    pub(crate) fn writable(&self) -> Result<(), Error> {
+        let mut conn = self.conn();
+        let tx = conn.begin_immediate()?;
+        // dropped rather than committed: there is nothing in it, and asking is
+        // not a reason to write to somebody's run log
+        drop(tx);
+        Ok(())
     }
 
     /// which backend this is and where, for a line that says what was opened.
@@ -4227,7 +4246,20 @@ impl Store {
         Ok(())
     }
 
-    /// drop a table, so that every read touching it fails. a test proving a
+    /// refuse every write from here on, the way a database mounted read-only
+    /// or opened without permission does. tests only.
+    ///
+    /// sqlite has a switch for exactly this. postgres has no per-connection
+    /// equivalent that a transaction cannot simply open anyway, so the
+    /// [writable](Self::writable) probe is asked of sqlite, where the answer
+    /// means something on both.
+    #[cfg(test)]
+    pub(crate) fn refuse_writes(&self) -> Result<(), Error> {
+        self.conn().execute("PRAGMA query_only = ON", args![])?;
+        Ok(())
+    }
+
+    /// drop a table, so that every read touching it fails.    /// drop a table, so that every read touching it fails. a test proving a
     /// control-plane read fails closed has no other way to break one.
     #[cfg(test)]
     pub(crate) fn drop_table(&self, name: &str) -> Result<(), Error> {
@@ -9358,6 +9390,21 @@ mod tests {
         assert_eq!(
             killer.op_run("r1", "a").unwrap().unwrap().status,
             OpStatus::Pending
+        );
+    }
+
+    // sqlite's read-only switch, which is what a doctor's probe has to be able
+    // to see: `writable` is a claim about a write lock, so a database that
+    // will not give one must come back as a refusal rather than as an `ok`
+    #[test]
+    fn a_store_that_will_not_take_a_write_says_so_when_asked() {
+        let store = Store::open(":memory:").unwrap();
+        store.writable().unwrap();
+        store.refuse_writes().unwrap();
+        let refused = store.writable().unwrap_err();
+        assert!(
+            refused.to_string().contains("readonly") || refused.to_string().contains("read-only"),
+            "{refused}"
         );
     }
 

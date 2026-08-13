@@ -417,17 +417,38 @@ pub(crate) fn job_summary(
     }))
 }
 
-/// who this process is and what it is holding.
+/// who this process is, what it is holding, and whether its store is taking
+/// what it writes.
 ///
 /// the instance id is what a run row's `claimed_by` carries, so this is how you
 /// tell which of three workers is executing the run you are looking at — and,
 /// pointed at each of them in turn, which one has gone quiet.
+///
+/// **`ok` is false while the store is refusing writes**, because a control
+/// plane that reports health while run outcomes are going missing is the
+/// specific failure this endpoint exists to catch. a process in that state has
+/// also stopped claiming, so a green load balancer in front of it would be
+/// pointing at something doing no work and saying nothing about it.
 async fn health(State(st): State<AppState>) -> Json<Value> {
     let holding = st.runner.holding().unwrap_or_default();
+    let store = st.runner.store().health();
     Json(json!({
-        "ok": true,
+        "ok": !store.failing(),
         "instance": st.runner.instance(),
         "holding": holding,
+        "store": {
+            // what the last write did, which is what decides whether this
+            // process is claiming anything
+            "writing": !store.failing(),
+            // and the totals since it started, which do not go down: a
+            // deployment that dropped a hundred events an hour ago dropped
+            // them, and the run pages that are missing them stay missing them
+            "dropped_writes": store.dropped_writes(),
+            "unrecorded_writes": store.unrecorded_writes(),
+            // runs this process claimed and could not record. they are nobody's
+            // work now until a lease runs out and a reclaimer settles them
+            "given_up": st.runner.given_up(),
+        },
     }))
 }
 
@@ -5572,7 +5593,46 @@ mod tests {
         assert!(content_type.starts_with("text/html"), "{content_type}");
     }
 
-    // ------------------------------------------------------------- the guard
+    // a control plane that says it is fine while run outcomes go missing is
+    // the specific failure this endpoint exists to catch, so the store's own
+    // answer is what `ok` is made of
+    #[tokio::test]
+    async fn health_is_not_ok_while_the_store_is_refusing_writes() {
+        let st = state(vec![]);
+        let (status, body, _) = request(router(st.clone()), Method::GET, "/api/health").await;
+        assert_eq!(status, StatusCode::OK);
+        let body = body.unwrap();
+        assert_eq!(body["ok"], true);
+        assert_eq!(body["store"]["writing"], true);
+        assert_eq!(body["store"]["unrecorded_writes"], 0);
+
+        // one write that will not land, exactly as a run would have made it
+        let store = st.runner.store().clone();
+        store.fail_writes(u64::MAX);
+        assert!(
+            !store
+                .landed("op_finished", || store.op_finished(
+                    "r1",
+                    "a",
+                    OpStatus::Success,
+                    None,
+                    None,
+                    None,
+                    &[]
+                ))
+                .await
+        );
+
+        let (status, body, _) = request(router(st), Method::GET, "/api/health").await;
+        // still a 200: the endpoint answered, and what it answered is the news
+        assert_eq!(status, StatusCode::OK);
+        let body = body.unwrap();
+        assert_eq!(body["ok"], false);
+        assert_eq!(body["store"]["writing"], false);
+        assert_eq!(body["store"]["unrecorded_writes"], 1);
+    }
+
+    // ------------------------------------------------------------- the guard    // ------------------------------------------------------------- the guard
 
     /// every read the api serves, and every mutation, by the route each one
     /// matches.

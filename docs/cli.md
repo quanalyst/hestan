@@ -251,6 +251,7 @@ thing it is about is worse than no check at all.
 ```
 $ orders doctor
 ok    store      sqlite at /var/lib/hestan.db, schema v18
+ok    writes     the store took a write lock and gave it back
 ok    schedules  2 of 2 parse
 note  schedules  paused, so they will not fire: warehouse_healthcheck
                  unpause schedule warehouse_healthcheck
@@ -270,6 +271,7 @@ what it checks, and what each one can actually see:
 | check | it finds | needs |
 | ----- | -------- | ----- |
 | store | that the database opened, which backend it is, and what schema version | a store |
+| writes | that the database would take a write — a file whose permissions changed, a disk mounted read-only, another writer holding the lock. nothing is recorded about any run while this is wrong | a store |
 | schedules | a cron expression or a timezone that no longer resolves, so the schedule silently never fires again | a store |
 | schedules, sensors | anything paused, which is the answer to "why is nothing running" often enough to be worth a line | a store |
 | leases | runs claimed by a process that stopped renewing, which nothing is reclaiming if nothing is running a lease loop | a store |
@@ -286,9 +288,13 @@ be, which is what makes the other two believable.
 `--json` gives `{"ok": bool, "findings": [...], "unchecked": [...]}` with a
 `fix` on everything actionable.
 
-over `--server` doctor answers the one question http can, and says plainly that
-it saw nothing else: whether the deployment [checks who is
-asking](auth.md), and — with a token — who it makes you. the store, the
+over `--server` doctor answers the two questions http can, and says plainly
+that it saw nothing else. whether the deployment [checks who is
+asking](auth.md), and — with a token — who it makes you; and, with that same
+token, whether its store is taking the writes it makes, which is the one thing
+only the running process knows. that second one is `wrong` when run outcomes
+are going unrecorded — the process has stopped claiming and is leaving what it
+holds for a reclaimer — and a `note` when it lost something and recovered. the
 schedules, the sensors, the leases, the queue, the retention policy and the
 disk are listed as not checked, because an api exposes none of them. point
 `--db` at the database, or run it in the deployment's own binary, for the rest.

@@ -15,7 +15,7 @@ page is for writing something that is not hestan.
 
 | method | path | purpose |
 | --- | --- | --- |
-| GET | `/api/health` | liveness, this process's instance id, and what it is holding |
+| GET | `/api/health` | liveness, this process's instance id, what it is holding, and whether its store is taking writes |
 | GET | `/api/resources` | registered resources: names and types |
 | GET | `/api/jobs` | all job summaries, sorted by name |
 | GET | `/api/jobs/{name}` | one job summary |
@@ -186,8 +186,32 @@ a [split deployment](scaling.md#roles) in turn, that answers "which worker has
 my run" and "which one has gone quiet".
 
 ```json
-{"ok": true, "instance": "3f2a91cc", "holding": ["0192...", "0192..."]}
+{
+  "ok": true,
+  "instance": "3f2a91cc",
+  "holding": ["0192...", "0192..."],
+  "store": {
+    "writing": true,
+    "dropped_writes": 0,
+    "unrecorded_writes": 0,
+    "given_up": []
+  }
+}
 ```
+
+`store` is what this process has seen its run log do. **`ok` is `false`
+whenever `writing` is** — a process whose store is refusing writes has also
+stopped claiming runs, and a control plane that reported it healthy while run
+outcomes went missing is the thing this field exists to prevent. `writing` is
+about the last write attempted, so it goes back to `true` on its own as soon
+as one lands; the lease loop makes one every 15 seconds.
+
+The two counts do not go down. `dropped_writes` is best-effort writes lost —
+events and captured log lines, which a run survives. `unrecorded_writes` is
+the other kind: something a run *did* that could not be written down, after
+retries. `given_up` lists the runs this process stopped executing for that
+reason; each is waiting for its lease to lapse so a reclaimer can settle it.
+See [what hestan promises about writes](concepts.md#what-hestan-promises-about-writes).
 
 `GET /api/queue` is the queue itself: runs nobody has claimed, in the order a
 dispatcher will take them.

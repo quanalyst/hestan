@@ -186,6 +186,64 @@ terminal event (`run_failed` / `run_success` / `run_canceled`) is committed
 before the terminal status, so anything that observes a finished run can also
 read its closing event.
 
+## What hestan promises about writes
+
+**a run never reports an outcome the run log did not take.** every status you
+read — an op that succeeded, a run that failed, an asset that was built — is a
+row that landed, not a thing the process believed at the time.
+
+there are two kinds of write behind that, and the difference is deliberate:
+
+- **what a run did** is critical: an op's terminal row, a run's terminal row,
+  an op starting, a fan-out instance's row, a committed
+  [watermark](state.md). one that fails is retried — four attempts, capped
+  exponential with full jitter, under a second in the worst case — because a
+  busy database is the ordinary reason a write does not land and it is over in
+  milliseconds.
+- **what a run said** is best-effort: the [event log](events.md) and captured
+  [op output](logs.md). losing a line of narration is survivable where losing
+  a run's outcome is not, so these are let go rather than retried. they are
+  not let go *silently*: the count is on `GET /api/health`, and a store
+  dropping them says so there.
+
+what makes this a guarantee rather than a convention is that the two are
+different types in the source. an event write returns a value the "let it go"
+path accepts and a critical write does not, so dropping a run's outcome is a
+compile error rather than a thing somebody has to remember not to write.
+
+### When a write cannot land at all
+
+after its retries, a critical write can still fail: a disk that is full, a
+database that is gone, a postgres connection that died. **the run stops
+there.** it does not report success, and it does not report failure either,
+because at that point this process does not know what is true — the work may
+well have finished, and the row that would say so is the write that did not
+land. reporting either way is picking one of two guesses.
+
+what it leaves behind is worth stating plainly, because it is not tidy:
+
+> the run sits `running`, claimed by the process that gave up on it, with a
+> lease nobody is renewing. it stays that way until the lease runs out — 60
+> seconds — and some process with a working store reclaims it, at which point
+> [`Reclaim`](scaling.md#claims-and-leases) decides: `Fail` marks it failed
+> with `claimer went away` and fires the failure hooks, `Requeue` puts it back
+> on the queue.
+
+that is worse than a clean failure. a run hangs around for a minute looking
+active when it is not, and anything waiting on it waits. it is far better than
+a false success, which is the only other thing hestan could do: a `success`
+the store never heard about is a lie that outlives the incident, gets read by
+the next resume, and marks an asset current that was never built.
+
+the process also stops taking new work while its store is refusing writes.
+claiming a run is promising to record what it does, and a queue draining into
+a process that cannot keep that promise turns one lost run into a shift's
+worth. it starts again on its own as soon as a write lands.
+
+the ops of an abandoned run are stopped with it: in-process ops are aborted
+and an [isolated](isolation.md) op's child process is killed, so nothing
+carries on working for a run nobody is going to record.
+
 ## Trigger rules
 
 by default an op runs when its whole upstream worked. that makes the one op

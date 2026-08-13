@@ -139,6 +139,22 @@ claimer, and then
 Hestan::new().reclaim(Reclaim::Requeue)
 ```
 
+a lease is also how a process says something it cannot write down. if a run's
+critical write will not land after its retries, the process **stops executing
+that run and stops renewing its lease** — it reports no status at all, because
+at that point it does not know what the status is. one lease later the run is
+reclaimed exactly as if the process had died, and `Reclaim` decides. that is
+deliberate: a process that kept renewing a claim it had given up on would hold
+that run out of every reclaimer's reach for as long as it stayed alive.
+[what hestan promises about writes](concepts.md#what-hestan-promises-about-writes)
+is the whole of it, including why a run left `running` for a minute beats a
+run reported `success` that nothing recorded.
+
+such a process also stops claiming until a write of its lands — the lease
+renewal itself is what tells it the store is back — so a worker with a broken
+store empties no queue. `GET /api/health` says `ok: false` while that is true,
+and lists the runs it gave up on.
+
 ### Boot recovery respects a live claim
 
 the startup sweep used to mark every `queued` or `running` run failed, on the

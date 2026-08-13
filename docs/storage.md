@@ -497,6 +497,36 @@ loop: every process renews the leases it holds every 15 seconds and takes back
 anything nobody has renewed for 60, failing it or requeueing it per
 [`Reclaim`](scaling.md#claims-and-leases).
 
+## When the database will not take a write
+
+a store is a dependency like any other and it can refuse. the rules are the
+same on both backends and are written out in
+[what hestan promises about writes](concepts.md#what-hestan-promises-about-writes);
+this is what they mean for the database in front of you.
+
+a write that records what a run did is **retried four times** with jittered
+backoff before hestan gives up on it — that covers the ordinary case, which is
+another writer holding sqlite's write lock past its 5-second busy timeout, or
+a postgres serialization failure or deadlock. what is *not* retried is a
+failure the backend cannot have rolled back on its own: a connection that
+died. that write may have been committed with its acknowledgement lost, and
+going back for it is the one retry that could record a build twice.
+
+which is worth knowing about the postgres backend specifically: it is **one
+connection with no pool and no reconnect**. a connection that drops stays
+dropped for the life of the process, so a postgres restart under a live
+deployment is not something a retry rides out — the runs in flight are left
+for a reclaimer and the process stops claiming new ones until it is restarted.
+sqlite has no equivalent: a file that comes back is a file that works again.
+
+a run whose write cannot land is left `running` with a lease that lapses; see
+the section above for what a reclaimer then does with it. **the process stops
+claiming** while its store is refusing writes, so a queue does not drain into
+something that cannot record it, and `GET /api/health` reports `ok: false`
+with the counts. `hestan doctor` asks a database directly whether it would
+take a write lock, which is the question a command line can answer from
+outside a deployment.
+
 ## Retention
 
 by default nothing is ever deleted — runs, op runs, events and captured output
