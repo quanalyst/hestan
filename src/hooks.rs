@@ -5,7 +5,7 @@ use std::time::Duration;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::executor::{Runner, note, panic_payload};
+use crate::executor::{Runner, panic_payload};
 use crate::model::{OpStatus, RunStatus, Trigger};
 
 /// what an [`on_run_finished`](crate::Hestan::on_run_finished) hook receives:
@@ -238,14 +238,25 @@ pub(crate) async fn deliver_once(runner: &Runner, now: DateTime<Utc>) -> usize {
             Err(e) => {
                 let why = format!("payload is not a run event: {e}");
                 tracing::warn!(notification = row.id, "{why}");
-                note(store.delivery_failed(row.id, row.attempts, None, &why));
+                store
+                    .landed("delivery_failed", || {
+                        store.delivery_failed(row.id, row.attempts, None, &why)
+                    })
+                    .await;
                 continue;
             }
         };
         let hooks = runner.run_hooks(&event.job);
         match deliver(&hooks, event).await {
+            // a mark that does not land is the at-least-once window itself:
+            // the row stays due and the next pass delivers it again, which is
+            // the side of it this table was built to fall on
             Ok(()) => {
-                note(store.delivered(row.id, Utc::now()).map(|_| ()));
+                store
+                    .landed("delivered", || {
+                        store.delivered(row.id, Utc::now()).map(|_| ())
+                    })
+                    .await;
                 settled += 1;
             }
             Err(why) => {
@@ -264,7 +275,11 @@ pub(crate) async fn deliver_once(runner: &Runner, now: DateTime<Utc>) -> usize {
                         "giving up after {attempts} attempts: {why}"
                     );
                 }
-                note(store.delivery_failed(row.id, attempts, next, &why));
+                store
+                    .landed("delivery_failed", || {
+                        store.delivery_failed(row.id, attempts, next, &why)
+                    })
+                    .await;
                 settled += 1;
             }
         }

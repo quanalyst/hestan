@@ -21,7 +21,7 @@ use crate::model::{
 };
 use crate::op::{self, Cancel, MetaBuf, Op, OpCtx};
 use crate::resource::{self, Resources};
-use crate::store::{Built, RunKey, Store};
+use crate::store::{Built, RunKey, Store, note};
 
 /// how far back a resume follows `resumed_from` links. resuming a resume is
 /// normal; a chain this long is a bug, and the walk says so instead of looping.
@@ -1708,7 +1708,9 @@ async fn execute_in_span(
 ) {
     let store = runner.store.clone();
     let started_at = Utc::now();
-    note(store.run_started(&run_id, started_at));
+    store
+        .landed("run_started", || store.run_started(&run_id, started_at))
+        .await;
     note(store.append_event(
         &run_id,
         None,
@@ -1779,15 +1781,19 @@ async fn execute_in_span(
                         reason,
                         Some(&json!({ "reason": reason, "when": op.runs_when() })),
                     ));
-                    note(store.op_finished(
-                        &run_id,
-                        &name,
-                        OpStatus::Skipped,
-                        None,
-                        None,
-                        None,
-                        &[],
-                    ));
+                    store
+                        .landed("op_finished", || {
+                            store.op_finished(
+                                &run_id,
+                                &name,
+                                OpStatus::Skipped,
+                                None,
+                                None,
+                                None,
+                                &[],
+                            )
+                        })
+                        .await;
                     statuses.insert(name.clone(), OpStatus::Skipped);
                     let reason = format!("skipped: upstream {name} was skipped");
                     skip_downstream(
@@ -1799,7 +1805,8 @@ async fn execute_in_span(
                         &mut statuses,
                         &run_id,
                         &store,
-                    );
+                    )
+                    .await;
                     continue;
                 }
                 // an instance resolves to its parent's op, which is mapped
@@ -1886,29 +1893,29 @@ async fn execute_in_span(
                         &mut statuses,
                         &run_id,
                         &store,
-                    );
+                    )
+                    .await;
                     continue;
                 };
                 // rows first, so a cancel or a skip has something to write to,
                 // exactly as a static op's row exists from the launch on
-                let created: Vec<String> = elements
-                    .into_iter()
-                    .enumerate()
-                    .map(|(index, element)| {
-                        let label = instance_label(op, index, &element);
-                        let instance = format!("{name}[{label}]");
-                        note(store.create_op_run(&run_id, &instance));
-                        instances.insert(
-                            instance.clone(),
-                            Instance {
-                                parent: name.clone(),
-                                index,
-                                element,
-                            },
-                        );
-                        instance
-                    })
-                    .collect();
+                let mut created: Vec<String> = Vec::with_capacity(elements.len());
+                for (index, element) in elements.into_iter().enumerate() {
+                    let label = instance_label(op, index, &element);
+                    let instance = format!("{name}[{label}]");
+                    store
+                        .landed("create_op_run", || store.create_op_run(&run_id, &instance))
+                        .await;
+                    instances.insert(
+                        instance.clone(),
+                        Instance {
+                            parent: name.clone(),
+                            index,
+                            element,
+                        },
+                    );
+                    created.push(instance);
+                }
                 note(store.append_event(
                     &run_id,
                     Some(&name),
@@ -2005,15 +2012,19 @@ async fn execute_in_span(
                     &msg,
                     Some(&json!({ "error": &msg })),
                 ));
-                note(store.op_finished(
-                    &run_id,
-                    &name,
-                    OpStatus::Failed,
-                    None,
-                    None,
-                    Some(&msg),
-                    &[],
-                ));
+                store
+                    .landed("op_finished", || {
+                        store.op_finished(
+                            &run_id,
+                            &name,
+                            OpStatus::Failed,
+                            None,
+                            None,
+                            Some(&msg),
+                            &[],
+                        )
+                    })
+                    .await;
                 if first_failure.is_none() {
                     first_failure = Some((name.clone(), msg));
                 }
@@ -2028,7 +2039,8 @@ async fn execute_in_span(
                     &mut statuses,
                     &run_id,
                     &store,
-                );
+                )
+                .await;
                 continue;
             }
             // instrumented as well as parented: what `run_op` itself writes to the
@@ -2100,19 +2112,27 @@ async fn execute_in_span(
                                 // and whatever it built, in that same write:
                                 // the output is stored, so the row that says
                                 // the asset is current is now true
-                                note(store.op_finished(
-                                    &run_id,
-                                    &name,
-                                    OpStatus::Success,
-                                    Some(&handle),
-                                    meta.as_ref(),
-                                    None,
-                                    &built,
-                                ));
+                                store
+                                    .landed("op_finished", || {
+                                        store.op_finished(
+                                            &run_id,
+                                            &name,
+                                            OpStatus::Success,
+                                            Some(&handle),
+                                            meta.as_ref(),
+                                            None,
+                                            &built,
+                                        )
+                                    })
+                                    .await;
                                 // state second: a crash between the writes
                                 // re-runs the op, never skips it
                                 if let Some(state) = state {
-                                    note(store.set_op_state(job.name(), &name, &state));
+                                    store
+                                        .landed("set_op_state", || {
+                                            store.set_op_state(job.name(), &name, &state)
+                                        })
+                                        .await;
                                 }
                                 Ok(handle)
                             }
@@ -2128,7 +2148,27 @@ async fn execute_in_span(
                                 ));
                                 // and `built` goes with the attempt: an asset
                                 // whose value nothing stored was not built
-                                note(store.op_finished(
+                                store
+                                    .landed("op_finished", || {
+                                        store.op_finished(
+                                            &run_id,
+                                            &name,
+                                            OpStatus::Failed,
+                                            None,
+                                            None,
+                                            Some(&msg),
+                                            &[],
+                                        )
+                                    })
+                                    .await;
+                                Err(msg)
+                            }
+                        }
+                    }
+                    Outcome::Failed(msg) => {
+                        store
+                            .landed("op_finished", || {
+                                store.op_finished(
                                     &run_id,
                                     &name,
                                     OpStatus::Failed,
@@ -2136,27 +2176,15 @@ async fn execute_in_span(
                                     None,
                                     Some(&msg),
                                     &[],
-                                ));
-                                Err(msg)
-                            }
-                        }
-                    }
-                    Outcome::Failed(msg) => {
-                        note(store.op_finished(
-                            &run_id,
-                            &name,
-                            OpStatus::Failed,
-                            None,
-                            None,
-                            Some(&msg),
-                            &[],
-                        ));
+                                )
+                            })
+                            .await;
                         Err(msg)
                     }
                     // only a cancel produces this, so the run is stopping:
                     // record what was watched to happen and go drain the rest
                     Outcome::Killed(msg) => {
-                        op_killed(&store, &run_id, &name, &msg);
+                        op_killed(&store, &run_id, &name, &msg).await;
                         canceled = true;
                         break;
                     }
@@ -2191,7 +2219,8 @@ async fn execute_in_span(
                             &mut statuses,
                             &run_id,
                             &store,
-                        );
+                        )
+                        .await;
                     }
                 }
             }
@@ -2208,15 +2237,19 @@ async fn execute_in_span(
                     &msg,
                     Some(&json!({ "error": msg })),
                 ));
-                note(store.op_finished(
-                    &run_id,
-                    &name,
-                    OpStatus::Failed,
-                    None,
-                    None,
-                    Some(&msg),
-                    &[],
-                ));
+                store
+                    .landed("op_finished", || {
+                        store.op_finished(
+                            &run_id,
+                            &name,
+                            OpStatus::Failed,
+                            None,
+                            None,
+                            Some(&msg),
+                            &[],
+                        )
+                    })
+                    .await;
                 if first_failure.is_none() {
                     first_failure = Some((name.clone(), msg));
                 }
@@ -2231,7 +2264,8 @@ async fn execute_in_span(
                     &mut statuses,
                     &run_id,
                     &store,
-                );
+                )
+                .await;
             }
         }
     }
@@ -2282,30 +2316,42 @@ async fn execute_in_span(
                             match crate::io::put(&runner.io, unit.io_name(), key, output).await {
                                 Ok(handle) => {
                                     let meta = crate::io::handle_meta(&handle, meta);
-                                    note(store.op_finished(
-                                        &run_id,
-                                        &name,
-                                        OpStatus::Success,
-                                        Some(&handle),
-                                        meta.as_ref(),
-                                        None,
-                                        &built,
-                                    ));
+                                    store
+                                        .landed("op_finished", || {
+                                            store.op_finished(
+                                                &run_id,
+                                                &name,
+                                                OpStatus::Success,
+                                                Some(&handle),
+                                                meta.as_ref(),
+                                                None,
+                                                &built,
+                                            )
+                                        })
+                                        .await;
                                     if let Some(state) = state {
-                                        note(store.set_op_state(job.name(), &name, &state));
+                                        store
+                                            .landed("set_op_state", || {
+                                                store.set_op_state(job.name(), &name, &state)
+                                            })
+                                            .await;
                                     }
                                 }
                                 Err(e) => {
                                     let msg = format!("could not persist the output: {e}");
-                                    note(store.op_finished(
-                                        &run_id,
-                                        &name,
-                                        OpStatus::Failed,
-                                        None,
-                                        None,
-                                        Some(&msg),
-                                        &[],
-                                    ));
+                                    store
+                                        .landed("op_finished", || {
+                                            store.op_finished(
+                                                &run_id,
+                                                &name,
+                                                OpStatus::Failed,
+                                                None,
+                                                None,
+                                                Some(&msg),
+                                                &[],
+                                            )
+                                        })
+                                        .await;
                                 }
                             }
                         }
@@ -2313,22 +2359,26 @@ async fn execute_in_span(
                         // it; there is nothing left to record
                         Outcome::Recorded(_) => {}
                         Outcome::Failed(msg) => {
-                            note(store.op_finished(
-                                &run_id,
-                                &name,
-                                OpStatus::Failed,
-                                None,
-                                None,
-                                Some(&msg),
-                                &[],
-                            ));
+                            store
+                                .landed("op_finished", || {
+                                    store.op_finished(
+                                        &run_id,
+                                        &name,
+                                        OpStatus::Failed,
+                                        None,
+                                        None,
+                                        Some(&msg),
+                                        &[],
+                                    )
+                                })
+                                .await;
                         }
-                        Outcome::Killed(msg) => op_killed(&store, &run_id, &name, &msg),
+                        Outcome::Killed(msg) => op_killed(&store, &run_id, &name, &msg).await,
                     }
                 }
                 Err(join_err) if join_err.is_cancelled() => {
                     let name = names.remove(&join_err.id()).expect("spawned with id");
-                    op_canceled(&store, &run_id, &name);
+                    op_canceled(&store, &run_id, &name).await;
                 }
                 Err(join_err) => {
                     let name = names.remove(&join_err.id()).expect("spawned with id");
@@ -2341,15 +2391,19 @@ async fn execute_in_span(
                         &msg,
                         Some(&json!({ "error": msg })),
                     ));
-                    note(store.op_finished(
-                        &run_id,
-                        &name,
-                        OpStatus::Failed,
-                        None,
-                        None,
-                        Some(&msg),
-                        &[],
-                    ));
+                    store
+                        .landed("op_finished", || {
+                            store.op_finished(
+                                &run_id,
+                                &name,
+                                OpStatus::Failed,
+                                None,
+                                None,
+                                Some(&msg),
+                                &[],
+                            )
+                        })
+                        .await;
                 }
             }
         }
@@ -2359,10 +2413,10 @@ async fn execute_in_span(
         let mut unstopped: Vec<String> = names.drain().map(|(_, name)| name).collect();
         unstopped.sort();
         for name in unstopped {
-            op_unstopped(&store, &run_id, &name, grace);
+            op_unstopped(&store, &run_id, &name, grace).await;
         }
         for name in pending.drain(..) {
-            op_canceled(&store, &run_id, &name);
+            op_canceled(&store, &run_id, &name).await;
         }
     }
 
@@ -2427,13 +2481,17 @@ async fn execute_in_span(
     let queued = runner
         .durable
         .then(|| serde_json::to_value(&event).expect("a run event is json"));
-    note(store.run_finished(
-        &run_id,
-        status,
-        error.as_deref(),
-        finished_at,
-        queued.as_ref(),
-    ));
+    store
+        .landed("run_finished", || {
+            store.run_finished(
+                &run_id,
+                status,
+                error.as_deref(),
+                finished_at,
+                queued.as_ref(),
+            )
+        })
+        .await;
     runner.active.lock().unwrap().remove(&run_id);
     // this run's slot is free: wake anything waiting on it, then go and see
     // what the queue can start in its place
@@ -2576,7 +2634,7 @@ async fn resolve(io: &Io, job: &Job, run_id: &str, op: &str, held: Value) -> Res
 // mapped op — there is no partial array — and the siblings still in flight
 // run to the end, exactly as an op's siblings do
 #[allow(clippy::too_many_arguments)]
-fn give_up(
+async fn give_up(
     name: &str,
     instances: &HashMap<String, Instance>,
     fanouts: &mut HashMap<String, Fanout>,
@@ -2590,7 +2648,7 @@ fn give_up(
     statuses.insert(name.to_string(), OpStatus::Failed);
     let Some(instance) = instances.get(name) else {
         let reason = format!("skipped: upstream {name} failed");
-        skip_downstream(job, pairs, name, &reason, pending, statuses, run_id, store);
+        skip_downstream(job, pairs, name, &reason, pending, statuses, run_id, store).await;
         return;
     };
     let fan = fanouts
@@ -2606,20 +2664,25 @@ fn give_up(
         let reason = format!("skipped: upstream {parent} failed");
         skip_downstream(
             job, pairs, &parent, &reason, pending, statuses, run_id, store,
-        );
+        )
+        .await;
     }
 }
 
-fn op_canceled(store: &Store, run_id: &str, name: &str) {
-    note(store.op_finished(
-        run_id,
-        name,
-        OpStatus::Canceled,
-        None,
-        None,
-        Some("canceled"),
-        &[],
-    ));
+async fn op_canceled(store: &Store, run_id: &str, name: &str) {
+    store
+        .landed("op_finished", || {
+            store.op_finished(
+                run_id,
+                name,
+                OpStatus::Canceled,
+                None,
+                None,
+                Some("canceled"),
+                &[],
+            )
+        })
+        .await;
     note(store.append_event(
         run_id,
         Some(name),
@@ -2634,7 +2697,7 @@ fn op_canceled(store: &Store, run_id: &str, name: &str) {
 /// signalled, killed and reaped, so this row gets a real finish time. that is
 /// the difference the subprocess buys — everywhere else hestan can only record
 /// what it asked for.
-fn op_killed(store: &Store, run_id: &str, name: &str, msg: &str) {
+async fn op_killed(store: &Store, run_id: &str, name: &str, msg: &str) {
     note(store.append_event(
         run_id,
         Some(name),
@@ -2645,12 +2708,16 @@ fn op_killed(store: &Store, run_id: &str, name: &str, msg: &str) {
         // about the work having stopped rather than about having asked it to
         Some(&json!({ "reason": msg, "stopped": true })),
     ));
-    note(store.op_finished(run_id, name, OpStatus::Canceled, None, None, Some(msg), &[]));
+    store
+        .landed("op_finished", || {
+            store.op_finished(run_id, name, OpStatus::Canceled, None, None, Some(msg), &[])
+        })
+        .await;
 }
 
 // canceled, but only the request is a fact: the op never joined, so it gets no
 // finish time and an error that says exactly that
-fn op_unstopped(store: &Store, run_id: &str, name: &str, grace: Duration) {
+async fn op_unstopped(store: &Store, run_id: &str, name: &str, grace: Duration) {
     let msg = format!(
         "cancellation requested; this op was not observed to stop within {grace:?} \
          and may still be running (blocking work stops only if it polls ctx.is_cancelled())"
@@ -2665,7 +2732,9 @@ fn op_unstopped(store: &Store, run_id: &str, name: &str, grace: Duration) {
         // the request is the fact, and whether the work stopped is not known
         Some(&json!({ "reason": &msg, "stopped": false })),
     ));
-    note(store.op_unstopped(run_id, name, &msg));
+    store
+        .landed("op_unstopped", || store.op_unstopped(run_id, name, &msg))
+        .await;
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2704,7 +2773,9 @@ async fn run_op(
         }
     });
     let mut attempt = 1;
-    note(store.op_started(&run_id, &name, attempt));
+    store
+        .landed("op_started", || store.op_started(&run_id, &name, attempt))
+        .await;
     note(store.append_event(
         &run_id,
         Some(&name),
@@ -2975,7 +3046,9 @@ async fn run_op(
         }
         attempt += 1;
         // a fresh attempt of an isolated op is a fresh child process
-        note(store.op_started(&run_id, &name, attempt));
+        store
+            .landed("op_started", || store.op_started(&run_id, &name, attempt))
+            .await;
     }
 }
 
@@ -3024,7 +3097,7 @@ pub(crate) fn panic_payload(panic: &(dyn std::any::Any + Send)) -> Option<&str> 
 /// plain [`When::AllSucceeded`] ops is skipped as one, naming `root` — that is
 /// one failure with one cause, not a chain of them.
 #[allow(clippy::too_many_arguments)]
-fn skip_downstream(
+async fn skip_downstream(
     job: &Job,
     pairs: &[(String, Vec<String>)],
     root: &str,
@@ -3051,17 +3124,15 @@ fn skip_downstream(
                 reason,
                 Some(&json!({ "reason": reason, "upstream": root })),
             ));
-            note(store.op_finished(run_id, &name, OpStatus::Skipped, None, None, None, &[]));
+            store
+                .landed("op_finished", || {
+                    store.op_finished(run_id, &name, OpStatus::Skipped, None, None, None, &[])
+                })
+                .await;
             statuses.insert(name, OpStatus::Skipped);
         } else {
             i += 1;
         }
-    }
-}
-
-pub(crate) fn note(res: Result<(), Error>) {
-    if let Err(e) = res {
-        tracing::warn!("store write failed: {e}");
     }
 }
 

@@ -1038,6 +1038,14 @@ impl Hestan {
         let code = match self.ran_op_subprocess(req).await {
             Ok(crate::isolate::Worked::Success) => 0,
             Ok(crate::isolate::Worked::Failed) => 1,
+            // the op ran; nothing recorded it. said here for the same reason
+            // the arm below prints rather than traces — the parent captures
+            // this stream as the attempt's output, and its own read of the op
+            // row is about to find nothing there
+            Ok(crate::isolate::Worked::Unrecorded) => {
+                eprintln!("hestan op subprocess: the store would not record what this op did");
+                1
+            }
             // printed rather than traced: a worker whose store or registry is
             // wrong cannot record anything anywhere, and its stderr is piped
             // by its parent, which stores it as this attempt's output

@@ -12,7 +12,7 @@ use tokio::sync::{OwnedSemaphorePermit, watch};
 use crate::backoff;
 use crate::model::{EventKind, EventLevel, OpStatus, When};
 use crate::resource::{self, Resources};
-use crate::store::{Built, Store};
+use crate::store::{Built, Store, note};
 
 /// what an op body returns: json output on success, any error on failure.
 pub type OpResult = Result<Value, Box<dyn std::error::Error + Send + Sync>>;
@@ -1642,12 +1642,10 @@ impl OpCtx {
         data: Option<&Value>,
     ) {
         // a lost log line should not fail the op
-        if let Err(e) =
+        note(
             self.store
-                .append_event(&self.run_id, Some(&self.op), level, kind, msg, data)
-        {
-            tracing::warn!(run = %self.run_id, op = %self.op, "event write failed: {e}");
-        }
+                .append_event(&self.run_id, Some(&self.op), level, kind, msg, data),
+        );
     }
 }
 

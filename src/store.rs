@@ -1,6 +1,7 @@
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
@@ -1092,6 +1093,91 @@ fn parse_json(idx: usize, text: &str) -> Result<Value, Error> {
     serde_json::from_str(text).map_err(|e| Error::Column(idx, e.to_string()))
 }
 
+/// a store write the run can survive losing, and the only thing [`note`] takes.
+///
+/// an event, a captured log line, the pid of a child: each is worth having and
+/// none of them is what a run *did*. a write that records that — a terminal
+/// row, a status, a watermark — returns `Result<(), Error>` like everything
+/// else and goes through [`Store::landed`], so `note(store.op_finished(..))`
+/// is a thing the compiler refuses rather than a thing to remember not to
+/// write.
+///
+/// only this module makes one, and only in the signature of a write it has
+/// declared best-effort. **a write added later is critical until somebody says
+/// otherwise**, which is the way round that survives being forgotten.
+#[must_use = "a best-effort write is still a write: note it, so a store that is dropping them says so"]
+pub(crate) struct BestEffort {
+    wrote: Result<(), Error>,
+    health: Arc<Health>,
+}
+
+impl BestEffort {
+    /// panic unless it landed. tests only, and about fixtures rather than
+    /// about runs: a case that plants an event and then asserts on it wants to
+    /// hear that the row is there.
+    #[cfg(test)]
+    #[track_caller]
+    pub(crate) fn unwrap(self) {
+        self.wrote.unwrap();
+    }
+}
+
+/// let a best-effort write go, and count it.
+///
+/// losing a log line is survivable where losing a run's outcome is not — but
+/// being quiet about it is not part of the deal. what this drops is counted on
+/// the store's [health](Store::health), which is what `/api/health` and
+/// `hestan doctor` report: a deployment whose run pages are missing half their
+/// events should find that out from the control plane rather than from the
+/// gap.
+pub(crate) fn note(write: BestEffort) {
+    if let Err(e) = write.wrote {
+        tracing::warn!("store write dropped: {e}");
+        write.health.dropped();
+    }
+}
+
+/// what this process has seen one store do.
+///
+/// counters rather than a verdict: a store either takes a write or it does
+/// not, and how often it did not is the fact worth reporting. one per store,
+/// shared by every clone of it, and never reset — a deployment that dropped a
+/// hundred events an hour ago dropped them.
+#[derive(Default)]
+pub(crate) struct Health {
+    dropped: AtomicU64,
+    unrecorded: AtomicU64,
+    /// how many of the writes a run makes are to fail before the database is
+    /// allowed to see them. tests only — see [`Store::fail_writes`].
+    #[cfg(test)]
+    injected: AtomicU64,
+}
+
+impl Health {
+    /// a best-effort write did not land, and nothing will try again.
+    fn dropped(&self) {
+        self.dropped.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// a write that records authoritative state did not land.
+    fn unrecorded(&self) {
+        self.unrecorded.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// how many events, log lines and other best-effort writes this store has
+    /// lost.
+    #[cfg(test)]
+    pub(crate) fn dropped_writes(&self) -> u64 {
+        self.dropped.load(Ordering::Relaxed)
+    }
+
+    /// how many times something a run did could not be written down.
+    #[cfg(test)]
+    pub(crate) fn unrecorded_writes(&self) -> u64 {
+        self.unrecorded.load(Ordering::Relaxed)
+    }
+}
+
 /// run history on sqlite or postgres. cheap to clone; safe to share across
 /// tasks.
 ///
@@ -1111,11 +1197,15 @@ fn parse_json(idx: usize, text: &str) -> Result<Value, Error> {
 /// export, or a test asserting what a run actually did is written against.
 /// opening it does migrate the schema, so point it at a copy if that is not
 /// wanted.
-///
-/// the second field is the target it was opened at — a path or a url — kept so
-/// a runner can tell whether a child process could reach the same database.
 #[derive(Clone)]
-pub struct Store(Arc<Db>, Arc<str>);
+pub struct Store {
+    db: Arc<Db>,
+    /// the target it was opened at — a path or a url — kept so a runner can
+    /// tell whether a child process could reach the same database.
+    target: Arc<str>,
+    /// what this process has seen this database do, shared by every clone.
+    health: Arc<Health>,
+}
 
 impl Store {
     /// open (and migrate) the sqlite database at `path`; `":memory:"` works
@@ -1127,7 +1217,15 @@ impl Store {
         }
         conn.busy_timeout(BUSY_TIMEOUT)?;
         migrate(&mut conn)?;
-        Ok(Store(Arc::new(Db::Sqlite(Mutex::new(conn))), path.into()))
+        Ok(Store::new(Db::Sqlite(Mutex::new(conn)), path))
+    }
+
+    fn new(db: Db, target: &str) -> Store {
+        Store {
+            db: Arc::new(db),
+            target: target.into(),
+            health: Arc::new(Health::default()),
+        }
     }
 
     /// open (and migrate) the postgres database at `url` —
@@ -1141,10 +1239,7 @@ impl Store {
     #[cfg_attr(docsrs, doc(cfg(feature = "postgres")))]
     pub fn connect(url: &str) -> Result<Store, Error> {
         let client = crate::pg::open(url)?;
-        Ok(Store(
-            Arc::new(Db::Postgres(Mutex::new(client))),
-            url.into(),
-        ))
+        Ok(Store::new(Db::Postgres(Mutex::new(client)), url))
     }
 
     /// whichever of the two `target` names: a `postgres://` url connects, and
@@ -1164,7 +1259,7 @@ impl Store {
     /// the connection, with the mutex held. every method below goes through
     /// one of these or a [transaction](Conn::begin) on one.
     fn conn(&self) -> Conn<'_> {
-        match &*self.0 {
+        match &*self.db {
             Db::Sqlite(db) => Conn::Sqlite(db.lock().unwrap()),
             #[cfg(feature = "postgres")]
             Db::Postgres(db) => Conn::Postgres(db.lock().unwrap()),
@@ -1175,7 +1270,72 @@ impl Store {
     /// cannot be reached by a child. `":memory:"` is private per connection,
     /// which is exactly right for a test and exactly wrong for an isolated op.
     pub(crate) fn is_private(&self) -> bool {
-        &*self.1 == ":memory:"
+        &*self.target == ":memory:"
+    }
+
+    /// what this process has seen this store do: what it dropped, and what it
+    /// could not record at all.
+    #[cfg(test)]
+    pub(crate) fn health(&self) -> &Health {
+        &self.health
+    }
+
+    /// a write that records authoritative state — what a run did, what an op
+    /// did, where a watermark got to. says whether it landed.
+    ///
+    /// `what` names the write in the log, since the caller is the only thing
+    /// that knows which one this is; `write` is the call itself rather than
+    /// its result, because a failure here is worth another attempt.
+    ///
+    /// every caller has to say what it does when a write did not land, and the
+    /// answer is never "carry on as if it had" — `docs/concepts.md` is what
+    /// hestan promises about writes, and what it stops promising here.
+    pub(crate) async fn landed(&self, what: &str, write: impl Fn() -> Result<(), Error>) -> bool {
+        match write() {
+            Ok(()) => true,
+            Err(e) => {
+                tracing::error!("{what} could not be written: {e}");
+                self.health.unrecorded();
+                false
+            }
+        }
+    }
+
+    /// a [`BestEffort`] over this store, which is the only way one is made.
+    fn best_effort(&self, wrote: Result<(), Error>) -> BestEffort {
+        BestEffort {
+            wrote,
+            health: self.health.clone(),
+        }
+    }
+
+    /// fail the next `n` writes a run makes, whatever the database would have
+    /// said.
+    ///
+    /// tests only, and the whole of this phase is about the state it produces:
+    /// a store that will not take a write is the one thing a test cannot ask a
+    /// working database for. what it fails with is sqlite's "database is
+    /// locked" whichever backend is underneath, because what a caller needs
+    /// here is a transient failure and not a particular one's spelling.
+    #[cfg(test)]
+    pub(crate) fn fail_writes(&self, n: u64) {
+        self.health.injected.store(n, Ordering::SeqCst);
+    }
+
+    /// one of the failures [`fail_writes`](Self::fail_writes) asked for, if
+    /// any are left.
+    #[cfg(test)]
+    fn injected(&self) -> Option<Error> {
+        self.health
+            .injected
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+            .ok()
+            .map(|_| {
+                Error::Sqlite(rusqlite::Error::SqliteFailure(
+                    rusqlite::ffi::Error::new(5),
+                    Some("database is locked (injected)".to_string()),
+                ))
+            })
     }
 
     /// [`create_run_keyed`](Self::create_run_keyed) with no key and no plan,
@@ -1297,6 +1457,12 @@ impl Store {
     /// and it inserts before spawning, so a row can never land after the run's
     /// terminal status write; ignoring a conflict keeps a repeat harmless.
     pub(crate) fn create_op_run(&self, run_id: &str, op: &str) -> Result<(), Error> {
+        #[cfg(test)]
+        {
+            if let Some(e) = self.injected() {
+                return Err(e);
+            }
+        }
         let mut conn = self.conn();
         let (insert, ignore) = conn.dialect().insert_or_ignore();
         conn.execute(
@@ -1787,21 +1953,29 @@ impl Store {
     /// line of its own, written here, and it is the line the audit trail
     /// reads. an unauthenticated deployment writes it with no actor, which is
     /// still true: something asked.
-    pub(crate) fn cancel_requested(&self, id: &str, actor: Option<&str>) -> Result<(), Error> {
+    /// best-effort: what stops the run is the signal, not this line, and the
+    /// terminal row the executing process writes is the record either way.
+    pub(crate) fn cancel_requested(&self, id: &str, actor: Option<&str>) -> BestEffort {
         let message = match actor {
             Some(who) => format!("cancel requested by {who}"),
             None => "cancel requested".to_string(),
         };
-        write_event(
+        self.best_effort(write_event(
             &mut self.conn(),
             &NewEvent::run(id, EventKind::Log, message).actor(actor),
             Utc::now(),
-        )
+        ))
     }
 
     /// `at` is passed in rather than read here so the row and the event the
     /// executor hands its hooks carry the same instant.
     pub(crate) fn run_started(&self, id: &str, at: DateTime<Utc>) -> Result<(), Error> {
+        #[cfg(test)]
+        {
+            if let Some(e) = self.injected() {
+                return Err(e);
+            }
+        }
         self.conn().execute(
             "UPDATE runs SET status = ?1, started_at = ?2 WHERE id = ?3",
             args![RunStatus::Running.as_str(), at.to_rfc3339(), id],
@@ -1826,6 +2000,12 @@ impl Store {
         at: DateTime<Utc>,
         note: Option<&Value>,
     ) -> Result<(), Error> {
+        #[cfg(test)]
+        {
+            if let Some(e) = self.injected() {
+                return Err(e);
+            }
+        }
         let mut conn = self.conn();
         let mut tx = conn.begin()?;
         // and the lease with it: there is nothing left to renew, and a run that
@@ -1982,6 +2162,12 @@ impl Store {
     }
 
     pub(crate) fn op_started(&self, run_id: &str, op: &str, attempts: u32) -> Result<(), Error> {
+        #[cfg(test)]
+        {
+            if let Some(e) = self.injected() {
+                return Err(e);
+            }
+        }
         // coalesce so retries keep the first attempt's start time. the finish
         // and the error are cleared: a fresh attempt has neither, and an
         // isolated op's child records its failure on this row before the parent
@@ -2023,6 +2209,12 @@ impl Store {
         error: Option<&str>,
         built: &[Built],
     ) -> Result<(), Error> {
+        #[cfg(test)]
+        {
+            if let Some(e) = self.injected() {
+                return Err(e);
+            }
+        }
         let at = Utc::now();
         let mut conn = self.conn();
         let mut tx = conn.begin()?;
@@ -2053,6 +2245,12 @@ impl Store {
     /// requested and the task never joined, so when — or whether — the work
     /// stopped is exactly what this process does not know.
     pub(crate) fn op_unstopped(&self, run_id: &str, op: &str, error: &str) -> Result<(), Error> {
+        #[cfg(test)]
+        {
+            if let Some(e) = self.injected() {
+                return Err(e);
+            }
+        }
         self.conn().execute(
             "UPDATE op_runs SET status = ?1, finished_at = NULL, output = NULL, metadata = NULL,
                  error = ?2, pid = NULL
@@ -2068,12 +2266,20 @@ impl Store {
     /// guarded on `running`, because a fast child can record its own terminal
     /// row before the parent gets here — and a pid written onto a finished op
     /// would name a process that no longer exists.
-    pub(crate) fn op_spawned(&self, run_id: &str, op: &str, pid: u32) -> Result<(), Error> {
-        self.conn().execute(
-            "UPDATE op_runs SET pid = ?1 WHERE run_id = ?2 AND op = ?3 AND status = 'running'",
-            args![pid, run_id, op],
-        )?;
-        Ok(())
+    ///
+    /// best-effort: the pid is for whoever is *looking* at the run. the parent
+    /// holds the child handle it stops the process with, and drops it — which
+    /// kills the child — whether or not this row says where it was.
+    pub(crate) fn op_spawned(&self, run_id: &str, op: &str, pid: u32) -> BestEffort {
+        self.best_effort(
+            self.conn()
+                .execute(
+                    "UPDATE op_runs SET pid = ?1
+                     WHERE run_id = ?2 AND op = ?3 AND status = 'running'",
+                    args![pid, run_id, op],
+                )
+                .map(|_| ()),
+        )
     }
 
     /// record what an isolated op is being handed, before the child that reads
@@ -2108,6 +2314,10 @@ impl Store {
     /// statement of its own and a crash between the work and the event loses
     /// the event. the terminal ones are not written here — a run's queued and
     /// finished rows go in the transaction that moves the run.
+    ///
+    /// which is also why it is best-effort: an event narrates a run and no
+    /// part of the run turns on one. the row it narrates is written somewhere
+    /// else, by something that does not carry on without it.
     pub(crate) fn append_event(
         &self,
         run_id: &str,
@@ -2116,39 +2326,51 @@ impl Store {
         kind: EventKind,
         message: &str,
         data: Option<&Value>,
-    ) -> Result<(), Error> {
+    ) -> BestEffort {
+        #[cfg(test)]
+        {
+            if let Some(e) = self.injected() {
+                return self.best_effort(Err(e));
+            }
+        }
         let mut event = NewEvent::run(run_id, kind, message).op(op).level(level);
         if let Some(data) = data {
             event = event.data(data.clone());
         }
-        write_event(&mut self.conn(), &event, Utc::now())
+        self.best_effort(write_event(&mut self.conn(), &event, Utc::now()))
     }
 
     /// append one captured line. the cap lives in [`logs::Budget`], which is
     /// the only thing that calls this — writing here directly would be a way
     /// to fill a disk.
+    ///
+    /// best-effort, and the clearest case of it: a line an op printed is worth
+    /// keeping and worth nothing beside the op's own row.
     pub(crate) fn append_op_log(
         &self,
         at: &Attempt,
         source: Source<'_>,
         message: &str,
-    ) -> Result<(), Error> {
+    ) -> BestEffort {
         let (stream, level, target) = source.columns();
-        self.conn().execute(
-            "INSERT INTO op_logs (run_id, op, attempt, at, stream, level, target, message)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-            args![
-                &at.run_id,
-                &at.op,
-                at.attempt,
-                Utc::now().to_rfc3339(),
-                stream,
-                level,
-                target,
-                message
-            ],
-        )?;
-        Ok(())
+        self.best_effort(
+            self.conn()
+                .execute(
+                    "INSERT INTO op_logs (run_id, op, attempt, at, stream, level, target, message)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                    args![
+                        &at.run_id,
+                        &at.op,
+                        at.attempt,
+                        Utc::now().to_rfc3339(),
+                        stream,
+                        level,
+                        target,
+                        message
+                    ],
+                )
+                .map(|_| ()),
+        )
     }
 
     /// captured output for one run, oldest first, after cursor `after`.
@@ -2890,6 +3112,12 @@ impl Store {
     }
 
     pub(crate) fn set_op_state(&self, job: &str, op: &str, value: &Value) -> Result<(), Error> {
+        #[cfg(test)]
+        {
+            if let Some(e) = self.injected() {
+                return Err(e);
+            }
+        }
         self.conn().execute(
             "INSERT INTO op_state (job, op, value, updated_at) VALUES (?1, ?2, ?3, ?4)
              ON CONFLICT (job, op) DO UPDATE SET value = ?3, updated_at = ?4",
@@ -8596,5 +8824,189 @@ mod tests {
             .query("SELECT version FROM schema_version", args![], |r| r.int(0))
             .unwrap();
         assert_eq!(version, [19]);
+    }
+
+    // ------------------------------------------- what a write is worth losing
+
+    /// every store write that declares itself best-effort, read out of this
+    /// file: the name in front of each `-> BestEffort`.
+    ///
+    /// the return type *is* the declaration. nothing outside this file can
+    /// make one — the fields are private to it — so a scrape of this file is
+    /// the whole of the boundary rather than a sample of it.
+    fn best_effort_writes() -> Vec<String> {
+        // spelled at runtime so this line is not itself one of the matches
+        let declaration = format!("-> {} {{", "BestEffort");
+        include_str!("store.rs")
+            .match_indices(&declaration)
+            .filter_map(|(at, _)| {
+                let before = &include_str!("store.rs")[..at];
+                let name = &before[before.rfind("fn ")? + "fn ".len()..];
+                Some(name[..name.find('(')?].to_string())
+            })
+            // the one that makes them, which is not one of them
+            .filter(|name| name != "best_effort")
+            .collect()
+    }
+
+    // the compiler stops a critical write being handed to `note`. what it
+    // does not stop is one being thrown away by hand, which is the whole of
+    // what is left of this hole — so the whole of what is left is a grep
+    #[test]
+    fn a_store_write_is_never_thrown_away() {
+        for (file, src) in [
+            ("executor.rs", include_str!("executor.rs")),
+            ("hooks.rs", include_str!("hooks.rs")),
+            ("isolate.rs", include_str!("isolate.rs")),
+            ("logs.rs", include_str!("logs.rs")),
+            ("op.rs", include_str!("op.rs")),
+            ("store.rs", include_str!("store.rs")),
+        ] {
+            // spelled at runtime so these lines are not themselves matches
+            for thrown in [
+                format!("let _ = {}.", "store"),
+                format!("let _ = self.{}.", "store"),
+                format!("{}(store.", "drop"),
+            ] {
+                assert!(
+                    !src.contains(&thrown),
+                    "{file} discards a store write with `{thrown}`"
+                );
+            }
+        }
+    }
+
+    // the list is short on purpose and every entry on it is a decision: an
+    // event, a captured line, a pid, and the line that says who asked for a
+    // cancel. everything else a store writes is authoritative until this file
+    // says otherwise, which is the way round that survives being forgotten
+    #[test]
+    fn only_the_writes_named_here_may_be_dropped() {
+        let mut declared = best_effort_writes();
+        declared.sort();
+        assert_eq!(
+            declared,
+            [
+                "append_event",
+                "append_op_log",
+                "cancel_requested",
+                "op_spawned"
+            ]
+        );
+    }
+
+    /// rustc, wherever the cargo that built this test came from.
+    fn rustc() -> std::path::PathBuf {
+        std::path::Path::new(env!("CARGO"))
+            .parent()
+            .map(|bin| bin.join("rustc"))
+            .filter(|rustc| rustc.exists())
+            .unwrap_or_else(|| "rustc".into())
+    }
+
+    /// compile `source` on its own, and hand back what rustc said about it.
+    fn compiled(dir: &std::path::Path, name: &str, source: &str) -> std::process::Output {
+        let file = dir.join(format!("{name}.rs"));
+        std::fs::write(&file, source).unwrap();
+        std::process::Command::new(rustc())
+            .args([
+                "--edition",
+                "2024",
+                "--crate-type",
+                "lib",
+                "--emit",
+                "metadata",
+            ])
+            .arg("--out-dir")
+            .arg(dir)
+            .arg(&file)
+            .output()
+            .expect("rustc built this test and is still on this machine")
+    }
+
+    /// one store write's return type, as this file declares it, in front of a
+    /// `note` that takes what this file says `note` takes.
+    ///
+    /// both halves are scraped rather than written out, so that a signature
+    /// moving moves this with it: a `note` that quietly started taking a
+    /// `Result` again would otherwise leave a hand-written model compiling,
+    /// and that is the regression worth catching.
+    fn as_declared(write: &str, noted: bool) -> String {
+        let src = include_str!("store.rs");
+        let after = |what: &str| {
+            let at = src.find(what).expect("a declaration to read");
+            &src[at + what.len()..]
+        };
+        let returns = after(&format!("fn {write}("));
+        let returns = &returns[returns.find("->").expect("a return type") + 2..];
+        let returns = returns[..returns.find(" {").expect("a body")].trim();
+        let takes = after(&format!("fn {}(", "note"));
+        let takes = &takes[..takes.find(')').expect("one parameter")];
+        let takes = takes[takes.find(':').expect("its type") + 1..].trim();
+        format!(
+            "#[derive(Debug)] pub struct Error;\n\
+             pub struct BestEffort;\n\
+             pub fn note(_: {takes}) {{}}\n\
+             pub fn wrote() -> {returns} {{ unimplemented!() }}\n\
+             pub fn check() {{ {} }}\n",
+            match noted {
+                true => "note(wrote());",
+                false => "wrote();",
+            }
+        )
+    }
+
+    // the property this phase exists for is a type error, and a type error is
+    // the one thing a green suite cannot show you. so it is put to rustc
+    // directly, against the return types this file actually declares: an event
+    // may be dropped, and what an op did is not the kind of thing `note` takes
+    #[test]
+    fn a_write_that_records_what_a_run_did_cannot_be_noted() {
+        let dir = tempfile::tempdir().unwrap();
+        let dir = dir.path();
+        let event = compiled(dir, "event", &as_declared("append_event", true));
+        assert!(
+            event.status.success(),
+            "an event write could not be noted either, so this proves nothing: {}",
+            String::from_utf8_lossy(&event.stderr)
+        );
+
+        let terminal = compiled(dir, "terminal", &as_declared("op_finished", true));
+        let said = String::from_utf8_lossy(&terminal.stderr);
+        assert!(
+            !terminal.status.success(),
+            "an op's terminal write compiled"
+        );
+        // and refused for the reason claimed, rather than for a typo in the
+        // source this test just wrote
+        assert!(
+            said.contains("expected `BestEffort`") && said.contains("mismatched types"),
+            "refused, but not as a type error: {said}"
+        );
+
+        // and the same write, not noted, still compiles: what is being refused
+        // is dropping it, not writing it
+        assert!(
+            compiled(dir, "kept", &as_declared("op_finished", false))
+                .status
+                .success()
+        );
+    }
+
+    // an event that does not land is survivable and is not silent: the store
+    // says how many it has lost, and `/api/health` is where that is read
+    #[test]
+    fn a_dropped_event_is_counted_where_somebody_can_see_it() {
+        let store = Store::open(":memory:").unwrap();
+        assert_eq!(store.health().dropped_writes(), 0);
+
+        store.fail_writes(1);
+        note(store.append_event("r1", None, EventLevel::Info, EventKind::Log, "hello", None));
+        assert_eq!(store.health().dropped_writes(), 1);
+        assert_eq!(store.health().unrecorded_writes(), 0);
+
+        // the next one lands, and is not counted
+        note(store.append_event("r1", None, EventLevel::Info, EventKind::Log, "hello", None));
+        assert_eq!(store.health().dropped_writes(), 1);
     }
 }

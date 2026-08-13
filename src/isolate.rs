@@ -42,14 +42,14 @@ use tokio::sync::watch;
 use tracing::Instrument;
 
 use crate::error::Error;
-use crate::executor::{CANCEL_GRACE, Ended, note, panic_payload};
+use crate::executor::{CANCEL_GRACE, Ended, panic_payload};
 use crate::io::{Io, IoKey};
 use crate::job::Job;
 use crate::logs::{Attempt, capture_child};
 use crate::model::{EventKind, EventLevel, OpStatus};
 use crate::op::{self, Cancel, Op, OpCtx};
 use crate::resource::Resources;
-use crate::store::Store;
+use crate::store::{Store, note};
 
 /// the run an op subprocess is part of.
 pub(crate) const RUN_VAR: &str = "HESTAN_ISOLATED_RUN";
@@ -79,6 +79,11 @@ pub(crate) fn requested() -> Option<Request> {
 pub(crate) enum Worked {
     Success,
     Failed,
+    /// the body ran and the store would not take the row that says what it
+    /// did. the parent reads the op's row rather than this process's exit
+    /// code, so what this changes is what gets *said* about an attempt that
+    /// recorded nothing.
+    Unrecorded,
 }
 
 // ---------------------------------------------------------------- the parent
@@ -109,9 +114,16 @@ pub(crate) async fn attempt(
         return Ended::Killed("canceled before its process started".to_string());
     }
     // written before the child exists, because the child reads its inputs
-    // rather than being told them
-    if let Err(e) = store.set_op_inputs(run_id, name, invocation) {
-        return Ended::Failed(format!("could not record the op's inputs: {e}"));
+    // rather than being told them. the error itself is in this process's log,
+    // where `landed` put it; what belongs on the op run is that the child was
+    // never given anything to read
+    if !store
+        .landed("set_op_inputs", || {
+            store.set_op_inputs(run_id, name, invocation)
+        })
+        .await
+    {
+        return Ended::Failed("could not record the op's inputs".to_string());
     }
     let exe = match std::env::current_exe() {
         Ok(exe) => exe,
@@ -497,44 +509,67 @@ pub(crate) async fn run_one_op(
             // what the manager knows about what it stored, beside what the op
             // staged — the same rule the parent applies to an in-process op
             let meta = crate::io::handle_meta(&handle, op::staged_meta(&new_meta));
-            store.op_finished(
-                &req.run_id,
-                &req.op,
-                OpStatus::Success,
-                Some(&handle),
-                meta.as_ref(),
-                None,
-                &op::staged_builds(&built),
-            )?;
+            let built = op::staged_builds(&built);
+            if !store
+                .landed("op_finished", || {
+                    store.op_finished(
+                        &req.run_id,
+                        &req.op,
+                        OpStatus::Success,
+                        Some(&handle),
+                        meta.as_ref(),
+                        None,
+                        &built,
+                    )
+                })
+                .await
+            {
+                return Ok(Worked::Unrecorded);
+            }
             // state second: a crash between the writes re-runs the op, never
-            // skips it
-            if let Some(state) = new_state.lock().unwrap().take() {
-                store.set_op_state(job.name(), &req.op, &state)?;
+            // skips it. taken out of the mutex first, because a lock held
+            // across a retry is a lock held for as long as the store is slow
+            let state = new_state.lock().unwrap().take();
+            if let Some(state) = state
+                && !store
+                    .landed("set_op_state", || {
+                        store.set_op_state(job.name(), &req.op, &state)
+                    })
+                    .await
+            {
+                return Ok(Worked::Unrecorded);
             }
             let data = op.output_type().map(|t| json!({ "output_type": t }));
-            store.append_event(
+            note(store.append_event(
                 &req.run_id,
                 Some(&req.op),
                 EventLevel::Info,
                 EventKind::OpSuccess,
                 "finished",
                 data.as_ref(),
-            )?;
+            ));
             Ok(Worked::Success)
         }
         // the row carries the message home; the parent decides whether this was
         // the last attempt and writes the event that says so
         Err(msg) => {
-            store.op_finished(
-                &req.run_id,
-                &req.op,
-                OpStatus::Failed,
-                None,
-                None,
-                Some(&msg),
-                &[],
-            )?;
-            Ok(Worked::Failed)
+            match store
+                .landed("op_finished", || {
+                    store.op_finished(
+                        &req.run_id,
+                        &req.op,
+                        OpStatus::Failed,
+                        None,
+                        None,
+                        Some(&msg),
+                        &[],
+                    )
+                })
+                .await
+            {
+                true => Ok(Worked::Failed),
+                false => Ok(Worked::Unrecorded),
+            }
         }
     }
 }

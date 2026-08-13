@@ -21,9 +21,8 @@ use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::Child;
 
-use crate::executor::note;
 use crate::model::{EventLevel, LogStream};
-use crate::store::Store;
+use crate::store::{Store, note};
 
 /// how much of one attempt's output is stored before capture stops.
 /// [`Hestan::log_limit`](crate::Hestan::log_limit) moves it.
