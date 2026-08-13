@@ -8,17 +8,12 @@ own binary and the run log is a sqlite file next to it, so there is nothing to
 deploy alongside it — or a postgres database, when the workers have to live on
 more than one machine.
 
-## Alpha
+the ui and json api are unauthenticated by default, and `serve` refuses to bind
+anything but loopback under that default. an address anyone can reach needs an
+[authenticator](docs/auth.md) — one token, or your own check. see
+[SECURITY.md](SECURITY.md).
 
-this is `0.1.0-beta.1`. under 0.x the api changes without a deprecation cycle,
-so read the changelog before bumping. it has not been run in production, and
-the gaps that are known are listed under [not here yet](#not-here-yet).
-
-the ui and json api are unauthenticated by default, and `serve` refuses to
-bind anything but loopback under that default. giving it an address anyone can
-reach means giving it an [authenticator](docs/auth.md) — one token, or your
-own check — and there is no user store, no session and no per-job permission
-model behind it. see [SECURITY.md](SECURITY.md).
+pin an exact version: under 0.x the api changes without a deprecation cycle.
 
 ## Quickstart
 
@@ -415,17 +410,3 @@ should get to decline:
 | `http` | `HttpSource` and the [notification](docs/notifications.md) helpers — [http sources](docs/http-sources.md) |
 | `parquet` | `ParquetIo`, op outputs stored as parquet files — [io managers](docs/io-managers.md) |
 | `dbt` | `hestan::dbt`, a dbt project's models as assets — [dbt](docs/dbt.md) |
-
-## Developing the ui
-
-`cd ui && npm run dev` starts the vite dev server, which proxies `/api` to
-`localhost:4000` — run the demo alongside it. `just ui-build` regenerates
-`ui/dist`, which is committed so cargo users don't need node.
-
-## Not here yet
-
-- [ ] tls to postgres. the connection is `sslmode=disable` today: a socket, a
-      private network, or a proxy that terminates it
-- [ ] post/body http sources
-- [ ] incremental cursors for http sources
-- [ ] paired-param fan-out

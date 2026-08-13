@@ -187,3 +187,13 @@ let job = builder
     .after(["price_bitcoin", "price_ethereum", "price_solana"]))
     .build()?;
 ```
+
+## What it does not do
+
+`HttpSource` issues `GET`. a source that has to post a body — a graphql query,
+a search that will not fit in a query string — is an ordinary op with your own
+client in it, which is what [connecting](connecting.md) is about.
+
+there is no cursor. every fire fetches the same url and hands back what came
+back; a source that should ask only for what changed since last time wants a
+[sensor](sensors.md), whose cursor is exactly that and is persisted for you.
