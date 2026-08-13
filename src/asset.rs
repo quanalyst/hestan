@@ -2212,6 +2212,11 @@ mod tests {
     // history gains all of them or none. asserted rather than described: a
     // trigger refuses one insert, and everything the op wrote goes back with
     // it — the other materialization and the op run's own terminal row.
+    //
+    // and the run stops where that write stopped. it does not go on to report
+    // a status the store never took: it is left `running`, claimed, for a
+    // reclaimer to settle, which is what a build that hestan cannot record
+    // now leaves behind.
     #[tokio::test]
     async fn a_multi_asset_records_all_of_its_outputs_or_none_of_them() {
         let dir = tempfile::tempdir().unwrap();
@@ -2233,7 +2238,29 @@ mod tests {
         .produces(["clean", "rejected"]);
         let reg = AssetRegistry::new(Vec::new(), vec![split], Vec::new()).unwrap();
         let runner = Runner::new([reg.lower_job().unwrap()], store.clone()).unwrap();
-        let run = build_all(&reg, &runner).await;
+
+        let m = mats_map(&store).unwrap();
+        let plan = plan_all(&reg, &m).expect("something stale");
+        let id = runner
+            .launch_subset(
+                ASSETS_JOB,
+                plan.ops.into_iter().collect(),
+                plan.seeds,
+                json!({}),
+                Trigger::Build,
+                None,
+                RunTags::new(),
+                None,
+            )
+            .unwrap();
+        // a constraint is not a lock: it says the same thing every time, so
+        // the write is attempted once and the run stops on it
+        for _ in 0..1_000 {
+            if store.health().unrecorded_writes() > 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
 
         for asset in ["clean", "rejected"] {
             assert!(
@@ -2243,9 +2270,18 @@ mod tests {
         }
         // the op run row is where it was before the write: the same
         // transaction carried both, so neither landed
-        let op = store.op_run(&run.id, "split").unwrap().unwrap();
+        let op = store.op_run(&id, "split").unwrap().unwrap();
         assert_eq!(op.status, OpStatus::Running);
         assert_eq!(op.finished_at, None);
+        // and the run says nothing about itself, because there is nothing this
+        // process can honestly say
+        let run = store.run(&id).unwrap().unwrap();
+        assert_eq!(run.status, RunStatus::Running);
+        assert_eq!(run.finished_at, None);
+        assert!(
+            run.claimed_by.is_some(),
+            "its claim is what a reclaim needs"
+        );
     }
 
     #[tokio::test]

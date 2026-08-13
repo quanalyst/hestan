@@ -330,6 +330,11 @@ enum Outcome {
     /// path this one gets a real finish time, because for once hestan watched
     /// the work stop.
     Killed(String),
+    /// the store would not take the row that says this op started, so nothing
+    /// this process could write about it afterwards would mean anything. the
+    /// run stops here rather than recording an outcome over a row it never
+    /// established.
+    Unrecorded,
 }
 
 type OpOutcome = (String, Outcome);
@@ -369,6 +374,11 @@ pub struct Runner {
     store: Store,
     // one watch sender per in-flight run; cancel() flips it to true
     active: Arc<Mutex<HashMap<String, watch::Sender<bool>>>>,
+    // runs this process claimed and stopped executing without recording an
+    // outcome, because the store would not take the write that says what
+    // happened. their leases are deliberately left to lapse — see
+    // `Runner::abandon`
+    abandoned: Arc<Mutex<HashSet<String>>>,
     // what this process registered for every job, beside whatever each job
     // registered for itself
     hooks: Arc<Hooks>,
@@ -452,6 +462,7 @@ impl Runner {
             jobs: Arc::new(map),
             store,
             active: Arc::new(Mutex::new(HashMap::new())),
+            abandoned: Arc::new(Mutex::new(HashSet::new())),
             hooks: Arc::new(Hooks {
                 run: hooks.into_iter().map(crate::hooks::as_run_hook).collect(),
                 op: Vec::new(),
@@ -924,6 +935,14 @@ impl Runner {
         if !self.role.executes() {
             return;
         }
+        // and neither has one whose store is refusing writes. claiming a run is
+        // promising to record what it does, and a process that cannot keep that
+        // promise draining the queue into itself is how a backlog becomes a
+        // pile of runs nobody can account for. the lease loop's renewal is the
+        // write that says the store is back
+        if self.store.health().failing() {
+            return;
+        }
         // one pass at a time in this process: two passes counting the same free
         // slot would both fill it. across processes the store's claim does it,
         // which is the only place it can be done
@@ -996,6 +1015,33 @@ impl Runner {
         ));
     }
 
+    /// stop touching a run this process cannot record.
+    ///
+    /// it gets no terminal status and fires no hooks. **this process no longer
+    /// knows what is true about it**: the work may have finished, and the row
+    /// that would say so is the write that did not land. reporting success
+    /// would be a lie and reporting failure would be a guess, so it reports
+    /// nothing and lets go — the claim stops being renewed, the lease lapses,
+    /// and [`Hestan::reclaim`](crate::Hestan::reclaim) decides what the run
+    /// was: failed, saying a claimer went away, or back on the queue.
+    ///
+    /// what that leaves behind is a run sitting `running` with a dead lease
+    /// until some process with a working store notices. that is worse than a
+    /// clean failure and it is the trade being made on purpose, because the
+    /// alternative is a run that says `success` over a store that never heard
+    /// about it.
+    fn abandon(&self, run_id: &str) {
+        // the write that would not land named itself in the line above this
+        // one, at the same level, from `Store::landed`
+        tracing::error!(
+            run = %run_id,
+            "leaving this run for a reclaimer rather than reporting an outcome \
+             the store did not take"
+        );
+        self.abandoned.lock().unwrap().insert(run_id.to_string());
+        self.active.lock().unwrap().remove(run_id);
+    }
+
     /// the runs this process is executing, by id.
     pub(crate) fn holding(&self) -> Result<Vec<String>, Error> {
         self.store.held_by(self.claimer)
@@ -1009,7 +1055,8 @@ impl Runner {
     /// particular, and a deployment where only the dead process could have
     /// noticed would never notice.
     pub(crate) fn heartbeat(&self) {
-        if let Err(e) = self.store.renew_leases(self.claimer, LEASE) {
+        let given_up: Vec<String> = self.abandoned.lock().unwrap().iter().cloned().collect();
+        if let Err(e) = self.store.renew_leases(self.claimer, LEASE, &given_up) {
             tracing::warn!("lease renewal failed: {e}");
         }
         let durable = self.durable;
@@ -1708,7 +1755,11 @@ async fn execute_in_span(
 ) {
     let store = runner.store.clone();
     let started_at = Utc::now();
-    store
+    // set the moment a write that records what this run did will not land.
+    // from there the run stops touching the store and stops touching itself:
+    // see `Runner::abandon` for what it leaves behind and why that is the
+    // least dishonest thing available
+    let mut unrecorded = !store
         .landed("run_started", || store.run_started(&run_id, started_at))
         .await;
     note(store.append_event(
@@ -1750,7 +1801,7 @@ async fn execute_in_span(
     let mut instances: HashMap<String, Instance> = HashMap::new();
     let mut fanouts: HashMap<String, Fanout> = HashMap::new();
 
-    loop {
+    'run: while !unrecorded {
         // settle every unit whose deps have all reached a terminal status: its
         // trigger rule either admits it or skips it here, and a skip is itself
         // terminal, so this repeats until a sweep settles nothing new.
@@ -1781,7 +1832,7 @@ async fn execute_in_span(
                         reason,
                         Some(&json!({ "reason": reason, "when": op.runs_when() })),
                     ));
-                    store
+                    if !store
                         .landed("op_finished", || {
                             store.op_finished(
                                 &run_id,
@@ -1793,10 +1844,14 @@ async fn execute_in_span(
                                 &[],
                             )
                         })
-                        .await;
+                        .await
+                    {
+                        unrecorded = true;
+                        break 'run;
+                    }
                     statuses.insert(name.clone(), OpStatus::Skipped);
                     let reason = format!("skipped: upstream {name} was skipped");
-                    skip_downstream(
+                    if !skip_downstream(
                         &job,
                         &pairs,
                         &name,
@@ -1806,7 +1861,11 @@ async fn execute_in_span(
                         &run_id,
                         &store,
                     )
-                    .await;
+                    .await
+                    {
+                        unrecorded = true;
+                        break 'run;
+                    }
                     continue;
                 }
                 // an instance resolves to its parent's op, which is mapped
@@ -1884,7 +1943,7 @@ async fn execute_in_span(
                     failed = true;
                     statuses.insert(name.clone(), OpStatus::Failed);
                     let reason = format!("skipped: upstream {name} failed");
-                    skip_downstream(
+                    if !skip_downstream(
                         &job,
                         &pairs,
                         &name,
@@ -1894,7 +1953,11 @@ async fn execute_in_span(
                         &run_id,
                         &store,
                     )
-                    .await;
+                    .await
+                    {
+                        unrecorded = true;
+                        break 'run;
+                    }
                     continue;
                 };
                 // rows first, so a cancel or a skip has something to write to,
@@ -1903,9 +1966,13 @@ async fn execute_in_span(
                 for (index, element) in elements.into_iter().enumerate() {
                     let label = instance_label(op, index, &element);
                     let instance = format!("{name}[{label}]");
-                    store
+                    if !store
                         .landed("create_op_run", || store.create_op_run(&run_id, &instance))
-                        .await;
+                        .await
+                    {
+                        unrecorded = true;
+                        break 'run;
+                    }
                     instances.insert(
                         instance.clone(),
                         Instance {
@@ -2012,7 +2079,7 @@ async fn execute_in_span(
                     &msg,
                     Some(&json!({ "error": &msg })),
                 ));
-                store
+                if !store
                     .landed("op_finished", || {
                         store.op_finished(
                             &run_id,
@@ -2024,12 +2091,16 @@ async fn execute_in_span(
                             &[],
                         )
                     })
-                    .await;
+                    .await
+                {
+                    unrecorded = true;
+                    break 'run;
+                }
                 if first_failure.is_none() {
                     first_failure = Some((name.clone(), msg));
                 }
                 failed = true;
-                give_up(
+                if !give_up(
                     &name,
                     &instances,
                     &mut fanouts,
@@ -2040,7 +2111,11 @@ async fn execute_in_span(
                     &run_id,
                     &store,
                 )
-                .await;
+                .await
+                {
+                    unrecorded = true;
+                    break 'run;
+                }
                 continue;
             }
             // instrumented as well as parented: what `run_op` itself writes to the
@@ -2112,7 +2187,7 @@ async fn execute_in_span(
                                 // and whatever it built, in that same write:
                                 // the output is stored, so the row that says
                                 // the asset is current is now true
-                                store
+                                if !store
                                     .landed("op_finished", || {
                                         store.op_finished(
                                             &run_id,
@@ -2124,15 +2199,26 @@ async fn execute_in_span(
                                             &built,
                                         )
                                     })
-                                    .await;
+                                    .await
+                                {
+                                    unrecorded = true;
+                                    break 'run;
+                                }
                                 // state second: a crash between the writes
-                                // re-runs the op, never skips it
-                                if let Some(state) = state {
-                                    store
+                                // re-runs the op, never skips it. a watermark
+                                // that will not commit stops the run for the
+                                // same reason a terminal row does: the run
+                                // would otherwise finish `success` having
+                                // promised to remember where it got to
+                                if let Some(state) = state
+                                    && !store
                                         .landed("set_op_state", || {
                                             store.set_op_state(job.name(), &name, &state)
                                         })
-                                        .await;
+                                        .await
+                                {
+                                    unrecorded = true;
+                                    break 'run;
                                 }
                                 Ok(handle)
                             }
@@ -2148,7 +2234,7 @@ async fn execute_in_span(
                                 ));
                                 // and `built` goes with the attempt: an asset
                                 // whose value nothing stored was not built
-                                store
+                                if !store
                                     .landed("op_finished", || {
                                         store.op_finished(
                                             &run_id,
@@ -2160,13 +2246,17 @@ async fn execute_in_span(
                                             &[],
                                         )
                                     })
-                                    .await;
+                                    .await
+                                {
+                                    unrecorded = true;
+                                    break 'run;
+                                }
                                 Err(msg)
                             }
                         }
                     }
                     Outcome::Failed(msg) => {
-                        store
+                        if !store
                             .landed("op_finished", || {
                                 store.op_finished(
                                     &run_id,
@@ -2178,15 +2268,25 @@ async fn execute_in_span(
                                     &[],
                                 )
                             })
-                            .await;
+                            .await
+                        {
+                            unrecorded = true;
+                            break 'run;
+                        }
                         Err(msg)
                     }
                     // only a cancel produces this, so the run is stopping:
                     // record what was watched to happen and go drain the rest
                     Outcome::Killed(msg) => {
-                        op_killed(&store, &run_id, &name, &msg).await;
+                        unrecorded = !op_killed(&store, &run_id, &name, &msg).await;
                         canceled = true;
-                        break;
+                        break 'run;
+                    }
+                    // the op ran and its own start was never written down, so
+                    // this process has no idea what state its row is in
+                    Outcome::Unrecorded => {
+                        unrecorded = true;
+                        break 'run;
                     }
                 };
                 match persisted {
@@ -2209,7 +2309,7 @@ async fn execute_in_span(
                             first_failure = Some((name.clone(), msg));
                         }
                         failed = true;
-                        give_up(
+                        if !give_up(
                             &name,
                             &instances,
                             &mut fanouts,
@@ -2220,7 +2320,11 @@ async fn execute_in_span(
                             &run_id,
                             &store,
                         )
-                        .await;
+                        .await
+                        {
+                            unrecorded = true;
+                            break 'run;
+                        }
                     }
                 }
             }
@@ -2237,7 +2341,7 @@ async fn execute_in_span(
                     &msg,
                     Some(&json!({ "error": msg })),
                 ));
-                store
+                if !store
                     .landed("op_finished", || {
                         store.op_finished(
                             &run_id,
@@ -2249,12 +2353,16 @@ async fn execute_in_span(
                             &[],
                         )
                     })
-                    .await;
+                    .await
+                {
+                    unrecorded = true;
+                    break 'run;
+                }
                 if first_failure.is_none() {
                     first_failure = Some((name.clone(), msg));
                 }
                 failed = true;
-                give_up(
+                if !give_up(
                     &name,
                     &instances,
                     &mut fanouts,
@@ -2265,12 +2373,16 @@ async fn execute_in_span(
                     &run_id,
                     &store,
                 )
-                .await;
+                .await
+                {
+                    unrecorded = true;
+                    break 'run;
+                }
             }
         }
     }
 
-    if canceled {
+    if canceled && !unrecorded {
         // abort lands at an op's next await point; an op that never awaits, and
         // blocking work an op spawned, never land at all.
         //
@@ -2290,7 +2402,7 @@ async fn execute_in_span(
             false => CANCEL_GRACE,
         };
         let deadline = tokio::time::Instant::now() + grace;
-        loop {
+        'drain: loop {
             let joined = match tokio::time::timeout_at(deadline, tasks.join_next_with_id()).await {
                 Ok(Some(joined)) => joined,
                 // every task landed, or the grace ran out with some still running
@@ -2316,7 +2428,7 @@ async fn execute_in_span(
                             match crate::io::put(&runner.io, unit.io_name(), key, output).await {
                                 Ok(handle) => {
                                     let meta = crate::io::handle_meta(&handle, meta);
-                                    store
+                                    if !store
                                         .landed("op_finished", || {
                                             store.op_finished(
                                                 &run_id,
@@ -2328,18 +2440,25 @@ async fn execute_in_span(
                                                 &built,
                                             )
                                         })
-                                        .await;
-                                    if let Some(state) = state {
-                                        store
+                                        .await
+                                    {
+                                        unrecorded = true;
+                                        break 'drain;
+                                    }
+                                    if let Some(state) = state
+                                        && !store
                                             .landed("set_op_state", || {
                                                 store.set_op_state(job.name(), &name, &state)
                                             })
-                                            .await;
+                                            .await
+                                    {
+                                        unrecorded = true;
+                                        break 'drain;
                                     }
                                 }
                                 Err(e) => {
                                     let msg = format!("could not persist the output: {e}");
-                                    store
+                                    if !store
                                         .landed("op_finished", || {
                                             store.op_finished(
                                                 &run_id,
@@ -2351,7 +2470,11 @@ async fn execute_in_span(
                                                 &[],
                                             )
                                         })
-                                        .await;
+                                        .await
+                                    {
+                                        unrecorded = true;
+                                        break 'drain;
+                                    }
                                 }
                             }
                         }
@@ -2359,7 +2482,7 @@ async fn execute_in_span(
                         // it; there is nothing left to record
                         Outcome::Recorded(_) => {}
                         Outcome::Failed(msg) => {
-                            store
+                            if !store
                                 .landed("op_finished", || {
                                     store.op_finished(
                                         &run_id,
@@ -2371,14 +2494,32 @@ async fn execute_in_span(
                                         &[],
                                     )
                                 })
-                                .await;
+                                .await
+                            {
+                                unrecorded = true;
+                                break 'drain;
+                            }
                         }
-                        Outcome::Killed(msg) => op_killed(&store, &run_id, &name, &msg).await,
+                        Outcome::Killed(msg) => {
+                            if !op_killed(&store, &run_id, &name, &msg).await {
+                                unrecorded = true;
+                                break 'drain;
+                            }
+                        }
+                        // its start was never recorded either, so there is
+                        // nothing here this process can put right
+                        Outcome::Unrecorded => {
+                            unrecorded = true;
+                            break 'drain;
+                        }
                     }
                 }
                 Err(join_err) if join_err.is_cancelled() => {
                     let name = names.remove(&join_err.id()).expect("spawned with id");
-                    op_canceled(&store, &run_id, &name).await;
+                    if !op_canceled(&store, &run_id, &name).await {
+                        unrecorded = true;
+                        break 'drain;
+                    }
                 }
                 Err(join_err) => {
                     let name = names.remove(&join_err.id()).expect("spawned with id");
@@ -2391,7 +2532,7 @@ async fn execute_in_span(
                         &msg,
                         Some(&json!({ "error": msg })),
                     ));
-                    store
+                    if !store
                         .landed("op_finished", || {
                             store.op_finished(
                                 &run_id,
@@ -2403,7 +2544,11 @@ async fn execute_in_span(
                                 &[],
                             )
                         })
-                        .await;
+                        .await
+                    {
+                        unrecorded = true;
+                        break 'drain;
+                    }
                 }
             }
         }
@@ -2413,11 +2558,21 @@ async fn execute_in_span(
         let mut unstopped: Vec<String> = names.drain().map(|(_, name)| name).collect();
         unstopped.sort();
         for name in unstopped {
-            op_unstopped(&store, &run_id, &name, grace).await;
+            unrecorded |= !op_unstopped(&store, &run_id, &name, grace).await;
         }
         for name in pending.drain(..) {
-            op_canceled(&store, &run_id, &name).await;
+            unrecorded |= !op_canceled(&store, &run_id, &name).await;
         }
+    }
+
+    // every op of this run that could be recorded has been; what cannot be is
+    // the run itself, and this is where it stops. dropping the `JoinSet` on
+    // the way out aborts whatever is still in flight — and kills an isolated
+    // op's child with it — so nothing carries on working for a run nobody is
+    // going to record
+    if unrecorded {
+        runner.abandon(&run_id);
+        return;
     }
 
     debug_assert!(pending.is_empty(), "ops left unspawned at run end");
@@ -2481,7 +2636,7 @@ async fn execute_in_span(
     let queued = runner
         .durable
         .then(|| serde_json::to_value(&event).expect("a run event is json"));
-    store
+    if !store
         .landed("run_finished", || {
             store.run_finished(
                 &run_id,
@@ -2491,7 +2646,13 @@ async fn execute_in_span(
                 queued.as_ref(),
             )
         })
-        .await;
+        .await
+    {
+        // every op of it is recorded and the run's own row is not, so the
+        // status this process would report is the one thing nobody can read
+        runner.abandon(&run_id);
+        return;
+    }
     runner.active.lock().unwrap().remove(&run_id);
     // this run's slot is free: wake anything waiting on it, then go and see
     // what the queue can start in its place
@@ -2644,12 +2805,11 @@ async fn give_up(
     statuses: &mut HashMap<String, OpStatus>,
     run_id: &str,
     store: &Store,
-) {
+) -> bool {
     statuses.insert(name.to_string(), OpStatus::Failed);
     let Some(instance) = instances.get(name) else {
         let reason = format!("skipped: upstream {name} failed");
-        skip_downstream(job, pairs, name, &reason, pending, statuses, run_id, store).await;
-        return;
+        return skip_downstream(job, pairs, name, &reason, pending, statuses, run_id, store).await;
     };
     let fan = fanouts
         .get_mut(&instance.parent)
@@ -2657,20 +2817,21 @@ async fn give_up(
     fan.remaining -= 1;
     // the first failure is what fails the mapped op and skips downstream;
     // later ones just close a slot
-    if !fan.failed {
-        fan.failed = true;
-        let parent = instance.parent.clone();
-        statuses.insert(parent.clone(), OpStatus::Failed);
-        let reason = format!("skipped: upstream {parent} failed");
-        skip_downstream(
-            job, pairs, &parent, &reason, pending, statuses, run_id, store,
-        )
-        .await;
+    if fan.failed {
+        return true;
     }
+    fan.failed = true;
+    let parent = instance.parent.clone();
+    statuses.insert(parent.clone(), OpStatus::Failed);
+    let reason = format!("skipped: upstream {parent} failed");
+    skip_downstream(
+        job, pairs, &parent, &reason, pending, statuses, run_id, store,
+    )
+    .await
 }
 
-async fn op_canceled(store: &Store, run_id: &str, name: &str) {
-    store
+async fn op_canceled(store: &Store, run_id: &str, name: &str) -> bool {
+    let landed = store
         .landed("op_finished", || {
             store.op_finished(
                 run_id,
@@ -2691,13 +2852,14 @@ async fn op_canceled(store: &Store, run_id: &str, name: &str) {
         "canceled",
         Some(&json!({ "reason": "canceled", "stopped": true })),
     ));
+    landed
 }
 
 /// canceled, and stopped: an [isolated](Op::isolated) op's process was
 /// signalled, killed and reaped, so this row gets a real finish time. that is
 /// the difference the subprocess buys — everywhere else hestan can only record
 /// what it asked for.
-async fn op_killed(store: &Store, run_id: &str, name: &str, msg: &str) {
+async fn op_killed(store: &Store, run_id: &str, name: &str, msg: &str) -> bool {
     note(store.append_event(
         run_id,
         Some(name),
@@ -2712,12 +2874,12 @@ async fn op_killed(store: &Store, run_id: &str, name: &str, msg: &str) {
         .landed("op_finished", || {
             store.op_finished(run_id, name, OpStatus::Canceled, None, None, Some(msg), &[])
         })
-        .await;
+        .await
 }
 
 // canceled, but only the request is a fact: the op never joined, so it gets no
 // finish time and an error that says exactly that
-async fn op_unstopped(store: &Store, run_id: &str, name: &str, grace: Duration) {
+async fn op_unstopped(store: &Store, run_id: &str, name: &str, grace: Duration) -> bool {
     let msg = format!(
         "cancellation requested; this op was not observed to stop within {grace:?} \
          and may still be running (blocking work stops only if it polls ctx.is_cancelled())"
@@ -2734,7 +2896,7 @@ async fn op_unstopped(store: &Store, run_id: &str, name: &str, grace: Duration) 
     ));
     store
         .landed("op_unstopped", || store.op_unstopped(run_id, name, &msg))
-        .await;
+        .await
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2773,9 +2935,12 @@ async fn run_op(
         }
     });
     let mut attempt = 1;
-    store
+    if !store
         .landed("op_started", || store.op_started(&run_id, &name, attempt))
-        .await;
+        .await
+    {
+        return (name, Outcome::Unrecorded);
+    }
     note(store.append_event(
         &run_id,
         Some(&name),
@@ -3046,9 +3211,12 @@ async fn run_op(
         }
         attempt += 1;
         // a fresh attempt of an isolated op is a fresh child process
-        store
+        if !store
             .landed("op_started", || store.op_started(&run_id, &name, attempt))
-            .await;
+            .await
+        {
+            return (name, Outcome::Unrecorded);
+        }
     }
 }
 
@@ -3090,7 +3258,9 @@ pub(crate) fn panic_payload(panic: &(dyn std::any::Any + Send)) -> Option<&str> 
         .or_else(|| panic.downcast_ref::<String>().map(String::as_str))
 }
 
-/// mark what `root` not succeeding cuts off. propagation asks each candidate's
+/// mark what `root` not succeeding cuts off, and say whether every row of it
+/// landed.
+/// propagation asks each candidate's
 /// [trigger rule](When) instead of assuming: an op that would still run is not
 /// skipped, and neither is anything hanging off it, which waits on what that
 /// op does rather than on what happened above it. everything reached through
@@ -3106,7 +3276,7 @@ async fn skip_downstream(
     statuses: &mut HashMap<String, OpStatus>,
     run_id: &str,
     store: &Store,
-) {
+) -> bool {
     let down = graph::downstream_through(pairs, root, |n| {
         job.op(n)
             .is_none_or(|o| o.runs_when() == When::AllSucceeded)
@@ -3124,16 +3294,20 @@ async fn skip_downstream(
                 reason,
                 Some(&json!({ "reason": reason, "upstream": root })),
             ));
-            store
+            if !store
                 .landed("op_finished", || {
                     store.op_finished(run_id, &name, OpStatus::Skipped, None, None, None, &[])
                 })
-                .await;
+                .await
+            {
+                return false;
+            }
             statuses.insert(name, OpStatus::Skipped);
         } else {
             i += 1;
         }
     }
+    true
 }
 
 #[cfg(test)]
@@ -3906,7 +4080,10 @@ mod tests {
             .plant_claim("theirs", "somebody-else", Some(stale))
             .unwrap();
 
-        assert_eq!(store.renew_leases(runner.instance(), LEASE).unwrap(), 1);
+        assert_eq!(
+            store.renew_leases(runner.instance(), LEASE, &[]).unwrap(),
+            1
+        );
         let mine = store.run("mine").unwrap().unwrap();
         assert!(
             mine.lease_until.unwrap() > Utc::now(),
@@ -4111,5 +4288,180 @@ mod tests {
         // a write that was tried again and a write that was let go
         assert_eq!(store.health().unrecorded_writes(), 0);
         assert_eq!(store.health().dropped_writes(), 0);
+    }
+
+    /// a job whose op breaks one write on its way out: the body runs, and the
+    /// row that would say so is the one thing the store will not take.
+    ///
+    /// that write and no other, so that a run which carried on regardless
+    /// would record its outcome perfectly well — which is exactly what these
+    /// cases have to be able to tell apart.
+    fn breaks_the_store(store: &Store) -> Job {
+        let store = store.clone();
+        Job::builder("etl")
+            .op(Op::new("work", move |_| {
+                let store = store.clone();
+                async move {
+                    store.fail_writes_to("op_finished", u64::MAX);
+                    Ok(json!("done"))
+                }
+            }))
+            .build()
+            .unwrap()
+    }
+
+    /// wait for this process to give up on the run it cannot record.
+    async fn given_up(runner: &Runner, store: &Store) {
+        for _ in 0..1_000 {
+            if store.health().unrecorded_writes() > 0 && runner.active.lock().unwrap().is_empty() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        panic!("the run neither finished nor was given up on");
+    }
+
+    // the whole point of the phase: an op that worked, a store that will not
+    // say so, and a run that reports nothing rather than reporting success
+    #[tokio::test]
+    async fn a_run_whose_outcome_cannot_be_written_does_not_claim_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_, store) = file_store(&dir);
+        let runner = Runner::new([breaks_the_store(&store)], store.clone()).unwrap();
+
+        let id = runner.launch("etl", json!({}), Trigger::Manual).unwrap();
+        given_up(&runner, &store).await;
+
+        // not success, not failure: this process does not know which, and
+        // says so by leaving the row where the last write it managed left it
+        let run = store.run(&id).unwrap().unwrap();
+        assert_eq!(run.status, RunStatus::Running);
+        assert_eq!(run.finished_at, None);
+        assert_eq!(run.error, None);
+        let op = store.op_run(&id, "work").unwrap().unwrap();
+        assert_eq!(op.status, OpStatus::Running);
+        assert_eq!(op.finished_at, None);
+
+        // the claim is still there, which is what a reclaimer needs, and the
+        // lease is what will run out: a heartbeat renews everything this
+        // process is executing and this is no longer one of them
+        assert_eq!(run.claimed_by.as_deref(), Some(runner.instance()));
+        let lease = run.lease_until.expect("a claim carries a lease");
+        store.fail_writes(0);
+        runner.heartbeat();
+        assert_eq!(
+            store.run(&id).unwrap().unwrap().lease_until,
+            Some(lease),
+            "an abandoned run's lease was renewed, so nothing could ever reclaim it"
+        );
+    }
+
+    // and what it is left as is the reclaim policy's decision rather than this
+    // process's: the same run, seen by something with a working store, after
+    // the lease it stopped renewing has run out
+    #[tokio::test]
+    async fn a_run_left_for_a_reclaimer_is_settled_by_the_reclaim_policy() {
+        for (policy, expected) in [
+            (Reclaim::Fail, RunStatus::Failed),
+            (Reclaim::Requeue, RunStatus::Queued),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let (_, store) = file_store(&dir);
+            let runner = Runner::new([breaks_the_store(&store)], store.clone())
+                .unwrap()
+                .with_reclaim(policy);
+
+            let id = runner.launch("etl", json!({}), Trigger::Manual).unwrap();
+            given_up(&runner, &store).await;
+            store.fail_writes(0);
+
+            // the lease this process stopped renewing, run out
+            store
+                .plant_claim(
+                    &id,
+                    runner.instance(),
+                    Some(Utc::now() - chrono::Duration::seconds(90)),
+                )
+                .unwrap();
+            runner.heartbeat();
+
+            let run = store.run(&id).unwrap().unwrap();
+            assert_eq!(run.status, expected, "under {policy:?}");
+            if policy == Reclaim::Fail {
+                let why = run.error.unwrap();
+                assert!(why.contains("claimer went away"), "{why}");
+                let op = store.op_run(&id, "work").unwrap().unwrap();
+                assert_eq!(op.status, OpStatus::Failed);
+            }
+        }
+    }
+
+    // and the same from the other end of an op: a run that cannot record that
+    // an op *started* has no row to record it finishing against either, so it
+    // stops there rather than running work nothing is keeping the score of
+    #[tokio::test]
+    async fn an_op_whose_start_cannot_be_written_stops_the_run_before_it_runs() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_, store) = file_store(&dir);
+        let ran = Arc::new(AtomicBool::new(false));
+        let watched = ran.clone();
+        let job = Job::builder("etl")
+            .op(Op::new("work", move |_| {
+                let ran = watched.clone();
+                async move {
+                    ran.store(true, Ordering::SeqCst);
+                    Ok(json!(null))
+                }
+            }))
+            .build()
+            .unwrap();
+        let runner = Runner::new([job], store.clone()).unwrap();
+        store.fail_writes_to("op_started", u64::MAX);
+
+        let id = runner.launch("etl", json!({}), Trigger::Manual).unwrap();
+        given_up(&runner, &store).await;
+
+        assert!(!ran.load(Ordering::SeqCst), "the op body ran anyway");
+        let run = store.run(&id).unwrap().unwrap();
+        assert_eq!(run.status, RunStatus::Running);
+        assert_eq!(run.finished_at, None);
+    }
+
+    // a process that cannot record a run has no business claiming another one:
+    // a queue draining into something that will not write it down is the
+    // failure this phase exists to end, and it is not an improvement on one
+    // lost run
+    #[tokio::test]
+    async fn a_process_whose_store_is_failing_stops_claiming() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_, store) = file_store(&dir);
+        let runner = Runner::new([breaks_the_store(&store)], store.clone()).unwrap();
+
+        let first = runner.launch("etl", json!({}), Trigger::Manual).unwrap();
+        given_up(&runner, &store).await;
+        assert!(store.health().failing());
+
+        // the queue still works and this process still would, but it does not
+        let second = runner.launch("etl", json!({}), Trigger::Manual).unwrap();
+        store.fail_writes(0);
+        runner.dispatch();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let queued = store.run(&second).unwrap().unwrap();
+        assert_eq!(queued.status, RunStatus::Queued);
+        assert_eq!(queued.claimed_by, None);
+        assert_ne!(first, second);
+
+        // the lease loop is the write that says the store is back, and the
+        // queue moves again on the strength of it
+        runner.heartbeat();
+        assert!(!store.health().failing());
+        runner.dispatch();
+        for _ in 0..1_000 {
+            if store.run(&second).unwrap().unwrap().claimed_by.is_some() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        panic!("the queue never moved again");
     }
 }

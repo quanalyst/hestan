@@ -1,7 +1,7 @@
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
@@ -1131,9 +1131,12 @@ impl BestEffort {
 /// events should find that out from the control plane rather than from the
 /// gap.
 pub(crate) fn note(write: BestEffort) {
-    if let Err(e) = write.wrote {
-        tracing::warn!("store write dropped: {e}");
-        write.health.dropped();
+    match write.wrote {
+        Ok(()) => write.health.wrote(),
+        Err(e) => {
+            tracing::warn!("store write dropped: {e}");
+            write.health.dropped();
+        }
     }
 }
 
@@ -1248,21 +1251,43 @@ fn postgres_transient(e: &tokio_postgres::Error) -> bool {
 pub(crate) struct Health {
     dropped: AtomicU64,
     unrecorded: AtomicU64,
+    /// whether the last write this process attempted did not land and none
+    /// has landed since. what a process asks before it claims anything.
+    failing: AtomicBool,
     /// how many of the writes a run makes are to fail before the database is
     /// allowed to see them. tests only — see [`Store::fail_writes`].
     #[cfg(test)]
     injected: AtomicU64,
+    /// which write those failures are for, `None` being all of them.
+    #[cfg(test)]
+    injected_into: Mutex<Option<&'static str>>,
 }
 
 impl Health {
+    /// a write landed, so whatever was wrong is no longer wrong.
+    fn wrote(&self) {
+        self.failing.store(false, Ordering::Relaxed);
+    }
+
     /// a best-effort write did not land, and nothing will try again.
     fn dropped(&self) {
         self.dropped.fetch_add(1, Ordering::Relaxed);
+        self.failing.store(true, Ordering::Relaxed);
     }
 
     /// a write that records authoritative state did not land.
     fn unrecorded(&self) {
         self.unrecorded.fetch_add(1, Ordering::Relaxed);
+        self.failing.store(true, Ordering::Relaxed);
+    }
+
+    /// whether this store is refusing writes as far as this process can tell.
+    ///
+    /// one bit about the last attempt rather than a rate: what asks is a
+    /// dispatcher deciding whether to claim a run, and "the last thing i tried
+    /// to write did not land" is exactly the question it is asking.
+    pub(crate) fn failing(&self) -> bool {
+        self.failing.load(Ordering::Relaxed)
     }
 
     /// how many events, log lines and other best-effort writes this store has
@@ -1374,9 +1399,8 @@ impl Store {
         &*self.target == ":memory:"
     }
 
-    /// what this process has seen this store do: what it dropped, and what it
-    /// could not record at all.
-    #[cfg(test)]
+    /// what this process has seen this store do: what it dropped, what it
+    /// could not record at all, and whether it is taking writes now.
     pub(crate) fn health(&self) -> &Health {
         &self.health
     }
@@ -1401,7 +1425,10 @@ impl Store {
         let mut attempt = 0;
         loop {
             let e = match write() {
-                Ok(()) => return true,
+                Ok(()) => {
+                    self.health.wrote();
+                    return true;
+                }
                 Err(e) => e,
             };
             if attempt + 1 == WRITE_ATTEMPTS || !transient(&e) {
@@ -1427,7 +1454,7 @@ impl Store {
     }
 
     /// fail the next `n` writes a run makes, whatever the database would have
-    /// said.
+    /// said. `0` is a store that works again.
     ///
     /// tests only, and the whole of this phase is about the state it produces:
     /// a store that will not take a write is the one thing a test cannot ask a
@@ -1436,13 +1463,31 @@ impl Store {
     /// here is a transient failure and not a particular one's spelling.
     #[cfg(test)]
     pub(crate) fn fail_writes(&self, n: u64) {
+        *self.health.injected_into.lock().unwrap() = None;
+        self.health.injected.store(n, Ordering::SeqCst);
+    }
+
+    /// [`fail_writes`](Self::fail_writes) for one write and no others, named
+    /// as [`Store::landed`] names it.
+    ///
+    /// which is what a case asserting where a run *stopped* needs: with every
+    /// write failing, a run that carried on regardless would fail its next
+    /// write too and leave the same rows behind as one that stopped, and the
+    /// case would pass either way.
+    #[cfg(test)]
+    pub(crate) fn fail_writes_to(&self, what: &'static str, n: u64) {
+        *self.health.injected_into.lock().unwrap() = Some(what);
         self.health.injected.store(n, Ordering::SeqCst);
     }
 
     /// one of the failures [`fail_writes`](Self::fail_writes) asked for, if
-    /// any are left.
+    /// any are left and this is the write they were asked for.
     #[cfg(test)]
-    fn injected(&self) -> Option<Error> {
+    fn injected(&self, what: &'static str) -> Option<Error> {
+        let into = *self.health.injected_into.lock().unwrap();
+        if into.is_some_and(|into| into != what) {
+            return None;
+        }
         self.health
             .injected
             .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
@@ -1576,7 +1621,7 @@ impl Store {
     pub(crate) fn create_op_run(&self, run_id: &str, op: &str) -> Result<(), Error> {
         #[cfg(test)]
         {
-            if let Some(e) = self.injected() {
+            if let Some(e) = self.injected("create_op_run") {
                 return Err(e);
             }
         }
@@ -1886,15 +1931,49 @@ impl Store {
         Ok(true)
     }
 
-    /// say that `claimer` is still here, for every run it holds. returns how
-    /// many leases moved, which is how many runs this process is executing.
-    pub(crate) fn renew_leases(&self, claimer: &str, lease: Duration) -> Result<usize, Error> {
+    /// say that `claimer` is still here, for every run it holds — except the
+    /// ones in `given_up`, which are the runs it has stopped executing because
+    /// it could not record them.
+    ///
+    /// leaving those out is the whole of how a lease lapses on purpose. a
+    /// process that keeps renewing a claim it has abandoned holds that run
+    /// out of every reclaimer's reach for as long as the process lives, which
+    /// is the one outcome worse than the failure that got it there.
+    ///
+    /// returns how many leases moved, which is how many runs this process is
+    /// still executing.
+    pub(crate) fn renew_leases(
+        &self,
+        claimer: &str,
+        lease: Duration,
+        given_up: &[String],
+    ) -> Result<usize, Error> {
         let until = Utc::now() + chrono::Duration::from_std(lease).unwrap_or(chrono::Duration::MAX);
-        self.conn().execute(
-            "UPDATE runs SET lease_until = ?2
-             WHERE claimed_by = ?1 AND status IN ('queued', 'running')",
-            args![claimer, until.to_rfc3339()],
-        )
+        let mut args: Vec<Val<'_>> = vec![Val::from(claimer), Val::from(until.to_rfc3339())];
+        // numbered from 3, since the claimer and the new lease are already
+        // bound; an empty list is no clause rather than an empty `IN ()`
+        let except = match given_up.is_empty() {
+            true => String::new(),
+            false => {
+                let list: Vec<String> = (3..3 + given_up.len()).map(|i| format!("?{i}")).collect();
+                args.extend(given_up.iter().map(Val::from));
+                format!(" AND id NOT IN ({})", list.join(", "))
+            }
+        };
+        let moved = self.conn().execute(
+            &format!(
+                "UPDATE runs SET lease_until = ?2
+                 WHERE claimed_by = ?1 AND status IN ('queued', 'running'){except}"
+            ),
+            &args,
+        );
+        // the loop that calls this every fifteen seconds is also the cheapest
+        // thing hestan has that says whether the store is back
+        match &moved {
+            Ok(_) => self.health.wrote(),
+            Err(_) => self.health.unrecorded(),
+        }
+        moved
     }
 
     /// the runs `claimer` currently holds, so a process can say what it is
@@ -2089,7 +2168,7 @@ impl Store {
     pub(crate) fn run_started(&self, id: &str, at: DateTime<Utc>) -> Result<(), Error> {
         #[cfg(test)]
         {
-            if let Some(e) = self.injected() {
+            if let Some(e) = self.injected("run_started") {
                 return Err(e);
             }
         }
@@ -2119,7 +2198,7 @@ impl Store {
     ) -> Result<(), Error> {
         #[cfg(test)]
         {
-            if let Some(e) = self.injected() {
+            if let Some(e) = self.injected("run_finished") {
                 return Err(e);
             }
         }
@@ -2281,7 +2360,7 @@ impl Store {
     pub(crate) fn op_started(&self, run_id: &str, op: &str, attempts: u32) -> Result<(), Error> {
         #[cfg(test)]
         {
-            if let Some(e) = self.injected() {
+            if let Some(e) = self.injected("op_started") {
                 return Err(e);
             }
         }
@@ -2328,7 +2407,7 @@ impl Store {
     ) -> Result<(), Error> {
         #[cfg(test)]
         {
-            if let Some(e) = self.injected() {
+            if let Some(e) = self.injected("op_finished") {
                 return Err(e);
             }
         }
@@ -2364,7 +2443,7 @@ impl Store {
     pub(crate) fn op_unstopped(&self, run_id: &str, op: &str, error: &str) -> Result<(), Error> {
         #[cfg(test)]
         {
-            if let Some(e) = self.injected() {
+            if let Some(e) = self.injected("op_unstopped") {
                 return Err(e);
             }
         }
@@ -2446,7 +2525,7 @@ impl Store {
     ) -> BestEffort {
         #[cfg(test)]
         {
-            if let Some(e) = self.injected() {
+            if let Some(e) = self.injected("append_event") {
                 return self.best_effort(Err(e));
             }
         }
@@ -3231,7 +3310,7 @@ impl Store {
     pub(crate) fn set_op_state(&self, job: &str, op: &str, value: &Value) -> Result<(), Error> {
         #[cfg(test)]
         {
-            if let Some(e) = self.injected() {
+            if let Some(e) = self.injected("set_op_state") {
                 return Err(e);
             }
         }
@@ -8111,9 +8190,9 @@ mod tests {
             // a heartbeat moves the leases this claimer holds and nobody else's
             let before = store.run("r1").unwrap().unwrap().lease_until.unwrap();
             let longer = Duration::from_secs(600);
-            assert_eq!(store.renew_leases("alpha", longer).unwrap(), 1);
+            assert_eq!(store.renew_leases("alpha", longer, &[]).unwrap(), 1);
             assert!(store.run("r1").unwrap().unwrap().lease_until.unwrap() > before);
-            assert_eq!(store.renew_leases("beta", lease).unwrap(), 0);
+            assert_eq!(store.renew_leases("beta", lease, &[]).unwrap(), 0);
 
             // cancelling takes an unclaimed run off the queue and leaves a
             // claimed one to be stopped the ordinary way
