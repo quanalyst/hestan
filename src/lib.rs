@@ -143,7 +143,7 @@ pub use capture::{CaptureLayer, capture_layer};
 #[cfg_attr(docsrs, doc(cfg(feature = "dbt")))]
 pub use dbt::Dbt;
 pub use error::Error;
-pub use executor::{Blocked, CancelOutcome, Limits, Queued, ResumePlan, Runner};
+pub use executor::{Blocked, CancelOutcome, Limits, Queued, ReplayPlan, ResumePlan, Runner};
 pub use freshness::{LateEvent, LateHook, LateKind};
 pub use hooks::{FailureHook, OpEvent, OpHook, RunEvent, RunFailure, RunHook};
 #[cfg(feature = "http")]

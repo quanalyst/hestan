@@ -421,7 +421,14 @@ ALTER TABLE runs ADD COLUMN actor TEXT;
 ALTER TABLE events ADD COLUMN actor TEXT;
 "#;
 
-pub(crate) const SCHEMA_VERSION: u32 = 18;
+// which run a replay replayed. beside `resumed_from` rather than sharing it:
+// a resume continues a run and a replay re-runs one, and a column that meant
+// either would leave the run log unable to say which happened.
+const SCHEMA_V19: &str = r#"
+ALTER TABLE runs ADD COLUMN replay_of TEXT;
+"#;
+
+pub(crate) const SCHEMA_VERSION: u32 = 19;
 
 // one transaction around every pending step and the version stamp (sqlite DDL
 // is transactional), so a crash mid-migration leaves the db exactly as found
@@ -489,6 +496,9 @@ fn migrate(conn: &mut Connection) -> Result<(), Error> {
     if version < 18 {
         tx.execute_batch(SCHEMA_V18)?;
     }
+    if version < 19 {
+        tx.execute_batch(SCHEMA_V19)?;
+    }
     if version != SCHEMA_VERSION {
         tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     }
@@ -525,7 +535,7 @@ const EVENT_COLS: &str =
 /// two of them drifting apart is a real way to spend an afternoon.
 const RUN_COLS: &str = r#"id, job, status, "trigger", params, created_at, started_at, finished_at,
     resumed_from, error, scheduled_for, tags, priority, claimed_by, claimed_at, lease_until,
-    actor"#;
+    actor, replay_of"#;
 
 /// every column [`notification_from_row`] reads, in the order it reads them.
 const NOTIFICATION_COLS: &str =
@@ -1549,8 +1559,8 @@ impl Store {
         tx.execute(
             r#"INSERT INTO runs (id, job, status, "trigger", params, created_at, started_at,
                                  finished_at, error, resumed_from, scheduled_for, tags,
-                                 priority, plan, actor)
-               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)"#,
+                                 priority, plan, actor, replay_of)
+               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)"#,
             args![
                 &run.id,
                 &run.job,
@@ -1567,6 +1577,7 @@ impl Store {
                 run.priority,
                 plan.map(|v| v.to_string()),
                 run.actor.as_deref(),
+                run.replay_of.as_deref(),
             ],
         )?;
         for op in ops {
@@ -3065,6 +3076,23 @@ impl Store {
         )
     }
 
+    /// the [plan](Self::create_run_keyed) a run was launched with: the ops it
+    /// was to execute and what it was seeded with ahead of them. `None` on a
+    /// run of a whole job, which reconstructs itself from the job and records
+    /// no plan, and on a run this store has never had.
+    ///
+    /// what a [replay](crate::Runner::replay) reads to find the inputs a
+    /// subset run was handed. the ops it ran left rows behind; what it was
+    /// given instead of running them is here and nowhere else.
+    pub(crate) fn run_plan(&self, id: &str) -> Result<Option<Value>, Error> {
+        Ok(self
+            .conn()
+            .query_opt("SELECT plan FROM runs WHERE id = ?1", args![id], |r| {
+                r.opt_json(0)
+            })?
+            .flatten())
+    }
+
     /// a page of runs, newest first, narrowed by whichever of the filters are
     /// set.
     ///
@@ -4336,7 +4364,7 @@ fn queued(db: &mut impl Exec, limit: u32) -> Result<Vec<(Run, Option<Value>)>, E
              ORDER BY priority DESC, created_at, id LIMIT ?1"
         ),
         args![limit],
-        |r| Ok((run_from_row(r)?, r.opt_json(17)?)),
+        |r| Ok((run_from_row(r)?, r.opt_json(18)?)),
     )
 }
 
@@ -4359,6 +4387,7 @@ fn run_from_row(row: &AnyRow<'_>) -> Result<Run, Error> {
         claimed_at: row.opt_ts(14)?,
         lease_until: row.opt_ts(15)?,
         actor: row.opt_text(16)?,
+        replay_of: row.opt_text(17)?,
     })
 }
 
@@ -4925,6 +4954,7 @@ mod tests {
             finished_at: None,
             error: None,
             resumed_from: None,
+            replay_of: None,
             scheduled_for: None,
             tags: Default::default(),
             priority: 0,
@@ -6563,14 +6593,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("future.db");
         let path = path.to_str().unwrap();
-        phase1_db(path, 19);
+        phase1_db(path, 20);
         let err = Store::open(path).err().unwrap();
-        assert_eq!(err.to_string(), "db schema v19 is newer than this build");
+        assert_eq!(err.to_string(), "db schema v20 is newer than this build");
         let conn = Connection::open(path).unwrap();
         let version: u32 = conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 19);
+        assert_eq!(version, 20);
     }
 
     #[test]
@@ -6738,6 +6768,7 @@ mod tests {
                          ALTER TABLE events ALTER COLUMN run_id SET NOT NULL;
                          ALTER TABLE runs DROP COLUMN actor;
                          ALTER TABLE events DROP COLUMN actor;
+                         ALTER TABLE runs DROP COLUMN replay_of;
                          UPDATE schema_version SET version = 16;"
                     ))
                     .unwrap();
@@ -6834,6 +6865,7 @@ mod tests {
                     .batch(
                         "ALTER TABLE runs DROP COLUMN actor;
                          ALTER TABLE events DROP COLUMN actor;
+                         ALTER TABLE runs DROP COLUMN replay_of;
                          UPDATE schema_version SET version = 17;",
                     )
                     .unwrap();
@@ -6878,6 +6910,92 @@ mod tests {
             assert_eq!(
                 store.run("r2").unwrap().unwrap().actor.as_deref(),
                 Some("ada")
+            );
+        });
+    }
+
+    /// a database at v18: every column but the one that says a run replayed
+    /// another.
+    ///
+    /// the two backends get there differently, for the reason [`at_v17`]
+    /// gives — sqlite walks the chain forward and postgres, created whole at
+    /// the current version, walks the one step back.
+    fn at_v18(db: &Backend) {
+        match db {
+            Backend::Sqlite(dir) => {
+                let conn = Connection::open(dir.path().join("hestan.db")).unwrap();
+                for batch in [
+                    PHASE1_SCHEMA,
+                    SCHEMA_V2,
+                    SCHEMA_V3,
+                    SCHEMA_V4,
+                    SCHEMA_V5,
+                    SCHEMA_V6,
+                    SCHEMA_V7,
+                    SCHEMA_V8,
+                    SCHEMA_V9,
+                    SCHEMA_V10,
+                    SCHEMA_V11,
+                    SCHEMA_V12,
+                    SCHEMA_V13,
+                    SCHEMA_V14,
+                    SCHEMA_V15,
+                    SCHEMA_V16,
+                    SCHEMA_V17,
+                    SCHEMA_V18,
+                ] {
+                    conn.execute_batch(batch).unwrap();
+                }
+                conn.pragma_update(None, "user_version", 18).unwrap();
+            }
+            #[cfg(feature = "postgres")]
+            Backend::Postgres(pg) => {
+                let store = pg.store();
+                let mut resumed = mk_run("r1", "etl", Utc::now());
+                resumed.trigger = Trigger::Resume;
+                resumed.resumed_from = Some("r0".into());
+                store.create_run(&resumed, &["a".into()]).unwrap();
+                store
+                    .conn()
+                    .batch(
+                        "ALTER TABLE runs DROP COLUMN replay_of;
+                         UPDATE schema_version SET version = 18;",
+                    )
+                    .unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn a_populated_v18_db_migrates_to_v19_and_can_record_a_replay() {
+        both(|db| {
+            at_v18(db);
+            let store = db.store();
+
+            // every run written before this replayed nothing, which is what a
+            // null column honestly says. the sqlite fixture's r1 comes from
+            // the phase-1 schema and the postgres one is written above, so
+            // only what both have is asserted
+            for run in store.runs(None, None, None, None, None, 10).unwrap() {
+                assert_eq!(run.replay_of, None, "{}", run.id);
+            }
+
+            // and from here a replay can say what it replayed, beside the
+            // column that says what a resume continued
+            let mut replayed = mk_run("r9", "etl", Utc::now());
+            replayed.trigger = Trigger::Replay;
+            replayed.replay_of = Some("r1".into());
+            store.create_run(&replayed, &["a".into()]).unwrap();
+            let stored = store.run("r9").unwrap().unwrap();
+            assert_eq!(stored.replay_of.as_deref(), Some("r1"));
+            assert_eq!(stored.resumed_from, None);
+
+            // reopening does not migrate a second time
+            drop(store);
+            let store = db.store();
+            assert_eq!(
+                store.run("r9").unwrap().unwrap().replay_of.as_deref(),
+                Some("r1")
             );
         });
     }
@@ -7167,6 +7285,65 @@ mod tests {
         assert_eq!(ticks[0].launched, 2);
         assert_eq!(ticks[0].skipped, 0);
         assert!(!store.run_key_claimed("watch", "2026-01-01").unwrap());
+    }
+
+    // the two are opposite operations and the row has to say which happened,
+    // so they are two columns and a run carries at most one of them
+    #[test]
+    fn a_run_records_the_run_it_resumed_apart_from_the_one_it_replayed() {
+        both(|db| {
+            let store = db.store();
+            store
+                .create_run(&mk_run("r1", "etl", Utc::now()), &["a".into()])
+                .unwrap();
+
+            let mut resumed = mk_run("r2", "etl", Utc::now());
+            resumed.trigger = Trigger::Resume;
+            resumed.resumed_from = Some("r1".into());
+            store.create_run(&resumed, &["a".into()]).unwrap();
+
+            let mut replayed = mk_run("r3", "etl", Utc::now());
+            replayed.trigger = Trigger::Replay;
+            replayed.replay_of = Some("r1".into());
+            store.create_run(&replayed, &["a".into()]).unwrap();
+
+            let row = |id: &str| store.run(id).unwrap().unwrap();
+            assert_eq!(row("r2").resumed_from.as_deref(), Some("r1"));
+            assert_eq!(row("r2").replay_of, None);
+            assert_eq!(row("r3").replay_of.as_deref(), Some("r1"));
+            assert_eq!(row("r3").resumed_from, None);
+            assert_eq!(row("r3").trigger, Trigger::Replay);
+            // and the listing reads the same columns the single row does
+            let listed = store.runs(None, None, None, None, None, 10).unwrap();
+            let of = |id: &str| listed.iter().find(|r| r.id == id).unwrap();
+            assert_eq!(of("r3").replay_of.as_deref(), Some("r1"));
+            assert_eq!(of("r2").replay_of, None);
+        });
+    }
+
+    // what a subset run was handed is on its plan and nowhere else: its op
+    // rows say what it produced, and a replay of it needs what it was given
+    #[test]
+    fn a_runs_plan_reads_back_and_a_whole_jobs_run_has_none() {
+        both(|db| {
+            let store = db.store();
+            let plan = json!({"ops": ["load"], "seeds": {"extract": {"rows": 3}}});
+            store
+                .create_run_keyed(
+                    &mk_run("r1", "etl", Utc::now()),
+                    &["load".into()],
+                    None,
+                    Some(&plan),
+                )
+                .unwrap();
+            store
+                .create_run(&mk_run("r2", "etl", Utc::now()), &["a".into()])
+                .unwrap();
+
+            assert_eq!(store.run_plan("r1").unwrap(), Some(plan));
+            assert_eq!(store.run_plan("r2").unwrap(), None);
+            assert_eq!(store.run_plan("never-existed").unwrap(), None);
+        });
     }
 
     #[test]
@@ -9038,20 +9215,20 @@ mod tests {
         let store = pg.store();
         store
             .conn()
-            .execute("UPDATE schema_version SET version = ?1", args![19_i64])
+            .execute("UPDATE schema_version SET version = ?1", args![20_i64])
             .unwrap();
         drop(store);
 
         let err = Store::connect(&pg.url).err().unwrap();
-        assert_eq!(err.to_string(), "db schema v19 is newer than this build");
+        assert_eq!(err.to_string(), "db schema v20 is newer than this build");
 
-        // and it is still v19: a build that cannot read a database must not
+        // and it is still v20: a build that cannot read a database must not
         // rewrite it either
         let version = crate::pg::unmigrated(&pg.url)
             .unwrap()
             .query("SELECT version FROM schema_version", args![], |r| r.int(0))
             .unwrap();
-        assert_eq!(version, [19]);
+        assert_eq!(version, [20]);
     }
 
     // ------------------------------------------- what a write is worth losing

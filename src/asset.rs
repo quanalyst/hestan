@@ -9,6 +9,7 @@ use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 
 use crate::error::Error;
+use crate::executor::Lineage;
 use crate::graph;
 use crate::job::Job;
 use crate::model::{CheckStatus, Materialization, RunTags, Severity, Trigger};
@@ -1587,7 +1588,7 @@ pub(crate) fn launch_plan(
         plan.seeds,
         json!({}),
         trigger,
-        None,
+        Lineage::None,
         tags,
         None,
     )
@@ -2189,7 +2190,7 @@ mod tests {
                 plan.seeds,
                 json!({}),
                 Trigger::Build,
-                None,
+                Lineage::None,
                 RunTags::new(),
                 None,
             )
@@ -2248,7 +2249,7 @@ mod tests {
                 plan.seeds,
                 json!({}),
                 Trigger::Build,
-                None,
+                Lineage::None,
                 RunTags::new(),
                 None,
             )

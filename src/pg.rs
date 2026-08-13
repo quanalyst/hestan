@@ -74,7 +74,8 @@ CREATE TABLE runs (
     claimed_at TEXT COLLATE "C",
     lease_until TEXT COLLATE "C",
     plan TEXT COLLATE "C",
-    actor TEXT COLLATE "C"
+    actor TEXT COLLATE "C",
+    replay_of TEXT COLLATE "C"
 );
 CREATE INDEX runs_job_created ON runs(job, created_at DESC);
 CREATE INDEX runs_queue ON runs(status, claimed_by, priority DESC, created_at);
@@ -438,6 +439,13 @@ ALTER TABLE runs ADD COLUMN actor TEXT COLLATE "C";
 ALTER TABLE events ADD COLUMN actor TEXT COLLATE "C";
 "#;
 
+/// which run a replay replayed. the postgres half of `SCHEMA_V19`, and one
+/// nullable column on both backends: null is what every row written before
+/// this says, and what every run that is not a replay goes on saying.
+const MIGRATE_V19: &str = r#"
+ALTER TABLE runs ADD COLUMN replay_of TEXT COLLATE "C";
+"#;
+
 const MIGRATE_V17: &str = r#"
 ALTER TABLE events ALTER COLUMN run_id DROP NOT NULL;
 ALTER TABLE events ADD COLUMN subject_kind TEXT COLLATE "C" NOT NULL DEFAULT 'run';
@@ -479,6 +487,9 @@ fn migrate(client: &mut Client) -> Result<(), Error> {
             }
             if version < 18 {
                 tx.batch(MIGRATE_V18)?;
+            }
+            if version < 19 {
+                tx.batch(MIGRATE_V19)?;
             }
             if version != SCHEMA_VERSION {
                 tx.execute(

@@ -113,6 +113,10 @@ pub enum Trigger {
     /// a re-run that seeds the ops that already succeeded — see
     /// [`ResumePlan`](crate::ResumePlan).
     Resume,
+    /// a re-run of ops that already ran, on the inputs they were given — see
+    /// [`ReplayPlan`](crate::ReplayPlan). the opposite of a resume, which
+    /// re-runs what did *not* succeed.
+    Replay,
     /// an asset was materialized, whether asked for by hand, by a freshness
     /// policy or by a [backfill](Backfill) chunk.
     Build,
@@ -124,6 +128,7 @@ str_enum!(Trigger {
     Schedule => "schedule",
     Retry => "retry",
     Resume => "resume",
+    Replay => "replay",
     Build => "build",
     Sensor => "sensor",
 });
@@ -631,6 +636,14 @@ pub struct Run {
     /// the run this one resumed, for a run launched by
     /// [`Runner::resume_from`](crate::Runner::resume_from); `None` otherwise.
     pub resumed_from: Option<String>,
+    /// the run this one replayed, for a run launched by
+    /// [`Runner::replay`](crate::Runner::replay); `None` otherwise.
+    ///
+    /// a column of its own rather than a second meaning for `resumed_from`,
+    /// because the two say opposite things about what was re-run: a resume
+    /// continues a run from where it broke, and a replay re-runs what already
+    /// ran. never both.
+    pub replay_of: Option<String>,
     /// the occurrence this run stands for, on a scheduled or caught-up run:
     /// the logical time, not the wall clock it launched at. `None` on a manual
     /// launch, a retry, a resume, a build or a sensor fire, which represent

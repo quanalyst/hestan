@@ -296,6 +296,53 @@ pub struct ResumePlan {
     resumed_from: String,
 }
 
+/// what a replay would do, from [`Runner::replay_plan`]. both lists are in the
+/// job's topological order.
+#[derive(Debug, Clone)]
+pub struct ReplayPlan {
+    /// the job the replayed run belongs to.
+    pub job: String,
+    /// the ops the new run executes — exactly these, with nothing downstream
+    /// of them pulled in. that is the difference from a
+    /// [resume](ResumePlan), which re-runs a chosen op *and* everything below
+    /// it.
+    pub ops: Vec<String>,
+    /// the deps those ops read, seeded from what the original run recorded, so
+    /// each op above is handed what it was handed then.
+    pub inputs: Vec<String>,
+    params: Value,
+    // `inputs`' values plus the job's external names, which a launch seeds null
+    seeds: HashMap<String, Value>,
+    replay_of: String,
+}
+
+/// what a new run came from: the run a resume continues, the run a replay
+/// re-runs, or nothing at all.
+///
+/// one argument rather than two nullable ones, because a run is at most one of
+/// these and a pair of options can say it was both.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) enum Lineage<'a> {
+    /// launched on its own account, which is most runs.
+    #[default]
+    None,
+    /// continues this run from where it broke.
+    Resumed(&'a str),
+    /// re-runs ops of this run on the inputs it gave them.
+    Replayed(&'a str),
+}
+
+impl Lineage<'_> {
+    /// the two columns a run row carries it in: `(resumed_from, replay_of)`.
+    fn columns(self) -> (Option<String>, Option<String>) {
+        match self {
+            Lineage::None => (None, None),
+            Lineage::Resumed(id) => (Some(id.to_string()), None),
+            Lineage::Replayed(id) => (None, Some(id.to_string())),
+        }
+    }
+}
+
 /// how one attempt ended, before the retry policy has looked at it.
 pub(crate) enum Ended {
     /// an in-process body returned this.
@@ -832,7 +879,17 @@ impl Runner {
         priority: Option<i64>,
     ) -> Result<String, Error> {
         Ok(self
-            .enqueue(job, None, params, trigger, None, None, None, tags, priority)?
+            .enqueue(
+                job,
+                None,
+                params,
+                trigger,
+                Lineage::None,
+                None,
+                None,
+                tags,
+                priority,
+            )?
             .expect("only a claimed run key skips a launch"))
     }
 
@@ -854,7 +911,7 @@ impl Runner {
                 None,
                 params,
                 trigger,
-                None,
+                Lineage::None,
                 scheduled_for,
                 None,
                 RunTags::new(),
@@ -881,7 +938,7 @@ impl Runner {
             None,
             params,
             trigger,
-            None,
+            Lineage::None,
             None,
             Some(key),
             tags,
@@ -1123,7 +1180,7 @@ impl Runner {
 
     /// launch over a subset of the job's ops with upstream outputs pre-seeded.
     /// every subset member's dep must be in the subset or seeded, else
-    /// [`Error::Graph`]. asset builds and resumes are the callers.
+    /// [`Error::Graph`]. asset builds, resumes and replays are the callers.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn launch_subset(
         &self,
@@ -1132,7 +1189,7 @@ impl Runner {
         seeded: HashMap<String, Value>,
         params: Value,
         trigger: Trigger,
-        resumed_from: Option<&str>,
+        lineage: Lineage<'_>,
         tags: RunTags,
         priority: Option<i64>,
     ) -> Result<String, Error> {
@@ -1142,7 +1199,7 @@ impl Runner {
                 Some((ops, seeded)),
                 params,
                 trigger,
-                resumed_from,
+                lineage,
                 None,
                 None,
                 tags,
@@ -1171,7 +1228,7 @@ impl Runner {
             plan.seeded,
             plan.params,
             Trigger::Resume,
-            Some(&plan.resumed_from),
+            Lineage::Resumed(&plan.resumed_from),
             RunTags::new(),
             None,
         )
@@ -1362,6 +1419,219 @@ impl Runner {
         Ok(chain)
     }
 
+    /// re-run the ops of a finished run that failed, on the inputs that run
+    /// gave them. returns the new run's id.
+    ///
+    /// this is the question "does my fix work on the input that broke it".
+    /// the ops execute again with today's code, reading byte for byte what
+    /// they read then. it is a **new** run: the original is not written to,
+    /// and stays exactly as it finished.
+    ///
+    /// # What it does not reproduce
+    ///
+    /// a replay reproduces the *inputs*, not the world the run happened in.
+    /// four things move on regardless, and a replay that succeeded is only
+    /// evidence about the ones that did not matter to it:
+    ///
+    /// - **the code is today's.** that is the point — you are testing a fix —
+    ///   but it means this is not a bit-for-bit re-execution of what happened.
+    /// - **resources are rebuilt.** a connection, a client, a temp dir: the op
+    ///   gets today's, not the original's. an op that read something from a
+    ///   resource read a world that has moved on.
+    /// - **the clock, randomness, and anything the op fetches itself** are not
+    ///   captured and cannot be. an op that calls an api gets today's answer.
+    /// - **[retention](crate::Retention) is the horizon.** a pruned run cannot
+    ///   be replayed: pruning takes an io manager's files with the run, so the
+    ///   values go when the rows do, and a replay of one is
+    ///   [refused](Error::ReplayInput) rather than run on a hole.
+    ///
+    /// `docs/replay.md` is the same list at length, with how to keep a run
+    /// longer when replay is why you want it.
+    pub fn replay(&self, run_id: &str) -> Result<String, Error> {
+        self.replay_ops(run_id, None)
+    }
+
+    /// [`Runner::replay`] of a chosen set of ops instead of the failed ones.
+    /// `ops` executes exactly those and nothing downstream of them; `None`
+    /// means every op the run recorded as failed. the new run carries the
+    /// original's params, is triggered [`Trigger::Replay`], and records
+    /// `replay_of`.
+    pub fn replay_ops(&self, run_id: &str, ops: Option<&[String]>) -> Result<String, Error> {
+        let plan = self.replay_plan(run_id, ops)?;
+        self.launch_subset(
+            &plan.job,
+            plan.ops.iter().cloned().collect(),
+            plan.seeds,
+            plan.params,
+            Trigger::Replay,
+            Lineage::Replayed(&plan.replay_of),
+            RunTags::new(),
+            None,
+        )
+    }
+
+    /// what [`Runner::replay_ops`] would launch, without launching it. every
+    /// refusal it can raise is raised here too, so a preview and the launch
+    /// that follows it agree.
+    ///
+    /// the inputs come from the run itself and no further: the outputs it
+    /// recorded, plus — on a run that was a subset of its job, so a resume, a
+    /// replay or an [asset build](crate::Asset) — the seeds it was handed for
+    /// the ops it did not execute. that is exactly what the ops being
+    /// replayed read, whichever run originally produced it.
+    ///
+    /// each of those is read back through its [io
+    /// manager](crate::IoManager) here rather than when the op asks for it,
+    /// because a value [retention](crate::Retention) has taken makes a replay
+    /// that reproduces nothing: it is refused, naming the op whose input is
+    /// gone, instead of launching a run that will fail halfway.
+    ///
+    /// there is no check that the job still has the shape the run recorded —
+    /// a replay needs the ops it was asked for and the deps those ops read,
+    /// and a graph that grew an op elsewhere does not change either. a dep
+    /// the job has gained since has no recorded output, and is refused as
+    /// one.
+    pub fn replay_plan(&self, run_id: &str, ops: Option<&[String]>) -> Result<ReplayPlan, Error> {
+        // an empty selection is a caller saying nothing, not asking for nothing
+        let ops = ops.filter(|names| !names.is_empty());
+        let run = self
+            .store
+            .run(run_id)?
+            .ok_or_else(|| Error::UnknownRun(run_id.to_string()))?;
+        if matches!(run.status, RunStatus::Queued | RunStatus::Running) {
+            return Err(Error::RunActive(run_id.to_string()));
+        }
+        let job = self
+            .jobs
+            .get(&run.job)
+            .ok_or_else(|| Error::UnknownJob(run.job.clone()))?;
+
+        let rows = self.store.op_runs(run_id)?;
+        let ran = ran(job, &rows);
+        let mut had: HashMap<String, Value> = HashMap::new();
+        for (op, status, output) in fold_instances(&self.io, job, run_id, rows) {
+            if let (OpStatus::Success, Some(output)) = (status, output) {
+                had.insert(op, output);
+            }
+        }
+        // a subset run's seeds live on its plan and nowhere else: they are
+        // outputs of a run further back, which this one was given rather than
+        // made
+        let given: HashMap<String, Value> = self
+            .store
+            .run_plan(run_id)?
+            .as_ref()
+            .and_then(|plan| plan.get("seeds"))
+            .and_then(Value::as_object)
+            .map(|seeds| seeds.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
+            .unwrap_or_default();
+
+        let current: BTreeSet<&str> = job.ops().iter().map(|o| o.name()).collect();
+        let chosen: BTreeSet<String> = match ops {
+            Some(names) => {
+                let unknown: Vec<&str> = names
+                    .iter()
+                    .map(String::as_str)
+                    .filter(|n| !current.contains(n))
+                    .collect();
+                if !unknown.is_empty() {
+                    return Err(Error::Graph(format!(
+                        "job {}: run {run_id} cannot replay ops the job does not have: {}",
+                        job.name(),
+                        unknown.join(", ")
+                    )));
+                }
+                // a replay re-runs what ran. an op this run never reached has
+                // no inputs of its own to reproduce, and running it anyway
+                // would be a partial launch wearing a replay's name
+                let never: Vec<&str> = names
+                    .iter()
+                    .map(String::as_str)
+                    .filter(|n| !ran.contains_key(*n))
+                    .collect();
+                if !never.is_empty() {
+                    return Err(Error::Graph(format!(
+                        "job {}: run {run_id} cannot replay ops it never ran: {}",
+                        job.name(),
+                        never.join(", ")
+                    )));
+                }
+                names.iter().cloned().collect()
+            }
+            None => ran
+                .iter()
+                .filter(|(name, status)| {
+                    **status == OpStatus::Failed && current.contains(name.as_str())
+                })
+                .map(|(name, _)| name.clone())
+                .collect(),
+        };
+        if chosen.is_empty() {
+            return Err(Error::NothingToReplay(run_id.to_string()));
+        }
+
+        let replayed: Vec<String> = job
+            .order()
+            .iter()
+            .filter(|n| chosen.contains(*n))
+            .cloned()
+            .collect();
+        let mut seeds: HashMap<String, Value> = HashMap::new();
+        for name in &replayed {
+            let op = job.op(name).expect("a replayed op is an op of the job");
+            for dep in op.deps() {
+                // a dep being replayed too produces its own value, exactly as
+                // it did for this op the first time
+                if chosen.contains(dep) || seeds.contains_key(dep) || job.is_external(dep) {
+                    continue;
+                }
+                let Some(value) = had.get(dep).or_else(|| given.get(dep)) else {
+                    return Err(Error::Graph(format!(
+                        "job {}: run {run_id} cannot replay {name}: its dep {dep} \
+                         recorded no output to read back",
+                        job.name()
+                    )));
+                };
+                // read back now rather than when the op asks: a handle whose
+                // file went with the run that wrote it resolves to nothing,
+                // and a replay that reproduces nothing should not launch. the
+                // value is dropped — the new run resolves it again through
+                // the manager, the way every run resolves a dep
+                let manager = self.io.manager(job.op(dep).and_then(Op::io_name));
+                let key = IoKey {
+                    run_id: run_id.to_string(),
+                    job: run.job.clone(),
+                    op: dep.clone(),
+                };
+                if let Err(e) = manager.get(&key, value) {
+                    return Err(Error::ReplayInput {
+                        run: run_id.to_string(),
+                        op: name.clone(),
+                        dep: dep.clone(),
+                        reason: e.to_string(),
+                    });
+                }
+                seeds.insert(dep.clone(), value.clone());
+            }
+        }
+        let inputs: Vec<String> = job
+            .order()
+            .iter()
+            .filter(|n| seeds.contains_key(*n))
+            .cloned()
+            .collect();
+        // externals are seeded null by a full launch; a replay of one keeps that
+        seeds.extend(job.external_seeds());
+        Ok(ReplayPlan {
+            job: run.job,
+            ops: replayed,
+            inputs,
+            params: run.params,
+            seeds,
+            replay_of: run.id,
+        })
+    }
+
     /// like [`Runner::launch_subset`] but awaits completion.
     pub(crate) async fn run_subset(
         &self,
@@ -1372,7 +1642,8 @@ impl Runner {
         trigger: Trigger,
         tags: RunTags,
     ) -> Result<Run, Error> {
-        let id = self.launch_subset(job, ops, seeded, params, trigger, None, tags, None)?;
+        let id =
+            self.launch_subset(job, ops, seeded, params, trigger, Lineage::None, tags, None)?;
         self.settle(&id).await
     }
 
@@ -1422,7 +1693,7 @@ impl Runner {
         subset: Option<(HashSet<String>, HashMap<String, Value>)>,
         params: Value,
         trigger: Trigger,
-        resumed_from: Option<&str>,
+        lineage: Lineage<'_>,
         scheduled_for: Option<DateTime<Utc>>,
         key: Option<RunKey<'_>>,
         tags: RunTags,
@@ -1483,6 +1754,7 @@ impl Runner {
                 });
             }
         }
+        let (resumed_from, replay_of) = lineage.columns();
         let run = Run {
             id: new_run_id(),
             job: job.name().to_string(),
@@ -1493,7 +1765,8 @@ impl Runner {
             started_at: None,
             finished_at: None,
             error: None,
-            resumed_from: resumed_from.map(str::to_string),
+            resumed_from,
+            replay_of,
             scheduled_for,
             // a default is a fact about the deployment and the launch is
             // closer to the truth, so the launch's own tags win
@@ -1585,6 +1858,27 @@ fn instance_label(op: &Op, index: usize, element: &Value) -> String {
         Some(key) => key.to_string(),
         None => index.to_string(),
     }
+}
+
+/// what one run's rows say each op of the job did, with a mapped op's
+/// instances rolled up into it: it failed if any instance did, since that is
+/// what the run itself concluded about it.
+///
+/// what a [replay](Runner::replay_plan) reads to find the ops that failed, and
+/// to refuse one the run never ran. deliberately not
+/// [`fold_instances`](fold_instances), which answers a different question —
+/// there, a mapped op whose instances cannot be reassembled is reported failed
+/// so that a resume expands it again, and a replay reading that would offer to
+/// re-run an op that succeeded.
+fn ran(job: &Job, rows: &[OpRun]) -> HashMap<String, OpStatus> {
+    let mut out: HashMap<String, OpStatus> = HashMap::new();
+    for row in rows {
+        let name = instance_of(job, &row.op).map_or_else(|| row.op.clone(), |(parent, _)| parent);
+        if row.status == OpStatus::Failed || !out.contains_key(&name) {
+            out.insert(name, row.status);
+        }
+    }
+    out
 }
 
 /// one mapped op's instance rows mid-fold, by index: the instance's name, what
@@ -3517,7 +3811,7 @@ mod tests {
                 HashMap::new(),
                 json!({}),
                 Trigger::Manual,
-                None,
+                Lineage::None,
                 RunTags::new(),
                 None,
             )
@@ -3532,7 +3826,7 @@ mod tests {
                 HashMap::new(),
                 json!({}),
                 Trigger::Manual,
-                None,
+                Lineage::None,
                 RunTags::new(),
                 None,
             )
@@ -3546,7 +3840,7 @@ mod tests {
                 HashMap::from([("a".into(), json!(1))]),
                 json!({}),
                 Trigger::Manual,
-                None,
+                Lineage::None,
                 RunTags::new(),
                 None,
             )
@@ -3943,6 +4237,7 @@ mod tests {
             finished_at: None,
             error: None,
             resumed_from: None,
+            replay_of: None,
             scheduled_for: None,
             tags: RunTags::new(),
             priority: 0,
@@ -4269,6 +4564,65 @@ mod tests {
         let (pending, seeded) = planned(&job, None);
         assert_eq!(pending, ["a", "b", "c"]);
         assert!(seeded.is_empty());
+    }
+
+    // a replay asks what each op of a run did, and a mapped op is its
+    // instances. `fold_instances` answers a different question — it reports a
+    // mapped op failed whenever its instances cannot be reassembled into one
+    // array, which is right for a resume and would have a replay offering to
+    // re-run an op that succeeded
+    #[test]
+    fn what_a_run_did_rolls_a_mapped_ops_instances_into_it() {
+        let job = Job::builder("fan")
+            .op(Op::new("list", |_| async { Ok(json!(["a", "b"])) }))
+            .op(Op::mapped("each", |_, _: String| async { Ok(json!(1)) }).over("list"))
+            .build()
+            .unwrap();
+        let row = |op: &str, status: OpStatus| OpRun {
+            run_id: "r1".into(),
+            op: op.into(),
+            status,
+            attempts: 1,
+            started_at: None,
+            finished_at: None,
+            output: None,
+            metadata: None,
+            error: None,
+            pid: None,
+        };
+
+        let whole = ran(
+            &job,
+            &[
+                row("list", OpStatus::Success),
+                row("each[0]", OpStatus::Success),
+                row("each[1]", OpStatus::Success),
+            ],
+        );
+        assert_eq!(whole["list"], OpStatus::Success);
+        assert_eq!(whole["each"], OpStatus::Success);
+
+        // one instance failing is the mapped op failing, whichever order the
+        // rows come back in
+        let broken = ran(
+            &job,
+            &[
+                row("list", OpStatus::Success),
+                row("each[0]", OpStatus::Failed),
+                row("each[1]", OpStatus::Success),
+            ],
+        );
+        assert_eq!(broken["each"], OpStatus::Failed);
+        let broken = ran(
+            &job,
+            &[
+                row("each[0]", OpStatus::Success),
+                row("each[1]", OpStatus::Failed),
+            ],
+        );
+        assert_eq!(broken["each"], OpStatus::Failed);
+        // and an op with no row at all is not something the run ran
+        assert!(!broken.contains_key("list"));
     }
 
     #[tokio::test]

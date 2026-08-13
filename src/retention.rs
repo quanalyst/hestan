@@ -266,6 +266,7 @@ mod tests {
                     finished_at: None,
                     error: None,
                     resumed_from: None,
+                    replay_of: None,
                     scheduled_for: None,
                     tags: RunTags::new(),
                     priority: 0,

@@ -21,7 +21,7 @@ use crate::asset::{ASSETS_JOB, AssetRegistry, launch_plan, mats_map, plan_all, s
 use crate::auth::{self, Access, Auth, Identity};
 use crate::backfill;
 use crate::error::Error;
-use crate::executor::{self, CancelOutcome, Runner};
+use crate::executor::{self, CancelOutcome, Lineage, Runner};
 use crate::freshness::{self, asset_freshness};
 use crate::graph;
 use crate::job::Job;
@@ -646,7 +646,7 @@ fn launch_subset(
         job.external_seeds(),
         params,
         Trigger::Manual,
-        None,
+        Lineage::None,
         tags,
         priority,
     ))
@@ -2200,6 +2200,7 @@ mod tests {
             finished_at: None,
             error: None,
             resumed_from: None,
+            replay_of: None,
             scheduled_for: None,
             tags: Default::default(),
             priority: 0,
@@ -2228,6 +2229,7 @@ mod tests {
                 finished_at: None,
                 error: None,
                 resumed_from: None,
+                replay_of: None,
                 scheduled_for: None,
                 tags: Default::default(),
                 priority: 0,
@@ -2285,6 +2287,7 @@ mod tests {
                 finished_at: None,
                 error: None,
                 resumed_from: None,
+                replay_of: None,
                 scheduled_for: None,
                 tags: Default::default(),
                 priority: 0,
@@ -2353,6 +2356,7 @@ mod tests {
                 finished_at: None,
                 error: None,
                 resumed_from: None,
+                replay_of: None,
                 scheduled_for: None,
                 tags: Default::default(),
                 priority: 0,
@@ -2456,6 +2460,7 @@ mod tests {
                 finished_at: None,
                 error: None,
                 resumed_from: None,
+                replay_of: None,
                 scheduled_for: None,
                 tags: Default::default(),
                 priority: 0,
@@ -2575,6 +2580,7 @@ mod tests {
             finished_at: None,
             error: None,
             resumed_from: None,
+            replay_of: None,
             scheduled_for: None,
             tags: Default::default(),
             priority: 0,
@@ -4066,6 +4072,7 @@ mod tests {
             finished_at: None,
             error: None,
             resumed_from: None,
+            replay_of: None,
             scheduled_for: None,
             tags: Default::default(),
             priority: 0,
@@ -4289,6 +4296,7 @@ mod tests {
             finished_at: Some(Utc::now() - Duration::days(400)),
             error: None,
             resumed_from: None,
+            replay_of: None,
             scheduled_for: None,
             tags: Default::default(),
             priority: 0,

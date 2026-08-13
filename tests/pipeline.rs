@@ -1481,6 +1481,343 @@ async fn resume_refuses_a_changed_graph() {
     );
 }
 
+// ---- replay ----
+
+/// everything the run log holds about one run, as text: the row, its op runs
+/// and every event of it.
+///
+/// what a replay must not change. compared as strings rather than field by
+/// field, so a column added later is covered by this without anybody
+/// remembering to add it.
+fn history(runner: &Runner, run_id: &str) -> String {
+    let store = runner.store();
+    let run = store.run(run_id).unwrap().unwrap();
+    let ops = store.op_runs(run_id).unwrap();
+    let events = store.events(run_id, 0).unwrap();
+    format!("{:?}\n{:?}\n{:?}", run, ops, events)
+}
+
+#[tokio::test]
+async fn a_replayed_op_reads_the_input_the_original_gave_it() {
+    let Chain {
+        job,
+        a_calls,
+        b_saw,
+        fixed,
+    } = chain();
+    fixed.store(true, Ordering::SeqCst);
+    let runner = Runner::new([job], Store::open(":memory:").unwrap()).unwrap();
+    let first = runner
+        .run("chain", json!({}), Trigger::Manual)
+        .await
+        .unwrap();
+    assert_eq!(first.status, RunStatus::Success);
+    let recorded = runner
+        .store()
+        .op_runs(&first.id)
+        .unwrap()
+        .into_iter()
+        .find(|o| o.op == "a")
+        .unwrap()
+        .output;
+    assert_eq!(recorded, Some(json!({"rows": 0})));
+    *b_saw.lock().unwrap() = None;
+
+    let second = runner
+        .replay_ops(&first.id, Some(&["b".to_string()]))
+        .unwrap();
+    let second = settled(&runner, &second).await;
+    assert_eq!(second.status, RunStatus::Success);
+    // b read what the original run handed it, and a — which would have
+    // produced a different number this time — never ran
+    assert_eq!(*b_saw.lock().unwrap(), recorded);
+    assert_eq!(a_calls.load(Ordering::SeqCst), 1);
+}
+
+// exactly the ops asked for. this is the whole of what separates a replay
+// from a resume: `resume_from` would take b and everything below it
+#[tokio::test]
+async fn a_replay_runs_the_ops_it_was_given_and_nothing_downstream() {
+    let Chain {
+        job,
+        a_calls,
+        fixed,
+        ..
+    } = chain();
+    fixed.store(true, Ordering::SeqCst);
+    let runner = Runner::new([job], Store::open(":memory:").unwrap()).unwrap();
+    let first = runner
+        .run("chain", json!({}), Trigger::Manual)
+        .await
+        .unwrap();
+    assert_eq!(first.status, RunStatus::Success);
+
+    let second = runner
+        .replay_ops(&first.id, Some(&["b".to_string()]))
+        .unwrap();
+    let second = settled(&runner, &second).await;
+    assert_eq!(second.status, RunStatus::Success);
+    assert_eq!(op_names(&runner, &second.id), ["b"]);
+    assert_eq!(a_calls.load(Ordering::SeqCst), 1, "a ran again");
+
+    // and the same run resumed from b takes c with it, which is the other thing
+    let resumed = runner
+        .resume_from(&first.id, Some(&["b".to_string()]))
+        .unwrap();
+    let resumed = settled(&runner, &resumed).await;
+    assert_eq!(op_names(&runner, &resumed.id), ["b", "c"]);
+}
+
+#[tokio::test]
+async fn a_replay_of_a_failed_op_succeeds_while_the_original_stays_failed() {
+    let Chain { job, fixed, .. } = chain();
+    let runner = Runner::new([job], Store::open(":memory:").unwrap()).unwrap();
+    let first = runner
+        .run("chain", json!({}), Trigger::Manual)
+        .await
+        .unwrap();
+    assert_eq!(first.status, RunStatus::Failed);
+    let before = history(&runner, &first.id);
+
+    // the fix
+    fixed.store(true, Ordering::SeqCst);
+    let second = runner.replay(&first.id).unwrap();
+    let second = settled(&runner, &second).await;
+    assert_eq!(second.status, RunStatus::Success);
+    // the one op that failed, on the input it failed on
+    assert_eq!(op_names(&runner, &second.id), ["b"]);
+
+    // and the run that failed is still the run that failed, to the byte
+    assert_eq!(history(&runner, &first.id), before);
+    let first = runner.store().run(&first.id).unwrap().unwrap();
+    assert_eq!(first.status, RunStatus::Failed);
+    assert!(first.error.unwrap().contains("b exploded"));
+}
+
+// the run log has to be able to say which of the two happened, because they
+// mean opposite things: a resume re-runs what did not succeed, and a replay
+// re-runs what did
+#[tokio::test]
+async fn a_replayed_run_says_it_is_a_replay_and_a_resumed_one_says_it_resumed() {
+    let Chain { job, fixed, .. } = chain();
+    let runner = Runner::new([job], Store::open(":memory:").unwrap()).unwrap();
+    let first = runner
+        .run("chain", json!({"n": 5}), Trigger::Manual)
+        .await
+        .unwrap();
+    assert_eq!(first.status, RunStatus::Failed);
+
+    fixed.store(true, Ordering::SeqCst);
+    let replayed = runner.replay(&first.id).unwrap();
+    let replayed = settled(&runner, &replayed).await;
+    assert_eq!(replayed.trigger, Trigger::Replay);
+    assert_eq!(replayed.replay_of.as_deref(), Some(first.id.as_str()));
+    assert_eq!(replayed.resumed_from, None);
+    // and it carries what the original was launched with
+    assert_eq!(replayed.params, json!({"n": 5}));
+
+    let resumed = runner.resume(&first.id).unwrap();
+    let resumed = settled(&runner, &resumed).await;
+    assert_eq!(resumed.trigger, Trigger::Resume);
+    assert_eq!(resumed.resumed_from.as_deref(), Some(first.id.as_str()));
+    assert_eq!(resumed.replay_of, None);
+}
+
+#[tokio::test]
+async fn a_replay_writes_nothing_to_the_run_it_replays() {
+    let dir = tempfile::tempdir().unwrap();
+    let runner = file_backed(dir.path(), vec![chain_job("etl")]);
+    let first = runner.run("etl", json!({}), Trigger::Manual).await.unwrap();
+    assert_eq!(first.status, RunStatus::Success);
+    let before = history(&runner, &first.id);
+    let written = dir.path().join(&first.id).join("extract.json");
+    let bytes = std::fs::read(&written).unwrap();
+
+    let second = runner
+        .replay_ops(&first.id, Some(&["load".to_string()]))
+        .unwrap();
+    let second = settled(&runner, &second).await;
+    assert_eq!(second.status, RunStatus::Success);
+
+    // not a row, not an event, not a byte of what it wrote
+    assert_eq!(history(&runner, &first.id), before);
+    assert_eq!(std::fs::read(&written).unwrap(), bytes);
+    // the new run's own output went under the new run, as any run's does
+    assert!(dir.path().join(&second.id).join("load.json").exists());
+    assert!(!dir.path().join(&second.id).join("extract.json").exists());
+}
+
+// retention takes an io manager's files with the run, so an old run's values
+// go when its rows do. a replay of one would run an op on a value it never
+// received, which is not a replay of anything
+#[tokio::test]
+async fn a_replay_whose_inputs_are_gone_refuses_and_names_them() {
+    let dir = tempfile::tempdir().unwrap();
+    let runner = file_backed(dir.path(), vec![chain_job("etl")]);
+    let first = runner.run("etl", json!({}), Trigger::Manual).await.unwrap();
+    assert_eq!(first.status, RunStatus::Success);
+
+    // what a retention sweep does to the run's outputs
+    std::fs::remove_dir_all(dir.path().join(&first.id)).unwrap();
+
+    let err = runner
+        .replay_ops(&first.id, Some(&["load".to_string()]))
+        .unwrap_err();
+    let said = err.to_string();
+    assert!(
+        matches!(&err, Error::ReplayInput { op, dep, .. } if op == "load" && dep == "extract"),
+        "{err}"
+    );
+    assert!(said.contains("load"), "{said}");
+    assert!(said.contains("extract"), "{said}");
+    // and nothing launched: the refusal is instead of a run, not after one
+    assert_eq!(
+        runner
+            .store()
+            .runs(None, None, None, None, None, 10)
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+// a run that was itself a subset was handed values it did not produce. they
+// are on its plan and nowhere else, and they are what its ops actually read
+#[tokio::test]
+async fn a_replay_of_a_resumed_run_reads_what_that_run_was_seeded_with() {
+    let Chain {
+        job,
+        a_calls,
+        b_saw,
+        fixed,
+    } = chain();
+    let runner = Runner::new([job], Store::open(":memory:").unwrap()).unwrap();
+    let first = runner
+        .run("chain", json!({}), Trigger::Manual)
+        .await
+        .unwrap();
+    assert_eq!(first.status, RunStatus::Failed);
+
+    fixed.store(true, Ordering::SeqCst);
+    let second = runner.resume(&first.id).unwrap();
+    let second = settled(&runner, &second).await;
+    assert_eq!(second.status, RunStatus::Success);
+    assert_eq!(op_names(&runner, &second.id), ["b", "c"]);
+    *b_saw.lock().unwrap() = None;
+
+    // b's input in that run came from the run before it, through the seed the
+    // resume recorded
+    let third = runner
+        .replay_ops(&second.id, Some(&["b".to_string()]))
+        .unwrap();
+    let third = settled(&runner, &third).await;
+    assert_eq!(third.status, RunStatus::Success);
+    assert_eq!(*b_saw.lock().unwrap(), Some(json!({"rows": 0})));
+    assert_eq!(a_calls.load(Ordering::SeqCst), 1);
+}
+
+// a mapped op is its instances, and what it fanned out over is an ordinary
+// dep — so a replay of one re-expands over the array the original run
+// expanded over, rather than over whatever the source says today
+#[tokio::test]
+async fn a_replay_of_a_mapped_op_expands_over_the_array_it_expanded_over() {
+    let pages: Arc<Mutex<Value>> = Arc::new(Mutex::new(json!([1, 2, 3])));
+    let seen: Arc<Mutex<Vec<u32>>> = Arc::new(Mutex::new(Vec::new()));
+    let (listed, saw, broken) = (
+        pages.clone(),
+        seen.clone(),
+        Arc::new(AtomicBool::new(false)),
+    );
+    let fails = broken.clone();
+    let job = Job::builder("fanout")
+        .op(Op::new("pages", move |_| {
+            let listed = listed.clone();
+            let pages = listed.lock().unwrap().clone();
+            async move { Ok(pages) }
+        }))
+        .op(Op::mapped("process", move |_ctx: OpCtx, page: u32| {
+            let (saw, fails) = (saw.clone(), fails.clone());
+            async move {
+                saw.lock().unwrap().push(page);
+                if !fails.load(Ordering::SeqCst) && page == 2 {
+                    return Err("page 2 exploded".into());
+                }
+                Ok(json!(page * 10))
+            }
+        })
+        .over("pages"))
+        .build()
+        .unwrap();
+    let runner = Runner::new([job], Store::open(":memory:").unwrap()).unwrap();
+    let first = runner
+        .run("fanout", json!({}), Trigger::Manual)
+        .await
+        .unwrap();
+    assert_eq!(first.status, RunStatus::Failed);
+
+    // the source has moved on, which is exactly what a replay must not read
+    *pages.lock().unwrap() = json!([9]);
+    broken.store(true, Ordering::SeqCst);
+    seen.lock().unwrap().clear();
+
+    let second = runner.replay(&first.id).unwrap();
+    let second = settled(&runner, &second).await;
+    assert_eq!(second.status, RunStatus::Success);
+    let mut ran = seen.lock().unwrap().clone();
+    ran.sort_unstable();
+    assert_eq!(ran, [1, 2, 3], "the replay expanded over today's pages");
+    // one row per instance and none for the op that listed them
+    let mut names = op_names(&runner, &second.id);
+    names.sort();
+    assert_eq!(names, ["process[0]", "process[1]", "process[2]"]);
+}
+
+#[tokio::test]
+async fn replay_refuses_what_it_cannot_reproduce() {
+    let Chain { job, fixed, .. } = chain();
+    let slow = Job::builder("slow")
+        .op(Op::new("nap", |_| async {
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            Ok(json!(null))
+        }))
+        .build()
+        .unwrap();
+    let runner = Runner::new([job, slow], Store::open(":memory:").unwrap()).unwrap();
+
+    let err = runner.replay("nope").unwrap_err();
+    assert!(matches!(err, Error::UnknownRun(_)), "{err}");
+
+    let live = runner.launch("slow", json!({}), Trigger::Manual).unwrap();
+    let err = runner.replay(&live).unwrap_err();
+    assert!(matches!(err, Error::RunActive(_)), "{err}");
+    assert_eq!(runner.cancel(&live).unwrap(), CancelOutcome::Requested);
+
+    // a run where nothing failed has nothing a plain replay would re-run
+    fixed.store(true, Ordering::SeqCst);
+    let good = runner
+        .run("chain", json!({}), Trigger::Manual)
+        .await
+        .unwrap();
+    assert_eq!(good.status, RunStatus::Success);
+    let err = runner.replay(&good.id).unwrap_err();
+    assert!(matches!(err, Error::NothingToReplay(_)), "{err}");
+    assert!(err.to_string().contains("no op of run"), "{err}");
+
+    // an op the job does not have, and one it has that this run never ran
+    let err = runner
+        .replay_ops(&good.id, Some(&["ghost".to_string()]))
+        .unwrap_err();
+    assert!(err.to_string().contains("does not have: ghost"), "{err}");
+    let partial = runner
+        .replay_ops(&good.id, Some(&["c".to_string()]))
+        .unwrap();
+    settled(&runner, &partial).await;
+    let err = runner
+        .replay_ops(&partial, Some(&["a".to_string()]))
+        .unwrap_err();
+    assert!(err.to_string().contains("never ran: a"), "{err}");
+}
+
 // ---- cancellation, pools, timeouts, run errors ----
 
 // waits past `wait_until`'s three seconds: a canceled run holds its grace

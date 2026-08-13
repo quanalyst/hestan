@@ -3,7 +3,8 @@
 /// `DuplicateJob`, `Resource`) surface at build time, before anything is
 /// written. the
 /// resume variants (`UnknownRun`, `RunActive`, `RunNotFailed`,
-/// `NothingToResume`, `ResumeChain`) say why a run cannot be resumed, and
+/// `NothingToResume`, `ResumeChain`) say why a run cannot be resumed,
+/// `NothingToReplay` and `ReplayInput` say why one cannot be replayed, and
 /// `Conflict` is something already under way that this would collide with.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -33,6 +34,27 @@ pub enum Error {
     /// run was already resumed and it worked.
     #[error("nothing to resume: every op of run {0} already succeeded")]
     NothingToResume(String),
+    /// there is no op of that run to replay: nothing it recorded failed. a
+    /// run that worked is replayed by naming the ops to re-run.
+    #[error("nothing to replay: no op of run {0} failed")]
+    NothingToReplay(String),
+    /// a replay reads the inputs the original run was given, and one of them
+    /// cannot be read back. what usually took it is
+    /// [retention](crate::Retention): pruning a run asks every
+    /// [io manager](crate::IoManager) to drop what it wrote, so the values go
+    /// when the rows do. refused rather than run, because an op given
+    /// something else is not a replay of anything.
+    #[error("cannot replay {op} of run {run}: its input {dep} cannot be read back: {reason}")]
+    ReplayInput {
+        /// the run being replayed.
+        run: String,
+        /// the op that would have read it.
+        op: String,
+        /// the dep whose recorded output is gone.
+        dep: String,
+        /// what the io manager said when it was asked for it.
+        reason: String,
+    },
     /// a resume needs the outputs of the ops it is not re-running, and
     /// somewhere back along the chain of resumes they are gone — pruned by
     /// [retention](crate::Retention), or never recorded.
