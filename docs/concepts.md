@@ -305,11 +305,25 @@ retries is not sitting on the resource it is backing off from. naming a pool
 that was never declared is `Error::Graph` at build time, as is declaring the
 same pool twice; a limit below 1 means 1.
 
+"ends" means the work stopped, not that hestan stopped waiting for it. a
+[cancelled](#cancellation) run abandons an op at its next await point, and
+blocking work the body started carries on — so the permit is held by the
+`OpCtx` the body was handed rather than by the task that ran it, and the slot
+goes back when the last holder of that ctx lets go. blocking work already has
+to keep its ctx to see a cancel at all, and keeping it is what keeps the
+count true: the closure still calling the api still holds the slot that
+admitted it. an op that never stops holds its permit until the process ends,
+because the work genuinely has not stopped — the pool is a promise about that
+api, and hestan would rather hold a slot than break it. the limit of this is
+work that keeps nothing of hestan's: a thread the body spawned and handed
+nothing is work hestan cannot see the end of, and the slot goes back without
+it.
+
 pools compose with `max_parallel`: an op waits for both, in that order — a
 slot in its own run first, then a permit. an op waiting for a permit does
 hold its `max_parallel` slot, which can idle a job, but it cannot deadlock:
-permits are only ever held by ops that are already running and are on their
-way to releasing one, and nothing that holds a permit ever waits for a slot.
+permits are only ever held by work that is already running, and nothing that
+holds a permit ever waits for a slot.
 the wait order is the same everywhere, so there is no cycle to close. (the
 permit is deliberately taken inside the op's own task rather than in the
 run's scheduling loop; taking it in the loop would stop that loop from
@@ -388,6 +402,13 @@ this: the op's own task is awaiting the join handle, so it aborts and comes
 back promptly while the closure keeps going. that is exactly why polling
 `is_cancelled()` is the contract rather than a suggestion — hestan can hand
 the closure the signal, but it cannot see whether the closure heeded it.
+
+one thing does outlive the abort with it. a [pool](#concurrency-pools) permit
+is held by the ctx rather than by the task, so a closure that carried its ctx
+into `spawn_blocking` — which is how it reads the cancel signal at all —
+holds the slot it was admitted into until it returns. the run is over and its
+row says canceled; the pool still counts the call that is still in flight,
+which is the only count worth having.
 
 ### the isolated contrast
 

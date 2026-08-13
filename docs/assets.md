@@ -374,16 +374,38 @@ it stale. auto without a probed source somewhere upstream never fires —
 nothing else re-evaluates staleness spontaneously. non-auto assets just show
 stale in the ui until someone builds them.
 
-## At-least-once materialization
+## When a build is recorded
 
-the materialization row is written inside the asset's op, after the fn
-returns its output and immediately before the op reports success; the op
-result row then commits through the executor's normal path. a crash in the
-gap leaves a written materialization for an op with no recorded success, so
-the next build re-runs it and rewrites the same row: materialization is
-at-least-once, the same policy (and the same reasoning) as
-[op state](state.md). a failure writing the row fails the attempt, which
-goes through the op's ordinary retry policy.
+an asset is built when the op that built it succeeded, so that is when the
+row is written — in the same transaction as the op run's terminal row, after
+the output has been handed to the [io manager](io-managers.md) and stored.
+the body computes what only the body can know (the fingerprint, the deps it
+consumed, the value, whatever `ctx.meta` staged) and stages it; the executor
+commits it with the row that says the op worked.
+
+so an attempt that does not get all the way through records **nothing**: an
+op that returns an error, panics, times out, is cancelled, or whose output
+the manager refuses leaves no materialization, and the asset stays stale and
+gets built again. a retry that succeeds records one entry, not one per
+attempt. that matters most for the manager: an op whose output was never
+stored used to leave a row saying the asset was current, and the next build
+believed it and skipped — the asset was missing and nothing was stale.
+
+an op that produces [several assets](#one-op-several-assets) writes all of
+its materializations or none of them. they are one fact about one op run, and
+they go into that one transaction together, so a history never holds the
+first half of a multi-asset build.
+
+what a probe writes is the exception, and it is a different kind of row: a
+[source](#probes-and-auto) materialization records what a probe observed
+outside any op, so it is written when the probe sees it and carries no run.
+
+materialization stays at-least-once, the same policy (and the same reasoning)
+as [op state](state.md): a crash between the transaction committing and
+anything downstream reading it re-runs the build, and the rebuild appends a
+second entry rather than editing the first. the direction of the uncertainty
+is the part worth knowing — a build hestan lost the record of is rebuilt, and
+a build hestan recorded is one whose op succeeded and whose value is stored.
 
 ## Materialization history
 
@@ -467,7 +489,7 @@ op.
 
 state this one plainly, because it is the consequence people expect to go the
 other way: **a failing error check does not un-materialize the asset.** the
-materialization was written inside the asset's op, which succeeded; the check
+materialization was written with the asset's op, which succeeded; the check
 hangs off that op rather than feeding it, so downstream assets still see the
 value and still build. what a failing error check does is fail the run that
 produced it — loudly, in the run list, through the failure hooks. if you need

@@ -72,7 +72,7 @@ rule phase 21 applied to a run's terminal notification.
 | `run_success` / `run_failed` / `run_canceled` | — | **no**, see below |
 | `run_reclaimed` | the reclaim's status change | yes |
 | `op_*`, `type_check_failed`, `log` | — | **no**, see below |
-| `asset_materialized` | the `asset_materializations` insert | yes |
+| `asset_materialized` | the `asset_materializations` insert — which, for a build, is the op's terminal write | yes |
 | `check_passed` / `check_failed` | the `asset_checks` insert | yes |
 | `schedule_*` | the `schedule_ticks` insert | yes |
 | `sensor_tick` | the `sensor_ticks` insert | yes |
