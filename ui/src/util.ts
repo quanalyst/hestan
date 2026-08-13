@@ -1,9 +1,36 @@
-import type { Metadata, OpSummary, RunStatus, When } from "./types";
+import type { Metadata, OpSummary, ReplayPreview, ResumePreview, RunStatus, When } from "./types";
 
 const OUTPUT_CAP = 160;
 
 export function shortId(id: string): string {
   return id.slice(0, 8);
+}
+
+// what a run says about the run it came from. a resume continues one from
+// where it broke and a replay re-runs ops of one on the inputs it had, which
+// are opposite things — so the two are separate fields and this reads whichever
+// is set. most runs came from nothing and say nothing
+export function lineage(run: {
+  resumed_from: string | null;
+  replay_of: string | null;
+}): { verb: string; id: string } | null {
+  if (run.replay_of) return { verb: "replay of", id: run.replay_of };
+  if (run.resumed_from) return { verb: "continues", id: run.resumed_from };
+  return null;
+}
+
+// what a resume would do, on one line
+export function resumeLine(p: ResumePreview): string {
+  return `${p.rerun.length} to re-run · ${p.reuse.length} reused`;
+}
+
+// and a replay: what it executes, and how much of what it reads comes from the
+// run being replayed. an op with no deps seeds nothing, and saying "0 inputs"
+// there would read as a value that went missing
+export function replayLine(p: ReplayPreview): string {
+  const ops = `${p.ops.length} to replay`;
+  if (p.inputs.length === 0) return ops;
+  return `${ops} · ${p.inputs.length} input${p.inputs.length === 1 ? "" : "s"} seeded`;
 }
 
 // an asset's permanent address. the name is a path segment per separator, so

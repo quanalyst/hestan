@@ -17,6 +17,7 @@ import type {
   OpRun,
   OpStatus,
   OpSummary,
+  ReplayPreview,
   ResumePreview,
   Run,
   RunEvent,
@@ -26,13 +27,14 @@ import {
   durationMs,
   fmtDuration,
   isTerminal,
+  lineage,
   opBadge,
   outputLine,
   relTime,
+  replayLine,
+  resumeLine,
   shortId,
 } from "./util";
-
-const plan = (p: ResumePreview) => `${p.rerun.length} to re-run · ${p.reuse.length} reused`;
 
 // an instance's label is its index, or the element itself on an op that names
 // its instances by them — which is what makes a partitioned asset's instances
@@ -142,12 +144,16 @@ function RunView({ id }: { id: string }) {
   const [follow, setFollow] = useState(true);
   const [opSel, setOpSel] = useState<string | null>(null);
   const [job, setJob] = useState<JobSummary | null>(null);
-  const [pending, setPending] = useState<null | "re-run" | "resume">(null);
+  const [pending, setPending] = useState<null | "re-run" | "resume" | "replay">(null);
   const [launchError, setLaunchError] = useState<string | null>(null);
   const [preview, setPreview] = useState<ResumePreview | null>(null);
   const [previewError, setPreviewError] = useState<string | null>(null);
   const [fromPlan, setFromPlan] = useState<ResumePreview | null>(null);
   const [fromError, setFromError] = useState<string | null>(null);
+  const [replay, setReplay] = useState<ReplayPreview | null>(null);
+  const [replayError, setReplayError] = useState<string | null>(null);
+  const [opReplay, setOpReplay] = useState<ReplayPreview | null>(null);
+  const [opReplayError, setOpReplayError] = useState<string | null>(null);
   const [canceling, setCanceling] = useState(false);
   const [cancelError, setCancelError] = useState<string | null>(null);
   const [missing, setMissing] = useState(false);
@@ -157,6 +163,9 @@ function RunView({ id }: { id: string }) {
   const logRef = useRef<HTMLDivElement>(null);
 
   const done = run !== null && isTerminal(run.status);
+  // a replay's default is the ops that failed, so this is what makes one
+  // available on the run as a whole
+  const failedOp = ops.some((o) => o.status === "failed");
   // a run that ended badly is the one resume continues; any finished run can be
   // re-run from a chosen op
   const resumable = run !== null && (run.status === "failed" || run.status === "canceled");
@@ -239,6 +248,47 @@ function RunView({ id }: { id: string }) {
       });
   }, [id, done, opSel]);
 
+  // what a replay would re-run, and — the answer worth having before the
+  // click — whether the inputs it needs are still there to read.
+  //
+  // asked only where a replay of the whole run means something: its default is
+  // the ops that failed, and on a run where none did, "nothing to replay" is
+  // an answer to a question nobody asked. one op of such a run is still
+  // replayable, and that is the control on the op row
+  useEffect(() => {
+    if (!done || !failedOp) {
+      setReplay(null);
+      setReplayError(null);
+      return;
+    }
+    get<ReplayPreview>(`/api/runs/${id}/replay_preview`)
+      .then((p) => {
+        setReplay(p);
+        setReplayError(null);
+      })
+      .catch((e) => {
+        setReplay(null);
+        setReplayError(e instanceof Error ? e.message : String(e));
+      });
+  }, [id, done, failedOp]);
+
+  useEffect(() => {
+    if (!done || !opSel) {
+      setOpReplay(null);
+      setOpReplayError(null);
+      return;
+    }
+    get<ReplayPreview>(`/api/runs/${id}/replay_preview?ops=${encodeURIComponent(opSel)}`)
+      .then((p) => {
+        setOpReplay(p);
+        setOpReplayError(null);
+      })
+      .catch((e) => {
+        setOpReplay(null);
+        setOpReplayError(e instanceof Error ? e.message : String(e));
+      });
+  }, [id, done, opSel]);
+
   useEffect(() => {
     const el = logRef.current;
     if (el && follow && !done) el.scrollTop = el.scrollHeight;
@@ -253,14 +303,16 @@ function RunView({ id }: { id: string }) {
     if (!atEnd && follow) setFollow(false);
   };
 
-  // re-run redoes the whole job; resume continues this run, optionally from a
-  // chosen op. both land on the new run's page
-  const relaunch = async (kind: "re-run" | "resume", from?: string[]) => {
+  // re-run redoes the whole job; resume continues this run from where it
+  // broke; replay re-runs ops that already ran on the inputs they had. all
+  // three land on the new run's page
+  const relaunch = async (kind: "re-run" | "resume" | "replay", ops?: string[]) => {
     setPending(kind);
     setLaunchError(null);
     try {
-      const path = kind === "resume" ? "resume" : "retry";
-      const r = await post<{ run_id: string }>(`/api/runs/${id}/${path}`, from && { from });
+      const path = kind === "re-run" ? "retry" : kind;
+      const body = ops && (kind === "replay" ? { ops } : { from: ops });
+      const r = await post<{ run_id: string }>(`/api/runs/${id}/${path}`, body);
       nav(`/runs/${r.run_id}`);
     } catch (e) {
       setLaunchError(`${kind} failed: ${e instanceof Error ? e.message : String(e)}`);
@@ -356,12 +408,12 @@ function RunView({ id }: { id: string }) {
               <> · for {relTime(run.scheduled_for)}</>
             )}
             {dur !== null && <> · took {fmtDuration(dur)}</>}
-            {run.resumed_from && (
+            {lineage(run) && (
               <>
                 {" "}
-                · continues{" "}
-                <Link className="head-link mono" to={`/runs/${run.resumed_from}`}>
-                  {shortId(run.resumed_from)}
+                · {lineage(run)!.verb}{" "}
+                <Link className="head-link mono" to={`/runs/${lineage(run)!.id}`}>
+                  {shortId(lineage(run)!.id)}
                 </Link>
               </>
             )}
@@ -403,6 +455,15 @@ function RunView({ id }: { id: string }) {
                       resume
                     </button>
                   )}
+                  {replay && (
+                    <button
+                      className="text-btn"
+                      onClick={() => relaunch("replay")}
+                      disabled={pending !== null}
+                    >
+                      replay
+                    </button>
+                  )}
                 </>
               ) : (
                 <button className="text-btn" onClick={cancel} disabled={canceling}>
@@ -410,8 +471,10 @@ function RunView({ id }: { id: string }) {
                 </button>
               ))}
           </div>
-          {resumable && preview && <p className="muted">resume: {plan(preview)}</p>}
+          {resumable && preview && <p className="muted">resume: {resumeLine(preview)}</p>}
           {resumable && previewError && <p className="muted">no resume: {previewError}</p>}
+          {replay && <p className="muted">replay: {replayLine(replay)}</p>}
+          {failedOp && replayError && <p className="muted">no replay: {replayError}</p>}
           {launchError && <p className="muted">{launchError}</p>}
           {cancelError && <p className="muted">cancel failed: {cancelError}</p>}
         </div>
@@ -471,7 +534,28 @@ function RunView({ id }: { id: string }) {
               >
                 re-run from {opSel}
               </button>
-              {fromPlan && <> · {plan(fromPlan)}</>}
+              {fromPlan && <> · {resumeLine(fromPlan)}</>}
+            </>
+          )}
+        </p>
+      )}
+
+      {/* the same op, the other way round: this one re-runs it alone, on what
+          this run gave it, and says so rather than reading as a second resume */}
+      {mayDrive && done && opSel && (
+        <p className="muted dag-action">
+          {opReplayError ? (
+            `cannot replay ${opSel}: ${opReplayError}`
+          ) : (
+            <>
+              <button
+                className="text-btn"
+                onClick={() => relaunch("replay", [opSel])}
+                disabled={pending !== null}
+              >
+                replay {opSel}
+              </button>
+              {opReplay && <> · {replayLine(opReplay)}</>}
             </>
           )}
         </p>

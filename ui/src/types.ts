@@ -1,6 +1,6 @@
 export type RunStatus = "queued" | "running" | "success" | "failed" | "canceled";
 export type OpStatus = "pending" | "running" | "success" | "failed" | "skipped" | "canceled";
-export type Trigger = "manual" | "schedule" | "retry" | "resume" | "build" | "sensor";
+export type Trigger = "manual" | "schedule" | "retry" | "resume" | "replay" | "build" | "sensor";
 export type EventLevel = "info" | "warn" | "error";
 
 // what happened. the string is open, not closed: a build newer than this ui
@@ -193,8 +193,13 @@ export interface Run {
   // the first op that terminally failed, named; null unless the run failed
   error: string | null;
   resumed_from: string | null;
+  // the run this one replayed: re-ran ops of, on the inputs that run gave
+  // them. null on every run that is not a replay, and never set beside
+  // resumed_from — a resume re-runs what did not succeed and a replay re-runs
+  // what did
+  replay_of: string | null;
   // the cron occurrence this run stands for, not the clock it launched at;
-  // null on a manual launch, retry, resume, build or sensor fire
+  // null on a manual launch, retry, resume, replay, build or sensor fire
   scheduled_for: string | null;
   // flat key:value marks on the run: set at launch, defaulted process-wide,
   // and set automatically on machine-made runs. {} on an untagged run
@@ -241,6 +246,13 @@ export interface QueueView {
 export interface ResumePreview {
   rerun: string[];
   reuse: string[];
+}
+
+// what a replay would do: the ops it executes — exactly those, nothing
+// downstream — and the deps it seeds from what the original run recorded
+export interface ReplayPreview {
+  ops: string[];
+  inputs: string[];
 }
 
 // one column of a metadata table: its name, and the type the op named when it

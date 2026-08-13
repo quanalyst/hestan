@@ -404,7 +404,8 @@ deployment with no limits declared.
 if anything is queued or running, a "running now" section lists it with a
 live elapsed clock (ticking every second; the ticker only runs while
 something is active). below that, filters: status, trigger (manual,
-schedule, retry, resume, build, sensor), a time window (all/1h/6h/24h), and
+schedule, retry, resume, replay, build, sensor), a time window
+(all/1h/6h/24h), and
 a quick find box matching substrings of the job name or run id (escape
 clears it).
 filters apply client-side to the loaded set.
@@ -433,11 +434,14 @@ now" — it is over, just not finished.
 ## Run page
 
 the header names the job (linked), the short run id, trigger, creation time,
-and duration — plus, on a resumed run, a link back to the run it continued.
+and duration — plus, on a run that came from another, a link back to it:
+"continues" on a resumed run and "replay of" on a
+[replayed](replay.md) one, which are opposite things and say so.
 next to the status sit the actions: clone at any point, cancel while the run is
-queued or running, re-run once it is terminal, and resume beside re-run when
-the run failed or was canceled. clone launches nothing — it opens the job's
-launchpad prefilled with this run's params and tags
+queued or running, re-run once it is terminal, resume beside re-run when
+the run failed or was canceled, and replay when an op of it failed. clone
+launches nothing — it opens the job's launchpad prefilled with this run's
+params and tags
 ([cloning](launching.md#cloning-a-past-run)), because editing one field is the
 point; a clone that launched straight away would be re-run, which is right
 beside it. cancel posts and disables itself; cancellation is
@@ -450,10 +454,21 @@ a resumable run also shows what resume would do before it is clicked — "3 to
 re-run · 2 reused", from `resume_preview` — or, when the resume is refused
 (the job's ops changed since), the reason instead.
 
+a run with a failed op shows the same for replay — "1 to replay · 1 input
+seeded", from `replay_preview` — and this one earns the round trip twice
+over: a run whose inputs [retention](storage.md#retention) has taken cannot
+be replayed at all, so where the button would be there is the sentence saying
+which op's input is gone. the replay control is offered on the run itself only
+where its default means something, which is a run something failed in; one op
+of a run that succeeded is still replayable from the op row below.
+
 the dag reappears with each node showing that op's live status glyph and
 label. clicking a node filters the log below to that op; on a terminal run
 the selection also offers "re-run from here", with the same counts, which
-re-runs that op and everything downstream whatever their last status was.
+re-runs that op and everything downstream whatever their last status was, and
+"replay <op>" beneath it, which re-runs that op **alone** on the inputs this
+run gave it. the two are one letter apart and mean opposite things, so both
+carry what they would do rather than only their names.
 ops a subset run never contained read "not in run" and carry no glyph, which
 is how a resumed run shows what it reused. an [isolated op](isolation.md)
 carries an `isolated` marker on its node, and while it is running the selected

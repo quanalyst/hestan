@@ -9,7 +9,16 @@ import { durationMs, fmtDuration, isTerminal, relTime, shortId } from "./util";
 
 const PAGE = 100;
 const STATUSES = ["all", "queued", "running", "success", "failed", "canceled"] as const;
-const TRIGGERS = ["all", "manual", "schedule", "retry", "resume", "build", "sensor"] as const;
+const TRIGGERS = [
+  "all",
+  "manual",
+  "schedule",
+  "retry",
+  "resume",
+  "replay",
+  "build",
+  "sensor",
+] as const;
 const WINDOWS = [
   { label: "all", secs: null },
   { label: "1h", secs: 3600 },

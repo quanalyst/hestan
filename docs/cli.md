@@ -47,7 +47,7 @@ these are fixed and each one means one thing:
 | ---- | ------- |
 | 0 | the command did what was asked; a `--wait` run succeeded |
 | 1 | the run failed, or the command could not do what was asked |
-| 2 | the command line was wrong: a bad flag, an unknown job, params the schema rejects |
+| 2 | the command line was wrong: a bad flag, an unknown job, params the schema rejects, an ask this run cannot honour |
 | 3 | the run was canceled |
 | 4 | `--timeout` ran out; the run is still going |
 | 5 | the store or the server could not be reached |
@@ -183,10 +183,29 @@ this process executes it**, streams it, and exits with what it did.
 ```
 retry <run>                     the same job again, with the same params
 resume <run> [--from OP]...     re-run what did not succeed, seeding what did
+replay <run> [--op OP]...       re-run what did, on the inputs it had
 cancel <run>                    take a queued run off the queue
 build <asset> [--partition KEY]... [--wait]
 backfill <asset> --from KEY --to KEY [--all]
 ```
+
+`replay` is the other direction from `resume`, and they are easy to confuse:
+a resume re-runs the ops that did **not** succeed and everything downstream of
+them, and a replay re-runs the ops that **did** — exactly the ones named, on
+the inputs the original run gave them — which is how you find out whether a
+fix works on the input that broke it. without `--op` it replays the ops that
+run recorded as failed. what a replay does not reproduce is
+[its own page](replay.md), and a run whose inputs
+[retention](storage.md#retention) has taken is refused rather than run on a
+hole, naming the op:
+
+```
+$ orders replay 019ff1b7-8df6 --op load
+error: cannot replay load of run 019ff1b7-8df6: its input extract cannot be
+read back: No such file or directory (os error 2)
+```
+
+that is exit 2, with `nothing to replay` and an op the run never ran.
 
 `cancel` is worth a sentence. a cancel is a signal to whichever process is
 *executing* the run, and there is no signal in the database — so a command line

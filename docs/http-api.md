@@ -37,6 +37,8 @@ page is for writing something that is not hestan.
 | POST | `/api/runs/{id}/retry` | launch a fresh run with the same params |
 | POST | `/api/runs/{id}/resume` | continue a run from where it broke |
 | GET | `/api/runs/{id}/resume_preview` | what a resume would do |
+| POST | `/api/runs/{id}/replay` | re-run ops on the inputs they had |
+| GET | `/api/runs/{id}/replay_preview` | what a replay would do |
 | GET | `/api/runs/{id}/clone` | a past run's params and tags, to launch again |
 | POST | `/api/runs/{id}/cancel` | stop a queued or running run |
 | GET | `/api/queue` | what is waiting, in order, and what blocks each |
@@ -428,6 +430,7 @@ so a value may hold one; anything that is not a `key:value` pair is a 400
   "finished_at": "2026-08-07T12:00:03Z",
   "error": null,
   "resumed_from": null,
+  "replay_of": null,
   "scheduled_for": "2026-08-07T12:00:00Z",
   "tags": { "kind": "backfill", "backfill": "41" },
   "priority": 0,
@@ -450,13 +453,17 @@ a failed run's `error` names the first op that terminally failed, as
 `on_failure` hook receives. it is null on runs that did not fail.
 
 `status` is `queued | running | success | failed | canceled`; `trigger` is
-`manual | schedule | retry | resume | build | sensor`. an op run's status is
-`pending | running | success | failed | skipped | canceled`. `resumed_from`
-is the id of the run this one continued, null for every run that isn't a
-[resume](#resume). `scheduled_for` is the cron occurrence the run stands for —
-not the clock it started at, once a schedule is
-[catching up](scheduling.md#missed-fire-catch-up) or a held fire drains — and
-is null on a manual launch, a retry, a resume, a build or a sensor fire.
+`manual | schedule | retry | resume | replay | build | sensor`. an op run's
+status is `pending | running | success | failed | skipped | canceled`.
+`resumed_from` is the id of the run this one continued, null for every run
+that isn't a [resume](#resume); `replay_of` is the id of the run this one
+[replayed](#replay), null for every run that isn't one. they are separate
+columns and a run carries at most one of them, because a resume re-runs what
+did not succeed and a replay re-runs what did. `scheduled_for` is the cron
+occurrence the run stands for — not the clock it started at, once a schedule
+is [catching up](scheduling.md#missed-fire-catch-up) or a held fire drains —
+and is null on a manual launch, a retry, a resume, a replay, a build or a
+sensor fire.
 `tags` is the run's [tag map](launching.md#run-tags), `{}` when it carries
 none — set at launch, defaulted with `Hestan::run_tags`, and set automatically
 on sensor, backfill and single-asset build runs.
@@ -705,6 +712,49 @@ separated (blank means "from the failure"), and every refusal above applies
 here identically — a preview never promises a run the launch would reject.
 ops that neither re-run nor have an output worth reusing appear in neither
 list.
+
+## Replay
+
+`POST /api/runs/{id}/replay` launches a run that re-runs ops of a finished
+one **on the inputs that run gave them**: every dep of the replayed ops is
+seeded from what the original recorded, so the op reads byte for byte what it
+read then. it is for the question "does this fix work on the input that broke
+it". the new run keeps the original params, gets trigger `replay`, and records
+`replay_of`. the original run is not written to.
+
+the body is optional: empty, `{}`, or `{"ops": []}` all mean "every op this
+run recorded as failed". `{"ops": ["clean"]}` replays exactly those ops and
+nothing downstream of them — which is the difference from
+[resume](#resume), and the reason both exist.
+
+what a replay does **not** reproduce — today's code, today's resources,
+today's clock, and today's answer from anything the op fetches itself — is
+[replay](replay.md), and worth reading before trusting one that succeeded.
+
+202 with the new `run_id`; 404 when the run id is unknown; 409
+(`run still active: ...`) when the run is still queued or running; 409
+(`job no longer defined: ...`) when the run exists but its job is no longer
+registered; 400 for a body that isn't `{"ops": [...]}`-shaped, for `ops`
+naming ops the job does not have or ops this run never ran, when nothing the
+run recorded failed and no `ops` were named
+(`nothing to replay: no op of run ... failed`), when a replayed op's dep
+recorded no output to read back, and when an input cannot be read back at all
+(`cannot replay load of run ...: its input extract cannot be read back: ...`)
+— which is what a run whose files [retention](storage.md#retention) has taken
+answers, rather than running on a hole.
+
+`GET /api/runs/{id}/replay_preview?ops=clean` answers what that replay would
+do, without launching anything:
+
+```json
+{ "ops": ["clean"], "inputs": ["fetch_orders"] }
+```
+
+both lists are in the job's topological order: `ops` is what would execute and
+`inputs` is what would be seeded from the original run. `ops` is optional and
+comma separated (blank means "the ops that failed"), and every refusal above
+applies here identically — including the missing-input one, so a run that
+cannot be replayed says so before anybody clicks.
 
 ## Cancel
 

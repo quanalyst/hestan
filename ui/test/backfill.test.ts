@@ -121,6 +121,7 @@ const run = (id: string, status: Run["status"]): Run => ({
   finished_at: null,
   error: null,
   resumed_from: null,
+  replay_of: null,
   scheduled_for: null,
   tags: {},
   priority: 0,

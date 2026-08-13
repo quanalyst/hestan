@@ -97,6 +97,8 @@ pub(crate) fn router(state: AppState) -> Router {
         .route("/api/runs/{id}/retry", post(retry_run))
         .route("/api/runs/{id}/resume", post(resume_run))
         .route("/api/runs/{id}/resume_preview", get(resume_preview))
+        .route("/api/runs/{id}/replay", post(replay_run))
+        .route("/api/runs/{id}/replay_preview", get(replay_preview))
         .route("/api/runs/{id}/clone", get(clone_run))
         .route("/api/runs/{id}/cancel", post(cancel_run))
         .route("/api/runs/{id}/priority", post(set_run_priority))
@@ -1705,9 +1707,10 @@ fn resume_from_body(body: &Bytes) -> Result<Vec<String>, ApiError> {
     Ok(parsed.from.unwrap_or_default())
 }
 
-// the checks live in Runner::resume_plan, so the preview and the launch that
-// follows it answer with the same status
-fn resume_error(e: Error) -> ApiError {
+// the checks live in Runner::resume_plan and Runner::replay_plan, so a preview
+// and the launch that follows it answer with the same status. one mapper for
+// both because the refusals are mostly the same refusals, and two would drift
+fn rerun_error(e: Error) -> ApiError {
     match e {
         e @ Error::UnknownRun(_) => err(StatusCode::NOT_FOUND, e.to_string()),
         e @ (Error::RunActive(_) | Error::RunNotFailed(_)) => {
@@ -1720,6 +1723,8 @@ fn resume_error(e: Error) -> ApiError {
         ),
         e @ (Error::Graph(_)
         | Error::NothingToResume(_)
+        | Error::NothingToReplay(_)
+        | Error::ReplayInput { .. }
         | Error::ResumeChain(_)
         | Error::InvalidParams { .. }) => err(StatusCode::BAD_REQUEST, e.to_string()),
         e => internal(e),
@@ -1739,7 +1744,7 @@ async fn resume_run(
         .resume_from(&id, Some(&from))
     {
         Ok(run_id) => Ok((StatusCode::ACCEPTED, Json(json!({ "run_id": run_id })))),
-        Err(e) => Err(resume_error(e)),
+        Err(e) => Err(rerun_error(e)),
     }
 }
 
@@ -1766,8 +1771,65 @@ async fn resume_preview(
     let plan = st
         .runner
         .resume_plan(&id, Some(&from))
-        .map_err(resume_error)?;
+        .map_err(rerun_error)?;
     Ok(Json(json!({ "reuse": plan.reuse, "rerun": plan.rerun })))
+}
+
+#[derive(Deserialize)]
+struct ReplayBody {
+    ops: Option<Vec<String>>,
+}
+
+fn replay_ops_body(body: &Bytes) -> Result<Vec<String>, ApiError> {
+    if body.is_empty() {
+        return Ok(Vec::new());
+    }
+    let parsed: ReplayBody = serde_json::from_slice(body)
+        .map_err(|e| err(StatusCode::BAD_REQUEST, format!("invalid body: {e}")))?;
+    Ok(parsed.ops.unwrap_or_default())
+}
+
+async fn replay_run(
+    State(st): State<AppState>,
+    Path(id): Path<String>,
+    who: Who,
+    body: Bytes,
+) -> Result<(StatusCode, Json<Value>), ApiError> {
+    let ops = replay_ops_body(&body)?;
+    match st.runner.as_actor(actor(&who)).replay_ops(&id, Some(&ops)) {
+        Ok(run_id) => Ok((StatusCode::ACCEPTED, Json(json!({ "run_id": run_id })))),
+        Err(e) => Err(rerun_error(e)),
+    }
+}
+
+#[derive(Deserialize)]
+struct ReplayPreviewQuery {
+    ops: Option<String>,
+}
+
+// worth an endpoint of its own rather than a click and a refusal: a run whose
+// inputs retention has taken cannot be replayed at all, and that is the answer
+// somebody needs before they believe a replay is available to them
+async fn replay_preview(
+    State(st): State<AppState>,
+    Path(id): Path<String>,
+    q: Result<Query<ReplayPreviewQuery>, QueryRejection>,
+) -> Result<Json<Value>, ApiError> {
+    let Query(q) = q.map_err(bad_query)?;
+    let ops: Vec<String> = q
+        .ops
+        .as_deref()
+        .unwrap_or_default()
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(String::from)
+        .collect();
+    let plan = st
+        .runner
+        .replay_plan(&id, Some(&ops))
+        .map_err(rerun_error)?;
+    Ok(Json(json!({ "ops": plan.ops, "inputs": plan.inputs })))
 }
 
 // what a past run was launched with, for the launchpad to open prefilled.
@@ -4267,6 +4329,188 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn replay_endpoint_launches_the_ops_that_failed_and_nothing_below_them() {
+        let st = state(vec![brittle_job("etl")]);
+        let failed = st
+            .runner
+            .run("etl", json!({"n": 5}), Trigger::Manual)
+            .await
+            .unwrap();
+        assert_eq!(failed.status, RunStatus::Failed);
+
+        let (status, Json(body)) =
+            replay_run(State(st.clone()), Path(failed.id.clone()), None, raw(""))
+                .await
+                .unwrap();
+        assert_eq!(status, StatusCode::ACCEPTED);
+        let new_id = body["run_id"].as_str().unwrap();
+        let run = st.runner.store().run(new_id).unwrap().unwrap();
+        assert_eq!(run.trigger, Trigger::Replay);
+        assert_eq!(run.params, json!({"n": 5}));
+        assert_eq!(run.replay_of.as_deref(), Some(failed.id.as_str()));
+        assert_eq!(run.resumed_from, None);
+        // b alone: a resume of the same run would take c with it
+        let ops: Vec<String> = st
+            .runner
+            .store()
+            .op_runs(new_id)
+            .unwrap()
+            .into_iter()
+            .map(|o| o.op)
+            .collect();
+        assert_eq!(ops, ["b"]);
+
+        // and a chosen op that succeeded, on the input it succeeded on
+        let (status, Json(body)) = replay_run(
+            State(st.clone()),
+            Path(failed.id.clone()),
+            None,
+            raw(r#"{"ops": ["a"]}"#),
+        )
+        .await
+        .unwrap();
+        assert_eq!(status, StatusCode::ACCEPTED);
+        let ops = st
+            .runner
+            .store()
+            .op_runs(body["run_id"].as_str().unwrap())
+            .unwrap();
+        assert_eq!(ops.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn replay_endpoint_statuses() {
+        let st = state(vec![echo_job("etl")]);
+        let replay = |st: &AppState, id: &str, b: &'static str| {
+            replay_run(State(st.clone()), Path(id.into()), None, raw(b))
+        };
+
+        let (status, Json(b)) = replay(&st, "nope", "").await.unwrap_err();
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(b["error"], "unknown run: nope");
+
+        insert_run_with_ops(&st, "live", "etl", RunStatus::Queued, &["echo"]);
+        let (status, Json(b)) = replay(&st, "live", "").await.unwrap_err();
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(b["error"], "run still active: live");
+
+        insert_run_with_ops(&st, "orphan", "gone", RunStatus::Failed, &["echo"]);
+        let (status, Json(b)) = replay(&st, "orphan", "").await.unwrap_err();
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(b["error"], "job no longer defined: gone");
+
+        // nothing this run recorded failed, so a plain replay has no ops
+        insert_run_with_ops(&st, "won", "etl", RunStatus::Success, &["echo"]);
+        st.runner
+            .store()
+            .op_finished(
+                "won",
+                "echo",
+                OpStatus::Success,
+                Some(&json!(1)),
+                None,
+                None,
+                &[],
+            )
+            .unwrap();
+        let (status, Json(b)) = replay(&st, "won", "").await.unwrap_err();
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(b["error"], "nothing to replay: no op of run won failed");
+
+        let (status, Json(b)) = replay(&st, "won", r#"{"ops": ["ghost"]}"#)
+            .await
+            .unwrap_err();
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(b["error"].as_str().unwrap().contains("ghost"), "{b}");
+
+        let (status, Json(b)) = replay(&st, "won", "{not json}").await.unwrap_err();
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(
+            b["error"].as_str().unwrap().starts_with("invalid body"),
+            "{b}"
+        );
+
+        // an op the job has that this run never ran is not something to replay
+        insert_run_with_ops(&st, "part", "etl", RunStatus::Failed, &[]);
+        let (status, Json(b)) = replay(&st, "part", r#"{"ops": ["echo"]}"#)
+            .await
+            .unwrap_err();
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(
+            b["error"].as_str().unwrap().contains("never ran: echo"),
+            "{b}"
+        );
+
+        // an empty body and an empty selection both mean "the ops that failed"
+        insert_run_with_ops(&st, "r1", "etl", RunStatus::Failed, &["echo"]);
+        st.runner
+            .store()
+            .op_finished(
+                "r1",
+                "echo",
+                OpStatus::Failed,
+                None,
+                None,
+                Some("boom"),
+                &[],
+            )
+            .unwrap();
+        let (status, _) = replay(&st, "r1", r#"{"ops": []}"#).await.unwrap();
+        assert_eq!(status, StatusCode::ACCEPTED);
+    }
+
+    #[tokio::test]
+    async fn replay_preview_lists_what_would_run_and_what_it_would_be_seeded_with() {
+        let st = state(vec![brittle_job("etl")]);
+        let preview = |st: &AppState, id: &str, ops: Option<&str>| {
+            replay_preview(
+                State(st.clone()),
+                Path(id.into()),
+                Ok(Query(ReplayPreviewQuery {
+                    ops: ops.map(String::from),
+                })),
+            )
+        };
+        let failed = st
+            .runner
+            .run("etl", json!({}), Trigger::Manual)
+            .await
+            .unwrap();
+
+        let Json(b) = preview(&st, &failed.id, None).await.unwrap();
+        assert_eq!(b, json!({"ops": ["b"], "inputs": ["a"]}));
+
+        // an op with no deps reproduces nothing and says so by seeding nothing
+        let Json(b) = preview(&st, &failed.id, Some("a")).await.unwrap();
+        assert_eq!(b, json!({"ops": ["a"], "inputs": []}));
+
+        // names are comma separated and trimmed
+        let Json(b) = preview(&st, &failed.id, Some("b, ")).await.unwrap();
+        assert_eq!(b, json!({"ops": ["b"], "inputs": ["a"]}));
+
+        // c is a row of the run, but b never produced what it reads
+        let (status, Json(b)) = preview(&st, &failed.id, Some("c")).await.unwrap_err();
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(
+            b["error"]
+                .as_str()
+                .unwrap()
+                .contains("recorded no output to read back"),
+            "{b}"
+        );
+
+        // the same refusals as the launch, so a preview never promises more
+        let (status, Json(b)) = preview(&st, "nope", None).await.unwrap_err();
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(b["error"], "unknown run: nope");
+
+        insert_run_with_ops(&st, "live", "etl", RunStatus::Running, &["a", "b", "c"]);
+        let (status, Json(b)) = preview(&st, "live", None).await.unwrap_err();
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(b["error"], "run still active: live");
+    }
+
+    #[tokio::test]
     async fn overdue_follows_missed_fires() {
         let st = state(vec![echo_job("etl")]);
         let job = &st.jobs["etl"];
@@ -5649,7 +5893,7 @@ mod tests {
     /// a route nobody asserted the access of, so the two lists below are
     /// checked against the router itself in
     /// [`the_table_covers_every_endpoint_the_router_serves`].
-    const READS: [&str; 32] = [
+    const READS: [&str; 33] = [
         "/api/health",
         "/api/resources",
         "/api/jobs",
@@ -5664,6 +5908,7 @@ mod tests {
         "/api/runs/r1/logs",
         "/api/runs/r1/logs/download",
         "/api/runs/r1/resume_preview",
+        "/api/runs/r1/replay_preview",
         "/api/runs/r1/clone",
         "/api/queue",
         "/api/assets",
@@ -5686,11 +5931,12 @@ mod tests {
 
     /// what each mutation needs of whoever asks for it. an operator drives what
     /// is happening now; an admin changes what the deployment will do next.
-    const MUTATIONS: [(&str, &str, Access); 14] = [
+    const MUTATIONS: [(&str, &str, Access); 15] = [
         ("POST", "/api/jobs/etl/runs", Access::Operator),
         ("POST", "/api/jobs/etl/validate_params", Access::Operator),
         ("POST", "/api/runs/r1/retry", Access::Operator),
         ("POST", "/api/runs/r1/resume", Access::Operator),
+        ("POST", "/api/runs/r1/replay", Access::Operator),
         ("POST", "/api/runs/r1/cancel", Access::Operator),
         ("POST", "/api/assets/build", Access::Operator),
         ("POST", "/api/assets/docs/build", Access::Operator),
@@ -5874,7 +6120,7 @@ mod tests {
         );
         // and the count, so that a scraper that quietly stopped finding
         // anything cannot pass this by covering nothing
-        assert_eq!(declared_routes().len(), 46);
+        assert_eq!(declared_routes().len(), 48);
     }
 
     /// every `| METHOD | \`/api/path\` |` row of the table at the top of
@@ -5938,8 +6184,8 @@ mod tests {
         assert!(stale.is_empty(), "documented but not served: {stale:?}");
         // and neither list is empty, so a scraper that stopped finding
         // anything cannot pass by comparing nothing with nothing
-        assert_eq!(declared.len(), 47);
-        assert_eq!(documented.len(), 47);
+        assert_eq!(declared.len(), 49);
+        assert_eq!(documented.len(), 49);
     }
 
     // a role that may not is 403 and says what it would take; nobody at all is

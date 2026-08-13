@@ -144,6 +144,11 @@ async fn cases(dir: &Path) {
     )
     .await;
     case("a_follow_resumes_from_a_cursor", resumes(dir)).await;
+    case(
+        "replay_re_runs_what_a_run_did_or_says_why_not",
+        replays(dir),
+    )
+    .await;
     case("doctor_answers_why_nothing_is_running", diagnosed(dir)).await;
     case("a_dry_run_checks_the_params_and_creates_nothing", dry(dir)).await;
     case(
@@ -301,6 +306,47 @@ async fn unreachable(dir: &Path) {
     let db = dir.join("no").join("such").join("directory.db");
     let ran = cli(&db, &["runs"]);
     ran.assert(5);
+}
+
+/// replay through the command line, and the codes its refusals exit with.
+///
+/// a resume and a replay are one letter apart and mean opposite things, so
+/// what is asserted is that the run this one leaves behind says which happened.
+async fn replays(dir: &Path) {
+    let db = db(dir, "replay");
+    let store = Store::open(db.to_str().unwrap()).unwrap();
+
+    // a run that failed, which is the case somebody actually has
+    cli(&db, &["run", "boom", "--wait"]).assert(1);
+    let failed = store.runs(Some("boom"), None, None, None, None, 1).unwrap();
+    let failed = failed[0].id.clone();
+
+    let ran = cli(&db, &["--quiet", "replay", &failed]);
+    ran.assert(0);
+    let replayed = store.run(ran.stdout.trim()).unwrap().unwrap();
+    assert_eq!(replayed.trigger, Trigger::Replay);
+    assert_eq!(replayed.replay_of.as_deref(), Some(failed.as_str()));
+    assert_eq!(replayed.resumed_from, None);
+    // the op that failed, and nothing else
+    let ops: Vec<String> = store
+        .op_runs(&replayed.id)
+        .unwrap()
+        .into_iter()
+        .map(|o| o.op)
+        .collect();
+    assert_eq!(ops, ["explode"]);
+
+    // a run that worked has no failed op to replay, and saying so is exit 2
+    cli(&db, &["run", "quick", "--wait"]).assert(0);
+    let won = store
+        .runs(Some("quick"), None, None, None, None, 1)
+        .unwrap();
+    let ran = cli(&db, &["replay", &won[0].id]);
+    ran.assert(2);
+    assert!(ran.stderr.contains("nothing to replay"), "{ran:?}");
+
+    // and a run id that is not one is the same answer `show` gives
+    cli(&db, &["replay", "nosuchrun"]).assert(2);
 }
 
 async fn machine(dir: &Path) {

@@ -131,7 +131,7 @@ one comparison — `identity.role >= what this endpoint needs`.
 | role | may |
 | --- | --- |
 | **viewer** | read: every `GET` |
-| **operator** | that, plus launch, cancel, retry, resume, build, backfill |
+| **operator** | that, plus launch, cancel, retry, resume, replay, build, backfill |
 | **admin** | that, plus pause, unpause, priority, presets — anything that changes how the deployment behaves rather than what it is doing now |
 
 endpoint by endpoint, and this table is the security surface — the code is
@@ -146,6 +146,7 @@ the real router:
 | `POST /api/jobs/{name}/validate_params` | operator |
 | `POST /api/runs/{id}/retry` | operator |
 | `POST /api/runs/{id}/resume` | operator |
+| `POST /api/runs/{id}/replay` | operator |
 | `POST /api/runs/{id}/cancel` | operator |
 | `POST /api/assets/build` | operator |
 | `POST /api/assets/{name}/build` | operator |
@@ -192,8 +193,8 @@ requests; everything else gets the ui it always had.
 
 **a control a role may not use is not rendered.** a viewer's job page says
 `launching needs an operator` where the launch controls are; the cancel,
-re-run, resume, build, backfill, pause, preset and queue-order controls are
-absent the same way. a button that is there and answers 403 teaches people that
+re-run, resume, replay, build, backfill, pause, preset and queue-order
+controls are absent the same way. a button that is there and answers 403 teaches people that
 the ui lies about what they can do, and the ones who learn that stop reading
 the rest of it.
 

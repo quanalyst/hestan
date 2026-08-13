@@ -155,7 +155,9 @@ impl From<Error> for Fail {
             | Error::InvalidParams { .. }
             | Error::RunActive(_)
             | Error::RunNotFailed(_)
-            | Error::NothingToResume(_) => Exit::Usage,
+            | Error::NothingToResume(_)
+            | Error::NothingToReplay(_)
+            | Error::ReplayInput { .. } => Exit::Usage,
             Error::Sqlite(_) | Error::Io(_) | Error::UnsupportedDb(_) | Error::SchemaTooNew(_) => {
                 Exit::Unreachable
             }
@@ -229,6 +231,8 @@ enum Command {
     Retry(RunRef),
     /// re-run what did not succeed, seeding what did
     Resume(ResumeArgs),
+    /// re-run ops that already ran, on the inputs they had
+    Replay(ReplayArgs),
     /// every job this deployment defines
     Jobs,
     /// every asset, and whether it is stale
@@ -386,6 +390,16 @@ struct ResumeArgs {
     /// repeatable. without it, every op that did not succeed
     #[arg(long = "from", value_name = "OP")]
     from: Vec<String>,
+}
+
+#[derive(Args)]
+struct ReplayArgs {
+    /// the run id
+    run: String,
+    /// replay exactly these ops, whatever they did, and nothing downstream of
+    /// them; repeatable. without it, every op the run recorded as failed
+    #[arg(long = "op", value_name = "OP")]
+    ops: Vec<String>,
 }
 
 #[derive(Args)]
@@ -760,6 +774,34 @@ async fn dispatch(reach: Reach, command: Command, out: &Out) -> Result<(), Fail>
                 let id = built
                     .runner
                     .resume_from(&args.run, from)
+                    .map_err(Fail::from)?;
+                let job = built
+                    .runner
+                    .store()
+                    .run(&id)?
+                    .map_or_else(String::new, |r| r.job);
+                out.launched(&id, &job);
+                Ok(())
+            }
+        },
+
+        Command::Replay(args) => match reach {
+            Reach::Server(api) => {
+                let answer = api
+                    .post(
+                        &format!("/api/runs/{}/replay", args.run),
+                        json!({ "ops": args.ops }),
+                    )
+                    .await?;
+                out.launched(&s(&answer, "run_id"), "");
+                Ok(())
+            }
+            reach => {
+                let built = reach.built(false).await?;
+                let ops = (!args.ops.is_empty()).then_some(args.ops.as_slice());
+                let id = built
+                    .runner
+                    .replay_ops(&args.run, ops)
                     .map_err(Fail::from)?;
                 let job = built
                     .runner
