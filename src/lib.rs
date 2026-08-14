@@ -166,7 +166,7 @@ pub use model::{
     Trigger, When,
 };
 pub use op::{InputError, META_TABLE_ROWS, Meta, MetaColumn, MetaTable, Op, OpCtx, OpResult};
-pub use partition::Partitions;
+pub use partition::{PartitionMapping, Partitions};
 pub use rate::RateStatus;
 pub use resource::ResourceCtx;
 pub use retention::Retention;
@@ -184,8 +184,8 @@ pub use store::{EventQuery, Settled, Store};
 pub mod prelude {
     pub use crate::{
         Asset, AssetCheck, Catchup, CheckResult, Graph, Hestan, Job, Meta, MultiAsset, Op, OpCtx,
-        OpResult, Partitions, RunRequest, RunStatus, RunStatusSensor, RunSummary, Schedule, Sensor,
-        Severity,
+        OpResult, PartitionMapping, Partitions, RunRequest, RunStatus, RunStatusSensor, RunSummary,
+        Schedule, Sensor, Severity,
     };
     pub use serde_json::{Value, json};
 }

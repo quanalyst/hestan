@@ -14,7 +14,7 @@ use crate::graph;
 use crate::job::Job;
 use crate::model::{CheckStatus, Materialization, RunTags, Severity, Trigger};
 use crate::op::{self, Meta, Op, OpCtx};
-use crate::partition::Partitions;
+use crate::partition::{KeySet, PartitionMapping, Partitions, Reads};
 use crate::store::{Built, Store};
 
 /// the internal job every asset build runs under.
@@ -63,6 +63,7 @@ pub struct Asset {
     name: String,
     source: bool,
     deps: Vec<String>,
+    maps: BTreeMap<String, PartitionMapping>,
     op: Option<Op>,
     io: Option<String>,
     probe: Option<Arc<ProbeFn>>,
@@ -83,6 +84,7 @@ impl Asset {
             name: name.into(),
             source: true,
             deps: Vec::new(),
+            maps: BTreeMap::new(),
             op: None,
             io: None,
             probe: None,
@@ -109,6 +111,7 @@ impl Asset {
             name,
             source: false,
             deps: Vec::new(),
+            maps: BTreeMap::new(),
             io: None,
             probe: None,
             probe_every: Duration::from_secs(60),
@@ -136,6 +139,7 @@ impl Asset {
             name,
             source: false,
             deps: Vec::new(),
+            maps: BTreeMap::new(),
             io: None,
             probe: None,
             probe_every: Duration::from_secs(60),
@@ -179,6 +183,42 @@ impl Asset {
     /// [`from`](Self::from).
     pub fn from_named(mut self, dep: impl Into<String>) -> Asset {
         self.deps.push(dep.into());
+        self
+    }
+
+    /// declare lineage on another asset *and which of its keys* this asset's
+    /// partitions read: a daily key
+    /// [covering](PartitionMapping::covering) its 24 hours, yesterday's key at
+    /// an [offset](PartitionMapping::offset), or
+    /// [all](PartitionMapping::all) of them at once.
+    ///
+    /// ```no_run
+    /// # use hestan::{Asset, OpCtx, PartitionMapping, Partitions};
+    /// # use serde_json::json;
+    /// # let hourly = Asset::new("hourly_traffic", |_: OpCtx| async { Ok(json!(null)) })
+    /// #     .partitioned(Partitions::hourly("2026-01-01"));
+    /// Asset::new("daily_traffic", |_: OpCtx| async { Ok(json!(null)) })
+    ///     .reads(&hourly, PartitionMapping::covering())
+    ///     .partitioned(Partitions::daily("2026-01-01"));
+    /// ```
+    ///
+    /// [`from`](Self::from) is this with
+    /// [`identity`](PartitionMapping::identity) — the same key, which is what
+    /// a dep between two partitioned assets meant before there was anything
+    /// else it could mean. repeatable, and a mapping the two key sets could
+    /// never resolve fails the build.
+    pub fn reads(mut self, dep: &Asset, mapping: PartitionMapping) -> Asset {
+        self.maps.insert(dep.name.clone(), mapping);
+        self.deps.push(dep.name.clone());
+        self
+    }
+
+    /// [`reads`](Self::reads) by name, as [`from_named`](Self::from_named) is
+    /// [`from`](Self::from) by name.
+    pub fn reads_named(mut self, dep: impl Into<String>, mapping: PartitionMapping) -> Asset {
+        let dep = dep.into();
+        self.maps.insert(dep.clone(), mapping);
+        self.deps.push(dep);
         self
     }
 
@@ -521,6 +561,9 @@ pub(crate) struct AssetMeta {
     pub name: String,
     pub source: bool,
     pub deps: Vec<String>,
+    /// the [mapping](PartitionMapping) declared on each dep it reads, for the
+    /// deps that declared one; everything else is identity.
+    maps: BTreeMap<String, PartitionMapping>,
     pub auto: bool,
     pub probe: Option<Arc<ProbeFn>>,
     pub probe_every: Duration,
@@ -536,6 +579,15 @@ pub(crate) struct AssetMeta {
     pub fresh_within: Option<Duration>,
 }
 
+impl AssetMeta {
+    /// which of `dep`'s keys one of this asset's partitions reads. identity
+    /// unless the dep was declared with [`Asset::reads`], which is what makes
+    /// every graph written before mappings existed read exactly as it did.
+    pub(crate) fn mapping(&self, dep: &str) -> PartitionMapping {
+        self.maps.get(dep).cloned().unwrap_or_default()
+    }
+}
+
 /// one op of the lowered `assets` job and the assets it produces — one for a
 /// plain [`Asset`], several for a [`MultiAsset`]. the registry is asset -> op
 /// N:1, and this is the op side of it.
@@ -544,6 +596,8 @@ pub(crate) struct OpMeta {
     pub produces: Vec<String>,
     /// the assets this op reads, shared by everything it produces.
     pub deps: Vec<String>,
+    /// how it reads each of them, for the deps that declared a mapping.
+    maps: BTreeMap<String, PartitionMapping>,
     op: Op,
     /// the io manager this asset's value is stored through, from
     /// [`Asset::io`]; `None` for the process default.
@@ -552,6 +606,13 @@ pub(crate) struct OpMeta {
     retry_delay: Option<Duration>,
     /// set only on a single-asset op: a multi-asset is never partitioned.
     pub partitions: Option<Partitions>,
+}
+
+impl OpMeta {
+    /// which of `dep`'s keys this op reads, the same answer its assets give.
+    pub(crate) fn mapping(&self, dep: &str) -> PartitionMapping {
+        self.maps.get(dep).cloned().unwrap_or_default()
+    }
 }
 
 /// how one dep asset reaches the op that reads it: the op that produces it
@@ -564,7 +625,11 @@ struct DepLink {
     asset: String,
     op: String,
     key: Option<String>,
-    partitioned: bool,
+    /// the dep's own key set when it is partitioned, which is what a mapping
+    /// resolves against; `None` for an unpartitioned dep, read whole.
+    partitions: Option<Partitions>,
+    /// which of those keys the reader takes.
+    mapping: PartitionMapping,
     /// the manager the producer stores through, needed to read a partitioned
     /// dep's value back out of the store.
     io: Option<String>,
@@ -638,6 +703,7 @@ impl AssetRegistry {
                     name: a.name.clone(),
                     produces: vec![a.name.clone()],
                     deps: a.deps.clone(),
+                    maps: a.maps.clone(),
                     op,
                     io: a.io,
                     retries: a.retries,
@@ -649,6 +715,7 @@ impl AssetRegistry {
                 name: a.name.clone(),
                 source: a.source,
                 deps: a.deps,
+                maps: a.maps,
                 auto: a.auto,
                 probe: a.probe,
                 probe_every: a.probe_every,
@@ -669,6 +736,7 @@ impl AssetRegistry {
                     name: produced.clone(),
                     source: false,
                     deps: m.deps.clone(),
+                    maps: BTreeMap::new(),
                     auto: m.auto,
                     probe: None,
                     probe_every: Duration::from_secs(60),
@@ -683,6 +751,7 @@ impl AssetRegistry {
                 name: m.name,
                 produces: m.produces,
                 deps: m.deps,
+                maps: BTreeMap::new(),
                 op: m.op,
                 io: m.io,
                 retries: m.retries,
@@ -820,8 +889,9 @@ impl AssetRegistry {
         }
     }
 
-    /// how an op reads one of its dep assets.
-    fn dep_link(&self, asset: &str) -> DepLink {
+    /// how an op reads one of its dep assets, under the mapping the edge
+    /// declared.
+    fn dep_link(&self, asset: &str, mapping: PartitionMapping) -> DepLink {
         let op = self.producer(asset);
         // a multi-asset's output is one object keyed by what it produces, so a
         // dep on one of them is a key of it; everything else is the whole value
@@ -834,7 +904,8 @@ impl AssetRegistry {
             asset: asset.to_string(),
             op,
             key,
-            partitioned: self.get(asset).is_some_and(|m| m.partitions.is_some()),
+            partitions: self.get(asset).and_then(|m| m.partitions.clone()),
+            mapping,
         }
     }
 
@@ -886,10 +957,13 @@ impl AssetRegistry {
 
 /// what lineage across a partition boundary is allowed to look like.
 ///
-/// dependencies between partitioned assets are **identity mapping only**: a
-/// partition takes the same key from every partitioned dep it reads. that
-/// rules out two shapes, and both are refused here rather than left to
-/// produce something plausible and wrong.
+/// every dep carries a [mapping](PartitionMapping), identity unless
+/// [`Asset::reads`] said otherwise, and a pairing the mapping could never
+/// resolve is refused here rather than left to produce something plausible and
+/// wrong: a day covering a set of keys that span no time, an offset along a
+/// set with no order, a window on a dep whose keys are coarser than its own.
+/// each refusal names both partitionings, since which two they are is the
+/// whole of the answer.
 fn check_partition_deps(metas: &[AssetMeta]) -> Result<(), Error> {
     let spec = |name: &str| {
         metas
@@ -899,8 +973,40 @@ fn check_partition_deps(metas: &[AssetMeta]) -> Result<(), Error> {
     };
     for meta in metas {
         for dep in &meta.deps {
-            let Some(dep_spec) = spec(dep) else { continue };
+            let mapping = meta.mapping(dep);
+            let bad = |why: String| Err(Error::Graph(format!("asset {}: {why}", meta.name)));
+            let Some(dep_spec) = spec(dep) else {
+                // an unpartitioned dep has no keys to choose between: its whole
+                // value arrives at every key, which is identity's other half
+                if !mapping.is_identity() {
+                    return bad(format!(
+                        "it reads {dep} by {}, but {dep} is not partitioned at all. an \
+                         unpartitioned dep has no keys to map onto — its whole value \
+                         arrives at every key of {}",
+                        mapping.label(),
+                        meta.name
+                    ));
+                }
+                continue;
+            };
             let Some(own) = &meta.partitions else {
+                // every key at once is what an unpartitioned consumer can mean;
+                // nothing else resolves from a key it does not have
+                if mapping.is_all() {
+                    continue;
+                }
+                if !mapping.is_identity() {
+                    return bad(format!(
+                        "it is not partitioned, but reads its {} dep {dep} by {}. a \
+                         mapping resolves from one key to another and {} has no key of \
+                         its own — read every key with PartitionMapping::all, or \
+                         partition {} too",
+                        dep_spec.kind_label(),
+                        mapping.label(),
+                        meta.name,
+                        meta.name
+                    ));
+                }
                 return Err(Error::Graph(format!(
                     "asset {}: it is not partitioned but its dep {dep} is. reading every \
                      partition of {dep} at once is an aggregation, and hestan has no \
@@ -909,7 +1015,45 @@ fn check_partition_deps(metas: &[AssetMeta]) -> Result<(), Error> {
                     meta.name, meta.name
                 )));
             };
-            if !own.same_kind(dep_spec) {
+            // all pairs any two key sets, which is the point of it
+            let (own_kind, dep_kind) = (own.kind_label(), dep_spec.kind_label());
+            if mapping.is_covering() {
+                let (Some(mine), Some(theirs)) = (own.grain(), dep_spec.grain()) else {
+                    return bad(format!(
+                        "partitioned {own_kind}, covering its dep {dep}, partitioned \
+                         {dep_kind}. a window covers a span of time, and a {} key set \
+                         spans none",
+                        match own.grain() {
+                            None => own_kind,
+                            Some(_) => dep_kind,
+                        }
+                    ));
+                };
+                if mine < theirs {
+                    return bad(format!(
+                        "partitioned {own_kind}, but it cannot cover its dep {dep}, \
+                         partitioned {dep_kind}: one {own_kind} key sits inside one \
+                         {dep_kind} key rather than the other way round"
+                    ));
+                }
+            }
+            if mapping.is_offset() {
+                if !own.same_kind(dep_spec) {
+                    return bad(format!(
+                        "partitioned {own_kind}, but its dep {dep} is partitioned \
+                         {dep_kind}. an offset steps along one kind of key, which two \
+                         kinds cannot agree on"
+                    ));
+                }
+                if !own.ordered() {
+                    return bad(format!(
+                        "partitioned {own_kind}, and so is its dep {dep}. an offset \
+                         steps along the order of a key set, and a {own_kind} one is in \
+                         the order it was written rather than one to step along"
+                    ));
+                }
+            }
+            if mapping.is_identity() && !own.same_kind(dep_spec) {
                 return Err(Error::Graph(format!(
                     "asset {}: partitioned {}, but its dep {dep} is partitioned {}. \
                      a partition reads the same key from its dep, which two kinds of key \
@@ -956,36 +1100,73 @@ async fn stored_value(
         .map_err(|e| format!("could not read the value of {}: {e}", link.asset).into())
 }
 
+/// one key of a partitioned dep, out of the store and back through the manager
+/// that stored it; `None` when nothing has materialized there.
+async fn partition_value(
+    ctx: &OpCtx,
+    link: &DepLink,
+    key: &str,
+) -> Result<Option<Value>, Box<dyn std::error::Error + Send + Sync>> {
+    let held = ctx
+        .store
+        .materialization(&link.asset, Some(key))?
+        .and_then(|m| m.value);
+    match held {
+        Some(held) => Ok(Some(stored_value(ctx, link, held).await?)),
+        None => Ok(None),
+    }
+}
+
 /// the ctx an asset body sees: inputs keyed by the *asset* names it declared,
 /// whatever ops the run actually ran to produce them, plus the partition key
 /// this invocation is for. `ctx.input("orders")` reads the same inside an
 /// asset whether `orders` has an op to itself or is one output of a
 /// multi-asset.
 ///
-/// a **partitioned** dep is read from the store at the same key rather than
-/// out of the run. that is what makes identity mapping mean one thing: the
-/// consumer reads `dep[k]` whether `dep[k]` was rebuilt by this run — its
-/// materialization is written inside its own op, which has finished by now —
-/// or was already fresh and never ran at all. what that row holds is what the
-/// manager returned, so it is read back through the manager like any other
-/// input.
+/// a **partitioned** dep is read from the store, at whatever keys this
+/// partition's [mapping](PartitionMapping) resolves to rather than out of the
+/// run. that is what makes a mapping mean one thing: the consumer reads
+/// `dep[k]` whether `dep[k]` was rebuilt by this run — its materialization is
+/// written inside its own op, which has finished by now — or was already fresh
+/// and never ran at all. what that row holds is what the manager returned, so
+/// it is read back through the manager like any other input.
+///
+/// a mapping that names one key hands the body that key's value. one that
+/// names a set hands it an object keyed by partition, holding the keys that
+/// have materialized — an empty object rather than nothing when none have, so
+/// "the set was empty" and "there is no such dep" stay different facts.
 async fn with_dep_inputs(
     ctx: &OpCtx,
     links: &[DepLink],
+    own: Option<&Partitions>,
     key: Option<&str>,
 ) -> Result<OpCtx, Box<dyn std::error::Error + Send + Sync>> {
     let mut inputs: HashMap<String, Value> = HashMap::new();
     let mut dep_statuses: HashMap<String, crate::model::OpStatus> = HashMap::new();
     for link in links {
-        let value = match (link.partitioned, key) {
-            (true, Some(key)) => match ctx.store.materialization(&link.asset, Some(key))? {
-                Some(m) => match m.value {
-                    Some(held) => Some(stored_value(ctx, link, held).await?),
-                    None => None,
-                },
-                None => None,
-            },
-            _ => dep_value(ctx, link),
+        let value = match &link.partitions {
+            Some(spec) => {
+                let reads = match link.mapping.is_identity() {
+                    true => Reads::at(key),
+                    false => link.mapping.reads(own, key, &KeySet::of(spec)),
+                };
+                match link.mapping.reads_one() {
+                    true => match reads.keys.first() {
+                        Some(key) => partition_value(ctx, link, key).await?,
+                        None => None,
+                    },
+                    false => {
+                        let mut by_key = Map::new();
+                        for key in reads.keys {
+                            if let Some(v) = partition_value(ctx, link, &key).await? {
+                                by_key.insert(key, v);
+                            }
+                        }
+                        Some(Value::Object(by_key))
+                    }
+                }
+            }
+            None => dep_value(ctx, link),
         };
         if let Some(v) = value {
             inputs.insert(link.asset.clone(), v);
@@ -1007,7 +1188,7 @@ async fn with_dep_inputs(
 fn dep_fingerprints(ctx: &OpCtx, links: &[DepLink], key: Option<&str>) -> Result<Value, Error> {
     let mut inputs = Map::new();
     for link in links {
-        let at = key.filter(|_| link.partitioned);
+        let at = key.filter(|_| link.partitions.is_some());
         let fp = ctx
             .store
             .materialization(&link.asset, at)?
@@ -1090,7 +1271,11 @@ fn wrap_op(reg: &AssetRegistry, meta: &OpMeta) -> Op {
     let inner = meta.op.clone();
     let name = meta.name.clone();
     let produces = meta.produces.clone();
-    let links: Vec<DepLink> = meta.deps.iter().map(|d| reg.dep_link(d)).collect();
+    let links: Vec<DepLink> = meta
+        .deps
+        .iter()
+        .map(|d| reg.dep_link(d, meta.mapping(d)))
+        .collect();
     // one entry per op the run knows, however many asset deps reach it
     let mut after: Vec<String> = Vec::new();
     for link in &links {
@@ -1098,20 +1283,21 @@ fn wrap_op(reg: &AssetRegistry, meta: &OpMeta) -> Op {
             after.push(link.op.clone());
         }
     }
-    let partitioned = meta.partitions.is_some();
+    let own = meta.partitions.clone();
     let mut op = Op::new(name.clone(), move |ctx: OpCtx| {
         let inner = inner.clone();
         let name = name.clone();
         let produces = produces.clone();
         let links = links.clone();
+        let own = own.clone();
         async move {
             // on a partitioned asset this op is one fan-out instance, and the
             // element it was handed is the key it is for
-            let key = match partitioned {
+            let key = match own.is_some() {
                 false => None,
                 true => Some(partition_of(&ctx)?),
             };
-            let inner_ctx = with_dep_inputs(&ctx, &links, key.as_deref()).await?;
+            let inner_ctx = with_dep_inputs(&ctx, &links, own.as_ref(), key.as_deref()).await?;
             let output = inner.call(inner_ctx).await?;
             let values = split_output(&name, &produces, &output)?;
             // deps' current fingerprints: ancestors in this run already wrote
@@ -1182,7 +1368,9 @@ fn partition_of(ctx: &OpCtx) -> Result<String, Box<dyn std::error::Error + Send 
 // downstream assets.
 fn check_op(reg: &AssetRegistry, meta: &CheckMeta) -> Op {
     let asset = meta.asset.clone();
-    let link = reg.dep_link(&meta.asset);
+    // a check reads the asset it checks at its own key, whatever mappings the
+    // asset itself declared upstream
+    let link = reg.dep_link(&meta.asset, PartitionMapping::identity());
     let producer = link.op.clone();
     let check = meta.name.clone();
     let severity = meta.severity;
@@ -1190,7 +1378,7 @@ fn check_op(reg: &AssetRegistry, meta: &CheckMeta) -> Op {
     // a check on a partitioned asset expands the same way the asset does, over
     // the same keys: one check per partition, on the value that partition
     // just produced
-    let partitioned = link.partitioned;
+    let partitioned = link.partitions.is_some();
     let op = Op::new(check_op_name(&meta.asset, &meta.name), move |ctx: OpCtx| {
         let (asset, check, f, link) = (asset.clone(), check.clone(), f.clone(), link.clone());
         async move {
@@ -1880,7 +2068,12 @@ mod tests {
         assert_eq!(wrap_op(&reg, reg.op("b").unwrap()).io_name(), None);
         // and the consumer knows where its dep's value went, which is how a
         // partitioned dep is read back off its row
-        assert_eq!(reg.dep_link("a").io.as_deref(), Some("parquet"));
+        assert_eq!(
+            reg.dep_link("a", PartitionMapping::identity())
+                .io
+                .as_deref(),
+            Some("parquet")
+        );
     }
 
     #[test]
@@ -3223,8 +3416,170 @@ mod tests {
         );
     }
 
+    fn hourly(name: &str) -> Asset {
+        Asset::new(name, |ctx: OpCtx| async move {
+            Ok(json!({ "hour": ctx.partition() }))
+        })
+        .partitioned(Partitions::hourly("2026-01-01T00"))
+    }
+
+    fn daily(name: &str, dep: &str, mapping: PartitionMapping) -> Asset {
+        Asset::new(name, |_| async { Ok(json!(null)) })
+            .reads_named(dep, mapping)
+            .partitioned(Partitions::daily("2026-01-01"))
+    }
+
     #[test]
-    fn lineage_across_a_partition_boundary_is_identity_or_nothing() {
+    fn a_mapping_is_declared_on_the_dep_and_is_identity_unless_it_says_otherwise() {
+        let hours = hourly("hours");
+        let rollup = daily("rollup", "hours", PartitionMapping::covering());
+        let plain = Asset::new("plain", |_| async { Ok(json!(null)) })
+            .from(&hours)
+            .partitioned(Partitions::hourly("2026-01-01T00"));
+        // the mapping rides on the edge, and the dep is declared by declaring it
+        assert_eq!(rollup.deps(), ["hours"]);
+        let reg = AssetRegistry::new(vec![hours, rollup, plain], Vec::new(), Vec::new()).unwrap();
+        assert_eq!(
+            reg.get("rollup").unwrap().mapping("hours"),
+            PartitionMapping::covering()
+        );
+        // a dep declared the way every dep was declared before mappings existed
+        assert!(reg.get("plain").unwrap().mapping("hours").is_identity());
+        // and so is a dep of an asset that has never heard of one
+        assert!(reg.get("rollup").unwrap().mapping("nothing").is_identity());
+        // the op the asset lowers to gives the same answer
+        assert_eq!(
+            reg.op("rollup").unwrap().mapping("hours"),
+            PartitionMapping::covering()
+        );
+
+        // a name nothing registers is still a build error
+        let err = reg_err(vec![daily("rollup", "ghost", PartitionMapping::all())]);
+        assert!(err.to_string().contains("unknown"), "{err}");
+    }
+
+    #[test]
+    fn a_pairing_no_mapping_could_resolve_fails_the_build() {
+        // a window covers a span of time, and a static set spans none
+        let err = reg_err(vec![
+            keyed("a"),
+            daily("rollup", "a", PartitionMapping::covering()),
+        ]);
+        assert!(err.to_string().contains("partitioned daily"), "{err}");
+        assert!(
+            err.to_string().contains("static key set spans none"),
+            "{err}"
+        );
+
+        // and an hour sits inside a day rather than covering one
+        let hours = Asset::new("hours", |_| async { Ok(json!(null)) })
+            .reads_named("days", PartitionMapping::covering())
+            .partitioned(Partitions::hourly("2026-01-01T00"));
+        let days = Asset::new("days", |_| async { Ok(json!(null)) })
+            .partitioned(Partitions::daily("2026-01-01"));
+        let err = reg_err(vec![days, hours]);
+        assert!(
+            err.to_string()
+                .contains("one hourly key sits inside one daily key"),
+            "{err}"
+        );
+
+        // an offset needs one kind of key
+        let hours = hourly("hours");
+        let err = reg_err(vec![
+            hours,
+            daily("rollup", "hours", PartitionMapping::offset(-1)),
+        ]);
+        assert!(
+            err.to_string()
+                .contains("partitioned daily, but its dep hours is partitioned hourly"),
+            "{err}"
+        );
+        assert!(
+            err.to_string().contains("an offset steps along one kind"),
+            "{err}"
+        );
+
+        // and an order to step along
+        let previous = Asset::new("previous", |_| async { Ok(json!(null)) })
+            .reads_named("a", PartitionMapping::offset(-1))
+            .partitioned(Partitions::keys(["k1", "k2", "k3"]));
+        let err = reg_err(vec![keyed("a"), previous]);
+        assert!(
+            err.to_string()
+                .contains("partitioned static, and so is its dep a"),
+            "{err}"
+        );
+
+        // an unpartitioned dep has no keys for any of it to choose between
+        let err = reg_err(vec![
+            Asset::source("s"),
+            Asset::new("rollup", |_| async { Ok(json!(null)) })
+                .reads_named("s", PartitionMapping::covering())
+                .partitioned(Partitions::daily("2026-01-01")),
+        ]);
+        assert!(
+            err.to_string().contains("s is not partitioned at all"),
+            "{err}"
+        );
+
+        // nor has an unpartitioned consumer a key of its own to resolve from
+        let err = reg_err(vec![
+            keyed("a"),
+            Asset::new("flat", |_| async { Ok(json!(null)) })
+                .reads_named("a", PartitionMapping::offset(-1)),
+        ]);
+        assert!(
+            err.to_string()
+                .contains("it is not partitioned, but reads its static dep a"),
+            "{err}"
+        );
+
+        // the pairings that do resolve
+        let hours = hourly("hours");
+        AssetRegistry::new(
+            vec![
+                hours,
+                daily("rollup", "hours", PartitionMapping::covering()),
+                daily("yesterday", "rollup", PartitionMapping::offset(-1)),
+                Asset::new("flat", |_| async { Ok(json!(null)) })
+                    .reads_named("hours", PartitionMapping::all()),
+            ],
+            Vec::new(),
+            Vec::new(),
+        )
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn an_unpartitioned_asset_reads_every_key_of_a_partitioned_dep() {
+        let store = Store::open(":memory:").unwrap();
+        let a = keyed("a");
+        let flat = Asset::new("flat", |ctx: OpCtx| async move {
+            Ok(ctx.input("a").cloned().unwrap_or(json!(null)))
+        })
+        .reads_named("a", PartitionMapping::all());
+        let reg = AssetRegistry::new(vec![a, flat], Vec::new(), Vec::new()).unwrap();
+        let runner = Runner::new([reg.lower_job().unwrap()], store.clone()).unwrap();
+
+        let two = HashMap::from([("a".to_string(), vec!["k1".to_string(), "k2".to_string()])]);
+        let m = mats_map(&store).unwrap();
+        let plan = plan_partitions(&reg, &m, &["a".into()], &two).unwrap();
+        assert_eq!(build_plan(&runner, plan).await.status, RunStatus::Success);
+
+        let m = mats_map(&store).unwrap();
+        let plan = plan_target(&reg, &m, "flat").unwrap();
+        assert_eq!(build_plan(&runner, plan).await.status, RunStatus::Success);
+        // one object keyed by partition, holding the keys that have
+        // materialized — k3 has not, and is absent rather than null
+        assert_eq!(
+            store.materialization("flat", None).unwrap().unwrap().value,
+            Some(json!({"k1": {"key": "k1"}, "k2": {"key": "k2"}}))
+        );
+    }
+
+    #[test]
+    fn a_dep_that_declares_no_mapping_is_identity_or_nothing() {
         let a = keyed("a");
         let flat = Asset::new("flat", |_| async { Ok(json!(null)) }).from_named("a");
         let err = reg_err(vec![a, flat]);
