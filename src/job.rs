@@ -355,8 +355,8 @@ fn merge_params_schemas(job: &str, ops: &[Op]) -> Result<Option<Value>, Error> {
     Ok(Some(Value::Object(merged)))
 }
 
-// a mapped op needs exactly one array to expand over, and its instances are
-// ordinary ops that cannot fan out again — one level, deliberately
+// a mapped op needs exactly one array to expand over, and nothing else may be
+// called what one of its instances is called
 fn validate_mapped(job: &str, ops: &[Op]) -> Result<(), Error> {
     for op in ops {
         match (op.is_mapped(), op.mapped_over()) {
@@ -372,16 +372,25 @@ fn validate_mapped(job: &str, ops: &[Op]) -> Result<(), Error> {
                     op.name()
                 )));
             }
-            (true, Some(dep)) => {
-                if ops.iter().any(|o| o.name() == dep && o.is_mapped()) {
-                    return Err(Error::Graph(format!(
-                        "job {job}: op {} maps over {dep}, which is itself mapped; \
-                         fan-out does not nest",
-                        op.name()
-                    )));
-                }
-            }
-            (false, None) => {}
+            _ => {}
+        }
+    }
+    // an instance is `{op}[{label}]`, one group per level of fan-out, and that
+    // name is all anything downstream of the run has to go on: op stats, a
+    // resume, the ui and the io manager's path each read the op back out of
+    // it. an op named like one of them would be read as an instance of a
+    // fan-out it has nothing to do with, so the collision is refused at build
+    // rather than misattributed for the life of the deployment
+    for op in ops {
+        let Some((root, _)) = op.name().split_once('[') else {
+            continue;
+        };
+        if ops.iter().any(|o| o.name() == root && o.is_mapped()) {
+            return Err(Error::Graph(format!(
+                "job {job}: op {} is named what an instance of the mapped op {root} is named; \
+                 every {root}[..] of a run belongs to that fan-out",
+                op.name()
+            )));
         }
     }
     Ok(())

@@ -387,21 +387,35 @@ enum Outcome {
 
 type OpOutcome = (String, Outcome);
 
-/// one instance of a mapped op, keyed in the run by its `{op}[{label}]` name —
-/// the element's index, or the element itself on an op that
+/// one instance of a mapped op, keyed in the run by its `{op}[{label}]` name:
+/// one `[label]` per level of fan-out it sits inside, so an instance of a
+/// fan-out inside a fan-out is `{op}[{outer}][{label}]`. a label is the
+/// element's index, or the element itself on an op that
 /// [labels its instances](Op::labels_instances).
 struct Instance {
-    parent: String,
+    /// the mapped op it runs, which is its name up to the first `[`
+    op: String,
+    /// the fan-out whose slot it fills: the mapped op itself at the outermost
+    /// level, one of the op's per-element branches inside another fan-out
+    fanout: String,
     index: usize,
     element: Value,
 }
 
-/// a mapped op mid-expansion: one slot per element, so the collected output
-/// comes out in element order however the instances interleave. `names` is
-/// what each slot's instance is called, which is the key its output was
-/// persisted under.
+/// a fan-out mid-expansion: one slot per element, so the collected output
+/// comes out in element order however the instances interleave.
+///
+/// a fan-out inside a fan-out is a tree of these, one node per outer element,
+/// and that is what gives the collected value the shape the fan-out had rather
+/// than a flattened list.
 struct Fanout {
-    names: Vec<String>,
+    /// where the collected value goes: the slot of the fan-out one level out,
+    /// or the mapped op's own output at the outermost level
+    into: Option<(String, usize)>,
+    /// what each slot's element is called. a fan-out over this one mirrors
+    /// them, which is how an inner instance carries the label of the outer
+    /// instance it belongs to
+    labels: Vec<String>,
     slots: Vec<Option<Value>>,
     remaining: usize,
     failed: bool,
@@ -1954,13 +1968,28 @@ fn planned(job: &Job, plan: Option<&Value>) -> (Vec<String>, HashMap<String, Val
     (ops, seeds)
 }
 
-// "process[3]" -> ("process", "3"), but only when `process` is a mapped op of
-// this job; any other bracketed name is just an op name
-pub(crate) fn instance_of(job: &Job, name: &str) -> Option<(String, String)> {
-    let (parent, label) = name.split_once('[')?;
-    let label = label.strip_suffix(']')?;
-    job.op(parent)?.mapped_over()?;
-    Some((parent.to_string(), label.to_string()))
+// "process[3]" -> ("process", ["3"]) and "process[3][1]" ->
+// ("process", ["3", "1"]), but only when `process` is a mapped op of this job;
+// any other bracketed name is just an op name.
+//
+// what makes the name reversible is that a label can hold neither bracket —
+// `expansion` refuses one that does — so there is nothing here to guess about
+// where one level ends and the next begins
+pub(crate) fn instance_of(job: &Job, name: &str) -> Option<(String, Vec<String>)> {
+    let (op, mut rest) = name.split_once('[')?;
+    job.op(op)?.mapped_over()?;
+    let mut labels = Vec::new();
+    loop {
+        let (label, tail) = rest.split_once(']')?;
+        if label.contains('[') {
+            return None;
+        }
+        labels.push(label.to_string());
+        match tail.is_empty() {
+            true => return Some((op.to_string(), labels)),
+            false => rest = tail.strip_prefix('[')?,
+        }
+    }
 }
 
 /// what one instance of a fan-out is called after the `[`: its index, or the
@@ -1970,6 +1999,17 @@ fn instance_label(op: &Op, index: usize, element: &Value) -> String {
     match element.as_str().filter(|_| op.labels_instances()) {
         Some(key) => key.to_string(),
         None => index.to_string(),
+    }
+}
+
+/// how many levels of fan-out an op's instances sit inside — the number of
+/// `[label]` groups their names carry, and the number of levels a fan-out over
+/// this op has to mirror. 0 for an op that is not mapped, and for an external
+/// dep, which is not an op of the job at all.
+fn fanout_depth(job: &Job, op: &str) -> usize {
+    match job.op(op).and_then(Op::mapped_over) {
+        Some(over) => 1 + fanout_depth(job, over),
+        None => 0,
     }
 }
 
@@ -1994,16 +2034,78 @@ fn ran(job: &Job, rows: &[OpRun]) -> HashMap<String, OpStatus> {
     out
 }
 
-/// one mapped op's instance rows mid-fold, by index: the instance's name, what
-/// it did, and what it recorded.
-type InstanceRows = BTreeMap<usize, (String, OpStatus, Option<Value>)>;
+/// one mapped op's instance rows mid-fold, as the tree their names describe:
+/// a level of the fan-out by index, or one instance's name, what it did and
+/// what it recorded.
+enum Folded {
+    Instance(String, OpStatus, Option<Value>),
+    Level(BTreeMap<usize, Folded>),
+}
+
+/// put one instance row where its label path says it belongs, or say that the
+/// path is not one a fan-out could have produced — an index twice, or a name
+/// that is both an instance and a level of instances.
+fn place(node: &mut Folded, path: &[usize], row: (String, OpStatus, Option<Value>)) -> bool {
+    let (Folded::Level(children), Some((&index, rest))) = (node, path.split_first()) else {
+        return false;
+    };
+    if rest.is_empty() {
+        let row = Folded::Instance(row.0, row.1, row.2);
+        return children.insert(index, row).is_none();
+    }
+    let child = children
+        .entry(index)
+        .or_insert_with(|| Folded::Level(BTreeMap::new()));
+    place(child, rest, row)
+}
+
+/// what a folded fan-out reassembles to, or `None` when it does not: the
+/// instances have to cover `0..n` at every level, and each has to have
+/// succeeded with an output that still reads back.
+fn reassemble(
+    io: &Io,
+    job: &Job,
+    run_id: &str,
+    named: Option<&str>,
+    node: Folded,
+) -> Option<Value> {
+    match node {
+        Folded::Instance(op, status, output) => {
+            let handle = output.filter(|_| status == OpStatus::Success)?;
+            let key = IoKey {
+                run_id: run_id.to_string(),
+                job: job.name().to_string(),
+                op,
+            };
+            match io.manager(named).get(&key, &handle) {
+                Ok(v) => Some(v),
+                Err(e) => {
+                    tracing::warn!(run = %run_id, op = %key.op, "instance output unreadable: {e}");
+                    None
+                }
+            }
+        }
+        Folded::Level(children) => {
+            if !children.keys().copied().eq(0..children.len()) {
+                return None;
+            }
+            let mut collected = Vec::with_capacity(children.len());
+            for (_, child) in children {
+                collected.push(reassemble(io, job, run_id, named, child)?);
+            }
+            Some(Value::Array(collected))
+        }
+    }
+}
 
 /// collapse one run's fan-out instance rows into a single entry for the mapped
 /// op they belong to. it counts as succeeded only when the instances cover
-/// `0..n` and every one of them did: the array a mapped op expands over can
-/// differ on a re-run, so anything less has to expand again from scratch. a
-/// mapped op with no rows at all — never reached, or expanded over an empty
-/// array — is absent here, which resume planning reads the same way.
+/// `0..n` at every level and every one of them did: the array a mapped op
+/// expands over can differ on a re-run, so anything less has to expand again
+/// from scratch. a mapped op with no rows at all — never reached, or expanded
+/// over an empty array — is absent here, which resume planning reads the same
+/// way, and an outer element that yielded an empty array leaves the same gap
+/// one level in.
 ///
 /// the one manager call hestan makes on its caller's own thread, because
 /// [`resume_plan`](Runner::resume_plan) is synchronous and reads its store the
@@ -2016,69 +2118,43 @@ fn fold_instances(
     rows: Vec<OpRun>,
 ) -> Vec<(String, OpStatus, Option<Value>)> {
     let mut folded: Vec<(String, OpStatus, Option<Value>)> = Vec::with_capacity(rows.len());
-    let mut groups: HashMap<String, InstanceRows> = HashMap::new();
-    let mut labeled: HashSet<String> = HashSet::new();
+    let mut groups: HashMap<String, Folded> = HashMap::new();
+    let mut unfoldable: HashSet<String> = HashSet::new();
     for row in rows {
-        match instance_of(job, &row.op) {
-            Some((parent, label)) => {
-                // an op that names its instances by their element has no index
-                // to order or count them by, so it never folds back into a
-                // reusable array — it expands again from scratch
-                match label.parse::<usize>() {
-                    Ok(index) if !job.op(&parent).is_some_and(Op::labels_instances) => {
-                        groups
-                            .entry(parent)
-                            .or_default()
-                            .insert(index, (row.op, row.status, row.output));
-                    }
-                    _ => {
-                        labeled.insert(parent);
-                    }
-                }
-            }
-            None => folded.push((row.op, row.status, row.output)),
-        }
-    }
-    for parent in labeled {
-        groups.remove(&parent);
-        folded.push((parent, OpStatus::Failed, None));
-    }
-    for (parent, slots) in groups {
-        let whole = slots.keys().copied().eq(0..slots.len())
-            && slots
-                .values()
-                .all(|(_, status, output)| *status == OpStatus::Success && output.is_some());
-        if !whole {
-            folded.push((parent, OpStatus::Failed, None));
+        let Some((op, labels)) = instance_of(job, &row.op) else {
+            folded.push((row.op, row.status, row.output));
             continue;
+        };
+        // an op that names its instances by their element has no index to
+        // order or count them by, and neither has one nested inside such an
+        // op, so neither ever folds back into a reusable array
+        let path: Option<Vec<usize>> = (!job.op(&op).is_some_and(Op::labels_instances))
+            .then(|| labels.iter().map(|l| l.parse().ok()).collect())
+            .flatten();
+        let Some(path) = path else {
+            unfoldable.insert(op);
+            continue;
+        };
+        let node = groups
+            .entry(op.clone())
+            .or_insert_with(|| Folded::Level(BTreeMap::new()));
+        if !place(node, &path, (row.op, row.status, row.output)) {
+            unfoldable.insert(op);
         }
+    }
+    for op in unfoldable {
+        groups.remove(&op);
+        folded.push((op, OpStatus::Failed, None));
+    }
+    for (op, node) in groups {
         // the instances' recorded outputs are handles; a mapped op's own
-        // value is the array of what they resolve to, exactly as the run that
-        // produced it assembled one. anything unreadable re-expands instead
-        let manager = io.manager(job.op(&parent).and_then(Op::io_name));
-        let mut collected: Vec<Value> = Vec::with_capacity(slots.len());
-        let mut readable = true;
-        for (_, (op, _, output)) in slots {
-            let handle = output.expect("checked just above");
-            let key = IoKey {
-                run_id: run_id.to_string(),
-                job: job.name().to_string(),
-                op,
-            };
-            match manager.get(&key, &handle) {
-                Ok(v) => collected.push(v),
-                Err(e) => {
-                    tracing::warn!(run = %run_id, op = %key.op, "instance output unreadable: {e}");
-                    readable = false;
-                    break;
-                }
-            }
+        // value is what they resolve to in the shape the fan-out had, exactly
+        // as the run that produced it assembled one
+        let named = job.op(&op).and_then(Op::io_name);
+        match reassemble(io, job, run_id, named, node) {
+            Some(value) => folded.push((op, OpStatus::Success, Some(value))),
+            None => folded.push((op, OpStatus::Failed, None)),
         }
-        if !readable {
-            folded.push((parent, OpStatus::Failed, None));
-            continue;
-        }
-        folded.push((parent, OpStatus::Success, Some(Value::Array(collected))));
     }
     folded
 }
@@ -2316,120 +2392,106 @@ async fn execute_in_span(
                     }
                     continue;
                 }
-                // an instance resolves to its parent's op, which is mapped
-                // too; only the parent ever expands
+                // an instance resolves to the op it runs, which is mapped too;
+                // only the op itself ever expands
                 let expandable = !instances.contains_key(&name);
                 let Some(over) = op.mapped_over().filter(|_| expandable).map(str::to_string) else {
                     ready.push(pending.remove(i));
                     continue;
                 };
                 pending.remove(i);
-                let mut expanded_over: Option<&'static str> = None;
-                let mut unreadable: Option<String> = None;
                 // a rule can admit a mapped op whose array never arrived. there
                 // is nothing to expand over, so it expands into nothing: the
                 // same zero-instance fan-out an empty array gives, output `[]`.
                 // the array itself is an op output like any other, so it is
                 // fetched back through its manager before it can be counted.
-                let elements = match outputs.get(&over).cloned() {
-                    None => Ok(Some(Vec::new())),
-                    Some(held) => resolve(&runner.io, &job, &run_id, &over, held)
+                let held = match outputs.get(&over).cloned() {
+                    None => Ok(json!([])),
+                    Some(held) => resolve(&runner.io, &job, &run_id, &over, held).await,
+                };
+                let planned = match held {
+                    Ok(value) => expansion(&job, op, &name, &over, value, &fanouts),
+                    Err(e) => Err(format!("could not read the output of {over}: {e}")),
+                };
+                let plan = match planned {
+                    Ok(plan) => plan,
+                    Err(msg) => {
+                        note(store.append_event(
+                            &run_id,
+                            Some(&name),
+                            EventLevel::Error,
+                            EventKind::OpFailed,
+                            &msg,
+                            Some(&json!({ "error": &msg })),
+                        ));
+                        if first_failure.is_none() {
+                            first_failure = Some((name.clone(), msg));
+                        }
+                        failed = true;
+                        statuses.insert(name.clone(), OpStatus::Failed);
+                        let reason = format!("skipped: upstream {name} failed");
+                        if !skip_downstream(
+                            &job,
+                            &pairs,
+                            &name,
+                            &reason,
+                            &mut pending,
+                            &mut statuses,
+                            &run_id,
+                            &store,
+                        )
                         .await
-                        .map(|v| match v {
-                            Value::Array(a) => Some(a),
-                            other => {
-                                expanded_over = Some(json_type(&other));
-                                None
-                            }
-                        }),
-                };
-                let elements = match elements {
-                    Ok(Some(elements)) => Some(elements),
-                    Ok(None) => None,
-                    Err(e) => {
-                        expanded_over = Some("unreadable");
-                        unreadable = Some(e);
-                        None
-                    }
-                };
-                // every instance is a row of its own, so two elements that
-                // would be called the same thing are not an expansion at all
-                let mut repeated: Option<String> = None;
-                let elements = elements.filter(|elements| {
-                    let mut labels: HashSet<String> = HashSet::new();
-                    for (i, element) in elements.iter().enumerate() {
-                        let label = instance_label(op, i, element);
-                        if !labels.insert(label.clone()) {
-                            repeated = Some(label);
-                            return false;
+                        {
+                            unrecorded = true;
+                            break 'run;
                         }
+                        continue;
                     }
-                    true
-                });
-                let Some(elements) = elements else {
-                    let msg = match (&unreadable, &repeated) {
-                        (Some(e), _) => format!("could not read the output of {over}: {e}"),
-                        (None, Some(label)) => {
-                            format!("expanded over {over}, which named the key {label:?} twice")
-                        }
-                        (None, None) => format!(
-                            "mapped over {over}, which produced {} rather than an array",
-                            expanded_over.unwrap_or("something else")
-                        ),
-                    };
-                    note(store.append_event(
-                        &run_id,
-                        Some(&name),
-                        EventLevel::Error,
-                        EventKind::OpFailed,
-                        &msg,
-                        Some(&json!({ "error": &msg })),
-                    ));
-                    if first_failure.is_none() {
-                        first_failure = Some((name.clone(), msg));
-                    }
-                    failed = true;
-                    statuses.insert(name.clone(), OpStatus::Failed);
-                    let reason = format!("skipped: upstream {name} failed");
-                    if !skip_downstream(
-                        &job,
-                        &pairs,
-                        &name,
-                        &reason,
-                        &mut pending,
-                        &mut statuses,
-                        &run_id,
-                        &store,
-                    )
-                    .await
-                    {
-                        unrecorded = true;
-                        break 'run;
-                    }
-                    continue;
                 };
                 // rows first, so a cancel or a skip has something to write to,
                 // exactly as a static op's row exists from the launch on
-                let mut created: Vec<String> = Vec::with_capacity(elements.len());
-                for (index, element) in elements.into_iter().enumerate() {
-                    let label = instance_label(op, index, &element);
-                    let instance = format!("{name}[{label}]");
-                    if !store
-                        .landed("create_op_run", || store.create_op_run(&run_id, &instance))
-                        .await
-                    {
-                        unrecorded = true;
-                        break 'run;
+                let mut created: Vec<String> = Vec::with_capacity(plan.instances);
+                let mut empty: Vec<String> = Vec::new();
+                for node in plan.nodes {
+                    let n = node.labels.len();
+                    if n == 0 {
+                        empty.push(node.name.clone());
                     }
-                    instances.insert(
-                        instance.clone(),
-                        Instance {
-                            parent: name.clone(),
-                            index,
-                            element,
+                    fanouts.insert(
+                        node.name.clone(),
+                        Fanout {
+                            into: node.into,
+                            labels: node.labels.clone(),
+                            slots: vec![None; n],
+                            remaining: n,
+                            failed: false,
                         },
                     );
-                    created.push(instance);
+                    let Some(elements) = node.elements else {
+                        continue;
+                    };
+                    for (index, (label, element)) in
+                        node.labels.into_iter().zip(elements).enumerate()
+                    {
+                        let instance = format!("{}[{label}]", node.name);
+                        if !store
+                            .landed("create_op_run", || store.create_op_run(&run_id, &instance))
+                            .await
+                        {
+                            unrecorded = true;
+                            break 'run;
+                        }
+                        instances.insert(
+                            instance.clone(),
+                            Instance {
+                                op: name.clone(),
+                                fanout: node.name.clone(),
+                                index,
+                                element,
+                            },
+                        );
+                        created.push(instance);
+                    }
                 }
                 note(store.append_event(
                     &run_id,
@@ -2439,23 +2501,16 @@ async fn execute_in_span(
                     &format!("expanded into {} instances over {over}", created.len()),
                     Some(&json!({ "instances": created.len(), "over": over })),
                 ));
+                // an empty array is a legal fan-out with nothing to wait on,
+                // and downstream runs normally on `[]` — at any level, so an
+                // outer element that yields none leaves an empty array inside
+                // the collected one rather than a gap
+                for unit in empty {
+                    deliver(unit, &mut fanouts, &mut outputs, &mut statuses);
+                }
                 if created.is_empty() {
-                    // nothing to wait on: an empty array is a legal fan-out,
-                    // and downstream runs normally on `[]`
-                    outputs.insert(name.clone(), json!([]));
-                    statuses.insert(name, OpStatus::Success);
                     continue;
                 }
-                let n = created.len();
-                fanouts.insert(
-                    name,
-                    Fanout {
-                        names: created.clone(),
-                        slots: vec![None; n],
-                        remaining: n,
-                        failed: false,
-                    },
-                );
                 // at `i`, so the instances settle in this same sweep
                 pending.splice(i..i, created);
             }
@@ -2743,10 +2798,13 @@ async fn execute_in_span(
                         break 'run;
                     }
                 };
-                match persisted {
+                // an instance whose output cannot be read back fails the
+                // fan-out it belongs to: its own row says what it did, and
+                // there is no honest array to hand downstream without it
+                let collected = match persisted {
                     Ok(handle) => {
-                        collect(
-                            name,
+                        let collected = collect(
+                            &name,
                             handle,
                             &runner.io,
                             &job,
@@ -2756,29 +2814,41 @@ async fn execute_in_span(
                             &mut outputs,
                             &mut statuses,
                         )
-                        .await
+                        .await;
+                        if let Err(msg) = &collected {
+                            note(store.append_event(
+                                &run_id,
+                                Some(&name),
+                                EventLevel::Error,
+                                EventKind::OpFailed,
+                                msg,
+                                Some(&json!({ "error": msg })),
+                            ));
+                        }
+                        collected.err()
                     }
-                    Err(msg) => {
-                        if first_failure.is_none() {
-                            first_failure = Some((name.clone(), msg));
-                        }
-                        failed = true;
-                        if !give_up(
-                            &name,
-                            &instances,
-                            &mut fanouts,
-                            &job,
-                            &pairs,
-                            &mut pending,
-                            &mut statuses,
-                            &run_id,
-                            &store,
-                        )
-                        .await
-                        {
-                            unrecorded = true;
-                            break 'run;
-                        }
+                    Err(msg) => Some(msg),
+                };
+                if let Some(msg) = collected {
+                    if first_failure.is_none() {
+                        first_failure = Some((name.clone(), msg));
+                    }
+                    failed = true;
+                    if !give_up(
+                        &name,
+                        &instances,
+                        &mut fanouts,
+                        &job,
+                        &pairs,
+                        &mut pending,
+                        &mut statuses,
+                        &run_id,
+                        &store,
+                    )
+                    .await
+                    {
+                        unrecorded = true;
+                        break 'run;
                     }
                 }
             }
@@ -3139,7 +3209,7 @@ fn invocation(held: serde_json::Map<String, Value>, deps: serde_json::Map<String
 // an instance runs its parent's op under its own name; everything else is
 // itself
 fn unit_op<'a>(job: &'a Job, instances: &HashMap<String, Instance>, name: &str) -> &'a Op {
-    let op = instances.get(name).map_or(name, |i| i.parent.as_str());
+    let op = instances.get(name).map_or(name, |i| i.op.as_str());
     job.op(op)
         .expect("every unit is an op of the job or an instance of one")
 }
@@ -3174,11 +3244,175 @@ fn admits(op: &Op, statuses: &HashMap<String, OpStatus>) -> Result<(), &'static 
     }
 }
 
-// an instance's output goes into its parent's slot; the mapped op's own
+/// what a mapped op is about to expand into: every fan-out it creates,
+/// outermost first, and how many op runs that comes to.
+struct Expansion {
+    nodes: Vec<Node>,
+    instances: usize,
+}
+
+/// one fan-out of a planned expansion: what it is called, the slot of the
+/// fan-out outside it that its collected value fills, and what its own slots
+/// hold — one instance's element each at the innermost level, a nested fan-out
+/// each above it.
+struct Node {
+    name: String,
+    into: Option<(String, usize)>,
+    labels: Vec<String>,
+    elements: Option<Vec<Value>>,
+}
+
+/// what `op` expands into over `over`'s value, or why it cannot.
+///
+/// a fan-out over a mapped op mirrors that op's own fan-out and adds a level
+/// inside it: one node per outer element, each expanding over what that outer
+/// instance produced. so an instance's labels are its element's coordinates,
+/// and the depth of its name is the depth of the nesting.
+///
+/// nothing is written here. the whole expansion is planned, counted and
+/// refused before a row of it exists, because a runaway found in the ui is a
+/// runaway that already happened.
+fn expansion(
+    job: &Job,
+    op: &Op,
+    name: &str,
+    over: &str,
+    value: Value,
+    fanouts: &HashMap<String, Fanout>,
+) -> Result<Expansion, String> {
+    let mut plan = Expansion {
+        nodes: Vec::new(),
+        instances: 0,
+    };
+    let depth = fanout_depth(job, over);
+    plan_node(op, over, fanouts, &mut plan, name, over, value, depth, None)?;
+    Ok(plan)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn plan_node(
+    op: &Op,
+    over: &str,
+    fanouts: &HashMap<String, Fanout>,
+    plan: &mut Expansion,
+    name: &str,
+    unit: &str,
+    value: Value,
+    depth: usize,
+    into: Option<(String, usize)>,
+) -> Result<(), String> {
+    let Value::Array(elements) = value else {
+        let what = json_type(&value);
+        return Err(match unit == over {
+            true => format!("mapped over {over}, which produced {what} rather than an array"),
+            false => format!(
+                "mapped over {over}, whose instance {unit} produced {what} rather than an array"
+            ),
+        });
+    };
+    // the labels the fan-out being mirrored gave its own elements, so an inner
+    // instance carries the outer one it belongs to. an index where there is no
+    // live fan-out to mirror, which is what a reused output leaves behind —
+    // and an op whose output can be reused is one that labels by index anyway
+    let mirrored = fanouts.get(unit);
+    let label_at = |i: usize| match mirrored.and_then(|f| f.labels.get(i)) {
+        Some(label) => label.clone(),
+        None => i.to_string(),
+    };
+    if depth > 0 {
+        let labels: Vec<String> = (0..elements.len()).map(label_at).collect();
+        plan.nodes.push(Node {
+            name: name.to_string(),
+            into,
+            labels: labels.clone(),
+            elements: None,
+        });
+        for (index, (label, element)) in labels.into_iter().zip(elements).enumerate() {
+            plan_node(
+                op,
+                over,
+                fanouts,
+                plan,
+                &format!("{name}[{label}]"),
+                &format!("{unit}[{label}]"),
+                element,
+                depth - 1,
+                Some((name.to_string(), index)),
+            )?;
+        }
+        return Ok(());
+    }
+    // every instance is a row of its own, so two elements that would be called
+    // the same thing are not an expansion at all — and a label carrying a
+    // bracket is a name nothing could read back
+    let mut labels: Vec<String> = Vec::with_capacity(elements.len());
+    let mut seen: HashSet<String> = HashSet::new();
+    for (index, element) in elements.iter().enumerate() {
+        let label = instance_label(op, index, element);
+        if label.contains('[') || label.contains(']') {
+            return Err(format!(
+                "expanded over {over}, which named the key {label:?}; an instance's label \
+                 carries no bracket, since that is what separates one level of a fan-out \
+                 from the next"
+            ));
+        }
+        if !seen.insert(label.clone()) {
+            return Err(format!(
+                "expanded over {over}, which named the key {label:?} twice"
+            ));
+        }
+        labels.push(label);
+    }
+    plan.instances += elements.len();
+    plan.nodes.push(Node {
+        name: name.to_string(),
+        into,
+        labels,
+        elements: Some(elements),
+    });
+    Ok(())
+}
+
+/// hand a finished fan-out's value on: to the slot of the fan-out outside it,
+/// or to the mapped op's own output at the outermost level, which is where
+/// downstream reads it. filling that slot can finish the fan-out outside in
+/// turn, so this walks out as far as it goes.
+fn deliver(
+    mut unit: String,
+    fanouts: &mut HashMap<String, Fanout>,
+    outputs: &mut HashMap<String, Value>,
+    statuses: &mut HashMap<String, OpStatus>,
+) {
+    loop {
+        let fan = fanouts.get_mut(&unit).expect("a live fan-out");
+        if fan.remaining != 0 || fan.failed {
+            return;
+        }
+        let collected = Value::Array(
+            std::mem::take(&mut fan.slots)
+                .into_iter()
+                .map(|slot| slot.expect("a finished fan-out filled every slot"))
+                .collect(),
+        );
+        let Some((outer, slot)) = fan.into.clone() else {
+            statuses.insert(unit.clone(), OpStatus::Success);
+            outputs.insert(unit, collected);
+            return;
+        };
+        let fan = fanouts
+            .get_mut(&outer)
+            .expect("a nested fan-out belongs to one");
+        fan.slots[slot] = Some(collected);
+        fan.remaining -= 1;
+        unit = outer;
+    }
+}
+
+// an instance's output goes into its fan-out's slot; the mapped op's own
 // output appears, in element order, once every instance has landed
 #[allow(clippy::too_many_arguments)]
 async fn collect(
-    name: String,
+    name: &str,
     handle: Value,
     io: &Io,
     job: &Job,
@@ -3187,47 +3421,31 @@ async fn collect(
     fanouts: &mut HashMap<String, Fanout>,
     outputs: &mut HashMap<String, Value>,
     statuses: &mut HashMap<String, OpStatus>,
-) {
-    statuses.insert(name.clone(), OpStatus::Success);
-    let Some(instance) = instances.get(&name) else {
-        outputs.insert(name, handle);
-        return;
+) -> Result<(), String> {
+    let Some(instance) = instances.get(name) else {
+        statuses.insert(name.to_string(), OpStatus::Success);
+        outputs.insert(name.to_string(), handle);
+        return Ok(());
     };
+    // the collected array is a value, not a handle: a mapped op has no row and
+    // never put anything of its own, so an instance's handle is resolved here
+    // rather than left for downstream to puzzle over. one that cannot be read
+    // makes the whole fan-out unusable, and saying so beats handing downstream
+    // an array with a hole in it
+    let named = job.op(&instance.op).and_then(Op::io_name);
+    let value = crate::io::get(io, named, io_key(run_id, job, name), handle)
+        .await
+        .map_err(|e| format!("could not read the output of {name}: {e}"))?;
+    statuses.insert(name.to_string(), OpStatus::Success);
+    let fanout = instance.fanout.clone();
+    let index = instance.index;
     let fan = fanouts
-        .get_mut(&instance.parent)
+        .get_mut(&fanout)
         .expect("an instance belongs to a live fan-out");
-    fan.slots[instance.index] = Some(handle);
+    fan.slots[index] = Some(value);
     fan.remaining -= 1;
-    if fan.remaining == 0 && !fan.failed {
-        // the collected array is a value, not a handle: a mapped op has no
-        // row and never put anything of its own, so the instances' handles
-        // are resolved here rather than left for downstream to puzzle over
-        let named = job.op(&instance.parent).and_then(Op::io_name);
-        let mut collected: Vec<Value> = Vec::with_capacity(fan.slots.len());
-        for (index, slot) in std::mem::take(&mut fan.slots).into_iter().enumerate() {
-            let handle = slot.expect("every instance filled its slot");
-            let op = fan.names[index].clone();
-            let key = IoKey {
-                run_id: run_id.to_string(),
-                job: job.name().to_string(),
-                op: op.clone(),
-            };
-            match crate::io::get(io, named, key, handle).await {
-                Ok(v) => collected.push(v),
-                Err(e) => {
-                    // the whole fan-out is unusable, and saying so beats
-                    // handing downstream an array with a hole in it
-                    tracing::warn!(
-                        run = %run_id, op = %op, "instance output unreadable: {e}"
-                    );
-                    fan.failed = true;
-                    return;
-                }
-            }
-        }
-        outputs.insert(instance.parent.clone(), Value::Array(collected));
-        statuses.insert(instance.parent.clone(), OpStatus::Success);
-    }
+    deliver(fanout, fanouts, outputs, statuses);
+    Ok(())
 }
 
 fn io_key(run_id: &str, job: &Job, op: &str) -> IoKey {
@@ -3249,9 +3467,11 @@ async fn resolve(io: &Io, job: &Job, run_id: &str, op: &str, held: Value) -> Res
         .map_err(|e| e.to_string())
 }
 
-// a failed unit skips its downstream. one failing instance fails its whole
-// mapped op — there is no partial array — and the siblings still in flight
-// run to the end, exactly as an op's siblings do
+// a failed unit skips its downstream. one failing instance fails the fan-out
+// it belongs to, and that one fails the fan-out outside it, out to the mapped
+// op — there is no partial array at any level. the siblings still in flight
+// run to the end, exactly as an op's siblings do, and so do the fan-outs
+// beside the failing one
 #[allow(clippy::too_many_arguments)]
 async fn give_up(
     name: &str,
@@ -3269,23 +3489,29 @@ async fn give_up(
         let reason = format!("skipped: upstream {name} failed");
         return skip_downstream(job, pairs, name, &reason, pending, statuses, run_id, store).await;
     };
-    let fan = fanouts
-        .get_mut(&instance.parent)
-        .expect("an instance belongs to a live fan-out");
-    fan.remaining -= 1;
-    // the first failure is what fails the mapped op and skips downstream;
-    // later ones just close a slot
-    if fan.failed {
-        return true;
+    let mut unit = instance.fanout.clone();
+    fanouts
+        .get_mut(&unit)
+        .expect("an instance belongs to a live fan-out")
+        .remaining -= 1;
+    // the first failure under a mapped op is what fails it and skips
+    // downstream; later ones just close a slot
+    loop {
+        let fan = fanouts
+            .get_mut(&unit)
+            .expect("a nested fan-out belongs to one");
+        if fan.failed {
+            return true;
+        }
+        fan.failed = true;
+        let Some((outer, _)) = fan.into.clone() else {
+            break;
+        };
+        unit = outer;
     }
-    fan.failed = true;
-    let parent = instance.parent.clone();
-    statuses.insert(parent.clone(), OpStatus::Failed);
-    let reason = format!("skipped: upstream {parent} failed");
-    skip_downstream(
-        job, pairs, &parent, &reason, pending, statuses, run_id, store,
-    )
-    .await
+    statuses.insert(unit.clone(), OpStatus::Failed);
+    let reason = format!("skipped: upstream {unit} failed");
+    skip_downstream(job, pairs, &unit, &reason, pending, statuses, run_id, store).await
 }
 
 async fn op_canceled(store: &Store, run_id: &str, name: &str) -> bool {
@@ -4829,6 +5055,131 @@ mod tests {
         assert_eq!(broken["each"], OpStatus::Failed);
         // and an op with no row at all is not something the run ran
         assert!(!broken.contains_key("list"));
+    }
+
+    // `op_runs` is keyed `(run_id, op)`, so an instance's name is the whole of
+    // what it leaves behind and everything that reads a row has to get the op
+    // and the element back out of it
+    #[test]
+    fn an_instance_name_reads_back_as_its_op_and_a_label_per_level() {
+        let job = Job::builder("fan")
+            .op(Op::new("keys", |_| async { Ok(json!(["a"])) }))
+            .op(Op::mapped("fetch", |_, _: String| async { Ok(json!([1])) }).over("keys"))
+            .op(Op::mapped("parse", |_, _: u32| async { Ok(json!(1)) }).over("fetch"))
+            .op(Op::new("keys[extra]", |_| async { Ok(json!(null)) }))
+            .build()
+            .unwrap();
+        let of = |name: &str| instance_of(&job, name);
+        let labels = |ls: &[&str]| ls.iter().map(|l| l.to_string()).collect::<Vec<_>>();
+
+        assert_eq!(of("fetch[0]"), Some(("fetch".into(), labels(&["0"]))));
+        assert_eq!(
+            of("parse[0][3]"),
+            Some(("parse".into(), labels(&["0", "3"])))
+        );
+        // an op that labels its instances by their element puts the element in
+        // the brackets, at whichever level it is on
+        assert_eq!(
+            of("parse[2026-01-05][3]"),
+            Some(("parse".into(), labels(&["2026-01-05", "3"])))
+        );
+        // `keys` is what a fan-out expands over rather than a fan-out, so a
+        // real op named after one of its would-be instances is an op name and
+        // nothing else
+        assert_eq!(of("keys[extra]"), None);
+        assert_eq!(of("keys"), None);
+        // and a name no expansion could have written is not one
+        assert_eq!(of("parse[0"), None);
+        assert_eq!(of("parse[0]x"), None);
+        assert_eq!(of("parse[a[b]"), None);
+    }
+
+    // a label carrying a bracket would make the name ambiguous the moment
+    // anything nested inside it, and an instance whose name nothing can read
+    // back is a row that leaves the run unreadable rather than one that costs
+    // a little clarity
+    #[tokio::test]
+    async fn an_instance_label_that_carries_a_bracket_fails_the_expansion() {
+        let job = Job::builder("labeled")
+            .op(Op::new("keys", |_| async { Ok(json!(["fine", "odd[1]"])) }))
+            .op(
+                Op::mapped("fetch", |_ctx, key: String| async move { Ok(json!(key)) })
+                    .fans_out_over("keys"),
+            )
+            .build()
+            .unwrap();
+        let runner = Runner::new([job], Store::open(":memory:").unwrap()).unwrap();
+        let run = runner
+            .run("labeled", json!({}), Trigger::Manual)
+            .await
+            .unwrap();
+
+        assert_eq!(run.status, RunStatus::Failed);
+        assert_eq!(
+            run.error.as_deref(),
+            Some(
+                "op fetch failed: expanded over keys, which named the key \"odd[1]\"; an \
+                 instance\'s label carries no bracket, since that is what separates one level \
+                 of a fan-out from the next"
+            )
+        );
+        // and the one label that was fine wrote no row either: an expansion
+        // lands whole or not at all
+        let rows = runner.store().op_runs(&run.id).unwrap();
+        let names: Vec<&str> = rows.iter().map(|r| r.op.as_str()).collect();
+        assert_eq!(names, ["keys"]);
+    }
+
+    // an op that names its instances by their element is how a partitioned
+    // asset reuses the fan-out machinery, and a fan-out inside one has to say
+    // which of those instances it belongs to — `probe[2026-01-05][0]` rather
+    // than an index nothing can be traced back through
+    #[tokio::test]
+    async fn a_nested_instance_carries_the_label_of_the_outer_one_it_belongs_to() {
+        let job = Job::builder("labeled")
+            .op(Op::new("days", |_| async {
+                Ok(json!(["2026-01-05", "2026-01-06"]))
+            }))
+            .op(Op::mapped("orders", |_ctx, day: String| async move {
+                Ok(json!([format!("{day}#1")]))
+            })
+            .fans_out_over("days"))
+            .op(Op::mapped(
+                "line",
+                |_ctx, order: String| async move { Ok(json!(order)) },
+            )
+            .over("orders"))
+            .op(Op::new("total", |ctx: OpCtx| async move {
+                Ok(ctx.input("line").cloned().unwrap())
+            })
+            .after(["line"]))
+            .build()
+            .unwrap();
+        let runner = Runner::new([job], Store::open(":memory:").unwrap()).unwrap();
+        let run = runner
+            .run("labeled", json!({}), Trigger::Manual)
+            .await
+            .unwrap();
+
+        assert_eq!(run.status, RunStatus::Success, "{:?}", run.error);
+        let rows = runner.store().op_runs(&run.id).unwrap();
+        let names: Vec<&str> = rows.iter().map(|r| r.op.as_str()).collect();
+        assert_eq!(
+            names,
+            [
+                "days",
+                "line[2026-01-05][0]",
+                "line[2026-01-06][0]",
+                "orders[2026-01-05]",
+                "orders[2026-01-06]",
+                "total",
+            ]
+        );
+        let total = rows.iter().find(|r| r.op == "total").unwrap();
+        assert_eq!(
+            total.output,
+            Some(json!([["2026-01-05#1"], ["2026-01-06#1"]]))
+        );
     }
 
     #[tokio::test]

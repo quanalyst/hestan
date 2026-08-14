@@ -2985,24 +2985,210 @@ fn a_mapped_op_must_say_what_it_maps_over() {
     );
 }
 
+// an instance is `{op}[{label}]` and that name is the whole record of it, so
+// an op called what an instance would be called is read as one — for the life
+// of the deployment, in the ui, in op stats and on a resume
 #[test]
-fn fan_out_does_not_nest() {
-    let err = Job::builder("nested")
+fn an_op_named_like_an_instance_of_a_mapped_op_is_refused() {
+    let err = Job::builder("collide")
         .op(Op::new("pages", |_| async { Ok(json!([])) }))
         .op(Op::mapped(
-            "outer",
+            "process",
             |_ctx: OpCtx, _n: u32| async move { Ok(json!(null)) },
         )
         .over("pages"))
-        .op(Op::mapped(
-            "inner",
-            |_ctx: OpCtx, _n: u32| async move { Ok(json!(null)) },
-        )
-        .over("outer"))
+        .op(Op::new("process[extra]", |_| async { Ok(json!(null)) }))
         .build()
         .err()
         .unwrap();
-    assert!(err.to_string().contains("fan-out does not nest"), "{err}");
+    assert!(
+        err.to_string()
+            .contains("is named what an instance of the mapped op process is named"),
+        "{err}"
+    );
+
+    // and `pages` is what a fan-out expands over rather than a fan-out, so an
+    // op named after one of its would-be instances is just an op
+    Job::builder("fine")
+        .op(Op::new("pages", |_| async { Ok(json!([])) }))
+        .op(Op::mapped(
+            "process",
+            |_ctx: OpCtx, _n: u32| async move { Ok(json!(null)) },
+        )
+        .over("pages"))
+        .op(Op::new("pages[extra]", |_| async { Ok(json!(null)) }))
+        .build()
+        .unwrap();
+}
+
+// one region per element, one site list per region, one probe per site. the
+// collected value keeps the shape it expanded in — flattened it would say
+// nothing about which region a reading came from, which is the only reason to
+// nest a fan-out at all
+fn nested_job(sites: fn(u32) -> Value) -> Job {
+    Job::builder("nested")
+        .op(Op::new("regions", |_| async { Ok(json!([2, 1])) }))
+        .op(
+            Op::mapped("sites", move |_ctx: OpCtx, region: u32| async move {
+                Ok(sites(region))
+            })
+            .over("regions"),
+        )
+        .op(Op::mapped("probe", |_ctx: OpCtx, site: u32| async move {
+            // the earlier the site, the longer it takes, so completion order
+            // is not element order at either level
+            tokio::time::sleep(Duration::from_millis(u64::from(60 - site))).await;
+            Ok(json!(site))
+        })
+        .over("sites"))
+        .op(Op::new("report", |ctx: OpCtx| async move {
+            Ok(ctx.input("probe").cloned().unwrap())
+        })
+        .after(["probe"]))
+        .build()
+        .unwrap()
+}
+
+#[tokio::test]
+async fn a_fan_out_inside_a_fan_out_collects_in_element_order_at_both_levels() {
+    let job = nested_job(|region| json!((0..=region).map(|i| region * 10 + i).collect::<Vec<_>>()));
+    let runner = Runner::new([job], Store::open(":memory:").unwrap()).unwrap();
+    let run = runner
+        .run("nested", json!({}), Trigger::Manual)
+        .await
+        .unwrap();
+
+    assert_eq!(run.status, RunStatus::Success, "{:?}", run.error);
+    let rows = runner.store().op_runs(&run.id).unwrap();
+    let names: Vec<&str> = rows.iter().map(|r| r.op.as_str()).collect();
+    // an inner instance carries the outer one it belongs to; neither mapped op
+    // has a row of its own
+    assert_eq!(
+        names,
+        [
+            "probe[0][0]",
+            "probe[0][1]",
+            "probe[0][2]",
+            "probe[1][0]",
+            "probe[1][1]",
+            "regions",
+            "report",
+            "sites[0]",
+            "sites[1]",
+        ]
+    );
+    assert_eq!(op_row(&rows, "probe[1][1]").output, Some(json!(11)));
+    // nested, not flattened: `[20, 21, 22, 10, 11]` would have lost the region
+    assert_eq!(
+        op_row(&rows, "report").output,
+        Some(json!([[20, 21, 22], [10, 11]]))
+    );
+}
+
+#[tokio::test]
+async fn a_failing_inner_instance_fails_the_fan_out_it_belongs_to_and_not_the_one_beside_it() {
+    let job = Job::builder("nested")
+        .op(Op::new("regions", |_| async { Ok(json!([2, 1])) }))
+        .op(Op::mapped("sites", |_ctx: OpCtx, region: u32| async move {
+            Ok(json!([region * 10, region * 10 + 1]))
+        })
+        .over("regions"))
+        .op(Op::mapped("probe", |_ctx: OpCtx, site: u32| async move {
+            match site {
+                11 => Err("site 11 is unreachable".into()),
+                _ => Ok(json!(site)),
+            }
+        })
+        .over("sites"))
+        .op(Op::new("report", |_| async { Ok(json!(null)) }).after(["probe"]))
+        .build()
+        .unwrap();
+    let runner = Runner::new([job], Store::open(":memory:").unwrap()).unwrap();
+    let run = runner
+        .run("nested", json!({}), Trigger::Manual)
+        .await
+        .unwrap();
+
+    assert_eq!(run.status, RunStatus::Failed);
+    assert_eq!(
+        run.error.as_deref(),
+        Some("op probe[1][1] failed: site 11 is unreachable")
+    );
+    let rows = runner.store().op_runs(&run.id).unwrap();
+    assert_eq!(op_row(&rows, "probe[1][1]").status, OpStatus::Failed);
+    // the sibling in its own fan-out and both of the fan-out beside it are
+    // ordinary tasks: a failure never cancels them
+    assert_eq!(op_row(&rows, "probe[1][0]").status, OpStatus::Success);
+    assert_eq!(op_row(&rows, "probe[0][0]").status, OpStatus::Success);
+    assert_eq!(op_row(&rows, "probe[0][1]").status, OpStatus::Success);
+    // and there is no partial array at either level
+    assert_eq!(op_row(&rows, "report").status, OpStatus::Skipped);
+}
+
+#[tokio::test]
+async fn an_outer_element_that_yields_nothing_makes_no_inner_instances() {
+    let job = nested_job(|region| match region {
+        1 => json!([]),
+        _ => json!([region * 10]),
+    });
+    let runner = Runner::new([job], Store::open(":memory:").unwrap()).unwrap();
+    let run = runner
+        .run("nested", json!({}), Trigger::Manual)
+        .await
+        .unwrap();
+
+    assert_eq!(run.status, RunStatus::Success, "{:?}", run.error);
+    let rows = runner.store().op_runs(&run.id).unwrap();
+    let names: Vec<&str> = rows.iter().map(|r| r.op.as_str()).collect();
+    assert_eq!(
+        names,
+        ["probe[0][0]", "regions", "report", "sites[0]", "sites[1]"]
+    );
+    // an empty fan-out inside one is an empty array in its place, not a gap
+    assert_eq!(op_row(&rows, "report").output, Some(json!([[20], []])));
+}
+
+#[tokio::test]
+async fn a_nested_instance_takes_its_element_and_retries_on_its_own() {
+    let calls = Arc::new(AtomicU32::new(0));
+    let counter = calls.clone();
+    let job = Job::builder("nested")
+        .op(Op::new("regions", |_| async { Ok(json!([2, 1])) }))
+        .op(Op::mapped("sites", |_ctx: OpCtx, region: u32| async move {
+            Ok(json!([region * 10, region * 10 + 1]))
+        })
+        .over("regions"))
+        .op(Op::mapped("probe", move |ctx: OpCtx, site: u32| {
+            let calls = counter.clone();
+            async move {
+                if site == 11 && calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                    return Err("flaky".into());
+                }
+                // the other deps are read whole, exactly as at one level
+                let regions = ctx.input("regions").cloned().unwrap();
+                Ok(json!({ "site": site, "regions": regions }))
+            }
+        })
+        .over("sites")
+        .after(["regions"])
+        .retries(1)
+        .retry_delay(Duration::from_millis(10)))
+        .build()
+        .unwrap();
+    let runner = Runner::new([job], Store::open(":memory:").unwrap()).unwrap();
+    let run = runner
+        .run("nested", json!({}), Trigger::Manual)
+        .await
+        .unwrap();
+
+    assert_eq!(run.status, RunStatus::Success, "{:?}", run.error);
+    let rows = runner.store().op_runs(&run.id).unwrap();
+    assert_eq!(op_row(&rows, "probe[1][0]").attempts, 1);
+    assert_eq!(op_row(&rows, "probe[1][1]").attempts, 2);
+    assert_eq!(
+        op_row(&rows, "probe[0][1]").output,
+        Some(json!({ "site": 21, "regions": [2, 1] }))
+    );
 }
 
 #[tokio::test]
