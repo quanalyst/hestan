@@ -67,6 +67,9 @@ libc = "0.2"
 
 [dev-dependencies]
 tempfile = "3"
+# the rate suite drives a paused clock, so what a waiter did is asserted by the
+# instant it did it at rather than by how long the test took on a busy machine
+tokio = { version = "1", features = ["test-util"] }
 # the worked example in `Hestan::resource` connects to a real postgres, and it
 # is a doctest rather than a snippet — so the client it calls has to be here
 # whether or not the `postgres` feature is on. hestan does not wrap it: that is

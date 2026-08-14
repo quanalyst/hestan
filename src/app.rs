@@ -63,6 +63,7 @@ pub struct Hestan {
     sensors: Vec<Sensor>,
     run_sensors: Vec<RunStatusSensor>,
     pools: Vec<(String, usize)>,
+    rates: Vec<(String, usize, Duration)>,
     resources: Vec<(String, ResourceFn)>,
     io_default: Option<Arc<dyn IoManager>>,
     io_named: HashMap<String, Arc<dyn IoManager>>,
@@ -102,6 +103,7 @@ impl Default for Hestan {
             sensors: Vec::new(),
             run_sensors: Vec::new(),
             pools: Vec::new(),
+            rates: Vec::new(),
             resources: Vec::new(),
             io_default: None,
             io_named: HashMap::new(),
@@ -200,6 +202,39 @@ impl Hestan {
     /// [`Error::Graph`]. a limit below 1 means 1.
     pub fn pool(mut self, name: impl Into<String>, limit: usize) -> Self {
         self.pools.push((name.into(), limit));
+        self
+    }
+
+    /// declare a named rate: `limit` calls per `per`, shared by every job in
+    /// this process, taken one at a time by an op that names it via
+    /// [`Op::rate`](crate::Op::rate).
+    ///
+    /// ```no_run
+    /// # use hestan::Hestan;
+    /// # use std::time::Duration;
+    /// Hestan::new().rate("eia_api", 5, Duration::from_secs(1));
+    /// ```
+    ///
+    /// this is the limit most external systems actually publish — "5 requests
+    /// a second", "1000 an hour" — and the one a [`pool`](Self::pool) can only
+    /// approximate, since three calls at a time is a rate only if you know how
+    /// long each one takes. the two compose: a pool caps how many are in
+    /// flight, a rate how often one starts.
+    ///
+    /// it is a **token bucket**, so `limit` may go at once and the bucket then
+    /// refills at `limit` per `per` — a burst and then quiet, which is what an
+    /// api that publishes a per-second limit generally tolerates. a token is
+    /// spent rather than held: there is nothing to give back when the op ends.
+    ///
+    /// stackable; declaring the same name twice, or naming an undeclared rate
+    /// from an op, fails the build with [`Error::Graph`]. a limit below 1 means
+    /// 1.
+    ///
+    /// **the bucket is this process's.** two workers each honouring 5 a second
+    /// send ten, and the system being protected sees ten — `docs/scaling.md`
+    /// has what that means for a deployment with more than one of them.
+    pub fn rate(mut self, name: impl Into<String>, limit: usize, per: Duration) -> Self {
+        self.rates.push((name.into(), limit, per));
         self
     }
 
@@ -1194,6 +1229,7 @@ impl Hestan {
         let io = Io::new(self.io_default, self.io_named);
         let mut runner =
             Runner::with_resources(jobs, store, self.hooks, self.pools, resources, io)?
+                .with_rates(self.rates)?
                 .with_hooks(self.run_hooks, self.op_hooks)
                 .with_run_tags(self.run_tags)
                 .with_limits(self.limits, self.priority)
@@ -1356,6 +1392,67 @@ mod tests {
         let run = Hestan::new()
             .job(pooled("pull"))
             .pool("api", 2)
+            .db(":memory:")
+            .run_once("pull", json!({}))
+            .await
+            .unwrap();
+        assert_eq!(run.status, RunStatus::Success);
+    }
+
+    fn throttled(job: &str) -> Job {
+        Job::builder(job)
+            .op(Op::new("call", |_| async { Ok(serde_json::json!(null)) }).rate("api"))
+            .build()
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_rate_must_be_declared_before_an_op_takes_from_it() {
+        let err = Hestan::new()
+            .job(throttled("pull"))
+            .db(":memory:")
+            .run_once("pull", json!({}))
+            .await
+            .err()
+            .unwrap();
+        assert!(matches!(err, Error::Graph(_)), "{err}");
+        assert!(err.to_string().contains("not declared"), "{err}");
+
+        let err = Hestan::new()
+            .job(throttled("pull"))
+            .rate("api", 2, Duration::from_secs(1))
+            .rate("api", 3, Duration::from_secs(1))
+            .db(":memory:")
+            .run_once("pull", json!({}))
+            .await
+            .err()
+            .unwrap();
+        assert!(err.to_string().contains("declared twice"), "{err}");
+
+        let run = Hestan::new()
+            .job(throttled("pull"))
+            .rate("api", 2, Duration::from_secs(1))
+            .db(":memory:")
+            .run_once("pull", json!({}))
+            .await
+            .unwrap();
+        assert_eq!(run.status, RunStatus::Success);
+    }
+
+    // a name is a pool's or a rate's, never both, and an op may hold one of
+    // each: the two limits are about different things
+    #[tokio::test]
+    async fn an_op_can_take_a_pool_permit_and_a_rate_token_at_once() {
+        let job = Job::builder("pull")
+            .op(Op::new("call", |_| async { Ok(json!(null)) })
+                .pool("api")
+                .rate("api"))
+            .build()
+            .unwrap();
+        let run = Hestan::new()
+            .job(job)
+            .pool("api", 2)
+            .rate("api", 2, Duration::from_secs(1))
             .db(":memory:")
             .run_once("pull", json!({}))
             .await

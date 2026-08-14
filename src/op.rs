@@ -593,6 +593,7 @@ pub struct Op {
     retry: Retry,
     timeout: Option<Duration>,
     pool: Option<String>,
+    rate: Option<String>,
     // run the body in a child process rather than in this one, from
     // `isolated`. the runtime's test for one.
     isolated: bool,
@@ -645,6 +646,7 @@ impl Op {
             retry: DEFAULT_BACKOFF,
             timeout: None,
             pool: None,
+            rate: None,
             isolated: false,
             memory_limit: None,
             cpu_limit: None,
@@ -682,6 +684,7 @@ impl Op {
             retry: DEFAULT_BACKOFF,
             timeout: None,
             pool: None,
+            rate: None,
             isolated: false,
             memory_limit: None,
             cpu_limit: None,
@@ -935,7 +938,8 @@ impl Op {
     /// is dropped at its next await point; blocking work only stops if it
     /// polls that flag — see the cancellation section of the concepts doc.
     /// the clock starts once the op is running, so waiting for a
-    /// [`pool`](Self::pool) permit never counts against it.
+    /// [`pool`](Self::pool) permit or a [`rate`](Self::rate) token never counts
+    /// against it.
     pub fn timeout(mut self, d: Duration) -> Op {
         self.timeout = Some(d);
         self
@@ -958,6 +962,31 @@ impl Op {
     /// stops holds its permit until the process does.
     pub fn pool(mut self, name: impl Into<String>) -> Op {
         self.pool = Some(name.into());
+        self
+    }
+
+    /// take a token from the process-wide rate `name` before running. rates are
+    /// declared with `Hestan::rate` and shared by every job in the process, so
+    /// they cap what a pool cannot: how *often* something is called, rather
+    /// than how many calls are in flight. naming an undeclared rate fails the
+    /// build.
+    ///
+    /// a token is **spent, not returned**. that is the whole difference from a
+    /// [`pool`](Self::pool): a permit comes back when the work ends, and there
+    /// is nothing here to give back and nothing to hold — the op has had its
+    /// call and the bucket refills on its own clock. an op that takes both
+    /// waits for a permit and then for a token, and holds only the permit.
+    ///
+    /// the token is per attempt, because a retry is another call. waiting for
+    /// one is asynchronous and does not count against
+    /// [`timeout`](Self::timeout), and a canceled run's op stops waiting rather
+    /// than taking a token on its way out.
+    ///
+    /// **a bucket lives in one process.** two workers each honouring "5 a
+    /// second" send ten, and the api sees ten — see the rates section of the
+    /// concepts doc, and `docs/scaling.md`.
+    pub fn rate(mut self, name: impl Into<String>) -> Op {
+        self.rate = Some(name.into());
         self
     }
 
@@ -1143,6 +1172,11 @@ impl Op {
         self.pool.as_deref()
     }
 
+    /// the rate this op takes a token from, from [`rate`](Self::rate).
+    pub fn rate_name(&self) -> Option<&str> {
+        self.rate.as_deref()
+    }
+
     /// whether this op's body runs in a child process, from
     /// [`isolated`](Self::isolated).
     pub fn is_isolated(&self) -> bool {
@@ -1222,6 +1256,7 @@ impl fmt::Debug for Op {
             .field("retry", &self.retry)
             .field("timeout", &self.timeout)
             .field("pool", &self.pool)
+            .field("rate", &self.rate)
             .field("isolated", &self.isolated)
             .field("memory_limit", &self.memory_limit)
             .field("cpu_limit", &self.cpu_limit)

@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use hestan::prelude::*;
 use hestan::{
@@ -2176,6 +2176,149 @@ async fn an_undeclared_pool_is_refused() {
     assert!(err.to_string().contains("declared twice"), "{err}");
 
     // a runner assembled without pools at all must not quietly run unlimited
+    let runner = Runner::new([job()], Store::open(":memory:").unwrap()).unwrap();
+    let run = runner
+        .run("pull", json!({}), Trigger::Manual)
+        .await
+        .unwrap();
+    assert_eq!(run.status, RunStatus::Failed);
+    let op = &runner.store().op_runs(&run.id).unwrap()[0];
+    assert!(
+        op.error.as_deref().unwrap_or_default().contains("api"),
+        "{:?}",
+        op.error
+    );
+}
+
+/// a job of `ops` calls that each record when they were let through, all of
+/// them ready at once so the limit is the only thing spacing them.
+fn throttled_job(name: &str, ops: usize, at: &Arc<Mutex<Vec<Instant>>>) -> Job {
+    let mut builder = Job::builder(name);
+    for i in 0..ops {
+        let at = at.clone();
+        builder = builder.op(Op::new(format!("call{i}"), move |_| {
+            let at = at.clone();
+            async move {
+                at.lock().unwrap().push(Instant::now());
+                Ok(json!(null))
+            }
+        })
+        .rate("api"));
+    }
+    builder.build().unwrap()
+}
+
+// a pool caps how many calls are in flight, which is a rate only if you know
+// how long each one takes. this is the limit the api publishes.
+#[tokio::test]
+async fn a_rate_lets_a_burst_through_and_spaces_out_the_rest() {
+    let at: Arc<Mutex<Vec<Instant>>> = Arc::new(Mutex::new(Vec::new()));
+    // two per 200ms: one token every 100ms once the burst is gone
+    let runner = Runner::new(
+        [throttled_job("pull", 6, &at)],
+        Store::open(":memory:").unwrap(),
+    )
+    .unwrap()
+    .with_rates([("api".to_string(), 2, Duration::from_millis(200))])
+    .unwrap();
+
+    let started = Instant::now();
+    let run = runner
+        .run("pull", json!({}), Trigger::Manual)
+        .await
+        .unwrap();
+    assert_eq!(run.status, RunStatus::Success);
+
+    let at = at.lock().unwrap().clone();
+    assert_eq!(at.len(), 6, "not every op ran");
+    // four of them had to wait for a token, which is four spacings — a lower
+    // bound, because a busy machine can only make a run take longer
+    assert!(
+        started.elapsed() >= Duration::from_millis(400),
+        "six calls at two per 200ms took {:?}",
+        started.elapsed()
+    );
+    // and they were let through in order rather than in a clump at the end
+    assert!(at.windows(2).all(|w| w[0] <= w[1]));
+}
+
+// the two limits are about different things, and an op that declares both
+// answers to both
+#[tokio::test]
+async fn an_op_that_takes_a_permit_and_a_token_waits_for_both() {
+    let gauge = Arc::new(AtomicU32::new(0));
+    let peak = Arc::new(AtomicU32::new(0));
+    let mut builder = Job::builder("pull");
+    for i in 0..4 {
+        let (gauge, peak) = (gauge.clone(), peak.clone());
+        builder = builder.op(Op::new(format!("call{i}"), move |_| {
+            let (gauge, peak) = (gauge.clone(), peak.clone());
+            async move {
+                let now = gauge.fetch_add(1, Ordering::SeqCst) + 1;
+                peak.fetch_max(now, Ordering::SeqCst);
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                gauge.fetch_sub(1, Ordering::SeqCst);
+                Ok(json!(null))
+            }
+        })
+        .pool("api")
+        .rate("api"));
+    }
+    let runner = Runner::with_pools(
+        [builder.build().unwrap()],
+        Store::open(":memory:").unwrap(),
+        vec![],
+        [("api".to_string(), 1)],
+    )
+    .unwrap()
+    .with_rates([("api".to_string(), 2, Duration::from_millis(400))])
+    .unwrap();
+
+    let started = Instant::now();
+    let run = runner
+        .run("pull", json!({}), Trigger::Manual)
+        .await
+        .unwrap();
+    assert_eq!(run.status, RunStatus::Success);
+    // the pool: never two calls at once
+    assert_eq!(peak.load(Ordering::SeqCst), 1);
+    // the rate: the third and fourth waited 200ms and 400ms for a token, which
+    // forty milliseconds of work through a pool of one would never have taken
+    assert!(
+        started.elapsed() >= Duration::from_millis(400),
+        "the rate did not bind: {:?}",
+        started.elapsed()
+    );
+}
+
+#[tokio::test]
+async fn an_undeclared_rate_is_refused() {
+    let job = || {
+        Job::builder("pull")
+            .op(Op::new("call", |_| async { Ok(json!(null)) }).rate("api"))
+            .build()
+            .unwrap()
+    };
+    let err = Runner::new([job()], Store::open(":memory:").unwrap())
+        .unwrap()
+        .with_rates([])
+        .err()
+        .unwrap();
+    assert!(matches!(err, Error::Graph(_)), "{err}");
+    assert!(err.to_string().contains("not declared"), "{err}");
+
+    let err = Runner::new([job()], Store::open(":memory:").unwrap())
+        .unwrap()
+        .with_rates([
+            ("api".to_string(), 1, Duration::from_secs(1)),
+            ("api".to_string(), 3, Duration::from_secs(1)),
+        ])
+        .err()
+        .unwrap();
+    assert!(err.to_string().contains("declared twice"), "{err}");
+
+    // and a runner assembled without rates at all must not quietly run
+    // unthrottled, exactly as it must not run an undeclared pool unlimited
     let runner = Runner::new([job()], Store::open(":memory:").unwrap()).unwrap();
     let run = runner
         .run("pull", json!({}), Trigger::Manual)

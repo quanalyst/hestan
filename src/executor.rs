@@ -20,6 +20,7 @@ use crate::model::{
     new_run_id,
 };
 use crate::op::{self, Cancel, MetaBuf, Op, OpCtx};
+use crate::rate::{Rate, RateStatus, Rates, Ticket};
 use crate::resource::{self, Resources};
 use crate::store::{Built, RunKey, Store, note};
 
@@ -430,6 +431,7 @@ pub struct Runner {
     // registered for itself
     hooks: Arc<Hooks>,
     pools: Pools,
+    rates: Rates,
     resources: Resources,
     io: Io,
     // tags every run this runner launches carries, under whatever the launch
@@ -515,6 +517,7 @@ impl Runner {
                 op: Vec::new(),
             }),
             pools: Arc::new(HashMap::new()),
+            rates: Arc::new(HashMap::new()),
             resources: resource::none(),
             io: Io::default(),
             run_tags: Arc::new(RunTags::new()),
@@ -779,6 +782,49 @@ impl Runner {
         })
     }
 
+    /// declare the named rates this runner's ops take tokens from, each a
+    /// `(name, limit, per)` shared by every job it owns — `Hestan::rate` is the
+    /// way in.
+    ///
+    /// an op naming a rate that isn't declared here is [`Error::Graph`], as is
+    /// declaring the same rate twice; a limit below 1 means 1. the same
+    /// bargain a pool makes, for the same reason: a limit you named and did not
+    /// get is a build mistake rather than a 3am one.
+    ///
+    /// a runner assembled without this has no rates at all, so an op that names
+    /// one fails at run time — the pools have the same shape.
+    pub fn with_rates(
+        self,
+        rates: impl IntoIterator<Item = (String, usize, Duration)>,
+    ) -> Result<Runner, Error> {
+        let mut declared: HashMap<String, Rate> = HashMap::new();
+        for (name, limit, per) in rates {
+            if declared.contains_key(&name) {
+                return Err(Error::Graph(format!("rate {name} is declared twice")));
+            }
+            declared.insert(name, Rate::new(limit.max(1), per));
+        }
+        // every op that names a rate must find it, or the limit it was written
+        // to respect would silently not exist
+        for job in self.jobs.values() {
+            for op in job.ops() {
+                if let Some(rate) = op.rate_name()
+                    && !declared.contains_key(rate)
+                {
+                    return Err(Error::Graph(format!(
+                        "job {}: op {} takes from rate {rate}, which is not declared",
+                        job.name(),
+                        op.name()
+                    )));
+                }
+            }
+        }
+        Ok(Runner {
+            rates: Arc::new(declared),
+            ..self
+        })
+    }
+
     /// the resources this runner hands its ops: names and declared types,
     /// sorted, never values.
     pub fn resources(&self) -> Vec<(&str, &'static str)> {
@@ -813,6 +859,31 @@ impl Runner {
     /// the limit declared for `name`, for reporting it back.
     pub fn pool_limit(&self, name: &str) -> Option<usize> {
         self.pools.get(name).map(|p| p.limit)
+    }
+
+    /// every declared rate and what it is doing, by name.
+    ///
+    /// `waiting` is a live count of the ops sitting on this process's bucket,
+    /// which is what makes an op that is queued for a token readable as queued
+    /// — and it is **this process's** count, because the bucket is.
+    pub fn rates(&self) -> Vec<RateStatus> {
+        let mut all: Vec<RateStatus> = self
+            .rates
+            .iter()
+            .map(|(name, rate)| RateStatus {
+                name: name.clone(),
+                limit: rate.limit(),
+                per: rate.per(),
+                waiting: rate.waiting(),
+            })
+            .collect();
+        all.sort_by(|a, b| a.name.cmp(&b.name));
+        all
+    }
+
+    /// what `name` was declared as, for reporting it back.
+    pub fn rate_limit(&self, name: &str) -> Option<(usize, Duration)> {
+        self.rates.get(name).map(|r| (r.limit(), r.per()))
     }
 
     /// the same runner, launching and cancelling **as** somebody.
@@ -2449,6 +2520,7 @@ async fn execute_in_span(
                     runner.resources.clone(),
                     store.clone(),
                     runner.pools.clone(),
+                    runner.rates.clone(),
                     op_hooks.clone(),
                     cancel.clone(),
                     run_span.clone(),
@@ -3230,6 +3302,7 @@ async fn run_op(
     resources: Resources,
     store: Store,
     pools: Pools,
+    rates: Rates,
     hooks: Arc<Vec<OpHook>>,
     cancel: watch::Receiver<bool>,
     // the run this op belongs to, as a span. every attempt opens a child of it,
@@ -3282,6 +3355,26 @@ async fn run_op(
             }
         },
     };
+    // and a rate, refused at build for the same reason: an op running at
+    // whatever speed it likes is the api's problem rather than hestan's
+    let rate = match op.rate_name() {
+        None => None,
+        Some(rate) => match rates.get(rate) {
+            Some(r) => Some((rate, r)),
+            None => {
+                let msg = format!("op takes from rate {rate}, which is not declared");
+                note(store.append_event(
+                    &run_id,
+                    Some(&name),
+                    EventLevel::Error,
+                    EventKind::OpFailed,
+                    &msg,
+                    Some(&json!({ "error": &msg })),
+                ));
+                return (name, Outcome::Failed(msg));
+            }
+        },
+    };
     loop {
         // one span per attempt, and a retry gets its own rather than a second
         // annotation on the first: two attempts of an op are two spans of
@@ -3307,8 +3400,8 @@ async fn run_op(
         let (expired, on_expiry) = watch::channel(false);
         // this attempt's own start, which on a retry is later than the one on
         // the op run row: that column keeps the first attempt's. before the
-        // pool, so an attempt that queued for a slot reports how long it
-        // really took to get anywhere
+        // pool and the rate, so an attempt that queued for either reports how
+        // long it really took to get anywhere
         let began = Utc::now();
         // admitted before anything of the attempt runs, and handed to the ctx
         // rather than kept on this stack: an abort takes the stack and leaves
@@ -3336,6 +3429,17 @@ async fn run_op(
                 }
             })),
         };
+        // the token after the permit, and nothing between the token and the
+        // body: a token is spent when it is taken, so taking it last is what
+        // keeps "a token was spent" and "a call was made" the same moment. an
+        // op that holds a permit while it waits for one is holding a slot that
+        // nothing else could have used anyway — a pool and a rate on the same
+        // op are two limits on the same api
+        if let Some((_, rate)) = rate
+            && let Ticket::Waiting(reserved) = rate.take()
+        {
+            reserved.spend().await;
+        }
         let ctx = OpCtx {
             cancel: Cancel {
                 run: cancel.clone(),

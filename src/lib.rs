@@ -122,6 +122,9 @@ mod op;
 #[cfg_attr(docsrs, doc(cfg(feature = "otel")))]
 pub mod otel;
 mod partition;
+// a declared rate and the bucket behind it, beside the pools in the executor:
+// the limit that is n calls per period rather than n at once
+mod rate;
 // a shared run log on a postgres server. optional because sqlite is the right
 // default for one process and needs no server at all
 #[cfg(feature = "postgres")]
@@ -164,6 +167,7 @@ pub use model::{
 };
 pub use op::{InputError, META_TABLE_ROWS, Meta, MetaColumn, MetaTable, Op, OpCtx, OpResult};
 pub use partition::Partitions;
+pub use rate::RateStatus;
 pub use resource::ResourceCtx;
 pub use retention::Retention;
 pub use schedule::Schedule;
