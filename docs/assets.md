@@ -241,6 +241,14 @@ POST /api/assets/daily_orders/build  {"partitions": ["2026-01-05"]}
 a key the asset's set does not hold is a 400, as is naming partitions on an
 asset that has none.
 
+naming keys outright goes past `build_limit` deliberately, but not past
+[`Hestan::max_instances`](concepts.md#the-ceiling) — the ceiling on what one
+run may expand to, 1000 by default. a build naming more keys than that fails at
+the expansion saying so, before it writes a row; chunk it into backfills, or
+raise the ceiling if the deployment means it. partitioned assets are one level
+of fan-out and always have been: a partitioned asset expands over its own key
+set rather than over an upstream asset, so nothing here nests.
+
 ### Identity mapping only
 
 dependencies between partitioned assets take **the same key**, and nothing

@@ -735,6 +735,19 @@ impl Op {
     /// })
     /// .over("pages");
     /// ```
+    ///
+    /// `over` may name a mapped op, which fans this one out inside that one:
+    /// each of its instances produces an array of its own, this op runs once
+    /// per element of each, and the instances are named `{op}[{outer}][{i}]`.
+    /// the collected output keeps that shape — an array per outer element —
+    /// rather than one flat list, since which outer element a value came from
+    /// is the only reason to nest.
+    ///
+    /// nesting multiplies, and forty elements each yielding forty is sixteen
+    /// hundred op runs from two lines that each looked small. flattening in
+    /// the outer op is usually the better shape, and
+    /// [`Hestan::max_instances`](crate::Hestan::max_instances) is the ceiling
+    /// a run expands under either way.
     pub fn mapped<T, O, F, Fut>(name: impl Into<String>, f: F) -> Op
     where
         T: DeserializeOwned + Send + 'static,

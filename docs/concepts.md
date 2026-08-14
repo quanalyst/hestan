@@ -790,18 +790,87 @@ n = 0 is legal and load-bearing: no instances, output `[]`, downstream runs
 normally on an empty array. that is the difference between "nothing to do"
 and "something went wrong", and a fan-out over a filtered list needs it.
 
+### A fan-out inside a fan-out
+
+`.over` may name a mapped op. each of that op's instances then produces an
+array of its own, and this op runs once per element of each:
+
+```rust
+Op::new("regions", |_| async { Ok(json!(["north", "south"])) })
+Op::mapped("sites", |_ctx: OpCtx, region: String| async move {
+    Ok(json!(sites_in(&region)))       // one array per region
+})
+.over("regions")
+Op::mapped("probe", |_ctx: OpCtx, site: String| async move {
+    Ok(json!(probe(&site)))            // one instance per site of each region
+})
+.over("sites")
+```
+
+instances carry one `[label]` per level of fan-out they sit inside, outermost
+first: `sites[0]` and `sites[1]`, then `probe[0][0]`, `probe[0][1]`,
+`probe[1][0]`, … so an inner instance names the outer one it belongs to, and
+`op_runs` still has a unique row per instance. that is the whole naming rule,
+and it goes as deep as the nesting does. a label never holds a bracket — one
+that would is refused at the expansion — so the name reads back as an op and
+its coordinates without ambiguity. an op named like one of those instances,
+`probe[0]` in a job that also has a mapped `probe`, fails the build rather
+than spending the deployment's life being read as an instance.
+
+the collected output keeps the **shape**: `probe`'s value downstream is one
+array per outer element — `[["north-a", "north-b"], ["south-a"]]` — not one
+flat list. flattening would lose which region a reading came from, and that is
+the only reason to nest a fan-out rather than flatten in the outer op. an outer
+element yielding `[]` contributes an empty array in its place, not a gap.
+
+everything an instance already inherits works at every level: pools, rates,
+limits, retries, [rules](#rules-and-fan-out), timeouts and cancellation apply
+per instance with no special cases. failure works the same way one level down —
+`probe[1][1]` failing fails `probe`, skips its downstream, and leaves the
+instances under `probe[0]` running to the end.
+
+**flattening in the outer op is usually the better design.** nesting
+multiplies: forty regions each yielding forty sites is sixteen hundred op runs
+from two lines that each looked small, and every one of them is a row, a span
+in the gantt and a value held in memory until the fan-out collects. reach for
+it when the shape genuinely matters downstream, and reach for one `Vec` built
+in the outer op when it does not.
+
+### The ceiling
+
+`Hestan::max_instances(n)` is the most op runs one run may expand its fan-outs
+into, across every level of them; the default is 1000. a run about to go past
+it fails at the expansion:
+
+```
+op probe expands over sites into 1600 instances, one for each of its 1600
+elements; with the 40 this run has already made that is past the ceiling of
+1000 op runs one run may expand to.
+```
+
+the check is made **before** any of the rows are written, which is the point:
+a runaway found by counting op rows in the ui is a runaway that already
+happened. the budget belongs to the run rather than to any one op, since what
+a nesting multiplies is the run — ten fan-outs of a hundred cost the same
+thousand rows as one of a thousand.
+
+a thousand is thirty times what a [partitioned build](assets.md) launches by
+default and far more than any hand-written fan-out, so a job that means it
+never meets this. raise it for a deployment that genuinely fans out wider — a
+build naming thousands of partitions by hand is the usual one — and prefer
+flattening to raising it much.
+
 ### Limits
 
-fan-out does not nest: a mapped op may not be `.over` another mapped op, and
-saying so fails the build (`fan-out does not nest`). so does a mapped op
-without `.over`, and `.over` on an op that isn't mapped. instances are not
-themselves mappable for the same reason — one level, deliberately, because
-the second level has no honest name for its rows.
+a mapped op without `.over` fails the build, and so does `.over` on an op that
+isn't mapped.
 
 instance names are op names everywhere else in the system, which is what makes
 them free: `ctx.set_state` from an instance writes state keyed
-`(job, "fetch_page[3]")`, and op stats aggregate per static op, so a mapped op
-shows no history of its own.
+`(job, "fetch_page[3]")`, an io manager writes its value to a file of that
+name, and op stats aggregate per static op — at every level, so
+`probe[1][1]`'s history is `probe`'s — which is why a mapped op shows no
+history of its own.
 
 ### Resume across a mapped op
 
@@ -813,6 +882,14 @@ recorded output. anything less and the whole mapped op re-expands from its
 dep, instances and all, with its downstream. a mapped op that expanded over an
 empty array leaves no rows at all, and so is indistinguishable from one that
 never ran: it re-expands too, which costs nothing.
+
+nesting reads the same way one level in. the reassembled value keeps its shape,
+so a resume past `probe` seeds the array-per-region it collected; and the rule
+applies at every level, so an outer element whose inner fan-out was empty is
+the same gap as a mapped op with no rows, and the whole of `probe` expands
+again. an inner fan-out re-expanding over an outer one that *was* reused works
+from the seeded value: the shape is in the value, and the labels of an op whose
+output can be reused are its indices.
 
 ## launch() vs run()
 

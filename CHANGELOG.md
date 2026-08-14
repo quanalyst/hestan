@@ -2,6 +2,76 @@
 
 ## unreleased
 
+a fan-out may expand inside a fan-out, under a ceiling on what one run may
+expand to.
+
+**breaking**: no signature moved, but two jobs that used to build now do not,
+and one that used to be refused now builds. an op named what an instance of a
+mapped op of the same job is named — `probe[0]` beside a mapped `probe` — is
+`Error::Graph` at build rather than a row misread as an instance for the life
+of the deployment; and a run whose fan-outs expand into more than 1000 op runs
+fails at the expansion rather than writing them, which `Hestan::max_instances`
+raises. `.over` naming a mapped op is no longer refused.
+
+- **a mapped op may map over a mapped op.** each of the outer op's instances
+  produces an array of its own, and the inner op runs once per element of each:
+  a region list, a site list per region, a probe per site, written as three ops
+  and no plumbing. what it was before was a build error — `fan-out does not
+  nest`, refused because the second level had no honest name for its rows —
+  and the reason it was refused is what this phase went and fixed
+- **the name is the fix.** an instance carries one `[label]` per level of
+  fan-out it sits inside, outermost first: `sites[1]`, then `probe[1][0]`. it
+  round-trips because a label can hold neither bracket — an expansion that
+  would write one is refused, naming the key — so the parse is "the op is
+  everything before the first `[`, the coordinates are the groups after it",
+  at any depth. `op_runs` is keyed `(run_id, op)` and every instance name is
+  distinct within a run by construction, since sibling labels are already
+  checked for repeats and every level's prefix differs
+- **it cannot collide with an op somebody named by hand**, because that is now
+  refused at build. an op whose name splits at the first `[` onto a mapped op
+  of the same job is `Error::Graph` — which is exactly the case a previous
+  phase found and could only work around: `keys[extra]` beside a mapped `keys`
+  read as an instance of it, in op stats, in the ui, in a resume. `keys[extra]`
+  beside a *non-mapped* `keys` still builds and is still an op name and nothing
+  else, since what a fan-out expands over is not a fan-out
+- **collection is nested, not flattened.** an op downstream of the inner
+  fan-out gets one array per outer element — `[["north-a", "north-b"],
+  ["south-a"]]` — because flattening loses which outer element a value came
+  from, and that is the only reason to nest rather than build a `Vec` in the
+  outer op. an outer element yielding `[]` contributes an empty array in its
+  place rather than a gap, and does not stall the run
+- **failure and everything else work at every level.** one inner instance
+  failing fails the fan-out it belongs to and, through it, the mapped op:
+  downstream is skipped and there is no partial array, while the instances
+  under the outer elements beside it run to the end, exactly as an op's
+  siblings do. pools, rates, limits, retries, trigger rules, timeouts and
+  cancellation apply per instance with no special cases at either depth
+- **a ceiling, because multiplication is the hazard.** `Hestan::max_instances`
+  is the most op runs one run may expand its fan-outs into, across every level;
+  the default is 1000. past it the run fails at the expansion, naming the op,
+  how many instances it was about to make and how many elements it was about
+  to make them from — **before** a row of it is written, because a runaway
+  found by counting op rows in the ui is a runaway that already happened. the
+  budget is the run's rather than any one op's, since what a nesting multiplies
+  is the run. a thousand is thirty times what a partitioned build launches by
+  default and far more than a hand-written fan-out; forty elements each
+  yielding forty is 1600, which is the case this exists for
+- **the docs say flattening is usually better**, on `Op::mapped`, in
+  `concepts.md` and beside the ceiling — nesting is two lines that each look
+  small and every instance is a row, a gantt span and a value held until the
+  fan-out collects
+- **everything that reads an instance reads a nested one.** a resume reassembles
+  the value in the shape it was collected in and reuses it, or re-expands the
+  inner fan-out over an outer one it only has the value of; a replay re-runs
+  over the arrays the run expanded over rather than today's; an io manager
+  writes `probe[1][0].json` under the run's directory and phase 29's
+  containment check holds for it unchanged; op stats and the metadata trend
+  roll every level up into the op, which is the only history a mapped op has.
+  the run page groups the instances as a **tree** — a block per outer element
+  — so which outer element a failure sits under is on the page and not only in
+  the name, and the gantt lays an inner instance out after its own outer
+  instance rather than after all of them
+
 an asset's value goes through the io manager, and a resource can belong to one run.
 
 **breaking**: no signature moved, but `asset_materializations.value` — which
