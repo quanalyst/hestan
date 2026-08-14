@@ -237,7 +237,16 @@ fn jobs() -> Vec<Job> {
 /// blocking work that ignores every request to stop: no await point to drop it
 /// at, and nothing polling `ctx.is_cancelled()`. in-process this runs to the
 /// end whatever the run log says; isolated, it is killed.
+/// blocking work that will not stop for a signal — and a note, first, that it
+/// is in a position to ignore one.
+///
+/// the child installs its SIGTERM handler before it calls the body, so a body
+/// that has written this is a child that can hear one. the parent records a pid
+/// the moment it spawns, which is earlier, and a stop that lands in between is
+/// the default disposition killing the child rather than the case's stubborn
+/// op ignoring anything.
 async fn deaf_to_signals() -> hestan::OpResult {
+    std::fs::write(marker_named("deaf"), "it can hear")?;
     tokio::task::spawn_blocking(|| {
         std::thread::sleep(Duration::from_secs(120));
         Ok(json!("nobody should ever see this"))
@@ -484,11 +493,14 @@ async fn the_parents_run_is_untouched(runner: &Runner) {
 }
 
 async fn a_cancel_kills(runner: &Runner) {
+    let _ = std::fs::remove_file(marker_named("deaf"));
     let id = runner
         .launch("stubborn", json!({}), Trigger::Manual)
         .unwrap();
     let pid = wait_for_pid(runner, &id, "grind").await;
     assert!(alive(pid), "the child was not running to begin with");
+    // not before the child can ignore it: see `deaf_to_signals`
+    wait_for_marker(&marker_named("deaf")).await;
 
     assert_eq!(
         runner.cancel(&id).unwrap(),
@@ -734,6 +746,16 @@ fn window(rows: &[OpRun], op: &str) -> (i64, i64) {
 }
 
 /// the pid an isolated op is running in, once its row carries one.
+async fn wait_for_marker(path: &std::path::Path) {
+    for _ in 0..600 {
+        if path.exists() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("{} never appeared", path.display());
+}
+
 async fn wait_for_pid(runner: &Runner, run_id: &str, op: &str) -> libc::pid_t {
     for _ in 0..600 {
         if let Some(pid) = runner
