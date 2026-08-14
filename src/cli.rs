@@ -2351,6 +2351,7 @@ async fn doctor(reach: Reach, out: &Out) -> Result<(), Fail> {
     findings.extend(check_schedules(store)?);
     findings.extend(check_sensors(store)?);
     findings.extend(check_leases(store, Utc::now())?);
+    findings.push(check_held_values(store)?);
     match &app {
         Some(app) => {
             findings.extend(check_queue(app)?);
@@ -2587,6 +2588,29 @@ fn check_rates(app: &Inspected) -> Finding {
             format!("{declared}, counted in this process and no other"),
         ),
     }
+}
+
+/// the runs no policy will take, because an asset's current value is inside
+/// them.
+///
+/// a value that lives in an [io manager](crate::IoManager) lives in the run
+/// that wrote it, so the sweep holds that run back until something rebuilds
+/// the asset. that makes `days(30)` no longer mean "nothing older than thirty
+/// days is here", and the number of runs it is holding is worth reading before
+/// a disk fills rather than afterwards.
+fn check_held_values(store: &Store) -> Result<Finding, Fail> {
+    Ok(match store.runs_holding_a_value()?.len() {
+        0 => Finding::ok("values", "no run is held back from retention"),
+        n => Finding::note(
+            "values",
+            format!(
+                "{n} run(s) are held back from retention: an asset's current value is \
+                 what they wrote, and a later build reads it"
+            ),
+            "each goes on the sweep after the one that rebuilds its asset, so an asset \
+             nothing ever rebuilds keeps its run for as long as it is current",
+        ),
+    })
 }
 
 /// a retention policy in a process that will never run it.
@@ -3862,6 +3886,43 @@ mod tests {
         let findings = check_retention(&app);
         assert_eq!(levels(&findings), [Level::Wrong]);
         assert!(findings[0].says.contains("worker"), "{}", findings[0].says);
+    }
+
+    // a policy that no longer bounds what is on the disk, said before the disk
+    // fills rather than afterwards
+    #[test]
+    fn doctor_counts_the_runs_an_assets_value_is_holding_back() {
+        let store = Store::open(":memory:").unwrap();
+        let held = check_held_values(&store).unwrap();
+        assert_eq!(held.level, Level::Ok);
+
+        // a value that lives in the row holds nothing back; one that lives in
+        // a manager holds the run it was written by
+        let mat = |asset: &str, value: Value, run: &str| {
+            store
+                .record_materialization(
+                    asset,
+                    None,
+                    "fp",
+                    &json!({}),
+                    Some(&value),
+                    Some(run),
+                    None,
+                )
+                .unwrap()
+        };
+        mat("totals", json!({ "total": 12 }), "inline");
+        let held = check_held_values(&store).unwrap();
+        assert_eq!(held.level, Level::Ok);
+
+        mat(
+            "orders",
+            json!({ "$io": "file", "path": "/io/r1/orders.json" }),
+            "r1",
+        );
+        let held = check_held_values(&store).unwrap();
+        assert_eq!(held.level, Level::Note);
+        assert!(held.says.starts_with("1 run(s)"), "{}", held.says);
     }
 
     // the question to ask before giving a deployment an address: is anything

@@ -443,6 +443,7 @@ pub(crate) async fn run_one_op(
         // where the parent reads it, so it stays true if one ever is
         built: built.clone(),
         store: store.clone(),
+        io: io.clone(),
         // the parent holds this op's pool slot for as long as this process
         // lives, which is the whole of the child's work
         slot: None,
@@ -509,7 +510,7 @@ pub(crate) async fn run_one_op(
             // what the manager knows about what it stored, beside what the op
             // staged — the same rule the parent applies to an in-process op
             let meta = crate::io::handle_meta(&handle, op::staged_meta(&new_meta));
-            let built = op::staged_builds(&built);
+            let built = crate::store::stored_as(op::staged_builds(&built), &handle);
             if !store
                 .landed("op_finished", || {
                     store.op_finished(

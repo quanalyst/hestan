@@ -37,6 +37,24 @@ const EVENTS_KEPT: usize = 50_000;
 /// only until they are eight days old — whichever holds it back wins. the other
 /// reading deletes history the moment either rule fires, which is a thing you
 /// find out about afterwards.
+///
+/// ## What a policy does not bound
+///
+/// an [asset](crate::Asset) whose value went through an
+/// [io manager](crate::IoManager) has that value inside the run that built it,
+/// and a later build seeds from it. so a run an asset's **current**
+/// materialization still reads is kept whatever the policy says, rows and
+/// files together, until something rebuilds the asset.
+///
+/// that is the honest cost of the alternative: pruning it would leave a row
+/// pointing at nothing, and the next build would either fail on a hole or
+/// silently redo work somebody paid for. but it does mean `days(30)` is not
+/// "nothing older than thirty days is here" — an asset built a year ago and
+/// never rebuilt keeps its run for as long as it stays current.
+/// `hestan doctor` counts them under `values`, and `docs/storage.md` says what
+/// to do about it. nothing is held back for an
+/// [`Inline`](crate::Inline) deployment, whose values are in the
+/// materialization itself.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Retention {
     days: Option<u32>,
@@ -138,6 +156,16 @@ pub(crate) fn sweep(runner: &Runner, policy: &Retention, now: DateTime<Utc>) {
             return;
         }
     };
+    // read once for the whole sweep: an asset's value now lives wherever its
+    // op's output does, so the run that built it is holding something a later
+    // build is going to read
+    let held = match store.runs_holding_a_value() {
+        Ok(held) => held,
+        Err(e) => {
+            tracing::warn!("retention: reading which runs still hold a value failed: {e}");
+            return;
+        }
+    };
     let mut removed = 0;
     for job in &jobs {
         // a job this process does not define keeps the global policy: the runs
@@ -155,6 +183,17 @@ pub(crate) fn sweep(runner: &Runner, policy: &Retention, now: DateTime<Utc>) {
                 continue;
             }
         };
+        // a run past its policy that an asset's current value is inside stays,
+        // rows and files together. the policy bounds history, and a value
+        // something is still going to read is not history yet — the run goes on
+        // the next sweep after the one that rebuilds the asset
+        let doomed: Vec<String> = doomed
+            .into_iter()
+            .filter(|run| !held.contains(run))
+            .collect();
+        if doomed.is_empty() {
+            continue;
+        }
         // what the runs wrote before the rows that say they wrote it, and the
         // order is the whole of why this works. a run row is the only record
         // that the run existed: delete it first and a crash in between leaves
@@ -411,6 +450,47 @@ mod tests {
             *records.dropped.lock().unwrap(),
             [("old".to_string(), true)]
         );
+    }
+
+    /// what a manager's handle looks like on a materialization, which is the
+    /// only thing that tells the sweep a value is somewhere else.
+    fn handle(path: &str) -> Value {
+        json!({ "$io": "file", "path": path })
+    }
+
+    // an asset's value now lives wherever its op's output lives, so the run
+    // that wrote it is holding something the next build reads. the policy that
+    // would take that run has to wait for the build that replaces it — and a
+    // value that is on the row itself holds nothing back, which is every
+    // deployment that never configured a manager
+    #[test]
+    fn a_run_an_assets_current_value_is_inside_outlives_the_policy_that_would_take_it() {
+        let store = Store::open(":memory:").unwrap();
+        plant(&store, "held", "chatty", 30);
+        plant(&store, "inline", "chatty", 30);
+        let mat = |asset: &str, fp: &str, value: Value, run: &str| {
+            store
+                .record_materialization(asset, None, fp, &json!({}), Some(&value), Some(run), None)
+                .unwrap()
+        };
+        mat("orders", "fp1", handle("/io/held/orders.json"), "held");
+        mat("totals", "fp1", json!({ "total": 12 }), "inline");
+        let runner = Runner::new([job("chatty")], store.clone()).unwrap();
+
+        sweep(&runner, &Retention::days(7), Utc::now());
+        assert_eq!(ids(&store), ["held"], "the wrong run survived");
+
+        // and it goes on the sweep after the one that rebuilds the asset: the
+        // value it was holding is history now, like the run
+        plant(&store, "rebuilt", "chatty", 30);
+        mat(
+            "orders",
+            "fp2",
+            handle("/io/rebuilt/orders.json"),
+            "rebuilt",
+        );
+        sweep(&runner, &Retention::days(7), Utc::now());
+        assert_eq!(ids(&store), ["rebuilt"]);
     }
 
     // the whole point of the loop: a run that appeared after boot is pruned by

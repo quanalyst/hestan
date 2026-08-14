@@ -64,6 +64,7 @@ pub struct Asset {
     source: bool,
     deps: Vec<String>,
     op: Option<Op>,
+    io: Option<String>,
     probe: Option<Arc<ProbeFn>>,
     probe_every: Duration,
     auto: bool,
@@ -83,6 +84,7 @@ impl Asset {
             source: true,
             deps: Vec::new(),
             op: None,
+            io: None,
             probe: None,
             probe_every: Duration::from_secs(60),
             auto: false,
@@ -107,6 +109,7 @@ impl Asset {
             name,
             source: false,
             deps: Vec::new(),
+            io: None,
             probe: None,
             probe_every: Duration::from_secs(60),
             auto: false,
@@ -133,6 +136,7 @@ impl Asset {
             name,
             source: false,
             deps: Vec::new(),
+            io: None,
             probe: None,
             probe_every: Duration::from_secs(60),
             auto: false,
@@ -194,6 +198,40 @@ impl Asset {
     /// [`from`](Asset::from) and [`from_named`](Asset::from_named) took.
     pub fn deps(&self) -> &[String] {
         &self.deps
+    }
+
+    /// store this asset's value through the [io manager](crate::IoManager)
+    /// registered under `name` with `Hestan::io_named`, instead of the process
+    /// default. naming one that was never registered fails the build, and so
+    /// does naming one on a [source](Asset::source), which stores no value of
+    /// its own.
+    ///
+    /// ```no_run
+    /// # use hestan::{Asset, FileIo, Hestan, OpCtx};
+    /// # use serde_json::json;
+    /// let orders = Asset::new("orders", |_: OpCtx| async {
+    ///     Ok(json!([{"id": 1, "total": 9.99}]))
+    /// })
+    /// .io("files");
+    ///
+    /// Hestan::new()
+    ///     .io_named("files", FileIo::new("/var/lib/hestan/io"))
+    ///     .assets([orders]);
+    /// ```
+    ///
+    /// the materialization then records the handle the manager returned, and a
+    /// later build that memoizes this asset reads the value back through the
+    /// same manager rather than out of the run log — so an asset of rows can
+    /// be stored as [parquet][parquet] and nothing downstream reads json.
+    /// `docs/io-managers.md` says what that means for
+    /// [retention](crate::Retention), which takes what a manager wrote when it
+    /// prunes the run that wrote it.
+    ///
+    #[cfg_attr(feature = "parquet", doc = "[parquet]: crate::ParquetIo")]
+    #[cfg_attr(not(feature = "parquet"), doc = "[parquet]: crate")]
+    pub fn io(mut self, name: impl Into<String>) -> Asset {
+        self.io = Some(name.into());
+        self
     }
 
     /// extra attempts for the materializing op (default 0).
@@ -282,6 +320,7 @@ pub struct MultiAsset {
     produces: Vec<String>,
     deps: Vec<String>,
     op: Op,
+    io: Option<String>,
     auto: bool,
     retries: u32,
     retry_delay: Option<Duration>,
@@ -301,6 +340,7 @@ impl MultiAsset {
             name,
             produces: Vec::new(),
             deps: Vec::new(),
+            io: None,
             auto: false,
             retries: 0,
             retry_delay: None,
@@ -328,6 +368,18 @@ impl MultiAsset {
     /// output.
     pub fn from_named(mut self, dep: impl Into<String>) -> MultiAsset {
         self.deps.push(dep.into());
+        self
+    }
+
+    /// store what this op produces through the [io manager](crate::IoManager)
+    /// registered under `name`, as [`Asset::io`] does — one output holding
+    /// every asset, since one op returns it.
+    ///
+    /// each produced asset's materialization keeps its own slice of that
+    /// output rather than a handle: the manager has one handle for the whole
+    /// object and no part of it has one of its own.
+    pub fn io(mut self, name: impl Into<String>) -> MultiAsset {
+        self.io = Some(name.into());
         self
     }
 
@@ -493,6 +545,9 @@ pub(crate) struct OpMeta {
     /// the assets this op reads, shared by everything it produces.
     pub deps: Vec<String>,
     op: Op,
+    /// the io manager this asset's value is stored through, from
+    /// [`Asset::io`]; `None` for the process default.
+    pub io: Option<String>,
     retries: u32,
     retry_delay: Option<Duration>,
     /// set only on a single-asset op: a multi-asset is never partitioned.
@@ -510,6 +565,9 @@ struct DepLink {
     op: String,
     key: Option<String>,
     partitioned: bool,
+    /// the manager the producer stores through, needed to read a partitioned
+    /// dep's value back out of the store.
+    io: Option<String>,
 }
 
 /// the validated asset graph, in topo order, with the checks bound to it.
@@ -559,6 +617,12 @@ impl AssetRegistry {
                     a.name
                 )));
             }
+            if a.source && a.io.is_some() {
+                return Err(Error::Graph(format!(
+                    "asset {}: io on a source (a source has no value of its own to store)",
+                    a.name
+                )));
+            }
             if let Some(spec) = &a.partitions {
                 if a.source {
                     return Err(Error::Graph(format!(
@@ -575,6 +639,7 @@ impl AssetRegistry {
                     produces: vec![a.name.clone()],
                     deps: a.deps.clone(),
                     op,
+                    io: a.io,
                     retries: a.retries,
                     retry_delay: a.retry_delay,
                     partitions: a.partitions.clone(),
@@ -619,6 +684,7 @@ impl AssetRegistry {
                 produces: m.produces,
                 deps: m.deps,
                 op: m.op,
+                io: m.io,
                 retries: m.retries,
                 retry_delay: m.retry_delay,
                 partitions: None,
@@ -764,6 +830,7 @@ impl AssetRegistry {
             .filter(|o| o.produces.len() > 1)
             .map(|_| asset.to_string());
         DepLink {
+            io: self.op(&op).and_then(|o| o.io.clone()),
             asset: asset.to_string(),
             op,
             key,
@@ -868,6 +935,27 @@ fn dep_value(ctx: &OpCtx, link: &DepLink) -> Option<Value> {
     })
 }
 
+/// one asset's stored value, read back through the manager that stored it.
+///
+/// a materialization holds what the manager returned — a handle under a file
+/// manager, the value itself under [`Inline`](crate::Inline), and the raw
+/// value on any row written before an asset's value went through one. `get` is
+/// total over all three, which is what makes an old row keep working.
+async fn stored_value(
+    ctx: &OpCtx,
+    link: &DepLink,
+    held: Value,
+) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
+    let key = crate::io::IoKey {
+        run_id: ctx.run_id().to_string(),
+        job: ASSETS_JOB.to_string(),
+        op: link.op.clone(),
+    };
+    crate::io::get(&ctx.io, link.io.as_deref(), key, held)
+        .await
+        .map_err(|e| format!("could not read the value of {}: {e}", link.asset).into())
+}
+
 /// the ctx an asset body sees: inputs keyed by the *asset* names it declared,
 /// whatever ops the run actually ran to produce them, plus the partition key
 /// this invocation is for. `ctx.input("orders")` reads the same inside an
@@ -878,16 +966,25 @@ fn dep_value(ctx: &OpCtx, link: &DepLink) -> Option<Value> {
 /// out of the run. that is what makes identity mapping mean one thing: the
 /// consumer reads `dep[k]` whether `dep[k]` was rebuilt by this run — its
 /// materialization is written inside its own op, which has finished by now —
-/// or was already fresh and never ran at all.
-fn with_dep_inputs(ctx: &OpCtx, links: &[DepLink], key: Option<&str>) -> Result<OpCtx, Error> {
+/// or was already fresh and never ran at all. what that row holds is what the
+/// manager returned, so it is read back through the manager like any other
+/// input.
+async fn with_dep_inputs(
+    ctx: &OpCtx,
+    links: &[DepLink],
+    key: Option<&str>,
+) -> Result<OpCtx, Box<dyn std::error::Error + Send + Sync>> {
     let mut inputs: HashMap<String, Value> = HashMap::new();
     let mut dep_statuses: HashMap<String, crate::model::OpStatus> = HashMap::new();
     for link in links {
         let value = match (link.partitioned, key) {
-            (true, Some(key)) => ctx
-                .store
-                .materialization(&link.asset, Some(key))?
-                .and_then(|m| m.value),
+            (true, Some(key)) => match ctx.store.materialization(&link.asset, Some(key))? {
+                Some(m) => match m.value {
+                    Some(held) => Some(stored_value(ctx, link, held).await?),
+                    None => None,
+                },
+                None => None,
+            },
             _ => dep_value(ctx, link),
         };
         if let Some(v) = value {
@@ -1014,7 +1111,7 @@ fn wrap_op(reg: &AssetRegistry, meta: &OpMeta) -> Op {
                 false => None,
                 true => Some(partition_of(&ctx)?),
             };
-            let inner_ctx = with_dep_inputs(&ctx, &links, key.as_deref())?;
+            let inner_ctx = with_dep_inputs(&ctx, &links, key.as_deref()).await?;
             let output = inner.call(inner_ctx).await?;
             let values = split_output(&name, &produces, &output)?;
             // deps' current fingerprints: ancestors in this run already wrote
@@ -1042,7 +1139,12 @@ fn wrap_op(reg: &AssetRegistry, meta: &OpMeta) -> Op {
                     partition: key.clone(),
                     fingerprint,
                     inputs: inputs.clone(),
-                    value: Some(value.clone()),
+                    // one asset is its op's whole output, so the executor
+                    // records the handle that output got and the value is
+                    // stored once. a multi-asset's slice has no handle of its
+                    // own and is recorded as the value it is
+                    value: (produces.len() > 1).then(|| value.clone()),
+                    is_output: produces.len() == 1,
                     meta,
                 });
             }
@@ -1051,6 +1153,9 @@ fn wrap_op(reg: &AssetRegistry, meta: &OpMeta) -> Op {
     })
     .after(after)
     .retries(meta.retries);
+    if let Some(name) = &meta.io {
+        op = op.io(name);
+    }
     if let Some(spec) = &meta.partitions {
         let _ = spec;
         // the same expansion a mapped op gets, over the keys the plan chose
@@ -1093,12 +1198,18 @@ fn check_op(reg: &AssetRegistry, meta: &CheckMeta) -> Op {
                 false => None,
                 true => Some(partition_of(&ctx)?),
             };
+            // the value this key just produced, read back the way its consumer
+            // reads it: the row holds what the manager returned, not the rows
+            // themselves
             let value = match &key {
-                Some(key) => ctx
+                Some(key) => match ctx
                     .store
                     .materialization(&asset, Some(key))?
                     .and_then(|m| m.value)
-                    .unwrap_or(Value::Null),
+                {
+                    Some(held) => stored_value(&ctx, &link, held).await?,
+                    None => Value::Null,
+                },
                 None => dep_value(&ctx, &link).unwrap_or(Value::Null),
             };
             let ctx = match &key {
@@ -1336,9 +1447,15 @@ fn with_checks(reg: &AssetRegistry, ops: Vec<String>) -> Vec<String> {
 }
 
 /// what a fresh dep the plan does not re-run is seeded with, under the name the
-/// run knows it by: a source is null, an asset with an op to itself is its
-/// stored value, and a multi-asset is the object its op returns — every asset
-/// it produces, so that whichever key a consumer reads is there.
+/// run knows it by: a source is null, an asset with an op to itself is what its
+/// materialization holds, and a multi-asset is the object its op returns —
+/// every asset it produces, so that whichever key a consumer reads is there.
+///
+/// what a materialization holds is what the [manager](crate::IoManager)
+/// returned, so this seeds a handle where the value lives in one and the run
+/// resolves it exactly as it resolves an output of its own. that is also why
+/// nothing here has to know which kind a row is: the manager passes through
+/// anything it did not write.
 ///
 /// a partitioned asset is seeded null whatever it holds: its consumers read it
 /// per key from the store, and no single value could stand for the set.
@@ -1743,6 +1860,27 @@ mod tests {
 
         let err = reg_err(vec![Asset::source("s").auto()]);
         assert!(err.to_string().contains("auto on a source"), "{err}");
+
+        let err = reg_err(vec![Asset::source("s").io("parquet")]);
+        assert!(err.to_string().contains("io on a source"), "{err}");
+    }
+
+    // the manager an asset selected has to reach the op the run executes, or
+    // the value would go to the process default and the row would name a file
+    // nothing wrote
+    #[test]
+    fn a_wrapped_asset_op_keeps_the_manager_the_asset_selected() {
+        let a = echo("a").io("parquet");
+        let b = echo("b").from(&a);
+        let reg = AssetRegistry::new(vec![a, b], Vec::new(), Vec::new()).unwrap();
+        assert_eq!(
+            wrap_op(&reg, reg.op("a").unwrap()).io_name(),
+            Some("parquet")
+        );
+        assert_eq!(wrap_op(&reg, reg.op("b").unwrap()).io_name(), None);
+        // and the consumer knows where its dep's value went, which is how a
+        // partitioned dep is read back off its row
+        assert_eq!(reg.dep_link("a").io.as_deref(), Some("parquet"));
     }
 
     #[test]

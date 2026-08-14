@@ -3797,8 +3797,8 @@ async fn resume_reads_a_seeded_output_back_out_of_file_io() {
 }
 
 // a memoized build seeds a fresh dep from its materialization while file io
-// is the default; that seed never went through `put`, so this only works
-// because `get` passes through what it did not write
+// is the default, and what that row holds is the handle the op run holds:
+// one file, named twice, rather than a second copy of the value in the log
 #[tokio::test]
 async fn asset_memoization_seeds_a_fresh_dep_under_file_io() {
     let dir = tempfile::tempdir().unwrap();
@@ -3828,14 +3828,21 @@ async fn asset_memoization_seeds_a_fresh_dep_under_file_io() {
     let run = boot().build_asset("b").await.unwrap();
     assert_eq!(run.status, RunStatus::Success);
     let store = Store::open(db.to_str().unwrap()).unwrap();
-    // the materialization keeps the asset's value; the op run keeps a handle
-    assert_eq!(
-        store.materialization("b", None).unwrap().unwrap().value,
-        Some(json!({"doubled": 6}))
-    );
+    // the materialization and the op run name the same file
     let rows = store.op_runs(&run.id).unwrap();
     let a_out = rows.iter().find(|o| o.op == "a").unwrap().output.clone();
-    assert_eq!(a_out.unwrap()["$io"], "file");
+    assert_eq!(a_out.as_ref().unwrap()["$io"], "file");
+    assert_eq!(
+        store.materialization("a", None).unwrap().unwrap().value,
+        a_out
+    );
+    let held = store.materialization("b", None).unwrap().unwrap().value;
+    let path = held.unwrap()["path"].as_str().unwrap().to_string();
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        r#"{"doubled":6}"#,
+        "the value is not in the file the row names"
+    );
     drop(store);
 
     // a is fresh now, so the second build seeds it instead of rebuilding it
@@ -3846,10 +3853,14 @@ async fn asset_memoization_seeds_a_fresh_dep_under_file_io() {
     let rows = store.op_runs(&run.id).unwrap();
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].op, "b");
-    // and b, reading the seeded value, got the same answer as before
+    // and b, reading the seed back through the manager, got the same answer
+    // as before out of a file of its own
+    let held = store.materialization("b", None).unwrap().unwrap().value;
+    let rebuilt = held.unwrap()["path"].as_str().unwrap().to_string();
+    assert_ne!(rebuilt, path, "the second build wrote where the first did");
     assert_eq!(
-        store.materialization("b", None).unwrap().unwrap().value,
-        Some(json!({"doubled": 6}))
+        std::fs::read_to_string(&rebuilt).unwrap(),
+        r#"{"doubled":6}"#
     );
 }
 

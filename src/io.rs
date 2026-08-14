@@ -43,6 +43,12 @@ pub struct IoKey {
 /// and a job can mix managers op by op. anything it did not produce, it must
 /// return unchanged — which is exactly what [`Inline`] does with everything.
 ///
+/// that totality is also what lets an [asset](crate::Asset) store its value
+/// here. a materialization records what `put` returned, and a row written
+/// before assets went through a manager at all records the value itself; `get`
+/// hands the second kind straight back, so an old database keeps seeding
+/// without a migration and without a column saying which kind a row is.
+///
 /// `drop_run` is the other end of `put`: [retention](crate::Retention) calls
 /// it as it prunes a run, and it is the only thing that ever collects what a
 /// manager wrote.
@@ -171,6 +177,15 @@ fn relative(what: &str, name: &str) -> Result<PathBuf, String> {
     }
 }
 
+/// the key that marks an object as a manager's handle rather than a value.
+///
+/// the one thing a reader has to go on: a row written before an asset's value
+/// went through a manager holds the value itself, and `get` hands back
+/// anything it did not write. so this is what tells the two apart wherever
+/// they meet — [`handle_meta`] here, and the sweep that decides whether a
+/// run still holds a value somebody will read.
+pub(crate) const HANDLE: &str = "$io";
+
 /// the tag on a [`FileIo`] handle. a handle is an object rather than a bare
 /// path so anything reading `op_runs.output` can tell a reference from a
 /// value at a glance — including the ui.
@@ -231,14 +246,14 @@ impl IoManager for FileIo {
 // the path inside a FileIo handle, if that is what this is
 fn file_handle(handle: &Value) -> Option<&str> {
     let obj = handle.as_object()?;
-    (obj.get("$io")?.as_str()? == FILE_TAG).then(|| obj.get("path")?.as_str())?
+    (obj.get(HANDLE)?.as_str()? == FILE_TAG).then(|| obj.get("path")?.as_str())?
 }
 
 /// the path inside a handle tagged `tag`, if that is what this is.
 #[cfg(feature = "parquet")]
 fn tagged_handle<'a>(handle: &'a Value, tag: &str) -> Option<&'a str> {
     let obj = handle.as_object()?;
-    (obj.get("$io")?.as_str()? == tag).then(|| obj.get("path")?.as_str())?
+    (obj.get(HANDLE)?.as_str()? == tag).then(|| obj.get("path")?.as_str())?
 }
 
 /// the two numbers a handle may carry: how many rows were stored and how big
@@ -248,7 +263,7 @@ fn tagged_handle<'a>(handle: &'a Value, tag: &str) -> Option<&'a str> {
 /// — so this is where they come from. anything the op staged under the same
 /// name wins, since an op saying `rows` means its own rows.
 pub(crate) fn handle_meta(handle: &Value, staged: Option<Value>) -> Option<Value> {
-    let Some(obj) = handle.as_object().filter(|o| o.contains_key("$io")) else {
+    let Some(obj) = handle.as_object().filter(|o| o.contains_key(HANDLE)) else {
         return staged;
     };
     let mut out = match staged {

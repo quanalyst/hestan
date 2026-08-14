@@ -2844,6 +2844,35 @@ impl Store {
         )
     }
 
+    /// the runs an asset's current value is still inside: those a current
+    /// materialization names, holding a [handle](crate::IoManager) rather than
+    /// the value itself.
+    ///
+    /// what the manager wrote for a run goes when [retention](Retention)
+    /// prunes it, so pruning one of these would delete the value the next
+    /// build seeds from and leave a row pointing at nothing. the sweep holds
+    /// them back instead — until something rebuilds the asset, at which point
+    /// the run is history like any other.
+    ///
+    /// a row written before an asset's value went through a manager holds the
+    /// value itself and matches nothing here, which is also what an
+    /// [`Inline`](crate::Inline) deployment writes today: nothing is held back
+    /// for a value that lives in this table.
+    pub(crate) fn runs_holding_a_value(&self) -> Result<Vec<String>, Error> {
+        // the mark a manager puts on a handle, looked for anywhere in the
+        // stored text: which key of an object comes first is serde's business
+        // and not something a sweep should depend on
+        let handle = format!("%\"{}\"%", crate::io::HANDLE);
+        self.conn().query(
+            "SELECT DISTINCT run_id FROM asset_materializations
+              WHERE id IN (SELECT MAX(id) FROM asset_materializations
+                           GROUP BY asset, partition)
+                AND run_id IS NOT NULL AND value LIKE ?1",
+            args![handle.as_str()],
+            |r| r.text(0),
+        )
+    }
+
     /// which of one job's runs its [policy](Retention) says it may no longer
     /// keep, newest first.
     ///
@@ -3595,6 +3624,9 @@ impl Store {
             fingerprint: fingerprint.to_string(),
             inputs: inputs.clone(),
             value: value.cloned(),
+            // nothing here went through a manager: the caller observed a value
+            // rather than running the op that would have stored one
+            is_output: false,
             meta: metadata.cloned(),
         };
         let mut conn = self.conn();
@@ -4751,8 +4783,36 @@ pub(crate) struct Built {
     pub(crate) partition: Option<String>,
     pub(crate) fingerprint: String,
     pub(crate) inputs: Value,
+    /// what the [io manager](crate::IoManager) returned for this value, which
+    /// under [`Inline`](crate::Inline) is the value itself. `None` on a row
+    /// that only records that a build happened, which is what a probe writes.
     pub(crate) value: Option<Value>,
+    /// true when this asset's value is the whole of its op's output, so the
+    /// handle that output got names it exactly and [`stored_as`] fills it in.
+    /// an op producing several assets stages each slice itself: they share one
+    /// output and one handle, and no part of it has a handle of its own.
+    pub(crate) is_output: bool,
     pub(crate) meta: Option<Value>,
+}
+
+/// what one attempt built, with the handle its op's output got recorded as the
+/// value of every asset that output *is*.
+///
+/// the materialization and the op run then name one stored thing instead of
+/// holding two copies of it, and seeding reads the asset back through the
+/// manager that wrote it. under [`Inline`](crate::Inline) the handle is the
+/// value, which is what makes this the row it has always been.
+pub(crate) fn stored_as(built: Vec<Built>, handle: &Value) -> Vec<Built> {
+    built
+        .into_iter()
+        .map(|one| match one.is_output {
+            true => Built {
+                value: Some(handle.clone()),
+                ..one
+            },
+            false => one,
+        })
+        .collect()
 }
 
 /// insert one materialization and the [event](EventKind::AssetMaterialized)
@@ -7863,6 +7923,7 @@ mod tests {
                 fingerprint: format!("{asset}-fp"),
                 inputs: json!({ "source": "s-fp" }),
                 value: Some(json!({ "rows": rows })),
+                is_output: false,
                 meta: Some(json!({ "rows": { "int": rows } })),
             };
             store
@@ -9501,6 +9562,7 @@ mod tests {
             fingerprint: "fp".to_string(),
             inputs: json!({}),
             value: None,
+            is_output: false,
             meta: None,
         };
 

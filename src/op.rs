@@ -1331,6 +1331,11 @@ pub struct OpCtx {
     /// the op finishing.
     pub(crate) built: BuiltBuf,
     pub(crate) store: Store,
+    /// the managers this run's outputs go through. an asset op reads one of
+    /// its own inputs back through them — a partitioned dep's value is on a
+    /// row rather than in the run — which is why the table is here and not
+    /// only in the executor.
+    pub(crate) io: crate::io::Io,
     /// the pool slot this attempt holds, if its op takes from one. carried here
     /// so that work the body handed this ctx to keeps the slot for as long as
     /// it runs — see [`Slot`]. nothing reads it: being here is the whole job.
@@ -1712,6 +1717,7 @@ mod tests {
             new_per_asset: Arc::new(Mutex::new(BTreeMap::new())),
             built: Arc::new(Mutex::new(Vec::new())),
             store: Store::open(":memory:").unwrap(),
+            io: crate::io::Io::default(),
             slot: None,
         }
     }

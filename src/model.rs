@@ -1026,8 +1026,15 @@ pub struct Materialization {
     /// what staleness compares against — an asset is stale when a dep's
     /// current fingerprint is not the one recorded here.
     pub inputs: Value,
-    /// the value itself, when the asset stores one. `None` for a source asset
-    /// and for anything that only recorded that it happened.
+    /// what the [io manager](crate::IoManager) returned for the value: the
+    /// value itself under [`Inline`](crate::Inline), a handle under a manager
+    /// that stored it somewhere. `None` for a source asset and for anything
+    /// that only recorded that it happened.
+    ///
+    /// read it back with the manager the asset stores through, exactly as an
+    /// op's output is read back — a row written before assets went through a
+    /// manager holds the value, and every manager passes through what it did
+    /// not write.
     pub value: Option<Value>,
     /// where the build happened; `None` on one a probe recorded outside any
     /// run.

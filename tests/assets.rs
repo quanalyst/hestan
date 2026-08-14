@@ -1,7 +1,9 @@
 use std::time::Duration;
 
+use std::sync::{Arc, Mutex};
+
 use hestan::prelude::*;
-use hestan::{CheckStatus, Error, RunStatus, Severity, Store, Trigger};
+use hestan::{CheckStatus, Error, FileIo, RunStatus, Severity, Store, Trigger};
 
 fn doc_assets() -> Vec<Asset> {
     let docs = Asset::source("docs");
@@ -360,4 +362,70 @@ async fn asset_graph_validation_happens_at_build() {
         .await
         .unwrap_err();
     assert!(err.to_string().contains("unknown op ghost"), "{err}");
+}
+
+// a database written before an asset's value went through a manager holds the
+// value in the row, and a database written after it may hold a handle. nothing
+// tells them apart and nothing needs to: `get` hands back what it did not
+// write, which is what makes this a phase with no migration in it
+#[tokio::test]
+async fn a_materialization_written_before_any_of_this_still_seeds_a_build() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("hestan.db");
+    let db = db.to_str().unwrap();
+    let builds = Arc::new(Mutex::new(Vec::<&str>::new()));
+    let seen: Arc<Mutex<Option<Value>>> = Arc::new(Mutex::new(None));
+
+    // the row a v8-era build wrote: the value itself, under a run whose rows
+    // are long gone, and none of the columns added since
+    drop(Store::open(db).unwrap());
+    rusqlite::Connection::open(db)
+        .unwrap()
+        .execute(
+            "INSERT INTO asset_materializations (asset, fingerprint, inputs, value, run_id, built_at)
+             VALUES ('orders', 'o1', '{}', '{\"rows\": 3}', 'a-run-since-pruned', ?1)",
+            [chrono::Utc::now().to_rfc3339()],
+        )
+        .unwrap();
+
+    let ran = builds.clone();
+    let saw = seen.clone();
+    let orders = Asset::new("orders", move |_| {
+        let ran = ran.clone();
+        async move {
+            ran.lock().unwrap().push("orders");
+            Ok(json!({"rows": 99}))
+        }
+    });
+    let totals = Asset::new("totals", move |ctx: OpCtx| {
+        let saw = saw.clone();
+        async move {
+            let orders = ctx.input("orders").cloned().unwrap_or(Value::Null);
+            *saw.lock().unwrap() = Some(orders.clone());
+            Ok(json!({ "doubled": orders["rows"].as_u64().unwrap_or(0) * 2 }))
+        }
+    })
+    .from(&orders);
+
+    let run = Hestan::new()
+        .io(FileIo::new(dir.path().join("io")))
+        .assets([orders, totals])
+        .db(db)
+        .build_asset("totals")
+        .await
+        .unwrap();
+    assert_eq!(run.status, RunStatus::Success);
+
+    // seeded from the old row, not rebuilt, and what the body read is the
+    // value that row holds rather than something shaped like a handle
+    assert!(builds.lock().unwrap().is_empty(), "orders was rebuilt");
+    assert_eq!(*seen.lock().unwrap(), Some(json!({"rows": 3})));
+
+    // and the build it seeded wrote the new kind of row beside the old one
+    let store = Store::open(db).unwrap();
+    let old = store.materialization("orders", None).unwrap().unwrap();
+    assert_eq!(old.value, Some(json!({"rows": 3})));
+    let new = store.materialization("totals", None).unwrap().unwrap();
+    let path = new.value.unwrap()["path"].as_str().unwrap().to_string();
+    assert_eq!(std::fs::read_to_string(path).unwrap(), r#"{"doubled":6}"#);
 }

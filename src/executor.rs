@@ -2519,6 +2519,7 @@ async fn execute_in_span(
                     invocation,
                     runner.resources.clone(),
                     store.clone(),
+                    runner.io.clone(),
                     runner.pools.clone(),
                     runner.rates.clone(),
                     op_hooks.clone(),
@@ -2568,6 +2569,10 @@ async fn execute_in_span(
                                 // what the manager knows about what it stored,
                                 // beside what the op staged
                                 let meta = crate::io::handle_meta(&handle, meta);
+                                // an asset that is its op's whole output is
+                                // recorded where that output went, so the two
+                                // rows name one stored thing
+                                let built = crate::store::stored_as(built, &handle);
                                 // and whatever it built, in that same write:
                                 // the output is stored, so the row that says
                                 // the asset is current is now true
@@ -2812,6 +2817,7 @@ async fn execute_in_span(
                             match crate::io::put(&runner.io, unit.io_name(), key, output).await {
                                 Ok(handle) => {
                                     let meta = crate::io::handle_meta(&handle, meta);
+                                    let built = crate::store::stored_as(built, &handle);
                                     if !store
                                         .landed("op_finished", || {
                                             store.op_finished(
@@ -3301,6 +3307,9 @@ async fn run_op(
     invocation: Option<Value>,
     resources: Resources,
     store: Store,
+    // an asset op reads a partitioned dep's value back through these, so the
+    // table goes to the attempt as well as staying with the run loop
+    io: Io,
     pools: Pools,
     rates: Rates,
     hooks: Arc<Vec<OpHook>>,
@@ -3472,6 +3481,7 @@ async fn run_op(
             new_per_asset: Arc::new(Mutex::new(BTreeMap::new())),
             built: built.clone(),
             store: store.clone(),
+            io: io.clone(),
             slot: slot.clone(),
         };
         let ended = match &invocation {
