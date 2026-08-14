@@ -58,6 +58,18 @@ pub(crate) const DISPATCH_POLL: Duration = Duration::from_millis(500);
 /// past this the head of the queue really is the queue.
 pub(crate) const QUEUE_SCAN: u32 = 500;
 
+/// the most op runs one run expands its fan-outs into before hestan refuses
+/// the expansion, unless
+/// [`Hestan::max_instances`](crate::Hestan::max_instances) says otherwise.
+///
+/// a thousand is thirty times what a partitioned build launches by default and
+/// far more than any fan-out written by hand, so a job that means it never
+/// meets this. what it stops is the multiplication a nesting makes available:
+/// forty elements each yielding forty is sixteen hundred rows from two lines
+/// that each looked small, and finding that by counting rows in the ui is
+/// finding it too late.
+pub(crate) const DEFAULT_MAX_INSTANCES: usize = 1000;
+
 /// what the dispatcher will not start past.
 ///
 /// every limit here counts runs that are **executing** — claimed and not yet
@@ -470,6 +482,9 @@ pub struct Runner {
     role: Role,
     // how many runs this process will execute at once, whatever the queue holds
     slots: usize,
+    // the most op runs one run may expand its fan-outs into, across every
+    // level of them
+    max_instances: usize,
     // one dispatch pass at a time in this process: two passes counting the same
     // free slot would both fill it
     dispatching: Arc<Mutex<()>>,
@@ -546,6 +561,7 @@ impl Runner {
             durable: false,
             role: Role::default(),
             slots: usize::MAX,
+            max_instances: DEFAULT_MAX_INSTANCES,
             dispatching: Arc::new(Mutex::new(())),
             settled: Arc::new(Notify::new()),
             actor: None,
@@ -622,6 +638,16 @@ impl Runner {
         Runner {
             role,
             slots: slots.max(1),
+            ..self
+        }
+    }
+
+    /// the most op runs one run may expand its fan-outs into.
+    /// [`Hestan::max_instances`](crate::Hestan::max_instances) is the way in,
+    /// and says what the number is for.
+    pub fn with_max_instances(self, n: usize) -> Runner {
+        Runner {
+            max_instances: n.max(1),
             ..self
         }
     }
@@ -2304,6 +2330,12 @@ async fn execute_in_span(
     // fan-out state: what each instance is for, and where its output belongs
     let mut instances: HashMap<String, Instance> = HashMap::new();
     let mut fanouts: HashMap<String, Fanout> = HashMap::new();
+    // how many op runs this run's fan-outs have expanded into so far, against
+    // what one run may. one budget for the whole run rather than one per op:
+    // what a nesting multiplies is the run, and ten fan-outs of a hundred is
+    // the same thousand rows as one of a thousand
+    let ceiling = runner.max_instances;
+    let mut expanded = 0usize;
 
     // this run's own resources, built before the first op is dispatched and
     // dropped when this function returns — which every way of a run ending
@@ -2410,7 +2442,9 @@ async fn execute_in_span(
                     Some(held) => resolve(&runner.io, &job, &run_id, &over, held).await,
                 };
                 let planned = match held {
-                    Ok(value) => expansion(&job, op, &name, &over, value, &fanouts),
+                    Ok(value) => {
+                        expansion(&job, op, &name, &over, value, &fanouts, expanded, ceiling)
+                    }
                     Err(e) => Err(format!("could not read the output of {over}: {e}")),
                 };
                 let plan = match planned {
@@ -2448,6 +2482,7 @@ async fn execute_in_span(
                         continue;
                     }
                 };
+                expanded += plan.instances;
                 // rows first, so a cancel or a skip has something to write to,
                 // exactly as a static op's row exists from the launch on
                 let mut created: Vec<String> = Vec::with_capacity(plan.instances);
@@ -3269,9 +3304,11 @@ struct Node {
 /// instance produced. so an instance's labels are its element's coordinates,
 /// and the depth of its name is the depth of the nesting.
 ///
-/// nothing is written here. the whole expansion is planned, counted and
-/// refused before a row of it exists, because a runaway found in the ui is a
-/// runaway that already happened.
+/// nothing is written here. the whole expansion is planned, counted and — past
+/// what `spent` of the run's `ceiling` op runs leaves — refused before a row of
+/// it exists, because a runaway found by counting rows in the ui is a runaway
+/// that already happened.
+#[allow(clippy::too_many_arguments)]
 fn expansion(
     job: &Job,
     op: &Op,
@@ -3279,6 +3316,8 @@ fn expansion(
     over: &str,
     value: Value,
     fanouts: &HashMap<String, Fanout>,
+    spent: usize,
+    ceiling: usize,
 ) -> Result<Expansion, String> {
     let mut plan = Expansion {
         nodes: Vec::new(),
@@ -3286,6 +3325,15 @@ fn expansion(
     };
     let depth = fanout_depth(job, over);
     plan_node(op, over, fanouts, &mut plan, name, over, value, depth, None)?;
+    if spent + plan.instances > ceiling {
+        let n = plan.instances;
+        return Err(format!(
+            "op {name} expands over {over} into {n} instances, one for each of its {n} \
+             elements; with the {spent} this run has already made that is past the ceiling \
+             of {ceiling} op runs one run may expand to. flattening inside {over} is usually \
+             the better shape, and Hestan::max_instances raises the ceiling"
+        ));
+    }
     Ok(plan)
 }
 

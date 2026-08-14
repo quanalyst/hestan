@@ -3148,6 +3148,92 @@ async fn an_outer_element_that_yields_nothing_makes_no_inner_instances() {
     assert_eq!(op_row(&rows, "report").output, Some(json!([[20], []])));
 }
 
+// a fan-out is one line whose size is decided at run time, so the run has to
+// be able to refuse one — while refusing it still costs nothing
+#[tokio::test]
+async fn an_expansion_past_the_ceiling_fails_without_writing_an_instance_row() {
+    let runner = Runner::new(
+        [fanout_job(json!([1, 2, 3, 4]), doubling)],
+        Store::open(":memory:").unwrap(),
+    )
+    .unwrap()
+    .with_max_instances(3);
+    let run = runner
+        .run("fanout", json!({}), Trigger::Manual)
+        .await
+        .unwrap();
+
+    assert_eq!(run.status, RunStatus::Failed);
+    assert_eq!(
+        run.error.as_deref(),
+        Some(
+            "op process failed: op process expands over pages into 4 instances, one for each of \
+             its 4 elements; with the 0 this run has already made that is past the ceiling of 3 \
+             op runs one run may expand to. flattening inside pages is usually the better shape, \
+             and Hestan::max_instances raises the ceiling"
+        )
+    );
+    // the point of failing at the expansion: none of it happened
+    let rows = runner.store().op_runs(&run.id).unwrap();
+    let names: Vec<&str> = rows.iter().map(|r| r.op.as_str()).collect();
+    assert_eq!(names, ["pages", "total"]);
+    assert_eq!(op_row(&rows, "total").status, OpStatus::Skipped);
+
+    // and the same fan-out with room for it is a fan-out like any other
+    let runner = Runner::new(
+        [fanout_job(json!([1, 2, 3, 4]), doubling)],
+        Store::open(":memory:").unwrap(),
+    )
+    .unwrap()
+    .with_max_instances(4);
+    let run = runner
+        .run("fanout", json!({}), Trigger::Manual)
+        .await
+        .unwrap();
+    assert_eq!(run.status, RunStatus::Success, "{:?}", run.error);
+    assert_eq!(runner.store().op_runs(&run.id).unwrap().len(), 6);
+}
+
+#[tokio::test]
+async fn the_ceiling_counts_every_level_of_a_nesting() {
+    // two regions, three sites and two sites: seven op runs of fan-out
+    let job =
+        || nested_job(|region| json!((0..=region).map(|i| region * 10 + i).collect::<Vec<_>>()));
+    let runner = Runner::new([job()], Store::open(":memory:").unwrap())
+        .unwrap()
+        .with_max_instances(6);
+    let run = runner
+        .run("nested", json!({}), Trigger::Manual)
+        .await
+        .unwrap();
+
+    assert_eq!(run.status, RunStatus::Failed);
+    // the outer fan-out is spent budget by the time the inner one is counted,
+    // and the inner count is every instance of it across every outer element
+    assert_eq!(
+        run.error.as_deref(),
+        Some(
+            "op probe failed: op probe expands over sites into 5 instances, one for each of its \
+             5 elements; with the 2 this run has already made that is past the ceiling of 6 op \
+             runs one run may expand to. flattening inside sites is usually the better shape, \
+             and Hestan::max_instances raises the ceiling"
+        )
+    );
+    let rows = runner.store().op_runs(&run.id).unwrap();
+    let names: Vec<&str> = rows.iter().map(|r| r.op.as_str()).collect();
+    assert_eq!(names, ["regions", "report", "sites[0]", "sites[1]"]);
+
+    // seven is exactly what it comes to, so seven is enough
+    let runner = Runner::new([job()], Store::open(":memory:").unwrap())
+        .unwrap()
+        .with_max_instances(7);
+    let run = runner
+        .run("nested", json!({}), Trigger::Manual)
+        .await
+        .unwrap();
+    assert_eq!(run.status, RunStatus::Success, "{:?}", run.error);
+}
+
 #[tokio::test]
 async fn a_nested_instance_takes_its_element_and_retries_on_its_own() {
     let calls = Arc::new(AtomicU32::new(0));

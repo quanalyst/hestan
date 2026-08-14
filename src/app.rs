@@ -11,7 +11,7 @@ use crate::asset::{
 };
 use crate::auth::{self, Auth};
 use crate::error::Error;
-use crate::executor::{Limits, Runner};
+use crate::executor::{self, Limits, Runner};
 use crate::freshness::{self, LateEvent, LateHook};
 use crate::hooks::{self, FailureHook, OpEvent, OpHook, RunEvent, RunFailure, RunHook};
 use crate::io::{Io, IoManager};
@@ -81,6 +81,7 @@ pub struct Hestan {
     reclaim: Reclaim,
     role: Role,
     slots: usize,
+    max_instances: usize,
     retention: Retention,
     retention_every: Duration,
     durable: bool,
@@ -120,6 +121,7 @@ impl Default for Hestan {
             reclaim: Reclaim::default(),
             role: Role::default(),
             slots: usize::MAX,
+            max_instances: executor::DEFAULT_MAX_INSTANCES,
             retention: Retention::default(),
             retention_every: retention::DEFAULT_INTERVAL,
             durable: false,
@@ -318,6 +320,29 @@ impl Hestan {
     /// container has to hold.
     pub fn slots(mut self, n: usize) -> Self {
         self.slots = n.max(1);
+        self
+    }
+
+    /// the most op runs one run may expand its [fan-outs](crate::Op::mapped)
+    /// into, across every level of them; a value below 1 means 1. the default
+    /// is 1000.
+    ///
+    /// a fan-out is written as one line and sized at run time by whatever it
+    /// expands over, and a fan-out inside a fan-out multiplies: forty elements
+    /// each yielding forty is sixteen hundred op runs from two lines that each
+    /// looked small. so a run that is about to expand past this fails at the
+    /// expansion, naming the op, how many instances it was about to make and
+    /// how many elements it was about to make them from — before a row of it
+    /// is written, because a runaway found by counting rows in the ui is one
+    /// that already happened.
+    ///
+    /// the budget is the run's rather than the op's: what a nesting multiplies
+    /// is the run, and ten fan-outs of a hundred cost the same thousand rows
+    /// as one of a thousand. raise it for a deployment that genuinely fans out
+    /// wider — a build naming thousands of partitions by hand is the usual
+    /// one — and prefer flattening in the outer op to raising it much.
+    pub fn max_instances(mut self, n: usize) -> Self {
+        self.max_instances = n.max(1);
         self
     }
 
@@ -1321,7 +1346,8 @@ impl Hestan {
         .with_run_tags(self.run_tags)
         .with_limits(self.limits, self.priority)
         .with_reclaim(self.reclaim)
-        .with_role(self.role, self.slots);
+        .with_role(self.role, self.slots)
+        .with_max_instances(self.max_instances);
         if self.durable {
             runner = runner.with_durable_notifications();
         }
@@ -1546,6 +1572,47 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(run.status, RunStatus::Success);
+    }
+
+    // the ceiling is declared on the deployment and applied inside the run, so
+    // it is worth one case that the number a deployment sets is the number the
+    // expansion is measured against
+    #[tokio::test]
+    async fn the_instance_ceiling_a_deployment_sets_is_the_one_a_run_expands_under() {
+        let job = || {
+            Job::builder("fan")
+                .op(Op::new("pages", |_| async { Ok(json!([1, 2, 3])) }))
+                .op(
+                    Op::mapped("process", |_ctx, page: u32| async move { Ok(json!(page)) })
+                        .over("pages"),
+                )
+                .build()
+                .unwrap()
+        };
+        let run = Hestan::new()
+            .job(job())
+            .max_instances(2)
+            .db(":memory:")
+            .run_once("fan", json!({}))
+            .await
+            .unwrap();
+        assert_eq!(run.status, RunStatus::Failed);
+        assert!(
+            run.error
+                .as_deref()
+                .is_some_and(|e| e.contains("past the ceiling of 2 op runs")),
+            "{:?}",
+            run.error
+        );
+
+        let run = Hestan::new()
+            .job(job())
+            .max_instances(3)
+            .db(":memory:")
+            .run_once("fan", json!({}))
+            .await
+            .unwrap();
+        assert_eq!(run.status, RunStatus::Success, "{:?}", run.error);
     }
 
     // through build, which is the path serve takes, rather than only through
