@@ -3148,6 +3148,170 @@ async fn an_outer_element_that_yields_nothing_makes_no_inner_instances() {
     assert_eq!(op_row(&rows, "report").output, Some(json!([[20], []])));
 }
 
+// a resume reassembles a mapped op's value out of its instance rows, and a
+// nested one has to come back in the shape it was collected in rather than
+// flattened by the trip through the store
+#[tokio::test]
+async fn a_resume_reuses_a_whole_nested_fan_out_in_the_shape_it_had() {
+    let fail_late = Arc::new(AtomicBool::new(true));
+    let flag = fail_late.clone();
+    let job = Job::builder("nested")
+        .op(Op::new("regions", |_| async { Ok(json!([2, 1])) }))
+        .op(Op::mapped("sites", |_ctx: OpCtx, region: u32| async move {
+            Ok(json!([region * 10, region * 10 + 1]))
+        })
+        .over("regions"))
+        .op(Op::mapped(
+            "probe",
+            |_ctx: OpCtx, site: u32| async move { Ok(json!(site)) },
+        )
+        .over("sites"))
+        .op(Op::new("report", move |ctx: OpCtx| {
+            let flag = flag.clone();
+            async move {
+                if flag.swap(false, Ordering::SeqCst) {
+                    return Err("downstream blew up".into());
+                }
+                Ok(ctx.input("probe").cloned().unwrap())
+            }
+        })
+        .after(["probe"]))
+        .build()
+        .unwrap();
+
+    let runner = Runner::new([job], Store::open(":memory:").unwrap()).unwrap();
+    let first = runner
+        .run("nested", json!({}), Trigger::Manual)
+        .await
+        .unwrap();
+    assert_eq!(first.status, RunStatus::Failed);
+
+    // every instance at both levels succeeded, so both mapped ops are reused
+    let plan = runner.resume_plan(&first.id, None).unwrap();
+    assert_eq!(plan.reuse, ["regions", "sites", "probe"]);
+    assert_eq!(plan.rerun, ["report"]);
+
+    let second = runner.resume(&first.id).unwrap();
+    assert_eq!(settled(&runner, &second).await.status, RunStatus::Success);
+    let rows = runner.store().op_runs(&second).unwrap();
+    let names: Vec<&str> = rows.iter().map(|r| r.op.as_str()).collect();
+    assert_eq!(names, ["report"], "a reused fan-out must not re-expand");
+    assert_eq!(
+        op_row(&rows, "report").output,
+        Some(json!([[20, 21], [10, 11]]))
+    );
+}
+
+// the inner fan-out re-expands while the outer one is reused, so it mirrors a
+// shape that is a seeded value rather than anything live in this run
+#[tokio::test]
+async fn a_nested_fan_out_re_expands_over_an_outer_one_it_only_has_the_value_of() {
+    let fail_once = Arc::new(AtomicBool::new(true));
+    let flag = fail_once.clone();
+    let job = Job::builder("nested")
+        .op(Op::new("regions", |_| async { Ok(json!([2, 1])) }))
+        .op(Op::mapped("sites", |_ctx: OpCtx, region: u32| async move {
+            Ok(json!([region * 10, region * 10 + 1]))
+        })
+        .over("regions"))
+        .op(Op::mapped("probe", move |_ctx: OpCtx, site: u32| {
+            let flag = flag.clone();
+            async move {
+                if site == 11 && flag.swap(false, Ordering::SeqCst) {
+                    return Err("site 11 is unreachable".into());
+                }
+                Ok(json!(site))
+            }
+        })
+        .over("sites"))
+        .op(Op::new("report", |ctx: OpCtx| async move {
+            Ok(ctx.input("probe").cloned().unwrap())
+        })
+        .after(["probe"]))
+        .build()
+        .unwrap();
+
+    let runner = Runner::new([job], Store::open(":memory:").unwrap()).unwrap();
+    let first = runner
+        .run("nested", json!({}), Trigger::Manual)
+        .await
+        .unwrap();
+    assert_eq!(first.status, RunStatus::Failed);
+
+    let plan = runner.resume_plan(&first.id, None).unwrap();
+    assert_eq!(plan.reuse, ["regions", "sites"]);
+    assert_eq!(plan.rerun, ["probe", "report"]);
+
+    let second = runner.resume(&first.id).unwrap();
+    assert_eq!(settled(&runner, &second).await.status, RunStatus::Success);
+    let rows = runner.store().op_runs(&second).unwrap();
+    let names: Vec<&str> = rows.iter().map(|r| r.op.as_str()).collect();
+    assert_eq!(
+        names,
+        [
+            "probe[0][0]",
+            "probe[0][1]",
+            "probe[1][0]",
+            "probe[1][1]",
+            "report",
+        ]
+    );
+    assert_eq!(
+        op_row(&rows, "report").output,
+        Some(json!([[20, 21], [10, 11]]))
+    );
+}
+
+#[tokio::test]
+async fn a_replay_of_a_nested_fan_out_expands_over_the_arrays_it_expanded_over() {
+    let regions: Arc<Mutex<Value>> = Arc::new(Mutex::new(json!([2, 1])));
+    let listed = regions.clone();
+    let broken = Arc::new(AtomicBool::new(false));
+    let fails = broken.clone();
+    let job = Job::builder("nested")
+        .op(Op::new("regions", move |_| {
+            let regions = listed.lock().unwrap().clone();
+            async move { Ok(regions) }
+        }))
+        .op(Op::mapped("sites", |_ctx: OpCtx, region: u32| async move {
+            Ok(json!([region * 10, region * 10 + 1]))
+        })
+        .over("regions"))
+        .op(Op::mapped("probe", move |_ctx: OpCtx, site: u32| {
+            let fails = fails.clone();
+            async move {
+                if !fails.load(Ordering::SeqCst) && site == 11 {
+                    return Err("site 11 is unreachable".into());
+                }
+                Ok(json!(site))
+            }
+        })
+        .over("sites"))
+        .build()
+        .unwrap();
+    let runner = Runner::new([job], Store::open(":memory:").unwrap()).unwrap();
+    let first = runner
+        .run("nested", json!({}), Trigger::Manual)
+        .await
+        .unwrap();
+    assert_eq!(first.status, RunStatus::Failed);
+
+    // the source has moved on, which is exactly what a replay must not read
+    *regions.lock().unwrap() = json!([9]);
+    broken.store(true, Ordering::SeqCst);
+
+    let second = runner.replay(&first.id).unwrap();
+    let second = settled(&runner, &second).await;
+    assert_eq!(second.status, RunStatus::Success, "{:?}", second.error);
+    let mut names = op_names(&runner, &second.id);
+    names.sort();
+    assert_eq!(
+        names,
+        ["probe[0][0]", "probe[0][1]", "probe[1][0]", "probe[1][1]",],
+        "the replay expanded over yesterday's regions"
+    );
+}
+
 // a fan-out is one line whose size is decided at run time, so the run has to
 // be able to refuse one — while refusing it still costs nothing
 #[tokio::test]
@@ -4302,6 +4466,57 @@ async fn fan_out_under_file_io_collects_values_not_handles() {
     assert_eq!(
         std::fs::read_to_string(path["path"].as_str().unwrap()).unwrap(),
         r#"{"sum":6}"#
+    );
+}
+
+// an instance's name becomes a path component, and a nested one carries two
+// bracketed groups into it. every one of them still has to land under the
+// directory the manager was given
+#[tokio::test]
+async fn a_nested_fan_out_under_file_io_writes_one_file_per_instance() {
+    let dir = tempfile::tempdir().unwrap();
+    let job = Job::builder("nested")
+        .op(Op::new("regions", |_| async { Ok(json!([2, 1])) }))
+        .op(Op::mapped("sites", |_ctx: OpCtx, region: u64| async move {
+            Ok(json!([region * 10, region * 10 + 1]))
+        })
+        .over("regions"))
+        .op(Op::mapped("probe", |_ctx: OpCtx, site: u64| async move {
+            Ok(json!({ "site": site }))
+        })
+        .over("sites"))
+        .op(Op::new("report", |ctx: OpCtx| async move {
+            Ok(ctx.input("probe").cloned().unwrap())
+        })
+        .after(["probe"]))
+        .build()
+        .unwrap();
+
+    let runner = file_backed(dir.path(), vec![job]);
+    let run = runner
+        .run("nested", json!({}), Trigger::Manual)
+        .await
+        .unwrap();
+    assert_eq!(run.status, RunStatus::Success, "{:?}", run.error);
+
+    let root = dir.path().join(&run.id);
+    for name in ["probe[0][0]", "probe[0][1]", "probe[1][0]", "probe[1][1]"] {
+        let path = root.join(format!("{name}.json"));
+        assert!(path.exists(), "no file at {path:?}");
+    }
+    // and nothing was written outside the run's own directory
+    let stray: Vec<_> = std::fs::read_dir(dir.path())
+        .unwrap()
+        .map(|e| e.unwrap().file_name())
+        .filter(|n| n != std::ffi::OsStr::new(run.id.as_str()))
+        .collect();
+    assert!(stray.is_empty(), "{stray:?}");
+
+    let rows = runner.store().op_runs(&run.id).unwrap();
+    let path = op_row(&rows, "report").output.clone().unwrap();
+    assert_eq!(
+        std::fs::read_to_string(path["path"].as_str().unwrap()).unwrap(),
+        r#"[[{"site":20},{"site":21}],[{"site":10},{"site":11}]]"#
     );
 }
 

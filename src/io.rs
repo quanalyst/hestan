@@ -595,11 +595,14 @@ mod tests {
     /// written for it. the property is that the file lands under the directory
     /// the manager was given — not that the name is a boring one, since an
     /// asset's name is a path and the catalog reads it as one.
-    fn names() -> [(&'static str, bool); 10] {
+    fn names() -> [(&'static str, bool); 11] {
         [
             ("extract", true),
             ("sales/orders", true),
             ("fetch[0]", true),
+            // a fan-out inside a fan-out carries one group per level, and the
+            // whole of it is still one ordinary component
+            ("fetch[0][1]", true),
             ("./deep/nested", true),
             ("orders.2024", true),
             ("../escape", false),

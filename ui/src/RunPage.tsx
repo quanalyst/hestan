@@ -7,6 +7,8 @@ import GanttChart from "./GanttChart";
 import MetaList from "./MetaList";
 import StatusDot from "./StatusDot";
 import { GlyphShape } from "./StatusGlyph";
+import { expansions, fanOut, instanceDeps, instanceTree, rollup } from "./fanout";
+import type { InstanceNode } from "./fanout";
 import { hits, logRows, marks } from "./log";
 import { useMay } from "./role";
 import type { Source } from "./log";
@@ -36,54 +38,30 @@ import {
   shortId,
 } from "./util";
 
-// an instance's label is its index, or the element itself on an op that names
-// its instances by them — which is what makes a partitioned asset's instances
-// read as `daily_orders[2026-01-05]`. so the label is whatever is in the
-// brackets, and what makes it an instance is that its parent is mapped
-const INSTANCE = /^(.*)\[(.+)\]$/;
-
-// a mapped op writes no op_runs row of its own: its instances are the record,
-// so the ui rebuilds the group from their bracketed names
-function fanOut(job: JobSummary | null, ops: OpRun[]): Map<string, OpRun[]> {
-  const mapped = new Set((job?.ops ?? []).filter((o) => o.mapped_over).map((o) => o.name));
-  const out = new Map<string, OpRun[]>();
-  for (const o of ops) {
-    const m = INSTANCE.exec(o.op);
-    if (!m || !mapped.has(m[1])) continue;
-    const group = out.get(m[1]);
-    if (group) group.push(o);
-    else out.set(m[1], [o]);
-  }
-  // element order, which is what the collected output is in; a key-labelled
-  // instance has no index to order by, so its label is the order
-  const label = (o: OpRun) => INSTANCE.exec(o.op)![2];
-  for (const group of out.values())
-    group.sort((a, b) => {
-      const [x, y] = [label(a), label(b)];
-      const [i, j] = [Number(x), Number(y)];
-      return Number.isNaN(i) || Number.isNaN(j) ? x.localeCompare(y) : i - j;
-    });
-  return out;
-}
-
-// the worst thing any instance is doing is what the mapped op is doing:
-// it succeeds only if all of them did
-function rollup(rows: OpRun[]): OpStatus {
-  for (const st of ["failed", "canceled", "running", "pending", "skipped"] as const)
-    if (rows.some((r) => r.status === st)) return st;
-  return "success";
-}
-
-// how many instances a mapped op made, from the expansion event — the only
-// place the count lives when it expanded over an empty array
-function expansions(events: RunEvent[]): Map<string, number> {
-  const out = new Map<string, number>();
-  for (const e of events) {
-    if (e.kind !== "op_expanded" || !e.op) continue;
-    const n = (e.data as { instances?: number } | null)?.instances;
-    if (typeof n === "number") out.set(e.op, n);
-  }
-  return out;
+// the selected mapped op's instances. a fan-out inside a fan-out is a group
+// per outer element rather than one long list, so which outer element a
+// failure sits under is on the page and not only in the name
+function Instances({ nodes }: { nodes: InstanceNode[] }) {
+  return (
+    <div className="op-instances">
+      {nodes.map((n) =>
+        n.kind === "instance" ? (
+          <span key={n.row.op} className="op-instance">
+            <svg className="glyph" width={12} height={12} viewBox="-6 -6 12 12" aria-hidden="true">
+              <GlyphShape status={n.row.status} />
+            </svg>
+            <span className="mono">{n.row.op}</span>
+            <span className="muted">{n.row.status}</span>
+          </span>
+        ) : (
+          <div key={n.label} className="op-instance-group">
+            <span className="mono muted">[{n.label}]</span>
+            <Instances nodes={n.children} />
+          </div>
+        ),
+      )}
+    </div>
+  );
 }
 
 // captured output is paged, and a finished run's poll only fires once — so
@@ -381,7 +359,8 @@ function RunView({ id }: { id: string }) {
           })),
         ...[...instances].flatMap(([parent, rows]) => {
           const op = job.ops.find((o) => o.name === parent);
-          return op ? rows.map((r) => ({ ...op, name: r.op })) : [];
+          if (!op) return [];
+          return rows.map((r) => ({ ...op, name: r.op, deps: instanceDeps(op, r.op, instances) }));
         }),
       ]
     : [];
@@ -489,19 +468,7 @@ function RunView({ id }: { id: string }) {
         />
       )}
 
-      {opSel && instances.has(opSel) && (
-        <div className="op-instances">
-          {instances.get(opSel)!.map((r) => (
-            <span key={r.op} className="op-instance">
-              <svg className="glyph" width={12} height={12} viewBox="-6 -6 12 12" aria-hidden="true">
-                <GlyphShape status={r.status} />
-              </svg>
-              <span className="mono">{r.op}</span>
-              <span className="muted">{r.status}</span>
-            </span>
-          ))}
-        </div>
-      )}
+      {opSel && instances.has(opSel) && <Instances nodes={instanceTree(instances.get(opSel)!)} />}
 
       {selectedPid !== null && (
         <p className="muted dag-action">

@@ -3,6 +3,7 @@
 import "./activity.test";
 import "./backfill.test";
 import "./catalog.test";
+import "./fanout.test";
 import "./lineage.test";
 import "./log.test";
 import "./markdown.test";

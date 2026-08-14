@@ -398,6 +398,19 @@ button:disabled {
   color: var(--ink2);
 }
 
+/* a fan-out inside a fan-out: one block per outer element, its own label to
+   the left of the instances that belong to it */
+.op-instance-group {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  flex-basis: 100%;
+}
+
+.op-instance-group .op-instances {
+  margin: 0;
+}
+
 .bars {
   position: relative;
   display: inline-block;

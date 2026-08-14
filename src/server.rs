@@ -2787,6 +2787,128 @@ mod tests {
         assert_eq!(of("keys")["runs"], 0);
     }
 
+    /// and a fan-out inside a fan-out is the same op's history one level
+    /// further in: the instances are still the only rows it has.
+    #[tokio::test]
+    async fn a_nested_mapped_op_reads_the_history_of_its_instances() {
+        let job = Job::builder("nested")
+            .op(Op::new("regions", |_| async { Ok(json!([1])) }))
+            .op(Op::mapped("sites", |_ctx, _r: u32| async { Ok(json!([1])) }).over("regions"))
+            .op(Op::mapped("probe", |_ctx, _s: u32| async { Ok(json!(null)) }).over("sites"))
+            .build()
+            .unwrap();
+        let st = state(vec![job]);
+        let store = st.runner.store();
+        let ops = ["sites[0]", "probe[0][0]", "probe[0][1]"].map(String::from);
+        let run = Run {
+            id: "r0".into(),
+            job: "nested".into(),
+            status: RunStatus::Failed,
+            trigger: Trigger::Manual,
+            params: json!({}),
+            created_at: Utc::now(),
+            started_at: None,
+            finished_at: None,
+            error: None,
+            resumed_from: None,
+            replay_of: None,
+            scheduled_for: None,
+            tags: Default::default(),
+            priority: 0,
+            claimed_by: None,
+            claimed_at: None,
+            lease_until: None,
+            actor: None,
+        };
+        store.create_run(&run, &ops).unwrap();
+        for op in &ops {
+            store.op_started(&run.id, op, 1).unwrap();
+        }
+        store
+            .op_finished(
+                &run.id,
+                "sites[0]",
+                OpStatus::Success,
+                None,
+                None,
+                None,
+                &[],
+            )
+            .unwrap();
+        store
+            .op_finished(
+                &run.id,
+                "probe[0][0]",
+                OpStatus::Success,
+                None,
+                None,
+                None,
+                &[],
+            )
+            .unwrap();
+        store
+            .op_finished(
+                &run.id,
+                "probe[0][1]",
+                OpStatus::Failed,
+                None,
+                None,
+                Some("no"),
+                &[],
+            )
+            .unwrap();
+
+        let Json(body) = op_stats(
+            State(st),
+            Path("nested".into()),
+            Ok(Query(OpStatsQuery { runs: None })),
+        )
+        .await
+        .unwrap();
+        let of = |name: &str| {
+            body["ops"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|o| o["op"] == name)
+                .unwrap()
+                .clone()
+        };
+        let probe = of("probe");
+        assert_eq!(probe["runs"], 2, "both levels of the name roll up");
+        assert_eq!(probe["failures"], 1);
+        assert_eq!(probe["last_error"], "no");
+        assert_eq!(of("sites")["runs"], 1);
+        assert_eq!(of("regions")["runs"], 0);
+    }
+
+    // the trend an op reported is read under the name the row was written
+    // with, and a nested instance is a name the job does not declare
+    #[tokio::test]
+    async fn a_nested_instance_can_be_asked_for_its_own_metadata_trend() {
+        let job = Job::builder("nested")
+            .op(Op::new("regions", |_| async { Ok(json!([1])) }))
+            .op(Op::mapped("sites", |_ctx, _r: u32| async { Ok(json!([1])) }).over("regions"))
+            .op(Op::mapped("probe", |_ctx, _s: u32| async { Ok(json!(null)) }).over("sites"))
+            .build()
+            .unwrap();
+        let st = state(vec![job]);
+        let asked = |op: &str| {
+            op_metadata_series(
+                State(st.clone()),
+                Path(("nested".into(), op.to_string(), "rows".into())),
+                Ok(Query(SeriesQuery {
+                    limit: None,
+                    partition: None,
+                })),
+            )
+        };
+        assert!(asked("probe[0][1]").await.is_ok());
+        assert!(asked("probe").await.is_ok());
+        let refused = asked("nowhere[0][1]").await.err().unwrap();
+        assert_eq!(refused.0, StatusCode::NOT_FOUND);
+    }
+
     #[tokio::test]
     async fn op_stats_lists_ops_without_history() {
         let job = Job::builder("fresh")
