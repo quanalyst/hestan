@@ -18,7 +18,7 @@ use crate::io::{Io, IoManager};
 use crate::job::Job;
 use crate::logs;
 use crate::model::{Reclaim, Role, Run, RunTags, Trigger};
-use crate::resource::{self, Resource, ResourceCtx, ResourceFn};
+use crate::resource::{self, Resource, ResourceCtx, ResourceFn, RunResource, RunResourceFn};
 use crate::retention::{self, Retention};
 use crate::schedule::{self, Schedule, ScheduleEntry};
 use crate::sensor::{RunStatusSensor, Sensor, SensorEntry, run_sensors};
@@ -65,6 +65,7 @@ pub struct Hestan {
     pools: Vec<(String, usize)>,
     rates: Vec<(String, usize, Duration)>,
     resources: Vec<(String, ResourceFn)>,
+    run_resources: Vec<RunResource>,
     io_default: Option<Arc<dyn IoManager>>,
     io_named: HashMap<String, Arc<dyn IoManager>>,
     db_path: String,
@@ -105,6 +106,7 @@ impl Default for Hestan {
             pools: Vec::new(),
             rates: Vec::new(),
             resources: Vec::new(),
+            run_resources: Vec::new(),
             io_default: None,
             io_named: HashMap::new(),
             db_path: "hestan.db".into(),
@@ -356,9 +358,10 @@ impl Hestan {
     /// [`ResourceCtx`] holding the ones before it, so a client can lean on
     /// the config it reads.
     ///
-    /// resources live for the process: there is no per-run scoping and no
-    /// teardown hook in this phase. anything needing either should own it
-    /// inside the op.
+    /// resources live for the process. that is right for a connection pool, an
+    /// api client, a parsed config — anything a run should not have to build
+    /// and every run may share. for the other kind, a value one run must not
+    /// share with the next, see [`run_resource`](Self::run_resource).
     ///
     /// ops read one with [`OpCtx::resource`](crate::OpCtx::resource), and
     /// declaring it with [`Op::requires`](crate::Op::requires) turns a
@@ -434,6 +437,75 @@ impl Hestan {
             })
         });
         self.resources.push((name.into(), ctor));
+        self
+    }
+
+    /// register a run-scoped resource: a value built when a run starts and
+    /// dropped when it ends, for what a run must not share with the next one.
+    ///
+    /// ```no_run
+    /// # use hestan::{Hestan, Op, OpCtx};
+    /// # use serde_json::json;
+    /// # struct Scratch(std::path::PathBuf);
+    /// # impl Scratch { fn under(_: &str) -> Result<Scratch, std::io::Error> { todo!() } }
+    /// Hestan::new()
+    ///     .run_resource("scratch", |ctx| async move {
+    ///         // named for the run, so what it leaves behind can be traced
+    ///         Ok(Scratch::under(ctx.run_id().unwrap_or("no-run"))?)
+    ///     })
+    ///     .job(todo!());
+    /// ```
+    ///
+    /// a scratch directory, a per-tenant client, a token that belongs to one
+    /// execution: something two runs sharing would be a bug rather than a
+    /// saving. every op of the run reads it with
+    /// [`OpCtx::resource`](crate::OpCtx::resource) exactly as it reads a
+    /// process-wide one, and [`Op::requires`](crate::Op::requires) declares
+    /// either kind — the difference is how long the value lives, not how an op
+    /// asks for it.
+    ///
+    /// **what it costs**: the constructor runs for every run, so a value that
+    /// is expensive to build is expensive per run rather than once. a
+    /// connection pool built this way is a pool per run — a hundred pools on a
+    /// busy afternoon, each with its own connections, which is almost always a
+    /// mistake. build the pool with [`resource`](Self::resource) and put the
+    /// run's own short-lived thing here.
+    ///
+    /// the constructor sees the process-wide resources and the run-scoped ones
+    /// declared before it, and [`ResourceCtx::run_id`] says which run it is
+    /// for. one that fails fails the run before any op of it runs, with
+    /// `resource {name}: {reason}` on the run row — nothing else could be true
+    /// of an op that needed it. a name already used by a process-wide resource
+    /// is [`Error::Resource`] at build, so `ctx.resource("x")` never means two
+    /// things.
+    ///
+    /// **dropping**: the value is dropped when the run reaches a terminal
+    /// status, when it is cancelled, and when the process gives up on it — and
+    /// on the blocking pool rather than on the runtime, since a `Drop` that
+    /// closes a socket or removes a directory blocks. an op that kept its
+    /// `Arc` past the end of the run holds the value up until it lets go: the
+    /// last holder drops it, and hestan cannot see the end of work that keeps
+    /// nothing of hestan's.
+    pub fn run_resource<T, F, Fut>(mut self, name: impl Into<String>, f: F) -> Self
+    where
+        T: Any + Send + Sync,
+        F: Fn(ResourceCtx) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<T, Box<dyn std::error::Error + Send + Sync>>> + Send + 'static,
+    {
+        let build: RunResourceFn = Arc::new(move |ctx: ResourceCtx| {
+            let fut = f(ctx);
+            Box::pin(async move {
+                Ok(Resource {
+                    type_name: std::any::type_name::<T>(),
+                    value: Arc::new(fut.await?),
+                })
+            })
+        });
+        self.run_resources.push(RunResource {
+            name: name.into(),
+            type_name: std::any::type_name::<T>(),
+            build,
+        });
         self
     }
 
@@ -1099,10 +1171,17 @@ impl Hestan {
     ) -> Result<crate::isolate::Worked, Error> {
         let (jobs, _) = self.lower()?;
         let resources = resource::build(std::mem::take(&mut self.resources)).await?;
+        // the child builds the run's own resources too, for the one op it is
+        // here to run: a value scoped to a run is scoped to this op's share of
+        // it, exactly as a process-wide one in a child is this process's copy
+        // and not the parent's. it goes when the process does, which is when
+        // the op is over
+        let declared = Arc::new(std::mem::take(&mut self.run_resources));
+        let scoped = resource::for_run(&declared, &resources, &req.run_id).await?;
         let store = Store::at(&self.db_path)?;
         logs::set_caps(Some(self.log_bytes), Some(self.log_line_cap));
         let io = Io::new(self.io_default.take(), std::mem::take(&mut self.io_named));
-        crate::isolate::run_one_op(&req, &jobs, &store, &io, &resources).await
+        crate::isolate::run_one_op(&req, &jobs, &store, &io, &scoped.resources()).await
     }
 
     /// the store this app is configured with, opened and migrated and
@@ -1228,14 +1307,21 @@ impl Hestan {
             tracing::info!("trimmed {trimmed} asset history rows past the cap");
         }
         let io = Io::new(self.io_default, self.io_named);
-        let mut runner =
-            Runner::with_resources(jobs, store, self.hooks, self.pools, resources, io)?
-                .with_rates(self.rates)?
-                .with_hooks(self.run_hooks, self.op_hooks)
-                .with_run_tags(self.run_tags)
-                .with_limits(self.limits, self.priority)
-                .with_reclaim(self.reclaim)
-                .with_role(self.role, self.slots);
+        let mut runner = Runner::with_resources(
+            jobs,
+            store,
+            self.hooks,
+            self.pools,
+            resources,
+            self.run_resources,
+            io,
+        )?
+        .with_rates(self.rates)?
+        .with_hooks(self.run_hooks, self.op_hooks)
+        .with_run_tags(self.run_tags)
+        .with_limits(self.limits, self.priority)
+        .with_reclaim(self.reclaim)
+        .with_role(self.role, self.slots);
         if self.durable {
             runner = runner.with_durable_notifications();
         }

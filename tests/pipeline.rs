@@ -3584,6 +3584,81 @@ async fn a_required_resource_that_is_not_registered_fails_the_build() {
         .await
         .unwrap();
     assert_eq!(run.status, RunStatus::Success);
+
+    // and a run-scoped one satisfies the same declaration: `requires` is about
+    // whether the name is registered, not about how long the value lives
+    let run = Hestan::new()
+        .run_resource("api", |_| async {
+            Ok(ApiClient {
+                base: "https://api".into(),
+            })
+        })
+        .job(job())
+        .db(":memory:")
+        .run_once("needy", json!({}))
+        .await
+        .unwrap();
+    assert_eq!(run.status, RunStatus::Success);
+}
+
+// the two scopes at one call site: a client every run shares and a scratch
+// directory none of them does, read the same way by the same op
+#[tokio::test]
+async fn a_run_scoped_resource_is_one_value_for_the_whole_run_and_names_it() {
+    let scratches = Arc::new(AtomicU32::new(0));
+    let counted = scratches.clone();
+    let seen: Arc<Mutex<Vec<(String, usize)>>> = Arc::new(Mutex::new(Vec::new()));
+    let (first, second) = (seen.clone(), seen.clone());
+    let reader = move |seen: Arc<Mutex<Vec<(String, usize)>>>| {
+        move |ctx: OpCtx| {
+            let seen = seen.clone();
+            async move {
+                let api = ctx.resource::<ApiClient>("api")?;
+                let scratch = ctx.resource::<String>("scratch")?;
+                assert_eq!(api.base, "https://api");
+                seen.lock()
+                    .unwrap()
+                    .push((scratch.to_string(), Arc::as_ptr(&scratch) as usize));
+                Ok(json!(null))
+            }
+        }
+    };
+    let job = Job::builder("work")
+        .op(Op::new("head", reader(first)).requires(["api", "scratch"]))
+        .op(Op::new("tail", reader(second))
+            .after(["head"])
+            .requires(["api", "scratch"]))
+        .build()
+        .unwrap();
+
+    let run = Hestan::new()
+        .resource("api", |_| async {
+            Ok(ApiClient {
+                base: "https://api".into(),
+            })
+        })
+        .run_resource("scratch", move |ctx: hestan::ResourceCtx| {
+            let counted = counted.clone();
+            async move {
+                counted.fetch_add(1, Ordering::SeqCst);
+                // the run it belongs to, which is what a scratch directory
+                // wants to be named after
+                Ok(format!("/tmp/{}", ctx.run_id().unwrap_or("nowhere")))
+            }
+        })
+        .job(job)
+        .db(":memory:")
+        .run_once("work", json!({}))
+        .await
+        .unwrap();
+
+    assert_eq!(run.status, RunStatus::Success);
+    // one value for the run, not one per op that asked
+    assert_eq!(scratches.load(Ordering::SeqCst), 1);
+    let seen = seen.lock().unwrap();
+    assert_eq!(seen.len(), 2);
+    assert_eq!(seen[0].0, format!("/tmp/{}", run.id));
+    assert_eq!(seen[0], seen[1], "the two ops got two different values");
 }
 
 // a process whose client could not be built has nothing useful to serve, and

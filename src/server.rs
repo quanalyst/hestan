@@ -505,15 +505,26 @@ async fn whoami(
     }))
 }
 
-// names and declared types only: a resource is usually a client holding
-// credentials, and the api has no business showing what is inside one
+// names, declared types and how long each one lives: a resource is usually a
+// client holding credentials, and the api has no business showing what is
+// inside one. a run-scoped resource is reported as declared rather than as
+// built — nothing of it exists between runs
 async fn list_resources(State(st): State<AppState>) -> Json<Value> {
-    let resources: Vec<Value> = st
+    let scoped = |scope: &'static str| {
+        move |(name, ty): (&str, &'static str)| {
+            json!({
+                "name": name, "type": ty, "scope": scope
+            })
+        }
+    };
+    let mut resources: Vec<Value> = st
         .runner
         .resources()
         .into_iter()
-        .map(|(name, ty)| json!({ "name": name, "type": ty }))
+        .map(scoped("process"))
+        .chain(st.runner.run_resources().into_iter().map(scoped("run")))
         .collect();
+    resources.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str()));
     Json(json!({ "resources": resources }))
 }
 
@@ -3574,12 +3585,18 @@ mod tests {
                 value: Arc::new("s3cret".to_string()),
             },
         );
+        let scratch = crate::resource::RunResource {
+            name: "scratch".to_string(),
+            type_name: "demo::Scratch",
+            build: Arc::new(|_| Box::pin(async { unreachable!("never built here") })),
+        };
         let runner = Runner::with_resources(
             Vec::<Job>::new(),
             Store::open(":memory:").unwrap(),
             Vec::new(),
             Vec::new(),
             Arc::new(built),
+            vec![scratch],
             crate::io::Io::default(),
         )
         .unwrap();
@@ -3593,7 +3610,10 @@ mod tests {
         let Json(body) = list_resources(State(st)).await;
         assert_eq!(
             body,
-            json!({ "resources": [ { "name": "api", "type": "demo::ApiClient" } ] })
+            json!({ "resources": [
+                { "name": "api", "type": "demo::ApiClient", "scope": "process" },
+                { "name": "scratch", "type": "demo::Scratch", "scope": "run" },
+            ] })
         );
         assert!(!body.to_string().contains("s3cret"));
     }

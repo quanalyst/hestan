@@ -21,7 +21,7 @@ use crate::model::{
 };
 use crate::op::{self, Cancel, MetaBuf, Op, OpCtx};
 use crate::rate::{Rate, RateStatus, Rates, Ticket};
-use crate::resource::{self, Resources};
+use crate::resource::{self, Resources, RunResource, RunResources};
 use crate::store::{Built, RunKey, Store, note};
 
 /// how far back a resume follows `resumed_from` links. resuming a resume is
@@ -433,6 +433,9 @@ pub struct Runner {
     pools: Pools,
     rates: Rates,
     resources: Resources,
+    // built for each run this process starts and dropped with it, which is the
+    // whole difference from `resources`
+    run_resources: RunResources,
     io: Io,
     // tags every run this runner launches carries, under whatever the launch
     // itself said
@@ -519,6 +522,7 @@ impl Runner {
             pools: Arc::new(HashMap::new()),
             rates: Arc::new(HashMap::new()),
             resources: resource::none(),
+            run_resources: Arc::new(Vec::new()),
             io: Io::default(),
             run_tags: Arc::new(RunTags::new()),
             claimer: instance_id(),
@@ -664,7 +668,15 @@ impl Runner {
         hooks: Vec<FailureHook>,
         pools: impl IntoIterator<Item = (String, usize)>,
     ) -> Result<Runner, Error> {
-        Runner::with_resources(jobs, store, hooks, pools, resource::none(), Io::default())
+        Runner::with_resources(
+            jobs,
+            store,
+            hooks,
+            pools,
+            resource::none(),
+            Vec::new(),
+            Io::default(),
+        )
     }
 
     /// like [`Runner::with_pools`] with [io managers](crate::IoManager)
@@ -684,7 +696,7 @@ impl Runner {
         named: impl IntoIterator<Item = (String, Arc<dyn IoManager>)>,
     ) -> Result<Runner, Error> {
         let io = Io::new(Some(default), named.into_iter().collect());
-        Runner::with_resources(jobs, store, hooks, pools, resource::none(), io)
+        Runner::with_resources(jobs, store, hooks, pools, resource::none(), Vec::new(), io)
     }
 
     /// like [`Runner::with_pools`] plus the process-wide resources every op
@@ -698,6 +710,7 @@ impl Runner {
         hooks: Vec<FailureHook>,
         pools: impl IntoIterator<Item = (String, usize)>,
         resources: Resources,
+        run_resources: Vec<RunResource>,
         io: Io,
     ) -> Result<Runner, Error> {
         let mut declared: HashMap<String, Pool> = HashMap::new();
@@ -728,10 +741,24 @@ impl Runner {
                 }
             }
         }
+        // a name means one thing or the build says so: an op asking for it
+        // would otherwise get whichever scope happened to win, and the two
+        // have different lifetimes
+        for decl in &run_resources {
+            if resources.contains_key(&decl.name) {
+                return Err(Error::Resource {
+                    name: decl.name.clone(),
+                    reason: "declared both for the process and for each run".into(),
+                });
+            }
+        }
+        let registered = |name: &str| {
+            resources.contains_key(name) || run_resources.iter().any(|d| d.name == name)
+        };
         for job in runner.jobs.values() {
             for op in job.ops() {
                 for name in op.required_resources() {
-                    if !resources.contains_key(name) {
+                    if !registered(name) {
                         return Err(Error::Graph(format!(
                             "job {}: op {} requires resource {name}, which is not registered",
                             job.name(),
@@ -777,6 +804,7 @@ impl Runner {
         Ok(Runner {
             pools: Arc::new(declared),
             resources,
+            run_resources: Arc::new(run_resources),
             io,
             ..runner
         })
@@ -835,6 +863,20 @@ impl Runner {
             .collect();
         all.sort_by_key(|(name, _)| *name);
         all
+    }
+
+    /// the [run-scoped](crate::Hestan::run_resource) resources this runner
+    /// declares, by name and declared type, in declaration order — which is
+    /// the order they are built in.
+    ///
+    /// nothing is built until a run starts, so this is what is declared rather
+    /// than what exists. the type is known anyway: it is the one the
+    /// constructor was written to return.
+    pub fn run_resources(&self) -> Vec<(&str, &'static str)> {
+        self.run_resources
+            .iter()
+            .map(|decl| (decl.name.as_str(), decl.type_name))
+            .collect()
     }
 
     /// the run log this runner writes to, for reading it back. cloning it is
@@ -2172,6 +2214,9 @@ async fn execute_in_span(
     let mut failed = false;
     let mut canceled = false;
     let mut first_failure: Option<(String, String)> = None;
+    // what went wrong before any op could: the run's own error, where there is
+    // no op row to read it off
+    let mut run_error: Option<String> = None;
     let mut tasks: JoinSet<OpOutcome> = JoinSet::new();
     // JoinError only carries the task id, so remember which op each task is
     let mut names: HashMap<Id, String> = HashMap::new();
@@ -2183,6 +2228,26 @@ async fn execute_in_span(
     // fan-out state: what each instance is for, and where its output belongs
     let mut instances: HashMap<String, Instance> = HashMap::new();
     let mut fanouts: HashMap<String, Fanout> = HashMap::new();
+
+    // this run's own resources, built before the first op is dispatched and
+    // dropped when this function returns — which every way of a run ending
+    // goes through, including the task being dropped from under it. it is
+    // held for that and nothing else.
+    let scoped = resource::for_run(&runner.run_resources, &runner.resources, &run_id).await;
+    let resources = match &scoped {
+        Ok(scoped) => scoped.resources(),
+        Err(e) => {
+            // no op of this run can be true without it, so none of them runs
+            // and every row says why
+            let reason = format!("skipped: {e}");
+            for name in pending.drain(..) {
+                unrecorded |= !op_skipped(&store, &run_id, &name, &reason, None).await;
+            }
+            failed = true;
+            run_error = Some(e.to_string());
+            resource::none()
+        }
+    };
 
     'run: while !unrecorded {
         // settle every unit whose deps have all reached a terminal status: its
@@ -2517,7 +2582,7 @@ async fn execute_in_span(
                     Arc::new(inputs),
                     Arc::new(dep_statuses),
                     invocation,
-                    runner.resources.clone(),
+                    resources.clone(),
                     store.clone(),
                     runner.io.clone(),
                     runner.pools.clone(),
@@ -2979,10 +3044,13 @@ async fn execute_in_span(
         _ => (EventLevel::Info, EventKind::RunSuccess, "run succeeded"),
     };
     // the run's own error: the first op that terminally failed, named, so a
-    // hook or an alert reading the run row sees what RunFailure carries
-    let error = first_failure
-        .as_ref()
-        .map(|(op, msg)| format!("op {op} failed: {msg}"));
+    // hook or an alert reading the run row sees what RunFailure carries. or
+    // what stopped the run before it ran one, which no op row carries
+    let error = run_error.or_else(|| {
+        first_failure
+            .as_ref()
+            .map(|(op, msg)| format!("op {op} failed: {msg}"))
+    });
     // event first: anyone who reads a terminal status must also see this line
     let ended_at = Utc::now();
     note(store.append_event(
@@ -3721,21 +3789,7 @@ async fn skip_downstream(
     while i < pending.len() {
         if down.contains(&pending[i]) {
             let name = pending.remove(i);
-            // event first, like every other terminal transition
-            note(store.append_event(
-                run_id,
-                Some(&name),
-                EventLevel::Warn,
-                EventKind::OpSkipped,
-                reason,
-                Some(&json!({ "reason": reason, "upstream": root })),
-            ));
-            if !store
-                .landed("op_finished", || {
-                    store.op_finished(run_id, &name, OpStatus::Skipped, None, None, None, &[])
-                })
-                .await
-            {
+            if !op_skipped(store, run_id, &name, reason, Some(root)).await {
                 return false;
             }
             statuses.insert(name, OpStatus::Skipped);
@@ -3744,6 +3798,34 @@ async fn skip_downstream(
         }
     }
     true
+}
+
+/// record one op that will not run, with the reason on its row and in the log.
+///
+/// `upstream` names the op whose failure reached this one, and is `None` when
+/// nothing above it is what stopped it — a run that could not build a
+/// [run-scoped resource](crate::Hestan::run_resource) never ran an op at all.
+async fn op_skipped(
+    store: &Store,
+    run_id: &str,
+    name: &str,
+    reason: &str,
+    upstream: Option<&str>,
+) -> bool {
+    // event first, like every other terminal transition
+    note(store.append_event(
+        run_id,
+        Some(name),
+        EventLevel::Warn,
+        EventKind::OpSkipped,
+        reason,
+        Some(&json!({ "reason": reason, "upstream": upstream })),
+    ));
+    store
+        .landed("op_finished", || {
+            store.op_finished(run_id, name, OpStatus::Skipped, None, None, None, &[])
+        })
+        .await
 }
 
 #[cfg(test)]
@@ -4815,6 +4897,251 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
         panic!("the run neither finished nor was given up on");
+    }
+
+    // ---- run-scoped resources ----
+
+    /// a value that says when it was dropped, for which run, and on which
+    /// thread. dropping it is the whole of what it does.
+    struct Scratch {
+        run: String,
+        dropped: std::sync::mpsc::Sender<(String, std::thread::ThreadId)>,
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = self
+                .dropped
+                .send((self.run.clone(), std::thread::current().id()));
+        }
+    }
+
+    /// one run-scoped declaration handing every run a `Scratch` of its own.
+    fn scratch(
+        dropped: std::sync::mpsc::Sender<(String, std::thread::ThreadId)>,
+    ) -> Vec<RunResource> {
+        let type_name = std::any::type_name::<Scratch>();
+        vec![RunResource {
+            name: "scratch".to_string(),
+            type_name,
+            build: Arc::new(move |ctx: crate::resource::ResourceCtx| {
+                let run = ctx.run_id().expect("built for a run").to_string();
+                let dropped = dropped.clone();
+                Box::pin(async move {
+                    Ok(crate::resource::Resource {
+                        type_name,
+                        value: Arc::new(Scratch { run, dropped }),
+                    })
+                })
+            }),
+        }]
+    }
+
+    fn with_scratch(
+        jobs: impl IntoIterator<Item = Job>,
+        store: Store,
+        dropped: std::sync::mpsc::Sender<(String, std::thread::ThreadId)>,
+    ) -> Runner {
+        Runner::with_resources(
+            jobs,
+            store,
+            Vec::new(),
+            Vec::new(),
+            resource::none(),
+            scratch(dropped),
+            Io::default(),
+        )
+        .unwrap()
+    }
+
+    // a run's own value goes when the run does, and every way of a run ending
+    // is one of them: the guard is held by the task driving the run, so what
+    // drops it is that task returning rather than a line at the end of it
+    #[tokio::test]
+    async fn a_run_scoped_resource_is_dropped_however_the_run_ends() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_, store) = file_store(&dir);
+        let (tx, dropped) = std::sync::mpsc::channel();
+        let took = |what: &str| {
+            dropped
+                .recv_timeout(Duration::from_secs(30))
+                .unwrap_or_else(|e| panic!("{what}: nothing was dropped: {e}"))
+        };
+
+        // it worked
+        let ok = Job::builder("ok")
+            .op(Op::new("work", |_| async { Ok(json!(null)) }))
+            .build()
+            .unwrap();
+        // it failed
+        let bad = Job::builder("bad")
+            .op(Op::new("work", |_| async { Err("no".into()) }))
+            .build()
+            .unwrap();
+        let runner = with_scratch([ok, bad, sleepy_job("slow", 30_000)], store.clone(), tx);
+
+        let id = runner.launch("ok", json!({}), Trigger::Manual).unwrap();
+        assert_eq!(wait_terminal(&runner, &id).await, RunStatus::Success);
+        let (run, thread) = took("success");
+        assert_eq!(run, id);
+        // and off the runtime, which is what a `Drop` that closes a socket
+        // needs: this test runs on one runtime thread and the drop did not.
+        // asserted on the route where nothing else can still be holding the
+        // value — an op that outlives its own cancellation holds it until it
+        // lets go, wherever that leaves it
+        assert_ne!(thread, std::thread::current().id());
+
+        let id = runner.launch("bad", json!({}), Trigger::Manual).unwrap();
+        assert_eq!(wait_terminal(&runner, &id).await, RunStatus::Failed);
+        assert_eq!(took("failure").0, id);
+
+        // it was cancelled
+        let id = runner.launch("slow", json!({}), Trigger::Manual).unwrap();
+        assert_eq!(runner.cancel(&id).unwrap(), CancelOutcome::Requested);
+        assert_eq!(wait_terminal(&runner, &id).await, RunStatus::Canceled);
+        assert_eq!(took("cancellation").0, id);
+
+        // and the store gave up on it, which reports no outcome at all — the
+        // one route with no terminal row to hang a teardown off
+        let quiet = Job::builder("quiet")
+            .op(Op::new("work", |_| async { Ok(json!(null)) }))
+            .build()
+            .unwrap();
+        let (tx, dropped) = std::sync::mpsc::channel();
+        let runner = with_scratch([quiet], store.clone(), tx);
+        store.fail_writes_to("op_finished", u64::MAX);
+        let id = runner.launch("quiet", json!({}), Trigger::Manual).unwrap();
+        given_up(&runner, &store).await;
+        store.fail_writes(0);
+        assert_eq!(
+            dropped
+                .recv_timeout(Duration::from_secs(30))
+                .expect("nothing was dropped for the run that was given up on")
+                .0,
+            id
+        );
+    }
+
+    // the point of the scope: two runs in flight at once hold two values, and
+    // neither can see the other's. a process-wide resource is the opposite
+    // promise and `one_resource_reaches_every_op_that_asks_for_it` holds it
+    #[tokio::test]
+    async fn two_runs_at_once_each_hold_their_own_run_scoped_value() {
+        let store = Store::open(":memory:").unwrap();
+        let (tx, _dropped) = std::sync::mpsc::channel();
+        // both ops wait here, so the two runs are provably in flight together
+        // rather than one after the other on a quiet machine
+        let together = Arc::new(tokio::sync::Barrier::new(2));
+        let seen: Arc<Mutex<Vec<(String, usize)>>> = Arc::new(Mutex::new(Vec::new()));
+        let (gate, saw) = (together.clone(), seen.clone());
+        let job = Job::builder("etl")
+            .op(Op::new("work", move |ctx: OpCtx| {
+                let (gate, saw) = (gate.clone(), saw.clone());
+                async move {
+                    let scratch = ctx.resource::<Scratch>("scratch")?;
+                    gate.wait().await;
+                    saw.lock()
+                        .unwrap()
+                        .push((scratch.run.clone(), Arc::as_ptr(&scratch) as usize));
+                    Ok(json!(null))
+                }
+            })
+            .requires(["scratch"]))
+            .build()
+            .unwrap();
+        let runner = with_scratch([job], store.clone(), tx);
+
+        let first = runner.launch("etl", json!({}), Trigger::Manual).unwrap();
+        let second = runner.launch("etl", json!({}), Trigger::Manual).unwrap();
+        for id in [&first, &second] {
+            assert_eq!(wait_terminal(&runner, id).await, RunStatus::Success);
+        }
+
+        let mut seen = seen.lock().unwrap().clone();
+        seen.sort();
+        let mut ids = [first, second];
+        ids.sort();
+        assert_eq!(seen.len(), 2);
+        // each op read the value built for its own run
+        assert_eq!([seen[0].0.clone(), seen[1].0.clone()], ids);
+        assert_ne!(seen[0].1, seen[1].1, "the two runs shared one value");
+    }
+
+    // a run that cannot build what its ops read has nothing useful to do, and
+    // says so on the run rather than pretending an op failed
+    #[tokio::test]
+    async fn a_run_scoped_resource_that_cannot_be_built_fails_the_run_before_any_op() {
+        let store = Store::open(":memory:").unwrap();
+        let ran = Arc::new(AtomicBool::new(false));
+        let watched = ran.clone();
+        let job = Job::builder("etl")
+            .op(Op::new("work", move |_| {
+                let ran = watched.clone();
+                async move {
+                    ran.store(true, Ordering::SeqCst);
+                    Ok(json!(null))
+                }
+            })
+            .requires(["scratch"]))
+            .build()
+            .unwrap();
+        let declared = vec![RunResource {
+            name: "scratch".to_string(),
+            type_name: "tests::Scratch",
+            build: Arc::new(|_| Box::pin(async { Err("the disk is full".into()) })),
+        }];
+        let runner = Runner::with_resources(
+            [job],
+            store.clone(),
+            Vec::new(),
+            Vec::new(),
+            resource::none(),
+            declared,
+            Io::default(),
+        )
+        .unwrap();
+
+        let id = runner.launch("etl", json!({}), Trigger::Manual).unwrap();
+        assert_eq!(wait_terminal(&runner, &id).await, RunStatus::Failed);
+        assert!(!ran.load(Ordering::SeqCst), "the op ran without it");
+        let run = store.run(&id).unwrap().unwrap();
+        assert_eq!(
+            run.error.as_deref(),
+            Some("resource scratch: the disk is full")
+        );
+        // and the op it never ran says why rather than sitting unaccounted for
+        let op = store.op_runs(&id).unwrap().remove(0);
+        assert_eq!(op.status, OpStatus::Skipped);
+    }
+
+    // a name has to mean one thing: an op asking for it would otherwise get
+    // whichever scope won, and the two live for different lengths of time
+    #[test]
+    fn a_name_declared_in_both_scopes_is_refused_at_build() {
+        let mut process = HashMap::new();
+        process.insert(
+            "scratch".to_string(),
+            crate::resource::Resource {
+                type_name: "tests::Scratch",
+                value: Arc::new(()),
+            },
+        );
+        let (tx, _dropped) = std::sync::mpsc::channel();
+        let built = Runner::with_resources(
+            Vec::<Job>::new(),
+            Store::open(":memory:").unwrap(),
+            Vec::new(),
+            Vec::new(),
+            Arc::new(process),
+            scratch(tx),
+            Io::default(),
+        );
+        let err = built.err().expect("two scopes, one name");
+        assert!(
+            err.to_string()
+                .contains("resource scratch: declared both for the process and for each run"),
+            "{err}"
+        );
     }
 
     // the whole point of the phase: an op that worked, a store that will not

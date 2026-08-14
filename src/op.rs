@@ -1484,9 +1484,12 @@ impl OpCtx {
         serde_json::from_value(v.clone()).map_err(|e| InputError::Mismatch(e.to_string()))
     }
 
-    /// a process-wide resource, built once at startup by
-    /// `Hestan::resource(name, ..)` and shared by every op that asks — the
-    /// replacement for capturing a client in a closure.
+    /// a resource by name: one built once at startup by
+    /// `Hestan::resource(name, ..)` and shared by every op that asks, or one
+    /// built for this run by `Hestan::run_resource(name, ..)` and dropped when
+    /// it ends. either way it is the replacement for capturing a client in a
+    /// closure, and the call is the same — what differs is how long the value
+    /// lives, which is the declaration's business rather than the op's.
     ///
     /// ```no_run
     /// # use hestan::{Op, OpCtx};
@@ -1501,7 +1504,9 @@ impl OpCtx {
     /// ```
     ///
     /// the error says which of the two things went wrong: there is no such
-    /// resource, or there is and it is something else.
+    /// resource, or there is and it is something else. a run-scoped name asked
+    /// for outside a run — from a sensor, say — is the first of those: nothing
+    /// built it, because there is no run for it to belong to.
     pub fn resource<T: std::any::Any + Send + Sync>(
         &self,
         name: &str,
