@@ -303,6 +303,14 @@ standalone binary for those two. [docs/cli.md](docs/cli.md).
   of recomputing them. source assets stand for external data and carry a
   cheap fingerprint probe; `.auto()` assets rebuild themselves when a probe
   upstream makes them stale
+- a **partitioned** asset materializes once per key of a daily, hourly or
+  static key set, and a dep between two of them declares *which* keys it reads:
+  `Asset::reads(&hourly, PartitionMapping::covering())` is a daily rollup of
+  hourly data, with `offset(-1)` for yesterday's key and `all` for every key at
+  once. staleness follows the mapping — a build records a fingerprint per
+  upstream key it consumed, so the day is stale when an hour under it moves and
+  says which hour — and a pairing that could never resolve fails at build
+  rather than at 3am
 - materializations are append-only history, capped per asset: each build
   leaves an entry, and every entry says whether the fingerprint actually
   moved — so "when did this last change" is a question with an answer, not

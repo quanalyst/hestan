@@ -362,7 +362,10 @@ impl PartitionMapping {
     ///
     /// a window promises its whole range: a key whose dep does not hold every
     /// hour of it is refused at the build that names it, rather than
-    /// materialized from the part that happens to be there.
+    /// materialized from the part that happens to be there. the exception is
+    /// the range the dep's clock has not reached — the hours left in today —
+    /// which is not missing but not yet due, so a rollup of the day so far
+    /// builds and goes stale as each hour lands.
     pub fn covering() -> PartitionMapping {
         PartitionMapping {
             shape: Shape::Covering,
@@ -432,10 +435,16 @@ impl PartitionMapping {
                 let covered = here
                     .map(|(own, key)| covered(&own.kind, key, &dep.kind))
                     .unwrap_or_default();
+                // a key the dep's set has not reached yet is not missing, it
+                // is not due: a generated set grows with the clock, and what
+                // it holds up to now is all there is to read. a key *before*
+                // what it holds is the one that never arrives
+                let last = dep.keys().last();
                 for k in covered {
-                    match dep.holds(&k) {
-                        true => reads.keys.push(k),
-                        false => reads.missing.push(k),
+                    match (dep.holds(&k), last) {
+                        (true, _) => reads.keys.push(k),
+                        (false, Some(last)) if &k > last => {}
+                        (false, _) => reads.missing.push(k),
                     }
                 }
                 reads
@@ -453,10 +462,10 @@ impl PartitionMapping {
 }
 
 /// what one partition reads from one dep: the dep keys it takes, and the ones
-/// it promised that the dep does not hold. `missing` is empty for every shape
-/// but [`covering`](PartitionMapping::covering), which promises a whole range
-/// — the others name keys that may or may not exist, which is a different
-/// claim.
+/// it promised that the dep does not hold and never will. `missing` is empty
+/// for every shape but [`covering`](PartitionMapping::covering), which
+/// promises a whole range — the others name keys that may or may not exist,
+/// which is a different claim.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub(crate) struct Reads {
     pub keys: Vec<String>,
@@ -687,6 +696,16 @@ mod tests {
         assert_eq!(got.keys.len(), 18);
         assert_eq!(got.missing.len(), 6);
         assert_eq!(got.missing[0], "2026-03-02T00");
+
+        // an hour the dep's set has not reached is not one it is missing: the
+        // pinned clock is midnight, so that day holds exactly one hour so far
+        let got = reads(&day, "2026-03-09", &hour, &PartitionMapping::covering());
+        assert_eq!(got.keys, ["2026-03-09T00"]);
+        assert!(
+            got.missing.is_empty(),
+            "an hour that has not happened yet reads as missing: {:?}",
+            got.missing
+        );
 
         // and two sets of the same grain cover key for key
         let got = reads(

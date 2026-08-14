@@ -1942,6 +1942,16 @@ fn render_jobs(answer: &Value, out: &Out) {
     table.print(out, "no jobs");
 }
 
+/// how one dep's keys are read, for the deps that are read at anything but
+/// the same key.
+fn mapping_of(asset: &Value, dep: &str) -> Option<String> {
+    list(asset, "mappings")
+        .iter()
+        .find(|m| m["dep"] == json!(dep))
+        .and_then(|m| m["mapping"].as_str())
+        .map(str::to_string)
+}
+
 fn render_assets(answer: &Value, out: &Out) {
     let assets = list(answer, "assets");
     if out.json {
@@ -1971,10 +1981,16 @@ fn render_assets(answer: &Value, out: &Out) {
                 Some(at) => when(at),
                 None => "never".into(),
             }),
+            // a dep read at anything but the same key says which, since
+            // "deps" alone would make a rollup look like an identity read
             Cell::plain(
                 list(asset, "deps")
                     .iter()
-                    .map(|d| d.as_str().unwrap_or_default())
+                    .filter_map(|d| d.as_str())
+                    .map(|dep| match mapping_of(asset, dep) {
+                        Some(m) => format!("{dep} ({m})"),
+                        None => dep.to_string(),
+                    })
                     .collect::<Vec<_>>()
                     .join(", "),
             ),
@@ -3567,6 +3583,22 @@ mod tests {
             color: false,
             color_err: false,
         }
+    }
+
+    #[test]
+    fn the_asset_table_says_how_a_mapped_dep_is_read() {
+        let assets = json!({"assets": [{
+            "name": "rollup",
+            "stale": true,
+            "built_at": Value::Null,
+            "deps": ["hours", "calendar"],
+            "mappings": [{"dep": "hours", "mapping": "covering"}],
+        }]});
+        let assets = list(&assets, "assets");
+        let asset = &assets[0];
+        assert_eq!(mapping_of(asset, "hours").as_deref(), Some("covering"));
+        // a dep read at the same key has nothing to say beyond its name
+        assert_eq!(mapping_of(asset, "calendar"), None);
     }
 
     #[test]

@@ -160,9 +160,11 @@ it was consumed (the `inputs` map). an asset is stale iff:
   fingerprint-identical, the descendant rebuilds anyway (no early cutoff).
 
 `GET /api/assets` shows the verdict with its evidence: each stale asset
-lists `{dep, had, now}` reasons — the fingerprint it consumed against the
-dep's current one. equal `had`/`now` on a reason means the dep itself is
-stale and the asset is stale transitively. an asset that has never
+lists `{dep, partition, had, now}` reasons — the fingerprint it consumed
+against the dep's current one, and which key of the dep that was where a
+[mapping](#what-a-partition-reads-of-its-dep) reads one other than its own.
+equal `had`/`now` on a reason means the dep itself is stale and the asset is
+stale transitively. an asset that has never
 materialized is stale with an empty reasons list — nothing was recorded to
 compare against.
 
@@ -249,31 +251,120 @@ raise the ceiling if the deployment means it. partitioned assets are one level
 of fan-out and always have been: a partitioned asset expands over its own key
 set rather than over an upstream asset, so nothing here nests.
 
-### Identity mapping only
+### What a partition reads of its dep
 
-dependencies between partitioned assets take **the same key**, and nothing
-else:
+a dep declares **which of its keys** this asset's partitions read. that is a
+property of the edge and not of either asset, so it is declared where the dep
+is:
 
-- **partitioned on partitioned** — `daily_report` reading `daily_orders` at
-  its own key. the value comes from the store at `(dep, key)` rather than out
-  of the run, which is what makes "the same key" mean one thing whether the
-  upstream partition was rebuilt by this run or was already fresh. a build
-  pulls the upstream keys its targets need along with them.
-- **partitioned on unpartitioned** — fine, and the whole value arrives.
-- **unpartitioned on partitioned** — **rejected at build.** reading every
-  partition of something at once is an aggregation, and hestan does not define
-  one yet. partition the consumer too, or aggregate inside the body from a
-  source.
+```rust
+let hourly_traffic = Asset::new("hourly_traffic", …)
+    .partitioned(Partitions::hourly("2026-01-01T00"));
 
-two partitioned assets in a dep relationship must also use the same *kind* of
-key set (daily/hourly/static): "the same key" is not a thing two different
-kinds can agree on, so it is a build error rather than a shape that quietly
-never matches. there are no partition mapping functions and no partition sets
-added at runtime in this phase.
+let daily_traffic = Asset::new("daily_traffic", |ctx: OpCtx| async move {
+    // one entry per hour of the day this key is for
+    let hours = ctx.input("hourly_traffic").cloned().unwrap_or(json!({}));
+    Ok(json!({ "hits": hours.as_object().map_or(0, |h| h.len()) }))
+})
+.reads(&hourly_traffic, PartitionMapping::covering())
+.partitioned(Partitions::daily("2026-01-01"));
+```
 
-a key the upstream's set does not contain keeps the downstream partition
-stale forever — identity mapping has nothing to read there. that is the honest
+there are four shapes, and `Asset::from` is the first of them:
+
+| mapping | what one key reads | pairs with |
+| --- | --- | --- |
+| `identity` (the default, and what `from` declares) | the same key | two sets of the same kind, or an unpartitioned dep, whose whole value arrives |
+| `covering` | the dep keys inside this one — a day and its 24 hours | two time sets, the reader's keys no finer than the dep's |
+| `offset(n)` | the key `n` steps along the dep's order | two sets of the same kind, with an order to step along |
+| `all` | every key the dep has | anything, including an **unpartitioned** reader |
+
+a mapping that reads one key hands the body that key's value, exactly as
+identity always has. one that reads a set hands it an object keyed by
+partition — `{"2026-01-05T00": …, "2026-01-05T01": …}` — so the body knows
+which key each value came from.
+
+either way the value comes from the store at `(dep, key)` rather than out of
+the run, which is what makes a mapping mean one thing whether the upstream
+partition was rebuilt by this run or was already fresh. a build pulls the
+upstream keys its targets read along with them: materializing one daily key
+materializes the hours under it that are missing or stale.
+
+**a pairing the mapping could never resolve is a build error**, named at
+registration with both partitionings in the message: a window over a static
+key set (which spans no time to cover), an hourly asset trying to cover a
+daily one (an hour sits inside a day, not the other way round), an offset
+along a static set (declaration order is not an order to step along), any
+mapping but identity on a dep with no keys at all. the alternative is a
+dependency that resolves to nothing at 3am and calls itself fresh.
+
+two boundaries, and they are deliberately different:
+
+- an **offset off the end** of a set reads nothing. the first key has no key
+  before it, and that is a fact about the edge of history rather than a broken
+  dependency.
+- a **window that its dep cannot fill** — a daily key whose hourly asset starts
+  at 06:00 that day, so six of its hours are not keys of anything — is refused.
+  a window promises its whole range, and 18 hours reported as a day is a wrong
+  number rather than a missing one. naming that key at a build, or covering it
+  with a backfill range, says which hour is missing; a build that names no keys
+  leaves it out of its target set rather than refusing everything else with it,
+  and the grid shows it as never built.
+
+the *end* of a generated set is the one exception, and it is the ordinary case:
+the hours left in today have not happened, so they are not missing but not yet
+due. today's key rolls up the hours it has and goes stale as each next one
+lands, which is what makes an hourly rollup an hourly rollup rather than
+something that appears at midnight. an hour *before* the dep's first key is the
+one that never arrives, and that is what a refusal is about.
+
+**unpartitioned on partitioned** is the `all` mapping and only that: reading
+every partition at once is an aggregation, and it has to say so. `identity`
+there is still the error it was, because "the same key" needs a key.
+
+a key the upstream's set does not contain keeps the downstream partition stale
+forever under identity — there is nothing there to read. that is the honest
 reading of a range that starts later upstream than downstream.
+
+### Staleness follows the mapping
+
+a rollup that reported fresh because it only ever checked its own key would be
+worse than no mapping at all. so a build records the fingerprint of **every
+upstream key it consumed**: one string per dep as ever, except for a dep read
+through a mapping that names a set, which records an object of one fingerprint
+per key. no new column — `inputs` is json, and both shapes live in the one it
+has always had.
+
+staleness then asks the same question of every key the mapping resolves to. a
+daily rollup is stale when any hour it covers has moved, has gone missing, or
+is itself stale, and the reason it reports names **that hour** rather than the
+day: `{dep, partition, had, now}`, with `partition` null for the identity reads
+that are every dep that declared nothing. the grid's tooltip and the asset
+page's staleness chain both say `hours[2026-01-05T07]` where they used to be
+able to say only `hours`.
+
+two consequences worth knowing:
+
+- reading `all` of a set that grows leaves the reader stale every time it
+  grows. that is what "every key" means, and it is why `all` belongs on
+  fixed key sets and short ones rather than on an hourly range since 2020.
+- an hour rebuilt to the same bytes leaves the day fresh. staleness is
+  fingerprints, not clocks, all the way through.
+
+### The build limit counts keys, not instances
+
+`Partitions::build_limit` (default 31) caps the keys **of the asset being
+built**. under identity that was also roughly the size of the run: 31 keys of
+a target pulled at most 31 keys of each upstream. under a mapping it is not.
+one daily key covering 24 hourly ones is 25 op instances, so a default build of
+that rollup is up to 775, and a backfill chunk — which chunks by the same limit
+— is the same multiple. `all` is the extreme: one key of the reader can pull
+the dep's whole set.
+
+so on a mapped asset, `build_limit` is the number to set deliberately, and
+[`Hestan::max_instances`](concepts.md#the-ceiling) (1000 by default) is the
+ceiling that actually holds. a run that would expand past it fails at the
+expansion saying so, before it writes a row.
 
 ### Backfills
 
@@ -284,6 +375,10 @@ asset's partitions:
 POST /api/assets/daily_orders/backfill
      {"from": "2026-01-01", "to": "2026-01-31", "only_missing": true}
 ```
+
+a range covering a key whose window its dep cannot fill is a 400 naming the
+missing upstream key, for the same reason naming that key at a build is: a
+chunk that silently skipped it would report a backfill complete that was not.
 
 the range resolves against the asset's key set at the moment it is made and is
 then **fixed** — a daily set grows, and a backfill should build what it was

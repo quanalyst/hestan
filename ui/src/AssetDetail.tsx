@@ -19,6 +19,11 @@ import { assetPath, numericMetaKeys, relTime, shortId } from "./util";
 // enough hex to tell fingerprints apart at a glance; the title carries the rest
 const shortHash = (fp: string) => fp.slice(0, 12);
 
+// what a dep is read by, for a dep that is read at anything but the same key
+function mappingOf(asset: AssetSummary, dep: string): string | null {
+  return asset.mappings.find((m) => m.dep === dep)?.mapping ?? null;
+}
+
 // the established shapes: a solid disc for an asset whose inputs have not
 // moved, the pending ring for one whose have — with the word beside it, since
 // the ui is monochrome and a shape alone is not a sentence
@@ -126,6 +131,8 @@ export default function AssetDetail({
                 <span key={d}>
                   {i > 0 && ", "}
                   <Link to={assetPath(d)}>{d}</Link>
+                  {/* how its keys are read, where that is not the same key */}
+                  {mappingOf(asset, d) && <span className="muted"> {mappingOf(asset, d)}</span>}
                 </span>
               ))}
             </span>

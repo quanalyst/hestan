@@ -36,6 +36,7 @@ const asset = (name: string, over: Over = {}): AssetSummary => ({
   run_id: null,
   stale: over.stale ?? false,
   reasons: [],
+  mappings: [],
   checks: { passed: 1, failed: over.failed ?? 0, last_run_at: null },
   freshness:
     over.within_secs === undefined

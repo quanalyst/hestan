@@ -5,7 +5,12 @@
 // dep whose content changed, the build it changed in, and what had moved
 // under *that* build. these are the reads that turn those rows into a chain,
 // and they are pure so the walk can be tested against a fixture.
-import type { AssetSummary, MaterializationEntry, StaleReason } from "./types";
+import type {
+  AssetSummary,
+  InputFingerprint,
+  MaterializationEntry,
+  StaleReason,
+} from "./types";
 
 // how far the walk goes before it stops asking. four levels is more than
 // anybody reads, and each one costs a request
@@ -20,6 +25,9 @@ export type ChainKind = "changed" | "pending" | "absent";
 // one step of the chain: an upstream, what it did, and what did it in turn
 export interface ChainLink {
   asset: string;
+  // the key of it this is about, when it was read through a mapping that reads
+  // one other than the reader's own; null under identity
+  partition: string | null;
   kind: ChainKind;
   // what this asset consumed last time, and what the upstream holds now
   had: string | null;
@@ -68,13 +76,33 @@ export function whenChanged(
 // which of a build's inputs held a different fingerprint than they did for the
 // build before it — the reason that build produced something new. an input
 // with nothing before it to compare against is not a change: the first
-// recorded build changed nothing, it started everything
+// recorded build changed nothing, it started everything.
+//
+// a dep read through a mapping recorded one fingerprint per key it consumed,
+// so what moved there is a key of it, and the first one that did is what the
+// chain names
 export function movedInputs(
   built: MaterializationEntry,
   before: MaterializationEntry | null,
-): string[] {
+): { dep: string; partition: string | null }[] {
   if (before === null) return [];
-  return Object.keys(built.inputs).filter(
-    (dep) => dep in before.inputs && built.inputs[dep] !== before.inputs[dep],
-  );
+  const moved: { dep: string; partition: string | null }[] = [];
+  for (const dep of Object.keys(built.inputs)) {
+    if (!(dep in before.inputs)) continue;
+    const [now, had] = [built.inputs[dep], before.inputs[dep]];
+    const partition = movedKey(now, had);
+    if (partition !== undefined) moved.push({ dep, partition });
+  }
+  return moved;
+}
+
+// the key at which two recorded reads of one dep differ, `null` when the dep
+// was read as a whole, and `undefined` when nothing moved. a key one of them
+// does not have at all is a move: the set it read is not the set it read then
+function movedKey(now: InputFingerprint, had: InputFingerprint): string | null | undefined {
+  if (typeof now !== "object" || now === null || typeof had !== "object" || had === null) {
+    return now === had ? undefined : null;
+  }
+  const keys = [...new Set([...Object.keys(now), ...Object.keys(had)])].sort();
+  return keys.find((key) => now[key] !== had[key]);
 }

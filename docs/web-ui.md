@@ -276,6 +276,11 @@ under it" is one glance rather than four page loads. a fingerprint the
 recorded history does not reach names no build at all rather than the nearest
 plausible one.
 
+a row names a key of the upstream where the dep is read through a
+[mapping](assets.md#what-a-partition-reads-of-its-dep) that reads one other
+than the reader's own: `hours[2026-01-05T07] changed` is what a daily rollup
+says, since naming the day would name the thing that has not moved.
+
 a partitioned asset's staleness is per key, so it says how many keys were
 built against inputs that have since moved and how many have never been built,
 and the grid below says which.
@@ -341,13 +346,18 @@ pages use for ops (escape or × closes it), showing the same body as the asset
 page. its title links through to the page. it carries the asset's kind, the op
 that materializes it when that is not simply its own name (a
 [multi-asset](assets.md#one-op-several-assets)), its deps as links and its
-state.
+state. a dep read at anything but the same key carries the
+[mapping](assets.md#what-a-partition-reads-of-its-dep) beside it —
+`hourly_traffic covering` — since a dep list alone would make a rollup look
+like an ordinary read.
 
 a partitioned asset then gets the **partition grid**: one cell per key,
 newest first, in the same shape vocabulary as everything else — solid for a
 materialized key, hatched for a stale one, hollow for one never built.
 hovering a cell names the key, its state, its short fingerprint and when it
-was built; clicking one builds exactly that key and follows the run — except
+was built — and on a mapped asset, which dep keys that one reads and which of
+them left it stale, both of which are per key and neither of which is the key
+itself; clicking one builds exactly that key and follows the run — except
 on the asset page, where dragging across the grid picks a
 [backfill range](#launching-a-backfill) instead. the grid shows the newest 120
 keys and counts the rest, and it re-polls with the panel, so a backfill lands

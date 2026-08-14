@@ -17,7 +17,9 @@ use include_dir::{Dir, include_dir};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use crate::asset::{ASSETS_JOB, AssetRegistry, launch_plan, mats_map, plan_all, staleness};
+use crate::asset::{
+    ASSETS_JOB, AssetRegistry, launch_plan, mapped_reads, mats_map, plan_all, staleness,
+};
 use crate::auth::{self, Access, Auth, Identity};
 use crate::backfill;
 use crate::error::Error;
@@ -1048,10 +1050,20 @@ pub(crate) fn assets_json(registry: &AssetRegistry, store: &Store) -> Result<Val
                     "missing": missing,
                 })
             });
+            // the deps that are read at anything but the same key, which is
+            // what makes a mapped edge visible without reading the source
+            let mappings: Vec<Value> = meta
+                .deps
+                .iter()
+                .map(|dep| (dep, meta.mapping(dep)))
+                .filter(|(_, m)| !m.is_identity())
+                .map(|(dep, m)| json!({ "dep": dep, "mapping": m.label() }))
+                .collect();
             json!({
                 "name": meta.name,
                 "kind": if meta.source { "source" } else { "derived" },
                 "deps": meta.deps,
+                "mappings": mappings,
                 "auto": meta.auto,
                 // the op that materializes it, which is the asset's own name
                 // unless a multi-asset produces it alongside others
@@ -1234,13 +1246,15 @@ async fn asset_partitions(
     // and the newest keys are the ones anyone is looking at
     let limit = q.limit.unwrap_or(90).clamp(1, 1000) as usize;
     let total = verdict.parts.len();
-    let partitions: Vec<Value> = verdict
-        .parts
+    let shown: Vec<String> = verdict.parts.keys().rev().take(limit).cloned().collect();
+    // what each of them reads of the deps it maps: only the keys drawn, since
+    // a window resolves per key and a year of them is not a payload
+    let reads = mapped_reads(&st.assets, &name, &shown);
+    let partitions: Vec<Value> = shown
         .iter()
-        .rev()
-        .take(limit)
-        .map(|(key, s)| {
+        .map(|key| {
             let mat = mats.get(&name, Some(key));
+            let s = &verdict.parts[key];
             json!({
                 "key": key,
                 "state": match (mat.is_some(), s.stale) {
@@ -1251,6 +1265,22 @@ async fn asset_partitions(
                 "fingerprint": mat.map(|m| m.fingerprint.clone()),
                 "built_at": mat.map(|m| m.built_at),
                 "run_id": mat.and_then(|m| m.run_id.clone()),
+                // which dep key this one reads, and which of them left it
+                // stale — the hour under a day, rather than the day
+                "reads": reads.get(key).into_iter().flatten().map(|r| json!({
+                    "dep": r.dep,
+                    "mapping": r.mapping,
+                    "count": r.keys.len(),
+                    "first": r.keys.first(),
+                    "last": r.keys.last(),
+                    "missing": r.missing,
+                })).collect::<Vec<Value>>(),
+                "reasons": s.reasons.iter().map(|r| json!({
+                    "dep": r.dep,
+                    "partition": r.partition,
+                    "had": r.had,
+                    "now": r.now,
+                })).collect::<Vec<Value>>(),
             })
         })
         .collect();
@@ -5522,6 +5552,158 @@ mod tests {
         assert_eq!(rollup["partitions"]["total"], 2);
         assert_eq!(rollup["partitions"]["materialized"], 1);
         assert_eq!(rollup["partitions"]["missing"], 1);
+        // how it reads its dep, which is not something the dep list says
+        assert_eq!(
+            rollup["mappings"],
+            json!([{ "dep": "hours", "mapping": "covering" }])
+        );
+        let hours = body["assets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|a| a["name"] == "hours")
+            .unwrap();
+        assert_eq!(hours["mappings"], json!([]), "nothing to say about no deps");
+    }
+
+    // an unpartitioned asset is the one that reports mapped staleness on the
+    // asset itself: a partitioned one keeps its evidence per key, and the whole
+    // asset carries counts instead
+    #[tokio::test]
+    async fn an_aggregation_reports_which_key_of_its_dep_left_it_stale() {
+        let a = crate::Asset::new("a", |ctx: crate::OpCtx| async move {
+            Ok(json!({ "key": ctx.partition() }))
+        })
+        .partitioned(crate::Partitions::keys(["k1", "k2"]));
+        let flat = crate::Asset::new("flat", |ctx: crate::OpCtx| async move {
+            Ok(ctx.input("a").cloned().unwrap_or(json!(null)))
+        })
+        .reads_named("a", crate::PartitionMapping::all());
+        let registry = Arc::new(AssetRegistry::new(vec![a, flat], Vec::new(), Vec::new()).unwrap());
+        let runner = Runner::new(
+            [registry.lower_job().unwrap()],
+            Store::open(":memory:").unwrap(),
+        )
+        .unwrap();
+        let st = AppState {
+            jobs: Arc::new(runner.jobs().clone()),
+            runner,
+            assets: registry,
+            sensors: Arc::new(Vec::new()),
+            auth: None,
+        };
+        let (_, Json(body)) = build_one_asset(
+            State(st.clone()),
+            Path("flat".into()),
+            None,
+            Bytes::from("{}"),
+        )
+        .await
+        .unwrap();
+        wait_success(&st, body["run_id"].as_str().unwrap()).await;
+
+        // both keys move, so which one is named is a choice rather than the
+        // only thing there was to say
+        let store = st.runner.store();
+        for key in ["k1", "k2"] {
+            store
+                .record_materialization("a", Some(key), "moved", &json!({}), None, None, None)
+                .unwrap();
+        }
+        let Json(body) = list_assets(State(st.clone())).await.unwrap();
+        let flat = body["assets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|a| a["name"] == "flat")
+            .unwrap();
+        assert_eq!(flat["mappings"], json!([{"dep": "a", "mapping": "all"}]));
+        assert_eq!(flat["stale"], json!(true));
+        assert_eq!(flat["reasons"][0]["dep"], "a");
+        assert_eq!(flat["reasons"][0]["now"], "moved");
+        // the first key it read that moved, and one reason for the dep rather
+        // than one per key of it: a set of ten thousand keys is not a list
+        // anybody reads, and how many deps moved is what the count has meant
+        assert_eq!(flat["reasons"][0]["partition"], "k1");
+        assert_eq!(flat["reasons"].as_array().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_grid_row_says_what_its_key_reads_and_which_key_left_it_stale() {
+        let (st, day) = rollup_state();
+        let app = router(st.clone());
+        let row = |body: Value| -> Value {
+            body["partitions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|p| p["key"] == json!(day))
+                .expect("the day")
+                .clone()
+        };
+        let (status, Json(body)) = build_one_asset(
+            State(st.clone()),
+            Path("rollup".into()),
+            None,
+            Bytes::from(format!(r#"{{"partitions":["{day}"]}}"#)),
+        )
+        .await
+        .unwrap();
+        assert_eq!(status, StatusCode::ACCEPTED);
+        wait_success(&st, body["run_id"].as_str().unwrap()).await;
+
+        let (_, body, _) = request(
+            app.clone(),
+            Method::GET,
+            "/api/assets/rollup/partitions?limit=90",
+        )
+        .await;
+        let built = row(body.unwrap());
+        assert_eq!(built["state"], "materialized");
+        assert_eq!(
+            built["reads"],
+            json!([{
+                "dep": "hours",
+                "mapping": "covering",
+                "count": 24,
+                "first": format!("{day}T00"),
+                "last": format!("{day}T23"),
+                "missing": 0,
+            }])
+        );
+        assert_eq!(built["reasons"], json!([]));
+
+        // rebuild one hour to different content, which the day covers
+        let hour = format!("{day}T07");
+        let store = st.runner.store();
+        let held = store
+            .materialization("hours", Some(&hour))
+            .unwrap()
+            .unwrap();
+        store
+            .record_materialization(
+                "hours",
+                Some(&hour),
+                "moved",
+                &json!({}),
+                held.value.as_ref(),
+                None,
+                None,
+            )
+            .unwrap();
+
+        let (_, body, _) = request(
+            app.clone(),
+            Method::GET,
+            "/api/assets/rollup/partitions?limit=90",
+        )
+        .await;
+        let moved = row(body.unwrap());
+        assert_eq!(moved["state"], "stale");
+        // the hour that moved, not the day it is in
+        assert_eq!(moved["reasons"][0]["dep"], "hours");
+        assert_eq!(moved["reasons"][0]["partition"], json!(hour));
+        assert_eq!(moved["reasons"][0]["now"], "moved");
     }
 
     #[tokio::test]

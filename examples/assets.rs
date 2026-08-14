@@ -170,6 +170,46 @@ async fn main() -> Result<(), hestan::Error> {
     .from(&docs_dir)
     .partitioned(Partitions::daily(start).build_limit(10));
 
+    // one materialization per utc hour: how much of the docs directory was
+    // written in it. two days of them, so a daily key has 24 to cover
+    let start_hour = (Utc::now() - chrono::Duration::days(1))
+        .format("%Y-%m-%dT00")
+        .to_string();
+    let hourly_writes = Asset::new("hourly_doc_writes", |ctx: OpCtx| async move {
+        let hour = ctx.partition().expect("partitioned").to_string();
+        let mut bytes = 0;
+        for (_, len, mtime) in dir_entries(DOCS_DIR)? {
+            let at = DateTime::<Utc>::from_timestamp_millis(mtime as i64)
+                .ok_or("a file mtime outside the representable range")?;
+            if at.format("%Y-%m-%dT%H").to_string() == hour {
+                bytes += len;
+            }
+        }
+        ctx.meta("bytes", bytes as i64);
+        Ok(json!({ "hour": hour, "bytes": bytes }))
+    })
+    .from(&docs_dir)
+    .partitioned(Partitions::hourly(start_hour).build_limit(48));
+
+    // and the rollup this phase exists for: one daily key reading the 24 hourly
+    // keys inside it. today's key covers hours that have not happened yet — it
+    // rolls up the ones that have, and goes stale as each next one lands
+    let start_day = (Utc::now() - chrono::Duration::days(1))
+        .format("%Y-%m-%d")
+        .to_string();
+    let daily_writes = Asset::new("daily_doc_writes", |ctx: OpCtx| async move {
+        let hours = ctx.input("hourly_doc_writes").cloned().unwrap_or(json!({}));
+        let hours = hours.as_object().cloned().unwrap_or_default();
+        let bytes: u64 = hours
+            .values()
+            .map(|h| h["bytes"].as_u64().unwrap_or(0))
+            .sum();
+        ctx.meta("hours", hours.len() as i64);
+        Ok(json!({ "day": ctx.partition(), "hours": hours.len(), "bytes": bytes }))
+    })
+    .reads(&hourly_writes, PartitionMapping::covering())
+    .partitioned(Partitions::daily(start_day).build_limit(2));
+
     // every doc has content, and there are enough of them to be a doc set. the
     // first fails the run when it breaks; the second only says so.
     let non_empty = AssetCheck::new(
@@ -237,7 +277,14 @@ async fn main() -> Result<(), hestan::Error> {
     });
 
     let app = Hestan::new()
-        .assets([docs_dir, doc_stats, doc_totals, daily_changes])
+        .assets([
+            docs_dir,
+            doc_stats,
+            doc_totals,
+            daily_changes,
+            hourly_writes,
+            daily_writes,
+        ])
         .multi_assets([split_docs])
         .check(non_empty)
         .check(enough_docs)

@@ -21,6 +21,8 @@ const shown: PartitionEntry[] = ["05", "04", "03", "02", "01"].map((key, i) => (
   fingerprint: null,
   built_at: null,
   run_id: null,
+  reads: [],
+  reasons: [],
 }));
 
 const day = (d: string) => `2026-01-${d}`;

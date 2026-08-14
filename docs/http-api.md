@@ -795,10 +795,11 @@ startup's sweep marks failed.
     "fingerprint": "14a61f3c...", "built_at": "2026-08-08T11:01:36Z",
     "run_id": null, "stale": false, "reasons": [] },
   { "name": "doc_stats", "kind": "derived", "deps": ["docs_dir"], "auto": false,
-    "op": "doc_stats", "partitions": null,
+    "op": "doc_stats", "partitions": null, "mappings": [],
     "fingerprint": "3bffef12...", "built_at": "2026-08-08T11:01:36Z",
     "run_id": "019fe109-...", "stale": true,
-    "reasons": [ { "dep": "docs_dir", "had": "14a61f3c...", "now": "9c01d2aa..." } ],
+    "reasons": [ { "dep": "docs_dir", "partition": null,
+                   "had": "14a61f3c...", "now": "9c01d2aa..." } ],
     "checks": { "passed": 1, "failed": 0, "last_run_at": "2026-08-08T11:01:36Z" },
     "freshness": { "status": "late", "late_by_secs": 1800,
                    "last_success": "2026-08-08T10:01:36Z" } }
@@ -812,7 +813,13 @@ and null on a source, which has no op. `fingerprint`, `built_at`, and
 on sources (probes write their rows outside any run). `reasons` carries the
 staleness evidence per dep, the fingerprint consumed (`had`) against the
 dep's current one (`now`); equal values mean the dep is itself stale and
-this asset is stale transitively. `checks` counts the latest result per
+this asset is stale transitively. `partition` on a reason is which key of the
+dep it is about, and is null except where the dep is read through a
+[mapping](assets.md#what-a-partition-reads-of-its-dep) that reads a key other
+than this asset's own — the hour under a daily rollup rather than the day.
+`mappings` lists those deps and how each is read
+(`[{"dep": "hourly_traffic", "mapping": "covering"}]`), and is empty on every
+asset whose deps are all read at the same key. `checks` counts the latest result per
 [check](assets.md#asset-checks) name; both zero with a null timestamp means
 nothing has ever been recorded for this asset, which reads the same whether
 no check is declared or none has run yet. `freshness` is the asset's declared
@@ -840,7 +847,10 @@ the body is optional and, for a partitioned asset, may name the keys to build:
 
 those keys are built whatever staleness says. a key the asset's set does not
 hold, an empty list, `partitions` on an asset that is not partitioned, and a
-body that does not parse are all 400s. with no body (or no `partitions`) a
+body that does not parse are all 400s. so is a key whose
+[window](assets.md#what-a-partition-reads-of-its-dep) reaches a key its dep
+does not hold, and the message says which one: a day whose hours only half
+exist is a wrong number rather than a partial build. with no body (or no `partitions`) a
 partitioned asset builds its default target set: missing or stale, newest
 first, capped by `Partitions::build_limit`.
 
@@ -851,15 +861,26 @@ how much it left out:
 ```json
 { "total": 220, "shown": 90, "partitions": [
   { "key": "2026-08-09", "state": "missing",
-    "fingerprint": null, "built_at": null, "run_id": null },
-  { "key": "2026-08-08", "state": "materialized",
+    "fingerprint": null, "built_at": null, "run_id": null,
+    "reads": [], "reasons": [] },
+  { "key": "2026-08-08", "state": "stale",
     "fingerprint": "3bffef12...", "built_at": "2026-08-08T11:01:36Z",
-    "run_id": "019fe109-..." }
+    "run_id": "019fe109-...",
+    "reads": [ { "dep": "hourly_traffic", "mapping": "covering", "count": 24,
+                 "first": "2026-08-08T00", "last": "2026-08-08T23", "missing": 0 } ],
+    "reasons": [ { "dep": "hourly_traffic", "partition": "2026-08-08T07",
+                   "had": "aa01...", "now": "bb02..." } ] }
 ] }
 ```
 
-`state` is `materialized`, `stale` or `missing`. 404 for an unknown asset and
-400 for one that is not partitioned.
+`state` is `materialized`, `stale` or `missing`. `reads` is what this key
+reads of each dep it [maps](assets.md#what-a-partition-reads-of-its-dep) —
+the keys it resolves to, and how many it wants that the dep does not hold,
+which is what makes a key unbuildable rather than merely unbuilt. it is empty
+where every dep is read at the same key, since the key itself already says
+that. `reasons` is this key's own staleness evidence, in the shape
+`GET /api/assets` uses. 404 for an unknown asset and 400 for one that is not
+partitioned.
 
 while any run of the `assets` job is active, both build endpoints are a 409
 (`asset build already running`): builds are serialized so overlapping runs

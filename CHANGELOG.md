@@ -2,6 +2,61 @@
 
 ## unreleased
 
+a partition may read a mapping of its dep's keys: a daily rollup of hourly
+data, yesterday's key, every key at once.
+
+**breaking**: no signature moved, and identity — every dep declared with
+`from`, which is every dep that existed before this — resolves, builds and
+fingerprints exactly as it did. what changes is that two graphs which used to
+be refused now build (an unpartitioned asset reading every key of a
+partitioned one, declared `PartitionMapping::all`), and that a build naming a
+partition whose window its dep cannot fill is now `Error::Graph` naming the
+missing upstream key rather than a rollup of the hours that happened to be
+there.
+
+- **the mapping is on the edge**, since which keys are read is a property of
+  neither asset: `Asset::reads(&dep, PartitionMapping::covering())` beside the
+  `from` it generalizes. four shapes and no more — `identity`, the default and
+  the same key; `covering`, the dep keys inside this one, so a daily key reads
+  its 24 hours; `offset(n)`, the key n steps along the dep's order; and `all`,
+  every key the dep has, which is the only one an unpartitioned asset can mean
+- **a pairing none of them could resolve fails the build**, where the asset
+  graph is validated and with both partitionings in the message: a window over
+  a static key set, which spans no time to cover; an hourly asset trying to
+  cover a daily one, since an hour sits inside a day rather than the other way
+  round; an offset along a static set, whose declaration order is not an order
+  to step along; any mapping but identity on a dep with no keys at all
+- **staleness follows the mapping, which is the whole point of having one.** a
+  rollup that reported fresh because it only checked its own key would be worse
+  than no mapping, so a build records the fingerprint of every upstream key it
+  consumed — one object keyed by partition where it read a set, the bare string
+  identity has always written where it read one — and a daily key is stale when
+  any hour it covers has moved. no schema change: `inputs` is json and both
+  shapes live in the column it already had
+- **the reason names the hour rather than the day.** `{dep, partition, had,
+  now}` carries the key of the dep it is about, and the grid's tooltip and the
+  asset page's causal chain both say `hours[2026-01-05T07]` where they could
+  only say `hours` before. `partition` is null on every identity read, which is
+  every reason recorded before this
+- **building follows it too**: a plan walks from the sinks up resolving each
+  consumer's mapping, so materializing a daily key materializes the hours under
+  it that are missing or stale, and building an aggregation pulls in the keys
+  it has never read. one thing a window cannot do is promise a range its dep
+  does not hold — a day whose hourly asset starts at 06:00 — and naming such a
+  key at a build or covering it with a backfill range says which hour is
+  missing, while a build that names no keys leaves it out of its target set
+  rather than refusing everything else with it
+- **the build limit counts keys of the target, not instances of the run.**
+  under identity those were nearly the same number; under a window one key is
+  25 op runs, so a default build of a daily rollup is up to 775 and a backfill
+  chunk is the same multiple. `Hestan::max_instances` is the ceiling that
+  actually holds, and `docs/assets.md` says so where the limit is chosen
+- `GET /api/assets` reports each asset's `mappings` — the deps read at anything
+  but the same key, and how — and `/partitions` reports per key what it `reads`
+  of them and its own `reasons`. the drawer writes the mapping beside the dep,
+  the cli's asset table writes it in the deps column, and hovering a grid cell
+  says which upstream keys that key reads and which of them left it stale
+
 a fan-out may expand inside a fan-out, under a ceiling on what one run may
 expand to.
 

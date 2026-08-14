@@ -427,8 +427,19 @@ export interface Tick {
 
 export interface StaleReason {
   dep: string;
+  // which key of the dep, when it is read through a mapping that reads one
+  // other than this asset's own — the hour under a daily rollup, not the day.
+  // null under identity, where the key is the reader's own
+  partition: string | null;
   had: string | null; // fingerprint recorded when this asset last consumed dep
   now: string | null;
+}
+
+// how one dep's keys are read, for the deps that are read at anything but the
+// same key. `mapping` is what the api calls the shape: all, covering, offset -1
+export interface DepMapping {
+  dep: string;
+  mapping: string;
 }
 
 export type CheckStatus = "passed" | "failed";
@@ -473,6 +484,9 @@ export interface AssetSummary {
   run_id: string | null;
   stale: boolean;
   reasons: StaleReason[];
+  // the deps this asset reads at anything but the same key; empty when every
+  // one of them is identity, which is every dep that declared nothing
+  mappings: DepMapping[];
   checks: CheckSummary;
   // stale and late are different claims: stale means a dep moved, late means
   // time passed. null unless a policy was declared
@@ -514,7 +528,27 @@ export interface PartitionEntry {
   fingerprint: string | null;
   built_at: string | null;
   run_id: string | null;
+  // what this key reads of each dep it maps, and why it is stale — per key,
+  // because a mapping resolves per key
+  reads: KeyRead[];
+  reasons: StaleReason[];
 }
+
+// the dep keys one partition reads under one mapping: how many, and the ends
+// of the range they run between
+export interface KeyRead {
+  dep: string;
+  mapping: string;
+  count: number;
+  first: string | null;
+  last: string | null;
+  // keys it promised that the dep does not hold, which is what makes a key
+  // unbuildable rather than merely unbuilt
+  missing: number;
+}
+
+// what a build recorded of one dep: its fingerprint, or one per key of it
+export type InputFingerprint = string | null | Record<string, string | null>;
 
 // one entry of an asset's materialization history, newest first from the api
 export interface MaterializationEntry {
@@ -525,7 +559,9 @@ export interface MaterializationEntry {
   // this build's fingerprint differs from the one before it in time — the
   // difference between having been rebuilt and having actually changed
   changed: boolean;
-  inputs: Record<string, string | null>;
+  // one fingerprint per dep, or — for a dep read through a mapping that names
+  // a set of its keys — one per key it consumed
+  inputs: Record<string, InputFingerprint>;
   run_id: string | null;
   built_at: string;
   // what the op that built it reported, the same map as its op run's

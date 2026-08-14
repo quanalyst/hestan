@@ -2080,6 +2080,58 @@ pub(crate) fn build_one(
     launch_plan(runner, plan, Trigger::Build, asset_tag(name)).map(Some)
 }
 
+/// what one key of a partitioned asset reads of one mapped dep.
+pub(crate) struct MappedRead {
+    pub dep: String,
+    pub mapping: String,
+    /// the dep keys it resolves to, oldest first.
+    pub keys: Vec<String>,
+    /// how many it promised that the dep does not hold, which is what makes a
+    /// key unbuildable rather than merely unbuilt.
+    pub missing: usize,
+}
+
+/// what each of `keys` reads of the deps it maps, for the api and the grid.
+/// deps read at the same key are left out: identity says nothing the key does
+/// not say itself.
+pub(crate) fn mapped_reads(
+    reg: &AssetRegistry,
+    asset: &str,
+    keys: &[String],
+) -> HashMap<String, Vec<MappedRead>> {
+    let Some(meta) = reg.get(asset) else {
+        return HashMap::new();
+    };
+    let mapped: Vec<(&String, PartitionMapping)> = meta
+        .deps
+        .iter()
+        .map(|dep| (dep, meta.mapping(dep)))
+        .filter(|(_, m)| !m.is_identity())
+        .collect();
+    if mapped.is_empty() {
+        return HashMap::new();
+    }
+    let sets = key_sets(reg);
+    keys.iter()
+        .map(|key| {
+            let reads = mapped
+                .iter()
+                .filter_map(|(dep, mapping)| {
+                    let set = sets.get(dep.as_str())?;
+                    let reads = mapping.reads(meta.partitions.as_ref(), Some(key), set);
+                    Some(MappedRead {
+                        dep: dep.to_string(),
+                        mapping: mapping.label(),
+                        keys: reads.keys,
+                        missing: reads.missing.len(),
+                    })
+                })
+                .collect();
+            (key.clone(), reads)
+        })
+        .collect()
+}
+
 /// what naming a key outright is refused for: a partition whose
 /// [window](PartitionMapping::covering) reaches a key its dep does not hold.
 /// nothing could ever materialize it — a window is its whole range or it is a
@@ -3931,6 +3983,42 @@ mod tests {
         assert!(st["rollup"].parts[&day].stale);
     }
 
+    #[tokio::test]
+    async fn a_day_the_clock_is_still_inside_rolls_up_the_hours_it_has() {
+        let store = Store::open(":memory:").unwrap();
+        let today = Utc::now().format("%Y-%m-%d").to_string();
+        let reg = rollup_over(&format!("{}T00", yesterday()));
+        let runner = Runner::new([reg.lower_job().unwrap()], store.clone()).unwrap();
+        // the hours left in today have not happened, which is not the same as
+        // an hour that will never be a key of anything: this builds
+        check_named_keys(&reg, "rollup", std::slice::from_ref(&today)).unwrap();
+        let plan = plan_partitions(
+            &reg,
+            &mats_map(&store).unwrap(),
+            &["rollup".into()],
+            &on("rollup", [&today]),
+        )
+        .unwrap();
+        let hours = plan.seeds["partitions:hours"].as_array().unwrap().clone();
+        assert!(!hours.is_empty(), "the hours of today so far");
+        assert!(
+            hours
+                .iter()
+                .all(|h| h.as_str().unwrap().starts_with(&today)),
+            "an hour of another day came along: {hours:?}"
+        );
+        let run = build_plan(&runner, plan).await;
+        assert_eq!(run.status, RunStatus::Success);
+        let built = store
+            .materialization("rollup", Some(&today))
+            .unwrap()
+            .unwrap();
+        assert_eq!(built.value, Some(json!({ "hours": hours.len() })));
+        // and it is fresh against the hours that exist, until the next lands
+        let st = staleness(&reg, &mats_map(&store).unwrap());
+        assert!(!st["rollup"].parts[&today].stale);
+    }
+
     #[test]
     fn the_build_limit_counts_the_keys_of_the_target_and_not_what_they_read() {
         let day = yesterday();
@@ -3942,10 +4030,18 @@ mod tests {
         let reg = AssetRegistry::new(vec![hours, rollup], Vec::new(), Vec::new()).unwrap();
         let plan = plan_target(&reg, &Mats::default(), "rollup").unwrap();
         // one key of the target, as the limit says
-        assert_eq!(plan.seeds["partitions:rollup"], json!([day]));
+        assert_eq!(plan.seeds["partitions:rollup"].as_array().unwrap().len(), 1);
         // and the hours under it, which the limit says nothing about: a mapped
         // chunk is as many instances as its keys read, and the ceiling on that
-        // is Hestan::max_instances
+        // is Hestan::max_instances. a whole day is 24 of them
+        let plan = plan_partitions(
+            &reg,
+            &Mats::default(),
+            &["rollup".into()],
+            &on("rollup", [&day]),
+        )
+        .unwrap();
+        assert_eq!(plan.seeds["partitions:rollup"], json!([day]));
         assert_eq!(plan.seeds["partitions:hours"].as_array().unwrap().len(), 24);
     }
 

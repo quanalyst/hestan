@@ -12,6 +12,7 @@ import type {
   AssetSummary,
   Backfill,
   Freshness,
+  InputFingerprint,
   MaterializationEntry,
   PartitionEntry,
   StaleReason,
@@ -27,15 +28,29 @@ const CHAIN_HISTORY = 50;
 
 async function historyOf(
   asset: string,
+  partition: string | null,
   seen: Map<string, MaterializationEntry[]>,
 ): Promise<MaterializationEntry[]> {
-  const held = seen.get(asset);
+  // one key's history, where the reason names one: a partitioned asset's
+  // history interleaves every key, and the newest entry of the whole asset is
+  // rarely the newest entry of the key that moved
+  const at = partition === null ? "" : `&partition=${encodeURIComponent(partition)}`;
+  const key = `${asset}[${partition ?? ""}]`;
+  const held = seen.get(key);
   if (held) return held;
   const r = await get<{ materializations: MaterializationEntry[] }>(
-    `/api/assets/${encodeURIComponent(asset)}/history?limit=${CHAIN_HISTORY}`,
+    `/api/assets/${encodeURIComponent(asset)}/history?limit=${CHAIN_HISTORY}${at}`,
   ).catch(() => ({ materializations: [] }));
-  seen.set(asset, r.materializations);
+  seen.set(key, r.materializations);
   return r.materializations;
+}
+
+// what a build recorded for one dep, at the key that moved — the dep's own
+// fingerprint where it was read whole, and one key's where it was mapped
+function fingerprintAt(held: InputFingerprint | undefined, partition: string | null): string | null {
+  if (held === undefined) return null;
+  if (typeof held !== "object" || held === null) return held ?? null;
+  return partition === null ? null : (held[partition] ?? null);
 }
 
 // walk the reasons outward. an upstream whose content moved is asked which of
@@ -50,19 +65,22 @@ async function walk(
   const links: ChainLink[] = [];
   for (const r of reasons) {
     const kind = linkKind(r);
-    const at = kind === "changed" ? whenChanged(await historyOf(r.dep, seen), r.now) : null;
+    const at =
+      kind === "changed" ? whenChanged(await historyOf(r.dep, r.partition, seen), r.now) : null;
     let under: StaleReason[] = [];
     if (depth > 1 && at !== null && at.before !== null) {
-      under = movedInputs(at.built, at.before).map((dep) => ({
+      under = movedInputs(at.built, at.before).map(({ dep, partition }) => ({
         dep,
-        had: at.before!.inputs[dep],
-        now: at.built.inputs[dep],
+        partition,
+        had: fingerprintAt(at.before!.inputs[dep], partition),
+        now: fingerprintAt(at.built.inputs[dep], partition),
       }));
     } else if (depth > 1 && kind === "pending") {
       under = assets.find((a) => a.name === r.dep)?.reasons ?? [];
     }
     links.push({
       asset: r.dep,
+      partition: r.partition,
       kind,
       had: r.had,
       now: r.now,
@@ -81,10 +99,11 @@ function Chain({ links }: { links: ChainLink[] }) {
   return (
     <>
       {links.map((link) => (
-        <div key={link.asset} className="chain-link">
+        <div key={`${link.asset}[${link.partition ?? ""}]`} className="chain-link">
           <div className="chain-row">
             <Link className="mono" to={assetPath(link.asset)}>
               {link.asset}
+              {link.partition !== null && `[${link.partition}]`}
             </Link>
             <span className="muted">
               {link.kind === "changed"

@@ -23,6 +23,16 @@ function cellTitle(p: PartitionEntry): string {
   const lines = [p.key, p.state];
   if (p.fingerprint) lines.push(shortHash(p.fingerprint));
   if (p.built_at) lines.push(`built ${relTime(p.built_at)}`);
+  // what this key reads, and which upstream key left it stale: on a mapped
+  // asset neither is the key itself
+  for (const r of p.reads) {
+    const span = r.first === r.last ? r.first : `${r.first} … ${r.last}`;
+    lines.push(`reads ${r.dep}[${span ?? "nothing"}]${r.count > 1 ? ` (${r.count})` : ""}`);
+    if (r.missing > 0) lines.push(`${r.missing} it covers are not keys of ${r.dep}`);
+  }
+  for (const r of p.reasons.filter((r) => r.partition !== null)) {
+    lines.push(`${r.dep}[${r.partition}] moved`);
+  }
   return lines.join("\n");
 }
 

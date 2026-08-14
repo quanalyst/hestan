@@ -4,7 +4,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { downstreamOf, linkKind, movedInputs, whenChanged } from "../src/lineage";
-import type { AssetSummary, MaterializationEntry } from "../src/types";
+import type { AssetSummary, InputFingerprint, MaterializationEntry } from "../src/types";
 
 const asset = (name: string, deps: string[]): AssetSummary => ({
   name,
@@ -18,6 +18,7 @@ const asset = (name: string, deps: string[]): AssetSummary => ({
   run_id: null,
   stale: false,
   reasons: [],
+  mappings: [],
   checks: { passed: 0, failed: 0, last_run_at: null },
   freshness: null,
 });
@@ -26,7 +27,7 @@ const asset = (name: string, deps: string[]): AssetSummary => ({
 const build = (
   id: number,
   fingerprint: string,
-  inputs: Record<string, string | null> = {},
+  inputs: Record<string, InputFingerprint> = {},
   changed = true,
 ): MaterializationEntry => ({
   id,
@@ -85,10 +86,10 @@ test("a fingerprint the history does not reach names no build at all", () => {
 test("a dep that is merely stale itself is not a dep that changed", () => {
   // the api records a reason for both, and they are different claims: one has
   // moved, the other will move when somebody rebuilds it
-  assert.equal(linkKind({ dep: "orders", had: "aaa", now: "bbb" }), "changed");
-  assert.equal(linkKind({ dep: "orders", had: "aaa", now: "aaa" }), "pending");
-  assert.equal(linkKind({ dep: "orders", had: null, now: null }), "absent");
-  assert.equal(linkKind({ dep: "orders", had: "aaa", now: null }), "absent");
+  assert.equal(linkKind({ dep: "orders", partition: null, had: "aaa", now: "bbb" }), "changed");
+  assert.equal(linkKind({ dep: "orders", partition: null, had: "aaa", now: "aaa" }), "pending");
+  assert.equal(linkKind({ dep: "orders", partition: null, had: null, now: null }), "absent");
+  assert.equal(linkKind({ dep: "orders", partition: null, had: "aaa", now: null }), "absent");
 });
 
 test("what moved under a build is the inputs whose fingerprints differ", () => {
@@ -96,9 +97,31 @@ test("what moved under a build is the inputs whose fingerprints differ", () => {
   const before = build(1, "aaa", { docs_dir: "y", config: "c" });
   // config held still, and an input with nothing before it to compare against
   // is not a change: the first recorded build changed nothing
-  assert.deepEqual(movedInputs(built, before), ["docs_dir"]);
+  assert.deepEqual(movedInputs(built, before), [{ dep: "docs_dir", partition: null }]);
   assert.deepEqual(movedInputs(built, null), []);
 
   // a source records null for its own input, and null moving to a hash is a move
-  assert.deepEqual(movedInputs(build(2, "b", { src: "h" }), build(1, "a", { src: null })), ["src"]);
+  assert.deepEqual(movedInputs(build(2, "b", { src: "h" }), build(1, "a", { src: null })), [
+    { dep: "src", partition: null },
+  ]);
+});
+
+test("a mapped dep moved at the key of it that moved", () => {
+  // a rollup records one fingerprint per hour it read, so what moved under it
+  // is an hour and the chain can say which
+  const hours = (at: string) => ({ "2026-08-13T00": "a", "2026-08-13T01": at, "2026-08-13T02": "c" });
+  const built = build(2, "bbb", { hours: hours("moved") });
+  const before = build(1, "aaa", { hours: hours("b") });
+  assert.deepEqual(movedInputs(built, before), [{ dep: "hours", partition: "2026-08-13T01" }]);
+  // the same keys at the same fingerprints is not a move
+  assert.deepEqual(movedInputs(build(2, "bbb", { hours: hours("b") }), before), []);
+  // a key one of them did not read at all is one: the set it read has changed
+  assert.deepEqual(
+    movedInputs(build(2, "bbb", { hours: { ...hours("b"), "2026-08-13T03": "d" } }), before),
+    [{ dep: "hours", partition: "2026-08-13T03" }],
+  );
+  // and a dep that stopped being read whole moved without naming a key
+  assert.deepEqual(movedInputs(build(2, "bbb", { hours: hours("b") }), build(1, "a", { hours: "z" })), [
+    { dep: "hours", partition: null },
+  ]);
 });
