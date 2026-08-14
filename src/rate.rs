@@ -67,6 +67,7 @@ impl Rate {
             false => Ticket::Waiting(Reserved {
                 rate: self,
                 waiter: bucket.enqueue(at),
+                spent: false,
             }),
         }
     }
@@ -88,9 +89,16 @@ pub(crate) enum Ticket<'a> {
 }
 
 /// a token reserved from a bucket, waiting to be spent.
+///
+/// dropping it before [`spend`](Reserved::spend) resolves gives the token to
+/// the op behind it in the queue, which is what a canceled run does. a token
+/// is spent rather than returned, so one taken by an op that is already dying
+/// is a call nobody makes — and a call the op behind it should have been
+/// making.
 pub(crate) struct Reserved<'a> {
     rate: &'a Rate,
     waiter: Arc<Notify>,
+    spent: bool,
 }
 
 impl Reserved<'_> {
@@ -100,16 +108,26 @@ impl Reserved<'_> {
     }
 
     /// wait for the reserved token.
-    pub(crate) async fn spend(self) {
-        if let Some(at) = self.at() {
-            tokio::time::sleep_until(at).await;
+    ///
+    /// cancel-safe: dropping this future before it resolves is what hands the
+    /// token on, so an op abandoned by a canceled run costs the queue nothing.
+    pub(crate) async fn spend(mut self) {
+        // re-read on every wake rather than sleeping out the instant this
+        // started with: an op ahead in the queue that leaves hands its token
+        // down, and arriving early is the whole point of being handed one
+        while let Some(at) = self.at() {
+            tokio::select! {
+                () = tokio::time::sleep_until(at) => break,
+                () = self.waiter.notified() => {}
+            }
         }
+        self.spent = true;
     }
 }
 
 impl Drop for Reserved<'_> {
     fn drop(&mut self) {
-        self.rate.locked().leave(&self.waiter);
+        self.rate.locked().leave(&self.waiter, self.spent);
     }
 }
 
@@ -180,8 +198,31 @@ impl Bucket {
             .map(|(_, at)| *at)
     }
 
-    fn leave(&mut self, who: &Arc<Notify>) {
-        self.queue.retain(|(waiter, _)| !Arc::ptr_eq(waiter, who));
+    /// take a waiter out of the queue, having spent its token or not.
+    ///
+    /// an unspent token is neither lost nor left in the schedule as a hole:
+    /// every op behind this one moves up a place and is woken to find out, so a
+    /// canceled run costs the ops queued behind it nothing. the queue is in
+    /// token order and stays in it, which is what keeps this from being a way
+    /// to overtake.
+    fn leave(&mut self, who: &Arc<Notify>, spent: bool) {
+        let Some(gone) = self
+            .queue
+            .iter()
+            .position(|(waiter, _)| Arc::ptr_eq(waiter, who))
+        else {
+            return;
+        };
+        self.queue.remove(gone);
+        if spent {
+            return;
+        }
+        let spacing = self.spacing;
+        for (waiter, at) in self.queue.iter_mut().skip(gone) {
+            *at = at.checked_sub(spacing).unwrap_or(*at);
+            waiter.notify_one();
+        }
+        self.next = self.next.checked_sub(spacing).unwrap_or(self.next);
     }
 }
 
@@ -261,6 +302,83 @@ mod tests {
         assert_eq!(
             admissions(&mut idle, start, &[2000; 3]),
             vec![2000, 2000, 2500]
+        );
+    }
+
+    #[tokio::test]
+    async fn the_op_that_asked_first_is_given_the_token_that_comes_first() {
+        let rate = Rate::new(1, Duration::from_secs(30));
+        assert!(matches!(rate.take(), Ticket::Ready));
+        let (Ticket::Waiting(first), Ticket::Waiting(second)) = (rate.take(), rate.take()) else {
+            panic!("a second token inside the period was not a wait");
+        };
+        assert_eq!(rate.waiting(), 2);
+        assert!(
+            first.at() < second.at(),
+            "the op that asked second was given the earlier token"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_waiter_that_leaves_hands_its_token_to_the_one_behind_it() {
+        let rate = Rate::new(1, Duration::from_secs(30));
+        assert!(matches!(rate.take(), Ticket::Ready));
+        let (Ticket::Waiting(leaving), Ticket::Waiting(behind)) = (rate.take(), rate.take()) else {
+            panic!("a second token inside the period was not a wait");
+        };
+        let (freed, was) = (leaving.at(), behind.at());
+        // the shape of a canceled run: the wait is dropped where it stands
+        drop(leaving);
+        assert_eq!(rate.waiting(), 1);
+        assert_eq!(
+            behind.at(),
+            freed,
+            "the op behind waited out a token that was spent on nobody"
+        );
+        // and the token the queue gave up is the one at the back of it rather
+        // than one out of the middle: the next op to ask gets what the op
+        // behind used to hold
+        let next = rate.take();
+        let Ticket::Waiting(next) = next else {
+            panic!("a token appeared out of a reservation nobody spent");
+        };
+        assert_eq!(next.at(), was);
+    }
+
+    #[tokio::test]
+    async fn a_waiter_moved_up_the_queue_is_woken_rather_than_sleeping_it_out() {
+        // a paused clock: it only moves when everything is parked, so "was it
+        // woken" is answered by the instant the op went at rather than by how
+        // long the test took on a busy machine
+        tokio::time::pause();
+        let start = Instant::now();
+        let rate = Arc::new(Rate::new(1, Duration::from_secs(10)));
+        assert!(matches!(rate.take(), Ticket::Ready));
+        let Ticket::Waiting(leaving) = rate.take() else {
+            panic!("a second token inside the period was not a wait");
+        };
+
+        let behind = tokio::spawn({
+            let rate = rate.clone();
+            async move {
+                let Ticket::Waiting(behind) = rate.take() else {
+                    panic!("a third token inside the period was not a wait");
+                };
+                behind.spend().await;
+                Instant::now()
+            }
+        });
+        // parked on the token it was given, which is the one after `leaving`'s
+        while rate.waiting() < 2 {
+            tokio::task::yield_now().await;
+        }
+        tokio::time::advance(Duration::from_secs(11)).await;
+        drop(leaving);
+
+        assert_eq!(
+            behind.await.unwrap().duration_since(start),
+            Duration::from_secs(11),
+            "it slept out the token it was given instead of the one it inherited"
         );
     }
 

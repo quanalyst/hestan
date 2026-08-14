@@ -3435,9 +3435,19 @@ async fn run_op(
         // op that holds a permit while it waits for one is holding a slot that
         // nothing else could have used anyway — a pool and a rate on the same
         // op are two limits on the same api
-        if let Some((_, rate)) = rate
+        if let Some((declared, rate)) = rate
             && let Ticket::Waiting(reserved) = rate.take()
         {
+            // otherwise a queued op is just an op sitting in `running`, which
+            // is what the pool's line above says for the same reason
+            note(store.append_event(
+                &run_id,
+                Some(&name),
+                EventLevel::Info,
+                EventKind::Log,
+                &format!("waiting for a {declared} token"),
+                None,
+            ));
             reserved.spend().await;
         }
         let ctx = OpCtx {

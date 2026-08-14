@@ -2240,6 +2240,21 @@ async fn a_rate_lets_a_burst_through_and_spaces_out_the_rest() {
     );
     // and they were let through in order rather than in a clump at the end
     assert!(at.windows(2).all(|w| w[0] <= w[1]));
+
+    // an op waiting for a token says so, exactly as one waiting for a pool
+    // permit does: an op sitting in `running` with nothing happening is what
+    // makes people stop believing a scheduler
+    let waited = runner
+        .store()
+        .events(&run.id, 0)
+        .unwrap()
+        .into_iter()
+        .filter(|e| e.message == "waiting for a api token")
+        .count();
+    assert_eq!(
+        waited, 4,
+        "the log does not say what the queued ops waited on"
+    );
 }
 
 // the two limits are about different things, and an op that declares both
@@ -2288,6 +2303,102 @@ async fn an_op_that_takes_a_permit_and_a_token_waits_for_both() {
         started.elapsed() >= Duration::from_millis(400),
         "the rate did not bind: {:?}",
         started.elapsed()
+    );
+}
+
+/// a job of one call that records nothing and takes a token, for the cases
+/// that are about the queue rather than about what ran.
+fn one_call_job(name: &str) -> Job {
+    Job::builder(name)
+        .op(Op::new("call", |_| async { Ok(json!(null)) }).rate("api"))
+        .build()
+        .unwrap()
+}
+
+// a token is spent rather than returned, so one taken by an op that is already
+// dying is a call nobody makes — and a call the op behind it should have been
+// making.
+#[tokio::test]
+async fn a_run_canceled_while_it_waits_for_a_token_takes_none_with_it() {
+    let runner = Runner::new([one_call_job("pull")], Store::open(":memory:").unwrap())
+        .unwrap()
+        .with_rates([("api".to_string(), 1, Duration::from_secs(3))])
+        .unwrap();
+
+    // the first has the only token in the bucket; the second and third are
+    // queued behind it, three and six seconds out
+    let first = runner.launch("pull", json!({}), Trigger::Manual).unwrap();
+    assert_eq!(settled(&runner, &first).await.status, RunStatus::Success);
+    let doomed = runner.launch("pull", json!({}), Trigger::Manual).unwrap();
+    let behind = runner.launch("pull", json!({}), Trigger::Manual).unwrap();
+    let queued = runner.rates();
+    wait_until(|| runner.rates()[0].waiting == 2).await;
+
+    let canceled = Instant::now();
+    assert_eq!(
+        runner.cancel(&doomed).unwrap(),
+        CancelOutcome::Requested,
+        "{queued:?}"
+    );
+    assert_eq!(settled(&runner, &doomed).await.status, RunStatus::Canceled);
+    // it stopped waiting rather than waiting out the period it was queued for
+    assert!(
+        canceled.elapsed() < Duration::from_secs(2),
+        "a canceled run took {:?} to stop waiting",
+        canceled.elapsed()
+    );
+    wait_until(|| runner.rates()[0].waiting == 1).await;
+
+    // and the token it was holding went to the op behind it: that one goes at
+    // three seconds, where it would have gone if the canceled run had never
+    // asked, rather than at six. settled_slowly, so a token spent on nobody
+    // fails on what it cost rather than on a timeout that says nothing
+    let ran = settled_slowly(&runner, &behind).await;
+    assert_eq!(ran.status, RunStatus::Success);
+    assert!(
+        canceled.elapsed() < Duration::from_secs(5),
+        "the op behind waited {:?}, so the canceled run spent a token on nothing",
+        canceled.elapsed()
+    );
+    assert_eq!(runner.rates()[0].waiting, 0);
+}
+
+// a queue that lets a latecomer in first is a queue that can starve whoever is
+// at the head of it
+#[tokio::test]
+async fn the_op_that_waited_longest_for_a_token_is_served_first() {
+    let order: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let seen = order.clone();
+    let job = Job::builder("pull")
+        .op(Op::new("call", move |ctx: OpCtx| {
+            let seen = seen.clone();
+            async move {
+                seen.lock().unwrap().push(ctx.run_id().to_string());
+                Ok(json!(null))
+            }
+        })
+        .rate("api"))
+        .build()
+        .unwrap();
+    let runner = Runner::new([job], Store::open(":memory:").unwrap())
+        .unwrap()
+        .with_rates([("api".to_string(), 1, Duration::from_millis(400))])
+        .unwrap();
+
+    // launched far enough apart that which one asked first is not a race, and
+    // well inside one period so that all three are queued at once
+    let mut ids = Vec::new();
+    for _ in 0..3 {
+        ids.push(runner.launch("pull", json!({}), Trigger::Manual).unwrap());
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    for id in &ids {
+        assert_eq!(settled(&runner, id).await.status, RunStatus::Success);
+    }
+    assert_eq!(
+        *order.lock().unwrap(),
+        ids,
+        "the tokens went out in an order the arrivals were not in"
     );
 }
 
