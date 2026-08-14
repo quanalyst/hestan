@@ -4,8 +4,8 @@ import { Link, useNavigate, useSearchParams } from "react-router-dom";
 import { get, HttpError, post, usePoll } from "./api";
 import StatusDot from "./StatusDot";
 import { useMay } from "./role";
-import type { Notification, QueueView, Run } from "./types";
-import { durationMs, fmtDuration, isTerminal, relTime, shortId } from "./util";
+import type { Notification, QueueView, RateView, Run } from "./types";
+import { durationMs, fmtDuration, fmtRate, isTerminal, relTime, shortId } from "./util";
 
 const PAGE = 100;
 const STATUSES = ["all", "queued", "running", "success", "failed", "canceled"] as const;
@@ -133,6 +133,7 @@ export default function RunsPage() {
   const [tagQ, setTagQ] = useState("");
   const [tagErr, setTagErr] = useState<string | null>(null);
   const [queue, setQueue] = useState<QueueView | null>(null);
+  const [rates, setRates] = useState<RateView[]>([]);
   const [undelivered, setUndelivered] = useState<Notification[]>([]);
   const [busyId, setBusyId] = useState<string | null>(null);
   const [rowErr, setRowErr] = useState<{ id: string; msg: string } | null>(null);
@@ -183,6 +184,18 @@ export default function RunsPage() {
         .then(setQueue)
         // a queue that cannot be read is not a queue of nothing; leave the last
         // answer up rather than claiming it drained
+        .catch(() => {});
+    },
+    5000,
+    [],
+  );
+
+  usePoll(
+    () => {
+      get<{ rates: RateView[] }>("/api/rates")
+        .then((r) => setRates(r.rates))
+        // same as the queue: a read that failed says nothing about what is
+        // waiting, so leave the last answer up
         .catch(() => {});
     },
     5000,
@@ -308,6 +321,36 @@ export default function RunsPage() {
         </p>
       ) : (
         <>
+          {/* only when something is actually queued behind one: a rate with
+              nothing waiting is a declaration, and the job page has those */}
+          {rates.some((r) => r.waiting > 0) && (
+            <>
+              <h2>
+                waiting for a token
+                <span className="secondary"> — this process</span>
+              </h2>
+              <table>
+                <thead>
+                  <tr>
+                    <th>rate</th>
+                    <th>limit</th>
+                    <th className="num">ops waiting</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {rates
+                    .filter((r) => r.waiting > 0)
+                    .map((r) => (
+                      <tr key={r.name}>
+                        <td className="mono">{r.name}</td>
+                        <td className="muted">{fmtRate(r.limit, r.per_secs)}</td>
+                        <td className="num">{r.waiting}</td>
+                      </tr>
+                    ))}
+                </tbody>
+              </table>
+            </>
+          )}
           {queue && queue.depth > 0 && (
             <>
               <h2>

@@ -279,6 +279,7 @@ wrong queue      1 run(s) are queued with nothing holding them back, so no
                  process is taking them off the queue
                  start a process whose role executes — `serve` with the default
                  role, or `work` — against this database
+ok    rates      orders_api 5 per 1s, counted in this process and no other
 ok    retention  no policy: nothing is deleted
 ok    disk       24.6gb free of 25.1gb where /var/lib/hestan.db lives (98%)
 $ echo $?
@@ -295,6 +296,7 @@ what it checks, and what each one can actually see:
 | schedules, sensors | anything paused, which is the answer to "why is nothing running" often enough to be worth a line | a store |
 | leases | runs claimed by a process that stopped renewing, which nothing is reclaiming if nothing is running a lease loop | a store |
 | queue | runs waiting on a limit, and — separately — runs waiting on **nothing**, which is a deployment where no process executes | the limits, so the deployment's own binary |
+| rates | what this registry declares, and that a [rate](concepts.md#rates) is per process — a deployment that scaled by adding a worker doubled every one of them without changing a line. over `--server`, the live half instead: how many ops are queued for a token there | the registry, or a running deployment |
 | retention | a policy in a process whose [role](scaling.md#roles) never sweeps, so the database grows and nothing says why | the role, so the deployment's own binary |
 | disk | free space where the run log lives | a local file |
 
@@ -307,11 +309,12 @@ be, which is what makes the other two believable.
 `--json` gives `{"ok": bool, "findings": [...], "unchecked": [...]}` with a
 `fix` on everything actionable.
 
-over `--server` doctor answers the two questions http can, and says plainly
+over `--server` doctor answers the three questions http can, and says plainly
 that it saw nothing else. whether the deployment [checks who is
-asking](auth.md), and — with a token — who it makes you; and, with that same
-token, whether its store is taking the writes it makes, which is the one thing
-only the running process knows. that second one is `wrong` when run outcomes
+asking](auth.md), and — with a token — who it makes you; with that same token,
+whether its store is taking the writes it makes, and what is queued behind each
+of its [rates](concepts.md#rates) — the two things only the running process
+knows. that second one is `wrong` when run outcomes
 are going unrecorded — the process has stopped claiming and is leaving what it
 holds for a reclaimer — and a `note` when it lost something and recovered. the
 schedules, the sensors, the leases, the queue, the retention policy and the

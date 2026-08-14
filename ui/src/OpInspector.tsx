@@ -3,8 +3,8 @@ import { get } from "./api";
 import MetaList from "./MetaList";
 import MicroBars from "./MicroBars";
 import type { MicroBar } from "./MicroBars";
-import type { JobPool, JobState, MetaPoint, OpStat, OpSummary, Trends } from "./types";
-import { fmtBytes, fmtDuration, numericMetaKeys, relTime } from "./util";
+import type { JobPool, JobRate, JobState, MetaPoint, OpStat, OpSummary, Trends } from "./types";
+import { fmtBytes, fmtDuration, fmtRate, numericMetaKeys, relTime } from "./util";
 
 const TITLE_CAP = 2000;
 
@@ -21,6 +21,7 @@ export default function OpInspector({
   job,
   name,
   pools = [],
+  rates = [],
   stat,
   state,
   onClose,
@@ -29,6 +30,7 @@ export default function OpInspector({
   job: string;
   name: string;
   pools?: JobPool[];
+  rates?: JobRate[];
   stat?: OpStat;
   state?: JobState;
   onClose: () => void;
@@ -75,6 +77,9 @@ export default function OpInspector({
   // the limit belongs to the pool, not to this op: every job in the process
   // draws from the same one
   const poolLimit = pools.find((p) => p.name === op?.pool)?.limit ?? null;
+  // and the rate is the same kind of fact: declared once, honoured by every job
+  // in the process — and by this process alone
+  const declaredRate = rates.find((r) => r.name === op?.rate) ?? null;
   const stateJson = state === undefined ? null : JSON.stringify(state.value);
   const stateClipped = stateJson !== null && stateJson.length > 120;
   // capped, or a multi-megabyte state would sit in the DOM as one attribute
@@ -149,6 +154,17 @@ export default function OpInspector({
             <span className="mono">
               {op.pool}
               {poolLimit !== null && ` · ${poolLimit} at once`}
+            </span>
+          </div>
+        )}
+        {op.rate && (
+          <div className="op-line">
+            <span className="op-line-label">rate</span>
+            <span className="mono">
+              {op.rate}
+              {declaredRate?.limit != null &&
+                declaredRate.per_secs != null &&
+                ` · ${fmtRate(declaredRate.limit, declaredRate.per_secs)}`}
             </span>
           </div>
         )}

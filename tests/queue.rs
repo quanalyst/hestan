@@ -153,6 +153,10 @@ fn open(target: &str) -> Store {
 fn app(db: &str) -> Hestan {
     Hestan::new()
         .jobs(jobs())
+        // one call every two seconds, declared once in a registry every process
+        // in this test builds — which is exactly the deployment shape that
+        // makes it per process
+        .rate("api", 1, Duration::from_secs(2))
         // a sensor that would fire constantly, so "a worker fires nothing" is a
         // claim with something to disprove it
         .sensor(Sensor::new(
@@ -188,11 +192,37 @@ fn jobs() -> Vec<Job> {
             .max_concurrent_runs(8)
             .build()
             .unwrap(),
+        Job::builder("throttled")
+            .op(Op::new("call", |_ctx: OpCtx| async move {
+                // when this call went, and from which process. the api on
+                // the other side sees exactly this list
+                let pid = std::process::id();
+                let at = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_millis();
+                let mut file = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(rate_marks())?;
+                std::io::Write::write_all(&mut file, format!("{pid} {at}\n").as_bytes())?;
+                Ok(json!({ "pid": pid }))
+            })
+            .rate("api"))
+            .max_concurrent_runs(8)
+            .build()
+            .unwrap(),
     ]
 }
 
 fn marks() -> PathBuf {
     PathBuf::from(std::env::var(MARKS).unwrap())
+}
+
+/// where every throttled call records itself, beside the other mark file so
+/// each backend's run of the suite reads only its own.
+fn rate_marks() -> PathBuf {
+    marks().with_extension("rate")
 }
 
 /// a runner that enqueues and never executes — the scheduler half of a split
@@ -218,6 +248,11 @@ async fn cases(db: &str) {
     case(
         "a_worker_does_not_fire_schedules_or_sensors",
         a_worker_decides_nothing(db),
+    )
+    .await;
+    case(
+        "a_declared_rate_is_per_process_and_two_workers_are_two_of_them",
+        a_rate_is_per_process(db),
     )
     .await;
 }
@@ -339,6 +374,74 @@ async fn a_worker_decides_nothing(db: &str) {
     assert_eq!(fired.status, RunStatus::Queued);
     assert_eq!(fired.claimed_by, None);
     stop(&mut scheduler);
+}
+
+/// the honest limit, asserted rather than described.
+///
+/// a rate is a bucket in a process's memory. two workers each honouring "one
+/// call every two seconds" make two calls in two seconds, and the api on the
+/// other side has no idea it was talking to two of anything — so the thing to
+/// divide is the limit, and `docs/scaling.md` says so where somebody sizing a
+/// deployment will read it.
+async fn a_rate_is_per_process(db: &str) {
+    let store = open(db);
+    let runner = enqueuer(db);
+    let ids: Vec<String> = (0..4)
+        .map(|_| {
+            runner
+                .launch("throttled", json!({}), Trigger::Manual)
+                .unwrap()
+        })
+        .collect();
+
+    let mut workers = [spawn("worker"), spawn("worker")];
+    for id in &ids {
+        let run = wait_terminal(&store, id).await;
+        assert_eq!(run.status, RunStatus::Success, "{:?}", run.error);
+    }
+    for worker in &mut workers {
+        stop(worker);
+    }
+
+    // every call that was let through: which process made it, and when
+    let calls: Vec<(String, u64)> = std::fs::read_to_string(rate_marks())
+        .unwrap()
+        .lines()
+        .filter_map(|line| line.split_once(' '))
+        .map(|(pid, at)| (pid.to_string(), at.parse().unwrap()))
+        .collect();
+    assert_eq!(calls.len(), 4, "not every op recorded a call: {calls:?}");
+
+    // each process kept the promise it was given: its own calls are a period
+    // apart, whatever the other one was doing
+    let mut pids: Vec<&str> = calls.iter().map(|(pid, _)| pid.as_str()).collect();
+    pids.sort_unstable();
+    pids.dedup();
+    assert_eq!(pids.len(), 2, "one worker took the whole queue: {pids:?}");
+    for pid in &pids {
+        let mut theirs: Vec<u64> = calls
+            .iter()
+            .filter(|(who, _)| who == pid)
+            .map(|(_, at)| *at)
+            .collect();
+        theirs.sort_unstable();
+        for pair in theirs.windows(2) {
+            assert!(
+                pair[1] - pair[0] >= 1_900,
+                "process {pid} made two calls {}ms apart, inside its own period",
+                pair[1] - pair[0]
+            );
+        }
+    }
+
+    // and the api saw the sum: two calls inside one period, because there were
+    // two buckets. this is the limit of what one process can promise
+    let mut at: Vec<u64> = calls.iter().map(|(_, at)| *at).collect();
+    at.sort_unstable();
+    assert!(
+        at[1] - at[0] < 2_000,
+        "two workers spaced their calls as if they shared a bucket: {at:?}"
+    );
 }
 
 // ---------------------------------------------------------------- the harness

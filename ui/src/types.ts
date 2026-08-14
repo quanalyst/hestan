@@ -88,6 +88,7 @@ export interface OpSummary {
   retries: number;
   timeout_secs: number | null;
   pool: string | null;
+  rate: string | null;
   // the named io manager this op's output is persisted through; null is the
   // process default
   io: string | null;
@@ -110,6 +111,23 @@ export interface OpSummary {
 export interface JobPool {
   name: string;
   limit: number | null;
+}
+
+// a named rate shared process-wide: n calls per period, as it was declared
+export interface JobRate {
+  name: string;
+  limit: number | null;
+  per_secs: number | null;
+}
+
+// one rate from GET /api/rates: the declaration plus how many ops are queued
+// for a token in the process that answered, which is the only place the bucket
+// exists
+export interface RateView {
+  name: string;
+  limit: number;
+  per_secs: number;
+  waiting: number;
 }
 
 // what a schedule does about occurrences that came due while nothing was
@@ -159,6 +177,7 @@ export interface JobSummary {
   last_run: Run | null;
   max_parallel: number | null;
   pools: JobPool[];
+  rates: JobRate[];
   overlap: "allow" | "skip" | "queue";
   // the cron-derived heuristic, and always false once a policy is declared:
   // freshness is the answer then

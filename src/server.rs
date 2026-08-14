@@ -103,6 +103,7 @@ pub(crate) fn router(state: AppState) -> Router {
         .route("/api/runs/{id}/cancel", post(cancel_run))
         .route("/api/runs/{id}/priority", post(set_run_priority))
         .route("/api/queue", get(list_queue))
+        .route("/api/rates", get(list_rates))
         .route("/api/assets", get(list_assets))
         .route("/api/assets/build", post(build_all_assets))
         .route("/api/assets/{name}/build", post(build_one_asset))
@@ -318,6 +319,7 @@ pub(crate) fn job_summary(
     job: &Job,
     store: &Store,
     pool_limit: impl Fn(&str) -> Option<usize>,
+    rate_limit: impl Fn(&str) -> Option<(usize, StdDuration)>,
 ) -> Result<Value, Error> {
     let ops: Vec<Value> = job
         .ops()
@@ -331,6 +333,7 @@ pub(crate) fn job_summary(
                 "retries": op.max_retries(),
                 "timeout_secs": op.timeout_after().map(|d| d.as_secs_f64()),
                 "pool": op.pool_name(),
+                "rate": op.rate_name(),
                 "io": op.io_name(),
                 // where this op's body runs, and what it is allowed to spend
                 // there — null limits on every op that runs in this process
@@ -358,6 +361,27 @@ pub(crate) fn job_summary(
     let pools: Vec<Value> = seen
         .into_iter()
         .map(|name| json!({ "name": name, "limit": pool_limit(name) }))
+        .collect();
+    // and the rates, on the same terms: what was declared, not what is waiting
+    // on it now — that is a live number and lives on `/api/rates`
+    let mut seen: Vec<&str> = Vec::new();
+    for op in job.ops() {
+        if let Some(rate) = op.rate_name()
+            && !seen.contains(&rate)
+        {
+            seen.push(rate);
+        }
+    }
+    let rates: Vec<Value> = seen
+        .into_iter()
+        .map(|name| {
+            let declared = rate_limit(name);
+            json!({
+                "name": name,
+                "limit": declared.map(|(limit, _)| limit),
+                "per_secs": declared.map(|(_, per)| per.as_secs_f64()),
+            })
+        })
         .collect();
     let rows: Vec<ScheduleRow> = store
         .schedules()?
@@ -411,6 +435,7 @@ pub(crate) fn job_summary(
         "schedules": schedules,
         "max_parallel": job.max_parallel(),
         "pools": pools,
+        "rates": rates,
         "overlap": job.overlap(),
         "last_run": last_run,
         "interval_secs": interval_secs,
@@ -497,7 +522,14 @@ async fn list_jobs(State(st): State<AppState>) -> Result<Json<Value>, ApiError> 
     jobs.sort_by(|a, b| a.name().cmp(b.name()));
     let jobs: Vec<Value> = jobs
         .iter()
-        .map(|j| job_summary(j, st.runner.store(), |p| st.runner.pool_limit(p)))
+        .map(|j| {
+            job_summary(
+                j,
+                st.runner.store(),
+                |p| st.runner.pool_limit(p),
+                |r| st.runner.rate_limit(r),
+            )
+        })
         .collect::<Result<_, _>>()
         .map_err(internal)?;
     Ok(Json(json!({ "jobs": jobs })))
@@ -512,7 +544,13 @@ async fn get_job(
         .get(&name)
         .ok_or_else(|| err(StatusCode::NOT_FOUND, format!("unknown job: {name}")))?;
     Ok(Json(
-        job_summary(job, st.runner.store(), |p| st.runner.pool_limit(p)).map_err(internal)?,
+        job_summary(
+            job,
+            st.runner.store(),
+            |p| st.runner.pool_limit(p),
+            |r| st.runner.rate_limit(r),
+        )
+        .map_err(internal)?,
     ))
 }
 
@@ -860,6 +898,28 @@ async fn list_queue(State(st): State<AppState>) -> Result<Json<Value>, ApiError>
     )
     .map(Json)
     .map_err(internal)
+}
+
+/// every declared rate and what it is doing here.
+///
+/// "here" is the whole of it: a rate is a bucket in one process's memory, so
+/// `waiting` is this process's queue for it and a second worker has a second
+/// bucket and a second queue. see `docs/scaling.md`.
+async fn list_rates(State(st): State<AppState>) -> Json<Value> {
+    let rates: Vec<Value> = st
+        .runner
+        .rates()
+        .into_iter()
+        .map(|rate| {
+            json!({
+                "name": rate.name,
+                "limit": rate.limit,
+                "per_secs": rate.per.as_secs_f64(),
+                "waiting": rate.waiting,
+            })
+        })
+        .collect();
+    Json(json!({ "rates": rates }))
 }
 
 /// everything `GET /api/queue` says: what is waiting, in the order a dispatch
@@ -2791,6 +2851,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn job_summary_reports_rates_and_the_api_says_who_is_waiting() {
+        let job = Job::builder("pull")
+            .op(Op::new("first", |_| async { Ok(json!(null)) }).rate("api"))
+            .op(Op::new("second", |_| async { Ok(json!(null)) }).rate("api"))
+            .op(Op::new("local", |_| async { Ok(json!(null)) }))
+            .build()
+            .unwrap();
+        let runner = Runner::new([job], Store::open(":memory:").unwrap())
+            .unwrap()
+            .with_rates([("api".to_string(), 5, std::time::Duration::from_secs(1))])
+            .unwrap();
+        let st = AppState {
+            jobs: Arc::new(runner.jobs().clone()),
+            runner,
+            assets: Arc::new(AssetRegistry::empty()),
+            sensors: Arc::new(Vec::new()),
+            auth: None,
+        };
+
+        let Json(body) = get_job(State(st.clone()), Path("pull".into()))
+            .await
+            .unwrap();
+        let ops = body["ops"].as_array().unwrap();
+        assert_eq!(ops[0]["rate"], "api");
+        assert_eq!(ops[1]["rate"], "api");
+        assert_eq!(ops[2]["rate"], json!(null));
+        // what was declared, once per rate the job draws from
+        assert_eq!(
+            body["rates"],
+            json!([{ "name": "api", "limit": 5, "per_secs": 1.0 }])
+        );
+
+        // and the live half, which only the process holding the bucket has
+        let Json(body) = list_rates(State(st)).await;
+        assert_eq!(
+            body["rates"],
+            json!([{ "name": "api", "limit": 5, "per_secs": 1.0, "waiting": 0 }])
+        );
+    }
+
+    #[tokio::test]
     async fn validate_params_endpoint_answers_ok_bad_and_unknown() {
         #[derive(Deserialize)]
         #[allow(dead_code)]
@@ -4515,7 +4616,13 @@ mod tests {
         let st = state(vec![echo_job("etl")]);
         let job = &st.jobs["etl"];
 
-        let s = job_summary(job, st.runner.store(), |p| st.runner.pool_limit(p)).unwrap();
+        let s = job_summary(
+            job,
+            st.runner.store(),
+            |p| st.runner.pool_limit(p),
+            |r| st.runner.rate_limit(r),
+        )
+        .unwrap();
         assert_eq!(s["interval_secs"], json!(null));
         assert_eq!(s["overdue"], json!(false));
 
@@ -4525,7 +4632,13 @@ mod tests {
             .sync_schedules(&[Schedule::new("etl", "0,1 0 1 1 *")])
             .unwrap();
 
-        let s = job_summary(job, st.runner.store(), |p| st.runner.pool_limit(p)).unwrap();
+        let s = job_summary(
+            job,
+            st.runner.store(),
+            |p| st.runner.pool_limit(p),
+            |r| st.runner.rate_limit(r),
+        )
+        .unwrap();
         assert_eq!(s["interval_secs"], json!(60));
         assert_eq!(s["overdue"], json!(true));
 
@@ -4550,21 +4663,39 @@ mod tests {
             actor: None,
         };
         st.runner.store().create_run(&stale, &[]).unwrap();
-        let s = job_summary(job, st.runner.store(), |p| st.runner.pool_limit(p)).unwrap();
+        let s = job_summary(
+            job,
+            st.runner.store(),
+            |p| st.runner.pool_limit(p),
+            |r| st.runner.rate_limit(r),
+        )
+        .unwrap();
         assert_eq!(s["overdue"], json!(true));
 
         st.runner
             .run("etl", json!({}), Trigger::Manual)
             .await
             .unwrap();
-        let s = job_summary(job, st.runner.store(), |p| st.runner.pool_limit(p)).unwrap();
+        let s = job_summary(
+            job,
+            st.runner.store(),
+            |p| st.runner.pool_limit(p),
+            |r| st.runner.rate_limit(r),
+        )
+        .unwrap();
         assert_eq!(s["overdue"], json!(false));
 
         st.runner
             .store()
             .set_schedule_paused("etl", "0,1 0 1 1 *", true, None)
             .unwrap();
-        let s = job_summary(job, st.runner.store(), |p| st.runner.pool_limit(p)).unwrap();
+        let s = job_summary(
+            job,
+            st.runner.store(),
+            |p| st.runner.pool_limit(p),
+            |r| st.runner.rate_limit(r),
+        )
+        .unwrap();
         assert_eq!(s["interval_secs"], json!(null));
         assert_eq!(s["overdue"], json!(false));
     }
@@ -4586,18 +4717,24 @@ mod tests {
             .sync_schedules(&[sched("etl"), sched("plain")])
             .unwrap();
 
-        let plain = job_summary(&st.jobs["plain"], st.runner.store(), |p| {
-            st.runner.pool_limit(p)
-        })
+        let plain = job_summary(
+            &st.jobs["plain"],
+            st.runner.store(),
+            |p| st.runner.pool_limit(p),
+            |r| st.runner.rate_limit(r),
+        )
         .unwrap();
         assert_eq!(plain["overdue"], json!(true));
         assert_eq!(plain["freshness"], json!(null));
 
         // the heuristic would say overdue too; the policy is asked instead, and
         // never having succeeded is not late
-        let etl = job_summary(&st.jobs["etl"], st.runner.store(), |p| {
-            st.runner.pool_limit(p)
-        })
+        let etl = job_summary(
+            &st.jobs["etl"],
+            st.runner.store(),
+            |p| st.runner.pool_limit(p),
+            |r| st.runner.rate_limit(r),
+        )
         .unwrap();
         assert_eq!(etl["overdue"], json!(false), "the policy is the answer now");
         assert_eq!(etl["freshness"]["status"], json!("never"));
@@ -4607,9 +4744,12 @@ mod tests {
             .run("etl", json!({}), Trigger::Manual)
             .await
             .unwrap();
-        let etl = job_summary(&st.jobs["etl"], st.runner.store(), |p| {
-            st.runner.pool_limit(p)
-        })
+        let etl = job_summary(
+            &st.jobs["etl"],
+            st.runner.store(),
+            |p| st.runner.pool_limit(p),
+            |r| st.runner.rate_limit(r),
+        )
         .unwrap();
         assert_eq!(etl["freshness"]["status"], json!("fresh"));
         assert_eq!(etl["freshness"]["late_by_secs"], json!(null));
@@ -4635,9 +4775,12 @@ mod tests {
             .store()
             .backdate_run(&id, Utc::now() - Duration::minutes(90))
             .unwrap();
-        let etl = job_summary(&st.jobs["etl"], st.runner.store(), |p| {
-            st.runner.pool_limit(p)
-        })
+        let etl = job_summary(
+            &st.jobs["etl"],
+            st.runner.store(),
+            |p| st.runner.pool_limit(p),
+            |r| st.runner.rate_limit(r),
+        )
         .unwrap();
         assert_eq!(etl["freshness"]["status"], json!("late"));
         assert_eq!(etl["freshness"]["late_by_secs"], json!(1800));
@@ -5893,8 +6036,9 @@ mod tests {
     /// a route nobody asserted the access of, so the two lists below are
     /// checked against the router itself in
     /// [`the_table_covers_every_endpoint_the_router_serves`].
-    const READS: [&str; 33] = [
+    const READS: [&str; 34] = [
         "/api/health",
+        "/api/rates",
         "/api/resources",
         "/api/jobs",
         "/api/jobs/etl",
@@ -6120,7 +6264,7 @@ mod tests {
         );
         // and the count, so that a scraper that quietly stopped finding
         // anything cannot pass this by covering nothing
-        assert_eq!(declared_routes().len(), 48);
+        assert_eq!(declared_routes().len(), 49);
     }
 
     /// every `| METHOD | \`/api/path\` |` row of the table at the top of
@@ -6184,8 +6328,8 @@ mod tests {
         assert!(stale.is_empty(), "documented but not served: {stale:?}");
         // and neither list is empty, so a scraper that stopped finding
         // anything cannot pass by comparing nothing with nothing
-        assert_eq!(declared.len(), 49);
-        assert_eq!(documented.len(), 49);
+        assert_eq!(declared.len(), 50);
+        assert_eq!(documented.len(), 50);
     }
 
     // a role that may not is 403 and says what it would take; nobody at all is

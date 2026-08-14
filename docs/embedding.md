@@ -64,6 +64,12 @@ would quietly break the promise the pool exists to keep. use
 every op's pool up front and returns `Error::Graph` if one is missing;
 `Hestan::pool(name, limit)` is the same check at build.
 
+[rates](concepts.md#rates) work the same way and are declared on the runner
+rather than in a constructor, because they compose with whichever one you
+used: `Runner::new(jobs, store)?.with_rates([("api".into(), 5, Duration::from_secs(1))])?`.
+an op with `.rate(name)` on a runner that declares none fails at run time for
+the same reason an undeclared pool does.
+
 ## Testing your jobs
 
 `Store::open(":memory:")` makes job tests self-contained and fast — this is

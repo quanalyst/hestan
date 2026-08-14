@@ -44,9 +44,12 @@ holding it back. the runs page shows the same thing with a bump button.
 | `JobBuilder::max_concurrent_runs(n)` | one job | stored, shared |
 | `Hestan::tag_limit(k, v, n)` | every run carrying that [tag](launching.md#run-tags) | stored, shared |
 | `Hestan::slots(n)` | **this process** | in memory, per process |
+| `Hestan::rate(name, n, per)` | **this process**, and ops rather than runs | in memory, per process |
 
-every one of them counts runs that are **executing** — claimed and not
-finished. a run sitting on the queue costs nothing and counts as nothing.
+every one of them but the last counts runs that are **executing** — claimed and
+not finished. a run sitting on the queue costs nothing and counts as nothing.
+a [rate](#a-rate-is-per-process) is the odd one out twice over: it counts calls
+rather than runs, and it is the other limit that lives in memory.
 
 `slots` is the odd one out and the one people forget. the others say how much
 work the deployment does at once; `slots` says how much of it lands in this
@@ -222,6 +225,69 @@ a queue worker spawns op subprocesses like any other hestan process does. the
 environment variables that mark an op subprocess are `HESTAN_ISOLATED_RUN` and
 `HESTAN_ISOLATED_OP`, and every entry point checks for them first.
 
+## A rate is per process
+
+`Hestan::rate("api", 5, Duration::from_secs(1))` is five calls a second **from
+this process**. two workers each honouring it send ten, and the system on the
+other side sees ten and has no idea it was talking to two of anything. with
+`HESTAN_ROLE=worker` on two hosts, a declared rate is per host and the external
+system sees the sum.
+
+that is not a footnote to bury. a rate exists to protect something outside
+hestan, and the deployment shape that makes hestan scale is exactly the one
+that breaks the promise. the bucket is memory — like `slots`, and unlike every
+other limit on this page, it is not a row anybody else can read.
+
+**what to do about it is arithmetic.** the number of workers is a number
+somebody chose, so divide by it: three workers against an api that allows six
+calls a second is `rate("api", 2, ..)` in the registry all three of them build.
+that costs nothing, needs no database, and is exactly right for as long as the
+count is known. where it genuinely is not — an autoscaler — the honest choices
+are to size for the maximum you will ever run, or to keep the throttled work
+where only one process does it.
+
+this is asserted rather than described. `tests/queue.rs` starts two real worker
+processes against one queue, each honouring "one call every two seconds", and
+checks both halves of the truth: each process spaces its own calls a period
+apart, and the two of them together put two calls inside one period.
+
+### Why the bucket is not in the store
+
+a bucket in the run log would hold across processes — a row per name, refilled
+by elapsed time, decremented in a transaction — and it is deliberately not
+here. the reasons are worth writing down, because they are also the reasons it
+would have to be built differently than it sounds.
+
+- **a round trip per call, on the path of every op that declares a rate.** the
+  latency is not the problem; a millisecond either side of an http request is
+  nothing. the write is. a token is an `UPDATE`, and at the rates people
+  actually declare — 5 a second, 100 a minute — that is a write transaction per
+  call forever, against the same database the run log is going into. sqlite
+  serializes writers, so those queue behind every `op_started` and every event;
+  postgres does not, but the row is a single hot row and every worker wants it.
+- **waiting would become polling.** the local bucket wakes a waiter at the
+  instant its token arrives, because the waiter and the bucket are in one
+  process. across processes there is nobody to wake: a worker that finds the
+  bucket empty has to come back and ask, which is another round trip per waiter
+  per interval — and the fairness goes with it, because then the worker that
+  asks at the right moment wins rather than the op that has been waiting
+  longest.
+- **a token taken by a process that dies is gone.** locally a canceled op hands
+  its token to the op behind it, because dropping a future runs code. a host
+  that loses power runs nothing, so a shared bucket needs a lease per token — a
+  row, an expiry, a sweeper — which is the claim machinery the queue already
+  has, and a lot of it to protect a budget of five.
+- **it would work on postgres only**, since two hosts cannot share a sqlite
+  file, and the deployments that need a shared bucket are the ones on several
+  hosts. "the limit you declared is kept across your deployment, if you run a
+  database server" is a worse promise than one that is small and true
+  everywhere.
+
+so dividing is the answer for a known number of workers, which is most
+deployments, and a shared bucket is a later phase's problem — one that would
+start with the lease rather than with the row, and would be opt-in by name with
+the local bucket still the default.
+
 ## The compose example
 
 `Dockerfile` and `docker-compose.yml` at the repo root run the demo as one
@@ -298,5 +364,7 @@ not there.
 - [isolation](isolation.md) — the other mechanism that spawns processes.
 - [storage](storage.md) — the two backends, the queue columns, and what boot
   recovery sweeps.
+- [concepts](concepts.md#rates) — what a rate is, the bucket behind it, and
+  what waiting for a token does.
 - [http api](http-api.md) — `/api/queue`, `/api/runs/{id}/priority`,
-  `/api/health`.
+  `/api/rates`, `/api/health`.

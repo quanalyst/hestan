@@ -171,8 +171,9 @@ knocked them over on the same second; jitter is what pulls the herd apart.
 any other failure. without one, a hung op runs forever: it holds its
 `max_parallel` slot, and its run stays active, so a schedule on
 [`Overlap::Skip`](scheduling.md) never fires again. the clock starts when the
-op starts running, so time spent waiting for a pool permit is not counted
-against it. expiry also trips `ctx.is_cancelled()` — see
+op starts running, so time spent waiting for a pool permit or a
+[rate](#rates) token is not counted against it. expiry also trips
+`ctx.is_cancelled()` — see
 [cancellation](#cancellation) for what that does and does not stop, and
 [isolation](isolation.md) for the op that it stops for real.
 
@@ -394,6 +395,95 @@ queued op reads as queued instead of as an op mysteriously stuck in
 `running`. `GET /api/jobs/{name}` reports each op's `pool` and the job's
 `pools` with their limits, and the op inspector shows both.
 
+## Rates
+
+a pool caps how many calls are in flight. the limit an api publishes is almost
+never that — it is "5 requests a second", "1000 an hour" — and three at a time
+is a rate only if you know how long each call takes. `max_parallel(3)` is how
+that limit usually gets approximated, and the failure mode is a 429 at 06:00.
+
+a *rate* is the limit itself, declared once and shared by every job in the
+process:
+
+```rust
+Hestan::new()
+    .rate("eia_api", 5, Duration::from_secs(1))
+    .job(Job::builder("hourly").op(Op::new("pull", ..).rate("eia_api")).build()?)
+    .job(Job::builder("backfill").op(Op::new("pull", ..).rate("eia_api")).build()?)
+```
+
+an op with `.rate(name)` takes one token before its body runs. naming a rate
+that was never declared is `Error::Graph` at build time, as is declaring the
+same name twice; a limit below 1 means 1. an op may hold a pool permit and a
+rate token at once, and the two names are separate — a pool called `api` and a
+rate called `api` are two different limits on the same thing.
+
+**a token is spent, not returned.** that is the whole difference from a pool: a
+permit comes back when the work ends, and a token does not come back at all.
+there is nothing to release and nothing to hold — the op has had its call, and
+the bucket refills on its own clock whatever the op does next. so none of the
+"held until the work stops" that a permit needs applies here, in either
+direction. the token is per attempt, because a retry is another call, and per
+[fan-out](#dynamic-fan-out) instance, because each instance is another call
+too.
+
+### the burst, and the boundary
+
+it is a **token bucket**: `limit` tokens accrue over `per`, up to `limit` may be
+spent at once, and one more accrues every `per / limit` after that. so "5 a
+second" lets five go at once and then one every 200ms — which is what an api
+publishing a per-second limit generally tolerates, and metering them out one
+every 200ms from the start would be slower than the thing being protected asked
+for.
+
+the alternative is a fixed window — count what this second has spent, reset on
+the tick — and it is less code and it is wrong. five calls at 0.99s and five at
+1.01s are two legal windows and ten calls in fifty milliseconds, and the api
+sees ten. a bucket cannot do that, wherever the boundary falls, because there
+is no boundary: the second five have to wait for tokens to accrue.
+
+### waiting
+
+an op that finds the bucket empty waits. the wait is asynchronous — nothing
+holds a runtime thread — and it does not count against
+[`Op::timeout`](#how-a-run-executes), whose clock starts when the body does.
+the op logs `waiting for a {name} token`, so a throttled op reads as throttled
+instead of as an op mysteriously stuck in `running`, which is the line a pool
+writes for the same reason.
+
+**first come, first served.** the token is reserved when the op asks rather
+than handed out when it arrives, so the queue is in arrival order and stays
+there: an op cannot be overtaken by one that asked later, and a long queue
+cannot starve the op at the head of it.
+
+a [cancelled](#cancellation) run's waiting op stops waiting, and **does not take
+a token on its way out** — the token it was holding goes to the op behind it in
+the queue, which is woken to find out rather than sleeping out the one it was
+given. a token spent on an op that is already dying is a call nobody makes and
+a call somebody else should have been making.
+
+an op that takes both a pool permit and a rate token waits for the permit
+first and then for the token, and holds only the permit while it does. the
+token is taken as late as anything can be, so that "a token was spent" and "a
+call was made" stay the same moment.
+
+### one process
+
+**the bucket lives in this process.** two workers each honouring five a second
+send ten, and the system being protected sees ten. that is not a caveat worth
+burying: a rate exists to protect something outside hestan, and the deployment
+shape that makes hestan scale — [`Role::Worker`](scaling.md#roles) on several
+hosts — is exactly the one that breaks the guarantee.
+
+what to do about it is arithmetic: divide. three workers against an api that
+allows six a second is `rate("api", 2, ..)` in the registry all three build.
+[scaling](scaling.md#a-rate-is-per-process) has the whole of it, including why
+there is no shared bucket in the store.
+
+`GET /api/rates` reports every declared rate and how many ops are waiting on it
+here; `GET /api/jobs/{name}` reports each op's `rate` and the job's `rates`;
+the runs page shows what is piling up behind one, and `hestan doctor` says so.
+
 ## Cancellation
 
 `runner.cancel(run_id)` (or `POST /api/runs/{id}/cancel`) asks a queued or
@@ -468,6 +558,12 @@ into `spawn_blocking` — which is how it reads the cancel signal at all —
 holds the slot it was admitted into until it returns. the run is over and its
 row says canceled; the pool still counts the call that is still in flight,
 which is the only count worth having.
+
+a [rate](#rates) token is the other way round, and it is the difference between
+holding something and having spent it. an op still *waiting* for one when the
+cancel lands takes none with it — the token goes to the op behind it in the
+queue — and an op that already had one has already made its call, so there is
+nothing for the cancel to reach.
 
 ### the isolated contrast
 

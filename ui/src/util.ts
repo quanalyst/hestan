@@ -157,6 +157,23 @@ export function fmtDuration(ms: number | null): string {
   return `${Math.floor(total / 60)}m ${total % 60}s`;
 }
 
+// how a declared rate reads: "5 per second", "100 per 5m". the period is a
+// round number somebody typed, so it is written the way they would say it
+// rather than as a duration to be read off a stopwatch
+export function fmtPeriod(secs: number): string {
+  if (secs === 1) return "second";
+  if (secs === 60) return "minute";
+  if (secs === 3600) return "hour";
+  if (secs < 1) return `${Math.round(secs * 1000)}ms`;
+  if (secs % 3600 === 0) return `${secs / 3600}h`;
+  if (secs % 60 === 0) return `${secs / 60}m`;
+  return `${secs}s`;
+}
+
+export function fmtRate(limit: number, perSecs: number): string {
+  return `${limit} per ${fmtPeriod(perSecs)}`;
+}
+
 export function clockTime(iso: string): string {
   return new Date(iso).toLocaleTimeString([], { hour12: false });
 }

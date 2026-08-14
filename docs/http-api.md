@@ -42,6 +42,7 @@ page is for writing something that is not hestan.
 | GET | `/api/runs/{id}/clone` | a past run's params and tags, to launch again |
 | POST | `/api/runs/{id}/cancel` | stop a queued or running run |
 | GET | `/api/queue` | what is waiting, in order, and what blocks each |
+| GET | `/api/rates` | every declared rate, and how many ops wait on it here |
 | POST | `/api/runs/{id}/priority` | move a queued run up or down the queue |
 | GET | `/api/assets` | every asset with lineage and staleness |
 | POST | `/api/assets/{name}/build` | build one asset (and stale ancestors) |
@@ -255,6 +256,22 @@ saying so beats a 200 that changed nothing.
 Note that priority is a preference and not an order: the dispatcher skips a
 run a limit blocks and starts the next one that fits. See
 [scaling](scaling.md#priority).
+
+`GET /api/rates` is every [rate](concepts.md#rates) this registry declares and
+what each one is doing, sorted by name:
+
+```json
+{
+  "rates": [
+    { "name": "eia_api", "limit": 5, "per_secs": 1.0, "waiting": 3 }
+  ]
+}
+```
+
+`limit` and `per_secs` are what was declared; `waiting` is how many ops are
+queued for a token **in this process**, which is the only place the bucket
+exists. Point this at each worker in turn and add them up — the far side is
+seeing the sum. See [a rate is per process](scaling.md#a-rate-is-per-process).
 
 ## Resources
 

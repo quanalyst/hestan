@@ -21,7 +21,7 @@ import type {
   TickOutcome,
   UpcomingSchedule,
 } from "./types";
-import { durationMs, fmtDuration, opBadge, relTime, shortId, untilTime } from "./util";
+import { durationMs, fmtDuration, fmtRate, opBadge, relTime, shortId, untilTime } from "./util";
 
 const STATS_RUNS = 50;
 
@@ -359,6 +359,10 @@ function JobView({ name }: { name: string }) {
   const policy = [
     job.max_parallel === null ? null : `max_parallel ${job.max_parallel}`,
     ...job.pools.map((p) => `pool ${p.name}${p.limit === null ? "" : ` ${p.limit}`}`),
+    ...job.rates.map(
+      (r) =>
+        `rate ${r.name}${r.limit === null || r.per_secs === null ? "" : ` ${fmtRate(r.limit, r.per_secs)}`}`,
+    ),
     job.overlap === "skip" ? null : `overlap ${job.overlap}`,
   ]
     .filter(Boolean)
@@ -521,6 +525,7 @@ function JobView({ name }: { name: string }) {
           job={name}
           name={opSel}
           pools={job.pools}
+          rates={job.rates}
           stat={stats?.find((s) => s.op === opSel)}
           state={states.find((s) => s.op === opSel)}
           onClose={() => setOpSel(null)}

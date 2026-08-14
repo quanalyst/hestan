@@ -146,6 +146,16 @@ standalone binary for those two. [docs/cli.md](docs/cli.md).
   budget for one external resource, however many jobs overlap). a terminal op
   failure skips its downstream and fails the run, while independent branches
   keep going
+- the other shape an external limit comes in is a **rate**, and it is the one
+  most apis publish: `Hestan::rate("api", 5, Duration::from_secs(1))` plus
+  `Op::rate("api")` is five calls a second across every job in the process. a
+  token bucket, so five may go at once and then one every 200ms — not a fixed
+  window, which admits its whole allowance either side of a boundary. a token
+  is spent rather than held, waiting for one is asynchronous and first-come
+  first-served, and a canceled run's waiting op hands its token to the op
+  behind it. the bucket is **this process's**: two workers each honouring five
+  a second send ten, which [scaling](docs/scaling.md#a-rate-is-per-process) is
+  blunt about
 - op outputs are pluggable: `Hestan::io(FileIo::new(dir))` moves them out of
   the run log and leaves a `{"$io": ..}` handle in it, with `Op::io(name)`
   for per-op managers. the default `Inline` is exactly today's behaviour, and

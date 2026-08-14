@@ -56,6 +56,10 @@ async fn main() -> Result<(), hestan::Error> {
 
     let orders = Job::builder("orders_etl")
         .description("pull orders, clean them, publish aggregates")
+        // the one op here that stands in for a call to somebody else's api,
+        // and the limit that api would publish: five a second, whichever job
+        // is running. see docs/concepts.md#rates — and scaling.md before you
+        // run two of these
         .op(Op::new("fetch_orders", |ctx| async move {
             tokio::time::sleep(Duration::from_millis(400)).await;
             let limit = ctx.params_as::<FetchParams>()?.limit.unwrap_or(6);
@@ -75,6 +79,7 @@ async fn main() -> Result<(), hestan::Error> {
             Ok(json!(rows))
         })
         .timeout(Duration::from_secs(5))
+        .rate("orders_api")
         .params::<FetchParams>())
         .op(Op::new("validate", |ctx| async move {
             let rows = ctx.input("fetch_orders").cloned().unwrap_or_default();
@@ -183,6 +188,7 @@ async fn main() -> Result<(), hestan::Error> {
         .job(orders)
         .job(health)
         .pool("warehouse", 1)
+        .rate("orders_api", 5, Duration::from_secs(1))
         .schedule("orders_etl", "*/2 * * * *")
         .schedule("warehouse_healthcheck", "*/5 * * * *")
         .max_concurrent_runs(env_num("HESTAN_MAX_CONCURRENT_RUNS").unwrap_or(4))

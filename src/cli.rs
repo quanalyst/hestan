@@ -820,12 +820,22 @@ async fn dispatch(reach: Reach, command: Command, out: &Out) -> Result<(), Fail>
                     let app = reach.inspect()?;
                     let pools: HashMap<&str, usize> =
                         app.pools.iter().map(|(n, l)| (n.as_str(), *l)).collect();
+                    let rates: HashMap<&str, (usize, std::time::Duration)> = app
+                        .rates
+                        .iter()
+                        .map(|(n, limit, per)| (n.as_str(), (*limit, *per)))
+                        .collect();
                     let mut jobs: Vec<&Job> = app.jobs.iter().collect();
                     jobs.sort_by_key(|j| j.name());
                     let jobs: Vec<Value> = jobs
                         .iter()
                         .map(|j| {
-                            crate::server::job_summary(j, &app.store, |p| pools.get(p).copied())
+                            crate::server::job_summary(
+                                j,
+                                &app.store,
+                                |p| pools.get(p).copied(),
+                                |r| rates.get(r).copied(),
+                            )
                         })
                         .collect::<Result<_, _>>()?;
                     json!({ "jobs": jobs })
@@ -2344,6 +2354,7 @@ async fn doctor(reach: Reach, out: &Out) -> Result<(), Fail> {
     match &app {
         Some(app) => {
             findings.extend(check_queue(app)?);
+            findings.push(check_rates(app));
             findings.extend(check_retention(app));
             findings.push(check_auth(app.auth.as_ref()));
         }
@@ -2544,6 +2555,40 @@ fn check_queue(app: &Inspected) -> Result<Vec<Finding>, Fail> {
     Ok(findings)
 }
 
+/// the rates this registry declares, and what a second process does to them.
+///
+/// a bucket is one process's memory, so the number that matters is how many
+/// processes execute — and a deployment that scaled by adding a worker has
+/// doubled every rate it declares without changing a line. not an error: it is
+/// what a worker is for, and dividing the limit is the answer.
+fn check_rates(app: &Inspected) -> Finding {
+    if app.rates.is_empty() {
+        return Finding::ok("rates", "none declared");
+    }
+    let declared: Vec<String> = app
+        .rates
+        .iter()
+        .map(|(name, limit, per)| format!("{name} {limit} per {per:?}"))
+        .collect();
+    let declared = declared.join(", ");
+    match app.role {
+        Role::Worker => Finding::note(
+            "rates",
+            format!(
+                "{declared} — and this process is a {}, so every other worker \
+                 honours the same limit separately and the far side sees the sum",
+                app.role
+            ),
+            "divide the limit by the number of workers you run, or keep the \
+             throttled ops where only one process executes them",
+        ),
+        _ => Finding::ok(
+            "rates",
+            format!("{declared}, counted in this process and no other"),
+        ),
+    }
+}
+
 /// a retention policy in a process that will never run it.
 ///
 /// sweeping is a decision, so only a role that decides does it. a deployment
@@ -2635,6 +2680,13 @@ async fn remote_doctor(api: &Api, out: &Out) -> Result<(), Fail> {
     // the one thing only the running process knows: what its store has
     // actually done with the writes it made. behind the guard, so a doctor
     // with no credential says it could not look rather than that all is well
+    match api.get("/api/rates").await {
+        Ok(rates) => findings.push(check_remote_rates(&rates)),
+        Err(_) => unchecked.push(
+            "what is waiting behind its rates, which is behind the guard — pass \
+             --token, or set HESTAN_TOKEN",
+        ),
+    }
     match api.get("/api/health").await {
         Ok(health) => findings.push(check_remote_store(&health)),
         Err(_) => unchecked.push(
@@ -2674,6 +2726,44 @@ async fn remote_doctor(api: &Api, out: &Out) -> Result<(), Fail> {
         true => Err(Fail::new(Exit::Actionable, "something above is actionable")),
         false => Ok(()),
     }
+}
+
+/// what is piling up behind a rate, which only the process holding the bucket
+/// knows.
+///
+/// ops queued for a token are not an error — a rate is a promise to go slowly,
+/// and going slowly looks exactly like this — but it is the answer to "why is
+/// this run taking an hour", and nothing else on this page would say it.
+fn check_remote_rates(answer: &Value) -> Finding {
+    let rates = list(answer, "rates");
+    if rates.is_empty() {
+        return Finding::ok("rates", "none declared");
+    }
+    let queued: Vec<String> = rates
+        .iter()
+        .filter(|r| r["waiting"].as_u64().unwrap_or(0) > 0)
+        .map(|r| {
+            format!(
+                "{} ops behind {} ({} per {}s)",
+                r["waiting"].as_u64().unwrap_or(0),
+                s(r, "name"),
+                r["limit"].as_u64().unwrap_or(0),
+                r["per_secs"].as_f64().unwrap_or(0.0)
+            )
+        })
+        .collect();
+    if queued.is_empty() {
+        return Finding::ok(
+            "rates",
+            format!("{} declared, nothing waiting on any of them", rates.len()),
+        );
+    }
+    Finding::note(
+        "rates",
+        queued.join(", "),
+        "that is the rate doing its job — raise it if the far side allows more, \
+         and remember the bucket is this process's alone",
+    )
 }
 
 /// what a deployment says about its own store on `GET /api/health`.
@@ -2840,12 +2930,28 @@ fn explain(
             json!({ "name": name, "limit": limit })
         })
         .collect();
+    let rates: Vec<Value> = job
+        .ops()
+        .iter()
+        .filter_map(|op| op.rate_name())
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .map(|name| {
+            let declared = app.rates.iter().find(|(r, _, _)| r == name);
+            json!({
+                "name": name,
+                "limit": declared.map(|(_, limit, _)| *limit),
+                "per_secs": declared.map(|(_, _, per)| per.as_secs_f64()),
+            })
+        })
+        .collect();
     let answer = json!({
         "job": job.name(),
         "description": job.description(),
         "params": params,
         "max_parallel": job.max_parallel(),
         "pools": pools,
+        "rates": rates,
         "stages": stages.iter().enumerate().map(|(i, stage)| json!({
             "stage": i + 1,
             "ops": stage.iter().map(|op| json!({
@@ -2853,6 +2959,7 @@ fn explain(
                 "deps": op.deps(),
                 "when": op.runs_when(),
                 "pool": op.pool_name(),
+                "rate": op.rate_name(),
                 "isolated": op.is_isolated(),
                 "retries": op.max_retries(),
                 "timeout_secs": op.timeout_after().map(|d| d.as_secs_f64()),
@@ -2899,6 +3006,16 @@ fn explain(
             .collect();
         println!("pools    {}", gates.join(", "));
     }
+    if !rates.is_empty() {
+        let gates: Vec<String> = rates
+            .iter()
+            .map(|r| match (r["limit"].as_u64(), r["per_secs"].as_f64()) {
+                (Some(limit), Some(per)) => format!("{} ({limit} per {per}s)", s(r, "name")),
+                _ => format!("{} (not declared)", s(r, "name")),
+            })
+            .collect();
+        println!("rates    {}", gates.join(", "));
+    }
     println!();
     for (i, stage) in stages.iter().enumerate() {
         // the stage is what runs together: every op in it has its dependencies
@@ -2915,6 +3032,9 @@ fn explain(
             }
             if let Some(pool) = op.pool_name() {
                 notes.push(format!("pool {pool}"));
+            }
+            if let Some(rate) = op.rate_name() {
+                notes.push(format!("rate {rate}"));
             }
             if op.is_isolated() {
                 notes.push("isolated".into());
@@ -3569,6 +3689,7 @@ mod tests {
             registry: Arc::new(AssetRegistry::empty()),
             store,
             pools: Vec::new(),
+            rates: Vec::new(),
             limits: Limits::new(),
             retention: Retention::default(),
             role: Role::All,
@@ -3649,6 +3770,41 @@ mod tests {
         let findings = check_leases(&store, Utc::now() + chrono::Duration::seconds(1)).unwrap();
         assert_eq!(levels(&findings), [Level::Wrong]);
         assert!(findings[0].says.contains("gone"), "{}", findings[0].says);
+    }
+
+    // a rate is a promise one process makes, and the deployment that scaled by
+    // adding a worker made it twice
+    #[test]
+    fn doctor_says_a_rate_is_this_process_s_and_who_is_queued_behind_one() {
+        let store = Store::open(":memory:").unwrap();
+        let mut app = app(store, vec![job("etl")]);
+        assert_eq!(check_rates(&app).level, Level::Ok);
+        assert!(check_rates(&app).says.contains("none declared"));
+
+        app.rates = vec![("api".to_string(), 5, Duration::from_secs(1))];
+        let alone = check_rates(&app);
+        assert_eq!(alone.level, Level::Ok);
+        assert!(alone.says.contains("api 5 per 1s"), "{}", alone.says);
+
+        // the same registry under the role that makes a deployment scale
+        app.role = Role::Worker;
+        let shared = check_rates(&app);
+        assert_eq!(shared.level, Level::Note);
+        assert!(shared.says.contains("sees the sum"), "{}", shared.says);
+
+        // and over http, the half only the process holding the bucket knows
+        let none = check_remote_rates(&json!({ "rates": [] }));
+        assert_eq!(none.level, Level::Ok);
+        let quiet = check_remote_rates(&json!({
+            "rates": [{ "name": "api", "limit": 5, "per_secs": 1.0, "waiting": 0 }]
+        }));
+        assert_eq!(quiet.level, Level::Ok);
+        assert!(quiet.says.contains("nothing waiting"), "{}", quiet.says);
+        let piling = check_remote_rates(&json!({
+            "rates": [{ "name": "api", "limit": 5, "per_secs": 1.0, "waiting": 12 }]
+        }));
+        assert_eq!(piling.level, Level::Note);
+        assert!(piling.says.contains("12 ops behind api"), "{}", piling.says);
     }
 
     // the finding worth having: a run nothing is holding back and nothing is
