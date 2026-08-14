@@ -194,8 +194,10 @@ is the one case a wrapper genuinely buys something a client call cannot.
 
 ## Where to go next
 
-- [resources](resources.md) — the lifecycle, the ordering, and what
-  `GET /api/resources` will and will not show.
+- [resources](resources.md) — the two scopes, the ordering, and what
+  `GET /api/resources` will and will not show. a pool belongs in the
+  process-wide one: `Hestan::run_resource` builds per run, which for a pool
+  means a pool per run.
 - [io managers](io-managers.md) — the trait, the handle, and both bundled
   managers.
 - [isolation](isolation.md) — an op that segfaults a native driver, in a

@@ -336,11 +336,16 @@ Op::new("query", |ctx| async move {
 constructors are async and fallible and run before the store opens, so one
 that fails aborts startup with `Error::Resource { name, reason }` rather than
 leaving a half-live server. `Op::requires` turns a name nobody registered into
-a build error instead of a run that gets halfway. resources live for the
-process — no per-run scoping, no teardown hooks. the model has
-[its own page](resources.md), and [connecting to your data](connecting.md) is
-the worked version of it: a pool built once, the credential out of the
-environment, and the reason there is no client of anybody's wrapped in here.
+a build error instead of a run that gets halfway.
+
+a resource declared with `Hestan::run_resource` is built when a run starts and
+dropped when it ends instead — a scratch directory, a per-tenant client, a
+token that belongs to one execution. ops read either the same way, and the
+constructor running per run is the cost: a pool built that way is a pool per
+run, which is usually a mistake. the model has [its own page](resources.md),
+and [connecting to your data](connecting.md) is the worked version of it: a
+pool built once, the credential out of the environment, and the reason there
+is no client of anybody's wrapped in here.
 
 ## Concurrency pools
 

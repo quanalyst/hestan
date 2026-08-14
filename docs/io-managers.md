@@ -234,9 +234,60 @@ path, not just the happy one:
   manager whose `get` is expensive pays for that, and the alternative is a run
   that fails halfway through claiming to be a reproduction.
 - **asset builds.** a memoized build seeds a fresh dep from its
-  materialization. that value never went through `put` — asset
-  materializations record the asset's value, not an op handle — so it arrives
-  through `get`'s pass-through rule.
+  materialization, which holds what `put` returned for it. so seeding a
+  parquet-backed asset hands the next build a handle, and the op that reads it
+  reads the file — see [an asset's value](#an-assets-value).
+
+## An asset's value
+
+an [asset](assets.md) is an op with a value somebody keeps, so its value goes
+where every other output goes:
+
+```rust
+let orders = Asset::new("orders", ..).io("parquet");
+
+Hestan::new()
+    .io_named("parquet", ParquetIo::new("/var/lib/hestan/parquet"))
+    .assets([orders])
+```
+
+`asset_materializations.value` records **what the manager returned** — the
+handle under `ParquetIo`, the value itself under `Inline`. the same handle the
+op run keeps, for the same file: an asset of rows used to be stored twice, once
+as a handle in `op_runs.output` and once inline in the materialization, and the
+inline copy was the one a later build read.
+
+seeding reads it back through the manager the asset stores through, so the
+build that memoizes `orders` hands the op downstream the rows out of the
+parquet file rather than json out of the run log. nothing about staleness
+changes: the fingerprint is of the value the op returned, so where the value
+ended up cannot make anything stale.
+
+three things worth knowing:
+
+- **a source has no value of its own**, so `.io(..)` on one is a build error. a
+  source's materialization is a fingerprint of something outside hestan.
+- **a multi-asset keeps each slice inline.** one op returns one object holding
+  every asset it produces, the manager has one handle for the whole of it, and
+  no part of it has a handle of its own — so each produced asset records the
+  value it was, as it always has. `MultiAsset::io(..)` still says where the
+  op's own output goes.
+- **an existing row keeps working**, and there is no migration. a row written
+  before any of this holds the value itself, which is not one of any manager's
+  handles, so `get`'s pass-through rule hands it straight back. nothing has to
+  tell the two apart, and no column says which kind a row is — the same
+  arrangement `op_runs.output` has always had, with the same residual
+  ambiguity: a value that happens to look like a live manager's handle is read
+  as one.
+
+**changing where an asset's value goes** leaves a row the new manager did not
+write, and a manager hands back what it did not write: a `ParquetIo` handle is
+not a value to `Inline`, so a build that memoizes that asset would seed the
+handle itself. a build of the asset writes a row the new manager wrote and
+settles it, so the window is one memoized build in between — rebuild each asset
+you move, rather than waiting to find out.
+
+what else changes is [what retention takes](#what-retention-takes).
 
 ## When put fails
 
@@ -279,7 +330,30 @@ run's worth of waste that whoever owns the directory can still find; a sweep
 that stopped there would grow the database forever behind one unwritable
 directory, and go on doing it every hour.
 
-three things follow, and all three are worth knowing before you point a
+### The run an asset's value is inside
+
+a value in a manager is inside the run that wrote it, and the sweep takes what
+a run wrote when it takes the run. so a run that an asset's **current**
+materialization still reads is held back from every policy, rows and files
+together, until something rebuilds the asset — at which point it is history
+like any other run and the next sweep takes it.
+
+the alternative is worse in both directions: prune it and the row points at
+nothing, so the next build either fails on a hole or silently redoes work
+somebody paid for. but this is a real change to what a policy promises, and it
+is stated rather than buried — `Retention::days(30)` no longer means nothing
+older than thirty days is here. an asset built a year ago and never rebuilt
+keeps its run for as long as it stays current. `hestan doctor` counts them:
+
+```
+note  values     3 run(s) are held back from retention: an asset's current value is what they wrote, and a later build reads it
+```
+
+nothing is held back under `Inline`, whose values are in the materialization
+itself and go nowhere when a run is pruned — a deployment that never configured
+a manager prunes exactly as it did.
+
+three more things follow, and all three are worth knowing before you point a
 manager at a directory:
 
 - **only what a policy deletes is collected.** with no `Retention`

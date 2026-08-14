@@ -160,7 +160,9 @@ standalone binary for those two. [docs/cli.md](docs/cli.md).
   the run log and leaves a `{"$io": ..}` handle in it, with `Op::io(name)`
   for per-op managers. the default `Inline` is exactly today's behaviour, and
   `ParquetIo` (behind `--features parquet`) stores an op's rows as one parquet
-  file, recording how many rows and how many bytes without the op asking. see
+  file, recording how many rows and how many bytes without the op asking. an
+  asset's value goes the same way with `Asset::io(name)` — the materialization
+  records the handle and the next build seeds from the file. see
   [connecting to your data](docs/connecting.md) for the whole seam between an
   op and the system it reads: a client called from an op, a pool as a
   resource, secrets out of the environment, and why hestan wraps nobody's sdk
@@ -168,7 +170,10 @@ standalone binary for those two. [docs/cli.md](docs/cli.md).
   `Hestan::resource("api", |_| async { Ok(ApiClient::new()?) })` plus
   `ctx.resource::<ApiClient>("api")?`, with `Op::requires(["api"])` turning a
   missing one into a build error. a constructor that fails aborts startup
-  instead of leaving a half-live server
+  instead of leaving a half-live server. `Hestan::run_resource` is the other
+  scope — built when a run starts, dropped when it ends, off the runtime if
+  dropping blocks — for a scratch directory or anything else one run must not
+  share with the next
 - a reusable `Graph` of ops drops into a job as many times as you like:
   `.graph("clean_a", &clean).after(["fetch"])`. it is flattened at build into
   ordinary ops named `{instance}.{inner}`, so nothing at run time — resume,

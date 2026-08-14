@@ -206,7 +206,7 @@ CREATE TABLE asset_materializations (  -- added in v4, rebuilt in v8
     partition TEXT,           -- added in v9; null = unpartitioned
     fingerprint TEXT NOT NULL,
     inputs TEXT NOT NULL,     -- json map: dep name -> consumed fingerprint
-    value TEXT,               -- null for sources
+    value TEXT,               -- what the io manager returned; null for sources
     run_id TEXT,              -- null for probe-written source rows
     built_at TEXT NOT NULL,
     metadata TEXT             -- added in v8
@@ -578,6 +578,31 @@ latest materialization is the same: it survives the run that built it being
 retired, so a materialization's `run_id` can point at a run retention has since
 deleted.
 
+### The run an asset's value is inside
+
+one more thing a policy does not delete, and the one worth knowing before you
+choose a number. an [asset](assets.md) whose value goes through an
+[io manager](io-managers.md) has that value inside the run that built it, and
+the sweep takes what a run wrote when it takes the run. so **a run that an
+asset's current materialization still reads is held back**, rows and files
+together, until something rebuilds the asset — the next sweep after that takes
+it like any other run past its policy.
+
+pruning it instead would leave the row pointing at nothing, and the next build
+would either fail on a hole or silently redo work somebody paid for. but it
+does mean a policy no longer strictly bounds what is here: `days(30)` is "no
+run older than thirty days, except the ones holding a value something still
+reads", and an asset built a year ago and never rebuilt keeps its run forever.
+`hestan doctor` counts them so a disk filling is not a mystery:
+
+```
+note  values     3 run(s) are held back from retention: an asset's current value is what they wrote, and a later build reads it
+```
+
+nothing is held back under the default `Inline`, whose values are in
+`asset_materializations.value` itself: a deployment that never configured a
+manager prunes exactly as it did before.
+
 ### The sweep
 
 a sweep runs at startup **and every `Hestan::retention_interval` after it**,
@@ -653,6 +678,15 @@ itself, json in sqlite, which is what it has always been; under another it is
 a handle — `{"$io": "file", "path": ".."}` for `FileIo` — and the value lives
 wherever that manager put it. the write happens before the success row, so a
 row never claims success for a value that was not persisted.
+
+`asset_materializations.value` holds the same thing for the same reason: what
+the manager returned for the asset's value, which under `Inline` is the value
+and under a file manager is the handle its op run already holds — one stored
+thing named twice rather than a file and a json copy of it. a row written
+before an asset's value went through a manager holds the value itself and is
+read back the same way, since a manager hands back what it did not write; no
+migration turned those rows into anything. a multi-asset is the exception:
+several assets share one output and one handle, so each keeps its own slice.
 
 within a run, dependents are handed handles and resolve them as they are
 spawned; a resume and an asset build resolve the handles they seed the same

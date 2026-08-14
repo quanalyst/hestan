@@ -321,6 +321,29 @@ absent from the run's op list entirely. build-all is the same idea across
 the whole graph, one plan covering every stale asset and one run, so a
 morning's catch-up reads as a single coherent run in the ui.
 
+### Where a seeded value comes from
+
+a materialization records **what the io manager returned** for the value, so
+what a memoized build seeds is what the row holds and the run reads it back the
+way it reads any other input. under the default `Inline` that is the value
+itself, which is what hestan has always done. under a manager it is a handle,
+and the op downstream reads the file:
+
+```rust
+let orders = Asset::new("orders", ..).io("parquet");
+```
+
+so an asset of rows is stored once — as parquet, where the op run's handle
+already pointed — rather than as a file plus a json copy in the run log.
+`docs/io-managers.md` has the whole of it, including the one thing this changes
+about [retention](io-managers.md#the-run-an-assets-value-is-inside): a run that
+an asset's current value is inside is held back from the policy until something
+rebuilds the asset.
+
+a row written before any of this holds the value itself and still seeds — a
+manager hands back what it did not write, so nothing has to tell an old row
+from a new one and there is no migration.
+
 `Hestan::build_asset(name)` is the headless form, like `run_once`: it always
 materializes the target itself (plus stale ancestors), so check staleness
 first if you only want conditional builds. **the http endpoint and

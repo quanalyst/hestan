@@ -4,7 +4,7 @@
 - [choosing](choosing.md) — which of these do you want: job or asset, sqlite or postgres, in-process or isolated, schedule or sensor.
 - [concepts](concepts.md) — ops, jobs, runs, events, triggers, and exactly how a run executes.
 - [typed io](typed-io.md) — `Op::typed`, `input_as`, `.params::<P>()`, and what a type-check failure does.
-- [resources](resources.md) — values built once at startup and shared by every op: `Hestan::resource`, `ctx.resource::<T>`, `Op::requires`.
+- [resources](resources.md) — values hestan builds and hands to the ops that name them, for the process or for one run: `Hestan::resource`, `Hestan::run_resource`, `ctx.resource::<T>`, `Op::requires`.
 - [op state](state.md) — persisted watermarks: `ctx.state`/`set_state`, the at-least-once commit order, the state endpoint.
 - [metadata](metadata.md) — typed facts an op attaches to what it produced: `ctx.meta`, the `Meta` variants, per-attempt staging, and where they surface.
 - [events](events.md) — the one log every subsystem writes to: the kinds, what each payload carries, where each event is written and which of them cannot be atomic, and the schema's stability.

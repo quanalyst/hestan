@@ -11,7 +11,7 @@ src/
   graph.rs      topo order (kahn's) and transitive-downstream
   io.rs         IoManager, Inline, FileIo, ParquetIo (behind parquet),
                 the per-op manager table
-  resource.rs   process-wide resources and their constructors
+  resource.rs   resources and their constructors: the process's and the run's
   executor.rs   Runner and the run loop: concurrency, retries, skips, subset runs
   asset.rs      Asset, the registry, staleness/planning, the materializing wrapper
   sensor.rs     Sensor, SensorCtx, the sensor loop (probes included)

@@ -1,8 +1,20 @@
 # Resources
 
-a *resource* is a value built once at startup and shared by every op that asks
-for it: an http client, a connection pool, a parsed config. it is what
-replaces capturing a client in a closure.
+a *resource* is a value hestan builds and hands to the ops that ask for it by
+name: an http client, a connection pool, a parsed config, a scratch directory.
+it is what replaces capturing a client in a closure.
+
+there are two scopes, and which one you want is a question about how long the
+value should live:
+
+| declared with | built | dropped | for |
+| --- | --- | --- | --- |
+| `Hestan::resource` | once, at startup | when the process ends | a pool, a client, a config — anything every run may share |
+| `Hestan::run_resource` | when a run starts | when that run ends | a scratch directory, a per-tenant client, a token that belongs to one execution |
+
+ops read either with `ctx.resource::<T>(name)` and declare either with
+`Op::requires([name])`. the call site is the same on purpose: how long a value
+lives is the deployment's decision, not the op's.
 
 ```rust
 Hestan::new()
@@ -91,21 +103,87 @@ the same call either way. declaring is how you find out at startup instead of
 at 3am, which is the same bargain [`Op::pool`](concepts.md#concurrency-pools)
 offers.
 
+## Run-scoped resources
+
+`Hestan::run_resource` builds a value per run and drops it when the run ends:
+
+```rust
+Hestan::new()
+    .run_resource("scratch", |ctx| async move {
+        // the run it belongs to, so what it leaves behind can be traced
+        Ok(Scratch::under(ctx.run_id().unwrap())?)
+    })
+```
+
+`ResourceCtx::run_id` is `Some` here and `None` in a process-wide constructor,
+which is built before any run exists. run-scoped constructors run in
+declaration order after the process-wide ones, so one can lean on either.
+
+**what it costs.** the constructor runs for every run. a connection pool built
+this way is a pool per run — a hundred pools on a busy afternoon, each with its
+own connections, each dropped an hour later — which is almost always a mistake
+and is the reason the two scopes have different names. build the pool with
+`resource` and put the run's own short-lived thing in `run_resource`.
+
+a constructor that fails fails the run before any op of it runs:
+
+```
+resource scratch: no space left on device
+```
+
+on the run row, with every op of the run recorded `skipped` and saying so.
+nothing else could have been true of an op that needed it.
+
+a name used by both scopes is `Error::Resource` at build, so
+`ctx.resource("x")` never means two things. asking for a run-scoped name
+outside a run — from a sensor, say — is `no resource named x`: nothing built
+it, because there was no run for it to belong to.
+
+### When it is dropped
+
+when the run ends, by **every** route: it succeeded, it failed, it was
+cancelled, or the process gave up on recording its outcome. the value is held
+by the task driving the run and by nothing else, so what drops it is that task
+ending — including the task simply being dropped when the process stops caring
+about the run.
+
+dropping happens **on the blocking pool**, not on the async runtime. a `Drop`
+that removes a directory or closes a socket blocks, and the task driving a run
+is the one thread that must not — the same reason [io manager
+calls](io-managers.md) go to the pool. a runtime already shutting down runs
+nothing new and drops what it was handed instead: still off the run's stack,
+still dropped.
+
+the one limit is the one `Arc` always has: an op that kept its handle past the
+end of the run holds the value up until it lets go, and the drop then happens
+wherever that is. hestan cannot see the end of work that keeps nothing of
+hestan's.
+
+**an isolated op** runs in a child process, which builds the run's resources
+for itself — its own copy, dropped when the child exits, exactly as a
+process-wide resource in a child is that process's copy and not the parent's.
+
 ## Lifetime
 
-resources live for the process. there is **no per-run scoping and no teardown
-hook** in this phase: nothing is rebuilt between runs, and nothing is closed
-when the process exits beyond whatever `Drop` the value itself does. anything
-that needs a fresh value per run, or a deliberate shutdown, should own it
-inside the op instead.
+a process-wide resource lives for the process: nothing is rebuilt between runs,
+and nothing is closed when the process exits beyond whatever `Drop` the value
+itself does.
 
 ## Seeing what exists
 
-`GET /api/resources` lists them — names and declared types, never values:
+`GET /api/resources` lists them — names, declared types and scopes, never
+values:
 
 ```json
-{ "resources": [ { "name": "api", "type": "demo::ApiClient" } ] }
+{ "resources": [
+  { "name": "api",     "type": "demo::ApiClient", "scope": "process" },
+  { "name": "scratch", "type": "demo::Scratch",   "scope": "run" }
+] }
 ```
+
+a run-scoped one is reported as *declared* rather than as built: nothing of it
+exists between runs, and its type is the one its constructor was written to
+return.
 
 a resource is usually a client holding credentials, so the api has no business
 showing what is inside one. `GET /api/jobs/{name}` reports each op's
