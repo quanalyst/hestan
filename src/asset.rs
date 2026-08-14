@@ -1184,19 +1184,54 @@ async fn with_dep_inputs(
 }
 
 /// the dep fingerprints one materialization records: the key it consumed for a
-/// partitioned dep, the whole asset otherwise.
-fn dep_fingerprints(ctx: &OpCtx, links: &[DepLink], key: Option<&str>) -> Result<Value, Error> {
+/// partitioned dep read at one key, the whole asset for an unpartitioned one,
+/// and — for a dep read through a mapping that names a set — one fingerprint
+/// per key it consumed, as an object keyed by partition.
+///
+/// this is what staleness compares against, so a mapped read has to record
+/// every key it read and not only the one that matches its own: a rollup that
+/// recorded a day would report fresh while the hours under it moved.
+fn dep_fingerprints(
+    ctx: &OpCtx,
+    links: &[DepLink],
+    own: Option<&Partitions>,
+    key: Option<&str>,
+) -> Result<Value, Error> {
     let mut inputs = Map::new();
     for link in links {
-        let at = key.filter(|_| link.partitions.is_some());
-        let fp = ctx
-            .store
-            .materialization(&link.asset, at)?
-            .map(|m| m.fingerprint);
-        inputs.insert(
-            link.asset.clone(),
-            fp.map(Value::String).unwrap_or(Value::Null),
-        );
+        let fp = |at: Option<&str>| -> Result<Value, Error> {
+            let fp = ctx
+                .store
+                .materialization(&link.asset, at)?
+                .map(|m| m.fingerprint);
+            Ok(fp.map(Value::String).unwrap_or(Value::Null))
+        };
+        let recorded = match &link.partitions {
+            None => fp(None)?,
+            Some(spec) => {
+                let reads = match link.mapping.is_identity() {
+                    true => Reads::at(key),
+                    false => link.mapping.reads(own, key, &KeySet::of(spec)),
+                };
+                match link.mapping.reads_one() {
+                    // one key arrives as one fingerprint, exactly as identity
+                    // has always recorded it
+                    true => match reads.keys.first() {
+                        Some(at) => fp(Some(at))?,
+                        None => Value::Null,
+                    },
+                    false => {
+                        let mut by_key = Map::new();
+                        for at in reads.keys {
+                            let held = fp(Some(&at))?;
+                            by_key.insert(at, held);
+                        }
+                        Value::Object(by_key)
+                    }
+                }
+            }
+        };
+        inputs.insert(link.asset.clone(), recorded);
     }
     Ok(Value::Object(inputs))
 }
@@ -1303,7 +1338,7 @@ fn wrap_op(reg: &AssetRegistry, meta: &OpMeta) -> Op {
             // deps' current fingerprints: ancestors in this run already wrote
             // theirs. one entry per dep asset, not per op, so lineage reads in
             // the names the asset graph uses
-            let inputs = dep_fingerprints(&ctx, &links, key.as_deref())?;
+            let inputs = dep_fingerprints(&ctx, &links, own.as_ref(), key.as_deref())?;
             // the op-wide override, which covers every output that did not
             // stage one of its own
             let shared = ctx.take_fingerprint();
@@ -1514,6 +1549,11 @@ pub(crate) struct Staleness {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct StaleReason {
     pub dep: String,
+    /// which of the dep's keys this is about, when the dep was read through a
+    /// [mapping](PartitionMapping) that reads a key other than this asset's
+    /// own — the hour that moved under a daily rollup, rather than the day.
+    /// `None` under identity, where the key is the reader's own.
+    pub partition: Option<String>,
     pub had: Option<String>,
     pub now: Option<String>,
 }
@@ -1523,22 +1563,24 @@ pub(crate) struct StaleReason {
 /// computed in topo order, so staleness propagates before anything rebuilds.
 ///
 /// a partitioned asset is judged one key at a time, and is stale as a whole
-/// when any of its keys is. a partitioned dep is read at the *same* key —
-/// identity mapping — and an unpartitioned one whole, which is why a probe
-/// moving a source's fingerprint makes every partition of every descendant
-/// stale at once.
+/// when any of its keys is. a partitioned dep is read at whatever keys the
+/// edge's [mapping](PartitionMapping) resolves to — the same key under
+/// identity — and an unpartitioned one whole, which is why a probe moving a
+/// source's fingerprint makes every partition of every descendant stale at
+/// once.
 pub(crate) fn staleness(reg: &AssetRegistry, mats: &Mats) -> HashMap<String, Staleness> {
+    let sets = key_sets(reg);
     let mut out: HashMap<String, Staleness> = HashMap::new();
     for meta in reg.topo() {
-        let s = match &meta.partitions {
-            None => one_staleness(reg, mats, meta, &out, None),
-            Some(spec) => {
-                let parts: BTreeMap<String, Staleness> = spec
-                    .keys_now()
-                    .into_iter()
+        let s = match sets.get(&meta.name) {
+            None => one_staleness(mats, &sets, meta, &out, None),
+            Some(set) => {
+                let parts: BTreeMap<String, Staleness> = set
+                    .keys()
+                    .iter()
                     .map(|key| {
-                        let s = one_staleness(reg, mats, meta, &out, Some(&key));
-                        (key, s)
+                        let s = one_staleness(mats, &sets, meta, &out, Some(key));
+                        (key.clone(), s)
                     })
                     .collect();
                 Staleness {
@@ -1553,12 +1595,21 @@ pub(crate) fn staleness(reg: &AssetRegistry, mats: &Mats) -> HashMap<String, Sta
     out
 }
 
+/// every partitioned asset's keys, worked out once. a mapping resolves against
+/// what its dep holds, and asking the dep one key at a time would rebuild its
+/// whole set for every key of every consumer.
+fn key_sets(reg: &AssetRegistry) -> HashMap<String, KeySet> {
+    reg.topo()
+        .filter_map(|m| Some((m.name.clone(), KeySet::of(m.partitions.as_ref()?))))
+        .collect()
+}
+
 /// one verdict: the whole of an unpartitioned asset, or one key of a
 /// partitioned one. `done` holds the verdicts of everything upstream, which
 /// topo order guarantees is already there.
 fn one_staleness(
-    reg: &AssetRegistry,
     mats: &Mats,
+    sets: &HashMap<String, KeySet>,
     meta: &AssetMeta,
     done: &HashMap<String, Staleness>,
     key: Option<&str>,
@@ -1569,30 +1620,62 @@ fn one_staleness(
             ..Staleness::default()
         };
     };
-    let mut reasons = Vec::new();
-    for dep in &meta.deps {
-        let dep_partitioned = reg.get(dep).is_some_and(|m| m.partitions.is_some());
-        let at = key.filter(|_| dep_partitioned);
-        let had = mat
-            .inputs
-            .get(dep)
-            .and_then(Value::as_str)
-            .map(String::from);
+    // whether the dep's key `at` has moved since this build consumed the
+    // fingerprint `had`, and what to say about it if it has
+    let moved = |dep: &str, at: Option<&str>, had: Option<String>| {
         let now = mats.get(dep, at).map(|m| m.fingerprint.clone());
         let dep_stale = match (done.get(dep), at) {
-            // a key the dep's own set does not hold can never be fresh:
-            // identity mapping has nothing to read there
+            // a key the dep's own set does not hold can never be fresh: there
+            // is nothing there to read
             (Some(s), Some(key)) => s.parts.get(key).is_none_or(|s| s.stale),
             (Some(s), None) => s.stale,
             (None, _) => true,
         };
-        if dep_stale || now.is_none() || had != now {
-            reasons.push(StaleReason {
-                dep: dep.clone(),
-                had,
-                now,
+        (dep_stale || now.is_none() || had != now).then_some((had, now))
+    };
+    let mut reasons = Vec::new();
+    for dep in &meta.deps {
+        let mapping = meta.mapping(dep);
+        let held = mat.inputs.get(dep);
+        let Some(set) = sets.get(dep).filter(|_| !mapping.is_identity()) else {
+            // identity, and every dep that has no keys to map: the same key of
+            // a partitioned dep, the whole of an unpartitioned one, which is
+            // what a dep meant before there were mappings
+            let at = key.filter(|_| sets.contains_key(dep));
+            let had = held.and_then(Value::as_str).map(String::from);
+            if let Some((had, now)) = moved(dep, at, had) {
+                reasons.push(StaleReason {
+                    dep: dep.clone(),
+                    partition: None,
+                    had,
+                    now,
+                });
+            }
+            continue;
+        };
+        // a mapped read consumed a fingerprint per key, so the same question is
+        // asked of every key it read — and of every key it wanted and the dep
+        // does not hold, which can never be fresh either. one reason per dep
+        // still: the first key that moved is what made this one stale, and a
+        // window of ten thousand is not a list anybody reads
+        let reads = mapping.reads(meta.partitions.as_ref(), key, set);
+        let culprit = reads
+            .keys
+            .iter()
+            .chain(reads.missing.iter())
+            .find_map(|up| {
+                let had = held
+                    .and_then(|v| v.get(up))
+                    .and_then(Value::as_str)
+                    .map(String::from);
+                moved(dep, Some(up), had).map(|(had, now)| StaleReason {
+                    dep: dep.clone(),
+                    partition: Some(up.clone()),
+                    had,
+                    now,
+                })
             });
-        }
+        reasons.extend(culprit);
     }
     Staleness {
         stale: !reasons.is_empty(),
@@ -1703,11 +1786,20 @@ fn seeds_for(
 /// that are missing or stale, newest first, capped by the set's
 /// [build limit](crate::Partitions::build_limit). the cap is what stops an
 /// unbounded daily range starting a thousand instances by accident.
-fn default_keys(spec: &Partitions, verdict: &Staleness) -> Vec<String> {
+///
+/// a key whose [window](PartitionMapping::covering) reaches past what its dep
+/// holds is not in the set: nothing could materialize it, and a default build
+/// that targeted it would refuse every time rather than build the rest.
+fn default_keys(
+    sets: &HashMap<String, KeySet>,
+    meta: &AssetMeta,
+    spec: &Partitions,
+    verdict: &Staleness,
+) -> Vec<String> {
     let mut keys: Vec<String> = verdict
         .parts
         .iter()
-        .filter(|(_, s)| s.stale)
+        .filter(|(key, s)| s.stale && unheld(sets, meta, key).is_none())
         .map(|(key, _)| key.clone())
         .collect();
     keys.reverse(); // parts are oldest first; a build wants the newest
@@ -1715,13 +1807,32 @@ fn default_keys(spec: &Partitions, verdict: &Staleness) -> Vec<String> {
     keys
 }
 
+/// the first key one partition of `meta` promises to read that its dep does not
+/// hold, as `(dep, key)`. a [window](PartitionMapping::covering) is the only
+/// mapping that promises one: identity names a key whose absence is a dep that
+/// never arrives, and an offset off the end of a set reads nothing on purpose.
+fn unheld(sets: &HashMap<String, KeySet>, meta: &AssetMeta, key: &str) -> Option<(String, String)> {
+    for dep in &meta.deps {
+        let mapping = meta.mapping(dep);
+        let Some(set) = sets.get(dep).filter(|_| !mapping.is_identity()) else {
+            continue;
+        };
+        let reads = mapping.reads(meta.partitions.as_ref(), Some(key), set);
+        if let Some(missing) = reads.missing.first() {
+            return Some((dep.clone(), missing.clone()));
+        }
+    }
+    None
+}
+
 /// which keys each partitioned op in the plan will build.
 ///
-/// walked from the sinks up, because identity mapping runs that way: an
-/// upstream partitioned asset has to cover every key its consumers are about
-/// to read, and only the keys of *its* that are actually stale are worth
-/// rebuilding. a target with no keys named takes its default set; anything
-/// upstream takes what its consumers need.
+/// walked from the sinks up, because a mapping runs that way: an upstream
+/// partitioned asset has to cover every key its consumers are about to read —
+/// its own key under identity, the 24 hours under a daily window — and only
+/// the keys of *its* that are actually stale are worth rebuilding. a target
+/// with no keys named takes its default set; anything upstream takes what its
+/// consumers need.
 fn key_targets(
     reg: &AssetRegistry,
     stale: &HashMap<String, Staleness>,
@@ -1729,6 +1840,7 @@ fn key_targets(
     targets: &[String],
     named: &HashMap<String, Vec<String>>,
 ) -> HashMap<String, Vec<String>> {
+    let sets = key_sets(reg);
     let in_plan: HashSet<&str> = ops.iter().map(String::as_str).collect();
     let mut keys: HashMap<String, Vec<String>> = HashMap::new();
     for meta in reg.ops().collect::<Vec<_>>().into_iter().rev() {
@@ -1739,9 +1851,10 @@ fn key_targets(
             continue;
         }
         let asset = &meta.name; // a partitioned op produces exactly one asset
+        let own = reg.get(asset).expect("a planned op produces its asset");
         let mut want: Vec<String> = match named.get(asset) {
             Some(explicit) => explicit.clone(),
-            None if targets.contains(asset) => default_keys(spec, &stale[asset]),
+            None if targets.contains(asset) => default_keys(&sets, own, spec, &stale[asset]),
             None => Vec::new(),
         };
         // every key a consumer downstream will read, that this asset owes
@@ -1749,13 +1862,37 @@ fn key_targets(
             if !in_plan.contains(consumer.name.as_str()) || !consumer.deps.contains(asset) {
                 continue;
             }
-            for key in keys.get(&consumer.name).into_iter().flatten() {
-                let owed = stale[asset].parts.get(key).is_none_or(|s| s.stale);
-                if owed && !want.contains(key) {
-                    want.push(key.clone());
+            let mapping = consumer.mapping(asset);
+            let set = sets.get(asset);
+            // an unpartitioned consumer makes one read, at no key of its own —
+            // which only a mapping over every key resolves to anything
+            let reading: Vec<Option<&str>> = match consumer.partitions.is_some() {
+                false => vec![None],
+                true => keys
+                    .get(&consumer.name)
+                    .into_iter()
+                    .flatten()
+                    .map(|k| Some(k.as_str()))
+                    .collect(),
+            };
+            for key in reading {
+                // what that read takes of this asset: the consumer's own key
+                // under identity, and whatever the mapping resolves to otherwise
+                let reads = match (set, mapping.is_identity()) {
+                    (Some(set), false) => mapping.reads(consumer.partitions.as_ref(), key, set),
+                    _ => Reads::at(key),
+                };
+                for up in reads.keys {
+                    let owed = stale[asset].parts.get(&up).is_none_or(|s| s.stale);
+                    if owed && !want.contains(&up) {
+                        want.push(up);
+                    }
                 }
             }
         }
+        // a key this asset cannot read its own deps at is not one it can build,
+        // however it got into the list
+        want.retain(|key| unheld(&sets, own, key).is_none());
         keys.insert(meta.name.clone(), want);
     }
     keys
@@ -1926,6 +2063,7 @@ pub(crate) fn build_one(
             if meta.partitions.is_none() {
                 return Err(Error::Graph(format!("asset {name} is not partitioned")));
             }
+            check_named_keys(reg, name, keys)?;
             HashMap::from([(name.to_string(), keys.to_vec())])
         }
     };
@@ -1940,6 +2078,38 @@ pub(crate) fn build_one(
     }
     let plan = plan_partitions(reg, &mats, std::slice::from_ref(&name.to_string()), &named)?;
     launch_plan(runner, plan, Trigger::Build, asset_tag(name)).map(Some)
+}
+
+/// what naming a key outright is refused for: a partition whose
+/// [window](PartitionMapping::covering) reaches a key its dep does not hold.
+/// nothing could ever materialize it — a window is its whole range or it is a
+/// different number — so the answer is which key is missing, rather than a
+/// rollup of the part that happened to be there.
+///
+/// both places a caller names keys come through here: a build of named
+/// partitions and the range a [backfill](crate::Hestan) resolves. a build that
+/// names none of them leaves such keys out of its target set instead, since
+/// refusing the whole build for one key it never asked for would leave the
+/// asset unbuildable.
+pub(crate) fn check_named_keys(
+    reg: &AssetRegistry,
+    asset: &str,
+    keys: &[String],
+) -> Result<(), Error> {
+    let Some(meta) = reg.get(asset) else {
+        return Ok(());
+    };
+    let sets = key_sets(reg);
+    for key in keys {
+        if let Some((dep, missing)) = unheld(&sets, meta, key) {
+            return Err(Error::Graph(format!(
+                "asset {asset}: partition {key:?} reads {dep}[{missing}], which is not \
+                 one of {dep}'s partitions. a window covers its whole range or it is a \
+                 different number"
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// the tag a build of one named asset carries.
@@ -2112,6 +2282,7 @@ mod tests {
             s["a"].reasons,
             vec![StaleReason {
                 dep: "s".into(),
+                partition: None,
                 had: Some("s1".into()),
                 now: Some("s2".into()),
             }]
@@ -2123,6 +2294,7 @@ mod tests {
             s["b"].reasons,
             vec![StaleReason {
                 dep: "a".into(),
+                partition: None,
                 had: Some("a1".into()),
                 now: Some("a1".into()),
             }]
@@ -2143,6 +2315,7 @@ mod tests {
             s["a"].reasons,
             vec![StaleReason {
                 dep: "s".into(),
+                partition: None,
                 had: Some("s1".into()),
                 now: None,
             }]
@@ -2349,6 +2522,7 @@ mod tests {
             st["b"].reasons,
             vec![StaleReason {
                 dep: "a".into(),
+                partition: None,
                 had: Some("v1".into()),
                 now: Some("v2".into()),
             }]
@@ -3265,6 +3439,7 @@ mod tests {
             st["a"].parts["k2"].reasons,
             vec![StaleReason {
                 dep: "s".into(),
+                partition: None,
                 had: Some("s0".into()),
                 now: Some("s1".into()),
             }]
@@ -3569,13 +3744,209 @@ mod tests {
 
         let m = mats_map(&store).unwrap();
         let plan = plan_target(&reg, &m, "flat").unwrap();
+        // the key it has not read yet comes along: reading every key is a
+        // claim about all of them, so the build owes the one that is missing
+        assert_eq!(plan.seeds["partitions:a"], json!(["k3"]));
         assert_eq!(build_plan(&runner, plan).await.status, RunStatus::Success);
-        // one object keyed by partition, holding the keys that have
-        // materialized — k3 has not, and is absent rather than null
+        // one object keyed by partition
         assert_eq!(
             store.materialization("flat", None).unwrap().unwrap().value,
-            Some(json!({"k1": {"key": "k1"}, "k2": {"key": "k2"}}))
+            Some(json!({"k1": {"key": "k1"}, "k2": {"key": "k2"}, "k3": {"key": "k3"}}))
         );
+        // and with every key read and recorded, the aggregation is fresh
+        let st = staleness(&reg, &mats_map(&store).unwrap());
+        assert!(!st["flat"].stale, "{:?}", st["flat"].reasons);
+    }
+
+    // a window needs time, so these build their key sets around the clock the
+    // sets themselves are generated from: yesterday is a whole day of hours
+    // whatever hour it is now
+    fn yesterday() -> String {
+        Utc::now()
+            .date_naive()
+            .pred_opt()
+            .expect("a day before today")
+            .format("%Y-%m-%d")
+            .to_string()
+    }
+
+    fn hours_of(day: &str) -> Vec<String> {
+        (0..24).map(|h| format!("{day}T{h:02}")).collect()
+    }
+
+    /// hourly `hours` from `start`, and a daily `rollup` covering it from
+    /// yesterday.
+    fn rollup_over(start: &str) -> AssetRegistry {
+        let hours = Asset::new("hours", |ctx: OpCtx| async move {
+            Ok(json!({ "hour": ctx.partition() }))
+        })
+        .partitioned(Partitions::hourly(start.to_string()));
+        let rollup = Asset::new("rollup", |ctx: OpCtx| async move {
+            let hours = ctx.input("hours").cloned().unwrap_or(json!({}));
+            Ok(json!({ "hours": hours.as_object().map_or(0, |h| h.len()) }))
+        })
+        .reads_named("hours", PartitionMapping::covering())
+        .partitioned(Partitions::daily(yesterday()));
+        AssetRegistry::new(vec![hours, rollup], Vec::new(), Vec::new()).unwrap()
+    }
+
+    fn consumed(hours: &[String]) -> Value {
+        Value::Object(
+            hours
+                .iter()
+                .map(|h| (h.clone(), json!(format!("fp-{h}"))))
+                .collect(),
+        )
+    }
+
+    fn covered_rows(day: &str, hours: &[String]) -> Vec<Materialization> {
+        let mut rows: Vec<Materialization> = hours
+            .iter()
+            .map(|h| part("hours", h, &format!("fp-{h}"), json!({})))
+            .collect();
+        rows.push(part(
+            "rollup",
+            day,
+            "r1",
+            json!({ "hours": consumed(hours) }),
+        ));
+        rows
+    }
+
+    #[test]
+    fn a_rollup_is_stale_when_an_hour_it_covers_moves_and_not_when_another_does() {
+        let day = yesterday();
+        let hours = hours_of(&day);
+        let reg = rollup_over(&format!("{day}T00"));
+        let fresh = covered_rows(&day, &hours);
+        let st = staleness(&reg, &mats(fresh.clone()));
+        assert!(
+            !st["rollup"].parts[&day].stale,
+            "a rollup of hours that have not moved: {:?}",
+            st["rollup"].parts[&day].reasons
+        );
+
+        // one covered hour rebuilt to different content
+        let mut moved = fresh.clone();
+        moved[7] = part("hours", &hours[7], "fp-rebuilt", json!({}));
+        let st = staleness(&reg, &mats(moved));
+        assert!(st["rollup"].parts[&day].stale);
+        // and the chain names the hour rather than the day
+        assert_eq!(
+            st["rollup"].parts[&day].reasons,
+            vec![StaleReason {
+                dep: "hours".into(),
+                partition: Some(hours[7].clone()),
+                had: Some(format!("fp-{}", hours[7])),
+                now: Some("fp-rebuilt".into()),
+            }]
+        );
+
+        // an hour of *today* is not one this key covers, and moving it leaves
+        // the rollup of yesterday alone
+        let mut elsewhere = fresh;
+        let today = Utc::now().format("%Y-%m-%dT%H").to_string();
+        elsewhere.push(part("hours", &today, "fp-today", json!({})));
+        let st = staleness(&reg, &mats(elsewhere));
+        assert!(
+            !st["rollup"].parts[&day].stale,
+            "an hour outside the window moved the rollup"
+        );
+    }
+
+    #[tokio::test]
+    async fn building_a_daily_key_builds_the_hours_it_covers_and_records_every_one() {
+        let store = Store::open(":memory:").unwrap();
+        let day = yesterday();
+        let hours = hours_of(&day);
+        let reg = rollup_over(&format!("{day}T00"));
+        let runner = Runner::new([reg.lower_job().unwrap()], store.clone()).unwrap();
+
+        let m = mats_map(&store).unwrap();
+        let plan = plan_partitions(&reg, &m, &["rollup".into()], &on("rollup", [&day])).unwrap();
+        // the hours the key covers come along, and no others
+        assert_eq!(plan.seeds["partitions:hours"], json!(hours));
+        let run = build_plan(&runner, plan).await;
+        assert_eq!(run.status, RunStatus::Success);
+        assert_eq!(store.op_runs(&run.id).unwrap().len(), 25);
+
+        // the body saw all 24 of them, keyed by hour
+        let built = store
+            .materialization("rollup", Some(&day))
+            .unwrap()
+            .unwrap();
+        assert_eq!(built.value, Some(json!({"hours": 24})));
+        // and the lineage records the fingerprint of every hour it consumed,
+        // which is what lets one of them moving be noticed
+        let recorded = built.inputs["hours"].as_object().expect("one per hour");
+        assert_eq!(recorded.len(), 24);
+        for hour in &hours {
+            let fp = store.materialization("hours", Some(hour)).unwrap().unwrap();
+            assert_eq!(recorded[hour], json!(fp.fingerprint));
+        }
+        let st = staleness(&reg, &mats_map(&store).unwrap());
+        assert!(!st["rollup"].parts[&day].stale);
+
+        // one covered hour rebuilt on its own
+        let hour = &hours[3];
+        let plan = plan_partitions(
+            &reg,
+            &mats_map(&store).unwrap(),
+            &["hours".into()],
+            &on("hours", [hour]),
+        )
+        .unwrap();
+        build_plan(&runner, plan).await;
+        let st = staleness(&reg, &mats_map(&store).unwrap());
+        // it produced the same bytes, so the fingerprint it recorded is the
+        // one the day consumed and the day is still fresh: what makes a
+        // rollup stale is content moving, not an hour being run again
+        assert!(!st["rollup"].parts[&day].stale);
+    }
+
+    #[test]
+    fn a_key_whose_hours_the_dep_does_not_hold_is_refused_by_name_and_skipped_by_default() {
+        let day = yesterday();
+        // the hourly set starts at 06:00, so the first six hours of the day are
+        // not keys of it and never will be
+        let reg = rollup_over(&format!("{day}T06"));
+        let err = check_named_keys(&reg, "rollup", std::slice::from_ref(&day)).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains(&format!("partition {day:?} reads hours[{day}T00]")),
+            "{err}"
+        );
+
+        // a build that names nothing leaves it out rather than refusing: the
+        // day after it is a whole day of hours and is buildable
+        let plan = plan_target(&reg, &Mats::default(), "rollup").unwrap();
+        let keys = plan.seeds["partitions:rollup"].as_array().unwrap();
+        assert!(
+            !keys.contains(&json!(day)),
+            "a day whose hours are missing was targeted anyway: {keys:?}"
+        );
+        // and it stays stale rather than quietly reading the hours that are
+        // there
+        let st = staleness(&reg, &Mats::default());
+        assert!(st["rollup"].parts[&day].stale);
+    }
+
+    #[test]
+    fn the_build_limit_counts_the_keys_of_the_target_and_not_what_they_read() {
+        let day = yesterday();
+        let hours = Asset::new("hours", |_| async { Ok(json!(null)) })
+            .partitioned(Partitions::hourly(format!("{day}T00")));
+        let rollup = Asset::new("rollup", |_| async { Ok(json!(null)) })
+            .reads_named("hours", PartitionMapping::covering())
+            .partitioned(Partitions::daily(day.clone()).build_limit(1));
+        let reg = AssetRegistry::new(vec![hours, rollup], Vec::new(), Vec::new()).unwrap();
+        let plan = plan_target(&reg, &Mats::default(), "rollup").unwrap();
+        // one key of the target, as the limit says
+        assert_eq!(plan.seeds["partitions:rollup"], json!([day]));
+        // and the hours under it, which the limit says nothing about: a mapped
+        // chunk is as many instances as its keys read, and the ceiling on that
+        // is Hestan::max_instances
+        assert_eq!(plan.seeds["partitions:hours"].as_array().unwrap().len(), 24);
     }
 
     #[test]

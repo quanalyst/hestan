@@ -1025,6 +1025,12 @@ pub struct Materialization {
     /// the fingerprint of each dep as this build consumed it, by name. this is
     /// what staleness compares against — an asset is stale when a dep's
     /// current fingerprint is not the one recorded here.
+    ///
+    /// one string per dep, except for a dep read through a
+    /// [mapping](crate::PartitionMapping) that names a *set* of the dep's
+    /// keys: that one records an object of one fingerprint per key it
+    /// consumed, since a rollup that recorded a single one could not tell
+    /// which hour under it had moved.
     pub inputs: Value,
     /// what the [io manager](crate::IoManager) returned for the value: the
     /// value itself under [`Inline`](crate::Inline), a handle under a manager

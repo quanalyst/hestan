@@ -1018,7 +1018,16 @@ pub(crate) fn assets_json(registry: &AssetRegistry, store: &Store) -> Result<Val
             let reasons: Vec<Value> = s
                 .reasons
                 .iter()
-                .map(|r| json!({ "dep": r.dep, "had": r.had, "now": r.now }))
+                .map(|r| {
+                    json!({
+                        "dep": r.dep,
+                        // which key of the dep, when it was read through a
+                        // mapping that reads one other than this asset's own
+                        "partition": r.partition,
+                        "had": r.had,
+                        "now": r.now,
+                    })
+                })
                 .collect();
             // a partitioned asset has no single fingerprint to report, so it
             // reports the shape of its key set instead: the three states are
@@ -5401,6 +5410,118 @@ mod tests {
             sensors: Arc::new(Vec::new()),
             auth: None,
         }
+    }
+
+    /// hourly `hours` since yesterday, and a daily `rollup` covering it.
+    fn rollup_state() -> (AppState, String) {
+        let day = Utc::now()
+            .date_naive()
+            .pred_opt()
+            .expect("a day before today")
+            .format("%Y-%m-%d")
+            .to_string();
+        let hours = crate::Asset::new("hours", |ctx: crate::OpCtx| async move {
+            Ok(json!({ "hour": ctx.partition() }))
+        })
+        .partitioned(crate::Partitions::hourly(format!("{day}T00")));
+        let rollup = crate::Asset::new("rollup", |ctx: crate::OpCtx| async move {
+            let hours = ctx.input("hours").cloned().unwrap_or(json!({}));
+            Ok(json!({ "hours": hours.as_object().map_or(0, |h| h.len()) }))
+        })
+        .reads_named("hours", crate::PartitionMapping::covering())
+        .partitioned(crate::Partitions::daily(day.clone()));
+        let registry =
+            Arc::new(AssetRegistry::new(vec![hours, rollup], Vec::new(), Vec::new()).unwrap());
+        let runner = Runner::new(
+            [registry.lower_job().unwrap()],
+            Store::open(":memory:").unwrap(),
+        )
+        .unwrap();
+        let st = AppState {
+            jobs: Arc::new(runner.jobs().clone()),
+            runner,
+            assets: registry,
+            sensors: Arc::new(Vec::new()),
+            auth: None,
+        };
+        (st, day)
+    }
+
+    #[tokio::test]
+    async fn a_mapped_key_reads_right_on_the_grid_and_in_the_summary() {
+        let (st, day) = rollup_state();
+        let app = router(st.clone());
+        let (status, body, _) = request(
+            app.clone(),
+            Method::GET,
+            "/api/assets/rollup/partitions?limit=90",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let body = body.unwrap();
+        // two days of keys, neither built
+        assert_eq!(body["total"], 2);
+        assert!(
+            body["partitions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|p| p["state"] == "missing")
+        );
+
+        let (status, Json(body)) = build_one_asset(
+            State(st.clone()),
+            Path("rollup".into()),
+            None,
+            Bytes::from(format!(r#"{{"partitions":["{day}"]}}"#)),
+        )
+        .await
+        .unwrap();
+        assert_eq!(status, StatusCode::ACCEPTED);
+        wait_success(&st, body["run_id"].as_str().unwrap()).await;
+
+        // the day it built reads materialized, and so do the 24 hours the day
+        // covers — which the build pulled in without being asked for them
+        let (_, body, _) = request(
+            app.clone(),
+            Method::GET,
+            "/api/assets/rollup/partitions?limit=90",
+        )
+        .await;
+        let body = body.unwrap();
+        let built: Vec<&Value> = body["partitions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|p| p["key"] == json!(day))
+            .collect();
+        assert_eq!(built.len(), 1);
+        assert_eq!(built[0]["state"], "materialized");
+        let (_, body, _) = request(
+            app.clone(),
+            Method::GET,
+            "/api/assets/hours/partitions?limit=1000",
+        )
+        .await;
+        let body = body.unwrap();
+        let done = body["partitions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|p| p["state"] == "materialized")
+            .count();
+        assert_eq!(done, 24, "the hours the day covers");
+
+        let Json(body) = list_assets(State(st.clone())).await.unwrap();
+        let rollup = body["assets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|a| a["name"] == "rollup")
+            .unwrap();
+        assert_eq!(rollup["partitions"]["total"], 2);
+        assert_eq!(rollup["partitions"]["materialized"], 1);
+        assert_eq!(rollup["partitions"]["missing"], 1);
     }
 
     #[tokio::test]

@@ -3,7 +3,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::asset::{
-    ASSETS_JOB, AssetRegistry, asset_tag, launch_plan, mats_map, plan_partitions, staleness,
+    ASSETS_JOB, AssetRegistry, asset_tag, check_named_keys, launch_plan, mats_map, plan_partitions,
+    staleness,
 };
 use crate::error::Error;
 use crate::executor::Runner;
@@ -55,6 +56,9 @@ pub(crate) fn start(
         )));
     }
     let mut keys = spec.range(from, to)?;
+    // the range names its keys, so a key nothing could build is said here
+    // rather than skipped in every chunk that reaches it
+    check_named_keys(registry, asset, &keys)?;
     if only_missing {
         let mats = mats_map(runner.store())?;
         let verdict = &staleness(registry, &mats)[asset];
