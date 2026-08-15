@@ -5,12 +5,19 @@
 a policy on an asset says when hestan rebuilds it, evaluated per key, and one
 process acts on it.
 
-**breaking, and only in what a field means.** `.auto()` is unchanged in what it
-does and in what it is called: it is now `AutoPolicy::when_stale()`, the same
-rule with the others beside it. `"auto"` in `GET /api/assets` now means "hestan
-rebuilds this one itself", which is any policy rather than that one rule, and a
-graph declaring a policy on a source fails the build saying "an automation
-policy on a source" where it used to say "auto on a source".
+**breaking, and mostly in what a field means.** `.auto()` is unchanged in what it
+is called and in what it does on every graph that had a probe reaching it: it is
+now `AutoPolicy::when_stale()`, the same rule with the others beside it. one case
+does change. an auto asset whose sources have all been observed, sitting in a
+part of the graph no probe reaches, is now rebuilt by the policy pass within a
+minute of going stale, where before nothing looked at it at all. that is the rule
+doing what it always said; it is written here because a deployment relying on the
+old silence would see builds it did not see before.
+
+`"auto"` in `GET /api/assets` now means "hestan rebuilds this one itself", which
+is any policy rather than that one rule, and a graph declaring a policy on a
+source fails the build saying "an automation policy on a source" where it used
+to say "auto on a source".
 
 - **four rules and no more**, each of them something people were writing sensors
   for: `when_stale` (today's `auto`), `when_missing` (the fresh deployment and
