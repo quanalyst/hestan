@@ -15,6 +15,8 @@ use crate::job::Job;
 use crate::model::{CheckStatus, Materialization, RunTags, Severity, Trigger};
 use crate::op::{self, Meta, Op, OpCtx};
 use crate::partition::{KeySet, PartitionMapping, Partitions, Reads};
+use crate::policy::AutoPolicy;
+use crate::schedule::Cron;
 use crate::store::{Built, Store};
 
 /// the internal job every asset build runs under.
@@ -68,7 +70,7 @@ pub struct Asset {
     io: Option<String>,
     probe: Option<Arc<ProbeFn>>,
     probe_every: Duration,
-    auto: bool,
+    policy: Option<AutoPolicy>,
     retries: u32,
     retry_delay: Option<Duration>,
     partitions: Option<Partitions>,
@@ -89,7 +91,7 @@ impl Asset {
             io: None,
             probe: None,
             probe_every: Duration::from_secs(60),
-            auto: false,
+            policy: None,
             retries: 0,
             retry_delay: None,
             partitions: None,
@@ -115,7 +117,7 @@ impl Asset {
             io: None,
             probe: None,
             probe_every: Duration::from_secs(60),
-            auto: false,
+            policy: None,
             retries: 0,
             retry_delay: None,
             partitions: None,
@@ -143,7 +145,7 @@ impl Asset {
             io: None,
             probe: None,
             probe_every: Duration::from_secs(60),
-            auto: false,
+            policy: None,
             retries: 0,
             retry_delay: None,
             partitions: None,
@@ -288,8 +290,32 @@ impl Asset {
 
     /// rebuild this asset automatically when a probe upstream makes it stale.
     /// without a probed source somewhere upstream it just waits forever.
-    pub fn auto(mut self) -> Asset {
-        self.auto = true;
+    ///
+    /// this is [`AutoPolicy::when_stale`] and always was; the policy is the
+    /// same rule with the others beside it, and either spelling behaves
+    /// identically.
+    pub fn auto(self) -> Asset {
+        self.policy(AutoPolicy::when_stale())
+    }
+
+    /// when hestan may rebuild this asset on its own: stale, never built, after
+    /// a cron, and any of them held until everything the build reads is there.
+    ///
+    /// ```no_run
+    /// # use hestan::{Asset, AutoPolicy, OpCtx};
+    /// # use serde_json::json;
+    /// Asset::new("daily_revenue", |_: OpCtx| async { Ok(json!(null)) })
+    ///     .policy(AutoPolicy::after_cron("0 2 * * *"));
+    /// ```
+    ///
+    /// the deciding process evaluates it, key by key on a
+    /// [partitioned](Self::partitioned) asset, and builds what it says to
+    /// build; `docs/assets.md` says what it does when one is already building
+    /// and what it does with a rule that cannot be satisfied. declaring one on
+    /// a [source](Self::source) is a build error: sources are probed, never
+    /// built.
+    pub fn policy(mut self, policy: AutoPolicy) -> Asset {
+        self.policy = Some(policy);
         self
     }
 
@@ -361,7 +387,7 @@ pub struct MultiAsset {
     deps: Vec<String>,
     op: Op,
     io: Option<String>,
-    auto: bool,
+    policy: Option<AutoPolicy>,
     retries: u32,
     retry_delay: Option<Duration>,
 }
@@ -381,7 +407,7 @@ impl MultiAsset {
             produces: Vec::new(),
             deps: Vec::new(),
             io: None,
-            auto: false,
+            policy: None,
             retries: 0,
             retry_delay: None,
         }
@@ -436,9 +462,16 @@ impl MultiAsset {
     }
 
     /// rebuild automatically when a probe upstream makes any produced asset
-    /// stale; the flag lands on all of them, since one op produces them all.
-    pub fn auto(mut self) -> MultiAsset {
-        self.auto = true;
+    /// stale, which is [`policy`](Self::policy) with the stale rule.
+    pub fn auto(self) -> MultiAsset {
+        self.policy(AutoPolicy::when_stale())
+    }
+
+    /// when hestan may rebuild these on its own, as [`Asset::policy`]. the
+    /// policy lands on every produced asset, since one op produces them all,
+    /// and a pass that wants any of them runs that one op.
+    pub fn policy(mut self, policy: AutoPolicy) -> MultiAsset {
+        self.policy = Some(policy);
         self
     }
 }
@@ -564,7 +597,13 @@ pub(crate) struct AssetMeta {
     /// the [mapping](PartitionMapping) declared on each dep it reads, for the
     /// deps that declared one; everything else is identity.
     maps: BTreeMap<String, PartitionMapping>,
-    pub auto: bool,
+    /// when hestan rebuilds this on its own, from [`Asset::policy`]; `None`
+    /// when nothing was declared, which is an asset only a person builds.
+    pub policy: Option<AutoPolicy>,
+    /// the parsed form of an [`AutoPolicy::after_cron`] rule, so an expression
+    /// that does not resolve is a boot error rather than a pass at 2am, and the
+    /// evaluator reads a parse rather than repeating one every minute.
+    pub cron: Option<Cron>,
     pub probe: Option<Arc<ProbeFn>>,
     pub probe_every: Duration,
     /// the op that materializes this asset: its own name when it has an op to
@@ -664,9 +703,10 @@ impl AssetRegistry {
         let mut metas: Vec<AssetMeta> = Vec::with_capacity(assets.len());
         let mut ops: Vec<OpMeta> = Vec::new();
         for a in assets {
-            if a.source && a.auto {
+            if a.source && a.policy.is_some() {
                 return Err(Error::Graph(format!(
-                    "asset {}: auto on a source (sources are probed, never built)",
+                    "asset {}: an automation policy on a source (sources are probed, \
+                     never built)",
                     a.name
                 )));
             }
@@ -711,12 +751,17 @@ impl AssetRegistry {
                     partitions: a.partitions.clone(),
                 });
             }
+            let cron = match &a.policy {
+                Some(policy) => policy.parse_cron(&a.name)?,
+                None => None,
+            };
             metas.push(AssetMeta {
                 name: a.name.clone(),
                 source: a.source,
                 deps: a.deps,
                 maps: a.maps,
-                auto: a.auto,
+                policy: a.policy,
+                cron,
                 probe: a.probe,
                 probe_every: a.probe_every,
                 op: (!a.source).then_some(a.name),
@@ -731,19 +776,24 @@ impl AssetRegistry {
                     m.name
                 )));
             }
+            let cron = match &m.policy {
+                Some(policy) => policy.parse_cron(&m.name)?,
+                None => None,
+            };
             for produced in &m.produces {
                 metas.push(AssetMeta {
                     name: produced.clone(),
                     source: false,
                     deps: m.deps.clone(),
                     maps: BTreeMap::new(),
-                    auto: m.auto,
+                    policy: m.policy.clone(),
+                    cron: cron.clone(),
                     probe: None,
                     probe_every: Duration::from_secs(60),
                     op: Some(m.name.clone()),
                     partitions: None,
                     // a multi-asset produces names, not `Asset` values, so
-                    // there is nowhere to hang a policy on one of them
+                    // there is nowhere to hang a freshness policy on one of them
                     fresh_within: None,
                 });
             }
@@ -1598,7 +1648,7 @@ pub(crate) fn staleness(reg: &AssetRegistry, mats: &Mats) -> HashMap<String, Sta
 /// every partitioned asset's keys, worked out once. a mapping resolves against
 /// what its dep holds, and asking the dep one key at a time would rebuild its
 /// whole set for every key of every consumer.
-fn key_sets(reg: &AssetRegistry) -> HashMap<String, KeySet> {
+pub(crate) fn key_sets(reg: &AssetRegistry) -> HashMap<String, KeySet> {
     reg.topo()
         .filter_map(|m| Some((m.name.clone(), KeySet::of(m.partitions.as_ref()?))))
         .collect()
@@ -2269,7 +2319,7 @@ mod tests {
         assert!(err.to_string().contains("source cannot depend"), "{err}");
 
         let err = reg_err(vec![Asset::source("s").auto()]);
-        assert!(err.to_string().contains("auto on a source"), "{err}");
+        assert!(err.to_string().contains("policy on a source"), "{err}");
 
         let err = reg_err(vec![Asset::source("s").io("parquet")]);
         assert!(err.to_string().contains("io on a source"), "{err}");

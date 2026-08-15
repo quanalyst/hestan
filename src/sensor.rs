@@ -12,14 +12,13 @@ use serde_json::{Value, json};
 use tokio::sync::Semaphore;
 use tokio::time::Instant;
 
-use crate::asset::{
-    ASSETS_JOB, AssetRegistry, ProbeFn, launch_plan, mats_map, plan_targets, staleness,
-};
+use crate::asset::{AssetRegistry, ProbeFn, mats_map};
 use crate::backoff::{capped_exponential, full_jitter};
 use crate::error::Error;
 use crate::executor::Runner;
 use crate::model::{Run, RunCursor, RunStatus, RunTags, SensorOutcome, Trigger};
 use crate::op::InputError;
+use crate::policy::{self, Pass};
 use crate::store::RunKey;
 
 /// what a sensor evaluation asks for: launch `job` with `params`, at most once
@@ -1087,7 +1086,7 @@ async fn evaluate_probe(
     }
     // changed or not: the fingerprint commits before any launch, so re-deriving
     // every tick is what heals a launch that failed after the commit
-    match launch_stale_auto(asset, runner, registry) {
+    match launch_policy_builds(asset, runner, registry) {
         Ok(launched) => {
             if let Some(run_id) = launched {
                 counts.record(Fired::Launched(run_id));
@@ -1098,40 +1097,27 @@ async fn evaluate_probe(
     }
 }
 
-// one combined plan, never one per target: overlapping plans would share stale
-// ancestors and race each other's lineage writes (assets.md)
-fn launch_stale_auto(
+// what this source's descendants' policies want, launched as one plan: the same
+// evaluation the policy loop makes, over the part of the graph this probe just
+// answered a question about. the loop covers the rest, and the two cannot
+// disagree about a key because there is one of them
+fn launch_policy_builds(
     asset: &str,
     runner: &Runner,
     registry: &AssetRegistry,
 ) -> Result<Option<String>, String> {
     let mats = mats_map(runner.store()).map_err(|e| e.to_string())?;
-    let stale = staleness(registry, &mats);
     let downstream = registry.downstream(asset);
-    let targets: Vec<String> = registry
-        .topo()
-        .filter(|m| !m.source && m.auto && downstream.contains(&m.name))
-        .filter(|m| stale.get(&m.name).is_some_and(|s| s.stale))
-        .map(|m| m.name.clone())
-        .collect();
-    if targets.is_empty() {
-        return Ok(None);
-    }
-    if runner
-        .store()
-        .has_active_run(ASSETS_JOB)
-        .map_err(|e| e.to_string())?
-    {
-        tracing::info!(asset = %asset, "auto build skipped: asset build already running");
-        return Ok(None);
-    }
-    let plan = plan_targets(registry, &mats, &targets).map_err(|e| e.to_string())?;
+    let wants = Pass::new(registry, &mats, Utc::now()).wants(Some(&downstream));
+    let assets: Vec<&str> = wants.iter().map(|w| w.asset.as_str()).collect();
     // a probe is a sensor named after the source it watches, and `build` does
     // not say which one woke this up
-    let run_id = launch_plan(runner, plan, Trigger::Build, sensor_tag(asset))
-        .map_err(|e| format!("auto build of {} failed: {e}", targets.join(", ")))?;
-    tracing::info!(assets = %targets.join(", "), run = %run_id, "auto build launched");
-    Ok(Some(run_id))
+    let launched = policy::launch(runner, registry, &mats, &wants, sensor_tag(asset))
+        .map_err(|e| format!("auto build of {} failed: {e}", assets.join(", ")))?;
+    if let Some(run_id) = &launched {
+        tracing::info!(assets = %assets.join(", "), run = %run_id, "auto build launched");
+    }
+    Ok(launched)
 }
 
 fn panic_payload(panic: &(dyn std::any::Any + Send)) -> Option<&str> {

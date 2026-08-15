@@ -111,27 +111,52 @@ impl ScheduleEntry {
     }
 }
 
+/// a cron expression and the timezone it is read in, parsed once.
+///
+/// a [`Schedule`] is one of these on a job and an
+/// [automation policy](crate::AutoPolicy) is one on an asset. both want the
+/// same crontab dialect and the same "when did this last come round" answer,
+/// so both get them here rather than from two parsers that could drift.
+#[derive(Debug, Clone)]
+pub(crate) struct Cron {
+    pub schedule: cron::Schedule,
+    pub tz: Tz,
+}
+
+impl Cron {
+    pub(crate) fn parse(expr: &str, tz: &str) -> Result<Cron, Error> {
+        let tz: Tz = tz.parse().map_err(|_| Error::Timezone(tz.to_string()))?;
+        // the cron crate wants a seconds field; accept plain 5-field crontab
+        let fields: Vec<&str> = expr.split_whitespace().collect();
+        let full = if fields.len() == 5 {
+            let mut fields = fields;
+            let dow = remap_dow(fields[4]);
+            fields[4] = &dow;
+            format!("0 {}", fields.join(" "))
+        } else {
+            expr.to_string()
+        };
+        let schedule = cron::Schedule::from_str(&full).map_err(|e| Error::Cron {
+            expr: expr.to_string(),
+            reason: e.to_string(),
+        })?;
+        Ok(Cron { schedule, tz })
+    }
+
+    /// the most recent occurrence strictly before `now`; `None` when it has not
+    /// come due yet at all.
+    pub(crate) fn last_before(&self, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
+        last_before(&self.schedule, self.tz, now)
+    }
+}
+
 pub(crate) fn parse(job: &str, expr: &str, tz: &str) -> Result<ScheduleEntry, Error> {
-    let tz: Tz = tz.parse().map_err(|_| Error::Timezone(tz.to_string()))?;
-    // the cron crate wants a seconds field; accept plain 5-field crontab
-    let fields: Vec<&str> = expr.split_whitespace().collect();
-    let full = if fields.len() == 5 {
-        let mut fields = fields;
-        let dow = remap_dow(fields[4]);
-        fields[4] = &dow;
-        format!("0 {}", fields.join(" "))
-    } else {
-        expr.to_string()
-    };
-    let schedule = cron::Schedule::from_str(&full).map_err(|e| Error::Cron {
-        expr: expr.to_string(),
-        reason: e.to_string(),
-    })?;
+    let cron = Cron::parse(expr, tz)?;
     Ok(ScheduleEntry {
         job: job.to_string(),
         expr: expr.to_string(),
-        tz,
-        schedule,
+        tz: cron.tz,
+        schedule: cron.schedule,
         params: json!({}),
         catchup: Catchup::default(),
     })
@@ -202,10 +227,9 @@ fn rows(store: &Store) -> Option<HashMap<(String, String), ScheduleRow>> {
 
 /// the most recent occurrence strictly before `now`; `None` when the schedule
 /// has not come due yet at all.
-fn last_before(entry: &ScheduleEntry, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
-    entry
-        .schedule
-        .after(&now.with_timezone(&entry.tz))
+fn last_before(schedule: &cron::Schedule, tz: Tz, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
+    schedule
+        .after(&now.with_timezone(&tz))
         .next_back()
         .map(|t| t.with_timezone(&Utc))
 }
@@ -246,7 +270,7 @@ fn catch_up(entry: &ScheduleEntry, runner: &Runner, row: Option<&ScheduleRow>, n
         advance(runner, entry, now);
         return;
     };
-    let Some(last) = last_before(entry, now).filter(|t| *t > cursor) else {
+    let Some(last) = last_before(&entry.schedule, entry.tz, now).filter(|t| *t > cursor) else {
         return;
     };
     // pause means stop, including the catch-up: a schedule paused for a week

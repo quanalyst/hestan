@@ -122,6 +122,8 @@ mod op;
 #[cfg_attr(docsrs, doc(cfg(feature = "otel")))]
 pub mod otel;
 mod partition;
+// when hestan rebuilds an asset on its own, and the pass that decides
+mod policy;
 // a declared rate and the bucket behind it, beside the pools in the executor:
 // the limit that is n calls per period rather than n at once
 mod rate;
@@ -167,6 +169,7 @@ pub use model::{
 };
 pub use op::{InputError, META_TABLE_ROWS, Meta, MetaColumn, MetaTable, Op, OpCtx, OpResult};
 pub use partition::{PartitionMapping, Partitions};
+pub use policy::AutoPolicy;
 pub use rate::RateStatus;
 pub use resource::ResourceCtx;
 pub use retention::Retention;
@@ -183,9 +186,9 @@ pub use store::{EventQuery, Settled, Store};
 /// is not here, because that is written once in `main` and reads better named.
 pub mod prelude {
     pub use crate::{
-        Asset, AssetCheck, Catchup, CheckResult, Graph, Hestan, Job, Meta, MultiAsset, Op, OpCtx,
-        OpResult, PartitionMapping, Partitions, RunRequest, RunStatus, RunStatusSensor, RunSummary,
-        Schedule, Sensor, Severity,
+        Asset, AssetCheck, AutoPolicy, Catchup, CheckResult, Graph, Hestan, Job, Meta, MultiAsset,
+        Op, OpCtx, OpResult, PartitionMapping, Partitions, RunRequest, RunStatus, RunStatusSensor,
+        RunSummary, Schedule, Sensor, Severity,
     };
     pub use serde_json::{Value, json};
 }

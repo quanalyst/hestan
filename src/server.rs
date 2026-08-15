@@ -1064,7 +1064,9 @@ pub(crate) fn assets_json(registry: &AssetRegistry, store: &Store) -> Result<Val
                 "kind": if meta.source { "source" } else { "derived" },
                 "deps": meta.deps,
                 "mappings": mappings,
-                "auto": meta.auto,
+                // whether hestan rebuilds this one itself, which is what an
+                // automation policy says and what the flag has always meant
+                "auto": meta.policy.is_some(),
                 // the op that materializes it, which is the asset's own name
                 // unless a multi-asset produces it alongside others
                 "op": meta.op,
