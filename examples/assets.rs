@@ -189,7 +189,9 @@ async fn main() -> Result<(), hestan::Error> {
         Ok(json!({ "hour": hour, "bytes": bytes }))
     })
     .from(&docs_dir)
-    .partitioned(Partitions::hourly(start_hour).build_limit(48));
+    .partitioned(Partitions::hourly(start_hour).build_limit(48))
+    // fill the hours that have never been built, and leave the ones that have
+    .policy(AutoPolicy::when_missing());
 
     // and the rollup this phase exists for: one daily key reading the 24 hourly
     // keys inside it. today's key covers hours that have not happened yet: it
@@ -208,7 +210,10 @@ async fn main() -> Result<(), hestan::Error> {
         Ok(json!({ "day": ctx.partition(), "hours": hours.len(), "bytes": bytes }))
     })
     .reads(&hourly_writes, PartitionMapping::covering())
-    .partitioned(Partitions::daily(start_day).build_limit(2));
+    .partitioned(Partitions::daily(start_day).build_limit(2))
+    // and a day is rolled up once every hour it covers is there, rather than
+    // recorded from the part of it that happens to have been built
+    .policy(AutoPolicy::when_stale().and_upstream_ready());
 
     // every doc has content, and there are enough of them to be a doc set. the
     // first fails the run when it breaks; the second only says so.

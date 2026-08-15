@@ -14,8 +14,10 @@ src/
   resource.rs   resources and their constructors: the process's and the run's
   executor.rs   Runner and the run loop: concurrency, retries, skips, subset runs
   asset.rs      Asset, the registry, staleness/planning, the materializing wrapper
+  policy.rs     AutoPolicy, the per-key verdict, and the pass that acts on it
   sensor.rs     Sensor, SensorCtx, the sensor loop (probes included)
-  schedule.rs   cron parsing (5-field normalization, dow remap), scheduler loop
+  schedule.rs   cron parsing (5-field normalization, dow remap), scheduler loop;
+                a policy's cron is parsed here too
   store.rs      the store: schema, migrations, all reads and writes
   pg.rs         the postgres half of it (behind the postgres feature)
   server.rs     axum router, api handlers, embedded ui fallback
@@ -167,7 +169,9 @@ some, and these are the ones worth knowing about: `graph.rs` (ordering,
 cycles), `job.rs` (graph flattening: prefixes, wiring, nesting, rejected
 shapes), `schedule.rs` (cron normalization, dow remap, windows), `op.rs` (the
 metadata tags, which are a wire format, and the delta arithmetic),
-`auth.rs` (every spelling of loopback, and what each role may), `store.rs`
+`auth.rs` (every spelling of loopback, and what each role may), `policy.rs`
+(each rule against a fixture of materializations, per key, and the pass that
+holds rather than stampeding), `store.rs`
 (lifecycle roundtrips, migrations, sweep, claims under real contention;
 [twice](#the-store-suite-runs-twice)), `server.rs` (handlers called directly
 with axum extractors, no live server needed, and the two scrapers that hold

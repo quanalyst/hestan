@@ -11,6 +11,7 @@ const asset = (name: string, deps: string[]): AssetSummary => ({
   kind: "derived",
   deps,
   auto: false,
+  policy: null,
   op: name,
   partitions: null,
   fingerprint: null,

@@ -32,8 +32,9 @@ Hestan::new()
     .await
 ```
 
-`examples/assets.rs` is this pipeline in full, over this repo's own `docs/`
-directory.
+`.auto()` there is an [automation policy](#automation-policies): rebuild when
+what it is made of moves. `examples/assets.rs` is this pipeline in full, over
+this repo's own `docs/` directory.
 
 ## Derived assets are ops
 
@@ -184,6 +185,10 @@ late as soon as any one key is. stale and late are independent: an asset can
 be fresh and stale (a dep changed a minute ago) or late and not stale (nothing
 moved upstream, and nothing rebuilt it either). the whole of it is in
 [freshness](freshness.md).
+
+a freshness policy says when something is *late*; an
+[automation policy](#automation-policies) says when hestan *rebuilds* it. one
+alerts and the other acts, and an asset can carry both.
 
 ## Partitioned assets
 
@@ -467,38 +472,115 @@ the store at that moment. two overlapping builds interleaving those reads
 and writes could record lineage that never happened: an asset claiming it
 consumed a fingerprint its actual input value never had. so builds are
 serialized. while any run of the `assets` job is active, the incremental
-build endpoints answer 409 (`asset build already running`) and the probe
-auto-build path skips launching, leaving the next tick to self-heal (below).
+build endpoints answer 409 (`asset build already running`) and the
+[policy](#automation-policies) pass launches nothing, on its own clock or on a
+probe's, leaving the next pass to self-heal (below).
 
-the gate covers four paths: the two build endpoints, the probe auto-build,
-and each chunk a [backfill](#backfills) launches. anything that reaches the
+the gate covers five paths: the two build endpoints, the policy pass, the
+probe's evaluation of the same policies, and each chunk a
+[backfill](#backfills) launches. anything that reaches the
 executor by the ordinary run path launches regardless: a manual
 `POST /api/jobs/assets/runs`, a retry of an earlier assets run, and
 `build_asset` in a headless process. those are the documented escape
 hatches, and they cost what they cost: concurrent rebuilds can interleave,
 so their recorded lineage is only as coherent as the interleaving.
 
-## Probes and auto
+## Automation policies
+
+`.policy(..)` says when hestan may rebuild an asset without being asked. four
+shapes, and no more, because each of the four is a thing people were writing
+sensors for:
+
+```rust
+Asset::new("report", build).policy(AutoPolicy::when_stale());
+Asset::new("report", build).policy(AutoPolicy::when_missing());
+Asset::new("report", build).policy(AutoPolicy::after_cron("0 2 * * *"));
+Asset::new("rollup", build).policy(AutoPolicy::when_stale().and_upstream_ready());
+```
+
+- **`when_stale`** rebuilds whatever staleness says is owed. `.auto()` is this
+  and always was: the two spellings are the same policy and behave identically.
+- **`when_missing`** builds what has never been built and nothing else. a fresh
+  deployment and a newly declared asset both land here, and neither is a dep
+  that moved; once it exists this rule has nothing more to say, however stale it
+  goes.
+- **`after_cron`** builds after the expression comes round *and only if it is
+  stale by then*: "nightly, but do not rebuild what has not moved". the same
+  5-field crontab a [schedule](scheduling.md) takes, read in utc until `.tz()`
+  says otherwise, and an expression that does not parse is a boot error. a key
+  builds when the last occurrence at or before now is newer than that key's last
+  build, so an occurrence that passed while something else was building is
+  picked up by the next pass rather than lost.
+- **`and_upstream_ready`** holds any of them until every upstream key the build
+  would read is there. a daily rollup [covering](#what-a-partition-reads-of-its-dep)
+  hourly data waits for all 24 hours of its day rather than recording a partial
+  one; without it, the rollup of the hours that happen to be there is what you
+  get, and it goes stale as each of the rest lands. it waits for what its
+  mapping says it reads, which is the same question staleness asks, so the two
+  can never disagree about a key. it needs something to build upstream: an hourly
+  asset with no policy of its own is one nobody is filling.
+
+**a policy is evaluated one key at a time.** on a partitioned asset each key
+gets its own verdict, so a pass builds the keys that qualify and leaves the ones
+that do not: the two stale days of a daily rollup, not the four hundred fresh
+ones. the keys it takes are newest first and capped by the same
+[build limit](#the-build-limit-counts-keys-not-instances) a build that names no
+keys respects, so a rule declared over two years of days fills them a chunk per
+pass rather than all at once.
+
+### The pass that acts on them
+
+the process that [decides](scaling.md#roles) evaluates every policy once a
+minute,
+beside the [freshness](freshness.md) checker that reads the same staleness to
+say what is late, and launches everything it wants as one plan and one run
+(trigger `build`, tagged `policy` with the rule and `asset` when it is the only
+one). one process decides, so one process launches.
+
+it holds rather than stampeding. builds are [serialized](#one-build-at-a-time),
+so the pass checks for an active assets run before planning: the build endpoints
+answer 409 there because a person is reading the refusal, and a pass that
+answered 409 every minute would be a log nobody can read. it launches nothing,
+says so at debug, and asks again next minute of fresher data. nothing queues in
+between: "is this stale" is not a question that expires.
+
+a rule that cannot be satisfied sits quietly. the pass writes when it launches
+and at no other time, so a rollup waiting for an hour that will never arrive
+produces no run and no event, however many passes go by. what it is waiting for
+is a fact `GET /api/assets` reports and `hestan doctor` reads, rather than
+something it announces once a minute.
+
+every launch says so: one `policy_launched` [event](events.md) per asset in the
+plan, carrying the rule that fired and the keys it asked for.
+
+### Probes and auto
 
 a probe is a generated internal sensor named `probe:<asset>`, evaluated on
 the [sensor loop](sensors.md) every `probe_every` (default 60s). a changed
 fingerprint rewrites the source materialization (value null, no run); then,
-changed or not, every `.auto()` descendant that staleness proves stale is
-gathered into one combined plan and launched as a single build run (trigger
-`build`), the same one-coherent-run shape as build-all. the tick's
-`launched` records that run, so 0 or 1.
+changed or not, the policies of everything under that source are evaluated and
+whatever they want is gathered into one combined plan and launched as a single
+build run, the same one-coherent-run shape as build-all. the tick's `launched`
+records that run, so 0 or 1. it is the same evaluation the pass makes, over the
+part of the graph the probe just answered a question about, so the two cannot
+disagree; a cron rule is left to the pass, since a fingerprint moving says
+nothing about what time it is.
 
-launching only what staleness says is owed, on every tick, is the self-heal.
+launching only what a policy says is owed, on every tick, is the self-heal.
 a build that failed to launch, or was skipped because an assets run was
 already active, is retried on the next tick without waiting for the data to
 move again: the fingerprint commits before the launch, so nothing else
 would ever re-trigger it. probes are pausable and tick-logged like any
 sensor.
 
-`.auto()` marks a derived asset to rebuild whenever a probe upstream makes
-it stale. auto without a probed source somewhere upstream never fires:
-nothing else re-evaluates staleness spontaneously. non-auto assets just show
-stale in the ui until someone builds them.
+**a policy under a source nothing has observed does not fire.** a source's
+fingerprint is what everything below it is compared against, and until a probe
+writes one there is nothing to compare: a build would consume null and leave the
+asset exactly as stale as it found it, and be owed again on the next pass
+forever. so those keys wait for the probe instead, which is what `.auto()`
+without a probed source upstream has always done, and `doctor` reports the ones
+whose source has no probe at all. an asset with no policy just shows stale in
+the ui until someone builds it.
 
 ## When a build is recorded
 
@@ -654,8 +736,9 @@ nothing: it produced no verdict, so the failed op is the whole of the record.
 ## The http api
 
 `GET /api/assets` returns every asset in topo order with its kind, deps,
-auto flag, current fingerprint/built_at/run_id, and the staleness verdict
-with reasons.
+auto flag, its [policy](#automation-policies) (the rule, the cron where there is
+one, and what it is waiting for when it wants a build it cannot have yet),
+current fingerprint/built_at/run_id, and the staleness verdict with reasons.
 
 `POST /api/assets/{name}/build` answers 202 `{"run_id"}` for a stale target
 and 200 `{"up_to_date": true}` for a fresh one; 404 for an unknown name, 400

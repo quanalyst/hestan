@@ -5,7 +5,7 @@
 // because one flat table is fine at twelve assets and useless at three
 // hundred, which is exactly the size at which testing them through the dom
 // stops being possible.
-import type { AssetSummary } from "./types";
+import type { AssetPolicy, AssetSummary } from "./types";
 
 // the separator a name uses to say which group it is in. one character, and
 // the one every catalog in the world already uses
@@ -23,6 +23,19 @@ export interface Group {
   // "" for the assets whose names carry no separator at all
   prefix: string;
   assets: AssetSummary[];
+}
+
+// what a policy says, and what it is waiting for where it wants a build it
+// cannot have yet: "when stale · 2026-08-14 waiting for hours[2026-08-14T23]"
+// is the sentence somebody needs at 2am. one line, because it goes beside the
+// name rather than under it, and the two halves are separated the way the rest
+// of a header line is: the rule already has commas in it
+export function policySays(policy: AssetPolicy): string {
+  const wait = policy.waiting;
+  if (wait === null) return policy.says;
+  const more = wait.keys > 1 ? ` and ${wait.keys - 1} more` : "";
+  const which = wait.key === null ? "" : `${wait.key}${more} `;
+  return `${policy.says} · ${which}waiting for ${wait.for}`;
 }
 
 // never built and stale are the same verdict to the engine (nothing to

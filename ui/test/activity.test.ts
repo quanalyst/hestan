@@ -98,6 +98,7 @@ test("a kind reads without saying its subject twice", () => {
   assert.equal(kindLabel("schedule_caught_up"), "caught up");
   assert.equal(kindLabel("notification_failed"), "failed");
   assert.equal(kindLabel("sensor_tick"), "sensor tick");
+  assert.equal(kindLabel("policy_launched"), "policy launched");
   // a kind from a newer writer reads as itself rather than as nothing
   assert.equal(kindLabel("quantum_entangled"), "quantum entangled");
 });

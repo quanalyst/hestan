@@ -2,6 +2,51 @@
 
 ## unreleased
 
+a policy on an asset says when hestan rebuilds it, evaluated per key, and one
+process acts on it.
+
+**breaking, and only in what a field means.** `.auto()` is unchanged in what it
+does and in what it is called: it is now `AutoPolicy::when_stale()`, the same
+rule with the others beside it. `"auto"` in `GET /api/assets` now means "hestan
+rebuilds this one itself", which is any policy rather than that one rule, and a
+graph declaring a policy on a source fails the build saying "an automation
+policy on a source" where it used to say "auto on a source".
+
+- **four rules and no more**, each of them something people were writing sensors
+  for: `when_stale` (today's `auto`), `when_missing` (the fresh deployment and
+  the newly declared asset, which staleness alone never gets to say anything
+  about), `after_cron` ("nightly, but do not rebuild what has not moved", read
+  in utc until `.tz()` says otherwise), and `and_upstream_ready` on any of them,
+  which holds the build until everything it reads is there so a daily rollup
+  waits for its last hour rather than recording a partial day
+- **evaluated one key at a time.** a partitioned asset gets a verdict per key,
+  so a pass builds the keys that qualify and leaves the ones that do not, newest
+  first and capped by the same `build_limit` a build that names no keys respects
+- **readiness is the mapping's answer, asked again.** what a key reads and what
+  of it a dep will never hold is what phase 37 already resolves for staleness,
+  so a rule that waits for upstream cannot disagree with the verdict that said
+  the key was stale in the first place
+- **a policy under a source nothing has observed does not fire**, which is what
+  `.auto()` without a probe upstream has always done: there is no fingerprint to
+  compare against, so a build would consume null and be owed again forever.
+  `doctor` reports the ones whose source has no probe at all, beside a window
+  that promises keys its dep will never hold
+- **one process decides.** the pass runs beside the freshness checker on the
+  deciding role, every minute. it checks for an active assets run before
+  planning rather than tripping `asset build already running` every minute, and
+  it launches everything it wants as one plan and one run. a rule that cannot be
+  satisfied writes nothing at all: no run, no event, however many passes go by
+- **every launch is attributable**: a `policy_launched` event per asset naming
+  the rule that fired and the keys it asked for, and the run tagged `policy` with
+  the rule (and `asset` when it is the only one). the probe path evaluates the
+  same policies over its own descendants, so a probe and the pass cannot
+  disagree about a key
+- `GET /api/assets` reports each asset's `policy` and, when it wants a build it
+  cannot have yet, what it is waiting for; `/partitions` says it per key. the
+  assets table tags it `auto` or `waiting`, the asset page writes the sentence
+  ("when stale, once upstream is ready · 2026-08-14 waiting for
+  `hours[2026-08-14T23]`"), and the partition grid says it in a cell's tooltip
+
 ## 0.1.0-beta.3
 
 rate limits as declared token buckets, an asset's value stored through its io manager,

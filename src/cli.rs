@@ -2371,14 +2371,15 @@ async fn doctor(reach: Reach, out: &Out) -> Result<(), Fail> {
     match &app {
         Some(app) => {
             findings.extend(check_queue(app)?);
+            findings.extend(check_policies(app)?);
             findings.push(check_rates(app));
             findings.extend(check_retention(app));
             findings.push(check_auth(app.auth.as_ref()));
         }
         None => unchecked.push(
-            "the queue, the retention policy and whether anything checks who is asking, \
-             which are read off limits, a role and an authenticator that only the \
-             deployment's own binary carries",
+            "the queue, the automation policies, the retention policy and whether \
+             anything checks who is asking, which are read off limits, an asset graph, \
+             a role and an authenticator that only the deployment's own binary carries",
         ),
     }
     match disk_free(&target) {
@@ -2578,6 +2579,47 @@ fn check_queue(app: &Inspected) -> Result<Vec<Finding>, Fail> {
 /// processes execute, and a deployment that scaled by adding a worker has
 /// doubled every rate it declares without changing a line. not an error: it is
 /// what a worker is for, and dividing the limit is the answer.
+/// an [automation policy](crate::AutoPolicy) that can never fire.
+///
+/// a policy is a standing instruction, so one that will wait forever looks
+/// exactly like one that has nothing to do right now: both are quiet. the two
+/// shapes are an asset under a source with no probe (nothing will ever write
+/// the fingerprint it is compared against, which is what `auto` without a probe
+/// has always meant) and one whose every key promises a window its dep will
+/// never hold.
+fn check_policies(app: &Inspected) -> Result<Vec<Finding>, Fail> {
+    let declared = app.registry.topo().filter(|m| m.policy.is_some()).count();
+    if declared == 0 {
+        return Ok(vec![Finding::ok("policies", "none declared")]);
+    }
+    let mats = crate::asset::mats_map(&app.store)?;
+    let pass = crate::policy::Pass::new(&app.registry, &mats, Utc::now());
+    let stuck: Vec<String> = app
+        .registry
+        .topo()
+        .filter(|m| m.policy.is_some())
+        .filter_map(|m| pass.stuck(m).map(|on| format!("{} waits for {on}", m.name)))
+        .collect();
+    let Some(first) = stuck.first() else {
+        return Ok(vec![Finding::ok(
+            "policies",
+            format!("{declared} asset(s) rebuild themselves, none of them stuck"),
+        )]);
+    };
+    Ok(vec![Finding::wrong(
+        "policies",
+        format!(
+            "{} of {declared} will never fire, however long they wait: {}",
+            stuck.len(),
+            stuck.join("; ")
+        ),
+        format!(
+            "{first}, which nothing produces. give the source a probe, or the window \
+             a dep that holds the keys it covers, or drop the policy"
+        ),
+    )])
+}
+
 fn check_rates(app: &Inspected) -> Finding {
     if app.rates.is_empty() {
         return Finding::ok("rates", "none declared");
@@ -3756,6 +3798,46 @@ mod tests {
 
     fn levels(findings: &[Finding]) -> Vec<Level> {
         findings.iter().map(|f| f.level).collect()
+    }
+
+    // a policy that will wait forever is quiet, and a quiet policy looks
+    // exactly like one with nothing to do. this is the difference, said out
+    // loud where somebody is already asking why nothing is running
+    #[test]
+    fn doctor_finds_a_policy_that_can_never_fire() {
+        let store = Store::open(":memory:").unwrap();
+        let unprobed = crate::Asset::source("raw");
+        let stats = crate::Asset::new("stats", |_| async { Ok(json!(null)) })
+            .from(&unprobed)
+            .auto();
+        let registry =
+            Arc::new(AssetRegistry::new(vec![unprobed, stats], Vec::new(), Vec::new()).unwrap());
+        let mut deployment = app(store.clone(), Vec::new());
+        deployment.registry = registry;
+
+        let findings = check_policies(&deployment).unwrap();
+        assert_eq!(levels(&findings), [Level::Wrong]);
+        assert!(
+            findings[0].says.contains("stats waits for raw"),
+            "{}",
+            findings[0].says
+        );
+        assert!(findings[0].says.contains("1 of 1"), "{}", findings[0].says);
+        assert!(findings[0].fix.as_ref().unwrap().contains("probe"));
+
+        // a probe writes the fingerprint everything under it is compared
+        // against, and the same policy has a build to make
+        store
+            .record_materialization("raw", None, "r1", &json!({}), None, None, None)
+            .unwrap();
+        assert_eq!(levels(&check_policies(&deployment).unwrap()), [Level::Ok]);
+
+        // and a deployment that declares none is not a deployment with a
+        // problem
+        assert_eq!(
+            check_policies(&app(store, Vec::new())).unwrap()[0].says,
+            "none declared"
+        );
     }
 
     #[test]

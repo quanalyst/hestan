@@ -178,14 +178,15 @@ Hestan::new().work(None).await                          // executes
 Hestan::new().serve(addr).await                         // both; the default
 ```
 
-| role | schedules, sensors, freshness, backfill chunking, retention, notification delivery | claims and executes |
+| role | schedules, sensors, freshness, automation policies, backfill chunking, retention, notification delivery | claims and executes |
 | --- | --- | --- |
 | `Role::All` (default) | yes | yes |
 | `Role::Scheduler` | yes | no |
 | `Role::Worker` | no | yes |
 
 **exactly one process may be `All` or `Scheduler`.** schedules, sensors,
-freshness checks and backfill chunking are decisions, and two processes making
+freshness checks, [automation policies](assets.md#automation-policies) and
+backfill chunking are decisions, and two processes making
 them independently is two of every scheduled run: there is no lock that would
 stop it. **any number of processes may be `Worker`**; that is the entire point
 of a claimable queue.

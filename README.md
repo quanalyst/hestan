@@ -301,8 +301,14 @@ standalone binary for those two. [docs/cli.md](docs/cli.md).
   staleness is provable from recorded fingerprints: a build materializes
   exactly the stale ancestors plus the target, seeding fresh values instead
   of recomputing them. source assets stand for external data and carry a
-  cheap fingerprint probe; `.auto()` assets rebuild themselves when a probe
-  upstream makes them stale
+  cheap fingerprint probe
+- an **automation policy** says when an asset rebuilds itself:
+  `AutoPolicy::when_stale()` (which is what `.auto()` is), `when_missing()` for
+  the fresh deployment and the newly declared asset, `after_cron("0 2 * * *")`
+  for "nightly, but do not rebuild what has not moved", and
+  `.and_upstream_ready()` on any of them so a daily rollup waits for its last
+  hour rather than recording a partial day. a partitioned asset is evaluated per
+  key, so a pass builds the keys that qualify and leaves the ones that do not
 - a **partitioned** asset materializes once per key of a daily, hourly or
   static key set, and a dep between two of them declares *which* keys it reads:
   `Asset::reads(&hourly, PartitionMapping::covering())` is a daily rollup of

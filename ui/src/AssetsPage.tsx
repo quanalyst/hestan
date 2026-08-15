@@ -14,6 +14,7 @@ import {
   filterAssets,
   groupAssets,
   groupOf,
+  policySays,
   sortAssets,
 } from "./catalog";
 import type { Dir, SortKey, StateFilter } from "./catalog";
@@ -466,7 +467,11 @@ export default function AssetsPage() {
                             {leafName(a.name, g.prefix)}
                           </Link>
                           {a.kind === "source" && <span className="tag">source</span>}
-                          {a.auto && <span className="tag">auto</span>}
+                          {a.policy && (
+                            <span className="tag" title={policySays(a.policy)}>
+                              {a.policy.waiting ? "waiting" : "auto"}
+                            </span>
+                          )}
                           {a.freshness?.status === "late" && <span className="tag">late</span>}
                         </td>
                         <td>

@@ -154,12 +154,12 @@ every source asset with a [probe](assets.md) becomes an internal sensor
 named `probe:<asset>` on the same loop: same pausing, same tick history,
 listed by the same endpoint. its evaluation compares the probe's fingerprint
 against the stored one. a changed fingerprint rewrites the source
-materialization; then, changed or not, every `.auto()` descendant that
-staleness proves stale is launched as one combined build run (trigger
-`build`), so
+materialization; then, changed or not, every descendant whose
+[automation policy](assets.md#automation-policies) wants a build is launched as
+one combined build run (trigger `build`), so
 `launched` is 1 when a run went out and 0 when nothing was owed.
 
-re-deriving from staleness on every tick is the probe's self-heal. the
+re-deriving what is owed on every tick is the probe's self-heal. the
 fingerprint commits before the launch, so once it is written nothing in the
 data will ask for that build again: the source would have to change a
 second time. a launch that failed, or that was skipped because an assets

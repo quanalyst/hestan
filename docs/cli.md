@@ -279,6 +279,11 @@ wrong queue      1 run(s) are queued with nothing holding them back, so no
                  process is taking them off the queue
                  start a process whose role executes (`serve` with the default
                  role, or `work`) against this database
+wrong policies   1 of 3 will never fire, however long they wait: totals waits
+                 for raw_orders
+                 totals waits for raw_orders, which nothing produces. give the
+                 source a probe, or the window a dep that holds the keys it
+                 covers, or drop the policy
 ok    rates      orders_api 5 per 1s, counted in this process and no other
 ok    retention  no policy: nothing is deleted
 ok    disk       24.6gb free of 25.1gb where /var/lib/hestan.db lives (98%)
@@ -296,6 +301,7 @@ what it checks, and what each one can actually see:
 | schedules, sensors | anything paused, which is the answer to "why is nothing running" often enough to be worth a line | a store |
 | leases | runs claimed by a process that stopped renewing, which nothing is reclaiming if nothing is running a lease loop | a store |
 | queue | runs waiting on a limit, and (separately) runs waiting on **nothing**, which is a deployment where no process executes | the limits, so the deployment's own binary |
+| policies | an [automation policy](assets.md#automation-policies) that can never fire, because a source it reads has no probe to observe it or a window promises keys its dep will never hold. a policy that will wait forever looks exactly like one with nothing to do: both are quiet | the asset graph, so the deployment's own binary |
 | rates | what this registry declares, and that a [rate](concepts.md#rates) is per process: a deployment that scaled by adding a worker doubled every one of them without changing a line. over `--server`, the live half instead: how many ops are queued for a token there | the registry, or a running deployment |
 | retention | a policy in a process whose [role](scaling.md#roles) never sweeps, so the database grows and nothing says why | the role, so the deployment's own binary |
 | disk | free space where the run log lives | a local file |

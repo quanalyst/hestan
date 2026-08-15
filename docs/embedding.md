@@ -26,8 +26,9 @@ spells "serve".
 database, sweep runs that a dead process left behind, sync the schedules and
 sensors tables to the code, start the loops this process's
 [role](scaling.md#roles) owns (the scheduler, the sensors, the backfill
-chunker, the freshness checker and the retention sweeper for a role that
-decides, the queue dispatcher for one that executes, and the lease loop
+chunker, the freshness checker, the
+[policy](assets.md#automation-policies) pass and the retention sweeper for a
+role that decides, the queue dispatcher for one that executes, and the lease loop
 whatever the role is), and serve the ui and api.
 `.retention(Retention::days(n))` folds one more step into that startup work:
 terminal runs older than `n` days are pruned before anything new launches, and
@@ -129,8 +130,8 @@ has it open.
 ## Single-process assumptions
 
 one *decider* per database, and as many executors as you like. that split is
-what [scaling](scaling.md) is about: schedules, sensors, freshness checks and
-backfill chunking are decisions, and two processes making them independently
+what [scaling](scaling.md) is about: schedules, sensors, freshness checks,
+automation policies and backfill chunking are decisions, and two processes making them independently
 is two of every scheduled run, so exactly one process may be `Role::All` or
 `Role::Scheduler`. any number may be `Role::Worker`, because a run is claimed
 by exactly one of them and the startup sweep respects a live claim rather than

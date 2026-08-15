@@ -142,6 +142,7 @@ machine-made runs are tagged with what `trigger` cannot say, and nothing more:
 | --- | --- | --- |
 | sensor launch | `sensor: {name}` | `sensor` says a sensor did it, not which |
 | probe auto build | `sensor: {source}` | a probe is a sensor named after its source |
+| policy build | `policy: {rules}`, `asset: {name}` when it is the only one | which rule wanted it, since `build` says only that something built |
 | backfill chunk | `asset: {name}`, `backfill: {id}` | a chunk you cannot trace back to its backfill is a run adrift |
 | build of one asset | `asset: {name}` | `build` does not say what was asked for |
 

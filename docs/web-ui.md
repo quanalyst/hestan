@@ -221,7 +221,11 @@ current short hashes on hover; the whole story is on
 [the asset's page](#the-asset-page). the checks cell uses the same shapes as
 everything else: a solid disc with "n passed" when every check passed, an ×
 with "n failed" when any did not, and nothing at all when no check has ever
-recorded anything. `source` and `auto` are tags beside the name, as `late` is.
+recorded anything. `source`, `auto` and `waiting` are tags beside the name, as
+`late` is; `auto` is any [automation policy](assets.md#automation-policies) and
+becomes `waiting` when the policy wants a build it cannot have yet, with the
+whole sentence ("when stale, once upstream is ready · 2026-08-14 waiting for
+`hours[2026-08-14T23]`") on hover and on the asset's own page.
 
 every derived row has a `build` action; sources have none, since the endpoint
 400s on them. a launched build (202) navigates straight to the new run, while

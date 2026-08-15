@@ -292,8 +292,8 @@ impl Hestan {
     /// nothing).
     ///
     /// **exactly one process** in a deployment should be `All` or `Scheduler`.
-    /// schedules, sensors, freshness checks and backfill chunking are
-    /// decisions, and two processes making them independently is two of every
+    /// schedules, sensors, freshness checks, [automation
+    /// policies](crate::AutoPolicy) and backfill chunking are decisions, and two processes making them independently is two of every
     /// scheduled run: the store has no lock that would stop it. any number of
     /// processes may be `Worker`; that is what the queue is for.
     ///

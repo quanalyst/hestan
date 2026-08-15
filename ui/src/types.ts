@@ -23,6 +23,7 @@ export type EventKind =
   | "op_canceled"
   | "type_check_failed"
   | "asset_materialized"
+  | "policy_launched"
   | "check_passed"
   | "check_failed"
   | "schedule_fired"
@@ -467,11 +468,36 @@ export interface AssetCheckResult {
   checked_at: string;
 }
 
+// when hestan rebuilds an asset by itself, and what it is waiting for if it
+// wants a build it cannot have yet
+export interface AssetPolicy {
+  rule: "stale" | "missing" | "cron";
+  // the expression and the clock it is read on, both null on a rule that reads
+  // no clock
+  cron: string | null;
+  tz: string | null;
+  upstream_ready: boolean;
+  // what the policy says, in one line
+  says: string;
+  waiting: PolicyWait | null;
+}
+
+export interface PolicyWait {
+  // the newest key that is waiting; null on an unpartitioned asset
+  key: string | null;
+  // what it is waiting on, as `dep[key]`
+  for: string;
+  // how many of its keys are in the same position
+  keys: number;
+}
+
 export interface AssetSummary {
   name: string;
   kind: "source" | "derived";
   deps: string[];
+  // whether hestan rebuilds this one itself, which is what a policy says
   auto: boolean;
+  policy: AssetPolicy | null;
   // the op that materializes it: the asset's own name, unless a multi-asset
   // produces it alongside others. null for a source, which has no op
   op: string | null;
@@ -532,6 +558,9 @@ export interface PartitionEntry {
   // because a mapping resolves per key
   reads: KeyRead[];
   reasons: StaleReason[];
+  // what this key's policy is waiting for, as `dep[key]`; null when it is
+  // waiting for nothing, and on every asset that declared no policy
+  waiting: string | null;
 }
 
 // the dep keys one partition reads under one mapping: how many, and the ends

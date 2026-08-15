@@ -791,10 +791,15 @@ startup's sweep marks failed.
 
 ```json
 { "assets": [
-  { "name": "docs_dir", "kind": "source", "deps": [], "auto": false, "op": null,
+  { "name": "docs_dir", "kind": "source", "deps": [], "auto": false,
+    "policy": null, "op": null,
     "fingerprint": "14a61f3c...", "built_at": "2026-08-08T11:01:36Z",
     "run_id": null, "stale": false, "reasons": [] },
-  { "name": "doc_stats", "kind": "derived", "deps": ["docs_dir"], "auto": false,
+  { "name": "doc_stats", "kind": "derived", "deps": ["docs_dir"], "auto": true,
+    "policy": { "rule": "stale", "cron": null, "tz": null,
+                "upstream_ready": true, "says": "when stale, once upstream is ready",
+                "waiting": { "key": "2026-08-08", "for": "hourly_traffic[2026-08-08T23]",
+                             "keys": 1 } },
     "op": "doc_stats", "partitions": null, "mappings": [],
     "fingerprint": "3bffef12...", "built_at": "2026-08-08T11:01:36Z",
     "run_id": "019fe109-...", "stale": true,
@@ -826,6 +831,16 @@ no check is declared or none has run yet. `freshness` is the asset's declared
 [policy](freshness.md)'s verdict, in the same shape jobs report, and `null`
 when nothing was declared: stale and late are separate questions and both
 are answered here. the semantics are in [assets](assets.md).
+
+`auto` says hestan rebuilds this one itself, and `policy` says on what terms:
+`rule` is `stale`, `missing` or `cron`, `cron` and `tz` are set on that rule
+alone, `upstream_ready` is whether the build is held until everything it reads
+is there, and `says` is the whole of it in one line. both are null and false on
+an asset that declared no [policy](assets.md#automation-policies). `waiting` is
+what it wants and cannot have yet: the newest key in that position (null on an
+unpartitioned asset), what it is waiting `for` as `dep[key]`, and how many of
+its keys are waiting. null means nothing is waiting, which is also what an asset
+with nothing to build reports.
 
 `partitions` is null on an unpartitioned asset and, on a
 [partitioned](assets.md#partitioned-assets) one, replaces the single
@@ -862,14 +877,15 @@ how much it left out:
 { "total": 220, "shown": 90, "partitions": [
   { "key": "2026-08-09", "state": "missing",
     "fingerprint": null, "built_at": null, "run_id": null,
-    "reads": [], "reasons": [] },
+    "reads": [], "reasons": [], "waiting": "hourly_traffic[2026-08-09T13]" },
   { "key": "2026-08-08", "state": "stale",
     "fingerprint": "3bffef12...", "built_at": "2026-08-08T11:01:36Z",
     "run_id": "019fe109-...",
     "reads": [ { "dep": "hourly_traffic", "mapping": "covering", "count": 24,
                  "first": "2026-08-08T00", "last": "2026-08-08T23", "missing": 0 } ],
     "reasons": [ { "dep": "hourly_traffic", "partition": "2026-08-08T07",
-                   "had": "aa01...", "now": "bb02..." } ] }
+                   "had": "aa01...", "now": "bb02..." } ],
+    "waiting": null }
 ] }
 ```
 
@@ -879,7 +895,10 @@ the keys it resolves to, and how many it wants that the dep does not hold,
 which is what makes a key unbuildable rather than merely unbuilt. it is empty
 where every dep is read at the same key, since the key itself already says
 that. `reasons` is this key's own staleness evidence, in the shape
-`GET /api/assets` uses. 404 for an unknown asset and 400 for one that is not
+`GET /api/assets` uses. `waiting` is what this key's
+[policy](assets.md#automation-policies) wants and cannot have yet, as
+`dep[key]`, and null on every key that is not waiting and on every asset that
+declared no policy. 404 for an unknown asset and 400 for one that is not
 partitioned.
 
 while any run of the `assets` job is active, both build endpoints are a 409

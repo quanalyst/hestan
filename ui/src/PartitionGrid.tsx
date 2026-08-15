@@ -33,6 +33,9 @@ function cellTitle(p: PartitionEntry): string {
   for (const r of p.reasons.filter((r) => r.partition !== null)) {
     lines.push(`${r.dep}[${r.partition}] moved`);
   }
+  // what its policy wants and cannot have yet, which is why a stale key can
+  // sit here with nothing building it
+  if (p.waiting) lines.push(`waiting for ${p.waiting}`);
   return lines.join("\n");
 }
 

@@ -15,6 +15,11 @@ Hestan::new()
 `fresh_within(d)` says: the latest success may be up to `d` old. past that,
 this is **late**, and that is worth waking someone for.
 
+it says nothing about rebuilding: a freshness policy alerts, and an
+[automation policy](assets.md#automation-policies) acts. an asset can carry
+both, and a `fresh_within` with nothing rebuilding the asset is a claim about
+work somebody else has to schedule.
+
 ## Fresh, late, never
 
 the verdict is computed at read time (nothing caches it) from the latest

@@ -73,6 +73,7 @@ rule phase 21 applied to a run's terminal notification.
 | `run_reclaimed` | the reclaim's status change | yes |
 | `op_*`, `type_check_failed`, `log` | none | **no**, see below |
 | `asset_materialized` | the `asset_materializations` insert, which for a build is the op's terminal write | yes |
+| `policy_launched` | none | **no**, see below |
 | `check_passed` / `check_failed` | the `asset_checks` insert | yes |
 | `schedule_*` | the `schedule_ticks` insert | yes |
 | `sensor_tick` | the `sensor_ticks` insert | yes |
@@ -104,6 +105,13 @@ them leaves a run that is queued and will execute, with no tick and no event,
 recoverable and visible as a run whose trigger is `schedule`. the other
 direction, an event claiming a run that was never created, cannot happen. the
 same applies to `backfill_chunk`.
+
+**a policy's launch and its event are two writes.** the run is enqueued, then
+one `policy_launched` per asset in the plan. a crash between them leaves a build
+that will execute, tagged `policy`, with nothing saying which rule wanted it;
+the other direction, an event about a run that was never created, cannot happen.
+it is the same trade the fired schedule makes above, and for the same reason:
+the launch is the thing, and the narration is about it.
 
 **a delivered notification's event is about the mark, not about the hook.**
 delivery is at-least-once: the hook returns, then the row is marked and the
@@ -161,6 +169,7 @@ never observed to stop.
 | kind | level | payload |
 | --- | --- | --- |
 | `asset_materialized` | info | `partition` (optional), `fingerprint`, `run_id` (optional), `meta` (optional) |
+| `policy_launched` | info | `rule`, `partitions` (empty on an unpartitioned asset), `run_id` |
 | `check_passed` | info | `check`, `partition` (optional), `status`, `severity`, `message` (optional), `run_id`, `meta` (optional) |
 | `check_failed` | warn or error | as above; the level follows the *severity*, not the verdict |
 
@@ -169,6 +178,13 @@ subject, so a filter on one asset finds every key of it.
 
 `run_id` in the payload is where the build happened; it is null for a
 materialization a [probe](assets.md) recorded outside any run.
+
+`policy_launched` says an [automation policy](assets.md#automation-policies)
+asked for a build: `rule` is the one that fired (`stale`, `missing` or `cron`)
+and `partitions` is the keys it asked for, newest first. one per asset rather
+than one per key, because a pass that wants a month of a daily set made one
+decision, and a pass that wants nothing writes nothing at all: a rule waiting on
+something that will never arrive is silent rather than hourly.
 
 ### Schedules
 

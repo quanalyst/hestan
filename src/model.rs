@@ -117,8 +117,9 @@ pub enum Trigger {
     /// [`ReplayPlan`](crate::ReplayPlan). the opposite of a resume, which
     /// re-runs what did *not* succeed.
     Replay,
-    /// an asset was materialized, whether asked for by hand, by a freshness
-    /// policy or by a [backfill](Backfill) chunk.
+    /// an asset was materialized, whether asked for by hand, by an
+    /// [automation policy](crate::AutoPolicy) or by a [backfill](Backfill)
+    /// chunk.
     Build,
     /// a [sensor](crate::Sensor) evaluation asked for it.
     Sensor,
@@ -737,8 +738,9 @@ impl Role {
         matches!(self, Role::All | Role::Worker)
     }
 
-    /// whether this process owns the schedules, sensors, freshness checks and
-    /// backfill chunking: the loops that decide what runs.
+    /// whether this process owns the schedules, sensors, freshness checks,
+    /// [automation policies](crate::AutoPolicy) and backfill chunking: the
+    /// loops that decide what runs.
     pub fn decides(&self) -> bool {
         matches!(self, Role::All | Role::Scheduler)
     }

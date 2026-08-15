@@ -136,6 +136,39 @@ impl AutoPolicy {
         }
     }
 
+    /// the expression, on a cron rule.
+    pub(crate) fn cron_expr(&self) -> Option<&str> {
+        match &self.rule {
+            Rule::Cron(expr) => Some(expr),
+            _ => None,
+        }
+    }
+
+    /// the timezone the cron is read in, which is utc unless it says otherwise.
+    pub(crate) fn timezone(&self) -> &str {
+        &self.tz
+    }
+
+    pub(crate) fn waits_for_upstream(&self) -> bool {
+        self.upstream_ready
+    }
+
+    /// one line for a person: what this policy says, in the order it says it.
+    pub(crate) fn says(&self) -> String {
+        let rule = match &self.rule {
+            Rule::Stale => "when stale".to_string(),
+            Rule::Missing => "when never built".to_string(),
+            Rule::Cron(expr) => match self.tz.as_str() {
+                "UTC" => format!("when stale, after {expr}"),
+                tz => format!("when stale, after {expr} in {tz}"),
+            },
+        };
+        match self.upstream_ready {
+            true => format!("{rule}, once upstream is ready"),
+            false => rule,
+        }
+    }
+
     /// whether a probe upstream may launch this, which is the one trigger
     /// [`Asset::auto`](crate::Asset::auto) has ever had. a probe answers "has
     /// the data moved", which is what the stale and missing rules turn on; when
@@ -193,6 +226,21 @@ pub(crate) enum Waiting {
     Source(String),
 }
 
+impl Waiting {
+    /// whether nothing that happens later can satisfy this: a window over keys
+    /// that will never exist, and a source with no probe to observe it. what
+    /// `doctor` reports, since the rest is a wait that ends, and so it is
+    /// compiled where `doctor` is.
+    #[cfg(feature = "cli")]
+    pub(crate) fn permanent(&self, reg: &AssetRegistry) -> bool {
+        match self {
+            Waiting::Never { .. } => true,
+            Waiting::Source(name) => reg.get(name).is_none_or(|m| m.probe.is_none()),
+            Waiting::Key { .. } => false,
+        }
+    }
+}
+
 impl fmt::Display for Waiting {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -205,6 +253,16 @@ impl fmt::Display for Waiting {
             Waiting::Source(name) => write!(f, "{name}"),
         }
     }
+}
+
+/// what one asset's policy is waiting for, for the api and for `doctor`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Waits {
+    /// the newest key that is waiting; `None` on an unpartitioned asset.
+    pub key: Option<String>,
+    pub on: Waiting,
+    /// how many of its keys are in the same position.
+    pub keys: usize,
 }
 
 /// one asset a pass wants built, and why.
@@ -339,6 +397,49 @@ impl<'a> Pass<'a> {
             }
         }
         None
+    }
+
+    /// what every asset's staleness came to, so a caller that needs both asks
+    /// for it once.
+    pub(crate) fn stale(&self) -> &HashMap<String, Staleness> {
+        &self.stale
+    }
+
+    /// what one asset's policy is waiting for, or `None` when it is waiting for
+    /// nothing. the newest key of the ones waiting, since that is the one
+    /// somebody looking at this at 2am is asking about.
+    pub(crate) fn waiting(&self, meta: &AssetMeta) -> Option<Waits> {
+        let mut keys = 0;
+        let mut newest = None;
+        for key in self.keys_of(meta) {
+            if let Verdict::Waiting(on) = self.verdict(meta, key.as_deref()) {
+                keys += 1;
+                newest = Some(Waits { key, on, keys: 0 });
+            }
+        }
+        newest.map(|w| Waits { keys, ..w })
+    }
+
+    /// why this asset's policy can never fire: something it wants is waiting on
+    /// what will never arrive, and nothing it wants can be built. `None` is a
+    /// policy that has nothing to do, or something it can do, or something it
+    /// is waiting on that will arrive.
+    ///
+    /// `doctor` is the one caller: a policy that will wait forever is quiet,
+    /// and a quiet policy is exactly what everything else here reports as
+    /// healthy.
+    #[cfg(feature = "cli")]
+    pub(crate) fn stuck(&self, meta: &AssetMeta) -> Option<Waiting> {
+        let mut stuck = None;
+        for key in self.keys_of(meta) {
+            match self.verdict(meta, key.as_deref()) {
+                Verdict::Idle => {}
+                Verdict::Build => return None,
+                Verdict::Waiting(on) if on.permanent(self.reg) => stuck = stuck.or(Some(on)),
+                Verdict::Waiting(_) => return None,
+            }
+        }
+        stuck
     }
 
     /// every key a policy is evaluated over: one `None` for an unpartitioned

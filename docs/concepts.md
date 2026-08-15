@@ -54,7 +54,8 @@ the *trigger* records why a run exists: `manual` (launch endpoint,
 `resume` (the [resume endpoint](#resume), which continues an earlier run),
 `replay` (the [replay endpoint](replay.md), which re-runs ops of an earlier
 run on the inputs it gave them), `build` (an [asset build](assets.md): the
-endpoints, `build_asset`, and probe-driven auto builds), or `sensor` (a
+endpoints, `build_asset`, and what an
+[automation policy](assets.md#automation-policies) asked for), or `sensor` (a
 [sensor](sensors.md) evaluation asked for it). retry, resume and replay are
 for finished runs: the api answers 409 for one still queued or running, since
 a fresh copy of a live run would only double it. manual launches stay ungated,

@@ -17,9 +17,7 @@ use include_dir::{Dir, include_dir};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use crate::asset::{
-    ASSETS_JOB, AssetRegistry, launch_plan, mapped_reads, mats_map, plan_all, staleness,
-};
+use crate::asset::{ASSETS_JOB, AssetRegistry, launch_plan, mapped_reads, mats_map, plan_all};
 use crate::auth::{self, Access, Auth, Identity};
 use crate::backfill;
 use crate::error::Error;
@@ -32,6 +30,7 @@ use crate::model::{
     OpStatus, RunStatus, RunTags, ScheduleRow, Trigger,
 };
 use crate::op;
+use crate::policy::{AutoPolicy, Pass, Verdict, Waits};
 use crate::schedule;
 use crate::sensor::SensorState;
 use crate::store::{EventQuery, Step, Store};
@@ -1009,9 +1008,13 @@ async fn list_assets(State(st): State<AppState>) -> Result<Json<Value>, ApiError
 /// too, and one answer is one answer.
 pub(crate) fn assets_json(registry: &AssetRegistry, store: &Store) -> Result<Value, Error> {
     let mats = mats_map(store)?;
-    let stale = staleness(registry, &mats);
-    let latest_checks = store.latest_asset_checks()?;
     let now = Utc::now();
+    // the pass the deciding process makes, made here to report rather than to
+    // launch: what a policy says, and what it is waiting for, is the same
+    // answer whoever asks
+    let pass = Pass::new(registry, &mats, now);
+    let stale = pass.stale();
+    let latest_checks = store.latest_asset_checks()?;
     let assets: Vec<Value> = registry
         .topo()
         .map(|meta| {
@@ -1067,6 +1070,9 @@ pub(crate) fn assets_json(registry: &AssetRegistry, store: &Store) -> Result<Val
                 // whether hestan rebuilds this one itself, which is what an
                 // automation policy says and what the flag has always meant
                 "auto": meta.policy.is_some(),
+                // and which rule says so, with what it is waiting for when it
+                // wants a build it cannot have yet
+                "policy": meta.policy.as_ref().map(|p| policy_json(p, pass.waiting(meta))),
                 // the op that materializes it, which is the asset's own name
                 // unless a multi-asset produces it alongside others
                 "op": meta.op,
@@ -1087,6 +1093,27 @@ pub(crate) fn assets_json(registry: &AssetRegistry, store: &Store) -> Result<Val
         })
         .collect();
     Ok(json!({ "assets": assets }))
+}
+
+/// what an asset's [automation policy](crate::AutoPolicy) says, and what it is
+/// waiting for if it wants a build it cannot have yet. "stale but waiting for
+/// `hours[2026-08-14T23]`" is one row of this.
+fn policy_json(policy: &AutoPolicy, waiting: Option<Waits>) -> Value {
+    json!({
+        "rule": policy.rule_word(),
+        // the expression and the clock it is read on, null on the rules that
+        // read no clock
+        "cron": policy.cron_expr(),
+        "tz": policy.cron_expr().map(|_| policy.timezone()),
+        "upstream_ready": policy.waits_for_upstream(),
+        "says": policy.says(),
+        "waiting": waiting.map(|w| json!({
+            // the newest key that is waiting, and null where there are no keys
+            "key": w.key,
+            "for": w.on.to_string(),
+            "keys": w.keys,
+        })),
+    })
 }
 
 #[derive(Deserialize)]
@@ -1243,7 +1270,8 @@ async fn asset_partitions(
         ));
     }
     let mats = mats_map(st.runner.store()).map_err(internal)?;
-    let verdict = &staleness(&st.assets, &mats)[&name];
+    let pass = Pass::new(&st.assets, &mats, Utc::now());
+    let verdict = &pass.stale()[&name];
     // newest first, and capped: a daily set running for years is a long list,
     // and the newest keys are the ones anyone is looking at
     let limit = q.limit.unwrap_or(90).clamp(1, 1000) as usize;
@@ -1283,6 +1311,13 @@ async fn asset_partitions(
                     "had": r.had,
                     "now": r.now,
                 })).collect::<Vec<Value>>(),
+                // what this key's policy is waiting for, where it wants a build
+                // and something it reads is not there. null on every key that
+                // is not waiting, and on every asset with no policy at all
+                "waiting": match pass.verdict(meta, Some(key)) {
+                    Verdict::Waiting(on) => json!(on.to_string()),
+                    _ => Value::Null,
+                },
             })
         })
         .collect();
@@ -5209,6 +5244,96 @@ mod tests {
         assert_eq!(stats["reasons"][0]["dep"], "docs");
         assert_eq!(stats["reasons"][0]["had"], "d1");
         assert_eq!(stats["reasons"][0]["now"], "d2");
+    }
+
+    // what a policy says, and what it is waiting for, is the sentence somebody
+    // wants at 2am: "stale, but waiting for hours[..]"
+    #[tokio::test]
+    async fn the_assets_endpoint_says_what_a_policy_is_and_what_it_waits_for() {
+        let st = asset_state();
+        let Json(body) = list_assets(State(st.clone())).await.unwrap();
+        let assets = body["assets"].as_array().unwrap();
+        assert_eq!(assets[1]["policy"], json!(null), "nothing was declared");
+        let policy = &assets[2]["policy"];
+        assert_eq!(policy["rule"], "stale");
+        assert_eq!(policy["cron"], json!(null));
+        assert_eq!(policy["upstream_ready"], json!(false));
+        assert_eq!(policy["says"], "when stale");
+        // the source has no probe and has never been observed, so the auto
+        // asset under it wants a build it can never have
+        assert_eq!(policy["waiting"]["for"], "docs");
+        assert_eq!(policy["waiting"]["key"], json!(null));
+        assert_eq!(policy["waiting"]["keys"], json!(1));
+
+        // observed, and the same policy has nothing to wait for
+        st.runner
+            .store()
+            .record_materialization("docs", None, "d1", &json!({}), None, None, None)
+            .unwrap();
+        let Json(body) = list_assets(State(st)).await.unwrap();
+        let assets = body["assets"].as_array().unwrap();
+        assert_eq!(assets[2]["policy"]["waiting"], json!(null));
+    }
+
+    #[tokio::test]
+    async fn the_partitions_endpoint_says_which_key_is_waiting_and_for_what() {
+        let hours = crate::Asset::new("hours", |_| async { Ok(json!(null)) })
+            .partitioned(crate::Partitions::keys(["h0", "h1"]));
+        let rollup = crate::Asset::new("rollup", |_| async { Ok(json!(null)) })
+            .reads(&hours, crate::PartitionMapping::all())
+            .partitioned(crate::Partitions::keys(["d0"]))
+            .policy(AutoPolicy::when_stale().and_upstream_ready());
+        let registry =
+            Arc::new(AssetRegistry::new(vec![hours, rollup], Vec::new(), Vec::new()).unwrap());
+        let runner = Runner::new(
+            [registry.lower_job().unwrap()],
+            Store::open(":memory:").unwrap(),
+        )
+        .unwrap();
+        runner
+            .store()
+            .record_materialization("hours", Some("h0"), "f0", &json!({}), None, None, None)
+            .unwrap();
+        let st = AppState {
+            jobs: Arc::new(runner.jobs().clone()),
+            runner,
+            assets: registry,
+            sensors: Arc::new(Vec::new()),
+            auth: None,
+        };
+
+        let Json(body) = asset_partitions(
+            State(st.clone()),
+            Path("rollup".into()),
+            Ok(Query(HistoryQuery {
+                limit: None,
+                partition: None,
+            })),
+        )
+        .await
+        .unwrap();
+        let rows = body["partitions"].as_array().unwrap();
+        assert_eq!(rows[0]["key"], "d0");
+        assert_eq!(rows[0]["waiting"], "hours[h1]");
+
+        // an asset with no policy waits for nothing, whatever its keys hold
+        let Json(body) = asset_partitions(
+            State(st),
+            Path("hours".into()),
+            Ok(Query(HistoryQuery {
+                limit: None,
+                partition: None,
+            })),
+        )
+        .await
+        .unwrap();
+        assert!(
+            body["partitions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|p| p["waiting"].is_null())
+        );
     }
 
     #[tokio::test]

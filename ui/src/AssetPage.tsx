@@ -4,6 +4,7 @@ import { get, post, usePoll } from "./api";
 import AssetDetail, { StateGlyph } from "./AssetDetail";
 import BackfillLauncher from "./BackfillLauncher";
 import type { KeyRange } from "./backfill";
+import { policySays } from "./catalog";
 import { CHAIN_DEPTH, downstreamOf, linkKind, movedInputs, whenChanged } from "./lineage";
 import type { ChainLink } from "./lineage";
 import { useMay } from "./role";
@@ -336,7 +337,7 @@ function AssetView({ name }: { name: string }) {
                 </Link>
               </>
             )}
-            {asset.auto && " · auto"}
+            {asset.policy && ` · ${policySays(asset.policy)}`}
           </p>
         </div>
         <div className="run-actions">

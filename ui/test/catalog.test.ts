@@ -9,11 +9,12 @@ import {
   groupAssets,
   groupOf,
   neverBuilt,
+  policySays,
   sortAssets,
 } from "../src/catalog";
 import { collapseGroups, neighbourhood } from "../src/dag";
 import type { DagNode } from "../src/DagView";
-import type { AssetSummary, PartitionCounts } from "../src/types";
+import type { AssetPolicy, AssetSummary, PartitionCounts } from "../src/types";
 
 interface Over {
   stale?: boolean;
@@ -29,6 +30,7 @@ const asset = (name: string, over: Over = {}): AssetSummary => ({
   kind: "derived",
   deps: [],
   auto: false,
+  policy: null,
   op: name,
   partitions: over.partitions ?? null,
   fingerprint: "fp",
@@ -171,6 +173,38 @@ const graph: DagNode[] = [
   node("finance/revenue", ["sales/orders", "sales/returns"]),
   node("elsewhere"),
 ];
+
+test("a policy says what it is waiting for, and which key is waiting", () => {
+  const policy = (over: Partial<AssetPolicy> = {}): AssetPolicy => ({
+    rule: "stale",
+    cron: null,
+    tz: null,
+    upstream_ready: true,
+    says: "when stale, once upstream is ready",
+    waiting: null,
+    ...over,
+  });
+  assert.equal(policySays(policy()), "when stale, once upstream is ready");
+
+  // an unpartitioned asset has no key to name, so the sentence is what it is
+  // waiting on and nothing else
+  assert.equal(
+    policySays(policy({ says: "when stale", waiting: { key: null, for: "orders", keys: 1 } })),
+    "when stale · waiting for orders",
+  );
+
+  // and a partitioned one names the newest key waiting, then how many others
+  // are in the same position
+  const wait = { key: "2026-08-14", for: "hours[2026-08-14T23]", keys: 1 };
+  assert.equal(
+    policySays(policy({ says: "when stale", waiting: wait })),
+    "when stale · 2026-08-14 waiting for hours[2026-08-14T23]",
+  );
+  assert.equal(
+    policySays(policy({ says: "when stale", waiting: { ...wait, keys: 3 } })),
+    "when stale · 2026-08-14 and 2 more waiting for hours[2026-08-14T23]",
+  );
+});
 
 test("a neighbourhood reaches both ways, and stops at the depth asked for", () => {
   const at = (focus: string, depth: number) =>
