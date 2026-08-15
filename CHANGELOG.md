@@ -2,6 +2,18 @@
 
 ## unreleased
 
+## 0.1.0-beta.3
+
+rate limits as declared token buckets, an asset's value stored through its io manager,
+resources scoped to one run, fan-out that nests, and partition mappings so a daily asset
+can roll up hourly data. the prose lost 2,286 em dashes.
+
+**breaking, none of them signature changes.** an asset's value column now holds what the
+io manager returned rather than the value itself, and `Store::materialization` hands that
+back. `Trigger` gained `Replay` in beta.2 and nothing new joins it here. two jobs that used
+to build now do not: an op named what an instance of a mapped op of the same job is named,
+and a fan-out label containing a bracket. both were silently misread before.
+
 a partition may read a mapping of its dep's keys: a daily rollup of hourly
 data, yesterday's key, every key at once.
 

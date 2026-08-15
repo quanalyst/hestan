@@ -19,7 +19,7 @@ pin an exact version: under 0.x the api changes without a deprecation cycle.
 
 ```toml
 [dependencies]
-hestan = "0.1.0-beta.2"
+hestan = "0.1.0-beta.3"
 tokio = { version = "1", features = ["full"] }
 ```
 
@@ -71,7 +71,7 @@ Hestan::new()
 ```
 
 ```toml
-hestan = { version = "0.1.0-beta.2", features = ["http"] }
+hestan = { version = "0.1.0-beta.3", features = ["http"] }
 ```
 
 transport errors, 429s, and 5xx responses are retried with capped exponential
@@ -424,7 +424,7 @@ release notes are in [CHANGELOG.md](CHANGELOG.md).
 
 ```toml
 [dependencies]
-hestan = "0.1.0-beta.2"
+hestan = "0.1.0-beta.3"
 ```
 
 the binary is yours: define jobs, then `Hestan::new()...serve(addr)`, or
