@@ -72,7 +72,7 @@ pub(crate) const DEFAULT_MAX_INSTANCES: usize = 1000;
 
 /// what the dispatcher will not start past.
 ///
-/// every limit here counts runs that are **executing** — claimed and not yet
+/// every limit here counts runs that are **executing**, claimed and not yet
 /// finished. a queued run nobody has claimed costs nothing and counts as
 /// nothing, which is the difference between this and
 /// [`Overlap`](crate::Overlap): a limit is about machines, and overlap is about
@@ -107,7 +107,7 @@ impl Limits {
     }
 
     /// at most `n` runs carrying the [tag](RunTags) `key: value` executing at
-    /// once — `env: prod` at 2, whatever the jobs are.
+    /// once: `env: prod` at 2, whatever the jobs are.
     pub fn tag(mut self, key: impl Into<String>, value: impl Into<String>, n: usize) -> Limits {
         self.tags.insert((key.into(), value.into()), n.max(1));
         self
@@ -148,7 +148,7 @@ pub enum Blocked {
     Global(usize),
     /// this job's own cap is full.
     Job {
-        /// the job that is at its limit — this run's job.
+        /// the job that is at its limit: this run's job.
         job: String,
         /// what that limit is.
         limit: usize,
@@ -163,8 +163,8 @@ pub enum Blocked {
         limit: usize,
     },
     /// nothing here can run it: this process does not define the job. a run
-    /// left over from a job that was deleted, or — once workers are split by
-    /// what they can build — one waiting for a process that knows how.
+    /// left over from a job that was deleted, or (once workers are split by
+    /// what they can build) one waiting for a process that knows how.
     Undefined(String),
 }
 
@@ -315,7 +315,7 @@ pub struct ResumePlan {
 pub struct ReplayPlan {
     /// the job the replayed run belongs to.
     pub job: String,
-    /// the ops the new run executes — exactly these, with nothing downstream
+    /// the ops the new run executes: exactly these, with nothing downstream
     /// of them pulled in. that is the difference from a
     /// [resume](ResumePlan), which re-runs a chosen op *and* everything below
     /// it.
@@ -450,7 +450,7 @@ pub struct Runner {
     active: Arc<Mutex<HashMap<String, watch::Sender<bool>>>>,
     // runs this process claimed and stopped executing without recording an
     // outcome, because the store would not take the write that says what
-    // happened. their leases are deliberately left to lapse — see
+    // happened. their leases are deliberately left to lapse; see
     // `Runner::abandon`
     abandoned: Arc<Mutex<HashSet<String>>>,
     // what this process registered for every job, beside whatever each job
@@ -504,7 +504,7 @@ impl Runner {
     /// something asks it to. reach for it when you want to execute a job from
     /// your own code and nothing else.
     ///
-    /// no pools are declared, so an op that names one fails at run time —
+    /// no pools are declared, so an op that names one fails at run time;
     /// [`with_pools`](Runner::with_pools) is the constructor for that.
     ///
     /// two jobs under one name is [`Error::DuplicateJob`]: which of them you
@@ -518,7 +518,7 @@ impl Runner {
     /// its own task whenever a run finishes failed. canceled runs don't fire.
     ///
     /// these are [run hooks](crate::RunHook) that filter on the status rather
-    /// than a mechanism of their own — see
+    /// than a mechanism of their own; see
     /// [`with_hooks`](Runner::with_hooks), which is how the wider events get
     /// in.
     ///
@@ -684,9 +684,9 @@ impl Runner {
         self.limits.lock().unwrap().clone()
     }
 
-    /// change what the dispatcher enforces, live. the next pass reads it — and
+    /// change what the dispatcher enforces, live. the next pass reads it (and
     /// there is a pass whenever a run finishes, and one every half second
-    /// besides — so raising a limit drains the queue it was holding back
+    /// besides), so raising a limit drains the queue it was holding back
     /// without a restart.
     pub fn set_limits(&self, limits: Limits) {
         *self.limits.lock().unwrap() = limits;
@@ -724,7 +724,7 @@ impl Runner {
     /// `named` are the ones an op can select with [`Op::io`]. an op naming a
     /// manager that is not in `named` is [`Error::Graph`].
     ///
-    /// `Arc::new(Inline)` as the default is exactly today's behaviour —
+    /// `Arc::new(Inline)` as the default is exactly today's behaviour:
     /// outputs are their own handles and land in the run log as json.
     /// `Hestan::io` and `Hestan::io_named` are the way in from the builder.
     pub fn with_io(
@@ -810,7 +810,7 @@ impl Runner {
         }
         // an isolated op's child opens this database by path and reads the run
         // out of it. `:memory:` is private to a connection, so the child would
-        // open an empty one and find no run at all — refused here rather than
+        // open an empty one and find no run at all, refused here rather than
         // discovered as a baffling failure at 3am
         if runner.store.is_private() {
             for job in runner.jobs.values() {
@@ -851,7 +851,7 @@ impl Runner {
     }
 
     /// declare the named rates this runner's ops take tokens from, each a
-    /// `(name, limit, per)` shared by every job it owns — `Hestan::rate` is the
+    /// `(name, limit, per)` shared by every job it owns; `Hestan::rate` is the
     /// way in.
     ///
     /// an op naming a rate that isn't declared here is [`Error::Graph`], as is
@@ -860,7 +860,7 @@ impl Runner {
     /// get is a build mistake rather than a 3am one.
     ///
     /// a runner assembled without this has no rates at all, so an op that names
-    /// one fails at run time — the pools have the same shape.
+    /// one fails at run time; the pools have the same shape.
     pub fn with_rates(
         self,
         rates: impl IntoIterator<Item = (String, usize, Duration)>,
@@ -906,7 +906,7 @@ impl Runner {
     }
 
     /// the [run-scoped](crate::Hestan::run_resource) resources this runner
-    /// declares, by name and declared type, in declaration order — which is
+    /// declares, by name and declared type, in declaration order, which is
     /// the order they are built in.
     ///
     /// nothing is built until a run starts, so this is what is declared rather
@@ -946,8 +946,8 @@ impl Runner {
     /// every declared rate and what it is doing, by name.
     ///
     /// `waiting` is a live count of the ops sitting on this process's bucket,
-    /// which is what makes an op that is queued for a token readable as queued
-    /// — and it is **this process's** count, because the bucket is.
+    /// which is what makes an op that is queued for a token readable as
+    /// queued, and it is **this process's** count, because the bucket is.
     pub fn rates(&self) -> Vec<RateStatus> {
         let mut all: Vec<RateStatus> = self
             .rates
@@ -971,7 +971,7 @@ impl Runner {
     /// the same runner, launching and cancelling **as** somebody.
     ///
     /// what it changes is what gets written down: the run row's actor, the
-    /// events for what this handle does, and nothing else — a role was already
+    /// events for what this handle does, and nothing else: a role was already
     /// checked before anything got here, and this is the audit trail rather
     /// than a second gate.
     ///
@@ -998,7 +998,7 @@ impl Runner {
     /// launching is a request, not a start: the run row exists when this
     /// returns and the dispatcher starts it as soon as no
     /// [limit](Limits) says otherwise, which with no limits declared is the
-    /// same instant. the caller never blocks either way — what comes back is
+    /// same instant. the caller never blocks either way: what comes back is
     /// the run id, exactly as it always did.
     pub fn launch(&self, job: &str, params: Value, trigger: Trigger) -> Result<String, Error> {
         self.launch_at(job, params, trigger, None)
@@ -1076,7 +1076,7 @@ impl Runner {
     /// [`Runner::launch`] for a request carrying a [run
     /// key](crate::RunRequest::key): the key is claimed in the same
     /// transaction that creates the run, so it can never name a run that was
-    /// not created. `Ok(None)` is a key already claimed — nothing launched,
+    /// not created. `Ok(None)` is a key already claimed: nothing launched,
     /// and nothing failed.
     pub(crate) fn launch_keyed(
         &self,
@@ -1099,7 +1099,7 @@ impl Runner {
         )
     }
 
-    /// like [`Runner::launch`] but awaits completion — including the time the
+    /// like [`Runner::launch`] but awaits completion, including the time the
     /// run spends queued, if a limit is holding it back.
     pub async fn run(&self, job: &str, params: Value, trigger: Trigger) -> Result<Run, Error> {
         let id = self.launch(job, params, trigger)?;
@@ -1108,8 +1108,8 @@ impl Runner {
 
     /// wait for a run to reach a terminal status, whoever ends up executing it.
     ///
-    /// the wake-up is a notification rather than a poll, so the common case —
-    /// this process started the run and this process finished it — costs one
+    /// the wake-up is a notification rather than a poll, so the common case
+    /// (this process started the run and this process finished it) costs one
     /// wake. the timeout beside it covers the two cases no local notification
     /// can: another process claimed the run, and a limit freed up somewhere
     /// nothing here was watching.
@@ -1181,7 +1181,7 @@ impl Runner {
     }
 
     /// the queue as this runner sees it: its limits, its jobs. only the cases
-    /// below ask — the ui and the command line both go through
+    /// below ask: the ui and the command line both go through
     /// [`server::queue_json`](crate::server::queue_json), which takes the
     /// limits as an argument because a reader that does not own them has none
     /// to report.
@@ -1231,7 +1231,7 @@ impl Runner {
     /// knows what is true about it**: the work may have finished, and the row
     /// that would say so is the write that did not land. reporting success
     /// would be a lie and reporting failure would be a guess, so it reports
-    /// nothing and lets go — the claim stops being renewed, the lease lapses,
+    /// nothing and lets go. the claim stops being renewed, the lease lapses,
     /// and [`Hestan::reclaim`](crate::Hestan::reclaim) decides what the run
     /// was: failed, saying a claimer went away, or back on the queue.
     ///
@@ -1279,7 +1279,7 @@ impl Runner {
     /// back whatever belonged to one that is not.
     ///
     /// both halves run everywhere, including in a process that claims nothing
-    /// of its own — noticing a dead claimer is not the executor's job in
+    /// of its own: noticing a dead claimer is not the executor's job in
     /// particular, and a deployment where only the dead process could have
     /// noticed would never notice.
     pub(crate) fn heartbeat(&self) {
@@ -1370,7 +1370,7 @@ impl Runner {
 
     /// [`Runner::resume`] with a chosen starting point. `from` re-runs exactly
     /// those ops and everything downstream of them whatever their last status
-    /// was — "re-run from here" — and `None` means every op that did not
+    /// was ("re-run from here"), and `None` means every op that did not
     /// succeed. the new run records `resumed_from`, carries the original run's
     /// params, and is triggered [`Trigger::Resume`].
     pub fn resume_from(&self, run_id: &str, from: Option<&[String]>) -> Result<String, Error> {
@@ -1394,7 +1394,7 @@ impl Runner {
     /// outputs come from the run and, following `resumed_from`, from the runs
     /// it continues: each op is seeded with the most recent successful output
     /// recorded anywhere in that chain. the ops recorded across the chain must
-    /// still be exactly the job's ops, or the resume is refused — resuming
+    /// still be exactly the job's ops, or the resume is refused: resuming
     /// into a changed graph would record lineage that never happened. that
     /// also rules out resuming a run that was itself launched as a subset
     /// without being a resume (an asset build records rows for its plan only).
@@ -1436,8 +1436,8 @@ impl Runner {
 
         let current: BTreeSet<&str> = job.ops().iter().map(|o| o.name()).collect();
         let recorded: BTreeSet<&str> = latest.keys().map(String::as_str).collect();
-        // a mapped op records no row of its own — its instances are the
-        // record, and an expansion over an empty array leaves none at all — so
+        // a mapped op records no row of its own (its instances are the
+        // record, and an expansion over an empty array leaves none at all), so
         // it stays out of the shape check and simply re-expands below
         let mapped: BTreeSet<&str> = job
             .ops()
@@ -1586,7 +1586,7 @@ impl Runner {
     /// four things move on regardless, and a replay that succeeded is only
     /// evidence about the ones that did not matter to it:
     ///
-    /// - **the code is today's.** that is the point — you are testing a fix —
+    /// - **the code is today's.** that is the point (you are testing a fix),
     ///   but it means this is not a bit-for-bit re-execution of what happened.
     /// - **resources are rebuilt.** a connection, a client, a temp dir: the op
     ///   gets today's, not the original's. an op that read something from a
@@ -1628,8 +1628,8 @@ impl Runner {
     /// that follows it agree.
     ///
     /// the inputs come from the run itself and no further: the outputs it
-    /// recorded, plus — on a run that was a subset of its job, so a resume, a
-    /// replay or an [asset build](crate::Asset) — the seeds it was handed for
+    /// recorded, plus (on a run that was a subset of its job, so a resume, a
+    /// replay or an [asset build](crate::Asset)) the seeds it was handed for
     /// the ops it did not execute. that is exactly what the ops being
     /// replayed read, whichever run originally produced it.
     ///
@@ -1639,7 +1639,7 @@ impl Runner {
     /// that reproduces nothing: it is refused, naming the op whose input is
     /// gone, instead of launching a run that will fail halfway.
     ///
-    /// there is no check that the job still has the shape the run recorded —
+    /// there is no check that the job still has the shape the run recorded:
     /// a replay needs the ops it was asked for and the deps those ops read,
     /// and a graph that grew an op elsewhere does not change either. a dep
     /// the job has gained since has no recorded output, and is refused as
@@ -1748,7 +1748,7 @@ impl Runner {
                 // read back now rather than when the op asks: a handle whose
                 // file went with the run that wrote it resolves to nothing,
                 // and a replay that reproduces nothing should not launch. the
-                // value is dropped — the new run resolves it again through
+                // value is dropped: the new run resolves it again through
                 // the manager, the way every run resolves a dep
                 let manager = self.io.manager(job.op(dep).and_then(Op::io_name));
                 let key = IoKey {
@@ -1812,7 +1812,7 @@ impl Runner {
         }
         // still on the queue with nobody executing it: take it off the queue,
         // which is the only way to stop a run that has not started. atomic
-        // against a dispatcher reaching for the same row — one of the two wins,
+        // against a dispatcher reaching for the same row: one of the two wins,
         // and if the claim does, the sender below is there to signal
         if run.status == RunStatus::Queued
             && run.claimed_by.is_none()
@@ -1826,7 +1826,7 @@ impl Runner {
             Some(tx) => {
                 // the run's own terminal event is written by whatever is
                 // executing it, and that is not this call and has no idea who
-                // asked — so the asking is a line of its own, and it is the
+                // asked, so the asking is a line of its own, and it is the
                 // line with the name on it
                 note(self.store.cancel_requested(run_id, self.actor()));
                 let _ = tx.send(true);
@@ -1945,7 +1945,7 @@ impl Runner {
             .cloned()
             .collect();
         // a full launch reconstructs itself from the job, so only a subset has
-        // anything to record — and it has to, because its seeds are outputs of
+        // anything to record, and it has to, because its seeds are outputs of
         // an earlier run that live in this process's memory and nowhere a
         // claimer in another process could look
         let plan = subset_plan.then(|| json!({ "ops": &pending, "seeds": &seeded }));
@@ -1968,7 +1968,7 @@ impl Runner {
 /// and the outputs seeded in ahead of them.
 ///
 /// `None` is a run of the whole job, which is every launch that is not a
-/// resume, an asset build or a subset — it needs nothing recorded because the
+/// resume, an asset build or a subset: it needs nothing recorded because the
 /// job itself is the plan. anything else was written at
 /// [enqueue](Runner::enqueue) time, because by the time it is read the process
 /// that decided it may be gone.
@@ -1998,8 +1998,8 @@ fn planned(job: &Job, plan: Option<&Value>) -> (Vec<String>, HashMap<String, Val
 // ("process", ["3", "1"]), but only when `process` is a mapped op of this job;
 // any other bracketed name is just an op name.
 //
-// what makes the name reversible is that a label can hold neither bracket —
-// `expansion` refuses one that does — so there is nothing here to guess about
+// what makes the name reversible is that a label can hold neither bracket
+// (`expansion` refuses one that does), so there is nothing here to guess about
 // where one level ends and the next begins
 pub(crate) fn instance_of(job: &Job, name: &str) -> Option<(String, Vec<String>)> {
     let (op, mut rest) = name.split_once('[')?;
@@ -2019,7 +2019,7 @@ pub(crate) fn instance_of(job: &Job, name: &str) -> Option<(String, Vec<String>)
 }
 
 /// what one instance of a fan-out is called after the `[`: its index, or the
-/// element itself on an op that names its instances by them — which is what
+/// element itself on an op that names its instances by them, which is what
 /// makes a partitioned asset's instances read as `daily_orders[2026-01-05]`.
 fn instance_label(op: &Op, index: usize, element: &Value) -> String {
     match element.as_str().filter(|_| op.labels_instances()) {
@@ -2028,7 +2028,7 @@ fn instance_label(op: &Op, index: usize, element: &Value) -> String {
     }
 }
 
-/// how many levels of fan-out an op's instances sit inside — the number of
+/// how many levels of fan-out an op's instances sit inside: the number of
 /// `[label]` groups their names carry, and the number of levels a fan-out over
 /// this op has to mirror. 0 for an op that is not mapped, and for an external
 /// dep, which is not an op of the job at all.
@@ -2045,7 +2045,7 @@ fn fanout_depth(job: &Job, op: &str) -> usize {
 ///
 /// what a [replay](Runner::replay_plan) reads to find the ops that failed, and
 /// to refuse one the run never ran. deliberately not
-/// [`fold_instances`](fold_instances), which answers a different question —
+/// [`fold_instances`](fold_instances), which answers a different question:
 /// there, a mapped op whose instances cannot be reassembled is reported failed
 /// so that a resume expands it again, and a replay reading that would offer to
 /// re-run an op that succeeded.
@@ -2069,7 +2069,7 @@ enum Folded {
 }
 
 /// put one instance row where its label path says it belongs, or say that the
-/// path is not one a fan-out could have produced — an index twice, or a name
+/// path is not one a fan-out could have produced: an index twice, or a name
 /// that is both an instance and a level of instances.
 fn place(node: &mut Folded, path: &[usize], row: (String, OpStatus, Option<Value>)) -> bool {
     let (Folded::Level(children), Some((&index, rest))) = (node, path.split_first()) else {
@@ -2128,8 +2128,8 @@ fn reassemble(
 /// op they belong to. it counts as succeeded only when the instances cover
 /// `0..n` at every level and every one of them did: the array a mapped op
 /// expands over can differ on a re-run, so anything less has to expand again
-/// from scratch. a mapped op with no rows at all — never reached, or expanded
-/// over an empty array — is absent here, which resume planning reads the same
+/// from scratch. a mapped op with no rows at all (never reached, or expanded
+/// over an empty array) is absent here, which resume planning reads the same
 /// way, and an outer element that yielded an empty array leaves the same gap
 /// one level in.
 ///
@@ -2338,7 +2338,7 @@ async fn execute_in_span(
     let mut expanded = 0usize;
 
     // this run's own resources, built before the first op is dispatched and
-    // dropped when this function returns — which every way of a run ending
+    // dropped when this function returns, which every way of a run ending
     // goes through, including the task being dropped from under it. it is
     // held for that and nothing else.
     let scoped = resource::for_run(&runner.run_resources, &runner.resources, &run_id).await;
@@ -2537,7 +2537,7 @@ async fn execute_in_span(
                     Some(&json!({ "instances": created.len(), "over": over })),
                 ));
                 // an empty array is a legal fan-out with nothing to wait on,
-                // and downstream runs normally on `[]` — at any level, so an
+                // and downstream runs normally on `[]`, at any level, so an
                 // outer element that yields none leaves an empty array inside
                 // the collected one rather than a gap
                 for unit in empty {
@@ -2566,7 +2566,7 @@ async fn execute_in_span(
         for name in spawnable {
             let op = unit_op(&job, &instances, &name).clone();
             // a dep a rule let this op run past may have produced nothing, so
-            // its entry is simply absent — `ctx.input` says None, and
+            // its entry is simply absent: `ctx.input` says None, and
             // `ctx.dep_status` says what it did instead
             // keyed by what the body calls each dep, which differs from the
             // job-level name only inside a flattened graph instance
@@ -2574,7 +2574,7 @@ async fn execute_in_span(
             let mut dep_statuses: HashMap<String, OpStatus> = HashMap::new();
             let mut unresolved: Option<(String, String)> = None;
             // an isolated op's inputs go to its child instead, as the handles
-            // and statuses this run holds — it resolves them itself, in the
+            // and statuses this run holds: it resolves them itself, in the
             // process that wants the bytes
             let mut held: serde_json::Map<String, Value> = serde_json::Map::new();
             let mut dep_json: serde_json::Map<String, Value> = serde_json::Map::new();
@@ -2946,7 +2946,7 @@ async fn execute_in_span(
         // blocking work an op spawned, never land at all.
         //
         // isolated ops are not aborted: each is watching this same signal and
-        // stopping its own child — SIGTERM, a grace, then a kill — and a task
+        // stopping its own child (SIGTERM, a grace, then a kill), and a task
         // dropped mid-sequence would kill the process outright instead. so they
         // are given room to do it, and the wait below is doubled to cover the
         // grace they are spending inside it.
@@ -2979,7 +2979,7 @@ async fn execute_in_span(
                             built,
                         } => {
                             // won the race against the abort, so it is
-                            // persisted like any other success — or recorded
+                            // persisted like any other success, or recorded
                             // failed if it cannot be, and what it built goes
                             // or stays with that row either way
                             let unit = unit_op(&job, &instances, &name);
@@ -3113,7 +3113,7 @@ async fn execute_in_span(
             }
         }
         // whatever is still in `names` never joined. aborting cannot stop
-        // blocking work, so hestan does not know if it is over — and says so
+        // blocking work, so hestan does not know if it is over, and says so
         // instead of stamping a finish time it never observed.
         let mut unstopped: Vec<String> = names.drain().map(|(_, name)| name).collect();
         unstopped.sort();
@@ -3127,8 +3127,8 @@ async fn execute_in_span(
 
     // every op of this run that could be recorded has been; what cannot be is
     // the run itself, and this is where it stops. dropping the `JoinSet` on
-    // the way out aborts whatever is still in flight — and kills an isolated
-    // op's child with it — so nothing carries on working for a run nobody is
+    // the way out aborts whatever is still in flight (and kills an isolated
+    // op's child with it), so nothing carries on working for a run nobody is
     // going to record
     if unrecorded {
         runner.abandon(&run_id);
@@ -3173,11 +3173,12 @@ async fn execute_in_span(
         })),
     ));
 
-    // every terminal status fires, and the status says which — a hook that
+    // every terminal status fires, and the status says which: a hook that
     // only wants failures is what `on_failure` still is. the boot sweep does
-    // not come through here, so a restart after a crash replays nothing.
-    // the same instant the event carried: a hook and the log disagreeing about
-    // how long a run took by a millisecond is a question nobody wants to answer
+    // not come through here, so a restart after a crash replays nothing. the
+    // hook's finish time is the same instant the event carried: a hook and the
+    // log disagreeing about how long a run took by a millisecond is a question
+    // nobody wants to answer
     let finished_at = ended_at;
     let (failed_op, op_error) = match first_failure {
         Some((op, msg)) => (Some(op), Some(msg)),
@@ -3233,8 +3234,8 @@ async fn execute_in_span(
 ///
 /// handles rather than values, so an op reading a gigabyte through a
 /// [file io manager](crate::FileIo) reads it once, in the process that wants
-/// it. seeded deps — a resume's reused output, an asset build's memoized value
-/// — are here too, and they are the reason this exists at all: everything else
+/// it. seeded deps (a resume's reused output, an asset build's memoized
+/// value) are here too, and they are the reason this exists at all: everything else
 /// an op invocation needs is already a row the child can find on its own.
 /// `isolate::handed_over` is what reads it back.
 fn invocation(held: serde_json::Map<String, Value>, deps: serde_json::Map<String, Value>) -> Value {
@@ -3288,7 +3289,7 @@ struct Expansion {
 
 /// one fan-out of a planned expansion: what it is called, the slot of the
 /// fan-out outside it that its collected value fills, and what its own slots
-/// hold — one instance's element each at the innermost level, a nested fan-out
+/// hold: one instance's element each at the innermost level, a nested fan-out
 /// each above it.
 struct Node {
     name: String,
@@ -3304,8 +3305,8 @@ struct Node {
 /// instance produced. so an instance's labels are its element's coordinates,
 /// and the depth of its name is the depth of the nesting.
 ///
-/// nothing is written here. the whole expansion is planned, counted and — past
-/// what `spent` of the run's `ceiling` op runs leaves — refused before a row of
+/// nothing is written here. the whole expansion is planned, counted and (past
+/// what `spent` of the run's `ceiling` op runs leaves) refused before a row of
 /// it exists, because a runaway found by counting rows in the ui is a runaway
 /// that already happened.
 #[allow(clippy::too_many_arguments)]
@@ -3360,7 +3361,7 @@ fn plan_node(
     };
     // the labels the fan-out being mirrored gave its own elements, so an inner
     // instance carries the outer one it belongs to. an index where there is no
-    // live fan-out to mirror, which is what a reused output leaves behind —
+    // live fan-out to mirror, which is what a reused output leaves behind,
     // and an op whose output can be reused is one that labels by index anyway
     let mirrored = fanouts.get(unit);
     let label_at = |i: usize| match mirrored.and_then(|f| f.labels.get(i)) {
@@ -3391,7 +3392,7 @@ fn plan_node(
         return Ok(());
     }
     // every instance is a row of its own, so two elements that would be called
-    // the same thing are not an expansion at all — and a label carrying a
+    // the same thing are not an expansion at all, and a label carrying a
     // bracket is a name nothing could read back
     let mut labels: Vec<String> = Vec::with_capacity(elements.len());
     let mut seen: HashSet<String> = HashSet::new();
@@ -3506,7 +3507,7 @@ fn io_key(run_id: &str, job: &Job, op: &str) -> IoKey {
 
 /// turn what the run holds for `op` back into a value. every input an op
 /// receives comes through here, whether it was produced by this run, seeded
-/// from a resume, or memoized by an asset build — which is why a manager's
+/// from a resume, or memoized by an asset build, which is why a manager's
 /// `get` has to pass through anything it did not write.
 async fn resolve(io: &Io, job: &Job, run_id: &str, op: &str, held: Value) -> Result<Value, String> {
     let name = job.op(op).and_then(Op::io_name);
@@ -3517,7 +3518,7 @@ async fn resolve(io: &Io, job: &Job, run_id: &str, op: &str, held: Value) -> Res
 
 // a failed unit skips its downstream. one failing instance fails the fan-out
 // it belongs to, and that one fails the fan-out outside it, out to the mapped
-// op — there is no partial array at any level. the siblings still in flight
+// op: there is no partial array at any level. the siblings still in flight
 // run to the end, exactly as an op's siblings do, and so do the fan-outs
 // beside the failing one
 #[allow(clippy::too_many_arguments)]
@@ -3589,7 +3590,7 @@ async fn op_canceled(store: &Store, run_id: &str, name: &str) -> bool {
 
 /// canceled, and stopped: an [isolated](Op::isolated) op's process was
 /// signalled, killed and reaped, so this row gets a real finish time. that is
-/// the difference the subprocess buys — everywhere else hestan can only record
+/// the difference the subprocess buys: everywhere else hestan can only record
 /// what it asked for.
 async fn op_killed(store: &Store, run_id: &str, name: &str, msg: &str) -> bool {
     note(store.append_event(
@@ -3657,7 +3658,7 @@ async fn run_op(
     hooks: Arc<Vec<OpHook>>,
     cancel: watch::Receiver<bool>,
     // the run this op belongs to, as a span. every attempt opens a child of it,
-    // which is what makes a run a tree rather than a pile of unrelated spans —
+    // which is what makes a run a tree rather than a pile of unrelated spans:
     // `tokio::spawn` carries no span into the task it starts, so it is passed
     // rather than inherited
     run_span: tracing::Span,
@@ -3730,8 +3731,8 @@ async fn run_op(
         // one span per attempt, and a retry gets its own rather than a second
         // annotation on the first: two attempts of an op are two spans of
         // different lengths and that is what a waterfall has to show. it is
-        // also the span `capture_layer` reads its three fields off, and — for
-        // an isolated op — the span whose context the child is handed.
+        // also the span `capture_layer` reads its three fields off, and (for
+        // an isolated op) the span whose context the child is handed.
         //
         // costs nothing when nothing is subscribed, which is the ordinary case.
         let span = tracing::info_span!(
@@ -3784,7 +3785,7 @@ async fn run_op(
         // body: a token is spent when it is taken, so taking it last is what
         // keeps "a token was spent" and "a call was made" the same moment. an
         // op that holds a permit while it waits for one is holding a slot that
-        // nothing else could have used anyway — a pool and a rate on the same
+        // nothing else could have used anyway: a pool and a rate on the same
         // op are two limits on the same api
         if let Some((declared, rate)) = rate
             && let Ticket::Waiting(reserved) = rate.take()
@@ -3972,7 +3973,7 @@ async fn run_op(
             return (name, Outcome::Failed(msg));
         }
         // an in-process op's retry sleep dies with the abort a cancel sends.
-        // an isolated op is not aborted — it is trusted to stop its own child —
+        // an isolated op is not aborted (it is trusted to stop its own child),
         // so it watches for the cancel itself rather than making a canceled run
         // wait out a backoff nobody wants the end of
         let waited = tokio::time::sleep(op.delay(attempt));
@@ -4001,7 +4002,7 @@ async fn run_op(
 /// run one attempt in a child process.
 ///
 /// off unix there is no such thing, and the job build says so long before a run
-/// could reach this — see `validate_isolated`.
+/// could reach this; see `validate_isolated`.
 #[allow(clippy::too_many_arguments)]
 async fn isolated(
     op: &Op,
@@ -4042,7 +4043,7 @@ pub(crate) fn panic_payload(panic: &(dyn std::any::Any + Send)) -> Option<&str> 
 /// [trigger rule](When) instead of assuming: an op that would still run is not
 /// skipped, and neither is anything hanging off it, which waits on what that
 /// op does rather than on what happened above it. everything reached through
-/// plain [`When::AllSucceeded`] ops is skipped as one, naming `root` — that is
+/// plain [`When::AllSucceeded`] ops is skipped as one, naming `root`: that is
 /// one failure with one cause, not a chain of them.
 #[allow(clippy::too_many_arguments)]
 async fn skip_downstream(
@@ -4077,7 +4078,7 @@ async fn skip_downstream(
 /// record one op that will not run, with the reason on its row and in the log.
 ///
 /// `upstream` names the op whose failure reached this one, and is `None` when
-/// nothing above it is what stopped it — a run that could not build a
+/// nothing above it is what stopped it: a run that could not build a
 /// [run-scoped resource](crate::Hestan::run_resource) never ran an op at all.
 async fn op_skipped(
     store: &Store,
@@ -4256,7 +4257,7 @@ mod tests {
     }
 
     // the child opens the database by path, so a database with no path is one
-    // it would open empty — refused where every other undeliverable promise is
+    // it would open empty, refused where every other undeliverable promise is
     #[tokio::test]
     async fn an_isolated_op_needs_a_database_a_child_could_open() {
         let job = Job::builder("iso")
@@ -4576,7 +4577,7 @@ mod tests {
     }
 
     // head-of-line blocking would be worse, so the dispatcher skips a run a
-    // limit holds back and starts the next one that fits — which is exactly why
+    // limit holds back and starts the next one that fits, which is exactly why
     // priority is a preference and not an order
     #[tokio::test]
     async fn a_blocked_run_does_not_hold_up_a_lower_priority_one_behind_it() {
@@ -4736,7 +4737,7 @@ mod tests {
     }
 
     // the claim is a compare-and-set, so two claimers reaching for one run is
-    // not a race that has to be avoided — it is one that resolves
+    // not a race that has to be avoided: it is one that resolves
     #[tokio::test]
     async fn two_claimers_race_one_run_and_exactly_one_wins() {
         let dir = tempfile::tempdir().unwrap();
@@ -4937,7 +4938,7 @@ mod tests {
             .with_reclaim(Reclaim::Requeue);
 
         // heartbeat reclaims and then dispatches, so this process picks the run
-        // straight back up — which is what requeue is for
+        // straight back up, which is what requeue is for
         runner.heartbeat();
 
         let run = store.run("stalled").unwrap().unwrap();
@@ -5017,7 +5018,7 @@ mod tests {
     }
 
     // a subset launch's seeds belong to an earlier run and live nowhere on this
-    // one, so the plan is written down — which is what lets a claimer that was
+    // one, so the plan is written down, which is what lets a claimer that was
     // not the launcher start it
     #[tokio::test]
     async fn a_subset_launch_records_the_plan_it_will_execute() {
@@ -5047,7 +5048,7 @@ mod tests {
     }
 
     // a replay asks what each op of a run did, and a mapped op is its
-    // instances. `fold_instances` answers a different question — it reports a
+    // instances. `fold_instances` answers a different question: it reports a
     // mapped op failed whenever its instances cannot be reassembled into one
     // array, which is right for a resume and would have a replay offering to
     // re-run an op that succeeded
@@ -5180,7 +5181,7 @@ mod tests {
 
     // an op that names its instances by their element is how a partitioned
     // asset reuses the fan-out machinery, and a fan-out inside one has to say
-    // which of those instances it belongs to — `probe[2026-01-05][0]` rather
+    // which of those instances it belongs to: `probe[2026-01-05][0]` rather
     // than an index nothing can be traced back through
     #[tokio::test]
     async fn a_nested_instance_carries_the_label_of_the_outer_one_it_belongs_to() {
@@ -5271,7 +5272,7 @@ mod tests {
     /// row that would say so is the one thing the store will not take.
     ///
     /// that write and no other, so that a run which carried on regardless
-    /// would record its outcome perfectly well — which is exactly what these
+    /// would record its outcome perfectly well, which is exactly what these
     /// cases have to be able to tell apart.
     fn breaks_the_store(store: &Store) -> Job {
         let store = store.clone();
@@ -5386,7 +5387,7 @@ mod tests {
         // and off the runtime, which is what a `Drop` that closes a socket
         // needs: this test runs on one runtime thread and the drop did not.
         // asserted on the route where nothing else can still be holding the
-        // value — an op that outlives its own cancellation holds it until it
+        // value: an op that outlives its own cancellation holds it until it
         // lets go, wherever that leaves it
         assert_ne!(thread, std::thread::current().id());
 
@@ -5400,7 +5401,7 @@ mod tests {
         assert_eq!(wait_terminal(&runner, &id).await, RunStatus::Canceled);
         assert_eq!(took("cancellation").0, id);
 
-        // and the store gave up on it, which reports no outcome at all — the
+        // and the store gave up on it, which reports no outcome at all: the
         // one route with no terminal row to hang a teardown off
         let quiet = Job::builder("quiet")
             .op(Op::new("work", |_| async { Ok(json!(null)) }))

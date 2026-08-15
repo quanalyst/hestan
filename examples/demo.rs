@@ -58,7 +58,7 @@ async fn main() -> Result<(), hestan::Error> {
         .description("pull orders, clean them, publish aggregates")
         // the one op here that stands in for a call to somebody else's api,
         // and the limit that api would publish: five a second, whichever job
-        // is running. see docs/concepts.md#rates — and scaling.md before you
+        // is running. see docs/concepts.md#rates, and scaling.md before you
         // run two of these
         .op(Op::new("fetch_orders", |ctx| async move {
             tokio::time::sleep(Duration::from_millis(400)).await;
@@ -134,7 +134,7 @@ async fn main() -> Result<(), hestan::Error> {
                 ctx.meta(
                     "notes",
                     Meta::Markdown(
-                        "rows are dropped when `id` or `total` is missing — see\n\
+                        "rows are dropped when `id` or `total` is missing; see\n\
                          [metadata](https://github.com/quanalyst/hestan) for what\n\
                          *this* block is."
                             .into(),
@@ -181,7 +181,7 @@ async fn main() -> Result<(), hestan::Error> {
         .after(["ping"]))
         .build()?;
 
-    // the same registry whatever this process is here to do — which is the
+    // the same registry whatever this process is here to do, which is the
     // constraint a split deployment is under, so the demo is under it too. see
     // docs/scaling.md and the compose file beside it.
     let app = Hestan::new()
@@ -196,7 +196,7 @@ async fn main() -> Result<(), hestan::Error> {
         .db(env("HESTAN_DB").unwrap_or_else(|| "demo.db".into()));
 
     // the compose file binds 0.0.0.0 and publishes the port, which `serve`
-    // refuses to do unguarded — so it sets a token, and this is where a
+    // refuses to do unguarded, so it sets a token, and this is where a
     // deployment picks one up. from the environment rather than a literal: a
     // token in argv is a token in `ps` and a token in source is a token in git
     let app = match env("HESTAN_TOKEN") {

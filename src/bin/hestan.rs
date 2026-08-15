@@ -1,8 +1,8 @@
 //! the operator's binary: the same command line, with no registry of its own.
 //!
-//! it can do everything that only needs the run log — read runs, logs, events,
+//! it can do everything that only needs the run log (read runs, logs, events,
 //! assets and schedules out of a database, pause things, move a run up the
-//! queue — and everything a running instance will do on its behalf over the
+//! queue) and everything a running instance will do on its behalf over the
 //! http api. what it cannot do is launch anything on its own, because job
 //! definitions are rust and this binary was not built from yours.
 //!

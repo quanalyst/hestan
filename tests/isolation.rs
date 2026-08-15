@@ -2,7 +2,7 @@
 //!
 //! `harness = false` on purpose. an isolated op re-executes `current_exe()`,
 //! so the binary the parent spawns has to be one whose `main` rebuilds the
-//! same jobs against the same database — libtest's `main` cannot, and a test
+//! same jobs against the same database: libtest's `main` cannot, and a test
 //! binary that ran its whole suite as a worker child would be no test at all.
 //! the `main` below is the same `main` on both sides of the spawn, which is
 //! exactly the constraint isolation puts on a real deployment.
@@ -14,8 +14,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use hestan::prelude::*;
 use hestan::{LogStream, OpRun, Runner, Store, Trigger};
 
-/// where every process in this test — the parent and each op subprocess it
-/// spawns — finds the run log. a deployment's `main` reads this out of its own
+/// where every process in this test (the parent and each op subprocess it
+/// spawns) finds the run log. a deployment's `main` reads this out of its own
 /// config; a test has to hand it to its children somehow, and the environment
 /// is what children inherit.
 const DB: &str = "HESTAN_ISOLATION_DB";
@@ -237,10 +237,9 @@ fn jobs() -> Vec<Job> {
 /// blocking work that ignores every request to stop: no await point to drop it
 /// at, and nothing polling `ctx.is_cancelled()`. in-process this runs to the
 /// end whatever the run log says; isolated, it is killed.
-/// blocking work that will not stop for a signal — and a note, first, that it
-/// is in a position to ignore one.
 ///
-/// the child installs its SIGTERM handler before it calls the body, so a body
+/// it prints a note first, saying it is in a position to ignore a signal. the
+/// child installs its SIGTERM handler before it calls the body, so a body
 /// that has written this is a child that can hear one. the parent records a pid
 /// the moment it spawns, which is earlier, and a stop that lands in between is
 /// the default disposition killing the child rather than the case's stubborn

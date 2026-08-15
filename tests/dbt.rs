@@ -69,7 +69,7 @@ async fn building_a_model_builds_what_it_is_made_of_first_and_invokes_dbt_for_ea
     let store = Store::open(&db).unwrap();
     let order = built(&store, &run.id);
     // stg_orders before the two that read it, and both of those before the
-    // one that reads them — dbt's `depends_on`, not the order anything was
+    // one that reads them: dbt's `depends_on`, not the order anything was
     // written down in
     assert_eq!(order.len(), 4, "{order:?}");
     assert_eq!(order[0], "stg_orders");
@@ -99,7 +99,7 @@ async fn building_a_model_builds_what_it_is_made_of_first_and_invokes_dbt_for_ea
     assert_eq!(printed.len(), 8, "{printed:?}");
 
     // the source the manifest says stg_orders reads is in the graph with no
-    // materialization of its own — nothing built it, dbt read it
+    // materialization of its own: nothing built it, dbt read it
     assert!(
         store.materialization("raw.orders", None).unwrap().is_none(),
         "a source was materialized"
@@ -174,7 +174,7 @@ async fn a_dbt_that_is_not_installed_fails_the_asset_naming_it() {
 }
 
 // nothing fingerprints a dbt source unless you say how, so everything
-// downstream of one is stale on every plan — which is what `dbt run --select`
+// downstream of one is stale on every plan, which is what `dbt run --select`
 // does anyway, and is the behaviour to know about before wondering why dbt ran
 // again
 #[tokio::test]
@@ -228,7 +228,7 @@ async fn a_model_is_rebuilt_when_what_it_reads_changed_and_not_otherwise() {
 
     loaded("2026-08-11T03:00:00Z");
     assert_eq!(build("orders_daily").await, ["stg_orders", "orders_daily"]);
-    // the source has not moved, so the model upstream is not run again —
+    // the source has not moved, so the model upstream is not run again;
     // the one that was asked for always is, since that is what asking means
     assert_eq!(build("orders_daily").await, ["orders_daily"]);
     // it has moved now, and dbt runs for everything the change reaches

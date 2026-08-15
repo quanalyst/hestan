@@ -218,7 +218,7 @@ async fn typed_ops_roundtrip() {
     let events = runner.store().events(&run.id, 0).unwrap();
     assert_eq!(events[0].kind, EventKind::RunQueued);
     // the payload names the type the op declared it returns, and says which
-    // attempt produced it — `meta` is null because this op reported no facts
+    // attempt produced it: `meta` is null because this op reported no facts
     assert!(events.iter().any(|e| e.kind == EventKind::OpSuccess
         && e.data == Some(json!({"attempt": 1, "output_type": "pipeline::Total", "meta": null}))));
 }
@@ -586,8 +586,8 @@ async fn failed_attempt_metadata_dropped_on_retry() {
 
     assert_eq!(run.status, RunStatus::Success);
     assert_eq!(calls.load(Ordering::SeqCst), 2);
-    // only the attempt that worked reported anything, and `attempt` — staged
-    // by the failure and never restaged — is gone entirely
+    // only the attempt that worked reported anything, and `attempt` (staged
+    // by the failure and never restaged) is gone entirely
     let ops = runner.store().op_runs(&run.id).unwrap();
     assert_eq!(ops[0].metadata, Some(json!({"rows": {"int": 12}})));
 }
@@ -1528,8 +1528,8 @@ async fn a_replayed_op_reads_the_input_the_original_gave_it() {
         .unwrap();
     let second = settled(&runner, &second).await;
     assert_eq!(second.status, RunStatus::Success);
-    // b read what the original run handed it, and a — which would have
-    // produced a different number this time — never ran
+    // b read what the original run handed it, and a (which would have
+    // produced a different number this time) never ran
     assert_eq!(*b_saw.lock().unwrap(), recorded);
     assert_eq!(a_calls.load(Ordering::SeqCst), 1);
 }
@@ -1717,7 +1717,7 @@ async fn a_replay_of_a_resumed_run_reads_what_that_run_was_seeded_with() {
 }
 
 // a mapped op is its instances, and what it fanned out over is an ordinary
-// dep — so a replay of one re-expands over the array the original run
+// dep, so a replay of one re-expands over the array the original run
 // expanded over, rather than over whatever the source says today
 #[tokio::test]
 async fn a_replay_of_a_mapped_op_expands_over_the_array_it_expanded_over() {
@@ -2037,7 +2037,7 @@ fn one_slot_runner(jobs: [Job; 2]) -> Runner {
 
 // a pool caps what is calling the api, not what is waiting to be told it has
 // stopped. a cancel aborts the op's task at its next await, and blocking work
-// the body started is still running when it does — so the slot has to outlive
+// the body started is still running when it does, so the slot has to outlive
 // the task. it does because blocking work holds the ctx it polls for the
 // cancel, and the slot rides that ctx.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2231,7 +2231,7 @@ async fn a_rate_lets_a_burst_through_and_spaces_out_the_rest() {
 
     let at = at.lock().unwrap().clone();
     assert_eq!(at.len(), 6, "not every op ran");
-    // four of them had to wait for a token, which is four spacings — a lower
+    // four of them had to wait for a token, which is four spacings: a lower
     // bound, because a busy machine can only make a run take longer
     assert!(
         started.elapsed() >= Duration::from_millis(400),
@@ -2316,7 +2316,7 @@ fn one_call_job(name: &str) -> Job {
 }
 
 // a token is spent rather than returned, so one taken by an op that is already
-// dying is a call nobody makes — and a call the op behind it should have been
+// dying is a call nobody makes, and a call the op behind it should have been
 // making.
 #[tokio::test]
 async fn a_run_canceled_while_it_waits_for_a_token_takes_none_with_it() {
@@ -2986,7 +2986,7 @@ fn a_mapped_op_must_say_what_it_maps_over() {
 }
 
 // an instance is `{op}[{label}]` and that name is the whole record of it, so
-// an op called what an instance would be called is read as one — for the life
+// an op called what an instance would be called is read as one, for the life
 // of the deployment, in the ui, in op stats and on a resume
 #[test]
 fn an_op_named_like_an_instance_of_a_mapped_op_is_refused() {
@@ -3022,7 +3022,7 @@ fn an_op_named_like_an_instance_of_a_mapped_op_is_refused() {
 }
 
 // one region per element, one site list per region, one probe per site. the
-// collected value keeps the shape it expanded in — flattened it would say
+// collected value keeps the shape it expanded in: flattened it would say
 // nothing about which region a reading came from, which is the only reason to
 // nest a fan-out at all
 fn nested_job(sites: fn(u32) -> Value) -> Job {
@@ -3313,7 +3313,7 @@ async fn a_replay_of_a_nested_fan_out_expands_over_the_arrays_it_expanded_over()
 }
 
 // a fan-out is one line whose size is decided at run time, so the run has to
-// be able to refuse one — while refusing it still costs nothing
+// be able to refuse one, while refusing it still costs nothing
 #[tokio::test]
 async fn an_expansion_past_the_ceiling_fails_without_writing_an_instance_row() {
     let runner = Runner::new(
@@ -4521,7 +4521,7 @@ async fn a_nested_fan_out_under_file_io_writes_one_file_per_instance() {
 }
 
 /// two gates the manager blocks on, each announcing that it is stuck before
-/// it waits — so the op that opens one can be sure it did not open it early.
+/// it waits, so the op that opens one can be sure it did not open it early.
 #[derive(Default)]
 struct Gates {
     put_blocked: AtomicBool,
@@ -4646,7 +4646,7 @@ async fn retention_takes_what_the_run_wrote_and_leaves_the_runs_it_keeps() {
 
     // days(0) takes every terminal run already in the past and keep_last(1)
     // holds the newest of them back, so the startup sweep takes exactly the
-    // first run — before this third one launches
+    // first run, before this third one launches
     let third = boot()
         .retention(Retention::days(0).keep_last(1))
         .run_once("etl", json!({}))

@@ -140,8 +140,9 @@ fn close(runner: &Runner, backfill: &Backfill, status: BackfillStatus) -> Result
     )
 }
 
-/// launch the next chunk of `backfill`, capped at the asset's build limit —
-/// the point of the whole exercise, since a 400-day range fired as one run
+/// launch the next chunk of `backfill`, capped at the asset's build limit,
+/// which is the point of the whole exercise, since a 400-day range fired as
+/// one run
 /// would be 400 instances at somebody's api at once.
 fn launch_next(
     runner: &Runner,

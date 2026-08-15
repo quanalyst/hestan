@@ -77,7 +77,7 @@ impl HttpSource {
         self
     }
 
-    /// a header sent with every request. fixed at declaration — for a
+    /// a header sent with every request. fixed at declaration; for a
     /// credential that may be rotated, use [`bearer_env`](Self::bearer_env).
     pub fn header(mut self, k: &'static str, v: impl Into<String>) -> Self {
         self.headers.push((k, v.into()));
@@ -92,7 +92,7 @@ impl HttpSource {
         self
     }
 
-    /// a query parameter sent on every request, the same for all of them —
+    /// a query parameter sent on every request, the same for all of them;
     /// [`query_each`](Self::query_each) is the one that varies.
     pub fn query(mut self, k: impl Into<String>, v: impl Into<String>) -> Self {
         self.query.push((k.into(), v.into()));
@@ -178,7 +178,7 @@ impl HttpSource {
     /// past the ceiling the op fails naming the url and the limit, and the
     /// body is not parsed: what hit the ceiling is not a smaller valid
     /// document, and a json error there would send the reader looking in the
-    /// wrong place. the failure is fatal rather than retried — the same
+    /// wrong place. the failure is fatal rather than retried: the same
     /// request gets the same body.
     ///
     /// a `content-length` the server sent is checked before the body is read
@@ -221,7 +221,7 @@ impl HttpSource {
 
     /// [`into_ops`](Self::into_ops) wrapped in a single job. a `cron` on the
     /// source is dropped (with a warning): manual lowering owns registration,
-    /// so attach the schedule yourself — only `Hestan::source` consumes it.
+    /// so attach the schedule yourself; only `Hestan::source` consumes it.
     pub fn into_job(&self, job_name: &str) -> Result<Job, Error> {
         if let Some((expr, _)) = &self.cron {
             tracing::warn!(

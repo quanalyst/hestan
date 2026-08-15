@@ -2,7 +2,7 @@
 //!
 //! `harness = false` for the same reason [`queue`](queue.rs) needs it: every
 //! case here is this same binary started again, and its `main` has to be able
-//! to *be* the command line. that is not a detail of the test — an exit code is
+//! to *be* the command line. that is not a detail of the test: an exit code is
 //! not something a function call has, and the exit codes are the contract.
 //!
 //! so nothing below asserts that a command compiles. each case runs one, reads
@@ -53,7 +53,7 @@ fn main() {
     println!("cli: every case passed");
 }
 
-/// the registry the process under test is built from — a job that works, one
+/// the registry the process under test is built from: a job that works, one
 /// that does not, and one that takes longer than any case waits.
 fn app(db: &str) -> Hestan {
     let app = Hestan::new()
@@ -168,8 +168,8 @@ async fn cases(dir: &Path) {
 
 /// the fast-run case, and it is the one worth having.
 ///
-/// `quick` is over in milliseconds — very likely before the wait loop's first
-/// poll — so a stream that attaches to a running run and reads forward from
+/// `quick` is over in milliseconds (very likely before the wait loop's first
+/// poll) so a stream that attaches to a running run and reads forward from
 /// there would print nothing at all and this would still exit 0. what is
 /// asserted is that the line the op said is on stderr anyway.
 async fn succeeds(dir: &Path) {
@@ -193,7 +193,7 @@ async fn succeeds(dir: &Path) {
 /// the child of an isolated op is this binary with no arguments, which is the
 /// mount's spelling of "serve". without the guard the child binds a socket,
 /// writes no terminal row, and the parent records an op that exited having
-/// done nothing — so this case fails by timing out rather than by a wrong
+/// done nothing, so this case fails by timing out rather than by a wrong
 /// answer, which is why it asks for a short wait.
 #[cfg(unix)]
 async fn isolated_child(dir: &Path) {
@@ -251,7 +251,7 @@ async fn usage(dir: &Path) {
 }
 
 /// exit 3 needs a run that is canceled while something is waiting on it, and
-/// only the process executing a run can stop it — so the run under test is one
+/// only the process executing a run can stop it, so the run under test is one
 /// that never got that far: the case holds the deployment's only slot, the
 /// child's run queues behind it, and the case takes it off the queue.
 async fn canceled(dir: &Path) {
@@ -538,7 +538,7 @@ async fn authenticated(dir: &Path) {
     launched.assert(0);
 
     // doctor, pointed at a deployment it has no credential for, can still say
-    // whether it is guarded — which is the question you ask before you know
+    // whether it is guarded, which is the question you ask before you know
     let blind = operator(&["--server", &url, "--json", "doctor"]);
     blind.assert(0);
     let value: Value = serde_json::from_str(&blind.stdout).expect("one json object");
@@ -777,7 +777,7 @@ fn operator(args: &[&str]) -> Ran {
     operator_with(&[], args)
 }
 
-/// the same, with variables set for that one command — which is how a cron
+/// the same, with variables set for that one command, which is how a cron
 /// line hands a secret to a process without putting it in argv.
 fn operator_with(env: &[(&str, &str)], args: &[&str]) -> Ran {
     let mut command = Command::new(env!("CARGO_BIN_EXE_hestan"));

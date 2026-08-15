@@ -15,7 +15,7 @@ pub enum Error {
     /// rather than a run that gets halfway.
     #[error("invalid job graph: {0}")]
     Graph(String),
-    /// no job of that name in this process. a run of it may well exist — the
+    /// no job of that name in this process. a run of it may well exist: the
     /// run log outlives the code that defined the job.
     #[error("unknown job: {0}")]
     UnknownJob(String),
@@ -56,7 +56,7 @@ pub enum Error {
         reason: String,
     },
     /// a resume needs the outputs of the ops it is not re-running, and
-    /// somewhere back along the chain of resumes they are gone — pruned by
+    /// somewhere back along the chain of resumes they are gone: pruned by
     /// [retention](crate::Retention), or never recorded.
     #[error("broken resume chain: {0}")]
     ResumeChain(String),
@@ -66,7 +66,7 @@ pub enum Error {
     /// no backfill with that id.
     #[error("unknown backfill: {0}")]
     UnknownBackfill(i64),
-    /// something already under way that this would collide with — the 409 of
+    /// something already under way that this would collide with: the 409 of
     /// the api, and the reason a second build of the same assets is refused
     /// rather than queued.
     #[error("{0}")]
@@ -96,7 +96,7 @@ pub enum Error {
     /// is asking. see [`Auth`](crate::Auth).
     #[error(
         "refusing to serve {0}: that address is reachable from outside this machine and \
-         nothing here checks who is asking — this api launches runs, cancels them and \
+         nothing here checks who is asking. this api launches runs, cancels them and \
          changes limits. bind a loopback address, give it Hestan::auth(Auth::bearer(…)) \
          or Hestan::auth(Auth::custom(…)), or say Hestan::auth(Auth::None) if something \
          in front of hestan already checks identity"
@@ -139,7 +139,7 @@ pub enum Error {
     /// not know. the run log is not supposed to contain any of them.
     #[error("storage: column {0}: {1}")]
     Column(usize, String),
-    /// a database target this build cannot open — a `postgres://` url without
+    /// a database target this build cannot open: a `postgres://` url without
     /// the `postgres` feature compiled in.
     #[error("unsupported database: {0}")]
     UnsupportedDb(String),
@@ -166,7 +166,7 @@ pub enum Error {
 /// a postgres error and everything under it, in one line.
 ///
 /// on its own the crate's error says "db error" and puts the constraint, the
-/// column and the reason in its source — so a storage failure that reached a
+/// column and the reason in its source, so a storage failure that reached a
 /// log or an api response would say nothing whatsoever about what went wrong.
 #[cfg(feature = "postgres")]
 fn chain(e: &tokio_postgres::Error) -> String {

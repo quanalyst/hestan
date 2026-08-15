@@ -22,7 +22,7 @@ pub struct IoKey {
     pub run_id: String,
     /// the job that run was of.
     pub job: String,
-    /// the op's name — `{op}[{i}]` for one fan-out instance, since each
+    /// the op's name: `{op}[{i}]` for one fan-out instance, since each
     /// instance persists its own output.
     pub op: String,
 }
@@ -41,7 +41,7 @@ pub struct IoKey {
 /// op, and not all of them came from this manager's `put`: a source asset is
 /// seeded `null`, a fan-out's collected array is assembled from its instances,
 /// and a job can mix managers op by op. anything it did not produce, it must
-/// return unchanged — which is exactly what [`Inline`] does with everything.
+/// return unchanged, which is exactly what [`Inline`] does with everything.
 ///
 /// that totality is also what lets an [asset](crate::Asset) store its value
 /// here. a materialization records what `put` returned, and a row written
@@ -58,7 +58,7 @@ pub struct IoKey {
 /// storage behind it takes, and the ops beside it keep running. write them as
 /// ordinary blocking code.
 ///
-/// the one place that is still not true is the synchronous half of the api —
+/// the one place that is still not true is the synchronous half of the api:
 /// [`Runner::resume_plan`](crate::Runner::resume_plan) resolves an earlier
 /// run's outputs on the thread that called it, exactly as it does its store
 /// reads.
@@ -74,7 +74,7 @@ pub trait IoManager: Send + Sync + 'static {
     /// that the run existed, so what is not dropped here is something nothing
     /// will ever be able to name again.
     ///
-    /// a key is `{run_id}/{op}`, so a whole run is one prefix — one directory
+    /// a key is `{run_id}/{op}`, so a whole run is one prefix: one directory
     /// for both bundled file managers, and nothing at all for [`Inline`],
     /// which stored nothing of its own. `job` is here for a manager whose
     /// layout starts with it; both bundled ones ignore it, exactly as their
@@ -111,13 +111,13 @@ impl IoManager for Inline {
     }
 }
 
-/// where a manager that writes one file per op puts it —
-/// `{dir}/{run_id}/{op}.{ext}` — or why that key does not name a file under
+/// where a manager that writes one file per op puts it
+/// (`{dir}/{run_id}/{op}.{ext}`), or why that key does not name a file under
 /// `dir` at all.
 ///
 /// an asset's name is already a path: `sales/orders` is a directory and a
 /// file here, and the catalog groups on the same prefix. so what is refused is
-/// a name that leaves `dir`, not a name with a separator in it — every part of
+/// a name that leaves `dir`, not a name with a separator in it: every part of
 /// both halves of the key has to be an ordinary path component.
 ///
 /// both managers call this rather than each carrying a copy, because two
@@ -137,7 +137,7 @@ fn contained(dir: &Path, key: &IoKey, ext: &str) -> Result<PathBuf, String> {
 /// id does not name one.
 ///
 /// the same check a written file's path gets, against a name out of the same
-/// key — and this one matters more, because a sweep removes this path whole. a
+/// key, and this one matters more, because a sweep removes this path whole. a
 /// `rm -rf` of a directory nothing verified is a worse bug than the files it
 /// was collecting.
 fn run_dir(dir: &Path, run_id: &str) -> Result<PathBuf, String> {
@@ -182,13 +182,13 @@ fn relative(what: &str, name: &str) -> Result<PathBuf, String> {
 /// the one thing a reader has to go on: a row written before an asset's value
 /// went through a manager holds the value itself, and `get` hands back
 /// anything it did not write. so this is what tells the two apart wherever
-/// they meet — [`handle_meta`] here, and the sweep that decides whether a
+/// they meet: [`handle_meta`] here, and the sweep that decides whether a
 /// run still holds a value somebody will read.
 pub(crate) const HANDLE: &str = "$io";
 
 /// the tag on a [`FileIo`] handle. a handle is an object rather than a bare
 /// path so anything reading `op_runs.output` can tell a reference from a
-/// value at a glance — including the ui.
+/// value at a glance, including the ui.
 const FILE_TAG: &str = "file";
 
 /// outputs written to one json file per op under `dir`, as
@@ -259,8 +259,8 @@ fn tagged_handle<'a>(handle: &'a Value, tag: &str) -> Option<&'a str> {
 /// the two numbers a handle may carry: how many rows were stored and how big
 /// the thing that holds them is.
 ///
-/// a manager knows both and the op does not — it returned a value, not a file
-/// — so this is where they come from. anything the op staged under the same
+/// a manager knows both and the op does not (it returned a value, not a
+/// file), so this is where they come from. anything the op staged under the same
 /// name wins, since an op saying `rows` means its own rows.
 pub(crate) fn handle_meta(handle: &Value, staged: Option<Value>) -> Option<Value> {
     let Some(obj) = handle.as_object().filter(|o| o.contains_key(HANDLE)) else {
@@ -303,13 +303,13 @@ const PARQUET_TAG: &str = "parquet";
 /// ## What it stores
 ///
 /// **a table**: a json array whose elements are objects, one per row. that is
-/// what an op returns when it returns rows — including a
+/// what an op returns when it returns rows, including a
 /// [`typed`](crate::Op::typed) op returning a `Vec<T>`. the column types are
 /// inferred from the values: whole numbers as `int64`, fractions as `float64`,
 /// then `utf8`, `bool`, lists and structs, and a column that is null the whole
 /// way down as parquet's null type.
 ///
-/// `null` is passed through untouched — an op that produced nothing has no
+/// `null` is passed through untouched: an op that produced nothing has no
 /// table to write, and null is already its own handle. anything else is an
 /// error rather than a silent fallback to json: an op stored somewhere it did
 /// not ask for is a value nobody finds again.
@@ -328,12 +328,12 @@ const PARQUET_TAG: &str = "parquet";
 /// ## What it is not
 ///
 /// a directory of files, exactly as [`FileIo`] is one. no partitioned
-/// datasets, no compaction, no manifest, no object store — an op writes one
+/// datasets, no compaction, no manifest, no object store. an op writes one
 /// file and the op downstream reads that file. anything more is a table
 /// format, which is a different thing to be.
 ///
 /// [retention](crate::Retention) collects these exactly as it collects
-/// `FileIo`'s json — pruning a run removes `{dir}/{run_id}` whole — and, for
+/// `FileIo`'s json (pruning a run removes `{dir}/{run_id}` whole) and, for
 /// exactly the same reason, a run no policy ever deletes keeps its files.
 ///
 /// reading and writing happen on the blocking pool rather than on the task
@@ -441,7 +441,7 @@ mod parquet_impl {
 
     /// write the rows as one parquet file.
     ///
-    /// the schema is inferred from the rows themselves — every one of them,
+    /// the schema is inferred from the rows themselves, every one of them,
     /// not the first: a column that is null until row four is still that
     /// column's type, and inferring from a sample is how a load fails at 3am
     /// on the one row that was different.
@@ -522,7 +522,7 @@ impl Io {
     }
 
     /// the manager for an op that selected `name`, or the default. an
-    /// unknown name cannot get here — the build refuses it — but falling back
+    /// unknown name cannot get here (the build refuses it), but falling back
     /// beats panicking in a run loop.
     ///
     /// handed back owned rather than borrowed, because the call to it outlives
@@ -549,9 +549,9 @@ impl Io {
 ///
 /// `put` is `std::fs::write` in both bundled managers and an upload to
 /// somewhere in most of the ones you would write. the run's own task is the
-/// one thread that must not be waiting on that — every op of the run is
+/// one thread that must not be waiting on that (every op of the run is
 /// dispatched from it, and on a single-threaded runtime it is every op of
-/// every other run too — so the call goes to the blocking pool and the task
+/// every other run too), so the call goes to the blocking pool and the task
 /// awaits its result.
 pub(crate) async fn put(io: &Io, name: Option<&str>, key: IoKey, value: Value) -> IoResult {
     let manager = io.manager(name);
@@ -593,7 +593,7 @@ mod tests {
 
     /// every name the managers have to agree about, and whether a file may be
     /// written for it. the property is that the file lands under the directory
-    /// the manager was given — not that the name is a boring one, since an
+    /// the manager was given, not that the name is a boring one, since an
     /// asset's name is a path and the catalog reads it as one.
     fn names() -> [(&'static str, bool); 11] {
         [

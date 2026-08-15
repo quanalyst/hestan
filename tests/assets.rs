@@ -242,7 +242,7 @@ async fn a_multi_asset_materializes_its_outputs_and_feeds_one_of_them_downstream
     assert_eq!(run.status, RunStatus::Success);
 
     let store = Store::open(db).unwrap();
-    // one op run for the pull, one for the report — not one per output
+    // one op run for the pull, one for the report, not one per output
     let ops = store.op_runs(&run.id).unwrap();
     let names: Vec<&str> = ops.iter().map(|o| o.op.as_str()).collect();
     assert_eq!(names, ["report", "split_orders"]);
@@ -301,7 +301,7 @@ async fn a_partitioned_build_runs_one_instance_per_key_through_the_fan_out() {
     let ops = store.op_runs(&run.id).unwrap();
     let mut names: Vec<&str> = ops.iter().map(|o| o.op.as_str()).collect();
     names.sort();
-    // one op_runs row per instance, named for its key — the same rows a mapped
+    // one op_runs row per instance, named for its key: the same rows a mapped
     // op's fan-out writes, because it is the same expansion
     assert_eq!(names, ["sales[amer]", "sales[emea]"]);
     for key in ["emea", "amer"] {

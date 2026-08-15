@@ -138,8 +138,8 @@ ALTER TABLE schedules ADD COLUMN params TEXT NOT NULL DEFAULT '{}';
 // materializations become append-only history. the keyed table kept only the
 // latest, so "when did this asset actually change" had no answer at all; every
 // existing row carries across as that asset's first history entry. the other
-// two changes are the same phase's later parts — `op_runs.metadata` and the
-// `asset_checks` table — landed here so nothing after this migrates again.
+// two changes are the same phase's later parts (`op_runs.metadata` and the
+// `asset_checks` table) landed here so nothing after this migrates again.
 const SCHEMA_V8: &str = r#"
 CREATE TABLE asset_materializations_v8 (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -173,7 +173,7 @@ CREATE INDEX asset_checks_asset ON asset_checks(asset, id DESC);
 "#;
 
 // materializations and check results become per `(asset, partition)`, with
-// NULL standing for an unpartitioned asset — which is every asset that exists
+// NULL standing for an unpartitioned asset, which is every asset that exists
 // before this migration, so existing rows carry across unchanged and every
 // lookup below reads them exactly as it did. `backfills` is the same phase's
 // last part, landed here so nothing after this migrates again.
@@ -206,7 +206,7 @@ CREATE INDEX backfills_asset ON backfills(asset, id DESC);
 // so a job late for a week alerts once rather than every minute across every
 // restart. the `schedules` columns are the scheduler's durable cursor and its
 // catch-up policy, and `runs.scheduled_for` is the logical time a scheduled or
-// caught-up run stands for — null on a manual launch, which represents nothing
+// caught-up run stands for: null on a manual launch, which represents nothing
 // but itself. run-status sensors need no table of their own: they are entries
 // of `sensors` like every other sensor, and the cursor column is already there.
 const SCHEMA_V10: &str = r#"
@@ -224,11 +224,11 @@ ALTER TABLE runs ADD COLUMN scheduled_for TEXT;
 
 // run keys, which turn a sensor's at-least-once launching into effectively-once
 // per sensor. the key is claimed in the same transaction that creates the run,
-// so a key can never name a run that was never created — a key recorded for a
+// so a key can never name a run that was never created: a key recorded for a
 // run that did not launch drops that work forever, which is strictly worse than
 // the duplicate the key exists to prevent. the two `sensor_ticks` columns are
-// the same phase's last part — how long an evaluation took and how many keyed
-// requests it skipped — landed here so nothing after this migrates again.
+// the same phase's last part (how long an evaluation took and how many keyed
+// requests it skipped) landed here so nothing after this migrates again.
 const SCHEMA_V11: &str = r#"
 CREATE TABLE sensor_run_keys (
     sensor TEXT NOT NULL,
@@ -246,7 +246,7 @@ ALTER TABLE sensor_ticks ADD COLUMN duration_ms INTEGER NOT NULL DEFAULT 0;
 // part of a job definition: `Hestan::preset` seeds one at build and the
 // launchpad writes others beside it, so the table is the only place both can
 // meet. tags are a flat `{"k": "v"}` map, null on every run written before
-// this and on every run that carries none — which is not the same as `{}` on
+// this and on every run that carries none, which is not the same as `{}` on
 // the wire, but is the same thing to read.
 const SCHEMA_V12: &str = r#"
 CREATE TABLE presets (
@@ -264,8 +264,8 @@ ALTER TABLE runs ADD COLUMN tags TEXT;
 //
 // `pid` is what is running where, cleared by the terminal write: an op run row
 // is the ui's answer to "where is this happening", and a pid that outlived its
-// process would answer it wrongly. `inputs` is what the parent hands the child
-// — `{"held": {dep: handle}, "deps": {dep: status}}`, one row rather than a
+// process would answer it wrongly. `inputs` is what the parent hands the
+// child: `{"held": {dep: handle}, "deps": {dep: status}}`, one row rather than a
 // reconstruction of the run's state, and handles rather than payloads so an
 // [io manager](crate::IoManager) still keeps the bulk out of sqlite. null for
 // every op that runs in this process, which is nearly all of them.
@@ -282,7 +282,7 @@ ALTER TABLE op_runs ADD COLUMN inputs TEXT;
 // three claim columns are the whole of the ownership protocol: `claimed_by` is
 // the instance executing the run, `lease_until` is how long that is believed
 // for, and a claim past its lease is reclaimable by anyone. a queued run with
-// `claimed_by IS NULL` is a run nobody owns — which is what makes the queue
+// `claimed_by IS NULL` is a run nobody owns, which is what makes the queue
 // durable, and what a second process may take.
 //
 // `plan` is what the launch decided the run would execute:
@@ -308,9 +308,9 @@ CREATE INDEX runs_queue ON runs(status, claimed_by, priority DESC, created_at);
 // exactly one half of the middle three columns is filled per row and which
 // half says where the line came from. `stream` is `stdout`/`stderr` and the
 // other two null for an [isolated op](crate::Op::isolated)'s subprocess
-// capture — a pipe has no levels and no targets. `level` and `target` are set
+// capture: a pipe has no levels and no targets. `level` and `target` are set
 // and `stream` null for a tracing event captured by the `capture` feature's
-// layer — an event was never on a pipe. `attempt` is which attempt of the op
+// layer: an event was never on a pipe. `attempt` is which attempt of the op
 // produced it, because the output of the attempt that failed and the output of
 // the retry that worked are different things.
 //
@@ -333,7 +333,7 @@ CREATE INDEX op_logs_run ON op_logs(run_id, op, id);
 
 // notifications that have to survive the process that decided to send them.
 // opt-in with `Hestan::durable_notifications`, so on most databases this table
-// stays empty — an embedder using a hook to bump a metric wants a callback,
+// stays empty: an embedder using a hook to bump a metric wants a callback,
 // not a table and a delivery loop.
 //
 // the row is written in the same transaction as the run's terminal row, which
@@ -344,7 +344,7 @@ CREATE INDEX op_logs_run ON op_logs(run_id, op, id);
 // `next_attempt_at` is when this row is next due and is what says which of the
 // three states it is in: set and undelivered is pending, **null** and
 // undelivered is given up on, and a delivery time is a delivery. so a row is
-// inserted due now rather than null, and the give-up clears it — which also
+// inserted due now rather than null, and the give-up clears it, which also
 // keeps a permanently failing notification out of the scan while leaving it
 // visible, with the error that stopped it.
 //
@@ -367,7 +367,7 @@ CREATE INDEX notifications_delivered ON notifications(delivered_at);
 "#;
 
 // the event log stops being about runs. `run_id` was NOT NULL, so an event
-// could only ever describe a run — everything else hestan does happened in its
+// could only ever describe a run: everything else hestan does happened in its
 // own table and reached no stream at all.
 //
 // `subject_kind` and `subject` are what a non-run event says it is about:
@@ -385,7 +385,7 @@ CREATE INDEX notifications_delivered ON notifications(delivered_at);
 // own would only be a second copy of it.
 //
 // sqlite has no `ALTER COLUMN`, so dropping the NOT NULL means rebuilding the
-// table — the v8 pattern, and the expensive half of this migration on a
+// table: the v8 pattern, and the expensive half of this migration on a
 // database with a year of events in it. postgres drops a NOT NULL and adds two
 // defaulted columns in the catalog and touches no row at all; the two backends
 // are genuinely not doing the same amount of work here, and `docs/storage.md`
@@ -414,7 +414,7 @@ CREATE INDEX events_subject ON events(subject_kind, subject, seq DESC);
 // who did it, on the two tables that record something somebody asked for. two
 // nullable columns and no rewrite on either backend: null is what every row
 // written before this says, and it is also what an unauthenticated deployment
-// keeps writing — an empty name is not "system", and a fabricated actor is
+// keeps writing: an empty name is not "system", and a fabricated actor is
 // worse than none.
 const SCHEMA_V18: &str = r#"
 ALTER TABLE runs ADD COLUMN actor TEXT;
@@ -549,14 +549,14 @@ const RUN_NOTIFICATION: &str = "run";
 /// how long a write waits for another connection to let go of the file before
 /// giving up. an [isolated op](crate::Op::isolated) means two processes write
 /// this database at once, and sqlite's default is to fail the second one
-/// immediately — which would be a lost event, or a lost terminal row.
+/// immediately, which would be a lost event, or a lost terminal row.
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// the url scheme a postgres target is named with. libpq accepts both
 /// spellings and so does everything downstream of here.
 const PG_SCHEMES: [&str; 2] = ["postgres://", "postgresql://"];
 
-/// what the two backends spell differently, listed once — the seven methods
+/// what the two backends spell differently, listed once: the seven methods
 /// below, plus the placeholder sigil, which is a lexical rewrite on the way
 /// out (`?1` to `$1`, in [`pg`](crate::pg)) and needs no branch anywhere.
 ///
@@ -581,7 +581,7 @@ enum Dialect {
 impl Dialect {
     /// what an optional filter's parameter needs saying about it.
     ///
-    /// half the queries below are shaped `WHERE (?1 IS NULL OR job = ?1)` — a
+    /// half the queries below are shaped `WHERE (?1 IS NULL OR job = ?1)`: a
     /// filter that is a filter only when it was asked for. postgres works
     /// through an expression left to right and gives a parameter its type at
     /// the first place that implies one; `?1 IS NULL` implies nothing at all,
@@ -627,7 +627,7 @@ impl Dialect {
     /// it moves on to the next run rather than waiting on a claim to commit
     /// only to find it lost. one row, not the queue: a dispatcher that locked
     /// every candidate it looked at would hand every other dispatcher an empty
-    /// queue. sqlite has no such clause and needs none — inside an immediate
+    /// queue. sqlite has no such clause and needs none: inside an immediate
     /// transaction there is no other writer to wait for.
     fn claim_lock(self) -> &'static str {
         match self {
@@ -687,9 +687,9 @@ impl Dialect {
 ///
 /// one connection behind one mutex either way. a postgres pool would buy
 /// parallel statements, and with them reconnection, a second set of failure
-/// modes and transactions that no longer sit where the code around them thinks
-/// — sqlite already blocks on one connection and that is the architecture this
-/// matches. what postgres is for here is several *processes* sharing a run log,
+/// modes and transactions that no longer sit where the code around them
+/// thinks. sqlite already blocks on one connection and that is the
+/// architecture this matches. what postgres is for here is several *processes* sharing a run log,
 /// not one process issuing more statements at once.
 enum Db {
     Sqlite(Mutex<Connection>),
@@ -700,7 +700,7 @@ enum Db {
 /// a bound parameter. one list serves both backends: `Val` rather than each
 /// crate's own, so [`args!`] can be written once at every call site.
 ///
-/// three shapes, because the schema has three — text (which is every
+/// three shapes, because the schema has three: text (which is every
 /// timestamp, every status word and every piece of json), integers, and null.
 #[derive(Debug)]
 pub(crate) enum Val<'a> {
@@ -762,8 +762,8 @@ impl From<u32> for Val<'_> {
     }
 }
 
-// hestan's booleans are stored as 0 and 1 on both backends — see the note on
-// the postgres schema — so this is where one becomes the other
+// hestan's booleans are stored as 0 and 1 on both backends (see the note on
+// the postgres schema) so this is where one becomes the other
 impl From<bool> for Val<'_> {
     fn from(v: bool) -> Val<'static> {
         Val::Int(i64::from(v))
@@ -790,7 +790,7 @@ impl rusqlite::ToSql for Val<'_> {
 /// what a statement runs against: a connection, or a transaction on one.
 ///
 /// the same three calls either way, so a query written once runs in either
-/// place — which several methods below depend on, being handed a transaction
+/// place, which several methods below depend on, being handed a transaction
 /// by one caller and a bare connection by another.
 trait Exec {
     fn dialect(&self) -> Dialect;
@@ -914,8 +914,8 @@ impl Tx<'_> {
     /// where an immediate transaction is already the only writer. it is not
     /// enough on postgres: two transactions read the same free slot from their
     /// own snapshots and both spend it, which is the one way two dispatchers
-    /// break a limit. asked for only when a limit is in force — see
-    /// [`Limits::binding`] — so that the ordinary case, where nothing is
+    /// break a limit. asked for only when a limit is in force (see
+    /// [`Limits::binding`]) so that the ordinary case, where nothing is
     /// capped, still has dispatchers never meeting.
     fn take_turns(&mut self) -> Result<(), Error> {
         match self {
@@ -1106,8 +1106,8 @@ fn parse_json(idx: usize, text: &str) -> Result<Value, Error> {
 /// a store write the run can survive losing, and the only thing [`note`] takes.
 ///
 /// an event, a captured log line, the pid of a child: each is worth having and
-/// none of them is what a run *did*. a write that records that — a terminal
-/// row, a status, a watermark — returns `Result<(), Error>` like everything
+/// none of them is what a run *did*. a write that records that (a terminal
+/// row, a status, a watermark) returns `Result<(), Error>` like everything
 /// else and goes through [`Store::landed`], so `note(store.op_finished(..))`
 /// is a thing the compiler refuses rather than a thing to remember not to
 /// write.
@@ -1134,7 +1134,7 @@ impl BestEffort {
 
 /// let a best-effort write go, and count it.
 ///
-/// losing a log line is survivable where losing a run's outcome is not — but
+/// losing a log line is survivable where losing a run's outcome is not, but
 /// being quiet about it is not part of the deal. what this drops is counted on
 /// the store's [health](Store::health), which is what `/api/health` and
 /// `hestan doctor` report: a deployment whose run pages are missing half their
@@ -1160,7 +1160,7 @@ pub(crate) fn note(write: BestEffort) {
 const WRITE_ATTEMPTS: u32 = 4;
 
 /// the first gap between attempts, doubled per attempt up to [`WRITE_MAX`]
-/// with full jitter — the same pacing an op's retries and the notification
+/// with full jitter, the same pacing an op's retries and the notification
 /// loop's use, and for the same reason: a hundred ops that lost the same lock
 /// must not come back for it on the same millisecond.
 const WRITE_BASE: Duration = Duration::from_millis(50);
@@ -1172,16 +1172,16 @@ const WRITE_MAX: Duration = Duration::from_secs(1);
 /// connection, having already undone the transaction.** that is what makes a
 /// retry safe rather than lucky: `op_finished` appends materializations and
 /// events beside the row it updates, and repeating that after a *partial*
-/// apply would record a build twice. there is no partial apply to repeat —
+/// apply would record a build twice. there is no partial apply to repeat:
 /// sqlite's commit is atomic and rusqlite rolls back a transaction it could
 /// not commit, and postgres aborts the transaction it reports a serialization
 /// failure or a deadlock for.
 ///
 /// the one failure that leaves the outcome genuinely unknown is a connection
 /// that died: a commit may have been executed and its acknowledgement lost.
-/// **that is the case hestan does not retry.** it would also be futile — a
+/// **that is the case hestan does not retry.** it would also be futile (a
 /// [postgres store](crate::pg) is one connection with no pool behind it and
-/// no reconnect, so nothing this process writes will land again — but futility
+/// no reconnect, so nothing this process writes will land again) but futility
 /// is not the reason. the reason is that a retry there is the one that can
 /// double-apply.
 ///
@@ -1230,8 +1230,8 @@ fn sqlite_transient(e: &rusqlite::Error) -> bool {
 /// postgres's side of [`transient`]: a sqlstate the server answered with,
 /// minus the classes that are about the statement rather than the moment.
 ///
-/// no sqlstate at all means the server did not answer — the connection, the
-/// protocol, a value this client could not encode — and that is the case
+/// no sqlstate at all means the server did not answer (the connection, the
+/// protocol, a value this client could not encode) and that is the case
 /// [`transient`] refuses on principle.
 #[cfg(feature = "postgres")]
 fn postgres_transient(e: &tokio_postgres::Error) -> bool {
@@ -1255,7 +1255,7 @@ fn postgres_transient(e: &tokio_postgres::Error) -> bool {
 ///
 /// counters rather than a verdict: a store either takes a write or it does
 /// not, and how often it did not is the fact worth reporting. one per store,
-/// shared by every clone of it, and never reset — a deployment that dropped a
+/// shared by every clone of it, and never reset: a deployment that dropped a
 /// hundred events an hour ago dropped them.
 #[derive(Default)]
 pub(crate) struct Health {
@@ -1265,7 +1265,7 @@ pub(crate) struct Health {
     /// has landed since. what a process asks before it claims anything.
     failing: AtomicBool,
     /// how many of the writes a run makes are to fail before the database is
-    /// allowed to see them. tests only — see [`Store::fail_writes`].
+    /// allowed to see them. tests only; see [`Store::fail_writes`].
     #[cfg(test)]
     injected: AtomicU64,
     /// which write those failures are for, `None` being all of them.
@@ -1334,7 +1334,7 @@ impl Health {
 #[derive(Clone)]
 pub struct Store {
     db: Arc<Db>,
-    /// the target it was opened at — a path or a url — kept so a runner can
+    /// the target it was opened at (a path or a url) kept so a runner can
     /// tell whether a child process could reach the same database.
     target: Arc<str>,
     /// what this process has seen this database do, shared by every clone.
@@ -1362,7 +1362,7 @@ impl Store {
         }
     }
 
-    /// open (and migrate) the postgres database at `url` —
+    /// open (and migrate) the postgres database at `url`:
     /// `postgres://user:password@host/database`, as libpq spells it.
     ///
     /// a fresh database is created at the current schema version in one go.
@@ -1413,7 +1413,7 @@ impl Store {
         &self.health
     }
 
-    /// a write that records authoritative state — what a run did, what an op
+    /// a write that records authoritative state: what a run did, what an op
     /// did, where a watermark got to. says whether it landed.
     ///
     /// `what` names the write in the log, since the caller is the only thing
@@ -1422,12 +1422,12 @@ impl Store {
     ///
     /// a [transient](transient) failure is tried again, up to
     /// [`WRITE_ATTEMPTS`] times, on the same pacing an op's retries use. every
-    /// write reachable from here is safe to repeat — see the note on
+    /// write reachable from here is safe to repeat; see the note on
     /// [`transient`] for why that is a property of which errors are retried
     /// rather than a hope about which writes are idempotent.
     ///
     /// every caller has to say what it does when a write did not land, and the
-    /// answer is never "carry on as if it had" — `docs/concepts.md` is what
+    /// answer is never "carry on as if it had"; `docs/concepts.md` is what
     /// hestan promises about writes, and what it stops promising here.
     pub(crate) async fn landed(&self, what: &str, write: impl Fn() -> Result<(), Error>) -> bool {
         let mut attempt = 0;
@@ -1524,13 +1524,14 @@ impl Store {
     /// two failure modes are not equally bad: a duplicate launch is a request
     /// the caller sees twice, while a key left behind for a run that never
     /// launched drops that work forever and nothing ever notices. only a
-    /// transaction rules the second one out — a delete on the failure path
+    /// transaction rules the second one out: a delete on the failure path
     /// still leaves the window where the process dies between the insert and
     /// the launch.
     ///
     /// returns false when the key was already claimed: nothing is written, and
     /// the caller launches nothing.
-    /// `plan` is what this run will execute when something claims it — see the
+    ///
+    /// `plan` is what this run will execute when something claims it; see the
     /// `runs.plan` note on the v14 migration. `None` means the whole job.
     pub(crate) fn create_run_keyed(
         &self,
@@ -1614,8 +1615,8 @@ impl Store {
     }
 
     /// drop run keys claimed before `older_than`. nothing collects them on
-    /// their own — a sensor keyed by the day would keep a row per day for as
-    /// long as the file exists — so they ride the retention knob.
+    /// their own (a sensor keyed by the day would keep a row per day for as
+    /// long as the file exists) so they ride the retention knob.
     pub(crate) fn prune_sensor_run_keys(&self, older_than: DateTime<Utc>) -> Result<usize, Error> {
         self.conn().execute(
             "DELETE FROM sensor_run_keys WHERE launched_at < ?1",
@@ -1650,7 +1651,7 @@ impl Store {
     /// assume the process starting up was the only one there had ever been, so
     /// every non-terminal run belonged to a process that was gone and every one
     /// of them was over. with a claimable queue that assumption is false and
-    /// destructive — a second process starting would have failed a live one's
+    /// destructive: a second process starting would have failed a live one's
     /// runs, mid-run, and skipped their ops. what a run's fate turns on now is
     /// its claim:
     ///
@@ -1661,7 +1662,7 @@ impl Store {
     ///   dead, and swept.
     /// - **`running` with no claim**: written before the queue existed, by a
     ///   process that is gone. dead, and swept.
-    /// - **`queued` with no claim**: not a casualty — the queue. left for a
+    /// - **`queued` with no claim**: not a casualty but the queue. left for a
     ///   dispatcher, which is the whole point of making it durable.
     const INTERRUPTED: &'static str = "status IN ('queued', 'running') AND (
              (claimed_by IS NOT NULL AND (lease_until IS NULL OR lease_until < ?1))
@@ -1735,9 +1736,10 @@ impl Store {
     /// take the best queued run this claimer is allowed to start, and claim it.
     ///
     /// "best" is highest priority first, ties by `created_at`, **skipping any
-    /// run a limit would break**. skipping is deliberate: head-of-line blocking
-    /// — a `env:prod` run at the front of the queue stopping every unrelated
-    /// run behind it — is worse than a priority order that is a preference
+    /// run a limit would break**. skipping is deliberate: head-of-line
+    /// blocking (a `env:prod` run at the front of the queue stopping every
+    /// unrelated run behind it) is worse than a priority order that is a
+    /// preference
     /// rather than a promise. it does mean priority is not strict, and that is
     /// documented where a user meets it.
     ///
@@ -1755,7 +1757,7 @@ impl Store {
     /// different runs, none of them waiting on any other.
     ///
     /// counting capacity and spending it still have to be one decision, and on
-    /// postgres one transaction does not make them one — two snapshots can
+    /// postgres one transaction does not make them one: two snapshots can
     /// each see the same last slot free. so when a limit is actually in force,
     /// and only then, claimers [take turns](Tx::take_turns).
     ///
@@ -1854,12 +1856,13 @@ impl Store {
     /// either have to invent them, and report a queue that nothing is holding
     /// back, or report every job as undefined because this process defines
     /// none. saying only what it knows is the third option.
+    ///
     /// runs whose claimer stopped saying it was still there: claimed, not
     /// terminal, and past the lease it was holding them under.
     ///
     /// a deployment with a process running is already reclaiming these on its
     /// lease loop, so finding any means either that the loop is behind or that
-    /// nothing is running one — and the second is the case where they sit there
+    /// nothing is running one, and the second is the case where they sit there
     /// forever, which is exactly the thing worth being told about.
     #[cfg(any(test, feature = "cli"))]
     pub(crate) fn stalled_claims(&self, now: DateTime<Utc>) -> Result<Vec<Run>, Error> {
@@ -1876,7 +1879,7 @@ impl Store {
     }
 
     /// the schema version this database is at, which after an open is always
-    /// the one this build writes — the number is worth reporting rather than
+    /// the one this build writes: the number is worth reporting rather than
     /// checking, since a database from the future refuses to open at all.
     #[cfg(any(test, feature = "cli"))]
     pub(crate) fn schema_version(&self) -> Result<u32, Error> {
@@ -1899,7 +1902,7 @@ impl Store {
     /// which is what lets `doctor` ask it of a live deployment's database.
     ///
     /// this is the question a process that has not written anything yet cannot
-    /// answer from its [health](Store::health) — those counters are what *this*
+    /// answer from its [health](Store::health): those counters are what *this*
     /// process has seen, and a command line that just started has seen nothing.
     #[cfg(any(test, feature = "cli"))]
     pub(crate) fn writable(&self) -> Result<(), Error> {
@@ -1939,7 +1942,7 @@ impl Store {
     }
 
     /// move a run up or down the queue. false when there is no such run, and
-    /// [`Error::RunActive`] once something has claimed it — by then the
+    /// [`Error::RunActive`] once something has claimed it: by then the
     /// priority has already been spent.
     pub(crate) fn set_run_priority(&self, id: &str, priority: i64) -> Result<bool, Error> {
         let mut conn = self.conn();
@@ -1961,7 +1964,7 @@ impl Store {
         Ok(true)
     }
 
-    /// say that `claimer` is still here, for every run it holds — except the
+    /// say that `claimer` is still here, for every run it holds, except the
     /// ones in `given_up`, which are the runs it has stopped executing because
     /// it could not record them.
     ///
@@ -2025,7 +2028,7 @@ impl Store {
     /// is what the next resume would build on. returns `(run id, the claimer
     /// that went away)` for each.
     /// `note` is asked for the [durable notification](Self::run_finished) each
-    /// failed run owes, and is handed the row as this transaction leaves it —
+    /// failed run owes, and is handed the row as this transaction leaves it,
     /// so a reclaimed run's alert is written with its terminal status exactly
     /// as an ordinary one's is, rather than a statement later.
     pub(crate) fn reclaim_expired(
@@ -2175,10 +2178,11 @@ impl Store {
     /// somebody asked a run that is already executing to stop.
     ///
     /// its terminal event belongs to whichever process is executing it, which
-    /// may not be this one and does not know who asked — so the request is a
+    /// may not be this one and does not know who asked, so the request is a
     /// line of its own, written here, and it is the line the audit trail
     /// reads. an unauthenticated deployment writes it with no actor, which is
     /// still true: something asked.
+    ///
     /// best-effort: what stops the run is the signal, not this line, and the
     /// terminal row the executing process writes is the record either way.
     pub(crate) fn cancel_requested(&self, id: &str, actor: Option<&str>) -> BestEffort {
@@ -2289,7 +2293,7 @@ impl Store {
     }
 
     /// mark one delivered. guarded on it not already being so, which is what
-    /// makes a second delivery loop unable to claim the same row twice —
+    /// makes a second delivery loop unable to claim the same row twice,
     /// though it says nothing about the *hook* having run twice, and hestan
     /// promises at-least-once and no more.
     ///
@@ -2324,7 +2328,7 @@ impl Store {
 
     /// record a failed attempt. `next` of `None` is giving up: the row leaves
     /// the due scan and stays visible as failed, carrying the error that
-    /// stopped it — and only *that* gets an event. an attempt that will be
+    /// stopped it, and only *that* gets an event. an attempt that will be
     /// retried in ninety seconds is not news, and eight of them per alert
     /// would bury the one that matters.
     pub(crate) fn delivery_failed(
@@ -2377,7 +2381,7 @@ impl Store {
     }
 
     /// drop delivered notifications older than `older_than`. undelivered ones
-    /// stay whatever their age — an alert nobody received is not history, it is
+    /// stay whatever their age: an alert nobody received is not history, it is
     /// something outstanding, and a sweep that quietly cleared it would be the
     /// same loss this table exists to prevent.
     pub(crate) fn prune_notifications(&self, older_than: DateTime<Utc>) -> Result<usize, Error> {
@@ -2468,7 +2472,7 @@ impl Store {
     }
 
     /// mark an op canceled without claiming a finish time: cancellation was
-    /// requested and the task never joined, so when — or whether — the work
+    /// requested and the task never joined, so when (or whether) the work
     /// stopped is exactly what this process does not know.
     pub(crate) fn op_unstopped(&self, run_id: &str, op: &str, error: &str) -> Result<(), Error> {
         #[cfg(test)]
@@ -2490,12 +2494,12 @@ impl Store {
     /// running in.
     ///
     /// guarded on `running`, because a fast child can record its own terminal
-    /// row before the parent gets here — and a pid written onto a finished op
+    /// row before the parent gets here, and a pid written onto a finished op
     /// would name a process that no longer exists.
     ///
     /// best-effort: the pid is for whoever is *looking* at the run. the parent
-    /// holds the child handle it stops the process with, and drops it — which
-    /// kills the child — whether or not this row says where it was.
+    /// holds the child handle it stops the process with, and drops it (which
+    /// kills the child) whether or not this row says where it was.
     pub(crate) fn op_spawned(&self, run_id: &str, op: &str, pid: u32) -> BestEffort {
         self.best_effort(
             self.conn()
@@ -2538,7 +2542,7 @@ impl Store {
     /// the run's own progress is the one part of the log with nothing to be
     /// atomic *with*: an op starting is not a row anywhere else, so this is a
     /// statement of its own and a crash between the work and the event loses
-    /// the event. the terminal ones are not written here — a run's queued and
+    /// the event. the terminal ones are not written here: a run's queued and
     /// finished rows go in the transaction that moves the run.
     ///
     /// which is also why it is best-effort: an event narrates a run and no
@@ -2567,7 +2571,7 @@ impl Store {
     }
 
     /// append one captured line. the cap lives in [`logs::Budget`], which is
-    /// the only thing that calls this — writing here directly would be a way
+    /// the only thing that calls this: writing here directly would be a way
     /// to fill a disk.
     ///
     /// best-effort, and the clearest case of it: a line an op printed is worth
@@ -2735,7 +2739,7 @@ impl Store {
     }
 
     /// move a schedule's cursor to `at`, never backwards. rfc3339 utc sorts
-    /// lexicographically, so the guard is a plain string compare — and it is
+    /// lexicographically, so the guard is a plain string compare, and it is
     /// what lets a held fire drain long after its occurrence without
     /// un-accounting for everything since.
     pub(crate) fn set_schedule_cursor(
@@ -2754,7 +2758,7 @@ impl Store {
 
     /// every fire still waiting to launch, oldest occurrence first: a
     /// `deferred` tick with no later tick for the same `(job, expr,
-    /// scheduled_for)`. the tick log *is* the queue — a fire held in memory
+    /// scheduled_for)`. the tick log *is* the queue: a fire held in memory
     /// dies with the process, and this one does not.
     pub(crate) fn pending_fires(&self) -> Result<Vec<(String, String, DateTime<Utc>)>, Error> {
         self.conn().query(
@@ -2851,7 +2855,7 @@ impl Store {
     /// what the manager wrote for a run goes when [retention](Retention)
     /// prunes it, so pruning one of these would delete the value the next
     /// build seeds from and leave a row pointing at nothing. the sweep holds
-    /// them back instead — until something rebuilds the asset, at which point
+    /// them back instead, until something rebuilds the asset, at which point
     /// the run is history like any other.
     ///
     /// a row written before an asset's value went through a manager holds the
@@ -2898,7 +2902,7 @@ impl Store {
         // a null cutoff is no age policy at all: every comparison against it is
         // null, so nothing matches, which is the direction an absent setting
         // has to mean. `keep_last` holds the newest finished runs back from
-        // whatever the age rule says — a run goes only when both would take it
+        // whatever the age rule says: a run goes only when both would take it
         const DOOMED: &str = "SELECT id FROM runs
              WHERE job = ?1 AND status IN ('success', 'failed', 'canceled')
                AND created_at < CASE status WHEN 'success' THEN ?2 ELSE ?3 END
@@ -2926,7 +2930,7 @@ impl Store {
     /// by id rather than by policy, so the runs whose outputs the sweep just
     /// dropped are exactly the runs it deletes: one that came due in between
     /// keeps its rows and goes on the next pass, with its files, rather than
-    /// losing the second half of the pair. `op_state` is never touched — a
+    /// losing the second half of the pair. `op_state` is never touched: a
     /// watermark outlives every run that wrote it.
     ///
     /// one transaction per job rather than one for the sweep: a run and its
@@ -2997,7 +3001,7 @@ impl Store {
     /// v17 added belongs to no run, so nothing collected it: an asset built
     /// every five minutes writes a row here forever. a count cap rather than
     /// the retention policy's age, for the same reason the two tick logs have
-    /// one — this grows with time rather than with the history somebody asked
+    /// one: this grows with time rather than with the history somebody asked
     /// to keep.
     pub(crate) fn prune_events(&self, keep: usize) -> Result<usize, Error> {
         self.conn().execute(
@@ -3017,7 +3021,7 @@ impl Store {
     ///
     /// **the run is not in this transaction.** a fired tick's run was created
     /// by a launch that committed first, so a crash in between leaves a run
-    /// with no tick and no event — the run is still there, still queued, and
+    /// with no tick and no event: the run is still there, still queued, and
     /// still executes. the other direction, a tick claiming a run that was
     /// never created, is the one that cannot happen.
     #[allow(clippy::too_many_arguments)]
@@ -3055,7 +3059,7 @@ impl Store {
             (TickOutcome::Error, _) => (EventKind::ScheduleError, EventLevel::Error),
         };
         let message = match error {
-            Some(why) => format!("{expr}: {} — {why}", outcome.as_str()),
+            Some(why) => format!("{expr}: {} ({why})", outcome.as_str()),
             None => format!("{expr}: {}", outcome.as_str()),
         };
         write_event(
@@ -3095,7 +3099,7 @@ impl Store {
         }
     }
 
-    /// one run by id, or `None` if this store has never had it — or has
+    /// one run by id, or `None` if this store has never had it, or has
     /// pruned it.
     pub fn run(&self, id: &str) -> Result<Option<Run>, Error> {
         self.conn().query_opt(
@@ -3163,7 +3167,7 @@ impl Store {
         )
     }
 
-    /// terminal runs finished after `after`, oldest first — what a
+    /// terminal runs finished after `after`, oldest first: what a
     /// [run-status sensor](crate::RunStatusSensor) reads each evaluation.
     /// `job` narrows it to one job; `after` of `None` is every terminal run
     /// there has ever been, which is why a fresh sensor seeds its cursor
@@ -3245,7 +3249,7 @@ impl Store {
     }
 
     /// one op's row. the parent of an isolated op reads back what its child
-    /// recorded through this — the whole of what a worker process reports.
+    /// recorded through this: the whole of what a worker process reports.
     pub fn op_run(&self, run_id: &str, op: &str) -> Result<Option<OpRun>, Error> {
         self.conn().query_opt(
             "SELECT run_id, op, status, attempts, started_at, finished_at, output, metadata,
@@ -3271,7 +3275,7 @@ impl Store {
     }
 
     /// what each of `job`'s ops last reported, from the newest run before the
-    /// one named — the map a run's [deltas](crate::Meta) are computed against.
+    /// one named: the map a run's [deltas](crate::Meta) are computed against.
     /// keyed by op name, so a fan-out instance (`fetch[0]`) compares against
     /// the same instance of the previous run.
     ///
@@ -3305,7 +3309,7 @@ impl Store {
     }
 
     /// what a numeric metadata key was across `job`'s recent runs of one op,
-    /// oldest first — the trend the op inspector draws.
+    /// oldest first: the trend the op inspector draws.
     ///
     /// `limit` is how many **runs** are read, not how many points come back:
     /// a run that reported nothing, or reported `key` as something that is
@@ -3418,7 +3422,7 @@ impl Store {
 
     /// the whole log, newest first: what happened, across every subsystem.
     ///
-    /// `before` pages backwards — the last seq of the page you have, and the
+    /// `before` pages backwards: the last seq of the page you have, and the
     /// next page is what is below it. a page of the past is exact, because
     /// nothing is still being written down there; the newest page has the same
     /// in-flight window [`event_tail`](Self::event_tail) documents, and for the
@@ -3506,7 +3510,7 @@ impl Store {
     /// identical from here: a transaction that has allocated it and not yet
     /// committed, or one that aborted and never will. so a follower delivers up
     /// to [`upto`](Settled::upto), waits on the gap for a bounded grace, and
-    /// steps over it only after that — which is the one assumption in the whole
+    /// steps over it only after that, which is the one assumption in the whole
     /// mechanism, stated where it is made: **a transaction that appends an event
     /// and takes longer than the grace to commit may be skipped.** hestan's are
     /// a handful of statements each.
@@ -3547,14 +3551,14 @@ impl Store {
     ///
     /// on a backend that [settles in order](Self::settles_in_order) that is
     /// everything committed, full stop. on one that does not, it is the
-    /// unbroken run above the cursor — and the gap that ended it is remembered
+    /// unbroken run above the cursor, and the gap that ended it is remembered
     /// in `waiting`, so that the same gap seen for longer than
     /// [`SETTLE_GRACE`] is stepped over rather than stalling the follower
     /// forever on a rolled-back write.
     ///
     /// **every follower of this table goes through here**, so the sse stream
     /// and a command line tailing the log cannot come to different conclusions
-    /// about what is safe to read — which, for a rule this subtle, they
+    /// about what is safe to read, which, for a rule this subtle, they
     /// otherwise would.
     pub(crate) fn readable(
         &self,
@@ -3604,7 +3608,7 @@ impl Store {
     /// that asserts an op succeeded.
     ///
     /// the table is history, so a rebuild that came out fingerprint-identical
-    /// is still an entry — that a build happened and that it changed anything
+    /// is still an entry: that a build happened and that it changed anything
     /// are different facts.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn record_materialization(
@@ -3677,8 +3681,8 @@ impl Store {
     }
 
     /// one asset's history, newest first, each entry carrying whether its
-    /// fingerprint differs from the entry before it in time — which is what
-    /// turns a list of rebuilds into a list of changes — and what that entry
+    /// fingerprint differs from the entry before it in time (which is what
+    /// turns a list of rebuilds into a list of changes) and what that entry
     /// reported, which is what the deltas beside its numbers are against.
     /// `partition` narrows it to one key; `None` is every key of the asset,
     /// interleaved by time.
@@ -3816,7 +3820,7 @@ impl Store {
     }
 
     /// one asset's recent check results, newest first, every check and every
-    /// partition mixed together — the api and the ui take the first row per
+    /// partition mixed together: the api and the ui take the first row per
     /// `(check, partition)` to get each one's latest. `partition` narrows it to
     /// a single key.
     pub fn asset_checks(
@@ -3855,7 +3859,7 @@ impl Store {
     }
 
     /// trim every check to its newest `keep` results per partition, floored at
-    /// 1 like [`prune_materializations`](Self::prune_materializations) — the
+    /// 1 like [`prune_materializations`](Self::prune_materializations): the
     /// latest result is what the asset summary counts.
     pub(crate) fn prune_asset_checks(&self, keep: usize) -> Result<usize, Error> {
         let mut conn = self.conn();
@@ -3894,8 +3898,8 @@ impl Store {
         let mut conn = self.conn();
         let mut tx = conn.begin()?;
         // the one place that wanted `last_insert_rowid`. `RETURNING` is the
-        // portable spelling — postgres has always had it and sqlite has since
-        // 3.35 — so the id comes back with the row rather than from a second
+        // portable spelling (postgres has always had it and sqlite has since
+        // 3.35) so the id comes back with the row rather than from a second
         // question about what the connection did last
         let id = tx.query_opt(
             "INSERT INTO backfills
@@ -3966,7 +3970,7 @@ impl Store {
         )
     }
 
-    /// every backfill still going, oldest first — what the loop that chunks
+    /// every backfill still going, oldest first: what the loop that chunks
     /// them reads, and what makes a second one for the same asset a conflict.
     pub(crate) fn running_backfills(&self) -> Result<Vec<Backfill>, Error> {
         self.conn().query(
@@ -4027,7 +4031,7 @@ impl Store {
     }
 
     /// close a backfill. the first terminal status wins, so a cancel racing
-    /// the chunker cannot be overwritten by what the run did next — and the
+    /// the chunker cannot be overwritten by what the run did next, and the
     /// event is written only by the writer that won, so there is exactly one.
     pub(crate) fn finish_backfill(
         &self,
@@ -4119,7 +4123,7 @@ impl Store {
         Ok(())
     }
 
-    /// every stored sensor, by name — the paused flags and the cursors, not
+    /// every stored sensor, by name: the paused flags and the cursors, not
     /// the closures, which live in code.
     pub fn sensors(&self) -> Result<Vec<SensorRow>, Error> {
         self.conn().query(
@@ -4136,9 +4140,10 @@ impl Store {
         )
     }
 
-    /// returns false if no sensor with that name is registered.
-    /// pause or unpause one sensor, and record who did — see
+    /// pause or unpause one sensor, and record who did; see
     /// [`set_schedule_paused`](Self::set_schedule_paused).
+    ///
+    /// returns false if no sensor with that name is registered.
     pub fn set_sensor_paused(
         &self,
         name: &str,
@@ -4182,7 +4187,7 @@ impl Store {
     }
 
     /// `skipped` counts the requests this evaluation did not launch because
-    /// their run key was already claimed — distinct from launching nothing —
+    /// their run key was already claimed (distinct from launching nothing)
     /// and `duration_ms` is how long the evaluation took, which is the other
     /// half of "is this sensor healthy". `runs` is what it launched, by id,
     /// which is the tick's whole reason for existing and the one thing the
@@ -4216,7 +4221,7 @@ impl Store {
             ],
         )?;
         // **a tick that did nothing is not an event.** every evaluation is a
-        // row in `sensor_ticks` and always was — that is the sensor's own
+        // row in `sensor_ticks` and always was: that is the sensor's own
         // health record, and the sensors page reads it. but a sensor polling
         // every five seconds writes seventeen thousand of those a day, and an
         // activity log in which they are 99% of the rows is one nobody can read
@@ -4235,7 +4240,7 @@ impl Store {
                     sensor,
                     EventKind::SensorTick,
                     match error {
-                        Some(why) => format!("{} — {why}", outcome.as_str()),
+                        Some(why) => format!("{}: {why}", outcome.as_str()),
                         None => format!("{}, {launched} launched", outcome.as_str()),
                     },
                 )
@@ -4368,7 +4373,7 @@ impl Store {
 }
 
 /// what is executing right now, counted against `limits`. "executing" is
-/// claimed and not finished — the set a concurrency limit is about.
+/// claimed and not finished: the set a concurrency limit is about.
 fn in_flight(db: &mut impl Exec, limits: &Limits) -> Result<InFlight, Error> {
     let mut counts = InFlight::new();
     let rows = db.query(
@@ -4423,7 +4428,7 @@ fn run_from_row(row: &AnyRow<'_>) -> Result<Run, Error> {
     })
 }
 
-/// a tag map as it is stored, or `None` when it is empty — a null column, not
+/// a tag map as it is stored, or `None` when it is empty: a null column, not
 /// an empty object, so an untagged run and a run written before tags existed
 /// are the same row.
 fn tags_col(tags: &RunTags) -> Option<String> {
@@ -4539,7 +4544,7 @@ pub(crate) const SETTLE_GRACE: Duration = Duration::from_secs(2);
 pub(crate) const SETTLE_SCAN: u32 = 2_000;
 
 /// how far one pass of a follower may read, and whether it is also stepping
-/// over a gap — from [`Store::readable`].
+/// over a gap, from [`Store::readable`].
 pub(crate) struct Step {
     pub(crate) ceiling: i64,
     /// the cursor to jump to afterwards, when a gap has been waited out.
@@ -4569,7 +4574,7 @@ pub struct EventQuery {
     /// this level exactly, not this level and worse: three levels and a
     /// filter that means "show me the errors" is the one anybody types.
     pub level: Option<EventLevel>,
-    /// at or after this, by the writer's clock rather than by `seq` — which
+    /// at or after this, by the writer's clock rather than by `seq`, which
     /// is a window and not a cursor. `before` is the cursor.
     pub since: Option<DateTime<Utc>>,
     /// strictly before this, on the same terms.
@@ -4583,7 +4588,7 @@ impl EventQuery {
     /// the `WHERE` fragment and the parameters it binds, numbered from 1.
     ///
     /// the two reads share this so a filter cannot mean one thing to the query
-    /// and another to the stream — which, given that the stream exists to
+    /// and another to the stream, which, given that the stream exists to
     /// deliver what the query would have returned, would be a hard thing to
     /// notice and an easy thing to do.
     fn sql(&self, dialect: Dialect) -> (String, Vec<Val<'_>>) {
@@ -4601,7 +4606,7 @@ impl EventQuery {
         if let Some(subject) = &self.subject {
             let n = bind(&mut args, Val::Text(Cow::Borrowed(subject.as_str())));
             // a run event keeps its subject null and is named by `run_id`, so
-            // asking for one by id has to look in both places — the v17
+            // asking for one by id has to look in both places; the v17
             // migration says why the column was not filled in
             clauses.push(format!(
                 "(subject = ?{n} OR (subject IS NULL AND run_id = ?{n}))"
@@ -4636,7 +4641,7 @@ impl EventQuery {
 /// one event on its way into the log.
 ///
 /// built by whichever subsystem did the thing and written by [`write_event`],
-/// which every writer goes through — including the ones already inside a
+/// which every writer goes through, including the ones already inside a
 /// transaction, which is nearly all of them. an event asserts that something
 /// happened, so it is written where that happens and, wherever there is one,
 /// in the same transaction: written next to the call instead, a crash in the
@@ -4654,7 +4659,7 @@ pub(crate) struct NewEvent<'a> {
     data: Option<Value>,
     /// who asked for the thing this event is about, where a person did. never
     /// set on anything a schedule, a sensor or a loop did on its own, and
-    /// never a credential — only an [`Identity`](crate::Identity)'s name.
+    /// never a credential: only an [`Identity`](crate::Identity)'s name.
     actor: Option<&'a str>,
 }
 
@@ -4769,8 +4774,8 @@ fn write_event(tx: &mut impl Exec, ev: &NewEvent<'_>, at: DateTime<Utc>) -> Resu
 /// one asset build on its way into the history, everything about it that only
 /// the op body could know.
 ///
-/// staged by the body that computed it — the fingerprint, what it was built
-/// from, the value, what the build reported — and written by whoever knows the
+/// staged by the body that computed it (the fingerprint, what it was built
+/// from, the value, what the build reported) and written by whoever knows the
 /// build actually landed. for an op that is
 /// [`op_finished`](Store::op_finished), in the transaction that records the op
 /// succeeding, because "this asset is current" is not a separate fact from
@@ -4856,7 +4861,7 @@ fn write_materialization(
     .data(json!({
         "partition": partition,
         "fingerprint": built.fingerprint,
-        // where it happened, which is not what it is about — a probe
+        // where it happened, which is not what it is about: a probe
         // materializes outside any run and this is null there
         "run_id": run_id,
         // what the build reported, exactly as the op run carries it: the
@@ -4868,7 +4873,7 @@ fn write_materialization(
 }
 
 /// insert one notification, due immediately. inside whatever transaction the
-/// caller is already in — that is the only way it is worth anything.
+/// caller is already in: that is the only way it is worth anything.
 fn queue_note(tx: &mut impl Exec, payload: &Value, at: DateTime<Utc>) -> Result<(), Error> {
     tx.execute(
         "INSERT INTO notifications (kind, payload, created_at, next_attempt_at)
@@ -5066,7 +5071,7 @@ mod tests {
             }
         }
 
-        /// a new handle to this database — a new connection, every call.
+        /// a new handle to this database: a new connection, every call.
         fn store(&self) -> Store {
             match self {
                 Backend::Sqlite(dir) => Store::open(dir.path().join("hestan.db").to_str().unwrap()),
@@ -5089,8 +5094,9 @@ mod tests {
     /// and postgres when `HESTAN_TEST_PG` names a server.
     ///
     /// one suite run twice, rather than two suites. a second set of cases for
-    /// the second backend is exactly how two backends quietly come to disagree
-    /// — the cases that were never copied are the ones nobody notices — so
+    /// the second backend is exactly how two backends quietly come to
+    /// disagree (the cases that were never copied are the ones nobody notices)
+    /// so
     /// there is no second set. a machine with no postgres runs the sqlite half
     /// and passes, which is what makes that honest rather than optional.
     fn both(case: impl Fn(&Backend)) {
@@ -5112,8 +5118,8 @@ mod tests {
     ///
     /// a schema rather than a database per case because the isolation is the
     /// same and creating one is milliseconds. `options` is how a url carries a
-    /// session setting, which is what puts every connection a case opens —
-    /// including one in a child process — in the same schema.
+    /// session setting, which is what puts every connection a case opens
+    /// (including one in a child process) in the same schema.
     #[cfg(feature = "postgres")]
     struct Scratch {
         server: String,
@@ -5492,7 +5498,7 @@ mod tests {
     }
 
     // a lease that ran out is the one run event that is not about what the run
-    // did — and both policies write it, because "who stopped answering" is the
+    // did, and both policies write it, because "who stopped answering" is the
     // question either way
     #[test]
     fn a_reclaim_says_so_whichever_policy_took_it() {
@@ -6769,7 +6775,7 @@ mod tests {
     /// the two backends get there differently and cannot not. sqlite walks the
     /// chain it has always walked. postgres is created whole at the current
     /// version, so the only honest way to make a v16 postgres database out of
-    /// this build is to walk the one step *backwards* — which also means the
+    /// this build is to walk the one step *backwards*, which also means the
     /// fixture fails loudly if v17 ever stops being exactly these four
     /// statements. either way what the migration then meets is a populated
     /// events table with a NOT NULL `run_id`.
@@ -6880,8 +6886,8 @@ mod tests {
     /// bring `db` to v17: the schema from before anything recorded who did it.
     ///
     /// the two backends get there differently, for the same reason
-    /// [`at_v16`] gives: sqlite walks the chain forward, and postgres — which
-    /// is created whole at the current version — walks the one step back. the
+    /// [`at_v16`] gives: sqlite walks the chain forward, and postgres (which
+    /// is created whole at the current version) walks the one step back. the
     /// backwards step failing loudly if v18 ever stops being exactly these two
     /// columns is the point of writing it out.
     fn at_v17(db: &Backend) {
@@ -6939,7 +6945,7 @@ mod tests {
             at_v17(db);
             let store = db.store();
 
-            // what was there is still there, attributed to nobody — which is
+            // what was there is still there, attributed to nobody, which is
             // what every row written before this honestly says
             let run = store.run("r1").unwrap().unwrap();
             assert_eq!(run.status, RunStatus::Success);
@@ -6978,7 +6984,7 @@ mod tests {
     /// another.
     ///
     /// the two backends get there differently, for the reason [`at_v17`]
-    /// gives — sqlite walks the chain forward and postgres, created whole at
+    /// gives: sqlite walks the chain forward and postgres, created whole at
     /// the current version, walks the one step back.
     fn at_v18(db: &Backend) {
         match db {
@@ -7172,7 +7178,7 @@ mod tests {
         drop(conn);
 
         // the op run written before the migration reads back, claiming no
-        // process and no recorded inputs — which is what every op that runs in
+        // process and no recorded inputs, which is what every op that runs in
         // this process says too
         let store = Store::open(path).unwrap();
         let row = store.op_run("r1", "a").unwrap().unwrap();
@@ -7427,8 +7433,8 @@ mod tests {
             assert!(store.run_key_claimed("watch", "2026-08-09").unwrap());
             assert_eq!(store.op_runs("r1").unwrap().len(), 1);
 
-            // the same key again writes nothing at all — no run, no op rows, no
-            // second key — because the whole thing is one transaction
+            // the same key again writes nothing at all (no run, no op rows, no
+            // second key) because the whole thing is one transaction
             assert!(
                 !store
                     .create_run_keyed(
@@ -8380,8 +8386,8 @@ mod tests {
 
     // ------------------------------------------------------------------------
     // the cases below exist because of the second backend. what they cover was
-    // covered before — by the executor's tests, the backfill loop's, the asset
-    // registry's — and all of those run on sqlite and only sqlite. a query
+    // covered before (by the executor's tests, the backfill loop's, the asset
+    // registry's) and all of those run on sqlite and only sqlite. a query
     // nothing exercises on postgres is a query nobody has run on postgres, so
     // each of these puts one family of statements through the shared suite.
 
@@ -8434,7 +8440,7 @@ mod tests {
             assert_eq!(store.queue_depth().unwrap(), 2);
             assert_eq!(store.held_by("alpha").unwrap(), ["r1"]);
             // a claim is not stalled while its lease has time on it, and is
-            // once it does not — which is the only way a claimer that went away
+            // once it does not, which is the only way a claimer that went away
             // can be told from one that is working
             let now = Utc::now();
             assert!(store.stalled_claims(now).unwrap().is_empty());
@@ -9298,7 +9304,7 @@ mod tests {
     /// file: the name in front of each `-> BestEffort`.
     ///
     /// the return type *is* the declaration. nothing outside this file can
-    /// make one — the fields are private to it — so a scrape of this file is
+    /// make one (the fields are private to it) so a scrape of this file is
     /// the whole of the boundary rather than a sample of it.
     fn best_effort_writes() -> Vec<String> {
         // spelled at runtime so this line is not itself one of the matches
@@ -9317,7 +9323,7 @@ mod tests {
 
     // the compiler stops a critical write being handed to `note`. what it
     // does not stop is one being thrown away by hand, which is the whole of
-    // what is left of this hole — so the whole of what is left is a grep
+    // what is left of this hole, so the whole of what is left is a grep
     #[test]
     fn a_store_write_is_never_thrown_away() {
         for (file, src) in [
@@ -9544,7 +9550,7 @@ mod tests {
 
     // the one failure whose outcome hestan cannot know. a connection that died
     // may have carried a commit the server ran and the acknowledgement of it
-    // nobody received — so going back for it is the one retry that could
+    // nobody received, so going back for it is the one retry that could
     // record a build twice, and it is the one retry hestan does not make
     #[cfg(feature = "postgres")]
     #[tokio::test]

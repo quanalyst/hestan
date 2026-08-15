@@ -1,6 +1,6 @@
 //! the `otel` feature: a run as a distributed trace.
 //!
-//! hestan already knows a run is a causal tree — a run, its ops, an attempt
+//! hestan already knows a run is a causal tree: a run, its ops, an attempt
 //! each, and for an [isolated op](crate::Op::isolated) a subprocess under that.
 //! that is what a trace is, and emitting it as one puts a pipeline in the same
 //! waterfall as the services it calls.
@@ -9,7 +9,7 @@
 //! exporter. it opens `tracing` spans with the right shape and the right
 //! fields, and the host composes
 //! [`tracing-opentelemetry`](https://docs.rs/tracing-opentelemetry) into the
-//! subscriber it was going to build anyway — the same arrangement
+//! subscriber it was going to build anyway, the same arrangement
 //! [`capture_layer`][cap] uses, for the same reason: the
 //! subscriber belongs to the application, not to a library inside it.
 //!
@@ -37,7 +37,7 @@
 //! | --- | --- |
 //! | a run | `hestan.run`, the root, with `run_id`, `job` and `trigger` |
 //! | an attempt of an op | `hestan.op` beneath it, with `run_id`, `op` and `attempt` |
-//! | a retry | another `hestan.op`, with the next `attempt` — a span of its own, not an annotation on the first |
+//! | a retry | another `hestan.op`, with the next `attempt`: a span of its own, not an annotation on the first |
 //! | an event | a span event on the `hestan.op` it belongs to, or on `hestan.run` for a run-level one |
 //!
 //! the field names are exactly the ones
@@ -49,7 +49,7 @@
 //!
 //! **an isolated op's subprocess is only in the trace if the host puts it
 //! there.** hestan hands the child a `traceparent` in its environment and the
-//! child parents its span to it — that part works, and it is the part nothing
+//! child parents its span to it; that part works, and it is the part nothing
 //! else does. but a span is only exported by a provider, and the provider in
 //! the child process is the *host's*, built by the host's `main`. so:
 //!
@@ -57,8 +57,8 @@
 //!   correctly under the parent's `hestan.op`. this is the case worth having
 //!   and it is the case hestan can create.
 //! - a child that composes no layer produces no spans. the parent's
-//!   `hestan.op` still covers the whole of the child's execution — hestan
-//!   times the subprocess — so the trace is complete at op granularity and
+//!   `hestan.op` still covers the whole of the child's execution (hestan
+//!   times the subprocess), so the trace is complete at op granularity and
 //!   missing only what happened *inside* the child.
 //! - **hestan cannot flush the child's exporter.** a batch exporter that has
 //!   not shipped its spans when the child exits loses them, and the provider
@@ -152,7 +152,7 @@ mod tests {
 
     /// a provider that exports nowhere. what is being tested is the context a
     /// span carries and the parent a second span adopts from it, and both of
-    /// those are decided long before anything is exported — so a test that
+    /// those are decided long before anything is exported, so a test that
     /// needed an exporter would be testing the sdk rather than hestan.
     fn subscriber() -> tracing::subscriber::DefaultGuard {
         let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder().build();

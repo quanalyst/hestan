@@ -115,7 +115,7 @@ fn a_credential_reaches_no_stream_no_row_and_no_response(dir: &Path) {
     }
 
     // and the things the token is for: read, launch, wait, retry, cancel,
-    // pause — the whole of what an operator does in an afternoon
+    // pause: the whole of what an operator does in an afternoon
     let token = Some(TOKEN);
     let known = get(addr, "/api/whoami", token).unwrap();
     assert!(known.body.contains("\"role\":\"admin\""), "{known:?}");
@@ -156,7 +156,7 @@ fn a_credential_reaches_no_stream_no_row_and_no_response(dir: &Path) {
 
     let (out, err) = stop(child);
     let out = format!("{out}\n{err}");
-    // the deployment did say things — a grep over an empty string passes
+    // the deployment did say things: a grep over an empty string passes
     assert!(out.contains("hestan"), "the child said nothing: {out}");
     assert!(out.contains("run queued"), "no run in the log: {out}");
 

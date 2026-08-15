@@ -52,7 +52,7 @@ pub struct Job {
     // that quietly picks a winner
     params_schema: Option<Value>,
     // dep names satisfied from outside the job: no ops, absent from `order`,
-    // seeded at launch with the value declared here — null for an asset
+    // seeded at launch with the value declared here: null for an asset
     // source, `[]` for the partition keys a partitioned asset fans out over,
     // which only a build plan can work out. empty for every user-built job.
     external: Vec<(String, Value)>,
@@ -90,7 +90,7 @@ impl Job {
     }
 
     /// every op, including the ones a [`Graph`] instance flattened into the
-    /// job — declaration order, not execution order.
+    /// job; declaration order, not execution order.
     pub fn ops(&self) -> &[Op] {
         &self.ops
     }
@@ -117,7 +117,7 @@ impl Job {
 
     /// what a schedule of this job does when it fires while a run is still
     /// outstanding, from [`JobBuilder::overlap`]. it gates scheduled fires
-    /// only — a manual launch is never held back.
+    /// only: a manual launch is never held back.
     pub fn overlap(&self) -> Overlap {
         self.overlap
     }
@@ -147,7 +147,7 @@ impl Job {
     /// when no op declared one, which is every job that has not opted in.
     ///
     /// a launch's params go to every op that will run, so the fields the
-    /// launchpad should list are the union of what the ops describe — merged
+    /// launchpad should list are the union of what the ops describe, merged
     /// once at build rather than per request, since a disagreement between two
     /// ops is a mistake to report, not a request to answer.
     ///
@@ -157,7 +157,7 @@ impl Job {
         self.params_schema.as_ref()
     }
 
-    /// the first op that refuses `params`, with its reason — the same check a
+    /// the first op that refuses `params`, with its reason: the same check a
     /// launch runs, minus the store and the run. `None` means every op that
     /// declared [`Op::params`](crate::Op::params) accepts them.
     pub fn params_error(&self, params: &Value) -> Option<(String, String)> {
@@ -237,8 +237,8 @@ impl Job {
 ///
 /// that clash is the one thing a merge cannot paper over: picking a winner
 /// would describe a field in terms half the job disagrees with, and the point
-/// of the schema is that the description is trustworthy. everything else — a
-/// name only one op knows, or two ops agreeing — merges silently.
+/// of the schema is that the description is trustworthy. everything else (a
+/// name only one op knows, or two ops agreeing) merges silently.
 fn merge_named<'a>(
     job: &str,
     op: &'a str,
@@ -424,7 +424,7 @@ fn validate_isolated(job: &str, ops: &[Op]) -> Result<(), Error> {
         #[cfg(not(unix))]
         return Err(Error::Graph(format!(
             "job {job}: op {name} is .isolated(), which hestan supports on unix only \
-             (this is {}) — an isolation guarantee that quietly is not one is worse \
+             (this is {}): an isolation guarantee that quietly is not one is worse \
              than no isolation",
             std::env::consts::OS
         )));
@@ -488,7 +488,7 @@ struct Instance {
 
 impl Graph {
     /// start building a reusable subgraph called `name`. the name is a label
-    /// for error messages — what an instance is called in a job comes from
+    /// for error messages; what an instance is called in a job comes from
     /// [`JobBuilder::graph`], not from here.
     pub fn builder(name: impl Into<String>) -> GraphBuilder {
         GraphBuilder {
@@ -520,15 +520,15 @@ pub struct GraphBuilder {
 }
 
 impl GraphBuilder {
-    /// add an op. its deps are inner names — a graph knows nothing about the
+    /// add an op. its deps are inner names: a graph knows nothing about the
     /// job it will be instantiated in.
     pub fn op(mut self, op: Op) -> Self {
         self.ops.push(op);
         self
     }
 
-    /// nest another graph inside this one. nesting is fine — it is all
-    /// flattened at job build — and works exactly as it does on a job:
+    /// nest another graph inside this one. nesting is fine (it is all
+    /// flattened at job build) and works exactly as it does on a job:
     /// follow it with [`after`](Self::after).
     pub fn graph(mut self, name: impl Into<String>, graph: &Graph) -> Self {
         self.instances.push(Instance {
@@ -562,7 +562,7 @@ impl GraphBuilder {
     }
 
     /// the one inner op (or nested instance) whose output *is* the instance's
-    /// output — what anything depending on the instance name receives.
+    /// output, what anything depending on the instance name receives.
     /// required, and the last call wins.
     pub fn output(mut self, op: impl Into<String>) -> Self {
         self.output = Some(op.into());
@@ -699,8 +699,8 @@ fn output_op(prefix: &str, graph: &Graph) -> String {
 }
 
 /// an op as it appears after flattening: renamed, with every dep name it holds
-/// rewritten through `wiring`, and `extra` — whatever the instance itself
-/// waits on — appended because this op was declared an input. names `wiring`
+/// rewritten through `wiring`, and `extra` (whatever the instance itself
+/// waits on) appended because this op was declared an input. names `wiring`
 /// does not cover are left alone, so an unknown dep is still the topo sort's
 /// to report, in the same words as ever.
 fn rebind(op: &Op, name: String, wiring: &HashMap<String, String>, extra: &[String]) -> Op {
@@ -734,8 +734,8 @@ fn expand(
     path: &mut Vec<String>,
     out: &mut Vec<Op>,
 ) -> Result<(), Error> {
-    // nesting is a dag by construction — a graph can only contain graphs that
-    // were built before it — but flattening something that did contain itself
+    // nesting is a dag by construction (a graph can only contain graphs that
+    // were built before it), but flattening something that did contain itself
     // would not terminate, so say so instead of finding out
     if path.contains(&graph.name) {
         return Err(Error::Graph(format!(
@@ -785,8 +785,8 @@ fn expand(
     Ok(())
 }
 
-/// flatten a job's graph instances into ordinary ops. jobs without any — every
-/// job before graphs existed — come through untouched.
+/// flatten a job's graph instances into ordinary ops. jobs without any (every
+/// job before graphs existed) come through untouched.
 fn flatten(job: &str, ops: Vec<Op>, instances: Vec<Instance>) -> Result<Vec<Op>, Error> {
     if instances.is_empty() {
         return Ok(ops);
@@ -855,7 +855,7 @@ impl JobBuilder {
         self
     }
 
-    /// add an op. order does not matter — an op may name a dep declared after
+    /// add an op. order does not matter: an op may name a dep declared after
     /// it, since the dag is resolved at [`build`](Self::build).
     pub fn op(mut self, op: Op) -> Self {
         self.ops.push(op);
@@ -877,7 +877,7 @@ impl JobBuilder {
 
     /// what the graph instance just added waits on: the job-level deps its
     /// declared input ops additionally gain. only meaningful straight after
-    /// [`graph`](Self::graph) — anywhere else it is a build error, since an
+    /// [`graph`](Self::graph): anywhere else it is a build error, since an
     /// op's own deps belong on the op ([`Op::after`]).
     pub fn after<I>(mut self, deps: I) -> Self
     where
@@ -904,8 +904,8 @@ impl JobBuilder {
     ///
     /// this is not [`overlap`](Self::overlap), and the two answer different
     /// questions. overlap decides whether a scheduled fire should exist at all
-    /// while the job has a run outstanding — a policy about the work. this caps
-    /// how much of that work runs at once — a policy about the machine. a job
+    /// while the job has a run outstanding, a policy about the work. this caps
+    /// how much of that work runs at once, a policy about the machine. a job
     /// with `Overlap::Skip` never has two runs to limit; a job with
     /// `Overlap::Allow` and this at 2 has as many as it likes and runs two.
     pub fn max_concurrent_runs(mut self, n: usize) -> Self {
@@ -923,7 +923,7 @@ impl JobBuilder {
     /// declare how old this job's latest success may get before the job is
     /// late: `fresh_within(Duration::from_secs(86_400))` says a successful run
     /// every day. a declared policy takes over from the cron-derived `overdue`
-    /// heuristic entirely — see [freshness](../docs/freshness.md) — and is what
+    /// heuristic entirely (see [freshness](../docs/freshness.md)) and is what
     /// `Hestan::on_late` alerts on.
     pub fn fresh_within(mut self, d: Duration) -> Self {
         self.fresh_within = Some(d);

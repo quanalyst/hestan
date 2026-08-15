@@ -8,7 +8,7 @@ use crate::error::Error;
 use crate::op::InputError;
 
 /// one built resource: the value every op shares, plus the type it was
-/// declared as — enough to report what exists without ever showing what is
+/// declared as, enough to report what exists without ever showing what is
 /// in it.
 #[derive(Clone)]
 pub(crate) struct Resource {
@@ -62,8 +62,8 @@ pub(crate) fn none() -> Resources {
 
 /// build one run's own resources over the process's, in declaration order.
 ///
-/// a run-scoped constructor sees everything built before it — the process's
-/// own, then the run-scoped ones declared earlier — so a per-run client can
+/// a run-scoped constructor sees everything built before it (the process's
+/// own, then the run-scoped ones declared earlier), so a per-run client can
 /// lean on a process-wide pool. the first failure is the run's failure, named:
 /// an op whose scratch directory does not exist has nothing useful to do.
 pub(crate) async fn for_run(
@@ -133,7 +133,7 @@ impl Drop for RunScoped {
         // driving the run is the one thread that must not, which is the same
         // reason an io manager's work goes to the pool rather than running
         // here. a runtime already shutting down runs nothing new, and drops
-        // what it was handed instead — still off this stack, still dropped.
+        // what it was handed instead: still off this stack, still dropped.
         match tokio::runtime::Handle::try_current() {
             Ok(rt) => drop(rt.spawn_blocking(move || drop(built))),
             // no runtime to hand it to, so here is the only place left. this
@@ -164,7 +164,7 @@ pub(crate) fn lookup<T: Any + Send + Sync>(
 
 /// what a resource constructor is handed: its own name, and the resources
 /// declared before it. resources are built in declaration order, so one can
-/// lean on an earlier one — a client on the config it reads — and asking for
+/// lean on an earlier one (a client on the config it reads), and asking for
 /// a later one is [`InputError::NoResource`] rather than a deadlock.
 pub struct ResourceCtx {
     name: String,
@@ -196,7 +196,7 @@ impl ResourceCtx {
 }
 
 /// build every declared resource, in declaration order. the first one that
-/// fails aborts the whole startup naming itself — a process whose api client
+/// fails aborts the whole startup naming itself: a process whose api client
 /// could not be created has nothing useful to serve.
 pub(crate) async fn build(decls: Vec<(String, ResourceFn)>) -> Result<Resources, Error> {
     let mut built: HashMap<String, Resource> = HashMap::new();

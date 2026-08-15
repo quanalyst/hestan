@@ -3,7 +3,7 @@
 //! the api launches runs, cancels them, pauses schedules and moves queue
 //! positions. on loopback that is a process talking to itself and needs
 //! nothing; on any other address it is a button on the internet that runs
-//! arbitrary jobs. so the default is not "no authentication" — it is **no
+//! arbitrary jobs. so the default is not "no authentication": it is **no
 //! authenticator configured**, and [`serve`](crate::Hestan::serve) refuses any
 //! address that is not loopback under it:
 //!
@@ -34,7 +34,7 @@
 //! [`Auth::bearer`] is one token in an `Authorization: Bearer` header, for the
 //! deployment with no identities of its own to lend. [`Auth::custom`] is a
 //! closure over the request, for the host that already knows who its people
-//! are — a header its proxy set, a signature it can check, a table it owns.
+//! are: a header its proxy set, a signature it can check, a table it owns.
 //! one is something to stand up in an afternoon; the other composes hestan
 //! into what you already have rather than running a second scheme beside it.
 //!
@@ -44,7 +44,7 @@
 //! | --- | --- |
 //! | [`Access::Viewer`] | read: every `GET` |
 //! | [`Access::Operator`] | that, plus launch, cancel, retry, resume, build, backfill |
-//! | [`Access::Admin`] | that, plus pause, unpause, priority, presets — what changes how the deployment behaves rather than what it is doing now |
+//! | [`Access::Admin`] | that, plus pause, unpause, priority, presets (what changes how the deployment behaves rather than what it is doing now) |
 //!
 //! `docs/auth.md` writes that out endpoint by endpoint. the code that enforces
 //! it is derived from the table rather than the table from the code, and
@@ -69,8 +69,8 @@ pub enum Access {
     /// that, plus the things that drive work: launch, cancel, retry, resume,
     /// build, backfill.
     Operator,
-    /// that, plus the things that change how the deployment behaves — pausing
-    /// a schedule, moving a limit, editing a preset — as opposed to what it is
+    /// that, plus the things that change how the deployment behaves (pausing
+    /// a schedule, moving a limit, editing a preset) as opposed to what it is
     /// doing right now.
     Admin,
 }
@@ -97,13 +97,13 @@ impl std::fmt::Display for Access {
 /// decision.
 ///
 /// the name is what the event log records and what the ui shows. it is never a
-/// credential — see [`Auth::bearer`] — and it is never invented: a deployment
+/// credential (see [`Auth::bearer`]) and it is never invented: a deployment
 /// with no authenticator records no actor at all rather than a name that means
 /// nothing.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct Identity {
     /// what goes in the audit trail. use something a person would recognize
-    /// six months later in an event log — never the credential itself.
+    /// six months later in an event log, never the credential itself.
     pub name: String,
     /// what they may do.
     pub role: Access,
@@ -243,8 +243,8 @@ impl std::fmt::Debug for Token {
 pub enum Auth {
     /// nothing in hestan checks identity, deliberately.
     ///
-    /// this is an assertion about what is in front of hestan — a proxy that
-    /// authenticates, a mesh doing mtls, a network nobody else is on — and it
+    /// this is an assertion about what is in front of hestan (a proxy that
+    /// authenticates, a mesh doing mtls, a network nobody else is on), and it
     /// turns the refusal off for every address. it is spelled out rather than
     /// implied because the difference between "I have thought about this" and
     /// "I did not know" is the whole of what the refusal is for.
@@ -267,14 +267,14 @@ impl Auth {
     /// ```
     ///
     /// take it from the environment or a secret file rather than writing a
-    /// literal — a token in argv is a token in `ps`, and a token in source is
+    /// literal: a token in argv is a token in `ps`, and a token in source is
     /// a token in git. hestan hashes it here and never holds the plaintext,
     /// never logs it, never puts it in an event, an error or a response body,
     /// and never sends it to the ui: the only copies anywhere are the one you
     /// configured and the one whoever is asking presents.
     ///
     /// one token is one identity, named `bearer`, and everyone holding it is
-    /// that identity — which is why the audit trail says "somebody with the
+    /// that identity, which is why the audit trail says "somebody with the
     /// token" rather than a person's name. [`custom`](Auth::custom) is where
     /// names and read-only roles come from; hestan has no user store and is
     /// not going to grow one.
@@ -303,7 +303,7 @@ impl Auth {
     /// # }
     /// ```
     ///
-    /// it runs on the request path, so it must not block — a lookup that costs
+    /// it runs on the request path, so it must not block: a lookup that costs
     /// a network round trip belongs in the thing in front of hestan, where its
     /// answer is already being taken. and if it compares a secret of its own,
     /// compare it with [`secret_eq`].
@@ -328,7 +328,7 @@ impl Auth {
     }
 
     /// whether this checks anything at all. [`Auth::None`] does not, and every
-    /// request under it is served with no identity — the same as a deployment
+    /// request under it is served with no identity, the same as a deployment
     /// that configured nothing and is therefore on loopback.
     pub(crate) fn checks(&self) -> bool {
         !matches!(self, Auth::None)
@@ -372,7 +372,7 @@ fn ct_eq(a: &[u8; 32], b: &[u8; 32]) -> bool {
 /// whether an address can only be reached from this machine.
 ///
 /// the forms that are the same socket and do not look alike: `127.0.0.1` and
-/// the rest of `127.0.0.0/8`, `::1`, and `::ffff:127.0.0.1` — v4 loopback
+/// the rest of `127.0.0.0/8`, `::1`, and `::ffff:127.0.0.1`, v4 loopback
 /// wearing a v6 address, which `Ipv6Addr::is_loopback` says nothing about and
 /// which a listener does receive v4 loopback traffic on.
 ///

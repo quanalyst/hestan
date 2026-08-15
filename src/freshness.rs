@@ -39,7 +39,7 @@ impl LateKind {
 
 /// what an [`on_late`](crate::Hestan::on_late) hook receives: something with a
 /// declared freshness policy has just crossed from fresh to late. one event per
-/// crossing, not one per poll — the crossing is the news.
+/// crossing, not one per poll: the crossing is the news.
 #[derive(Debug, Clone, Serialize)]
 pub struct LateEvent {
     /// which side of the api this is about, since a job and an asset may share
@@ -85,8 +85,8 @@ impl Verdict {
 
 /// the success an asset's policy is measured from: its **oldest** key's build
 /// time, so a partitioned asset is late as soon as any one key is. keys that
-/// were never built are ignored — a key with no build has no age, and the
-/// missing count already says so — and an asset with no build at all reports
+/// were never built are ignored (a key with no build has no age, and the
+/// missing count already says so), and an asset with no build at all reports
 /// `None`, which reads as [`Freshness::Never`].
 pub(crate) fn asset_last_success(mats: &Mats, meta: &AssetMeta) -> Option<DateTime<Utc>> {
     match &meta.partitions {

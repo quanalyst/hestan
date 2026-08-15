@@ -5,12 +5,12 @@
 //! methods behind a mutex and every call site in the crate expects that;
 //! making them async would change all eighty and every caller for nothing,
 //! since sqlite blocks the runtime on one connection today and that is the
-//! accepted architecture. so this blocks too — but it drives the client
+//! accepted architecture. so this blocks too, but it drives the client
 //! itself rather than using the sync `postgres` crate, which owns a runtime
 //! and calls `block_on` on it, and so panics outright the moment it is called
 //! from a thread already driving one. hestan calls the store from async code
 //! nearly everywhere. one connection, one runtime of its own to carry it, and
-//! a caller that waits: the same blocking sqlite already does, and no pool —
+//! a caller that waits: the same blocking sqlite already does, and no pool:
 //! what postgres is for here is several processes sharing a run log, not one
 //! process issuing more statements at once.
 //!
@@ -23,7 +23,7 @@
 //! **every text column is `COLLATE "C"`.** sqlite compares text byte by byte;
 //! postgres compares it in the database's collation, which on a `en_US.UTF-8`
 //! database sorts `probe:docs` in a place byte order does not. the run log's
-//! text is ids, names, keys and timestamps — opaque strings that must sort the
+//! text is ids, names, keys and timestamps: opaque strings that must sort the
 //! same way on both backends or the same query answers two things.
 //!
 //! **no tls.** the connection is what libpq would call `sslmode=disable`: a
@@ -253,7 +253,7 @@ const CLAIM_LOCK: i64 = 0x0068_6573_7461_6e01;
 /// one postgres connection, and the runtime that carries it.
 ///
 /// the runtime is one thread whose whole job is the socket. the futures
-/// themselves are driven by whichever thread called — see [`wait`] — so a
+/// themselves are driven by whichever thread called (see [`wait`]), so a
 /// query blocks its caller and nothing else, and a caller that is itself a
 /// task on somebody else's runtime is not the special case it would be with
 /// the sync client.
@@ -261,7 +261,7 @@ pub(crate) struct Client {
     client: tokio_postgres::Client,
     /// an `Option` only so that [`Drop`] can take it: dropping a runtime
     /// blocks, blocking is not allowed on a thread that is driving one, and
-    /// the last handle on a store goes out of scope wherever it happens to —
+    /// the last handle on a store goes out of scope wherever it happens to,
     /// which is as likely as not inside a task.
     rt: Option<Runtime>,
 }
@@ -309,9 +309,9 @@ pub(crate) fn unmigrated(url: &str) -> Result<Client, Error> {
 
 /// drive `f` to completion on the calling thread.
 ///
-/// not `Runtime::block_on`, which panics when the thread already has a runtime
-/// — and every store call made from inside an op, a hook or an api handler is
-/// on such a thread. entering gives the future the reactor and the connection
+/// not `Runtime::block_on`, which panics when the thread already has a
+/// runtime, and every store call made from inside an op, a hook or an api
+/// handler is on such a thread. entering gives the future the reactor and the connection
 /// task it needs; blocking the caller is what keeps `Store` synchronous.
 fn wait<T>(rt: &Runtime, f: impl Future<Output = T>) -> T {
     let _entered = rt.enter();
@@ -320,7 +320,7 @@ fn wait<T>(rt: &Runtime, f: impl Future<Output = T>) -> T {
 
 impl Client {
     /// the runtime carrying this connection. present for as long as the client
-    /// is — [`Drop`] takes it and nothing else does.
+    /// is; [`Drop`] takes it and nothing else does.
     fn rt(&self) -> &Runtime {
         self.rt.as_ref().expect("the runtime outlives its client")
     }
@@ -457,7 +457,7 @@ CREATE INDEX events_subject ON events(subject_kind, subject, seq DESC);
 /// later build wrote.
 ///
 /// one transaction around the lot (postgres ddl is transactional), so an
-/// interrupted first boot — or an interrupted step — leaves the database
+/// interrupted first boot (or an interrupted step) leaves the database
 /// exactly as found, which is the same guarantee the sqlite chain gives. the
 /// chain is forward-only: a step is a `if version < n` below, in order, and
 /// the stamp moves once at the end.
@@ -511,7 +511,7 @@ fn migrate(client: &mut Client) -> Result<(), Error> {
 }
 
 /// `?1` becomes `$1`. the two dialects number their placeholders identically
-/// and spell the sigil differently, and that is the whole of it — a `?` not
+/// and spell the sigil differently, and that is the whole of it: a `?` not
 /// followed by a digit is left alone, and no query in the store has one.
 fn placeholders(sql: &str) -> String {
     let mut out = String::with_capacity(sql.len());

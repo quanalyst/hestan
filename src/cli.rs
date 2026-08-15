@@ -23,11 +23,11 @@
 //! the same commands mean the same things whether the jobs are in this binary,
 //! in a database on disk, or in a server across the network:
 //!
-//! - **embedded**, the default — everything works, because everything is here.
-//! - **`--db <path|url>`** — a run log opened directly, with no server running.
+//! - **embedded**, the default: everything works, because everything is here.
+//! - **`--db <path|url>`**: a run log opened directly, with no server running.
 //!   reads work; launching does not in a binary the jobs are not compiled into,
 //!   and it says so in a sentence rather than an error code.
-//! - **`--server <url>`** — a running instance, over the http api it already
+//! - **`--server <url>`**: a running instance, over the http api it already
 //!   serves. no new endpoints: everything asked for over the network is
 //!   something the ui already asks for.
 
@@ -52,7 +52,7 @@ use crate::store::{EventQuery, Store};
 /// how often the wait loop looks for new lines and for a settled status.
 ///
 /// a poll rather than a subscription because the run may be executing in
-/// another process altogether — there is no notification that crosses a process
+/// another process altogether: there is no notification that crosses a process
 /// boundary, and the store is the only thing both of them can see.
 const TAIL_POLL: Duration = Duration::from_millis(50);
 
@@ -68,7 +68,7 @@ const TAIL_PAGE: u32 = 500;
 /// how many runs `runs` shows unless `--limit` says otherwise.
 const RUNS_PAGE: u32 = 20;
 
-/// how much of the queue `queue` shows — the same page the api serves.
+/// how much of the queue `queue` shows, which is the same page the api serves.
 const QUEUE_PAGE: u32 = 200;
 
 /// what the process exits with.
@@ -99,7 +99,7 @@ pub enum Exit {
     /// the command line was wrong. no work was attempted, so retrying it does
     /// the same thing.
     Usage = 2,
-    /// the run was canceled — somebody's decision, not a fault.
+    /// the run was canceled: somebody's decision, not a fault.
     Canceled = 3,
     /// `--timeout` ran out. the run is still going; this says nothing about
     /// how it ends.
@@ -107,7 +107,7 @@ pub enum Exit {
     /// the store or the server could not be reached. the deployment, not the
     /// work.
     Unreachable = 5,
-    /// this mode cannot serve this command — a launch against `--db`, say —
+    /// this mode cannot serve this command (a launch against `--db`, say)
     /// and the message says which mode would.
     Unsupported = 6,
     /// `doctor` found something worth acting on. a code of its own so a check
@@ -473,7 +473,7 @@ struct ServeArgs {
 
 /// parse argv and do what it says, in this binary, against this registry.
 ///
-/// **with no arguments this is `app.serve(addr)`** — the same call, the same
+/// **with no arguments this is `app.serve(addr)`**: the same call, the same
 /// address, the same error if the socket will not bind. a deployment swapping
 /// one for the other gains a command line and changes nothing else, which is
 /// the only way a mount like this is worth having.
@@ -511,7 +511,7 @@ pub async fn run(app: Hestan, addr: impl Into<SocketAddr>) -> Result<(), Error> 
         // the promise at the top of this file
         None => return app.serve(addr).await,
         // `serve` is still this binary serving, so it stays out of the
-        // dispatch below — but `--db` moves which run log it serves, exactly
+        // dispatch below, but `--db` moves which run log it serves, exactly
         // as it does for every other command
         Some(Command::Serve(args)) if cli.global.server.is_none() => {
             let app = match &cli.global.db {
@@ -531,7 +531,7 @@ pub async fn run(app: Hestan, addr: impl Into<SocketAddr>) -> Result<(), Error> 
 /// enough.
 ///
 /// there is no address to serve on and no registry to serve, so unlike
-/// [`run`] this needs to be told where to look — `--db` or `--server`, and
+/// [`run`] this needs to be told where to look: `--db` or `--server`, and
 /// nothing at all is a usage error rather than a default.
 pub async fn standalone() -> Result<(), Error> {
     let cli = Cli::parse();
@@ -573,7 +573,7 @@ async fn finish(reach: Result<Reach, Fail>, command: Command, out: &Out) -> Resu
 /// what a command is being run against.
 ///
 /// the same commands mean the same things in all three, and where one of them
-/// genuinely cannot answer, it says which one it is and what would — see
+/// genuinely cannot answer, it says which one it is and what would; see
 /// [`no_registry`]. what separates them is only what is in front of them:
 /// definitions and a database, a database, or somebody else's process.
 enum Reach {
@@ -609,7 +609,7 @@ fn reach(app: Option<Hestan>, global: &Global) -> Result<Reach, Fail> {
 /// what to present to an authenticated server: `--token`, or `HESTAN_TOKEN`.
 ///
 /// the environment is read here rather than by the argument parser, which can
-/// do it — because a parser that knows about an environment variable prints
+/// do it, because a parser that knows about an environment variable prints
 /// its **value** in `--help`, and a secret in a help screen is a secret in
 /// whatever collected that help screen. an empty variable is not a token: an
 /// unset one and one set to nothing are the same intention.
@@ -669,7 +669,7 @@ fn no_registry(target: &str, wanted: &str) -> Fail {
         Exit::Unsupported,
         format!(
             "--db {target} opens a run log, which records what ran but holds no job \
-             definitions — {wanted} needs the binary they are compiled into, or --server \
+             definitions. {wanted} needs the binary they are compiled into, or --server \
              pointed at one that is running"
         ),
     )
@@ -934,7 +934,7 @@ async fn dispatch(reach: Reach, command: Command, out: &Out) -> Result<(), Fail>
                     crate::server::queue_json(&app.store, &app.limits, &defined)?
                 }
                 // the order is a fact about the queue; the blame is a fact
-                // about the limits, and this mode has none — see
+                // about the limits, and this mode has none; see
                 // `Store::queue_rows`
                 Reach::Store { store, .. } => {
                     let queued: Vec<Value> = store
@@ -1012,7 +1012,7 @@ async fn dispatch(reach: Reach, command: Command, out: &Out) -> Result<(), Fail>
 
 /// what a process that is about to launch something should be.
 ///
-/// **waiting**, it executes the run itself — the same thing
+/// **waiting**, it executes the run itself, the same thing
 /// [`Hestan::run_once`](crate::Hestan::run_once) does, and for the same reason:
 /// a one-shot has nobody else to hand the work to, and a `--wait` that only
 /// enqueued would hang wherever nothing else was serving.
@@ -1020,7 +1020,7 @@ async fn dispatch(reach: Reach, command: Command, out: &Out) -> Result<(), Fail>
 /// **not waiting**, it must not, and this is the whole reason there is a choice
 /// here. an enqueue pokes the dispatcher, so a process that both decides and
 /// executes would start the run and then exit out from under it a millisecond
-/// later — a launch that reliably killed what it launched. a role that decides
+/// later: a launch that reliably killed what it launched. a role that decides
 /// and does not execute leaves the run on the queue, which is exactly what
 /// "launch" has always meant everywhere else in hestan.
 fn launching_role(wait: bool) -> Role {
@@ -1234,7 +1234,7 @@ impl Watched {
 ///
 /// the ordering is the whole of this function. the status is read *before* the
 /// drain that follows it, so a run that finished between two polls has its last
-/// lines read after the status that ends the loop rather than before it — which
+/// lines read after the status that ends the loop rather than before it, which
 /// is the race a fast job loses: it can be over before the first poll, and every
 /// line it wrote still has to come out. the executor writes a run's terminal
 /// event before its terminal status for the same reason, so stopping at the
@@ -1256,7 +1256,7 @@ async fn wait(
         }
         if deadline.is_some_and(|d| Instant::now() >= d) {
             // "gave up waiting" and "stopped the run" are different things and
-            // only one of them happened — except when the run is executing
+            // only one of them happened, except when the run is executing
             // right here, where exiting is the other one too, and saying so
             // beats leaving it to be discovered
             let ours = match watched.ours(&run) {
@@ -1612,7 +1612,7 @@ async fn paused(reach: Reach, what: What, paused: bool, out: &Out) -> Result<(),
                     }
                     // no actor: a command line against a database has nobody
                     // to name. whoever ran it is a fact about a shell, not an
-                    // identity anything checked — and a name nothing checked
+                    // identity anything checked, and a name nothing checked
                     // is worse in an audit trail than no name at all
                     _ => {
                         stored(&reach)?.set_schedule_paused(&job, &s(row, "expr"), paused, None)?;
@@ -1665,8 +1665,8 @@ fn cancel(store: &Store, id: &str, out: &Out) -> Result<(), Fail> {
         RunStatus::Queued | RunStatus::Running => Err(Fail::new(
             Exit::Unsupported,
             format!(
-                "run {id} is being executed by instance {}, and only that process can stop it \
-                 — reach it with --server, or use the ui it is serving",
+                "run {id} is being executed by instance {}, and only that process can stop \
+                 it. reach it with --server, or use the ui it is serving",
                 run.claimed_by.as_deref().unwrap_or("(unknown)")
             ),
         )),
@@ -1754,11 +1754,11 @@ impl Api {
         // whether anything was sent or where it would have come from
         let message = match (status.as_u16(), self.token.is_some()) {
             (401, false) => format!(
-                "{message} — {} is authenticated: pass --token, or set HESTAN_TOKEN, which \
+                "{message}; {} is authenticated: pass --token, or set HESTAN_TOKEN, which \
                  keeps it out of ps",
                 self.base
             ),
-            (401, true) => format!("{message} — {} refused this token", self.base),
+            (401, true) => format!("{message}; {} refused this token", self.base),
             _ => message,
         };
         Fail::new(code, message)
@@ -1767,7 +1767,7 @@ impl Api {
     /// the server-sent event stream, one parsed `data:` payload at a time.
     ///
     /// hand-parsed rather than through a client library because the whole of
-    /// the format that matters here is two field names — and a dependency for
+    /// the format that matters here is two field names, and a dependency for
     /// that would be a dependency in every build that turns this feature on.
     async fn stream(&self, path: &str, mut each: impl FnMut(Value)) -> Result<(), Fail> {
         let mut response = self
@@ -1776,7 +1776,7 @@ impl Api {
             .await
             .map_err(|e| self.out_of_reach(&e))?;
         // a stream that never opened says why in the same words a request that
-        // was refused does — a follow that was not authenticated is not a
+        // was refused does: a follow that was not authenticated is not a
         // network that was not there
         let status = response.status();
         if !status.is_success() {
@@ -1818,7 +1818,7 @@ impl Api {
 // so `--json` means the same thing pointed at your own binary as it does
 // pointed at a server, and a script does not have to care which it got.
 //
-// where a mode genuinely knows less — a run log has no registry — the keys it
+// where a mode genuinely knows less (a run log has no registry) the keys it
 // cannot fill are **absent** rather than null or invented, and the table drops
 // the columns that would have shown them.
 
@@ -2132,7 +2132,7 @@ fn parse_tags(pairs: &[String]) -> Result<RunTags, Fail> {
 }
 
 /// the query string `GET /api/runs` takes, from the same flags the store read
-/// uses — so the two modes are filtering on the same thing.
+/// uses, so the two modes are filtering on the same thing.
 fn runs_query(args: &RunsArgs) -> Result<String, Fail> {
     let mut query = vec![format!("limit={}", args.limit)];
     if let Some(job) = &args.job {
@@ -2180,7 +2180,7 @@ fn escape(text: &str) -> String {
     out
 }
 
-/// `2h`, `30m`, `7d` — or an rfc3339 instant, for a script that has one.
+/// `2h`, `30m`, `7d`, or an rfc3339 instant, for a script that has one.
 ///
 /// the short form is what anybody types at a terminal and the long one is what
 /// a program has, so both are accepted and neither is the "real" one.
@@ -2244,7 +2244,7 @@ fn secs(ms: i64) -> String {
 /// how much free space is little enough to say something about.
 ///
 /// a ratio rather than a size, because "500mb left" means nothing without
-/// knowing whether that is 90% of the disk or 0.4% of it — and because the
+/// knowing whether that is 90% of the disk or 0.4% of it, and because the
 /// thing that fills a disk is a run log growing at whatever rate this
 /// deployment writes.
 const DISK_LOW: f64 = 0.10;
@@ -2285,7 +2285,7 @@ struct Finding {
     level: Level,
     check: &'static str,
     says: String,
-    /// what to do about it. only ever on something actionable — a fix beside
+    /// what to do about it. only ever on something actionable: a fix beside
     /// an `ok` would be advice about nothing.
     fix: Option<String>,
 }
@@ -2331,7 +2331,7 @@ impl Finding {
 /// one command that answers "why is nothing running".
 ///
 /// **every check here looks at something.** a check that cannot see what it is
-/// about does not report that everything is fine — it is not run at all, and
+/// about does not report that everything is fine: it is not run at all, and
 /// the checks a mode could not make are listed at the end under their own
 /// heading. an `ok` line means something was read and was as it should be,
 /// which is the only thing that makes the other lines worth believing.
@@ -2425,7 +2425,7 @@ async fn doctor(reach: Reach, out: &Out) -> Result<(), Fail> {
 /// writing and rolled back says the database took a write lock a moment ago,
 /// which is what a run needs and is not the same as the store being well. it
 /// is the half of "why is nothing being recorded" that a command line can
-/// answer from outside the deployment — a file whose permissions changed, a
+/// answer from outside the deployment: a file whose permissions changed, a
 /// disk mounted read-only, another writer holding the lock past the busy
 /// timeout, a postgres nobody can reach. what this process has *seen* a store
 /// do is the other half, and only a running deployment has that: it is on
@@ -2437,7 +2437,7 @@ fn check_store_writes(store: &Store) -> Finding {
             "writes",
             format!("the store will not take a write: {e}"),
             "nothing can be recorded about a run until this is fixed, and a process that \
-             finds it mid-run stops rather than reporting an outcome nothing holds — \
+             finds it mid-run stops rather than reporting an outcome nothing holds. \
              check permissions, free space, and whether another writer is holding the lock",
         ),
     }
@@ -2445,8 +2445,8 @@ fn check_store_writes(store: &Store) -> Finding {
 
 /// every cron in the table, parsed the way the scheduler parses it.
 ///
-/// the rows outlive the code that wrote them — a process syncs them at boot and
-/// a database can hold rows from a deployment that has since changed — so an
+/// the rows outlive the code that wrote them (a process syncs them at boot and
+/// a database can hold rows from a deployment that has since changed), so an
 /// expression or a timezone that no longer resolves is a schedule that silently
 /// never fires again. that is what this looks for, by parsing every one.
 fn check_schedules(store: &Store) -> Result<Vec<Finding>, Fail> {
@@ -2527,7 +2527,7 @@ fn check_leases(store: &Store, now: DateTime<Utc>) -> Result<Vec<Finding>, Fail>
             oldest.id,
             oldest.claimed_by.as_deref().unwrap_or("(unknown)")
         ),
-        "any hestan process runs the lease loop that reclaims these — start one, \
+        "any hestan process runs the lease loop that reclaims these: start one, \
          and they are failed or requeued as `reclaim` says",
     )])
 }
@@ -2557,8 +2557,8 @@ fn check_queue(app: &Inspected) -> Result<Vec<Finding>, Fail> {
                  taking them off the queue",
                 free.len()
             ),
-            "start a process whose role executes — `serve` with the default role, or \
-             `work` — against this database",
+            "start a process whose role executes (`serve` with the default role, or \
+             `work`) against this database",
         ));
     }
     if !blocked.is_empty() {
@@ -2575,7 +2575,7 @@ fn check_queue(app: &Inspected) -> Result<Vec<Finding>, Fail> {
 /// the rates this registry declares, and what a second process does to them.
 ///
 /// a bucket is one process's memory, so the number that matters is how many
-/// processes execute — and a deployment that scaled by adding a worker has
+/// processes execute, and a deployment that scaled by adding a worker has
 /// doubled every rate it declares without changing a line. not an error: it is
 /// what a worker is for, and dividing the limit is the answer.
 fn check_rates(app: &Inspected) -> Finding {
@@ -2592,7 +2592,7 @@ fn check_rates(app: &Inspected) -> Finding {
         Role::Worker => Finding::note(
             "rates",
             format!(
-                "{declared} — and this process is a {}, so every other worker \
+                "{declared}; this process is a {}, so every other worker \
                  honours the same limit separately and the far side sees the sum",
                 app.role
             ),
@@ -2649,7 +2649,7 @@ fn check_retention(app: &Inspected) -> Vec<Finding> {
         "retention",
         format!(
             "a retention policy is configured but this process is a {}, and only a role \
-             that decides sweeps — nothing here will ever delete anything",
+             that decides sweeps: nothing here will ever delete anything",
             app.role
         ),
         "give the policy to the process that owns the schedules, which is the one \
@@ -2661,7 +2661,7 @@ fn check_retention(app: &Inspected) -> Vec<Finding> {
 ///
 /// not an error either way: a deployment on loopback is a deployment on one
 /// machine, and the refusal in `serve` already makes that the only thing it can
-/// be. what this is for is the deployment somebody is about to move — the
+/// be. what this is for is the deployment somebody is about to move: the
 /// answer to "is the thing I am about to put an address on guarded" should not
 /// be "read the source".
 fn check_auth(auth: Option<&Auth>) -> Finding {
@@ -2671,7 +2671,7 @@ fn check_auth(auth: Option<&Auth>) -> Finding {
         Some(Auth::None) => Finding::note(
             "auth",
             "Auth::None: nothing here checks who is asking, deliberately",
-            "make sure what is in front of this still checks identity — that is what \
+            "make sure what is in front of this still checks identity: that is what \
              Auth::None asserts",
         ),
         None => Finding::note(
@@ -2714,7 +2714,7 @@ async fn remote_doctor(api: &Api, out: &Out) -> Result<(), Fail> {
     let mut findings = vec![finding];
     let mut unchecked = vec![
         "the schedules, the sensors, the leases, the queue, the retention policy and \
-         the disk, which an http api exposes none of — point --db at the database, or \
+         the disk, which an http api exposes none of: point --db at the database, or \
          run doctor in the deployment's own binary",
     ];
     // the one thing only the running process knows: what its store has
@@ -2723,14 +2723,14 @@ async fn remote_doctor(api: &Api, out: &Out) -> Result<(), Fail> {
     match api.get("/api/rates").await {
         Ok(rates) => findings.push(check_remote_rates(&rates)),
         Err(_) => unchecked.push(
-            "what is waiting behind its rates, which is behind the guard — pass \
+            "what is waiting behind its rates, which is behind the guard: pass \
              --token, or set HESTAN_TOKEN",
         ),
     }
     match api.get("/api/health").await {
         Ok(health) => findings.push(check_remote_store(&health)),
         Err(_) => unchecked.push(
-            "whether its store is taking writes, which is behind the guard — pass \
+            "whether its store is taking writes, which is behind the guard: pass \
              --token, or set HESTAN_TOKEN",
         ),
     }
@@ -2771,8 +2771,8 @@ async fn remote_doctor(api: &Api, out: &Out) -> Result<(), Fail> {
 /// what is piling up behind a rate, which only the process holding the bucket
 /// knows.
 ///
-/// ops queued for a token are not an error — a rate is a promise to go slowly,
-/// and going slowly looks exactly like this — but it is the answer to "why is
+/// ops queued for a token are not an error (a rate is a promise to go slowly,
+/// and going slowly looks exactly like this), but it is the answer to "why is
 /// this run taking an hour", and nothing else on this page would say it.
 fn check_remote_rates(answer: &Value) -> Finding {
     let rates = list(answer, "rates");
@@ -2801,7 +2801,7 @@ fn check_remote_rates(answer: &Value) -> Finding {
     Finding::note(
         "rates",
         queued.join(", "),
-        "that is the rate doing its job — raise it if the far side allows more, \
+        "that is the rate doing its job: raise it if the far side allows more, \
          and remember the bucket is this process's alone",
     )
 }
@@ -2823,8 +2823,8 @@ fn check_remote_store(health: &Value) -> Finding {
                 "its store is refusing writes: {unrecorded} run outcome(s) and {dropped} \
                  event(s) have gone unrecorded, and it has stopped claiming runs"
             ),
-            "it will start again on its own when a write lands — the lease loop tries \
-             every 15 seconds — so this is about the database rather than about hestan",
+            "it will start again on its own when a write lands (the lease loop tries \
+             every 15 seconds), so this is about the database rather than about hestan",
         );
     }
     if unrecorded > 0 || dropped > 0 {
@@ -2866,7 +2866,7 @@ fn check_disk(target: &str, free: u64, total: u64) -> Finding {
 }
 
 /// free and total bytes on the filesystem holding `target`, or `None` where the
-/// question does not apply — a `postgres://` url is a server's disk and not
+/// question does not apply: a `postgres://` url is a server's disk and not
 /// this machine's, and saying nothing beats reporting the wrong one.
 #[cfg(unix)]
 fn disk_free(target: &str) -> Option<(u64, u64)> {
@@ -2913,7 +2913,7 @@ fn bytes(n: u64) -> String {
 ///
 /// this is the command the mount pays for. the dag, what is parallel, which
 /// pools gate it and where isolation applies are all properties of the ops
-/// themselves — so answering takes a registry, and the registry is compiled
+/// themselves, so answering takes a registry, and the registry is compiled
 /// into the binary this ran from. nothing is loaded and nothing is asked.
 fn explain(
     reach: Reach,
@@ -2929,7 +2929,7 @@ fn explain(
             return Err(Fail::new(
                 Exit::Unsupported,
                 "a plan is a property of the job definitions, which live in the binary \
-                 they were compiled into — run explain there",
+                 they were compiled into: run explain there",
             ));
         }
     };
@@ -3023,7 +3023,7 @@ fn explain(
         "{}{}",
         out.paint(job.name(), BOLD),
         match job.description() {
-            Some(d) => format!(" — {d}"),
+            Some(d) => format!(": {d}"),
             None => String::new(),
         }
     );
@@ -3098,7 +3098,7 @@ fn explain(
 /// the ops in dependency order, grouped into the stages a run goes through.
 ///
 /// an op's stage is one past the deepest of its deps, so everything in a stage
-/// has its dependencies behind it and none on each other — which is exactly the
+/// has its dependencies behind it and none on each other, which is exactly the
 /// set the executor is free to run at once, subject to `max_parallel` and
 /// whatever pools they take from.
 fn stages(job: &Job) -> Vec<Vec<&crate::op::Op>> {
@@ -3359,8 +3359,8 @@ fn level_color(level: Option<EventLevel>) -> &'static str {
 /// the other end can take.
 ///
 /// the rule the rest of this module keeps is that **stdout belongs to the
-/// answer**. under `--json` or `--quiet` nothing else may reach it — no
-/// progress, no warning, no blank line — because something is parsing it. a
+/// answer**. under `--json` or `--quiet` nothing else may reach it (no
+/// progress, no warning, no blank line) because something is parsing it. a
 /// run's log is stderr for the same reason: it is company while you wait, not
 /// the answer.
 struct Out {
@@ -3503,7 +3503,7 @@ impl Cell {
 /// a padded table on stdout.
 ///
 /// the styling goes on after the padding, so a coloured cell is exactly as wide
-/// as the same cell in a pipe — a column that moves when you turn colour on is
+/// as the same cell in a pipe: a column that moves when you turn colour on is
 /// a column nothing can line up against.
 struct Table {
     headers: Vec<&'static str>,
@@ -4050,7 +4050,7 @@ mod tests {
         assert_eq!(wrong.level, Level::Wrong);
         assert!(wrong.says.contains("stopped claiming"), "{}", wrong.says);
 
-        // an api that says nothing about its store — an older deployment — is
+        // an api that says nothing about its store (an older deployment) is
         // not reported as broken
         assert_eq!(check_remote_store(&json!({"ok": true})).level, Level::Ok);
     }

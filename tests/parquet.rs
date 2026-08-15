@@ -1,7 +1,7 @@
 //! the parquet io manager where it actually sits: between two ops of a run.
 //!
 //! the unit tests in `src/io.rs` are the round trip on its own. these are the
-//! paths a manager only meets in a run — a downstream op reading a handle
+//! paths a manager only meets in a run: a downstream op reading a handle
 //! back, a resume seeding one written by a run that is over, and what
 //! retention does to the files when it takes the run.
 
@@ -88,7 +88,7 @@ async fn the_run_log_keeps_a_handle_and_the_op_run_says_how_much_it_stored() {
 }
 
 // a resume seeds the ops that already succeeded from the run before it, and
-// what it seeds is a handle to a file that run wrote — resolved by this run,
+// what it seeds is a handle to a file that run wrote, resolved by this run,
 // under this run's id, which the handle must not be looked up by
 #[tokio::test]
 async fn a_handle_written_by_the_run_before_survives_a_resume() {
@@ -149,7 +149,7 @@ async fn a_handle_written_by_the_run_before_survives_a_resume() {
 
 // retention takes the file with the run. the run row is the only record of
 // which files the run wrote, so a sweep that took the row and left the file
-// would be leaving something nothing could ever find again — and this is
+// would be leaving something nothing could ever find again, and this is
 // `FileIo`'s behaviour too, asserted beside it in `tests/pipeline.rs`, because
 // a run collected under one manager and left under the other would be two
 // answers to one question
@@ -205,7 +205,7 @@ async fn retention_takes_the_file_with_the_run() {
 
 // an asset's value goes where every other output goes. the second build does
 // not run the upstream at all, so what it reads is the file the first build
-// wrote — the whole of the point, since a memoized value used to be a second
+// wrote: the whole of the point, since a memoized value used to be a second
 // copy of it in the run log
 #[tokio::test]
 async fn a_later_build_seeds_an_asset_from_the_file_its_value_lives_in() {
@@ -253,7 +253,7 @@ async fn a_later_build_seeds_an_asset_from_the_file_its_value_lives_in() {
     assert!(path.exists(), "no file at {path:?}");
     drop(store);
 
-    // orders is fresh, so the second build seeds it — out of the file, which
+    // orders is fresh, so the second build seeds it, out of the file, which
     // is the only place its value is
     *seen.lock().unwrap() = None;
     let second = boot().build_asset("totals").await.unwrap();
@@ -310,7 +310,7 @@ async fn the_fingerprint_is_the_same_wherever_the_value_lives() {
 
 // retention takes what a run wrote when it takes the run, and an asset's value
 // is now one of those things. so the sweep leaves a run an asset's current
-// value is inside — and takes it once a rebuild has moved that value on, which
+// value is inside, and takes it once a rebuild has moved that value on, which
 // is what keeps this from being a leak dressed up as a policy
 #[tokio::test]
 async fn retention_leaves_the_run_a_later_build_would_seed_from() {
@@ -358,7 +358,7 @@ async fn retention_leaves_the_run_a_later_build_would_seed_from() {
     drop(store);
 
     // and the rebuild released it: the current value is in the second run now,
-    // so the first is history like any other run past its policy — while the
+    // so the first is history like any other run past its policy, while the
     // build this sweep runs still seeds from the value that is current
     let third = sweeping().build_asset("totals").await.unwrap();
     assert_eq!(third.status, RunStatus::Success);

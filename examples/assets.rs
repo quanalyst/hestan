@@ -192,7 +192,7 @@ async fn main() -> Result<(), hestan::Error> {
     .partitioned(Partitions::hourly(start_hour).build_limit(48));
 
     // and the rollup this phase exists for: one daily key reading the 24 hourly
-    // keys inside it. today's key covers hours that have not happened yet — it
+    // keys inside it. today's key covers hours that have not happened yet: it
     // rolls up the ones that have, and goes stale as each next one lands
     let start_day = (Utc::now() - chrono::Duration::days(1))
         .format("%Y-%m-%d")
@@ -294,6 +294,6 @@ async fn main() -> Result<(), hestan::Error> {
 
     // the same mount the demo uses: with no arguments this serves on :4002 and
     // the example is what it was, and with any it is a command line over the
-    // assets declared above — `assets`, `build`, `backfill` and the rest
+    // assets declared above: `assets`, `build`, `backfill` and the rest
     hestan::cli::run(app, ([127, 0, 0, 1], 4002)).await
 }

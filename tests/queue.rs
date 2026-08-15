@@ -3,7 +3,7 @@
 //! `harness = false` for the same reason [`isolation`](isolation.rs) needs it:
 //! every process in this test is this same binary, re-executed, and its `main`
 //! has to rebuild the same jobs against the same database. libtest's `main`
-//! cannot, and the constraint is exactly the one a real deployment is under —
+//! cannot, and the constraint is exactly the one a real deployment is under:
 //! a scheduler and its workers are one image with one registry, started with
 //! different roles.
 //!
@@ -32,7 +32,7 @@ const DB: &str = "HESTAN_QUEUE_DB";
 /// what a child is to be. absent means "run the cases".
 const ROLE: &str = "HESTAN_QUEUE_ROLE";
 /// where every op appends a line saying which run it was and which process ran
-/// it — the double-run detector.
+/// it: the double-run detector.
 const MARKS: &str = "HESTAN_QUEUE_MARKS";
 
 fn main() {
@@ -137,7 +137,7 @@ fn admin(server: &str, sql: &str) {
     });
 }
 
-/// a handle on whichever backend `target` names — a path or a url. what
+/// a handle on whichever backend `target` names: a path or a url. what
 /// [`Hestan::db`] does for a whole app, for the cases that want a store
 /// beside one.
 fn open(target: &str) -> Store {
@@ -148,13 +148,13 @@ fn open(target: &str) -> Store {
     Store::open(target).unwrap()
 }
 
-/// the registry every process in this test builds — the parent that enqueues
+/// the registry every process in this test builds: the parent that enqueues
 /// and each child that executes. one image, one registry, different roles.
 fn app(db: &str) -> Hestan {
     Hestan::new()
         .jobs(jobs())
         // one call every two seconds, declared once in a registry every process
-        // in this test builds — which is exactly the deployment shape that
+        // in this test builds, which is exactly the deployment shape that
         // makes it per process
         .rate("api", 1, Duration::from_secs(2))
         // a sensor that would fire constantly, so "a worker fires nothing" is a
@@ -225,7 +225,7 @@ fn rate_marks() -> PathBuf {
     marks().with_extension("rate")
 }
 
-/// a runner that enqueues and never executes — the scheduler half of a split
+/// a runner that enqueues and never executes: the scheduler half of a split
 /// deployment, in this process, so a case can put work on the queue and be sure
 /// nothing here took it.
 fn enqueuer(db: &str) -> Runner {
@@ -329,7 +329,7 @@ async fn two_workers_split_it(db: &str) {
     assert_eq!(
         pids.len(),
         2,
-        "one worker took the whole queue: {pids:?} — per-process slots did not bind"
+        "one worker took the whole queue: {pids:?}; per-process slots did not bind"
     );
 }
 
@@ -380,7 +380,7 @@ async fn a_worker_decides_nothing(db: &str) {
 ///
 /// a rate is a bucket in a process's memory. two workers each honouring "one
 /// call every two seconds" make two calls in two seconds, and the api on the
-/// other side has no idea it was talking to two of anything — so the thing to
+/// other side has no idea it was talking to two of anything, so the thing to
 /// divide is the limit, and `docs/scaling.md` says so where somebody sizing a
 /// deployment will read it.
 async fn a_rate_is_per_process(db: &str) {

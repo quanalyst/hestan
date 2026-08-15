@@ -24,22 +24,22 @@
 //! ```
 //!
 //! that is a deployment. `serve` opens `hestan.db`, runs the scheduler, and
-//! puts the ui on <http://127.0.0.1:4000> — every run, every op, the logs each
-//! one produced, and a button to launch one by hand. nothing else has to be
+//! puts the ui on <http://127.0.0.1:4000>, with every run, every op, the logs
+//! each one produced, and a button to launch one by hand. nothing else has to be
 //! installed and there is no separate daemon: this is your binary.
 //!
 //! # Where to go next
 //!
 //! - [`Op`] is a unit of work and [`Job`] wires ops into a dag. that is the
 //!   whole of the core model.
-//! - [`Asset`] is the other way of describing the same work — by what it
+//! - [`Asset`] is the other way of describing the same work: by what it
 //!   *produces* rather than by what runs. `docs/choosing.md` is about picking
 //!   between the two, and between the other pairs that look alike.
 //! - [`Schedule`] fires a job on a cron expression; [`Sensor`] fires one when
 //!   something it polls says to.
 //! - [`Hestan`] is the registry everything is declared on, and `serve` is what
 //!   starts it.
-//! - [`Store`] is the run log, readable on its own — a report, an export, a
+//! - [`Store`] is the run log, readable on its own: a report, an export, a
 //!   test that asserts what a run did.
 //!
 //! # Features
@@ -59,12 +59,12 @@
 //! | `bundled` | **on** by default: compiles sqlite from source rather than linking the system one |
 
 // `doc(cfg(..))` puts "available on crate feature x" on the items that need
-// one. it is a nightly attribute, so it is behind a cfg only docs.rs sets —
+// one. it is a nightly attribute, so it is behind a cfg only docs.rs sets,
 // which leaves a stable `cargo doc` building exactly as it did
 #![cfg_attr(docsrs, feature(doc_cfg))]
 // a public item with no rustdoc is a gap nothing reports: the build stays
 // green, the docs page grows a bare signature, and the number only ever goes
-// up. so it is an error, under every feature combination — a feature-gated
+// up. so it is an error, under every feature combination: a feature-gated
 // item is exactly the one nobody notices is bare
 #![deny(missing_docs)]
 // and a link to an item that was renamed is worse than no link: it reads as a
@@ -92,8 +92,8 @@ pub mod capture;
 #[cfg_attr(docsrs, doc(cfg(feature = "cli")))]
 pub mod cli;
 // a dbt project's models as assets, from the manifest dbt compiled. optional
-// because it is a whole other tool's dag and most deployments do not have one
-// — no dependency of its own, though: a manifest is json
+// because it is a whole other tool's dag and most deployments do not have
+// one. no dependency of its own, though: a manifest is json
 #[cfg(feature = "dbt")]
 #[cfg_attr(docsrs, doc(cfg(feature = "dbt")))]
 pub mod dbt;
@@ -179,7 +179,7 @@ pub use store::{EventQuery, Settled, Store};
 /// deliberately small: the types you name when writing a pipeline, plus
 /// `serde_json`'s [`Value`](serde_json::Value) and
 /// [`json!`](serde_json::json), which every op body ends up touching. the
-/// configuration surface — [`Auth`], [`Limits`], [`Retention`], [`Store`] —
+/// configuration surface ([`Auth`], [`Limits`], [`Retention`], [`Store`])
 /// is not here, because that is written once in `main` and reads better named.
 pub mod prelude {
     pub use crate::{

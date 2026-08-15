@@ -36,7 +36,7 @@ const CONTROL_READ_RETRY: Duration = Duration::from_secs(1);
 /// ```
 ///
 /// [`Hestan::schedule`](crate::Hestan::schedule) and friends are this with the
-/// common defaults filled in — utc, `{}`, [`Catchup::Skip`].
+/// common defaults filled in: utc, `{}`, [`Catchup::Skip`].
 #[derive(Debug, Clone)]
 pub struct Schedule {
     pub(crate) job: String,
@@ -90,7 +90,7 @@ pub(crate) struct ScheduleEntry {
     /// what every fire launches with; `{}` unless the declaration set it.
     pub params: Value,
     /// what downtime does to this schedule. it comes from the declaration and
-    /// is stored for the api rather than read back from it — the row is synced
+    /// is stored for the api rather than read back from it: the row is synced
     /// from the same value at startup, so the two cannot disagree.
     pub catchup: Catchup,
 }
@@ -183,7 +183,7 @@ pub(crate) fn upcoming_fires(
 /// cursor, both of which can change under a running process.
 ///
 /// `None` when the read failed. it used to be an empty map, which read as "no
-/// schedule is paused" — an administrative stop that fails open. the caller
+/// schedule is paused", an administrative stop that fails open. the caller
 /// stops the pass instead: a missed occurrence is recoverable, since catch-up
 /// sees it on the next pass, and a launch nobody asked for is not.
 fn rows(store: &Store) -> Option<HashMap<(String, String), ScheduleRow>> {
@@ -211,7 +211,7 @@ fn last_before(entry: &ScheduleEntry, now: DateTime<Utc>) -> Option<DateTime<Utc
 }
 
 /// occurrences strictly after `cursor` and strictly before `now`, newest
-/// first, at most `MAX_MISSED_SCAN` of them — the flag says the scan hit that
+/// first, at most `MAX_MISSED_SCAN` of them; the flag says the scan hit that
 /// wall with more behind it. this is the missed set, and the cursor is the only
 /// thing that makes it knowable: without one, "what should have fired while we
 /// were down" has no answer at all.
@@ -335,7 +335,7 @@ fn has_pending(runner: &Runner, job: &str) -> bool {
 }
 
 /// launch whatever is waiting, oldest first and one per job. the queue is the
-/// tick log — a `deferred` tick with no later tick for the same occurrence —
+/// tick log (a `deferred` tick with no later tick for the same occurrence),
 /// so a fire held when the process died is still held when it comes back.
 fn drain_pending(
     entries: &[ScheduleEntry],
@@ -516,7 +516,7 @@ fn note_runless_tick(
 }
 
 /// launch one occurrence and record what happened to it. `caught_up` says the
-/// occurrence came due while nothing was running to fire it — the tick row
+/// occurrence came due while nothing was running to fire it: the tick row
 /// cannot tell the two apart, and the event kind does.
 fn note_tick(
     runner: &Runner,
@@ -749,7 +749,7 @@ mod tests {
         parse(job, HOURLY, "UTC").unwrap().with_catchup(catchup)
     }
 
-    /// a store with one hourly schedule whose cursor is planted in the past —
+    /// a store with one hourly schedule whose cursor is planted in the past,
     /// which is exactly what a process that was down for `hours` leaves behind.
     fn down_for(store: &Store, hours: i64, catchup: Catchup) -> (DateTime<Utc>, DateTime<Utc>) {
         use chrono::TimeZone;
@@ -799,7 +799,7 @@ mod tests {
         );
         assert!(store.ticks(Some("etl"), 10).unwrap().is_empty());
         // 07:30 to 10:30 swallowed 08:00, 09:00 and 10:00; the cursor now says
-        // so, which is the whole point — without it the next boot would have
+        // so, which is the whole point: without it the next boot would have
         // no idea any of them existed
         assert_eq!(cursor_of(&store), Some(now - chrono::Duration::minutes(30)));
 

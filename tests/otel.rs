@@ -9,8 +9,8 @@
 //! in three.
 //!
 //! nothing here exports anything. what is being asserted is the tree hestan
-//! opens — which span is whose parent, what each carries, and where an event
-//! lands — because that tree is the whole of what hestan contributes to a
+//! opens (which span is whose parent, what each carries, and where an event
+//! lands) because that tree is the whole of what hestan contributes to a
 //! trace. turning it into otel spans is `tracing-opentelemetry`'s job, and
 //! testing that would be testing somebody else's crate.
 
@@ -141,7 +141,7 @@ fn flaky_job(fails: Arc<std::sync::atomic::AtomicU32>) -> Job {
 
 /// a current-thread runtime inside `with_default`, so every task hestan spawns
 /// polls on the thread the subscriber is the default for. hestan installs no
-/// subscriber anywhere — that is the claim — so a test has to install one to
+/// subscriber anywhere (that is the claim) so a test has to install one to
 /// see anything at all, and a multi-threaded runtime would put half the run on
 /// threads that have none.
 #[test]

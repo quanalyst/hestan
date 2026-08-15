@@ -132,7 +132,7 @@ pub(crate) fn router(state: AppState) -> Router {
         .route("/api/events", get(list_events))
         .route("/api/events/stream", get(stream_events))
         // every route above and nothing below it: the ui's own files are
-        // served by the fallback, which is outside this on purpose — a login
+        // served by the fallback, which is outside this on purpose: a login
         // page that needs a credential to load is a login page nobody can use
         .route_layer(axum::middleware::from_fn_with_state(auth, guard))
         .route("/api/whoami", get(whoami))
@@ -155,8 +155,8 @@ fn actor(who: &Who) -> Option<&str> {
 /// the endpoints that need an [admin](Access), by the route each request
 /// matched.
 ///
-/// only the exceptions are listed. everything else is the rule — a `GET` reads
-/// and needs a viewer, anything else changes something and needs an operator —
+/// only the exceptions are listed. everything else is the rule (a `GET` reads
+/// and needs a viewer, anything else changes something and needs an operator),
 /// so a route added tomorrow lands on the rule rather than in a hole, and the
 /// worst a forgotten line here can do is ask for too little privilege in one
 /// direction that is still not "anyone".
@@ -316,7 +316,7 @@ fn freshness_json(
 ///
 /// `store` and `pool_limit` rather than the whole server state, because the
 /// command line answers `jobs` with this same function and has no router
-/// around it — one description of a job, however it is asked for.
+/// around it: one description of a job, however it is asked for.
 pub(crate) fn job_summary(
     job: &Job,
     store: &Store,
@@ -338,7 +338,7 @@ pub(crate) fn job_summary(
                 "rate": op.rate_name(),
                 "io": op.io_name(),
                 // where this op's body runs, and what it is allowed to spend
-                // there — null limits on every op that runs in this process
+                // there: null limits on every op that runs in this process
                 "isolated": op.is_isolated(),
                 "memory_limit_bytes": op.declared_memory_limit(),
                 "cpu_limit_secs": op.declared_cpu_limit().map(|d| d.as_secs_f64()),
@@ -351,7 +351,7 @@ pub(crate) fn job_summary(
         })
         .collect();
     // the pools this job's ops take from, in first-use order, with the limit
-    // each one actually carries — the cap is process-wide, not the job's
+    // each one actually carries: the cap is process-wide, not the job's
     let mut seen: Vec<&str> = Vec::new();
     for op in job.ops() {
         if let Some(pool) = op.pool_name()
@@ -365,7 +365,7 @@ pub(crate) fn job_summary(
         .map(|name| json!({ "name": name, "limit": pool_limit(name) }))
         .collect();
     // and the rates, on the same terms: what was declared, not what is waiting
-    // on it now — that is a live number and lives on `/api/rates`
+    // on it now, which is a live number and lives on `/api/rates`
     let mut seen: Vec<&str> = Vec::new();
     for op in job.ops() {
         if let Some(rate) = op.rate_name()
@@ -450,7 +450,7 @@ pub(crate) fn job_summary(
 /// what it writes.
 ///
 /// the instance id is what a run row's `claimed_by` carries, so this is how you
-/// tell which of three workers is executing the run you are looking at — and,
+/// tell which of three workers is executing the run you are looking at, and,
 /// pointed at each of them in turn, which one has gone quiet.
 ///
 /// **`ok` is false while the store is refusing writes**, because a control
@@ -486,7 +486,7 @@ async fn health(State(st): State<AppState>) -> Json<Value> {
 /// **outside the guard**, and it is the only endpoint that is. the ui has to
 /// be able to ask before it holds anything to present, and `hestan doctor`
 /// has to be able to tell an authenticated deployment from an open one
-/// without credentials — a 401 there would answer the question with a question.
+/// without credentials: a 401 there would answer the question with a question.
 ///
 /// credentials it does not recognize are `identity: null` rather than a 401,
 /// which is what lets the ui's token prompt say "that one was refused" instead
@@ -510,7 +510,7 @@ async fn whoami(
 // names, declared types and how long each one lives: a resource is usually a
 // client holding credentials, and the api has no business showing what is
 // inside one. a run-scoped resource is reported as declared rather than as
-// built — nothing of it exists between runs
+// built: nothing of it exists between runs
 async fn list_resources(State(st): State<AppState>) -> Json<Value> {
     let scoped = |scope: &'static str| {
         move |(name, ty): (&str, &'static str)| {
@@ -582,7 +582,7 @@ struct LaunchBody {
     priority: Option<i64>,
 }
 
-/// a body that carries nothing but `params` — validation and preset writes.
+/// a body that carries nothing but `params`: validation and preset writes.
 /// an empty body means `{}`, which is what a launch would use.
 #[derive(Deserialize, Default)]
 struct ParamsBody {
@@ -651,7 +651,7 @@ async fn launch_run(
         Err(e @ Error::UnknownJob(_)) => Err(err(StatusCode::NOT_FOUND, e.to_string())),
         // a subset the job cannot satisfy is Error::Graph, raised by the same
         // check asset builds and resumes go through, and it names what is
-        // missing — the request's fault, so a 400
+        // missing, which is the request's fault, so a 400
         Err(e @ (Error::InvalidParams { .. } | Error::Graph(_))) => {
             Err(err(StatusCode::BAD_REQUEST, e.to_string()))
         }
@@ -663,7 +663,7 @@ async fn launch_run(
 ///
 /// "seeding nothing" is what makes this different from a resume: an upstream
 /// left out has no recorded output to stand in for it, so it must be in the
-/// set. that rule is [`Runner::launch_subset`]'s, not this function's — the
+/// set. that rule is [`Runner::launch_subset`]'s, not this function's: the
 /// closure below only saves the caller from listing the downstream by hand,
 /// and every refusal still comes from the one place asset builds and resumes
 /// are refused.
@@ -844,7 +844,7 @@ async fn op_stats(
     for row in &rows {
         // a mapped op's instances are its history: attributed to the row's own
         // name they land under a name the job does not declare, and the op
-        // itself reports no runs at all — which is what a partitioned asset's
+        // itself reports no runs at all, which is what a partitioned asset's
         // op did, for every run of it there had ever been. the executor's rule
         // for what is an instance is the rule, so it is the one asked
         let key = executor::instance_of(job, &row.op).map_or_else(|| row.op.clone(), |(op, _)| op);
@@ -1096,7 +1096,7 @@ struct HistoryQuery {
 }
 
 // what each build recorded, newest first. no `value`: like GET /api/assets,
-// this reports the facts about a build and not its payload — the value is what
+// this reports the facts about a build and not its payload: the value is what
 // a memoized build seeds, and it can be arbitrarily large.
 async fn asset_history(
     State(st): State<AppState>,
@@ -1143,7 +1143,7 @@ struct SeriesQuery {
 const SERIES_DEFAULT: u32 = 20;
 const SERIES_MAX: u32 = 200;
 
-// one numeric metadata key over recent history, oldest first — the sparkline
+// one numeric metadata key over recent history, oldest first: the sparkline
 // under the value. entries that did not report the key, or reported it as
 // something that is not a number, are skipped rather than drawn as zero.
 async fn asset_metadata_series(
@@ -1266,7 +1266,7 @@ async fn asset_partitions(
                 "built_at": mat.map(|m| m.built_at),
                 "run_id": mat.and_then(|m| m.run_id.clone()),
                 // which dep key this one reads, and which of them left it
-                // stale — the hour under a day, rather than the day
+                // stale: the hour under a day, rather than the day
                 "reads": reads.get(key).into_iter().flatten().map(|r| json!({
                     "dep": r.dep,
                     "mapping": r.mapping,
@@ -1292,7 +1292,7 @@ async fn asset_partitions(
 }
 
 // every check's recent results, newest first, all checks on the asset mixed
-// together — the first row per name is that check's latest
+// together: the first row per name is that check's latest
 async fn asset_checks(
     State(st): State<AppState>,
     Path(name): Path<String>,
@@ -1312,7 +1312,7 @@ async fn asset_checks(
 }
 
 /// what an asset's checks currently say, from the latest result per name.
-/// zero and zero means no check has ever recorded anything — which reads the
+/// zero and zero means no check has ever recorded anything, which reads the
 /// same whether none are declared or none have run yet.
 fn check_summary(latest: &[AssetCheckRow], asset: &str) -> Value {
     let mine = latest.iter().filter(|c| c.asset == asset);
@@ -1380,8 +1380,8 @@ async fn build_one_asset(
     }
 }
 
-// a plan that refuses is the request's fault — an unknown key, an asset that
-// is not partitioned — rather than the server's
+// a plan that refuses is the request's fault (an unknown key, an asset that
+// is not partitioned) rather than the server's
 fn bad_plan(e: Error) -> ApiError {
     match e {
         Error::Graph(msg) => err(StatusCode::BAD_REQUEST, msg),
@@ -1435,7 +1435,7 @@ async fn list_backfills(
     Ok(Json(json!({ "backfills": backfills })))
 }
 
-// the record plus the runs it launched, oldest first — a backfill's progress
+// the record plus the runs it launched, oldest first: a backfill's progress
 // is what its runs did, and this is where you go to see which one broke
 async fn get_backfill(
     State(st): State<AppState>,
@@ -1694,7 +1694,7 @@ async fn list_notifications(
 }
 
 // everything a declared policy currently calls late, jobs then assets, in the
-// shape `on_late` hands its hooks — so an alert and this list cannot disagree
+// shape `on_late` hands its hooks, so an alert and this list cannot disagree
 async fn list_late(State(st): State<AppState>) -> Result<Json<Value>, ApiError> {
     let now = Utc::now();
     let late: Vec<Value> = freshness::verdicts(&st.runner, &st.assets, now)
@@ -1783,7 +1783,7 @@ async fn retry_run(
         .run(&id)
         .map_err(internal)?
         .ok_or_else(|| err(StatusCode::NOT_FOUND, format!("unknown run: {id}")))?;
-    // a manual launch stays ungated — the documented escape hatch
+    // a manual launch stays ungated: the documented escape hatch
     if matches!(run.status, RunStatus::Queued | RunStatus::Running) {
         return Err(err(StatusCode::CONFLICT, format!("run still active: {id}")));
     }
@@ -1944,7 +1944,7 @@ async fn replay_preview(
 
 // what a past run was launched with, for the launchpad to open prefilled.
 // cloning is a launch you get to edit first, so this hands over what to edit
-// and launches nothing; the alternative — passing it through the url — puts a
+// and launches nothing; the alternative (passing it through the url) puts a
 // run's whole params in a query string
 async fn clone_run(
     State(st): State<AppState>,
@@ -2013,7 +2013,7 @@ async fn get_run(
 const EVENT_PAGE: u32 = 100;
 const EVENT_PAGE_MAX: u32 = 1_000;
 
-/// how often the stream looks for new events, and — on postgres — how far it
+/// how often the stream looks for new events, and (on postgres) how far it
 /// stays behind the newest committed seq. see [`stream_events`].
 const STREAM_POLL: StdDuration = StdDuration::from_secs(1);
 
@@ -2028,7 +2028,7 @@ const STREAM_QUEUE: usize = 256;
 const STREAM_BATCH: u32 = 500;
 
 /// the filters both event endpoints take. `kind` and `subject_kind` are open
-/// sets — a word this build does not know is a filter that matches nothing,
+/// sets: a word this build does not know is a filter that matches nothing,
 /// rather than a 400 about a kind a newer writer is entitled to write.
 #[derive(Deserialize)]
 struct EventLogQuery {
@@ -2068,7 +2068,7 @@ impl EventLogQuery {
 
 /// the whole log, newest first: the "what happened last night" query.
 ///
-/// cursored on `seq` — take the last row's seq and pass it as `before` for the
+/// cursored on `seq`: take the last row's seq and pass it as `before` for the
 /// page under it. filters compose, and every one of them is optional.
 async fn list_events(
     State(st): State<AppState>,
@@ -2089,13 +2089,13 @@ async fn list_events(
 /// the same log as server-sent events, live, from a cursor.
 ///
 /// the cursor is `after=`, or the `Last-Event-ID` header a reconnecting
-/// `EventSource` sends on its own — so a consumer that drops off gets the gap
+/// `EventSource` sends on its own, so a consumer that drops off gets the gap
 /// before the live tail and misses nothing in between. each message carries the
 /// event's `seq` as its SSE id, which is what makes that work.
 ///
 /// **the stream never delivers past what has settled.** `seq` is allocated on
 /// insert rather than on commit, so a writer holding seq 5 uncommitted is
-/// invisible while one that took 6 and committed is not — and a follower that
+/// invisible while one that took 6 and committed is not, and a follower that
 /// took 6 and moved on would never come back for 5. sqlite cannot get there:
 /// its writers hold the database's write lock until they commit, so seq order
 /// is commit order and the stream reads up to the newest seq at once. postgres
@@ -2725,7 +2725,7 @@ mod tests {
     }
 
     /// a mapped op writes no `op_runs` row of its own, so reading its history
-    /// under its own name found nothing and reported "no runs yet" — for every
+    /// under its own name found nothing and reported "no runs yet", for every
     /// mapped op, forever, including the op that materializes a partitioned
     /// asset, which is the one a backfill wants a duration from.
     #[tokio::test]
@@ -3203,7 +3203,7 @@ mod tests {
             .unwrap();
         let st = state(vec![job]);
 
-        // reported as declared, wrong and all — the api does not correct it
+        // reported as declared, wrong and all: the api does not correct it
         let Json(body) = get_job(State(st.clone()), Path("report".into()))
             .await
             .unwrap();
@@ -3520,7 +3520,7 @@ mod tests {
         let id = body["run_id"].as_str().unwrap().to_string();
 
         // the run records which ops it covered: d and everything downstream of
-        // it, and nothing else — no row at all for the other branch
+        // it, and nothing else: no row at all for the other branch
         assert_eq!(covered(&st, &id), ["d", "e"]);
         wait_success(&st, &id).await;
         let run = st.runner.store().run(&id).unwrap().unwrap();
@@ -3552,7 +3552,7 @@ mod tests {
     }
 
     // seeding nothing means an upstream left out has nothing to stand in for
-    // it — the same refusal an asset build or a resume would get, from the
+    // it: the same refusal an asset build or a resume would get, from the
     // same check, naming what is missing
     #[tokio::test]
     async fn an_unsatisfiable_subset_is_a_400_naming_the_missing_dep() {
@@ -5511,7 +5511,7 @@ mod tests {
         wait_success(&st, body["run_id"].as_str().unwrap()).await;
 
         // the day it built reads materialized, and so do the 24 hours the day
-        // covers — which the build pulled in without being asked for them
+        // covers, which the build pulled in without being asked for them
         let (_, body, _) = request(
             app.clone(),
             Method::GET,
@@ -6339,7 +6339,7 @@ mod tests {
 
     // a consumer that stops reading must not turn into unbounded memory in the
     // orchestrator. it loses events instead, and is told how many and up to
-    // where — a gap that says it is a gap can be fetched back from the query
+    // where: a gap that says it is a gap can be fetched back from the query
     #[tokio::test]
     async fn a_stalled_consumer_is_dropped_with_a_marker_rather_than_buffered() {
         use futures::StreamExt;
@@ -6638,7 +6638,7 @@ mod tests {
     /// every route [`router`] declares, read out of this file.
     ///
     /// the string literal after each `.route(`, which is the only place a
-    /// route is declared — there is no other way for an endpoint to exist, and
+    /// route is declared: there is no other way for an endpoint to exist, and
     /// no way for one to be added without landing here.
     fn declared_routes() -> Vec<String> {
         // spelled at runtime so this line is not itself one of the matches
@@ -6673,7 +6673,7 @@ mod tests {
             ] {
                 let status = status_of(&st, method, path, Some(("x-user", who))).await;
                 match role >= needs {
-                    // what they got back is the endpoint's business — a 404
+                    // what they got back is the endpoint's business: a 404
                     // for a run that is not there is not a refusal
                     true => assert!(
                         !refused(status),
@@ -6756,7 +6756,8 @@ mod tests {
 
     // the page and the router, against each other. a documented endpoint that
     // no longer exists sends a reader somewhere that 404s, and one the router
-    // serves but the page never mentions is an api nobody can find — both are
+    // serves but the page never mentions is an api nobody can find, and both
+    // are
     // the same defect, and neither shows up in any other test
     #[test]
     fn the_http_api_page_documents_exactly_what_the_router_serves() {
@@ -6806,7 +6807,7 @@ mod tests {
         assert!(!refused(status), "{status}");
 
         // a viewer is somebody, so what they cannot do is 403, and it says
-        // what it would have taken — the only useful half of a refusal
+        // what it would have taken: the only useful half of a refusal
         let (status, body) = asked(
             &guarded(people()),
             "POST",
@@ -6832,7 +6833,7 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         let body = body.unwrap();
         assert_eq!(body["auth"], true);
-        // no credentials, so nobody — and not a 401, because this is the
+        // no credentials, so nobody, and not a 401, because this is the
         // endpoint that is asked before there is anything to present
         assert_eq!(body["identity"], Value::Null);
 

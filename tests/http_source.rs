@@ -25,7 +25,7 @@ async fn serve(app: Router) -> String {
 ///
 /// the connection is held open afterwards rather than closed, so a client that
 /// reads further than it needs to waits for its own timeout instead of finding
-/// an eof — which is what makes "it stopped reading" something a test can
+/// an eof, which is what makes "it stopped reading" something a test can
 /// assert rather than hope for.
 async fn serve_raw(response: Vec<u8>) -> String {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -321,7 +321,7 @@ async fn a_body_under_the_ceiling_is_unaffected() {
 async fn a_content_length_that_understates_the_body_cannot_get_past_the_ceiling() {
     // the header says twenty bytes and 64 KiB follow them, against a ceiling
     // of one. what the response framing says is one document is what gets
-    // parsed either way — a header that lies cannot make it more than that
+    // parsed either way: a header that lies cannot make it more than that
     let mut response =
         b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 20\r\n\r\n".to_vec();
     response.extend(b"[1,2,3,4,5,6,7,8,9]\n");

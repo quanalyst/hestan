@@ -155,7 +155,7 @@ impl Hestan {
     }
 
     /// register assets; stackable. when any exist, build registers the
-    /// internal job `"assets"` that materializes them — a user job with that
+    /// internal job `"assets"` that materializes them; a user job with that
     /// name then collides ([`Error::DuplicateJob`]).
     pub fn assets(mut self, assets: impl IntoIterator<Item = Asset>) -> Self {
         self.assets.extend(assets);
@@ -165,7 +165,7 @@ impl Hestan {
     /// register [multi-assets](MultiAsset); stackable. each lowers to one op
     /// of the same internal `assets` job and materializes every asset it
     /// produces, which then behave exactly like assets registered with
-    /// [`assets`](Self::assets) — deps, checks, staleness, builds and all.
+    /// [`assets`](Self::assets): deps, checks, staleness, builds and all.
     pub fn multi_assets(mut self, multis: impl IntoIterator<Item = MultiAsset>) -> Self {
         self.multis.extend(multis);
         self
@@ -190,7 +190,7 @@ impl Hestan {
 
     /// register a [run-status sensor](RunStatusSensor): "when job A succeeds,
     /// run job B". stackable, and registered as `run:{name}` alongside every
-    /// other sensor — it runs on the same loop, on its own interval, and
+    /// other sensor: it runs on the same loop, on its own interval, and
     /// pauses the same way.
     pub fn run_sensor(mut self, sensor: RunStatusSensor) -> Self {
         self.run_sensors.push(sensor);
@@ -199,8 +199,8 @@ impl Hestan {
 
     /// declare a named concurrency pool: at most `limit` ops that name it via
     /// [`Op::pool`](crate::Op::pool) run at once, across every job in this
-    /// process. that is the shape most external limits have — "at most 3
-    /// requests to this api, ever" — which per-job `max_parallel` cannot
+    /// process. that is the shape most external limits have ("at most 3
+    /// requests to this api, ever"), which per-job `max_parallel` cannot
     /// express once two jobs can overlap. stackable; declaring the same name
     /// twice, or naming an undeclared pool from an op, fails the build with
     /// [`Error::Graph`]. a limit below 1 means 1.
@@ -219,14 +219,14 @@ impl Hestan {
     /// Hestan::new().rate("eia_api", 5, Duration::from_secs(1));
     /// ```
     ///
-    /// this is the limit most external systems actually publish — "5 requests
-    /// a second", "1000 an hour" — and the one a [`pool`](Self::pool) can only
+    /// this is the limit most external systems actually publish ("5 requests
+    /// a second", "1000 an hour"), and the one a [`pool`](Self::pool) can only
     /// approximate, since three calls at a time is a rate only if you know how
     /// long each one takes. the two compose: a pool caps how many are in
     /// flight, a rate how often one starts.
     ///
     /// it is a **token bucket**, so `limit` may go at once and the bucket then
-    /// refills at `limit` per `per` — a burst and then quiet, which is what an
+    /// refills at `limit` per `per`: a burst and then quiet, which is what an
     /// api that publishes a per-second limit generally tolerates. a token is
     /// spent rather than held: there is nothing to give back when the op ends.
     ///
@@ -235,7 +235,7 @@ impl Hestan {
     /// 1.
     ///
     /// **the bucket is this process's.** two workers each honouring 5 a second
-    /// send ten, and the system being protected sees ten — `docs/scaling.md`
+    /// send ten, and the system being protected sees ten; `docs/scaling.md`
     /// has what that means for a deployment with more than one of them.
     pub fn rate(mut self, name: impl Into<String>, limit: usize, per: Duration) -> Self {
         self.rates.push((name.into(), limit, per));
@@ -247,7 +247,7 @@ impl Hestan {
     /// below 1 means 1.
     ///
     /// this is a limit on *executing* runs. a run sitting on the queue costs
-    /// nothing and counts as nothing — which is what makes it different from
+    /// nothing and counts as nothing, which is what makes it different from
     /// [`Overlap`](crate::Overlap), the policy that decides whether a scheduled
     /// fire should exist at all while its job has a run outstanding.
     ///
@@ -259,12 +259,12 @@ impl Hestan {
         self
     }
 
-    /// at most `n` runs carrying the tag `key: value` executing at once —
+    /// at most `n` runs carrying the tag `key: value` executing at once:
     /// `tag_limit("env", "prod", 2)` whatever the jobs are. stackable; the same
     /// pair twice keeps the last. a value below 1 means 1.
     ///
-    /// tags are how a run says what it is beyond its job — see
-    /// [`run_tags`](Self::run_tags) — so this is the limit to reach for when
+    /// tags are how a run says what it is beyond its job (see
+    /// [`run_tags`](Self::run_tags)), so this is the limit to reach for when
     /// what is scarce belongs to none of the jobs in particular: the production
     /// warehouse, the paid api, the one machine with the gpu.
     pub fn tag_limit(mut self, key: impl Into<String>, value: impl Into<String>, n: usize) -> Self {
@@ -294,7 +294,7 @@ impl Hestan {
     /// **exactly one process** in a deployment should be `All` or `Scheduler`.
     /// schedules, sensors, freshness checks and backfill chunking are
     /// decisions, and two processes making them independently is two of every
-    /// scheduled run — the store has no lock that would stop it. any number of
+    /// scheduled run: the store has no lock that would stop it. any number of
     /// processes may be `Worker`; that is what the queue is for.
     ///
     /// [`work`](Self::work) is `role(Role::Worker)` with the address made
@@ -316,7 +316,7 @@ impl Hestan {
     /// the deployment does at once and lives in the store, shared. this says
     /// how much of it lands here, and lives in this process. a worker with four
     /// slots claims at most four runs however long the queue is, which is what
-    /// leaves the rest for the worker beside it — and what bounds what one
+    /// leaves the rest for the worker beside it, and what bounds what one
     /// container has to hold.
     pub fn slots(mut self, n: usize) -> Self {
         self.slots = n.max(1);
@@ -332,15 +332,15 @@ impl Hestan {
     /// each yielding forty is sixteen hundred op runs from two lines that each
     /// looked small. so a run that is about to expand past this fails at the
     /// expansion, naming the op, how many instances it was about to make and
-    /// how many elements it was about to make them from — before a row of it
+    /// how many elements it was about to make them from, before a row of it
     /// is written, because a runaway found by counting rows in the ui is one
     /// that already happened.
     ///
     /// the budget is the run's rather than the op's: what a nesting multiplies
     /// is the run, and ten fan-outs of a hundred cost the same thousand rows
     /// as one of a thousand. raise it for a deployment that genuinely fans out
-    /// wider — a build naming thousands of partitions by hand is the usual
-    /// one — and prefer flattening in the outer op to raising it much.
+    /// wider (a build naming thousands of partitions by hand is the usual
+    /// one), and prefer flattening in the outer op to raising it much.
     pub fn max_instances(mut self, n: usize) -> Self {
         self.max_instances = n.max(1);
         self
@@ -384,7 +384,7 @@ impl Hestan {
     /// the config it reads.
     ///
     /// resources live for the process. that is right for a connection pool, an
-    /// api client, a parsed config — anything a run should not have to build
+    /// api client, a parsed config: anything a run should not have to build
     /// and every run may share. for the other kind, a value one run must not
     /// share with the next, see [`run_resource`](Self::run_resource).
     ///
@@ -486,12 +486,12 @@ impl Hestan {
     /// saving. every op of the run reads it with
     /// [`OpCtx::resource`](crate::OpCtx::resource) exactly as it reads a
     /// process-wide one, and [`Op::requires`](crate::Op::requires) declares
-    /// either kind — the difference is how long the value lives, not how an op
+    /// either kind; the difference is how long the value lives, not how an op
     /// asks for it.
     ///
     /// **what it costs**: the constructor runs for every run, so a value that
     /// is expensive to build is expensive per run rather than once. a
-    /// connection pool built this way is a pool per run — a hundred pools on a
+    /// connection pool built this way is a pool per run: a hundred pools on a
     /// busy afternoon, each with its own connections, which is almost always a
     /// mistake. build the pool with [`resource`](Self::resource) and put the
     /// run's own short-lived thing here.
@@ -499,13 +499,14 @@ impl Hestan {
     /// the constructor sees the process-wide resources and the run-scoped ones
     /// declared before it, and [`ResourceCtx::run_id`] says which run it is
     /// for. one that fails fails the run before any op of it runs, with
-    /// `resource {name}: {reason}` on the run row — nothing else could be true
+    /// `resource {name}: {reason}` on the run row, since nothing else could be
+    /// true
     /// of an op that needed it. a name already used by a process-wide resource
     /// is [`Error::Resource`] at build, so `ctx.resource("x")` never means two
     /// things.
     ///
     /// **dropping**: the value is dropped when the run reaches a terminal
-    /// status, when it is cancelled, and when the process gives up on it — and
+    /// status, when it is cancelled, and when the process gives up on it, and
     /// on the blocking pool rather than on the runtime, since a `Drop` that
     /// closes a socket or removes a directory blocks. an op that kept its
     /// `Arc` past the end of the run holds the value up until it lets go: the
@@ -535,7 +536,7 @@ impl Hestan {
     }
 
     /// where op outputs are persisted, for every op that does not select a
-    /// named manager. the default is [`Inline`](crate::Inline) — outputs are
+    /// named manager. the default is [`Inline`](crate::Inline): outputs are
     /// their own handles and land in the run log as json, which is what
     /// hestan has always done and is wrong for anything bulky.
     ///
@@ -628,7 +629,7 @@ impl Hestan {
     /// Hestan::new().preset("orders_etl", "nightly", json!({"region": "eu", "days": 1}));
     /// ```
     ///
-    /// presets are runtime data — the launchpad saves and deletes them too —
+    /// presets are runtime data (the launchpad saves and deletes them too),
     /// so a declared one is an **upsert**: it refreshes on every start, and a
     /// preset made in the ui under another name is left alone. dropping the
     /// declaration therefore leaves the stored preset behind; delete it from
@@ -647,7 +648,7 @@ impl Hestan {
         self
     }
 
-    /// tag every run this process launches with `tags` — the deployment,
+    /// tag every run this process launches with `tags`: the deployment,
     /// the region, whatever a run's provenance needs to say. stackable, and a
     /// repeated key keeps the last.
     ///
@@ -704,7 +705,7 @@ impl Hestan {
     /// # }
     /// ```
     ///
-    /// unset — the default — is **not** "no authentication". it is "no
+    /// unset, which is the default, is **not** "no authentication". it is "no
     /// authenticator configured", and [`serve`](Self::serve) refuses to start
     /// on any address but loopback under it, because this api launches runs
     /// and cancels them and a warning about that is a warning somebody
@@ -725,13 +726,13 @@ impl Hestan {
     /// a cap rather than a preference: an op in a `println!` loop would
     /// otherwise fill the disk the run log lives on, and a run log that ran
     /// out of room is a run log that records nothing at all. past the cap one
-    /// line says what was dropped and why, and the attempt goes on running —
+    /// line says what was dropped and why, and the attempt goes on running:
     /// capture stopping is not the op failing. per attempt because a retry
     /// starts from a full budget, the failed attempt's output being the part
     /// usually worth reading.
     ///
     /// the limit covers every capture in this process, the `capture` feature's
-    /// [layer][cap] included — the host composes that with a store handle of
+    /// [layer][cap] included: the host composes that with a store handle of
     /// its own, and a cap that only reached the writers hestan happened to
     /// build would be a cap that quietly does not hold.
     ///
@@ -743,7 +744,7 @@ impl Hestan {
     }
 
     /// how many lines of captured output one attempt may store; default
-    /// 10,000. the other half of [`log_limit`](Self::log_limit) — a million
+    /// 10,000. the other half of [`log_limit`](Self::log_limit): a million
     /// empty lines are under any byte cap worth setting and are still a
     /// million rows.
     pub fn log_lines(mut self, lines: u64) -> Self {
@@ -762,7 +763,7 @@ impl Hestan {
     ///
     /// a sweep runs at startup and every
     /// [`retention_interval`](Self::retention_interval) after it, in whichever
-    /// process [decides](crate::Role) — a worker must never prune, since the
+    /// process [decides](crate::Role): a worker must never prune, since the
     /// history it would be deleting belongs to runs it does not own.
     pub fn retention(mut self, retention: Retention) -> Self {
         self.retention = retention;
@@ -788,19 +789,19 @@ impl Hestan {
     /// whose hook bumps a counter or writes a line wants a callback, not a
     /// table and a delivery loop; the ordinary dispatch is a `spawn_blocking`
     /// call and costs nothing. this is for the hook whose job is to tell a
-    /// human, where losing one is the failure mode that matters — without it,
+    /// human, where losing one is the failure mode that matters. without it,
     /// a process that dies between a run failing and the hook running has
     /// nothing anywhere recording that an alert was owed.
     ///
     /// **delivery is at-least-once.** a crash between a hook returning and the
     /// row being marked delivered re-delivers on the next pass, so a hook must
-    /// tolerate seeing the same event twice — key on `run_id` if that matters.
+    /// tolerate seeing the same event twice; key on `run_id` if that matters.
     /// exactly-once needs the receiver's cooperation and hestan will not
     /// pretend otherwise.
     ///
     /// a hook that panics is a failed delivery, retried on the same backoff an
     /// op's retries use and given up on after eight attempts, leaving the row
-    /// visible as `failed` with its last error — on `GET /api/notifications`
+    /// visible as `failed` with its last error, on `GET /api/notifications`
     /// and on the runs page. the loop belongs to the process that
     /// [decides](crate::Role), so register the hooks there.
     ///
@@ -814,7 +815,7 @@ impl Hestan {
 
     /// how often the retention sweep comes round; default one hour.
     ///
-    /// it also runs at startup, which is all it ever used to do — and a server
+    /// it also runs at startup, which is all it ever used to do, and a server
     /// that stays up for three months is exactly the deployment a retention
     /// policy is for.
     pub fn retention_interval(mut self, every: Duration) -> Self {
@@ -828,15 +829,15 @@ impl Hestan {
     /// cap applies whether you ask for it or not.
     ///
     /// the newest entry is never trimmed, whatever `n` says: an asset's
-    /// newest materialization is its current state — what staleness compares
-    /// against and what a memoized build seeds — and a check's newest result
+    /// newest materialization is its current state (what staleness compares
+    /// against and what a memoized build seeds), and a check's newest result
     /// is what the asset summary counts.
     pub fn asset_history(mut self, n: usize) -> Self {
         self.asset_history = n;
         self
     }
 
-    /// call `hook` whenever a run finishes failed — never on success, on cancel,
+    /// call `hook` whenever a run finishes failed, never on success, on cancel,
     /// or for runs the startup sweep marks failed. callable multiple times.
     ///
     /// [`on_run_finished`](Self::on_run_finished) is this without the filter,
@@ -848,7 +849,7 @@ impl Hestan {
         self
     }
 
-    /// call `hook` whenever a run reaches a terminal status — succeeded,
+    /// call `hook` whenever a run reaches a terminal status: succeeded,
     /// failed or canceled alike, with [`status`](RunEvent::status) saying
     /// which. callable multiple times, and dispatched exactly like
     /// [`on_failure`](Self::on_failure), so a hook may block.
@@ -874,7 +875,7 @@ impl Hestan {
     ///
     /// per attempt rather than per op, because an op that failed twice and
     /// worked on the third try is three facts and only the hook knows which of
-    /// them it wanted — [`attempt`](OpEvent::attempt) and
+    /// them it wanted; [`attempt`](OpEvent::attempt) and
     /// [`status`](OpEvent::status) are how it says so. an op skipped by its
     /// [trigger rule](crate::When) produces nothing: there was no attempt.
     ///
@@ -886,7 +887,7 @@ impl Hestan {
     }
 
     /// call `hook` whenever a job or asset with a declared freshness policy
-    /// crosses from fresh to late — [`JobBuilder::fresh_within`](crate::JobBuilder::fresh_within)
+    /// crosses from fresh to late; see [`JobBuilder::fresh_within`](crate::JobBuilder::fresh_within)
     /// and [`Asset::fresh_within`](crate::Asset::fresh_within). callable
     /// multiple times, dispatched exactly like [`on_failure`](Self::on_failure)
     /// so a hook may block.
@@ -949,7 +950,7 @@ impl Hestan {
     }
 
     /// run the ui and whatever loops this process's [role](Self::role) owns.
-    /// the default role is [`Role::All`] — one process doing everything, which
+    /// the default role is [`Role::All`]: one process doing everything, which
     /// is right until it is not.
     pub async fn serve(self, addr: impl Into<SocketAddr>) -> Result<(), Error> {
         let addr = addr.into();
@@ -964,7 +965,7 @@ impl Hestan {
     ///
     /// `addr` is optional because a worker has nothing to show: with `None` it
     /// binds no socket at all. give it one and you get the same ui, which is
-    /// worth having for `/api/health` — that is where a worker says which runs
+    /// worth having for `/api/health`, which is where a worker says which runs
     /// it is holding.
     ///
     /// this is [`role(Role::Worker)`](Self::role) with the addresses made
@@ -973,7 +974,7 @@ impl Hestan {
     ///
     /// **not** [`Op::isolated`](crate::Op::isolated), which also spawns
     /// processes: that spawns one op subprocess which runs a single op and
-    /// exits. this is a long-lived process that claims whole runs — and it
+    /// exits. this is a long-lived process that claims whole runs, and it
     /// spawns op subprocesses itself, like any other hestan process.
     pub async fn work(self, addr: Option<SocketAddr>) -> Result<(), Error> {
         self.role(Role::Worker).up(addr).await
@@ -982,7 +983,7 @@ impl Hestan {
     async fn up(self, addr: Option<SocketAddr>) -> Result<(), Error> {
         // before the address, before the store, before anything: this process
         // may be an op subprocess of a hestan already running against this
-        // database, and every line of boot behaviour below assumes otherwise —
+        // database, and every line of boot behaviour below assumes otherwise:
         // it would sweep, sync schedules, bind a listener and start claiming
         // runs, when it is here to run one op. `run_op_subprocess` never
         // returns.
@@ -1060,7 +1061,7 @@ impl Hestan {
         if role.executes() {
             // the dispatcher: the queue's own loop. every launch pokes it and
             // every run that finishes pokes it, so what this covers is the two
-            // things no local poke can — a run another process enqueued, and a
+            // things no local poke can: a run another process enqueued, and a
             // limit that changed under a queue nobody is touching
             loops.push(tokio::spawn(crate::executor::run_dispatcher(
                 built.runner.clone(),
@@ -1155,7 +1156,7 @@ impl Hestan {
     }
 
     /// the op-subprocess path: build the same registry the server path would,
-    /// run one op of one run, and exit — 0 for a success, 1 for anything else.
+    /// run one op of one run, and exit: 0 for a success, 1 for anything else.
     ///
     /// what is *not* here is the point of it. no `fail_interrupted`, no
     /// schedule sync, no tick prune, no retention sweep, no scheduler, sensor,
@@ -1171,7 +1172,7 @@ impl Hestan {
             Ok(crate::isolate::Worked::Success) => 0,
             Ok(crate::isolate::Worked::Failed) => 1,
             // the op ran; nothing recorded it. said here for the same reason
-            // the arm below prints rather than traces — the parent captures
+            // the arm below prints rather than traces: the parent captures
             // this stream as the attempt's output, and its own read of the op
             // row is about to find nothing there
             Ok(crate::isolate::Worked::Unrecorded) => {
@@ -1214,7 +1215,7 @@ impl Hestan {
     ///
     /// that is the whole difference from [`build`](Self::build), and the reason
     /// there are two ways in. a process starting up is entitled to tidy the
-    /// database it is about to own — fail what a dead process left running,
+    /// database it is about to own: fail what a dead process left running,
     /// sync the schedules, sweep retention. a command line asking what ran last
     /// night is not, and a cron line running one every minute would be doing
     /// all of it sixty times an hour on behalf of a process that exits
@@ -1225,7 +1226,7 @@ impl Hestan {
     }
 
     /// the registry beside the store, lowered and validated, and still with
-    /// none of the boot behaviour — see [`open`](Self::open) for what is
+    /// none of the boot behaviour; see [`open`](Self::open) for what is
     /// deliberately not happening.
     #[cfg(feature = "cli")]
     pub(crate) fn inspect(mut self) -> Result<Inspected, Error> {
@@ -1389,7 +1390,7 @@ pub(crate) struct Inspected {
     pub(crate) retention: Retention,
     pub(crate) role: Role,
     /// what would check who is asking, if this served. `None` is nothing
-    /// configured — which is what `doctor` reports, since it is the difference
+    /// configured, which is what `doctor` reports, since it is the difference
     /// between a deployment that can be moved off loopback and one that
     /// cannot.
     pub(crate) auth: Option<Auth>,
@@ -1449,7 +1450,7 @@ mod tests {
 
     // the page shows the example and the doctest runs it, so they have to be
     // the same text. a docs page carrying code nothing compiles is the one
-    // that tells you to call a method that was renamed two releases ago —
+    // that tells you to call a method that was renamed two releases ago,
     // which no test here would otherwise catch, since markdown compiles fine
     #[test]
     fn the_connecting_page_shows_exactly_the_example_the_doctest_runs() {
@@ -1852,7 +1853,7 @@ mod tests {
             .unwrap();
 
         // a queued run for the op subprocess, and one belonging to nobody it
-        // knows — which is exactly the shape of a parent's in-flight run
+        // knows, which is exactly the shape of a parent's in-flight run
         let store = Store::open(&path).unwrap();
         let planted = |id: &str| Run {
             id: id.to_string(),
@@ -1926,7 +1927,7 @@ mod tests {
     }
 
     /// a port nothing is on, on `host`. the listener is dropped before the
-    /// address is handed back — the same small race every test that needs a
+    /// address is handed back: the same small race every test that needs a
     /// port it can name has, and the only way to know which port `serve`
     /// bound before it has bound it.
     fn free_port(host: &str) -> SocketAddr {
@@ -2015,7 +2016,7 @@ mod tests {
         let said = served(None).await;
         assert!(said.contains("401 Unauthorized"), "{said}");
 
-        // the opt-out serves everyone, having said what it is leaning on — see
+        // the opt-out serves everyone, having said what it is leaning on; see
         // `auth::guard`, where that sentence is asserted
         let said = health(
             Hestan::new().db(":memory:").auth(Auth::None),

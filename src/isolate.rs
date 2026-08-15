@@ -10,8 +10,8 @@
 //!
 //! the child is this same binary re-executed with two environment variables
 //! set. it rebuilds the same jobs because it runs the same `main`, and it
-//! reads everything else out of the store — the run's params, the op's inputs,
-//! its committed state — so nothing is serialized between the two processes
+//! reads everything else out of the store (the run's params, the op's inputs,
+//! its committed state), so nothing is serialized between the two processes
 //! that was not already a row. what it produces goes back the same way: the
 //! output through its io manager, the terminal status onto its own op run row,
 //! its log lines into the run's events. there is no protocol between the two,
@@ -19,7 +19,7 @@
 //!
 //! the one thing that does travel down a pipe is what the child *printed*.
 //! stdout and stderr are the child's, whole, and a `println!` or a linked c
-//! library writing to fd 2 is output nobody else in this process can claim —
+//! library writing to fd 2 is output nobody else in this process can claim,
 //! so the parent pipes both, reads them concurrently, and stores each line
 //! under this attempt. an in-process op gets no such thing, and
 //! [`docs/logs.md`](https://docs.rs/hestan) says plainly why: redirecting fd 1
@@ -64,7 +64,7 @@ pub(crate) struct Request {
 
 /// the op-subprocess request in this process's environment, if there is one.
 ///
-/// every entry point asks this before it does anything else at all — `serve`,
+/// every entry point asks this before it does anything else at all: `serve`,
 /// `work`, `run_once`, `build_asset`. an op subprocess that reached ordinary
 /// boot behaviour would sync schedules, sweep, bind a listener and start
 /// claiming runs off the queue, none of which is its business: it is here to
@@ -92,7 +92,7 @@ pub(crate) enum Worked {
 ///
 /// the parent's whole job is to start the child, watch it, read what it
 /// printed, and read the row it wrote. a child that exits without writing one
-/// — killed, aborted, out of memory — is recorded here instead, with what
+/// (killed, aborted, out of memory) is recorded here instead, with what
 /// killed it, because that containment is the entire point of running it
 /// elsewhere. what it printed before dying is kept either way, and is usually
 /// the only thing that says what it was doing.
@@ -133,7 +133,7 @@ pub(crate) async fn attempt(
     // the trace context of the attempt that is spawning this, so the child's
     // spans nest under it rather than starting a trace of their own. empty
     // unless the `otel` feature is on *and* the host composed a layer, and an
-    // empty carrier is nothing to pass — see `crate::otel`
+    // empty carrier is nothing to pass; see `crate::otel`
     #[cfg(feature = "otel")]
     for (key, value) in crate::otel::carry(span) {
         command.env(key, value);
@@ -215,7 +215,7 @@ pub(crate) async fn attempt(
 ///
 /// the row comes first and the exit status second: the child is the process
 /// that ran the body, so if it got as far as writing a result, that result is
-/// what happened — however it exited afterwards.
+/// what happened, however it exited afterwards.
 fn recorded(store: &Store, run_id: &str, name: &str) -> Option<Ended> {
     let row = match store.op_run(run_id, name) {
         Ok(row) => row?,
@@ -386,7 +386,7 @@ pub(crate) async fn run_one_op(
         .ok_or_else(|| Error::UnknownJob(run.job.clone()))?;
     let op = job.op(&req.op).ok_or_else(|| {
         Error::Graph(format!(
-            "job {}: no op {} — this binary does not build the registry that launched run {}",
+            "job {}: no op {}. this binary does not build the registry that launched run {}",
             run.job, req.op, req.run_id
         ))
     })?;
@@ -439,7 +439,7 @@ pub(crate) async fn run_one_op(
         new_fingerprint: Arc::new(Mutex::new(None)),
         new_meta: new_meta.clone(),
         new_per_asset: Arc::new(Mutex::new(BTreeMap::new())),
-        // an asset op is never isolated, so this is empty — but it is read
+        // an asset op is never isolated, so this is empty, but it is read
         // where the parent reads it, so it stays true if one ever is
         built: built.clone(),
         store: store.clone(),
@@ -449,8 +449,8 @@ pub(crate) async fn run_one_op(
         slot: None,
     };
 
-    // the same span the parent opens around an in-process attempt, and — with
-    // the `otel` feature — a child of the parent's, taken from the trace
+    // the same span the parent opens around an in-process attempt, and (with
+    // the `otel` feature) a child of the parent's, taken from the trace
     // context in this process's environment. that is the whole of what makes a
     // subprocess's spans land under the op that spawned it rather than in a
     // trace of their own; `crate::otel` says what it does not do.
@@ -470,7 +470,7 @@ pub(crate) async fn run_one_op(
     crate::otel::adopt(&span);
 
     // last, so what the limits cap is the body and not the loading of its
-    // inputs — and refused outright if they cannot be applied, since an op that
+    // inputs, and refused outright if they cannot be applied, since an op that
     // ran uncapped believing otherwise is the one outcome worth nobody's time
     let produced = match apply_limits(op) {
         Err(e) => Err(e),
@@ -508,7 +508,7 @@ pub(crate) async fn run_one_op(
     match produced {
         Ok(handle) => {
             // what the manager knows about what it stored, beside what the op
-            // staged — the same rule the parent applies to an in-process op
+            // staged, the same rule the parent applies to an in-process op
             let meta = crate::io::handle_meta(&handle, op::staged_meta(&new_meta));
             let built = crate::store::stored_as(op::staged_builds(&built), &handle);
             if !store
@@ -580,7 +580,7 @@ pub(crate) async fn run_one_op(
 ///
 /// this is the whole reason a limit needs `.isolated()`: `setrlimit` caps a
 /// process, and in-process that process is the orchestrator. it caps this
-/// child, which is a few megabytes of hestan plus the op — near enough the op
+/// child, which is a few megabytes of hestan plus the op: near enough the op
 /// alone, and honest about not being exactly it.
 fn apply_limits(op: &Op) -> Result<(), String> {
     if let Some(bytes) = op.declared_memory_limit() {

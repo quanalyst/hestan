@@ -2,7 +2,7 @@
 //!
 //! its own test binary on purpose, and not only because the feature is
 //! optional. `tracing` caches a callsite's interest the first time that
-//! callsite is hit, using whatever subscriber the thread that hit it had —
+//! callsite is hit, using whatever subscriber the thread that hit it had,
 //! so in a binary where hundreds of other tests run ops with no subscriber
 //! installed, the executor's op span would be registered as "nobody is
 //! interested" by whichever thread got there first, and every test here would
@@ -28,7 +28,7 @@ fn turn() -> std::sync::MutexGuard<'static, ()> {
 
 /// a current-thread runtime inside `with_default`, so every op body polls on
 /// the thread the subscriber is the default for. hestan installs no
-/// subscriber of its own anywhere — that is the whole claim of the feature —
+/// subscriber of its own anywhere (that is the whole claim of the feature)
 /// so a test has to install one to see anything at all.
 fn run_under_capture(store: &Store, job: Job) -> String {
     let _turn = turn();
@@ -175,7 +175,7 @@ fn a_span_the_op_opened_itself_still_attributes_to_the_op() {
 
 /// through the public builder, because that is the whole point: the layer was
 /// handed a `Store` the test opened itself, and `log_lines` was set on a
-/// `Hestan` that opened its own — a cap that lived on either object would not
+/// `Hestan` that opened its own: a cap that lived on either object would not
 /// reach the other. it is a process-wide limit, which is also why this is the
 /// only case here that moves it, and why it moves it to a number every other
 /// case is comfortably under.

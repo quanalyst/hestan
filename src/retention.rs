@@ -20,8 +20,8 @@ const TICKS_KEPT: usize = 5000;
 /// exactly the same reason and unconditionally for exactly the same reason.
 ///
 /// a run's events go when the run does. everything the v17 log added belongs to
-/// no run — an asset built every five minutes, a sensor evaluated every ten
-/// seconds — so without this nothing would ever collect them. larger than the
+/// no run (an asset built every five minutes, a sensor evaluated every ten
+/// seconds), so without this nothing would ever collect them. larger than the
 /// tick caps because this is the table you read to find out what happened last
 /// night, and a night is not a small number of events.
 const EVENTS_KEPT: usize = 50_000;
@@ -34,7 +34,8 @@ const EVENTS_KEPT: usize = 50_000;
 /// the knobs combine **conservatively**: a run is deleted only when every one
 /// of them would delete it. `Retention::days(7).keep_last(50)` keeps a run that
 /// is eight days old if it is among the last fifty, and keeps the last fifty
-/// only until they are eight days old — whichever holds it back wins. the other
+/// only until they are eight days old. whichever holds it back wins, and the
+/// other
 /// reading deletes history the moment either rule fires, which is a thing you
 /// find out about afterwards.
 ///
@@ -49,7 +50,7 @@ const EVENTS_KEPT: usize = 50_000;
 /// that is the honest cost of the alternative: pruning it would leave a row
 /// pointing at nothing, and the next build would either fail on a hole or
 /// silently redo work somebody paid for. but it does mean `days(30)` is not
-/// "nothing older than thirty days is here" — an asset built a year ago and
+/// "nothing older than thirty days is here": an asset built a year ago and
 /// never rebuilt keeps its run for as long as it stays current.
 /// `hestan doctor` counts them under `values`, and `docs/storage.md` says what
 /// to do about it. nothing is held back for an
@@ -67,7 +68,7 @@ impl Retention {
     /// runs, events and captured output.
     ///
     /// the age is measured from `created_at` rather than from the finish, so a
-    /// run that sat on the queue for a week ages while it waits — which is what
+    /// run that sat on the queue for a week ages while it waits, which is what
     /// "keep 30 days of history" means to whoever asked for it.
     pub fn days(days: u32) -> Retention {
         Retention {
@@ -114,7 +115,7 @@ impl Retention {
 ///
 /// a `None` cutoff is **no age policy**, which keeps everything: the comparison
 /// against it is null, so no row matches. that is the direction an absent
-/// setting has to mean — the other one deletes the lot.
+/// setting has to mean: the other one deletes the lot.
 pub(crate) struct Cutoffs {
     pub success: Option<DateTime<Utc>>,
     pub failed: Option<DateTime<Utc>>,
@@ -133,7 +134,7 @@ impl Cutoffs {
 /// says it may no longer keep.
 ///
 /// **role-gated.** pruning is a decision like firing a schedule is, and a
-/// worker that took it would be deleting the history of runs it did not own —
+/// worker that took it would be deleting the history of runs it did not own:
 /// several processes share one database, and only one of them decides.
 pub(crate) fn sweep(runner: &Runner, policy: &Retention, now: DateTime<Utc>) {
     if !runner.role().decides() {
@@ -185,7 +186,7 @@ pub(crate) fn sweep(runner: &Runner, policy: &Retention, now: DateTime<Utc>) {
         };
         // a run past its policy that an asset's current value is inside stays,
         // rows and files together. the policy bounds history, and a value
-        // something is still going to read is not history yet — the run goes on
+        // something is still going to read is not history yet: the run goes on
         // the next sweep after the one that rebuilds the asset
         let doomed: Vec<String> = doomed
             .into_iter()
@@ -198,7 +199,7 @@ pub(crate) fn sweep(runner: &Runner, policy: &Retention, now: DateTime<Utc>) {
         // order is the whole of why this works. a run row is the only record
         // that the run existed: delete it first and a crash in between leaves
         // files nothing can ever name again. this way round a crash leaves
-        // rows pointing at outputs that are gone — for runs already past
+        // rows pointing at outputs that are gone, for runs already past
         // retention, which the next sweep deletes anyway.
         drop_outputs(runner.io(), job, &doomed);
         match store.delete_runs(job, &doomed, now) {
@@ -248,9 +249,9 @@ fn drop_outputs(io: &Io, job: &str, runs: &[String]) {
 /// the sweeper loop: its own task beside the scheduler, sweeping on `every`.
 ///
 /// the loop is the whole point of this being a phase. retention used to run
-/// once, at startup, so a server up for three months pruned nothing after boot
-/// — the one deployment shape where a retention policy matters is the one where
-/// it never ran.
+/// once, at startup, so a server up for three months pruned nothing after
+/// boot: the one deployment shape where a retention policy matters is the one
+/// where it never ran.
 pub(crate) async fn run_sweeper(runner: Runner, policy: Retention, every: Duration) {
     let mut ticker = tokio::time::interval(every);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -376,7 +377,7 @@ mod tests {
     }
 
     /// a manager that records which runs it was asked to drop, and whether the
-    /// run's row was still in the log when it was asked — which is the whole
+    /// run's row was still in the log when it was asked, which is the whole
     /// of what "files before rows" means from a manager's side.
     struct Records {
         store: Store,
@@ -444,7 +445,7 @@ mod tests {
         // the failing manager took nothing with it
         assert_eq!(ids(&store), ["recent"]);
         // asked about the run that went and nothing else, while that run was
-        // still a row — which is what makes the order provable rather than
+        // still a row, which is what makes the order provable rather than
         // asserted about a comment
         assert_eq!(
             *records.dropped.lock().unwrap(),
@@ -460,7 +461,7 @@ mod tests {
 
     // an asset's value now lives wherever its op's output lives, so the run
     // that wrote it is holding something the next build reads. the policy that
-    // would take that run has to wait for the build that replaces it — and a
+    // would take that run has to wait for the build that replaces it, and a
     // value that is on the row itself holds nothing back, which is every
     // deployment that never configured a manager
     #[test]

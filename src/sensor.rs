@@ -62,8 +62,8 @@ impl RunRequest {
 
     /// launch this at most once per key, ever, for this sensor.
     ///
-    /// sensors are at-least-once by design — a partial launch failure replays
-    /// the whole batch, and so does a cursor write that failed — so a key is
+    /// sensors are at-least-once by design (a partial launch failure replays
+    /// the whole batch, and so does a cursor write that failed), so a key is
     /// what turns that into **effectively-once per sensor**: the key is
     /// claimed in the same transaction that creates the run, and a request
     /// naming a claimed key is skipped rather than launched. keys are scoped
@@ -87,7 +87,7 @@ type SensorFn = dyn Fn(
     + Sync;
 
 /// a polling closure evaluated on an interval: it inspects the world (a
-/// directory, a queue, an api) and returns the runs to launch — usually none.
+/// directory, a queue, an api) and returns the runs to launch, usually none.
 /// register with `Hestan::sensor`; `serve` runs the loop.
 ///
 /// ```no_run
@@ -133,7 +133,7 @@ impl Sensor {
     /// `every` is the gap between evaluations rather than a schedule: nothing
     /// is aligned to the clock, and an evaluation that overruns simply delays
     /// the next one instead of stacking up behind it. the closure is expected
-    /// to return an empty vec nearly always — that is the normal outcome of
+    /// to return an empty vec nearly always: that is the normal outcome of
     /// looking and finding nothing.
     ///
     /// ```no_run
@@ -171,7 +171,7 @@ impl Sensor {
     /// abandoning is not stopping, and this is the same limit ops have. an
     /// `.await` inside the closure is where an abandoned evaluation actually
     /// goes away; a closure doing blocking work between await points cannot be
-    /// dropped at all, so it keeps its thread until that work returns — and if
+    /// dropped at all, so it keeps its thread until that work returns, and if
     /// it does return, late, what it returns still counts. nothing else can
     /// have run in the meantime: the loop never evaluates a sensor whose
     /// previous evaluation is still going. [`SensorCtx::is_cancelled`] is the
@@ -200,17 +200,17 @@ pub(crate) const DEFAULT_SENSOR_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// how many sensors evaluate at once. the loop evaluated in sequence before
 /// this, so one slow closure delayed every sensor and every probe behind it;
-/// the bound is here because the alternative — every due sensor at once — is
+/// the bound is here because the alternative (every due sensor at once) is
 /// how a hundred entries become a hundred concurrent api calls.
 const MAX_CONCURRENT_EVALS: usize = 8;
 
 /// what a [`RunStatusSensor`] closure is handed about a run that just
 /// finished. deliberately a small public struct and not the internal `Run`:
 /// what a sensor needs to decide is the identity, the job, how it went and
-/// when — not the params blob or the resume chain.
+/// when, not the params blob or the resume chain.
 #[derive(Debug, Clone, Serialize)]
 pub struct RunSummary {
-    /// the run that finished — what a request launched in response should
+    /// the run that finished: what a request launched in response should
     /// carry as its [key](RunRequest::key) if it must happen once per run.
     pub id: String,
     /// which job it was of, which is what most of these closures branch on.
@@ -271,7 +271,7 @@ type RunSensorFn = dyn Fn(
 /// ```
 ///
 /// it registers as `run:{name}` in the sensors table, so it shares pausing,
-/// tick history and cursor storage with every other sensor — there is one
+/// tick history and cursor storage with every other sensor: there is one
 /// sensor loop, and this is a third kind of source on it rather than a fourth
 /// loop.
 ///
@@ -290,7 +290,7 @@ pub struct RunStatusSensor {
 
 impl RunStatusSensor {
     /// `f` is called once per matching run, with the same [`SensorCtx`] a user
-    /// sensor gets — though the cursor is the loop's here, and
+    /// sensor gets, though the cursor is the loop's here, and
     /// [`set_cursor`](SensorCtx::set_cursor) has no effect on a run sensor.
     pub fn new<F, Fut>(name: impl Into<String>, f: F) -> RunStatusSensor
     where
@@ -310,7 +310,7 @@ impl RunStatusSensor {
     }
 
     /// which terminal statuses fire it; success by default. an empty list
-    /// means success, not nothing — a sensor that can never fire is a typo.
+    /// means success, not nothing: a sensor that can never fire is a typo.
     pub fn on(mut self, statuses: impl IntoIterator<Item = RunStatus>) -> RunStatusSensor {
         let statuses: Vec<RunStatus> = statuses.into_iter().collect();
         if !statuses.is_empty() {
@@ -374,7 +374,7 @@ impl SensorCtx {
     }
 
     /// true once this evaluation's [timeout](Sensor::timeout) has passed. cheap
-    /// enough to call in a loop — it reads the clock and allocates nothing.
+    /// enough to call in a loop: it reads the clock and allocates nothing.
     ///
     /// an async closure does not need this: it is dropped at its next await
     /// point. blocking work cannot be dropped at all, so polling this is the
@@ -507,7 +507,7 @@ const BACKOFF_MAX: Duration = Duration::from_secs(15 * 60);
 /// lockstep.
 ///
 /// the floor doubles as well as the ceiling, which is what makes the gap
-/// actually lengthen rather than merely lengthen on average — and it is never
+/// actually lengthen rather than merely lengthen on average, and it is never
 /// shorter than the interval that was asked for, including for a sensor whose
 /// interval is already past the cap and so has nothing to back off to.
 fn next_gap(every: Duration, failures: u32) -> Duration {
@@ -527,7 +527,7 @@ struct StateInner {
     /// it rather than derived: a monotonic instant has no calendar time to
     /// convert to
     next_eval: DateTime<Utc>,
-    /// an evaluation of this sensor is under way — waiting for a permit
+    /// an evaluation of this sensor is under way; waiting for a permit
     /// counts, because it is going to run
     running: bool,
     /// a skip has already been recorded for this stall, so the ones after it
@@ -573,7 +573,7 @@ impl SensorState {
     }
 
     /// when the sensor is next due, and how many evaluations have failed in a
-    /// row — what `GET /api/sensors` reports.
+    /// row, which is what `GET /api/sensors` reports.
     pub(crate) fn snapshot(&self) -> (DateTime<Utc>, u32) {
         let inner = self.0.lock().unwrap();
         (inner.next_eval, inner.failures)
@@ -699,7 +699,7 @@ fn note_skipped_tick(runner: &Runner, name: &str) {
 
 /// whether the sensor is administratively stopped. a read that fails counts as
 /// paused: it used to count as running, which is a control-plane switch that
-/// fails open — the one direction it must not fail in. a turn not taken is
+/// fails open, the one direction it must not fail in. a turn not taken is
 /// recoverable, and a launch nobody asked for is not.
 fn sensor_paused(runner: &Runner, name: &str) -> bool {
     match runner.store().sensors() {
@@ -721,7 +721,7 @@ fn sensor_paused(runner: &Runner, name: &str) -> bool {
 struct Counts {
     /// the runs it launched, in the order it launched them. the ids rather
     /// than a number, because "what did this sensor do at 3am" is answered by
-    /// the runs and not by how many there were — the length is the count.
+    /// the runs and not by how many there were: the length is the count.
     launched: Mutex<Vec<String>>,
     skipped: AtomicU32,
 }
@@ -769,7 +769,7 @@ async fn evaluate(entry: &SensorEntry, runner: &Runner, registry: &AssetRegistry
     };
     // abandoning is not stopping: the evaluation goes away at its next await
     // point, and a closure blocking between them keeps its thread until it
-    // returns. what is guaranteed is that nothing it does after this counts —
+    // returns. what is guaranteed is that nothing it does after this counts:
     // the cursor is not committed and the tick is already written
     let (outcome, error) = match tokio::time::timeout_at(deadline, eval).await {
         Ok(done) => done,
@@ -922,7 +922,7 @@ async fn evaluate_user(
 /// failure is consumed rather than re-read forever. and it is committed once at
 /// the end: a launch that fails halfway leaves the cursor where it was, so the
 /// runs already handled are handed over again next tick. that is the same
-/// at-least-once contract a user sensor has, for the same reason — a sensor
+/// at-least-once contract a user sensor has, for the same reason: a sensor
 /// that could lose an event would be worse than one that repeats it. a request
 /// carrying a [run key](RunRequest::key) is the way out of the replay: the
 /// second sight of it is skipped rather than launched.
@@ -1696,7 +1696,7 @@ mod tests {
         run.id
     }
 
-    /// what the chain launched, oldest first — sensor-triggered only, so a
+    /// what the chain launched, oldest first: sensor-triggered only, so a
     /// manual `publish` planted by a test is not mistaken for a chained one.
     fn published(store: &Store) -> Vec<Value> {
         let mut runs = store
@@ -1805,7 +1805,7 @@ mod tests {
         let store = Store::open(":memory:").unwrap();
         store.sync_sensors(&["run:loop".into()]).unwrap();
         let runner = chain_runner(store.clone());
-        // "when publish succeeds, publish again" — but only for the manual
+        // "when publish succeeds, publish again", but only for the manual
         // one, so the run it launches cannot re-trigger it
         let entry = chain_entry(
             "loop",
@@ -1881,7 +1881,7 @@ mod tests {
         );
 
         // at-least-once: the first run is handed over a second time, which is
-        // the contract — a sensor that could lose an event would be worse
+        // the contract: a sensor that could lose an event would be worse
         evaluate(&entry, &runner, &reg).await;
         let params = published(&store);
         assert_eq!(
@@ -2030,8 +2030,8 @@ mod tests {
         store.sync_sensors(&["run:chain".into()]).unwrap();
         let runner = chain_runner(store.clone());
         let reg = AssetRegistry::empty();
-        // the same partial failure as the at-least-once test above — the second
-        // request names a job nobody registered — with each request keyed by the
+        // the same partial failure as the at-least-once test above (the second
+        // request names a job nobody registered), with each request keyed by the
         // run that triggered it
         let calls = Arc::new(AtomicU32::new(0));
         let counter = calls.clone();
@@ -2261,7 +2261,7 @@ mod tests {
         let counter = chunks.clone();
         // the shape a blocking closure has: work in chunks, checking between
         // them. blocking work cannot be abandoned, so this is the only way it
-        // ever stops — and stopping is the closure's own decision to make
+        // ever stops, and stopping is the closure's own decision to make
         let entry = SensorEntry::user(
             Sensor::new(
                 "chunks",

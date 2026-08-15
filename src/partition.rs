@@ -30,7 +30,7 @@ const MAX_KEYS: usize = 10_000;
 /// ```
 ///
 /// `daily` keys are `YYYY-MM-DD` and `hourly` keys are `YYYY-MM-DDTHH`, both
-/// in utc, running from `start` to now — the set grows with the clock.
+/// in utc, running from `start` to now: the set grows with the clock.
 /// [`keys`](Self::keys) is a fixed set of whatever strings you like.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Partitions {
@@ -226,7 +226,7 @@ impl Partitions {
         self.keys_until(Utc::now())
     }
 
-    /// every key up to `now`, oldest first — the whole set for a static one.
+    /// every key up to `now`, oldest first; the whole set for a static one.
     pub(crate) fn keys_until(&self, now: DateTime<Utc>) -> Vec<String> {
         let keys = match &self.kind {
             Kind::Static { keys } => return keys.clone(),
@@ -274,7 +274,7 @@ impl Partitions {
         self.keys_now().iter().any(|k| k == key)
     }
 
-    /// the keys from `from` to `to` inclusive — what a
+    /// the keys from `from` to `to` inclusive, which is what a
     /// [backfill](crate::Hestan) resolves its range to. a generated set is in
     /// time order, so the range is every key between the two; a static set is
     /// in the order it was declared, so the range is the slice between them.
@@ -320,8 +320,8 @@ impl Partitions {
 ///
 /// [`identity`](Self::identity) is the default and the only shape that reads
 /// an unpartitioned dep. the rest need a partitioned one, and a pairing that
-/// could never resolve — a day covering a static key set, an offset along a
-/// set with no order — fails the build rather than quietly reading nothing.
+/// could never resolve (a day covering a static key set, an offset along a
+/// set with no order) fails the build rather than quietly reading nothing.
 #[derive(Clone, Debug, PartialEq, Eq, Default)]
 pub struct PartitionMapping {
     shape: Shape,
@@ -339,7 +339,7 @@ enum Shape {
 impl PartitionMapping {
     /// the same key, which is what every dep between two partitioned assets
     /// meant before there was anything else to mean. the default, and the only
-    /// shape that says anything about an unpartitioned dep — whose whole value
+    /// shape that says anything about an unpartitioned dep, whose whole value
     /// arrives at every key.
     pub fn identity() -> PartitionMapping {
         PartitionMapping {
@@ -349,7 +349,7 @@ impl PartitionMapping {
 
     /// every key the dep has, as one object keyed by them. this is the read an
     /// unpartitioned asset makes of a partitioned one, and the only shape that
-    /// pairs any two key sets — a set that grows leaves the consumer stale
+    /// pairs any two key sets: a set that grows leaves the consumer stale
     /// whenever it grows, which is what an aggregation of everything means.
     pub fn all() -> PartitionMapping {
         PartitionMapping { shape: Shape::All }
@@ -363,7 +363,7 @@ impl PartitionMapping {
     /// a window promises its whole range: a key whose dep does not hold every
     /// hour of it is refused at the build that names it, rather than
     /// materialized from the part that happens to be there. the exception is
-    /// the range the dep's clock has not reached — the hours left in today —
+    /// the range the dep's clock has not reached (the hours left in today),
     /// which is not missing but not yet due, so a rollup of the day so far
     /// builds and goes stale as each hour lands.
     pub fn covering() -> PartitionMapping {
@@ -372,7 +372,7 @@ impl PartitionMapping {
         }
     }
 
-    /// the key `n` steps back or forward along the dep's order —
+    /// the key `n` steps back or forward along the dep's order:
     /// `offset(-1)` is yesterday's key on a daily set and the previous hour on
     /// an hourly one. both sets have to be the same kind, and a set with no
     /// order to step along is refused at the build.
@@ -464,7 +464,7 @@ impl PartitionMapping {
 /// what one partition reads from one dep: the dep keys it takes, and the ones
 /// it promised that the dep does not hold and never will. `missing` is empty
 /// for every shape but [`covering`](PartitionMapping::covering), which
-/// promises a whole range — the others name keys that may or may not exist,
+/// promises a whole range: the others name keys that may or may not exist,
 /// which is a different claim.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub(crate) struct Reads {
@@ -474,7 +474,7 @@ pub(crate) struct Reads {
 
 impl Reads {
     /// what [identity](PartitionMapping::identity) reads, without asking the
-    /// dep what it holds — a key it does not hold is a dep that never
+    /// dep what it holds: a key it does not hold is a dep that never
     /// materializes, not a key that goes unread. worth having on its own: a
     /// dep of ten thousand keys is not worth walking to be told the answer is
     /// the key you started with.

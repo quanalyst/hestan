@@ -123,7 +123,7 @@ impl Asset {
         }
     }
 
-    /// a derived asset with typed io — the same machinery as [`Op::typed`]:
+    /// a derived asset with typed io, the same machinery as [`Op::typed`]:
     /// dep values are deserialized into `I` (one field per dep, named after
     /// it) and the return value is serialized back to json.
     pub fn typed<I, O, F, Fut>(name: impl Into<String>, f: F) -> Asset
@@ -177,7 +177,7 @@ impl Asset {
         self
     }
 
-    /// declare lineage on an asset by name — the way to depend on one output
+    /// declare lineage on an asset by name: the way to depend on one output
     /// of a [`MultiAsset`], which produces names rather than [`Asset`] values.
     /// a name nothing registers is a build error, exactly as with
     /// [`from`](Self::from).
@@ -203,7 +203,7 @@ impl Asset {
     /// ```
     ///
     /// [`from`](Self::from) is this with
-    /// [`identity`](PartitionMapping::identity) — the same key, which is what
+    /// [`identity`](PartitionMapping::identity): the same key, which is what
     /// a dep between two partitioned assets meant before there was anything
     /// else it could mean. repeatable, and a mapping the two key sets could
     /// never resolve fails the build.
@@ -234,7 +234,7 @@ impl Asset {
         &self.name
     }
 
-    /// what it is made of, in declaration order — the same names
+    /// what it is made of, in declaration order: the same names
     /// [`from`](Asset::from) and [`from_named`](Asset::from_named) took.
     pub fn deps(&self) -> &[String] {
         &self.deps
@@ -261,7 +261,7 @@ impl Asset {
     ///
     /// the materialization then records the handle the manager returned, and a
     /// later build that memoizes this asset reads the value back through the
-    /// same manager rather than out of the run log — so an asset of rows can
+    /// same manager rather than out of the run log, so an asset of rows can
     /// be stored as [parquet][parquet] and nothing downstream reads json.
     /// `docs/io-managers.md` says what that means for
     /// [retention](crate::Retention), which takes what a manager wrote when it
@@ -308,8 +308,8 @@ impl Asset {
     /// ```
     ///
     /// a build expands into one fan-out instance per target key, named
-    /// `{asset}[{key}]`. sources cannot be partitioned — a probe fingerprints
-    /// the whole thing — and neither can a [`MultiAsset`], which has no
+    /// `{asset}[{key}]`. sources cannot be partitioned (a probe fingerprints
+    /// the whole thing), and neither can a [`MultiAsset`], which has no
     /// `partitioned` at all.
     pub fn partitioned(mut self, partitions: Partitions) -> Asset {
         self.partitions = Some(partitions);
@@ -320,7 +320,7 @@ impl Asset {
     /// asset is late: `fresh_within(Duration::from_secs(3600))` says it should
     /// be rebuilt hourly, however that rebuild is triggered. on a [partitioned
     /// asset](Self::partitioned) the policy applies per key, so the asset is
-    /// late as soon as any one key is — see
+    /// late as soon as any one key is; see
     /// [freshness](../docs/freshness.md). staleness is a different question:
     /// stale means a dep moved, late means time passed.
     pub fn fresh_within(mut self, d: Duration) -> Asset {
@@ -347,7 +347,7 @@ impl Asset {
 /// ```
 ///
 /// the body returns a json **object** whose keys are exactly the produced
-/// names — a missing or extra key fails the op and says which. it lowers to
+/// names: a missing or extra key fails the op and says which. it lowers to
 /// one op of the internal `assets` job, and each produced asset gets its own
 /// materialization, its own fingerprint (the hash of that key's value, or
 /// [`OpCtx::set_fingerprint_of`]) and its own metadata
@@ -412,7 +412,7 @@ impl MultiAsset {
     }
 
     /// store what this op produces through the [io manager](crate::IoManager)
-    /// registered under `name`, as [`Asset::io`] does — one output holding
+    /// registered under `name`, as [`Asset::io`] does: one output holding
     /// every asset, since one op returns it.
     ///
     /// each produced asset's materialization keeps its own slice of that
@@ -459,7 +459,7 @@ pub struct CheckResult {
 
 impl CheckResult {
     /// it passed. hang a [`meta`](CheckResult::meta) on it to record what it
-    /// saw — a check that reports the number it was satisfied by is worth more
+    /// saw: a check that reports the number it was satisfied by is worth more
     /// three months later than one that only ever says yes.
     pub fn pass() -> CheckResult {
         CheckResult {
@@ -478,7 +478,7 @@ impl CheckResult {
         }
     }
 
-    /// attach a typed fact to the result — the number that failed the
+    /// attach a typed fact to the result: the number that failed the
     /// threshold, usually. same values as [`OpCtx::meta`](crate::OpCtx::meta),
     /// recorded on the check row rather than the op run.
     pub fn meta(mut self, name: impl Into<String>, value: impl Into<Meta>) -> CheckResult {
@@ -588,7 +588,7 @@ impl AssetMeta {
     }
 }
 
-/// one op of the lowered `assets` job and the assets it produces — one for a
+/// one op of the lowered `assets` job and the assets it produces: one for a
 /// plain [`Asset`], several for a [`MultiAsset`]. the registry is asset -> op
 /// N:1, and this is the op side of it.
 pub(crate) struct OpMeta {
@@ -618,7 +618,7 @@ impl OpMeta {
 /// how one dep asset reaches the op that reads it: the op that produces it
 /// (which is the name the run knows it by), the key to take out of that op's
 /// output when the producer is a multi-asset, and whether the dep is itself
-/// partitioned — in which case its value is read per key from the store
+/// partitioned, in which case its value is read per key from the store
 /// rather than out of the run.
 #[derive(Clone)]
 struct DepLink {
@@ -771,7 +771,7 @@ impl AssetRegistry {
         for o in &ops {
             // ops and assets share one namespace inside the job, so a
             // multi-asset named after an asset it does not produce collides
-            // there — said before the duplicate check below, which would
+            // there, said before the duplicate check below, which would
             // otherwise report the collision as two multi-assets
             if !o.produces.contains(&o.name) && order.contains(&o.name) {
                 return Err(Error::Graph(format!(
@@ -880,8 +880,8 @@ impl AssetRegistry {
         self.by_op.get(name).map(|&i| &self.ops[i])
     }
 
-    /// what the run knows `asset` by: the op that produces it, or — for a
-    /// source, which has no op — the asset's own name, seeded as an external.
+    /// what the run knows `asset` by: the op that produces it, or (for a
+    /// source, which has no op) the asset's own name, seeded as an external.
     fn producer(&self, asset: &str) -> String {
         match self.get(asset).and_then(|m| m.op.clone()) {
             Some(op) => op,
@@ -920,7 +920,7 @@ impl AssetRegistry {
     }
 
     /// lower into the internal "assets" job: one wrapped op per materializing
-    /// op — which is one asset, or all of a multi-asset's — one more per check
+    /// op (which is one asset, or all of a multi-asset's), one more per check
     /// hanging off the asset it checks, and sources as external deps that a
     /// full launch seeds null.
     pub(crate) fn lower_job(&self) -> Result<Job, Error> {
@@ -931,8 +931,8 @@ impl AssetRegistry {
             .chain(self.checks.iter().map(|c| check_op(self, c)))
             .collect();
         // sources seed null: their value is lineage, not data. a partitioned
-        // asset's key list seeds `[]`, so a full launch of the job — which
-        // computes no plan and so no targets — expands it into nothing rather
+        // asset's key list seeds `[]`, so a full launch of the job (which
+        // computes no plan and so no targets) expands it into nothing rather
         // than guessing at a range
         let external: Vec<(String, Value)> = self
             .metas
@@ -981,7 +981,7 @@ fn check_partition_deps(metas: &[AssetMeta]) -> Result<(), Error> {
                 if !mapping.is_identity() {
                     return bad(format!(
                         "it reads {dep} by {}, but {dep} is not partitioned at all. an \
-                         unpartitioned dep has no keys to map onto — its whole value \
+                         unpartitioned dep has no keys to map onto: its whole value \
                          arrives at every key of {}",
                         mapping.label(),
                         meta.name
@@ -999,7 +999,7 @@ fn check_partition_deps(metas: &[AssetMeta]) -> Result<(), Error> {
                     return bad(format!(
                         "it is not partitioned, but reads its {} dep {dep} by {}. a \
                          mapping resolves from one key to another and {} has no key of \
-                         its own — read every key with PartitionMapping::all, or \
+                         its own: read every key with PartitionMapping::all, or \
                          partition {} too",
                         dep_spec.kind_label(),
                         mapping.label(),
@@ -1010,7 +1010,7 @@ fn check_partition_deps(metas: &[AssetMeta]) -> Result<(), Error> {
                 return Err(Error::Graph(format!(
                     "asset {}: it is not partitioned but its dep {dep} is. reading every \
                      partition of {dep} at once is an aggregation, and hestan has no \
-                     semantics for one yet — partition {} too, or aggregate inside the \
+                     semantics for one yet: partition {} too, or aggregate inside the \
                      body from a source",
                     meta.name, meta.name
                 )));
@@ -1081,7 +1081,7 @@ fn dep_value(ctx: &OpCtx, link: &DepLink) -> Option<Value> {
 
 /// one asset's stored value, read back through the manager that stored it.
 ///
-/// a materialization holds what the manager returned — a handle under a file
+/// a materialization holds what the manager returned: a handle under a file
 /// manager, the value itself under [`Inline`](crate::Inline), and the raw
 /// value on any row written before an asset's value went through one. `get` is
 /// total over all three, which is what makes an old row keep working.
@@ -1126,14 +1126,14 @@ async fn partition_value(
 /// a **partitioned** dep is read from the store, at whatever keys this
 /// partition's [mapping](PartitionMapping) resolves to rather than out of the
 /// run. that is what makes a mapping mean one thing: the consumer reads
-/// `dep[k]` whether `dep[k]` was rebuilt by this run — its materialization is
-/// written inside its own op, which has finished by now — or was already fresh
+/// `dep[k]` whether `dep[k]` was rebuilt by this run (its materialization is
+/// written inside its own op, which has finished by now) or was already fresh
 /// and never ran at all. what that row holds is what the manager returned, so
 /// it is read back through the manager like any other input.
 ///
 /// a mapping that names one key hands the body that key's value. one that
 /// names a set hands it an object keyed by partition, holding the keys that
-/// have materialized — an empty object rather than nothing when none have, so
+/// have materialized: an empty object rather than nothing when none have, so
 /// "the set was empty" and "there is no such dep" stay different facts.
 async fn with_dep_inputs(
     ctx: &OpCtx,
@@ -1185,7 +1185,7 @@ async fn with_dep_inputs(
 
 /// the dep fingerprints one materialization records: the key it consumed for a
 /// partitioned dep read at one key, the whole asset for an unpartitioned one,
-/// and — for a dep read through a mapping that names a set — one fingerprint
+/// and (for a dep read through a mapping that names a set) one fingerprint
 /// per key it consumed, as an object keyed by partition.
 ///
 /// this is what staleness compares against, so a mapped read has to record
@@ -1238,7 +1238,7 @@ fn dep_fingerprints(
 
 /// what each produced asset's value is, out of the op's output. one asset is
 /// the whole output; a multi-asset splits by key, and a key it did not return
-/// — or one nothing declared — fails the op naming the discrepancy, because
+/// (or one nothing declared) fails the op naming the discrepancy, because
 /// the alternative is a materialization of `null` nobody asked for.
 fn split_output<'a>(
     op: &str,
@@ -1300,7 +1300,7 @@ fn json_type(v: &Value) -> &'static str {
 // the body computes what only the body can know and stages it; the executor
 // writes it in the transaction that records the op succeeding. so a build
 // that fails, is cancelled, times out, panics or cannot be persisted leaves
-// no materialization, and the next run rebuilds it — at-least-once, like op
+// no materialization, and the next run rebuilds it: at-least-once, like op
 // state
 fn wrap_op(reg: &AssetRegistry, meta: &OpMeta) -> Op {
     let inner = meta.op.clone();
@@ -1538,20 +1538,20 @@ pub(crate) struct Staleness {
     pub reasons: Vec<StaleReason>,
     /// one verdict per key of a [partitioned asset](crate::Partitions), and
     /// empty for an unpartitioned one. the asset as a whole is stale exactly
-    /// when one of its keys is, which is why `reasons` is empty here — the
+    /// when one of its keys is, which is why `reasons` is empty here: the
     /// evidence lives per key.
     pub parts: BTreeMap<String, Staleness>,
 }
 
 /// why an asset is stale: dep's fingerprint when this asset last consumed it
 /// (`had`) vs the dep's current one (`now`). equal fingerprints appear when
-/// the dep itself is stale — staleness propagates ahead of rebuilds.
+/// the dep itself is stale: staleness propagates ahead of rebuilds.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct StaleReason {
     pub dep: String,
     /// which of the dep's keys this is about, when the dep was read through a
     /// [mapping](PartitionMapping) that reads a key other than this asset's
-    /// own — the hour that moved under a daily rollup, rather than the day.
+    /// own: the hour that moved under a daily rollup, rather than the day.
     /// `None` under identity, where the key is the reader's own.
     pub partition: Option<String>,
     pub had: Option<String>,
@@ -1564,8 +1564,8 @@ pub(crate) struct StaleReason {
 ///
 /// a partitioned asset is judged one key at a time, and is stale as a whole
 /// when any of its keys is. a partitioned dep is read at whatever keys the
-/// edge's [mapping](PartitionMapping) resolves to — the same key under
-/// identity — and an unpartitioned one whole, which is why a probe moving a
+/// edge's [mapping](PartitionMapping) resolves to (the same key under
+/// identity), and an unpartitioned one whole, which is why a probe moving a
 /// source's fingerprint makes every partition of every descendant stale at
 /// once.
 pub(crate) fn staleness(reg: &AssetRegistry, mats: &Mats) -> HashMap<String, Staleness> {
@@ -1654,7 +1654,7 @@ fn one_staleness(
             continue;
         };
         // a mapped read consumed a fingerprint per key, so the same question is
-        // asked of every key it read — and of every key it wanted and the dep
+        // asked of every key it read, and of every key it wanted and the dep
         // does not hold, which can never be fresh either. one reason per dep
         // still: the first key that moved is what made this one stale, and a
         // window of ten thousand is not a list anybody reads
@@ -1685,7 +1685,7 @@ fn one_staleness(
 }
 
 /// what one build run executes: materializing ops in topo order with their
-/// check ops, plus seeds for everything they read that won't run — stored
+/// check ops, plus seeds for everything they read that won't run: stored
 /// values for fresh derived deps, null for sources. every name here is an op
 /// of the `assets` job, which for a multi-asset is not the name of any asset.
 #[derive(Debug)]
@@ -1719,7 +1719,7 @@ fn with_checks(reg: &AssetRegistry, ops: Vec<String>) -> Vec<String> {
 
 /// what a fresh dep the plan does not re-run is seeded with, under the name the
 /// run knows it by: a source is null, an asset with an op to itself is what its
-/// materialization holds, and a multi-asset is the object its op returns —
+/// materialization holds, and a multi-asset is the object its op returns:
 /// every asset it produces, so that whichever key a consumer reads is there.
 ///
 /// what a materialization holds is what the [manager](crate::IoManager)
@@ -1828,8 +1828,8 @@ fn unheld(sets: &HashMap<String, KeySet>, meta: &AssetMeta, key: &str) -> Option
 /// which keys each partitioned op in the plan will build.
 ///
 /// walked from the sinks up, because a mapping runs that way: an upstream
-/// partitioned asset has to cover every key its consumers are about to read —
-/// its own key under identity, the 24 hours under a daily window — and only
+/// partitioned asset has to cover every key its consumers are about to read
+/// (its own key under identity, the 24 hours under a daily window), and only
 /// the keys of *its* that are actually stale are worth rebuilding. a target
 /// with no keys named takes its default set; anything upstream takes what its
 /// consumers need.
@@ -1864,7 +1864,7 @@ fn key_targets(
             }
             let mapping = consumer.mapping(asset);
             let set = sets.get(asset);
-            // an unpartitioned consumer makes one read, at no key of its own —
+            // an unpartitioned consumer makes one read, at no key of its own,
             // which only a mapping over every key resolves to anything
             let reading: Vec<Option<&str>> = match consumer.partitions.is_some() {
                 false => vec![None],
@@ -1909,7 +1909,7 @@ pub(crate) fn plan_target(
 }
 
 /// one plan for several targets: the union of their stale derived ancestors plus
-/// every target itself. one plan means one run — overlapping per-target plans
+/// every target itself. one plan means one run: overlapping per-target plans
 /// would each re-run the shared ancestors. errors on an unknown or source target.
 pub(crate) fn plan_targets(
     reg: &AssetRegistry,
@@ -1920,7 +1920,7 @@ pub(crate) fn plan_targets(
 }
 
 /// [`plan_targets`] with the partitions of some targets named outright rather
-/// than defaulted — what `POST /api/assets/{name}/build` with a `partitions`
+/// than defaulted: what `POST /api/assets/{name}/build` with a `partitions`
 /// body and what a [backfill](crate::Hestan) launch build. a key that is not
 /// in the asset's set, or named for an asset that is not partitioned, is an
 /// error rather than an instance that could never mean anything.
@@ -2016,7 +2016,7 @@ pub(crate) fn mats_map(store: &Store) -> Result<Mats, Error> {
 }
 
 /// launch a plan as one subset run of the assets job, [tagged](RunTags) with
-/// whatever the caller can say that `Trigger::Build` cannot — which asset it
+/// whatever the caller can say that `Trigger::Build` cannot: which asset it
 /// was asked for, which backfill it is a chunk of, which sensor set it off.
 pub(crate) fn launch_plan(
     runner: &crate::executor::Runner,
@@ -2039,7 +2039,7 @@ pub(crate) fn launch_plan(
 /// launch a build of one asset: it, plus whatever upstream of it is stale, as
 /// one run.
 ///
-/// `Ok(None)` is an asset that is already up to date and had nothing to do —
+/// `Ok(None)` is an asset that is already up to date and had nothing to do,
 /// not a refusal and not a run. named `keys` are a rebuild of exactly those
 /// partitions whatever staleness says, which is the point of naming them.
 ///
@@ -2134,8 +2134,8 @@ pub(crate) fn mapped_reads(
 
 /// what naming a key outright is refused for: a partition whose
 /// [window](PartitionMapping::covering) reaches a key its dep does not hold.
-/// nothing could ever materialize it — a window is its whole range or it is a
-/// different number — so the answer is which key is missing, rather than a
+/// nothing could ever materialize it (a window is its whole range or it is a
+/// different number), so the answer is which key is missing, rather than a
 /// rollup of the part that happened to be there.
 ///
 /// both places a caller names keys come through here: a build of named
@@ -2718,7 +2718,7 @@ mod tests {
     }
 
     // a cancelled run stops its ops where they stand, and an op that was
-    // stopped built nothing — whatever it had computed by then.
+    // stopped built nothing, whatever it had computed by then.
     #[tokio::test]
     async fn a_canceled_build_records_nothing() {
         let store = Store::open(":memory:").unwrap();
@@ -2730,7 +2730,7 @@ mod tests {
                 started.store(true, std::sync::atomic::Ordering::SeqCst);
                 ctx.cancelled().await;
                 // the abort lands on this await, so the value is computed and
-                // never returned — which is every op that is stopped mid-work
+                // never returned, which is every op that is stopped mid-work
                 tokio::time::sleep(Duration::from_secs(30)).await;
                 Ok(json!({"rows": 1}))
             }
@@ -2769,7 +2769,7 @@ mod tests {
     // several assets out of one op are one fact about one op run, so the
     // history gains all of them or none. asserted rather than described: a
     // trigger refuses one insert, and everything the op wrote goes back with
-    // it — the other materialization and the op run's own terminal row.
+    // it: the other materialization and the op run's own terminal row.
     //
     // and the run stops where that write stopped. it does not go on to report
     // a status the store never took: it is left `running`, claimed, for a
@@ -3528,7 +3528,7 @@ mod tests {
         let daily = Asset::new("daily", |_| async { Ok(json!(null)) })
             .partitioned(Partitions::daily("2026-01-01").build_limit(3));
         let reg = AssetRegistry::new(vec![daily], Vec::new(), Vec::new()).unwrap();
-        // nothing built, so every key of an unbounded range is stale — and the
+        // nothing built, so every key of an unbounded range is stale, and the
         // build limit is what stops that being a thousand instances
         let plan = plan_target(&reg, &Mats::default(), "daily").unwrap();
         let keys = plan.seeds["partitions:daily"].as_array().unwrap().clone();

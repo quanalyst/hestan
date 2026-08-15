@@ -93,7 +93,7 @@ pub(crate) enum Ticket<'a> {
 /// dropping it before [`spend`](Reserved::spend) resolves gives the token to
 /// the op behind it in the queue, which is what a canceled run does. a token
 /// is spent rather than returned, so one taken by an op that is already dying
-/// is a call nobody makes — and a call the op behind it should have been
+/// is a call nobody makes, and a call the op behind it should have been
 /// making.
 pub(crate) struct Reserved<'a> {
     rate: &'a Rate,
@@ -134,14 +134,14 @@ impl Drop for Reserved<'_> {
 /// a token bucket: `limit` tokens accrue over `per`, and up to `limit` of them
 /// may be spent at once.
 ///
-/// a fixed window is less code and is the classic wrong answer — five a second,
+/// a fixed window is less code and is the classic wrong answer: five a second,
 /// five at 0.99s and five more at 1.01s, and the api sees ten inside fifty
 /// milliseconds. tokens accrue continuously here, so a span that short is worth
 /// what a span that short is worth wherever it falls.
 ///
 /// the schedule is one instant, `next`: when the token after everything taken
 /// so far accrues. a caller may draw up to `burst` ahead of it, which is what
-/// makes the first `limit` of them immediate — an api that says "5 a second"
+/// makes the first `limit` of them immediate: an api that says "5 a second"
 /// generally tolerates 5 at once and then a second of quiet, and dribbling them
 /// out one every 200ms would be slower than the thing being protected asked
 /// for.
@@ -168,7 +168,7 @@ impl Bucket {
         }
     }
 
-    /// take a token and say when it may be spent — `now` or earlier for one
+    /// take a token and say when it may be spent: `now` or earlier for one
     /// that was already in the bucket.
     ///
     /// every call takes one, whether or not it has to wait: the n+1th caller is
@@ -240,7 +240,7 @@ mod tests {
     }
 
     /// what `take` says to a run of arrivals, as millisecond offsets from
-    /// `start` — the times the api sees the calls at.
+    /// `start`, the times the api sees the calls at.
     fn admissions(bucket: &mut Bucket, start: Instant, arrivals_ms: &[u64]) -> Vec<u128> {
         arrivals_ms
             .iter()

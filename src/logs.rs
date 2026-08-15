@@ -1,5 +1,5 @@
 //! what an op *printed*, as opposed to what it
-//! [said](crate::OpCtx::info) — and the cap that keeps a `println!` loop from
+//! [said](crate::OpCtx::info), and the cap that keeps a `println!` loop from
 //! filling a disk.
 //!
 //! two mechanisms fill the `op_logs` table and this module is the throat both
@@ -10,7 +10,7 @@
 //! the cap is per **attempt**, not per op or per run: a retry starts from a
 //! full budget, because the interesting output is usually the attempt that
 //! failed last. past either limit capture stops for that attempt and one line
-//! says so — hestan speaking rather than the op, which is what the `hestan`
+//! says so, hestan speaking rather than the op, which is what the `hestan`
 //! target on a row with no stream means.
 
 use std::borrow::Cow;
@@ -41,8 +41,8 @@ pub(crate) const LINE_MAX: usize = 8 * 1024;
 pub(crate) const CLIPPED: &str = "… [truncated]";
 
 /// the `target` on a row hestan wrote about the capture itself. no tracing
-/// event carries it — an event's target is a module path, so the shortest one
-/// hestan can emit is `hestan::something` — which is what makes it a usable
+/// event carries it (an event's target is a module path, so the shortest one
+/// hestan can emit is `hestan::something`), which is what makes it a usable
 /// marker for the ui.
 pub(crate) const HESTAN: &str = "hestan";
 
@@ -63,7 +63,7 @@ pub(crate) const TRACE_TARGET: &str = "hestan::events";
 /// layer](crate::capture_layer) uses a handle the *host* opened, before
 /// [`Hestan`](crate::Hestan) existed and possibly on another connection to
 /// the same file. a cap that lived on one of those objects would silently not
-/// apply to the other — and a limit that quietly does not hold is worse than
+/// apply to the other, and a limit that quietly does not hold is worse than
 /// no limit at all. one process running two hestan applications with
 /// different limits would see the last one set; nothing does that.
 static CAPS: Caps = Caps {
@@ -143,7 +143,7 @@ impl Source<'_> {
 
 /// how much of one attempt's budget is spent, and whether it ran out.
 ///
-/// one budget per attempt, shared by everything writing for it — an isolated
+/// one budget per attempt, shared by everything writing for it: an isolated
 /// op's two pipes spend the same allowance, because the limit is on what the
 /// attempt produced and not on which pipe it came out of.
 #[derive(Debug)]
@@ -220,7 +220,7 @@ pub(crate) struct Capture(Vec<tokio::task::JoinHandle<()>>);
 /// start reading both of a child's pipes, into rows under `at`.
 ///
 /// **both, concurrently, always.** reading stdout to its end first and stderr
-/// afterwards would leave stderr's pipe buffer — 64 KiB on linux — to fill,
+/// afterwards would leave stderr's pipe buffer (64 KiB on linux) to fill,
 /// and a child blocked writing into a full pipe never exits, so the parent
 /// waits forever for a process waiting for the parent. it looks like a slow op
 /// under load and like nothing at all in a test with a chatty op, which is
@@ -260,7 +260,7 @@ impl Capture {
     /// closed and both tasks are already finishing. the exception is a
     /// grandchild the op left behind holding an inherited pipe open, and a
     /// lost tail of output is a far better outcome there than an op run that
-    /// never ends — so this waits, then stops.
+    /// never ends, so this waits, then stops.
     pub(crate) async fn finish(self, grace: Duration) {
         let stop: Vec<_> = self.0.iter().map(|t| t.abort_handle()).collect();
         if tokio::time::timeout(grace, futures::future::join_all(self.0))
@@ -364,7 +364,7 @@ impl Split {
 }
 
 /// one line out of the buffer: `\r` dropped so a CRLF child reads right, and
-/// invalid utf-8 replaced rather than dropping the line — a pipe carries
+/// invalid utf-8 replaced rather than dropping the line: a pipe carries
 /// bytes, and a mangled character is worth more than nothing at all.
 fn emit(pending: &mut Vec<u8>, line: &mut impl FnMut(&str)) {
     if pending.last() == Some(&b'\r') {

@@ -5,10 +5,10 @@
 //! global subscriber, it does not touch stdout, and it does not redirect a
 //! file descriptor: all three would be hestan taking over output that belongs
 //! to the host application. what it offers instead is a layer the host
-//! composes into the subscriber it was going to build anyway — see
+//! composes into the subscriber it was going to build anyway; see
 //! [`capture_layer`].
 //!
-//! the host's own logging carries on exactly as it did — this layer stores an
+//! the host's own logging carries on exactly as it did: this layer stores an
 //! event only when the span it was emitted inside carries hestan's `run_id`,
 //! `op` and `attempt` fields, which is a span only the executor opens. an
 //! event from the host's http server, its startup, or a background task of its
@@ -107,7 +107,7 @@ pub struct CaptureLayer {
 /// filtering is the host's, as it is for every layer: add
 /// `.with_filter(LevelFilter::INFO)` and hestan stores what survives it.
 /// hestan's own run log has three levels, so a `TRACE` or `DEBUG` event is
-/// stored as `info` — its `target` and message say the rest.
+/// stored as `info`; its `target` and message say the rest.
 pub fn capture_layer(store: &Store) -> CaptureLayer {
     let (events, queue) = sync_channel(BUFFER);
     let dropped = Arc::new(Mutex::new(HashMap::new()));

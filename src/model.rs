@@ -46,7 +46,7 @@ pub enum RunStatus {
     /// claimed and executing, somewhere.
     Running,
     /// no op terminally failed. ops the [trigger rules](When) skipped do not
-    /// change that — a skip is a decision, not a failure.
+    /// change that: a skip is a decision, not a failure.
     Success,
     /// an op ran out of retries, and [`Run::error`] names it.
     Failed,
@@ -73,7 +73,7 @@ str_enum!(RunStatus {
 pub enum OpStatus {
     /// written when the run was created and not touched since.
     Pending,
-    /// this attempt is executing — in this process, or in the child an
+    /// this attempt is executing, in this process or in the child an
     /// [isolated](crate::Op::isolated) op spawned.
     Running,
     /// the body returned, and its output is on the row.
@@ -97,7 +97,7 @@ str_enum!(OpStatus {
 
 /// what caused a run to exist.
 ///
-/// it says *what* asked, never *who* — [`Run::actor`] is who, and the two are
+/// it says *what* asked, never *who*: [`Run::actor`] is who, and the two are
 /// separate because most runs have a cause and no person behind them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -110,10 +110,10 @@ pub enum Trigger {
     Schedule,
     /// a fresh run of an earlier run's job and params, from the beginning.
     Retry,
-    /// a re-run that seeds the ops that already succeeded — see
+    /// a re-run that seeds the ops that already succeeded; see
     /// [`ResumePlan`](crate::ResumePlan).
     Resume,
-    /// a re-run of ops that already ran, on the inputs they were given — see
+    /// a re-run of ops that already ran, on the inputs they were given; see
     /// [`ReplayPlan`](crate::ReplayPlan). the opposite of a resume, which
     /// re-runs what did *not* succeed.
     Replay,
@@ -170,7 +170,7 @@ pub const EVENT_SCHEMA: u32 = 1;
 /// lives in.
 ///
 /// the log described runs and nothing else until v17, so every event written
-/// before it reads as [`Run`](SubjectKind::Run) — which is what those events
+/// before it reads as [`Run`](SubjectKind::Run), which is what those events
 /// were.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum SubjectKind {
@@ -189,7 +189,7 @@ pub enum SubjectKind {
     /// hestan itself: a notification's delivery, which belongs to no one job.
     System,
     /// a kind written by a build newer than this one. carried through rather
-    /// than refused — see [`EventKind::Unknown`].
+    /// than refused; see [`EventKind::Unknown`].
     Unknown(String),
 }
 
@@ -198,12 +198,12 @@ pub enum SubjectKind {
 ///
 /// the run kinds are the eight this log started with. the rest were added in
 /// v17 and are written by the subsystem that does the work, in the transaction
-/// that does it — `docs/events.md` has the table, and says which of them cannot
+/// that does it; `docs/events.md` has the table, and says which of them cannot
 /// be atomic and what the window is.
 ///
 /// **not a closed set.** a kind this build does not know reads as
 /// [`Unknown`](EventKind::Unknown) carrying the stored word, because the
-/// alternative — a parse error — is one row from a newer writer breaking every
+/// alternative (a parse error) is one row from a newer writer breaking every
 /// query that would have read the rows around it. the same reason
 /// [`Meta::from_tagged`](crate::Meta::from_tagged) tolerates an unknown tag.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -302,7 +302,7 @@ pub enum EventKind {
 macro_rules! open_enum {
     ($ty:ident { $($variant:ident => $s:literal),+ $(,)? }) => {
         impl $ty {
-            /// the stored word — including an unknown one, given back exactly
+            /// the stored word, including an unknown one, given back exactly
             /// as it was read, so a build that does not know a kind still
             /// reports what the writer called it.
             pub fn as_str(&self) -> &str {
@@ -389,14 +389,14 @@ open_enum!(EventKind {
 /// how one occurrence of a schedule was accounted for.
 ///
 /// every occurrence the scheduler passes gets one of these, including the ones
-/// it decided not to fire — a schedule that launched nothing last night is a
+/// it decided not to fire: a schedule that launched nothing last night is a
 /// question the [tick log](Tick) has to be able to answer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum TickOutcome {
     /// a run was launched, and `run_id` on the tick names it.
     Fired,
-    /// the launch itself failed — a validation error, a store that was not
+    /// the launch itself failed: a validation error, a store that was not
     /// there. the occurrence is still accounted for.
     Error,
     /// deliberately not fired: an [overlap policy](Overlap), a
@@ -414,8 +414,8 @@ str_enum!(TickOutcome {
 });
 
 /// an op's trigger rule: what its deps have to have done for it to run, from
-/// [`Op::when`](crate::Op::when). readiness is the same either way — every dep
-/// terminal — and this decides run vs skip once they are.
+/// [`Op::when`](crate::Op::when). readiness is the same either way (every dep
+/// terminal), and this decides run vs skip once they are.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum When {
@@ -423,7 +423,7 @@ pub enum When {
     /// trigger rules existed.
     #[default]
     AllSucceeded,
-    /// at least one dep did not succeed — failed, skipped, or canceled. an op
+    /// at least one dep did not succeed: failed, skipped, or canceled. an op
     /// with no deps never qualifies.
     AnyFailed,
     /// whatever the deps did, including nothing.
@@ -435,7 +435,7 @@ str_enum!(When {
     Always => "always",
 });
 
-/// what a declared freshness policy says right now —
+/// what a declared freshness policy says right now:
 /// [`Asset::fresh_within`](crate::Asset::fresh_within) or
 /// [`JobBuilder::fresh_within`](crate::JobBuilder::fresh_within) read against
 /// the latest success. computed at read time; nothing caches it.
@@ -506,7 +506,7 @@ pub struct FreshnessRow {
     pub name: String,
     /// what the last check concluded. the row exists to compare against, so
     /// this is the state a crossing is measured from rather than a fresh
-    /// verdict — read [`Freshness`] for that.
+    /// verdict; read [`Freshness`] for that.
     pub late: bool,
     /// when it went late; `None` while it is not.
     pub since: Option<DateTime<Utc>>,
@@ -533,7 +533,7 @@ pub enum Overlap {
 str_enum!(Overlap { Allow => "allow", Skip => "skip", Queue => "queue" });
 
 /// what a schedule does about occurrences that came due while nothing was
-/// running to fire them — a restart, a crash, a deploy. the scheduler's
+/// running to fire them: a restart, a crash, a deploy. the scheduler's
 /// [cursor](crate::Schedule::catchup) is what makes the missed set knowable at
 /// all; this decides what to do with it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -546,8 +546,8 @@ pub enum Catchup {
     /// current state, where the last one subsumes the rest.
     One,
     /// fire every missed occurrence, oldest first, at most `limit` of them.
-    /// for a job that does work *for* a logical time — read
-    /// [`ctx.scheduled_for`](crate::OpCtx::scheduled_for) — where each hour is
+    /// for a job that does work *for* a logical time (read
+    /// [`ctx.scheduled_for`](crate::OpCtx::scheduled_for)), where each hour is
     /// its own hour and skipping one leaves a hole. past the cap the oldest are
     /// dropped, loudly.
     All {
@@ -616,7 +616,7 @@ pub struct Run {
     /// where it has got to. not monotonic: a run whose claimer went quiet
     /// under [`Reclaim::Requeue`] goes back from running to queued.
     pub status: RunStatus,
-    /// what caused it — never who. `actor` is who, and most runs have a cause
+    /// what caused it, never who. `actor` is who, and most runs have a cause
     /// and nobody behind it.
     pub trigger: Trigger,
     /// what the launch was given, handed unchanged to every op that runs. `{}`
@@ -625,7 +625,7 @@ pub struct Run {
     /// when the run was written down, which is when it joined the queue and
     /// not when anything began.
     pub created_at: DateTime<Utc>,
-    /// when execution began. `None` while it is still queued — and forever on
+    /// when execution began. `None` while it is still queued, and forever on
     /// a run nothing ever got to.
     pub started_at: Option<DateTime<Utc>>,
     /// when it reached a terminal status. `None` until it does.
@@ -658,8 +658,8 @@ pub struct Run {
     /// [`Hestan::priority`](crate::Hestan::priority) said otherwise.
     pub priority: i64,
     /// the [instance](crate::Hestan::work) that claimed this run out of the
-    /// queue, and is executing it. `None` on a run nobody has claimed — which
-    /// is what a queued run is — and on every run written before the queue.
+    /// queue, and is executing it. `None` on a run nobody has claimed (which
+    /// is what a queued run is) and on every run written before the queue.
     pub claimed_by: Option<String>,
     /// when the claim was taken, which is what `started_at` follows within a
     /// moment.
@@ -672,7 +672,7 @@ pub struct Run {
     /// credential.
     ///
     /// `None` on everything a schedule, a sensor, a backfill or a freshness
-    /// policy launched on its own — and on every launch through an
+    /// policy launched on its own, and on every launch through an
     /// unauthenticated deployment, which has nobody to name. an empty name is
     /// not "system": `Trigger::Manual` with no actor means a person asked and
     /// nothing was checking who.
@@ -702,7 +702,7 @@ str_enum!(Reclaim { Fail => "fail", Requeue => "requeue" });
 ///
 /// the split exists because the two halves have opposite multiplicities.
 /// **exactly one** process should own the schedules, the sensors, the freshness
-/// checks and the backfill chunking — those are decisions, and two processes
+/// checks and the backfill chunking: those are decisions, and two processes
 /// deciding independently is two of every scheduled run. **any number** of
 /// processes may execute, which is the entire point of a claimable queue.
 ///
@@ -733,7 +733,7 @@ impl Role {
     }
 
     /// whether this process owns the schedules, sensors, freshness checks and
-    /// backfill chunking — the loops that decide what runs.
+    /// backfill chunking: the loops that decide what runs.
     pub fn decides(&self) -> bool {
         matches!(self, Role::All | Role::Scheduler)
     }
@@ -783,14 +783,14 @@ pub struct Notification {
     /// what the last failed attempt said.
     pub last_error: Option<String>,
     /// where delivery has got to. `failed` is a decision to stop trying, not a
-    /// transient error — the row stays as the record of one that never landed.
+    /// transient error: the row stays as the record of one that never landed.
     pub state: DeliveryState,
 }
 
 /// a named parameter set stored against one job: what
 /// [`Hestan::preset`](crate::Hestan::preset) declares and what the launchpad
-/// saves. runtime data rather than part of the job definition — the ui creates
-/// and deletes them, and a declared one is only ever seeded — so it lives in
+/// saves. runtime data rather than part of the job definition (the ui creates
+/// and deletes them, and a declared one is only ever seeded), so it lives in
 /// the store beside the run log rather than on [`Job`](crate::Job).
 #[derive(Debug, Clone, Serialize)]
 pub struct Preset {
@@ -800,7 +800,7 @@ pub struct Preset {
     /// what the launchpad lists it under, and the other half of its identity.
     pub name: String,
     /// the params a launch from this preset starts with. an editable starting
-    /// point, not a constraint — nothing stops the launch changing them.
+    /// point, not a constraint: nothing stops the launch changing them.
     pub params: Value,
     /// when the preset was first stored; a rewrite keeps it.
     pub created_at: DateTime<Utc>,
@@ -828,8 +828,8 @@ pub struct OpRun {
     pub started_at: Option<DateTime<Utc>>,
     /// when the op reached a terminal status.
     pub finished_at: Option<DateTime<Utc>>,
-    /// what the body returned — or, under an [`IoManager`](crate::IoManager),
-    /// the handle it stored the value under rather than the value.
+    /// what the body returned; under an [`IoManager`](crate::IoManager), the
+    /// handle it stored the value under rather than the value.
     pub output: Option<Value>,
     /// typed facts the op reported with [`OpCtx::meta`](crate::OpCtx::meta),
     /// one tagged value per name. `None` when it reported nothing.
@@ -838,7 +838,7 @@ pub struct OpRun {
     /// earlier attempts' messages are in the [event log](Event), not here.
     pub error: Option<String>,
     /// the child process an [isolated](crate::Op::isolated) op is running in.
-    /// `None` for every in-process op and for every op that has finished —
+    /// `None` for every in-process op and for every op that has finished:
     /// this says what is running where, not where something ran.
     pub pid: Option<i64>,
 }
@@ -864,20 +864,20 @@ pub struct Event {
     /// which op of the run, on the run events that have one.
     pub op: Option<String>,
     /// how loud. hestan picks it per kind, so filtering on it filters on what
-    /// happened rather than on how somebody phrased it — except on a
+    /// happened rather than on how somebody phrased it, except on a
     /// [`Log`](EventKind::Log) event, where the op chose.
     pub level: EventLevel,
     /// what happened, and the half of this row a program should read.
     pub kind: EventKind,
     /// one line for a person, in hestan's own words. the machine-readable half
-    /// is `kind` and `data` — nothing should be parsed out of this.
+    /// is `kind` and `data`; nothing should be parsed out of this.
     pub message: String,
     /// the payload, documented per kind in `docs/events.md`.
     pub data: Option<Value>,
     /// when it happened, as the writer saw the clock. ordering by this is not
     /// ordering by `seq`: several processes write here.
     pub ts: DateTime<Utc>,
-    /// who caused this, where a person did — the same name the run row
+    /// who caused this, where a person did: the same name the run row
     /// carries, and `None` everywhere a loop did it on its own. see
     /// [`Run::actor`].
     pub actor: Option<String>,
@@ -885,8 +885,8 @@ pub struct Event {
 
 impl Event {
     /// what this event is about, as one string: `subject`, or the run id on a
-    /// run event. v17 does not copy `run_id` into `subject` — see the migration
-    /// — so this is where the two become one answer.
+    /// run event. v17 does not copy `run_id` into `subject` (see the
+    /// migration), so this is where the two become one answer.
     pub fn about(&self) -> Option<&str> {
         self.subject.as_deref().or(self.run_id.as_deref())
     }
@@ -931,7 +931,7 @@ pub struct OpLog {
     pub stream: Option<LogStream>,
     /// how loud, on a captured event; `None` on a line off a pipe.
     pub level: Option<EventLevel>,
-    /// the tracing target on a captured event, which is a module path — except
+    /// the tracing target on a captured event, which is a module path, except
     /// on the lines hestan writes about capture itself, which are just
     /// `hestan`.
     pub target: Option<String>,
@@ -942,7 +942,7 @@ pub struct OpLog {
 /// one declared schedule as the store holds it.
 ///
 /// the declaration lives in code; what is stored is the state a restart must
-/// not lose — whether it is paused, and how far the scheduler has got. a
+/// not lose: whether it is paused, and how far the scheduler has got. a
 /// schedule the code no longer declares is deleted from here on the next start.
 #[derive(Debug, Clone, Serialize)]
 pub struct ScheduleRow {
@@ -952,7 +952,7 @@ pub struct ScheduleRow {
     /// new schedule rather than an edit, so the old one's cursor cannot be
     /// read as if it were this one's.
     pub expr: String,
-    /// the zone the expression is read in — which is what makes `0 3 * * *`
+    /// the zone the expression is read in, which is what makes `0 3 * * *`
     /// survive a daylight-saving change.
     pub tz: String,
     /// a paused schedule is still declared and still listed; its occurrences
@@ -964,7 +964,7 @@ pub struct ScheduleRow {
     pub params: Value,
     /// what to do with occurrences that came due while nothing was running.
     pub catchup: Catchup,
-    /// the newest occurrence the scheduler has accounted for — fired, skipped,
+    /// the newest occurrence the scheduler has accounted for: fired, skipped,
     /// held or deliberately dropped. `None` until this process has seen the
     /// schedule once; everything strictly after it and strictly before now is
     /// what downtime swallowed.
@@ -994,7 +994,7 @@ pub struct Tick {
     /// [caught-up](Catchup) occurrence is well after `scheduled_for`.
     pub fired_at: DateTime<Utc>,
     /// what became of the occurrence. a [`Deferred`](TickOutcome::Deferred)
-    /// tick with no later tick for the same occurrence **is** the held fire —
+    /// tick with no later tick for the same occurrence **is** the held fire:
     /// [`Overlap::Queue`] keeps nothing in memory, so a fire held when the
     /// process died is still held when it comes back.
     pub outcome: TickOutcome,
@@ -1023,7 +1023,7 @@ pub struct Materialization {
     /// upstream rebuild actually changed anything.
     pub fingerprint: String,
     /// the fingerprint of each dep as this build consumed it, by name. this is
-    /// what staleness compares against — an asset is stale when a dep's
+    /// what staleness compares against: an asset is stale when a dep's
     /// current fingerprint is not the one recorded here.
     ///
     /// one string per dep, except for a dep read through a
@@ -1038,7 +1038,7 @@ pub struct Materialization {
     /// that only recorded that it happened.
     ///
     /// read it back with the manager the asset stores through, exactly as an
-    /// op's output is read back — a row written before assets went through a
+    /// op's output is read back: a row written before assets went through a
     /// manager holds the value, and every manager passes through what it did
     /// not write.
     pub value: Option<Value>,
@@ -1048,7 +1048,7 @@ pub struct Materialization {
     /// when it was recorded.
     pub built_at: DateTime<Utc>,
     /// what the op that built this reported with
-    /// [`OpCtx::meta`](crate::OpCtx::meta) — the same map its op run carries.
+    /// [`OpCtx::meta`](crate::OpCtx::meta): the same map its op run carries.
     pub metadata: Option<Value>,
 }
 
@@ -1059,7 +1059,7 @@ pub struct MetaPoint {
     /// when the build that reported it landed.
     pub at: DateTime<Utc>,
     /// the number, widened to `f64` whichever numeric [`Meta`](crate::Meta) it
-    /// was reported as — a trend is a shape, not an exact count.
+    /// was reported as: a trend is a shape, not an exact count.
     pub value: f64,
     /// the run it was reported in.
     pub run_id: Option<String>,
@@ -1075,13 +1075,13 @@ pub struct HistoryEntry {
     /// this build's fingerprint differs from the one before it in time, which
     /// is the difference between having been rebuilt and having changed.
     pub changed: bool,
-    /// what the build before it reported, for the same `(asset, partition)` —
+    /// what the build before it reported, for the same `(asset, partition)`:
     /// what the deltas beside this entry's numbers are computed against.
     pub previous_metadata: Option<Value>,
 }
 
-/// what a failing [`AssetCheck`](crate::AssetCheck) costs. `Error` — the
-/// default — fails the check's op, and so the run that produced the asset;
+/// what a failing [`AssetCheck`](crate::AssetCheck) costs. `Error` (the
+/// default) fails the check's op, and so the run that produced the asset;
 /// `Warn` records the failure and lets the run carry on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
@@ -1108,7 +1108,7 @@ pub enum CheckStatus {
 str_enum!(CheckStatus { Passed => "passed", Failed => "failed" });
 
 /// one recorded check result. `failed` with severity `warn` is a run that
-/// succeeded and a check that did not — the two are recorded separately on
+/// succeeded and a check that did not: the two are recorded separately on
 /// purpose.
 #[derive(Debug, Clone, Serialize)]
 pub struct AssetCheckRow {
@@ -1178,7 +1178,7 @@ pub struct Backfill {
     pub partitions: Vec<String>,
     /// one per chunk launched, oldest first.
     pub run_ids: Vec<String>,
-    /// how many keys there are to build — `partitions.len()`, stored so
+    /// how many keys there are to build: `partitions.len()`, stored so
     /// progress can be reported without reading the list.
     pub total: usize,
     /// how many of them have been handed to a run. `launched == total` with a
@@ -1205,7 +1205,7 @@ pub(crate) struct RunCursor {
 /// one declared sensor as the store holds it: what a restart must not lose.
 ///
 /// the closure and its interval live in code. what is here is the state that
-/// makes a sensor pick up where it left off — and a sensor the code no longer
+/// makes a sensor pick up where it left off, and a sensor the code no longer
 /// declares is deleted from here on the next start, cursor and all.
 #[derive(Debug, Clone, Serialize)]
 pub struct SensorRow {
@@ -1215,7 +1215,7 @@ pub struct SensorRow {
     /// unpausing resumes rather than starts over.
     pub paused: bool,
     /// whatever the closure last committed with
-    /// [`SensorCtx::set_cursor`](crate::SensorCtx::set_cursor) — hestan stores
+    /// [`SensorCtx::set_cursor`](crate::SensorCtx::set_cursor): hestan stores
     /// it and never reads into it. `None` until one is set.
     pub cursor: Option<Value>,
     /// when the cursor last moved.
@@ -1228,7 +1228,7 @@ pub struct SensorRow {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum SensorOutcome {
-    /// the closure returned, and every run it asked for was launched — which
+    /// the closure returned, and every run it asked for was launched, which
     /// may be none, and usually is.
     Fired,
     /// the closure returned an error or ran out of time. nothing was launched

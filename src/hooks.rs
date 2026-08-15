@@ -11,8 +11,8 @@ use crate::model::{OpStatus, RunStatus, Trigger};
 /// what an [`on_run_finished`](crate::Hestan::on_run_finished) hook receives:
 /// a run reached a terminal status, whichever one.
 ///
-/// success, failure and cancellation all arrive here and `status` says which —
-/// which is the whole difference from [`RunFailure`], and the reason a hook
+/// success, failure and cancellation all arrive here and `status` says which.
+/// that is the whole difference from [`RunFailure`], and the reason a hook
 /// that wants only failures filters on it. a run the boot sweep marked failed
 /// is not here: nothing executed it, and a restart after a crash should not
 /// replay a morning of old failures into an alert channel.
@@ -22,7 +22,7 @@ pub struct RunEvent {
     pub run_id: String,
     /// which job it was of.
     pub job: String,
-    /// what caused the run — worth filtering on: a failed retry and a failed
+    /// what caused the run, worth filtering on: a failed retry and a failed
     /// nightly are usually not the same page.
     pub trigger: Trigger,
     /// how it ended. this is the field a hook that only wants failures
@@ -33,8 +33,8 @@ pub struct RunEvent {
     /// that op's own error message, which is what the run row says after
     /// `op {failed_op} failed: `.
     pub error: Option<String>,
-    /// when the run began executing. `None` for a run that never got that far
-    /// — one whose claimer went away before it started, say.
+    /// when the run began executing. `None` for a run that never got that
+    /// far, one whose claimer went away before it started, say.
     pub started_at: Option<DateTime<Utc>>,
     /// when it reached its terminal status, which is a moment before this hook
     /// was called.
@@ -52,20 +52,20 @@ pub struct RunEvent {
 /// accident: an op that failed twice and worked on the third try is three
 /// facts, and a hook that only wants the last one filters on `status`. an op
 /// skipped by its [trigger rule](crate::When), or one canceled before it was
-/// ever spawned, produces nothing at all — there was no attempt.
+/// ever spawned, produces nothing at all: there was no attempt.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct OpEvent {
     /// the run this attempt belonged to.
     pub run_id: String,
     /// the job that run was of.
     pub job: String,
-    /// the op, by its flattened name — `{instance}.{op}` inside a
+    /// the op, by its flattened name: `{instance}.{op}` inside a
     /// [`Graph`](crate::Graph), `{op}[{i}]` for one fan-out instance.
     pub op: String,
     /// which attempt this was, counting from 1.
     pub attempt: u32,
     /// how this attempt ended. a `failed` attempt with another to come and the
-    /// one that ends the op look identical here — `attempt` against
+    /// one that ends the op look identical here; `attempt` against
     /// [`Op::max_retries`](crate::Op::max_retries) is the difference.
     pub status: OpStatus,
     /// what it failed with; `None` unless it did.
@@ -75,7 +75,7 @@ pub struct OpEvent {
     pub started_at: DateTime<Utc>,
     /// when this attempt ended.
     pub finished_at: DateTime<Utc>,
-    /// how long this attempt took — the retries before it are their own
+    /// how long this attempt took; the retries before it are their own
     /// events, with their own durations.
     #[serde(rename = "duration_secs", with = "secs")]
     pub duration: Duration,
@@ -140,7 +140,7 @@ impl std::fmt::Debug for Hooks {
 /// the old callback over the new path rather than beside it: one dispatch, one
 /// place an event can be missed from, and no second traversal of the executor
 /// to keep in step with this one. the filter is exactly what `on_failure` has
-/// always promised — a canceled run notifies nobody, because somebody asked it
+/// always promised: a canceled run notifies nobody, because somebody asked it
 /// to stop and paging on that teaches people to ignore the page.
 pub(crate) fn as_run_hook(hook: FailureHook) -> RunHook {
     Arc::new(move |e: RunEvent| {
@@ -160,8 +160,8 @@ pub(crate) fn as_run_hook(hook: FailureHook) -> RunHook {
 
 /// hand `event` to every hook, each on its own blocking task.
 ///
-/// spawn_blocking, not spawn: a hook that blocks outright — a sync http post,
-/// a database write, a sleep — would otherwise pin an async worker and hang
+/// spawn_blocking, not spawn: a hook that blocks outright (a sync http post,
+/// a database write, a sleep) would otherwise pin an async worker and hang
 /// runtime shutdown. a panicking hook is caught and logged rather than taken
 /// out on the others. `what` names the hook family in that warning.
 pub(crate) fn fire_hooks<E: Clone + Send + 'static>(
@@ -197,14 +197,14 @@ const DELIVER_BATCH: u32 = 50;
 ///
 /// eight attempts is seven gaps, so with the growth below that is about
 /// twenty minutes of retrying at the outside and nearer ten once the jitter
-/// is counted — which covers a restart of whatever is on the other end and
-/// does not cover a url that was wrong when it was typed. past it the row stays, failed, with the
-/// error that stopped it: giving up **loudly** is the whole difference from
+/// is counted, which covers a restart of whatever is on the other end and
+/// does not cover a url that was wrong when it was typed. past it the row
+/// stays, failed, with the error that stopped it: giving up **loudly** is the whole difference from
 /// the best-effort dispatch this exists beside.
 const MAX_ATTEMPTS: u32 = 8;
 
 /// the first retry gap, doubled per attempt up to [`RETRY_MAX`] with full
-/// jitter — the same pacing an op's retries use, for the same reason: a
+/// jitter, the same pacing an op's retries use, for the same reason: a
 /// hundred notifications for the same outage must not retry in lockstep.
 ///
 /// the ceiling is the shared one rather than a reachable limit here:
@@ -217,7 +217,7 @@ const RETRY_MAX: Duration = Duration::from_secs(30 * 60);
 ///
 /// **at-least-once.** a crash between a hook returning and the row being
 /// marked delivered re-delivers on the next pass, because the alternative is
-/// marking first and losing the delivery instead — and of the two, a receiver
+/// marking first and losing the delivery instead. of the two, a receiver
 /// seeing an alert twice is the one you can do something about. exactly-once
 /// needs the receiver's cooperation and hestan does not pretend to have it.
 pub(crate) async fn deliver_once(runner: &Runner, now: DateTime<Utc>) -> usize {
@@ -292,7 +292,7 @@ pub(crate) async fn deliver_once(runner: &Runner, now: DateTime<Utc>) -> usize {
 /// waited on, unlike the best-effort dispatch: the loop has to know whether
 /// this row is delivered, and a hook that panics is how it is told the answer
 /// is no. one failure fails the row, so the hooks that did work will see the
-/// event again on the retry — which is what at-least-once means and why it is
+/// event again on the retry, which is what at-least-once means and why it is
 /// written down where the api is.
 async fn deliver(hooks: &[RunHook], event: RunEvent) -> Result<(), String> {
     for hook in hooks {

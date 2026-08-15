@@ -2,7 +2,7 @@
 //!
 //! dbt has already worked out what depends on what and written it down in
 //! `target/manifest.json`. this reads that file and produces one asset per
-//! model, wired from the manifest's own `depends_on` — so the graph on
+//! model, wired from the manifest's own `depends_on`, so the graph on
 //! hestan's asset page is the graph dbt compiled, rather than one somebody
 //! retyped and will forget to update.
 //!
@@ -19,7 +19,7 @@
 //!
 //! building one of those assets runs `dbt run --select <model>` in the project
 //! directory and stores what it printed as the op's
-//! [output](crate::Store::op_logs). **your dbt, your profile, invoked** —
+//! [output](crate::Store::op_logs). **your dbt, your profile, invoked**:
 //! nothing here reimplements a jinja renderer, an adapter or a profile
 //! lookup, and nothing here parses dbt's sql. hestan is the thing that decides
 //! when a model is built and records what happened when it was.
@@ -32,13 +32,13 @@
 //! # Manifest versions
 //!
 //! this reads **manifest schema v9 through v12**, which is dbt 1.5 through
-//! 1.10. the four fields it takes out of a manifest — a node's `name`,
-//! `resource_type` and `depends_on.nodes`, and a source's `source_name` —
+//! 1.10. the four fields it takes out of a manifest (a node's `name`,
+//! `resource_type` and `depends_on.nodes`, and a source's `source_name`)
 //! have meant the same thing across all of them, and everything else in the
 //! file is ignored, so a version that only adds fields keeps working.
 //!
 //! anything outside that range is [`crate::Error::Dbt`] naming
-//! the version it found. the alternative — parsing hopefully — produces an
+//! the version it found. the alternative (parsing hopefully) produces an
 //! empty asset graph, which looks exactly like a project nobody has compiled
 //! yet, and that is a failure somebody debugs for an afternoon.
 
@@ -56,7 +56,7 @@ use crate::error::Error;
 use crate::logs::{Attempt, capture_child};
 use crate::op::{OpCtx, OpResult};
 
-/// the `manifest.json` schema versions this reads — see the [module
+/// the `manifest.json` schema versions this reads; see the [module
 /// docs](self#manifest-versions), which is where a reader looks for them.
 const SCHEMA_VERSIONS: std::ops::RangeInclusive<u32> = 9..=12;
 
@@ -97,7 +97,7 @@ struct Model {
 }
 
 impl Dbt {
-    /// read `target/manifest.json` — the file `dbt compile`, `dbt run` and
+    /// read `target/manifest.json`, the file `dbt compile`, `dbt run` and
     /// `dbt parse` all write.
     ///
     /// the project directory defaults to two levels up from the manifest,
@@ -200,7 +200,7 @@ impl Dbt {
         self
     }
 
-    /// which executable is dbt, for a dbt that is not on `PATH` as `dbt` — a
+    /// which executable is dbt, for a dbt that is not on `PATH` as `dbt`: a
     /// virtualenv's, or a wrapper of your own. one program and no arguments:
     /// the arguments are hestan's, and they are `run --select <model>`.
     pub fn command(mut self, program: impl Into<String>) -> Dbt {
@@ -214,8 +214,8 @@ impl Dbt {
     /// a source arrives with no [probe](crate::Asset::probe), so nothing
     /// upstream ever marks a model stale on its own: hestan does not query
     /// your warehouse and will not pretend to know when a table last changed.
-    /// give one a probe of your own — [`Asset::name`](crate::Asset::name)
-    /// finds it in this vec — if you want the freshness of a source to drive
+    /// give one a probe of your own ([`Asset::name`](crate::Asset::name)
+    /// finds it in this vec) if you want the freshness of a source to drive
     /// rebuilds.
     ///
     /// a source nothing reads is not in here. it is a line in a yml file, not
@@ -325,7 +325,7 @@ fn schema_version(declared: &str) -> Option<u32> {
 }
 
 /// the whole of what hestan reads out of a manifest. everything else in the
-/// file — and there is a great deal of it — is somebody else's business, and
+/// file (and there is a great deal of it) is somebody else's business, and
 /// serde ignores it, so a version that adds a field is not a version this
 /// stops reading.
 #[derive(Deserialize)]
@@ -430,7 +430,7 @@ mod tests {
 
     // the assets have to be a graph hestan will actually register: a dep on a
     // name nothing produces is a startup error, and that is the whole claim
-    // this part makes — dbt's lineage, inside hestan's
+    // this part makes: dbt's lineage, inside hestan's
     #[test]
     fn the_assets_register_as_one_graph() {
         crate::asset::AssetRegistry::new(project().assets(), Vec::new(), Vec::new()).unwrap();

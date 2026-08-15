@@ -2,7 +2,7 @@
 //!
 //! a page nobody links to is a page nobody reads and therefore nobody updates,
 //! and a feature the readme does not mention is one nobody turns on. neither
-//! shows up in a compile, a clippy pass or any other test here — the file is
+//! shows up in a compile, a clippy pass or any other test here: the file is
 //! still valid markdown and the crate still builds. so they are asserted.
 
 use std::collections::BTreeSet;
@@ -55,7 +55,7 @@ fn the_index_lists_every_page_and_nothing_else() {
     assert!(pages.len() > 20, "only {} pages found", pages.len());
 }
 
-/// the feature names `Cargo.toml` declares, `default` excluded — it is a list
+/// the feature names `Cargo.toml` declares, `default` excluded: it is a list
 /// of the others rather than a thing of its own.
 fn declared_features() -> BTreeSet<String> {
     read("Cargo.toml")

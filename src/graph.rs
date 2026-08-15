@@ -66,7 +66,7 @@ pub(crate) fn downstream(ops: &[(String, Vec<String>)], root: &str) -> HashSet<S
 /// transitive dependents of `root` (excluded) reached only through nodes
 /// `through` accepts: a rejected node is left out and the walk does not
 /// continue past it, so whatever hangs off it is left out too. that is a
-/// [trigger rule](crate::When) boundary — an op that would run anyway is not
+/// [trigger rule](crate::When) boundary: an op that would run anyway is not
 /// cut off, and neither is its downstream, which waits on what it does.
 pub(crate) fn downstream_through(
     ops: &[(String, Vec<String>)],
@@ -161,7 +161,7 @@ mod tests {
             ("d", &["a"]),
             ("e", &["d"]),
         ]);
-        // b is not cut off, so c — which hangs off b alone — is not either
+        // b is not cut off, so c (which hangs off b alone) is not either
         let want: HashSet<String> = ["d", "e"].iter().map(|s| s.to_string()).collect();
         assert_eq!(downstream_through(&g, "a", |n| n != "b"), want);
         // rejecting nothing is the plain walk

@@ -18,8 +18,8 @@ use crate::store::{Built, Store, note};
 pub type OpResult = Result<Value, Box<dyn std::error::Error + Send + Sync>>;
 
 /// how many rows a [`Meta::table`] keeps, applied at construction. a metadata
-/// table is a sample you read at a glance — the top regions, the columns that
-/// changed type — not a result set, and a pipeline that reports its whole
+/// table is a sample you read at a glance (the top regions, the columns that
+/// changed type), not a result set, and a pipeline that reports its whole
 /// output here would put it in every run page, every history entry and every
 /// api response.
 pub const META_TABLE_ROWS: usize = 100;
@@ -44,7 +44,7 @@ impl MetaColumn {
     }
 
     /// a column that also names its type. the type is a label for whoever
-    /// reads it — hestan never parses it, so it is your vocabulary, not one
+    /// reads it: hestan never parses it, so it is your vocabulary, not one
     /// hestan imposes.
     pub fn typed(name: impl Into<String>, ty: impl Into<String>) -> MetaColumn {
         MetaColumn {
@@ -83,7 +83,7 @@ impl<N: Into<String>, T: Into<String>> From<(N, T)> for MetaColumn {
     }
 }
 
-/// a small table an op reports about what it produced — a sample of the rows,
+/// a small table an op reports about what it produced: a sample of the rows,
 /// a per-region breakdown, a schema. built with [`Meta::table`], which is the
 /// only way to make one: the row cap and the rectangle below are invariants
 /// rather than things a caller is asked to maintain.
@@ -104,7 +104,7 @@ impl MetaTable {
         &self.columns
     }
 
-    /// the rows, each exactly as wide as [`columns`](Self::columns) — padded
+    /// the rows, each exactly as wide as [`columns`](Self::columns), padded
     /// and truncated at construction, so nothing reading this has to decide
     /// what a ragged row means.
     pub fn rows(&self) -> &[Vec<Value>] {
@@ -124,8 +124,8 @@ impl MetaTable {
 /// source as a link, and a blob as a blob, without anything downstream
 /// guessing from the value.
 ///
-/// the obvious rust types convert on their own — `ctx.meta("rows", 1_234)`,
-/// `ctx.meta("note", "backfilled")`, `ctx.meta("took", elapsed)` — and the
+/// the obvious rust types convert on their own (`ctx.meta("rows", 1_234)`,
+/// `ctx.meta("note", "backfilled")`, `ctx.meta("took", elapsed)`), and the
 /// rest are named: `ctx.meta("source", Meta::Url(url))`,
 /// `ctx.meta("rows", Meta::count(1_240))`. `u64` and `usize` deliberately do
 /// not convert, since narrowing them is a lie waiting to happen; cast them
@@ -133,7 +133,7 @@ impl MetaTable {
 /// [`count`](Meta::count) or [`bytes`](Meta::bytes).
 #[derive(Debug, Clone, PartialEq)]
 pub enum Meta {
-    /// a whole number that is not a count of anything — a year, an id, a
+    /// a whole number that is not a count of anything: a year, an id, a
     /// difference that may be negative.
     Int(i64),
     /// a real number: a ratio, a rate, a score.
@@ -240,7 +240,7 @@ impl Meta {
 
     /// the stored shape: one tagged value per name, so
     /// `{"rows": {"int": 1234}, "source": {"url": ".."}}`. written out rather
-    /// than derived, because it is a wire format the api and the ui read — and
+    /// than derived, because it is a wire format the api and the ui read, and
     /// a format nothing may quietly renumber, since rows written by an older
     /// hestan are still on disk. every tag ever emitted still reads
     /// ([`from_tagged`](Self::from_tagged)); the ones this phase added are
@@ -274,7 +274,7 @@ impl Meta {
 
     /// read one stored value back, the inverse of [`tagged`](Self::tagged).
     /// `None` for anything that is not a one-key object with a tag this
-    /// version knows — a value written by a *newer* hestan reads as unknown
+    /// version knows: a value written by a *newer* hestan reads as unknown
     /// rather than as a guess.
     pub fn from_tagged(v: &Value) -> Option<Meta> {
         let object = v.as_object()?;
@@ -326,8 +326,8 @@ impl Meta {
         })
     }
 
-    /// the number a numeric variant carries — `Int`, `Float`, `Bytes`,
-    /// `Duration` (seconds) and `Count` — and `None` for every variant that is
+    /// the number a numeric variant carries (`Int`, `Float`, `Bytes`,
+    /// `Duration` (seconds) and `Count`), and `None` for every variant that is
     /// not a number. this is what deltas and trends are computed over, so the
     /// units are display types over the same one number and a `Count` compares
     /// against an `Int` of the same value.
@@ -430,8 +430,8 @@ pub(crate) fn number(n: f64) -> Value {
 /// ```
 ///
 /// a key appears only when **both** maps carry it as one of the numeric types
-/// — a key that is new, dropped, or whose type changed has no delta rather
-/// than a fake zero — and `delta_pct` is null under [`DELTA_PCT_FLOOR`].
+/// (a key that is new, dropped, or whose type changed has no delta rather
+/// than a fake zero), and `delta_pct` is null under [`DELTA_PCT_FLOOR`].
 /// always an object, `{}` when nothing changed measurably, so the shape does
 /// not depend on the data.
 pub(crate) fn deltas(current: Option<&Value>, previous: Option<&Value>) -> Value {
@@ -457,7 +457,7 @@ pub(crate) fn deltas(current: Option<&Value>, previous: Option<&Value>) -> Value
 pub(crate) type MetaBuf = Arc<Mutex<BTreeMap<String, Meta>>>;
 
 /// what an attempt staged for one asset in particular, rather than for the op
-/// as a whole — the form a [`MultiAsset`](crate::MultiAsset) needs, since its
+/// as a whole: the form a [`MultiAsset`](crate::MultiAsset) needs, since its
 /// several outputs each get their own fingerprint and their own facts.
 #[derive(Default)]
 pub(crate) struct AssetStage {
@@ -473,13 +473,13 @@ pub(crate) type AssetBuf = Arc<Mutex<BTreeMap<String, AssetStage>>>;
 /// worth nothing until whoever knows the attempt survived writes it down.
 pub(crate) type BuiltBuf = Arc<Mutex<Vec<Built>>>;
 
-/// everything an attempt staged as built, leaving the buffer empty — a retry
+/// everything an attempt staged as built, leaving the buffer empty: a retry
 /// stages its own or none.
 pub(crate) fn staged_builds(buf: &BuiltBuf) -> Vec<Built> {
     std::mem::take(&mut buf.lock().unwrap())
 }
 
-/// a metadata map as it is stored, or `None` when it is empty — which is a
+/// a metadata map as it is stored, or `None` when it is empty, which is a
 /// null column, not an empty object.
 pub(crate) fn tagged_map(map: &BTreeMap<String, Meta>) -> Option<Value> {
     if map.is_empty() {
@@ -532,7 +532,7 @@ impl Retry {
 /// why a typed accessor on [`OpCtx`] came up empty.
 #[derive(Debug, thiserror::Error)]
 pub enum InputError {
-    /// no dep of that name produced anything this op can see — usually a
+    /// no dep of that name produced anything this op can see: usually a
     /// typo, or a dep the job wires under a different name than the body
     /// expects.
     #[error("no input from op {0}")]
@@ -575,8 +575,8 @@ pub enum InputError {
 ///
 /// everything past the body is a policy about *this* op: what it waits on,
 /// how many attempts it gets, how long one may take, whether it runs in a
-/// child process. all of it is declaration — an op cannot decide at run time
-/// to have more retries — which is what makes a job's behaviour readable from
+/// child process. all of it is declaration (an op cannot decide at run time
+/// to have more retries), which is what makes a job's behaviour readable from
 /// its definition rather than from a log.
 #[derive(Clone)]
 pub struct Op {
@@ -624,7 +624,7 @@ impl Op {
     /// one is invoked again on a retry, again on the next run, and once per
     /// element when it [fans out](Self::mapped). anything it needs to keep
     /// hold of has to be cloned in or reached through
-    /// [`ctx`](OpCtx) — a resource, the state from last time, an input from a
+    /// [`ctx`](OpCtx): a resource, the state from last time, an input from a
     /// dep.
     ///
     /// it returns json rather than a type because that json is what the run
@@ -718,7 +718,7 @@ impl Op {
     /// an op that fans out: the dep named by [`over`](Self::over) must produce
     /// a json array, and this op runs once per element with that element
     /// deserialized into `T` as its second argument. the other deps are read
-    /// with `ctx.input` as usual, whole — including the mapped dep, whose
+    /// with `ctx.input` as usual, whole, including the mapped dep, whose
     /// entry is the entire array.
     ///
     /// each element becomes an instance named `{op}[{i}]`, zero-based, with
@@ -739,7 +739,7 @@ impl Op {
     /// `over` may name a mapped op, which fans this one out inside that one:
     /// each of its instances produces an array of its own, this op runs once
     /// per element of each, and the instances are named `{op}[{outer}][{i}]`.
-    /// the collected output keeps that shape — an array per outer element —
+    /// the collected output keeps that shape (an array per outer element)
     /// rather than one flat list, since which outer element a value came from
     /// is the only reason to nest.
     ///
@@ -792,13 +792,13 @@ impl Op {
 
     /// fan out over `dep` like [`Op::mapped`], but with instances named by
     /// their element rather than their index, and without the element being
-    /// deserialized into the body's second argument — it reads its own key off
+    /// deserialized into the body's second argument: it reads its own key off
     /// the ctx instead. this is how a [partitioned
     /// asset](crate::Partitions) reuses the fan-out machinery whole:
     /// `daily_orders[2026-01-05]` rather than `daily_orders[4]`.
     ///
     /// elements that are not strings still fall back to the index, and
-    /// repeated ones fail the expansion — two instances cannot share a name.
+    /// repeated ones fail the expansion: two instances cannot share a name.
     pub(crate) fn fans_out_over(mut self, dep: impl Into<String>) -> Op {
         self.mapped = true;
         self.labeled = true;
@@ -821,12 +821,12 @@ impl Op {
     }
 
     /// the trigger rule: what the deps have to have done for this op to run.
-    /// the default, [`When::AllSucceeded`], is the whole upstream working —
+    /// the default, [`When::AllSucceeded`], is the whole upstream working,
     /// what an op without a rule has always meant.
     ///
     /// readiness does not change: an op waits for every dep to reach a
     /// terminal status either way. the rule only decides what happens then,
-    /// which is what makes a summary or a cleanup expressible — the thing you
+    /// which is what makes a summary or a cleanup expressible: the thing you
     /// most want to run after a failure is exactly what the default skips.
     ///
     /// ```no_run
@@ -885,7 +885,7 @@ impl Op {
     /// **it is a ui aid, not a second validator.** the authority is and stays
     /// the serde round-trip [`params`](Self::params) installs: every launch
     /// deserializes into `P`, so a schema that disagrees with `P` cannot admit
-    /// anything `P` refuses — it can only describe it wrongly, which is a bad
+    /// anything `P` refuses: it can only describe it wrongly, which is a bad
     /// legend rather than a hole. nothing here is ever checked against the
     /// params.
     ///
@@ -909,7 +909,7 @@ impl Op {
     /// thing without writing it out, for a crate that already has schemars.
     ///
     /// only `properties`, `required` and `$defs`/`definitions` are read, to
-    /// merge every op's schema into one for the job — see
+    /// merge every op's schema into one for the job; see
     /// [`Job::params_schema`](crate::Job::params_schema). the rest is passed
     /// through untouched. the schema must be a json object, and two ops giving
     /// one property name different shapes is a build error.
@@ -925,7 +925,7 @@ impl Op {
     }
 
     /// the same pause between every attempt, with no jitter. this replaces the
-    /// default backoff, so ops that fail together retry together — say it only
+    /// default backoff, so ops that fail together retry together: say it only
     /// when that is what you want.
     pub fn retry_delay(mut self, d: Duration) -> Op {
         self.retry = Retry::Fixed(d);
@@ -949,7 +949,7 @@ impl Op {
     ///
     /// expiry also trips [`OpCtx::is_cancelled`] for that attempt. an async op
     /// is dropped at its next await point; blocking work only stops if it
-    /// polls that flag — see the cancellation section of the concepts doc.
+    /// polls that flag; see the cancellation section of the concepts doc.
     /// the clock starts once the op is running, so waiting for a
     /// [`pool`](Self::pool) permit or a [`rate`](Self::rate) token never counts
     /// against it.
@@ -966,7 +966,7 @@ impl Op {
     ///
     /// "ends" means the work stopped, not that hestan stopped waiting for it.
     /// a canceled run abandons an op at its next await point, and blocking
-    /// work carries on — so the permit is held by the [`OpCtx`] the body was
+    /// work carries on, so the permit is held by the [`OpCtx`] the body was
     /// handed rather than by the task, and goes back when the last holder of
     /// that ctx lets go. blocking work already has to keep its ctx to see a
     /// cancel at all ([`is_cancelled`](OpCtx::is_cancelled)), and keeping it
@@ -986,7 +986,7 @@ impl Op {
     ///
     /// a token is **spent, not returned**. that is the whole difference from a
     /// [`pool`](Self::pool): a permit comes back when the work ends, and there
-    /// is nothing here to give back and nothing to hold — the op has had its
+    /// is nothing here to give back and nothing to hold: the op has had its
     /// call and the bucket refills on its own clock. an op that takes both
     /// waits for a permit and then for a token, and holds only the permit.
     ///
@@ -996,7 +996,7 @@ impl Op {
     /// than taking a token on its way out.
     ///
     /// **a bucket lives in one process.** two workers each honouring "5 a
-    /// second" send ten, and the api sees ten — see the rates section of the
+    /// second" send ten, and the api sees ten; see the rates section of the
     /// concepts doc, and `docs/scaling.md`.
     pub fn rate(mut self, name: impl Into<String>) -> Op {
         self.rate = Some(name.into());
@@ -1013,31 +1013,32 @@ impl Op {
     ///
     /// what it buys is containment. an op that segfaults, aborts or exhausts
     /// memory takes down the process it runs in, and in-process that process
-    /// is hestan — every other run with it. isolated, the blast radius is one
+    /// is hestan, and every other run with it. isolated, the blast radius is
+    /// one
     /// attempt: the child dies, the parent records **why** it died, and the
     /// forty other ops carry on.
     ///
     /// it also makes stopping real. cancelling a run or expiring an
-    /// [`Op::timeout`] asks an in-process op to stop and cannot make it —
+    /// [`Op::timeout`] asks an in-process op to stop and cannot make it;
     /// see the cancellation section of the concepts doc. an isolated op is
     /// sent SIGTERM, given a few seconds, and then SIGKILLed, so for once
     /// "canceled" is something hestan watched rather than requested.
     ///
     /// the child is **this same binary**, re-executed with two environment
     /// variables set; it rebuilds the same jobs because it runs the same
-    /// `main`. that is the whole cost model — a process spawn per attempt,
-    /// milliseconds rather than the seconds an interpreter start costs — and
+    /// `main`. that is the whole cost model (a process spawn per attempt,
+    /// milliseconds rather than the seconds an interpreter start costs) and
     /// the whole constraint: a `main` that registers a different set of jobs
     /// depending on argv, or that reads a different database, cannot host a
     /// worker. nothing is passed to the child but the run id and the op name.
-    /// everything else — params, inputs, state — it reads out of the store,
+    /// everything else (params, inputs, state) it reads out of the store,
     /// and everything it produces it writes back the same way.
     ///
     /// an isolated op is otherwise an ordinary unit: `max_parallel`, pools,
     /// retries (each attempt is a fresh child), [`When`] rules and the run's
     /// cancellation all apply unchanged. it may not be
-    /// [mapped](Op::mapped) — a fan-out instance's element is the one input
-    /// that is not a row a child could read — and hestan supports it on unix
+    /// [mapped](Op::mapped) (a fan-out instance's element is the one input
+    /// that is not a row a child could read), and hestan supports it on unix
     /// only, both refused at build rather than quietly ignored.
     ///
     /// see [isolation](../docs/isolation.md).
@@ -1067,7 +1068,7 @@ impl Op {
     /// large reservations count even untouched, which is what makes the failure
     /// deterministic instead of a visit from the oom killer at some later
     /// moment of the kernel's choosing. and it covers the **whole child**, not
-    /// the body alone — a few megabytes of hestan, sqlite and your process's
+    /// the body alone: a few megabytes of hestan, sqlite and your process's
     /// own startup are inside it, so leave headroom.
     ///
     /// without [`isolated`](Self::isolated) this is a build error: the limit
@@ -1088,7 +1089,7 @@ impl Op {
     /// spin loop or a runaway regex, and for `timeout` against something slow.
     /// the two compose; they are measuring different things.
     ///
-    /// the limit has one-second granularity — the kernel's, not hestan's — and
+    /// the limit has one-second granularity (the kernel's, not hestan's) and
     /// anything under a second means one. without
     /// [`isolated`](Self::isolated) it is a build error, for the same reason a
     /// [`memory_limit`](Self::memory_limit) is.
@@ -1103,7 +1104,7 @@ impl Op {
         self
     }
 
-    /// rename this op and replace every dep name it holds — including the one
+    /// rename this op and replace every dep name it holds, including the one
     /// an [`Op::mapped`] fans out over, which is a dep name like any other.
     /// flattening a [`Graph`](crate::Graph) instance is the only caller.
     pub(crate) fn rebound(
@@ -1123,7 +1124,7 @@ impl Op {
     /// what this op's body calls the dep now named `dep`: inside a flattened
     /// [`Graph`](crate::Graph) instance that is the name the graph's author
     /// wrote, and everywhere else it is `dep` itself. this is what keeps a
-    /// graph's ops readable — `ctx.input("parse")` inside a graph, not
+    /// graph's ops readable: `ctx.input("parse")` inside a graph, not
     /// `ctx.input("clean_a.parse")`.
     pub(crate) fn dep_alias<'a>(&'a self, dep: &'a str) -> &'a str {
         self.aliases
@@ -1147,7 +1148,7 @@ impl Op {
         &self.name
     }
 
-    /// what it waits on, in job-level names — see [`after`](Self::after).
+    /// what it waits on, in job-level names; see [`after`](Self::after).
     /// order is what was declared, and means nothing beyond that.
     pub fn deps(&self) -> &[String] {
         &self.deps
@@ -1208,7 +1209,7 @@ impl Op {
     }
 
     /// the rust type a [`typed`](Self::typed) op deserializes its inputs into,
-    /// as `type_name` spells it. a label for the ui and the events — nothing
+    /// as `type_name` spells it. a label for the ui and the events; nothing
     /// parses it. `None` on an untyped op.
     pub fn input_type(&self) -> Option<&'static str> {
         self.input_type
@@ -1281,7 +1282,7 @@ impl fmt::Debug for Op {
 /// the two signals that ask one op invocation to stop: the run being canceled,
 /// and this attempt's timeout expiring. both are watch channels, so reading
 /// one is a lock-free borrow and both stay readable after their sender is
-/// gone — a blocking closure that outlives its run still sees the last value.
+/// gone: a blocking closure that outlives its run still sees the last value.
 #[derive(Clone)]
 pub(crate) struct Cancel {
     pub(crate) run: watch::Receiver<bool>,
@@ -1294,7 +1295,7 @@ pub(crate) struct Cancel {
 /// of what makes it honest: a cancel aborts the task, the stack goes with it,
 /// and blocking work the body carried its ctx into is still running when it
 /// does. shared, so the slot goes back when the last holder of that ctx lets
-/// go — which is the last moment hestan can see the work at all.
+/// go, which is the last moment hestan can see the work at all.
 pub(crate) type Slot = Arc<OwnedSemaphorePermit>;
 
 // resolves the first time `rx` holds true; parks forever if it never can
@@ -1345,27 +1346,27 @@ pub struct OpCtx {
     pub(crate) built: BuiltBuf,
     pub(crate) store: Store,
     /// the managers this run's outputs go through. an asset op reads one of
-    /// its own inputs back through them — a partitioned dep's value is on a
-    /// row rather than in the run — which is why the table is here and not
+    /// its own inputs back through them (a partitioned dep's value is on a
+    /// row rather than in the run), which is why the table is here and not
     /// only in the executor.
     pub(crate) io: crate::io::Io,
     /// the pool slot this attempt holds, if its op takes from one. carried here
     /// so that work the body handed this ctx to keeps the slot for as long as
-    /// it runs — see [`Slot`]. nothing reads it: being here is the whole job.
+    /// it runs; see [`Slot`]. nothing reads it: being here is the whole job.
     #[allow(dead_code)]
     pub(crate) slot: Option<Slot>,
 }
 
 impl OpCtx {
     /// the run this invocation belongs to. the one identifier that ties
-    /// whatever the op does to the row somebody will read afterwards — worth
+    /// whatever the op does to the row somebody will read afterwards, worth
     /// putting in the external systems it writes to.
     pub fn run_id(&self) -> &str {
         &self.run_id
     }
 
     /// true once this op has been asked to stop: the run was canceled, or the
-    /// attempt's [`Op::timeout`] expired. cheap enough to call in a loop — it
+    /// attempt's [`Op::timeout`] expired. cheap enough to call in a loop: it
     /// reads a watch channel and allocates nothing.
     ///
     /// an async op does not need this: it is dropped at its next await point.
@@ -1426,7 +1427,7 @@ impl OpCtx {
     }
 
     /// what the run was launched with, raw. every op of the run gets the same
-    /// object — params belong to the run, not to one op.
+    /// object: params belong to the run, not to one op.
     /// [`params_as`](Self::params_as) is the typed reading.
     pub fn params(&self) -> &Value {
         &self.params
@@ -1480,8 +1481,8 @@ impl OpCtx {
     /// a dep that produced nothing is `None`, but its status is still a fact.
     ///
     /// `None` means the name is not a declared dep of this op. a dep seeded
-    /// from outside the run — a resume's reused output, an asset build's
-    /// memoized value, a source asset — reads as
+    /// from outside the run (a resume's reused output, an asset build's
+    /// memoized value, a source asset) reads as
     /// [`Success`](crate::OpStatus::Success), since that is what it stands in
     /// for.
     pub fn dep_status(&self, op: &str) -> Option<OpStatus> {
@@ -1501,7 +1502,7 @@ impl OpCtx {
     /// `Hestan::resource(name, ..)` and shared by every op that asks, or one
     /// built for this run by `Hestan::run_resource(name, ..)` and dropped when
     /// it ends. either way it is the replacement for capturing a client in a
-    /// closure, and the call is the same — what differs is how long the value
+    /// closure, and the call is the same: what differs is how long the value
     /// lives, which is the declaration's business rather than the op's.
     ///
     /// ```no_run
@@ -1518,7 +1519,7 @@ impl OpCtx {
     ///
     /// the error says which of the two things went wrong: there is no such
     /// resource, or there is and it is something else. a run-scoped name asked
-    /// for outside a run — from a sensor, say — is the first of those: nothing
+    /// for outside a run (from a sensor, say) is the first of those: nothing
     /// built it, because there is no run for it to belong to.
     pub fn resource<T: std::any::Any + Send + Sync>(
         &self,
@@ -1606,7 +1607,7 @@ impl OpCtx {
         }
     }
 
-    /// attach a typed fact to what this op produced — a row count, the url it
+    /// attach a typed fact to what this op produced: a row count, the url it
     /// read, a note about the shape of the data. the last call for a name
     /// wins, and everything staged is committed with the op's terminal write:
     ///
@@ -1640,7 +1641,7 @@ impl OpCtx {
     }
 
     /// stage one asset as built by this attempt. it is written when the op is
-    /// recorded as having succeeded, and dropped with the attempt otherwise —
+    /// recorded as having succeeded, and dropped with the attempt otherwise:
     /// an asset is built when the op that built it succeeded, not when its
     /// body reached the end of the work.
     pub(crate) fn stage_build(&self, built: Built) {
@@ -1652,7 +1653,7 @@ impl OpCtx {
     /// this is the op *speaking*: a row in the [event log](crate::Event) that
     /// survives the process and is queryable by run, op and level. it is not
     /// the same as a `println!` or a `tracing::info!`, which are the op's
-    /// *output* — see `docs/logs.md` for which of the two ends up where.
+    /// *output*; see `docs/logs.md` for which of the two ends up where.
     ///
     /// a write that fails is dropped with a warning rather than failing the
     /// op: a lost log line is not worth losing the work over.
@@ -1667,7 +1668,7 @@ impl OpCtx {
     }
 
     /// [`info`](Self::info) at error level. it records; it does not fail the
-    /// op — return an `Err` for that.
+    /// op: return an `Err` for that.
     pub fn error(&self, msg: impl AsRef<str>) {
         self.log(EventLevel::Error, msg.as_ref());
     }

@@ -1,7 +1,7 @@
 //! the `http` feature: two ready-made hooks, for the deployment that wants an
 //! alert somewhere before it wants an integration.
 //!
-//! every hook hestan has takes a plain closure, and these are closures — there
+//! every hook hestan has takes a plain closure, and these are closures: there
 //! is nothing here you could not have written, and nothing that knows more
 //! than a hook does. what they save is the http client, the ten-second
 //! timeout, the decision not to follow redirects, and the wording of the one
@@ -11,7 +11,7 @@
 //! gone: the process that recorded the event may not survive to retry it, and
 //! a hook that blocked the executor to guarantee delivery would be worse than
 //! a missed alert. [`durable_notifications`](crate::Hestan::durable_notifications)
-//! is the other arrangement — the event is written down first and delivered by
+//! is the other arrangement: the event is written down first and delivered by
 //! a loop that retries.
 
 use std::sync::OnceLock;
@@ -55,7 +55,7 @@ fn post(url: String, body: serde_json::Value) {
 /// [`on_failure`](crate::Hestan::on_failure),
 /// [`on_run_finished`](crate::Hestan::on_run_finished),
 /// [`on_op_finished`](crate::Hestan::on_op_finished) and
-/// [`on_late`](crate::Hestan::on_late) — the call sites are identical either
+/// [`on_late`](crate::Hestan::on_late). the call sites are identical either
 /// way, and which one is meant is inferred from the hook it is handed to.
 pub trait Alert: Serialize {
     /// one line, for a channel that shows text rather than json.
@@ -161,10 +161,11 @@ pub fn webhook<A: Alert>(url: impl Into<String>) -> impl Fn(A) + Send + Sync {
 }
 
 /// a hook for a slack incoming webhook: posts `{"text": <the alert's one-line
-/// summary>}` — `job {job} failed at {failed_op}: {error} ({run_id})` for a
-/// failure, `job {job} succeeded in {n}s ({run_id})` for a run that worked,
-/// `op {op} of job {job} failed on attempt {n}: {error} ({run_id})` for an op,
-/// and `{kind} {name} is {n}m late (last success {t})` for a late one.
+/// summary>}`. that summary is `job {job} failed at {failed_op}: {error}
+/// ({run_id})` for a failure, `job {job} succeeded in {n}s ({run_id})` for a
+/// run that worked, `op {op} of job {job} failed on attempt {n}: {error}
+/// ({run_id})` for an op, and `{kind} {name} is {n}m late (last success {t})`
+/// for a late one.
 pub fn slack<A: Alert>(url: impl Into<String>) -> impl Fn(A) + Send + Sync {
     let url = url.into();
     move |a: A| {
