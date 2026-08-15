@@ -2,7 +2,7 @@
 
 a launch is a job name and a json params value, and for a long time the ui
 offered exactly that: a textarea. this page covers what the launchpad grew
-around it — stored parameter sets, a schema the editor can read, tags on the
+around it: stored parameter sets, a schema the editor can read, tags on the
 run, and launching part of a job.
 
 everything here is optional. a job with no presets, no schema and no tags
@@ -28,14 +28,14 @@ and hit **save**. both write the same row, and the ui lists both the same way.
 a declared preset is **seeded at build with an upsert**. the code that declares
 one owns its params, so a redeployed change lands on the next start; a preset
 somebody saved in the ui under another name is left alone. the flip side is
-that deleting the declaration leaves the stored preset behind — presets are
+that deleting the declaration leaves the stored preset behind: presets are
 runtime data and nothing sweeps them, unlike schedules, which mirror the code
 exactly. delete it from the ui, or with `Store::delete_preset`.
 
 declared presets are **validated at build**, exactly as a schedule's params
 are: a preset that no op would accept is `Error::InvalidParams` at startup
 rather than a 400 the night you reach for it. presets written through the api
-are validated before they are stored, for the same reason — a preset that
+are validated before they are stored, for the same reason: a preset that
 cannot launch is not worth keeping.
 
 launching by name is an alternative to inline params, never a merge:
@@ -50,7 +50,7 @@ preset name is a 404 and launches nothing.
 
 the endpoints are `GET /api/jobs/{name}/presets`,
 `PUT /api/jobs/{name}/presets/{preset}` with `{"params": {...}}`, and
-`DELETE /api/jobs/{name}/presets/{preset}` — see
+`DELETE /api/jobs/{name}/presets/{preset}`; see
 [the http api](http-api.md#presets).
 
 ## Params schemas
@@ -75,7 +75,7 @@ hand-written object works identically.
 
 the authority is and remains the serde round-trip: every launch deserializes
 the params into `P` before a run row exists. a schema that disagrees with `P`
-therefore **cannot admit anything `P` refuses** — it can only describe it
+therefore **cannot admit anything `P` refuses**: it can only describe it
 wrongly, which makes a bad legend rather than a hole. params matching a lying
 schema and not the type are still a 400 at the launch, at
 `validate_params`, and at a preset write; params matching the type and not the
@@ -106,7 +106,7 @@ object carries its own `params_schema` verbatim beside its `params_type`.
 
 with a schema, the params block grows a field list: name, type, `required`,
 and the description if the schema carries one. keys in the editor that the
-schema does not know are called out under it (`not in the schema: reigon`) —
+schema does not know are called out under it (`not in the schema: reigon`),
 pointed at, never refused, since the schema does not decide what launches.
 
 it is deliberately a legend and not a form builder. json is what the api takes
@@ -115,7 +115,7 @@ and what a preset stores, so the editor stays the thing you edit.
 ## Run tags
 
 a tag is a flat `{"k": "v"}` mark on a run. `trigger` already says *what kind
-of thing* launched it — schedule, sensor, build, resume — and tags say the rest:
+of thing* launched it (schedule, sensor, build, resume), and tags say the rest:
 this is a backfill, this was a manual smoke test, this one belongs to backfill
 41.
 
@@ -147,20 +147,20 @@ machine-made runs are tagged with what `trigger` cannot say, and nothing more:
 
 a build of *everything* stale carries no `asset` tag: there is no single asset
 to name, and inventing one would be worse than the silence. nothing tags a
-manual launch, a schedule fire or a retry — `trigger` already says all there is
+manual launch, a schedule fire or a retry: `trigger` already says all there is
 to say about those.
 
 ### filtering
 
-`GET /api/runs?tag=key:value` matches exactly — not a prefix, not a substring —
+`GET /api/runs?tag=key:value` matches exactly (not a prefix, not a substring)
 and composes with `job`, `since`, `before` and paging. the split is at the
 *first* colon, so a value may contain one (`at:12:30` is `at` = `12:30`). a
 `tag` that is not a `key:value` pair is a 400 rather than a filter quietly
 doing nothing.
 
 runs carry `tags` in their json, `{}` when untagged. the runs page has a tag
-box beside the other filters — served, unlike the rest, since a tag the page
-never fetched cannot be filtered for client-side — and shows each run's tags as
+box beside the other filters (served, unlike the rest, since a tag the page
+never fetched cannot be filtered for client-side), and shows each run's tags as
 muted `key:value` chips. from a terminal it is the same filter:
 `hestan runs --tag kind=smoke`, and `hestan run <job> --preset nightly
 --tag kind=smoke` is this whole page as one line ([the command
@@ -168,7 +168,7 @@ line](cli.md)).
 
 ## Launching a subset of ops
 
-hestan has always been able to run part of a job — it is how an asset build and
+hestan has always been able to run part of a job: it is how an asset build and
 a [resume](concepts.md#resume) work. this exposes it:
 
 ```
@@ -194,7 +194,7 @@ that refusal is not a check of its own: it is `Runner::launch_subset`'s, the
 same one an asset build and a resume go through, reported with the same words.
 there is exactly one implementation of "can this subset run".
 
-`{"ops": []}` is a 400 (`no ops named`) rather than a launch of everything — an
+`{"ops": []}` is a 400 (`no ops named`) rather than a launch of everything: an
 empty selection names nothing, and the way to launch the whole job is to leave
 `ops` out. an op the job does not have is a 400 from the same check. `params`,
 `preset` and `tags` all work alongside `ops`, and the run is an ordinary
@@ -202,8 +202,8 @@ empty selection names nothing, and the way to launch the whole job is to leave
 the rest of the dag as `not in run`.
 
 in the ui, selecting a node on the job page's dag offers **launch from here**
-with the number of ops it covers, next to the op inspector — the mirror of the
-run page's *re-run from here*. whether the selection is launchable is the
+with the number of ops it covers, next to the op inspector. it is the mirror
+of the run page's *re-run from here*. whether the selection is launchable is the
 server's answer, and a refusal appears beside the button.
 
 ## Cloning a past run
@@ -211,7 +211,7 @@ server's answer, and a refusal appears beside the button.
 the commonest real launch is "that run again, with one field changed". the run
 page's **clone** does exactly that and nothing more: it opens the job's
 launchpad prefilled with that run's params and tags, and launches nothing.
-editing is the point — a clone that launched immediately would be `re-run`,
+editing is the point: a clone that launched immediately would be `re-run`,
 which is already there.
 
 it works through a query parameter the job page reads,
@@ -219,14 +219,14 @@ it works through a query parameter the job page reads,
 in the url: a run's params do not belong in a query string, and a url long
 enough to hold them is a url that gets truncated.
 
-`GET /api/runs/{id}/clone` is what it fetches — `{"job", "params", "tags"}`,
+`GET /api/runs/{id}/clone` is what it fetches: `{"job", "params", "tags"}`,
 404 for a run that does not exist, and **409 `job no longer defined: {job}`**
 for a run whose job has left the code. that is the same refusal, in the same
 words, that a retry of such a run gets; a launchpad prefilled for a job that
 cannot launch would be a lie, and a 404 would blame the run, which is still
 right there.
 
-the launchpad's params block carries a tags line — `env:prod, kind:smoke`, the
-same `key:value` spelling the runs page filters on — so a cloned run's tags
+the launchpad's params block carries a tags line (`env:prod, kind:smoke`, the
+same `key:value` spelling the runs page filters on), so a cloned run's tags
 arrive editable rather than dropped. a line that is not tags disables the
 launch instead of quietly dropping the part that could not be read.

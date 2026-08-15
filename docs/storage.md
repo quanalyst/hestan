@@ -13,13 +13,13 @@ postgres is for the deployment one file cannot serve.
 | feature | on by default | `--features postgres` |
 
 sqlite is not the lesser option and is not deprecated. for one process, or for
-several on one host — which is the compose example and a great many real
-deployments — it is the right answer and the one with nothing to operate. reach
+several on one host (which is the compose example and a great many real
+deployments), it is the right answer and the one with nothing to operate. reach
 for postgres when the workers have to live on more than one machine, and not
 before.
 
 whichever it is, the schema is the same schema, the api is the same api, and
-the same test suite runs against both — see
+the same test suite runs against both; see
 [development](development.md#the-store-suite-runs-twice).
 
 ## Configuring it
@@ -33,8 +33,8 @@ Hestan::new().db("postgres://user:pw@db.internal/hestan")    // a postgres serve
 is a url and anything else is a path, and that one string is what an
 [isolated op](isolation.md)'s child process and every
 [queue worker](scaling.md) is handed, so all of them reach the same database.
-without `--features postgres` a url is refused by name — `unsupported
-database: postgres://…` — rather than opened as a very strange filename.
+without `--features postgres` a url is refused by name (`unsupported
+database: postgres://…`) rather than opened as a very strange filename.
 
 directly, the two constructors are `Store::open(path)` and
 `Store::connect(url)`. `Store::open(":memory:")` gives a throwaway store for
@@ -310,26 +310,26 @@ CREATE INDEX notifications_delivered ON notifications(delivered_at);
 is written in the same transaction as the run's terminal row, which is the
 whole of what durable delivery is: written after it, a crash in the gap loses
 the alert about the failure the alert existed to report, and nothing records
-that it was owed. `next_attempt_at` carries the state — set and undelivered is
-`pending`, **null** and undelivered is given up on — so a row is inserted due
+that it was owed. `next_attempt_at` carries the state (set and undelivered is
+`pending`, **null** and undelivered is given up on), so a row is inserted due
 now rather than null, and giving up clears it, which keeps a permanently
 failing notification out of the delivery scan while leaving it visible with
 the error that stopped it. the partial index is that scan and nothing else:
 the pending rows are a handful and the delivered ones are the table.
 
 `op_logs` is what an op *printed*, as opposed to what hestan said about it in
-`events` — a table of its own precisely because a chatty op would otherwise
-bury the eight events that describe what the run did. exactly one half of the
-middle three columns is filled per row, and which half says where the line
-came from: `stream` for an [isolated op](isolation.md)'s pipe, which has no
-levels and no targets, and `level`/`target` for a `tracing` event captured by
-the [`capture` layer](logs.md), which was never on a pipe. rows are capped per
-attempt, at 1 MiB and 10,000 lines by default — see [logs](logs.md).
+`events`. it is a table of its own precisely because a chatty op would
+otherwise bury the eight events that describe what the run did. exactly one
+half of the middle three columns is filled per row, and which half says where
+the line came from: `stream` for an [isolated op](isolation.md)'s pipe, which
+has no levels and no targets, and `level`/`target` for a `tracing` event
+captured by the [`capture` layer](logs.md), which was never on a pipe. rows are
+capped per attempt, at 1 MiB and 10,000 lines by default; see [logs](logs.md).
 
 `presets` holds named parameter sets ([launching](launching.md#presets)).
 they are runtime data, not part of a job definition: `Hestan::preset` seeds
 one at build with an upsert and the launchpad writes others beside it, so the
-table is the only place the two can meet. that is also why nothing sweeps it —
+table is the only place the two can meet. that is also why nothing sweeps it:
 unlike `schedules`, which mirrors the code exactly, a preset whose declaration
 was deleted stays until somebody deletes the preset. `created_at` survives a
 rewrite, so it means when the preset first appeared rather than when the
@@ -342,12 +342,12 @@ recorded for a run that was never created would drop that work forever, and
 silently, which is worse than the duplicate the key exists to prevent. the
 primary key is the claim, so two evaluations racing the same key still launch
 one run. `run_id` is a record of which run took the key rather than a foreign
-key — retention deletes runs and leaves keys, which is the right way round.
+key: retention deletes runs and leaves keys, which is the right way round.
 
 `runs.error` is the run's own failure summary: the first op that terminally
 failed, as `op {name} failed: {message}`, written in the same statement as
 the terminal status. it is stored rather than derived from `op_runs` on read
-for three reasons — only the executor knows which failure came *first*
+for three reasons: only the executor knows which failure came *first*
 (`op_runs.finished_at` is a proxy that ties and lies under retries), the run
 list is polled by the ui and a correlated subquery per row would be paid on
 every poll, and a stored column is what keeps the run row and the
@@ -382,7 +382,7 @@ alone keeps the old timestamp-only exclusive compare.
 ## Migrations
 
 this section is sqlite's chain, which every existing file walks and no
-postgres database ever will — see [postgres](#postgres) for why one is created
+postgres database ever will; see [postgres](#postgres) for why one is created
 whole instead.
 
 the schema version lives in `PRAGMA user_version` and `Store::open` migrates
@@ -393,7 +393,7 @@ adds `op_state`; version 4 adds `asset_materializations`, `sensors`, and
 `sensor_ticks`; version 5 adds `runs.resumed_from`, the link a
 [resume](concepts.md#resume) follows back to the run it continued; version 6
 adds `runs.error`; version 7 adds `schedules.params`, the params a cron fire
-launches with ([scheduling](scheduling.md)) — schedules declared before it
+launches with ([scheduling](scheduling.md)), and schedules declared before it
 default to `{}`, which is what they always fired with; version 8 rebuilds
 `asset_materializations` as append-only [history](assets.md), adds
 `op_runs.metadata` ([metadata](metadata.md)) and adds the `asset_checks`
@@ -406,15 +406,15 @@ and `schedules.catchup` ([catch-up](scheduling.md#missed-fire-catch-up)) and
 `runs.scheduled_for`, the logical time a scheduled or caught-up run stands
 for; version 11 adds the `sensor_run_keys` table
 ([run keys](sensors.md#run-keys)) plus `sensor_ticks.skipped` and
-`sensor_ticks.duration_ms`, which existing ticks read as 0 — they were never
-measured, and 0 is the only honest thing to say about that; version 12 adds
+`sensor_ticks.duration_ms`, which existing ticks read as 0 (they were never
+measured, and 0 is the only honest thing to say about that); version 12 adds
 the `presets` table and `runs.tags`, the flat `{"k": "v"}` map a run carries
-([tags](launching.md#run-tags)) — null on every run written before it and on
+([tags](launching.md#run-tags)), null on every run written before it and on
 every run launched without any, which reads back as `{}`; version 13 adds
 `op_runs.pid` and `op_runs.inputs`, both for [isolated ops](isolation.md) and
 both null for every op that runs in this process; version 14 adds the
-[queue](scaling.md) columns to `runs` — `priority`, `claimed_by`,
-`claimed_at`, `lease_until` and `plan` — plus the `runs_queue` index. every
+[queue](scaling.md) columns to `runs` (`priority`, `claimed_by`,
+`claimed_at`, `lease_until` and `plan`) plus the `runs_queue` index. every
 run written before it reads back as priority 0 and unclaimed, which is what a
 run that finished before there was a queue is. `plan` is what a launch decided
 the run would execute (`{"ops": [...], "seeds": {...}}`) and is null for a run
@@ -426,18 +426,18 @@ before there was anywhere to put what an op printed; version 16 adds the
 `notifications` table ([durable delivery](notifications.md#durable-delivery)),
 which stays empty unless a process asks for it; version 17 makes
 `events.run_id` nullable and adds `events.subject_kind` and `events.subject`,
-which is what stops the log being only about runs ([events](events.md)) —
+which is what stops the log being only about runs ([events](events.md)):
 every existing row is a run event and is stamped `subject_kind = 'run'`, and
 `subject` stays null on a run event because the run is already `run_id` and
 copying it would rewrite the largest table in the database to say the same
 thing twice; version 18 adds `runs.actor` and `events.actor`, the name of the
-[identity](auth.md) that asked for a run, a cancel, a pause or a backfill —
+[identity](auth.md) that asked for a run, a cancel, a pause or a backfill:
 null on every row written before it, and null on everything a schedule, a
 sensor or a loop did on its own, which is the same thing those rows always
 meant.
 
-an older file at any version opens straight into the current one, rows intact
-— the v8 rebuild copies every keyed materialization across, where it becomes
+an older file at any version opens straight into the current one, rows
+intact: the v8 rebuild copies every keyed materialization across, where it becomes
 that asset's first history entry and stays its current one, and v9 leaves every
 existing row with a null partition, which is exactly what an unpartitioned
 asset is. every pending step and the version stamp run in one transaction
@@ -449,7 +449,7 @@ than this build`) instead of quietly writing an older stamp over it.
 **v17 is the one step where the two backends do genuinely different amounts of
 work,** and it is worth knowing which way round. sqlite has no
 `ALTER TABLE ... ALTER COLUMN`, so dropping a `NOT NULL` means rebuilding the
-table and copying every row — on a database with a year of events in it that is
+table and copying every row. on a database with a year of events in it that is
 the expensive part of the upgrade, and it happens inside the one transaction
 like everything else, so an interrupted one leaves the file as it was found.
 postgres drops the constraint and adds two defaulted columns in the catalog and
@@ -458,8 +458,8 @@ database migrates in about as long as it takes to build one index, and a large
 sqlite one takes as long as it takes to copy the table.
 
 postgres has a forward chain of its own as of v17. before it, a postgres
-database was always created whole at the current version — there had never been
-an older one to move — so `pg::migrate` only ever stamped or refused. it now
+database was always created whole at the current version (there had never been
+an older one to move), so `pg::migrate` only ever stamped or refused. it now
 reads the stamp and applies the steps above it, in order, in one transaction,
 exactly as the sqlite chain does.
 
@@ -472,16 +472,16 @@ the v1 tables at `user_version` 0. open detects that case (version 0 with a
 ## Crash recovery
 
 `serve`, `work` and `run_once` sweep the database at startup, before anything
-new launches (an [op subprocess](isolation.md) does not — it owns nothing and
+new launches (an [op subprocess](isolation.md) does not: it owns nothing and
 is here to run one op). the sweep is **lease-aware**, and that is the whole of
 how several processes share one file safely:
 
-- **claimed, lease still good** — somebody is executing it and it is not this
+- **claimed, lease still good**: somebody is executing it and it is not this
   process. left entirely alone.
-- **claimed, lease expired** — its claimer stopped renewing. swept.
-- **`running` with no claim** — written before the queue existed, by a process
+- **claimed, lease expired**: its claimer stopped renewing. swept.
+- **`running` with no claim**: written before the queue existed, by a process
   that is gone. swept.
-- **`queued` with no claim** — not a casualty, [the queue](scaling.md). left
+- **`queued` with no claim**: not a casualty, [the queue](scaling.md). left
   for a dispatcher to claim.
 
 a swept run's `running` op runs become `failed` with error
@@ -489,7 +489,7 @@ a swept run's `running` op runs become `failed` with error
 `run_failed` event (`run interrupted: process exited`) is appended, and the
 run itself is marked `failed` with a finish time and that same message as its
 `error`. terminal runs are untouched. constructing a `Runner` directly skips
-the sweep — it belongs to process startup, not to the executor.
+the sweep: it belongs to process startup, not to the executor.
 
 the sweep only catches a claimer that was already gone when this process
 started. one that dies while everything is up is caught by the same test on a
@@ -505,7 +505,7 @@ same on both backends and are written out in
 this is what they mean for the database in front of you.
 
 a write that records what a run did is **retried four times** with jittered
-backoff before hestan gives up on it — that covers the ordinary case, which is
+backoff before hestan gives up on it. that covers the ordinary case, which is
 another writer holding sqlite's write lock past its 5-second busy timeout, or
 a postgres serialization failure or deadlock. what is *not* retried is a
 failure the backend cannot have rolled back on its own: a connection that
@@ -515,7 +515,7 @@ going back for it is the one retry that could record a build twice.
 which is worth knowing about the postgres backend specifically: it is **one
 connection with no pool and no reconnect**. a connection that drops stays
 dropped for the life of the process, so a postgres restart under a live
-deployment is not something a retry rides out — the runs in flight are left
+deployment is not something a retry rides out: the runs in flight are left
 for a reclaimer and the process stops claiming new ones until it is restarted.
 sqlite has no equivalent: a file that comes back is a file that works again.
 
@@ -529,7 +529,7 @@ outside a deployment.
 
 ## Retention
 
-by default nothing is ever deleted — runs, op runs, events and captured output
+by default nothing is ever deleted: runs, op runs, events and captured output
 accumulate for as long as the file exists. `Hestan::retention(policy)` opts in,
 and `Retention` says how much history to keep:
 
@@ -546,7 +546,7 @@ Hestan::new()
 | `.failed_days(n)` | a longer age for runs that failed or were canceled; without it they age like successes |
 
 `retention_days(n)` is still there and still means `Retention::days(n)`.
-`JobBuilder::retention` overrides the global policy for one job entirely — it
+`JobBuilder::retention` overrides the global policy for one job entirely: it
 is that job's whole policy, not an addition to the deployment's.
 
 the age is measured from `created_at` rather than from the finish, so a run
@@ -559,7 +559,7 @@ the one about to go.
 
 **a run is deleted only when every knob would delete it.** `days(7)` with
 `keep_last(50)` keeps a run that is eight days old if it is among the last
-fifty, and keeps the last fifty only until they are eight days old — whichever
+fifty, and keeps the last fifty only until they are eight days old. whichever
 rule holds it back wins. keep-if-either is the conservative direction, and the
 other reading silently deletes history you find out about afterwards.
 
@@ -572,7 +572,7 @@ a run that has not finished is **never** pruned, whatever its age: a queued run
 older than the cutoff is a queue problem, not a retention one. a
 [reclaimed](scaling.md) run is back on the queue rather than terminal, so what
 its first claimer captured is still there for the second one. `op_state` is
-never touched either — watermarks outlive their runs, so a job that fires
+never touched either: watermarks outlive their runs, so a job that fires
 rarely keeps its cursor even after every run that wrote it is gone. an asset's
 latest materialization is the same: it survives the run that built it being
 retired, so a materialization's `run_id` can point at a run retention has since
@@ -585,7 +585,7 @@ choose a number. an [asset](assets.md) whose value goes through an
 [io manager](io-managers.md) has that value inside the run that built it, and
 the sweep takes what a run wrote when it takes the run. so **a run that an
 asset's current materialization still reads is held back**, rows and files
-together, until something rebuilds the asset — the next sweep after that takes
+together, until something rebuilds the asset. the next sweep after that takes
 it like any other run past its policy.
 
 pruning it instead would leave the row pointing at nothing, and the next build
@@ -607,12 +607,12 @@ manager prunes exactly as it did before.
 
 a sweep runs at startup **and every `Hestan::retention_interval` after it**,
 an hour by default. the interval is the point: retention used to run once, at
-boot, so a server up for three months pruned nothing after its first second —
+boot, so a server up for three months pruned nothing after its first second:
 the one deployment shape a retention policy is for is the one where it never
 ran. the startup sweep stays as well, because a process that runs for an hour
 and exits should still tidy up.
 
-**only a process that [decides](scaling.md) sweeps** — `Role::All` or
+**only a process that [decides](scaling.md) sweeps**: `Role::All` or
 `Role::Scheduler`. a worker owns none of the history, and one pruning the
 scheduler's runs would be data loss nothing reports.
 
@@ -624,14 +624,14 @@ visit per run: the jobs with runs are walked by a loose index scan over
 index.
 
 **what a pruned run wrote goes first.** before the rows are deleted, every
-registered [io manager](io-managers.md) is asked to drop each doomed run —
+registered [io manager](io-managers.md) is asked to drop each doomed run:
 `FileIo` and `ParquetIo` remove `{dir}/{run_id}` whole, and the default
 `Inline` has nothing to drop, since its outputs *are* the rows. the order is
 the point: a run row is the only record that the run existed, so deleting it
 first and crashing in between would leave files nothing could ever name
 again. this way round a crash leaves rows pointing at outputs that are gone,
 for runs that are already past retention and go on the next sweep. a manager
-that fails to drop something is logged and the rows are pruned anyway — a
+that fails to drop something is logged and the rows are pruned anyway: a
 file left behind is a smaller problem than a sweep that stops. the io
 managers' page has [the whole of it](io-managers.md#what-retention-takes),
 including what to know before pointing a manager at a directory.
@@ -639,35 +639,36 @@ including what to know before pointing a manager at a directory.
 **a pruned run is an unreplayable one**, and that is worth knowing while
 choosing a policy rather than afterwards. [replay](replay.md) re-runs ops of
 an old run on the values that run recorded, so a sweep that takes the rows and
-the files takes the inputs with them — the replay is refused, naming the op
+the files takes the inputs with them: the replay is refused, naming the op
 whose input is gone, rather than run on a hole. `failed_days` is the knob that
 matters here, since a failure is what anybody replays: `Retention::days(30)
 .failed_days(180)` keeps six months of the runs worth re-running and a month
 of the ones that worked.
 
-the sweep also takes [sensor run keys](sensors.md) older than the age cutoff —
-nothing else collects them, and a sensor keyed by the day would keep a row per
-day forever — and delivered [notifications](notifications.md) older than it.
+the sweep also takes [sensor run keys](sensors.md) older than the age cutoff
+(nothing else collects them, and a sensor keyed by the day would keep a row
+per day forever) and delivered [notifications](notifications.md) older than
+it.
 undelivered notifications stay at any age: one that never got through is not
 history, it is something outstanding.
 
 three logs are trimmed by the same sweep whether or not a retention policy is
 configured, because all of them grow with time rather than with what you keep:
 `schedule_ticks` and `sensor_ticks` are each capped at their newest 5000 rows,
-and the [events](events.md) that belong to no run — everything v17 added — at
+and the [events](events.md) that belong to no run (everything v17 added) at
 their newest 50,000. a run's own events go when the run does and always did;
 what is new is that an asset built every five minutes writes a row nothing
 would otherwise ever collect.
 `asset_materializations` is capped *per asset*, and `asset_checks` per
-`(asset, check)`, at the newest 200 each — or whatever
-`Hestan::asset_history(n)` says — and those two are trimmed at startup. the
+`(asset, check)`, at the newest 200 each (or whatever
+`Hestan::asset_history(n)` says), and those two are trimmed at startup. the
 newest row of either is never trimmed at any `n`: an asset's latest
 materialization is its current state and a check's latest result is what the
 asset summary counts ([assets](assets.md)).
 
 ## What's stored and what stays in memory
 
-job and op definitions are code, not rows — the database records history
+job and op definitions are code, not rows: the database records history
 (names, statuses, timings, outputs, events), never the dag itself. that's why
 a retried run whose job has left the code is a 409, and why the store carries
 no job table to migrate when you refactor.
@@ -675,13 +676,13 @@ no job table to migrate when you refactor.
 `op_runs.output` holds whatever the op's [io manager](io-managers.md)
 returned from `put`. under the default `Inline` manager that is the output
 itself, json in sqlite, which is what it has always been; under another it is
-a handle — `{"$io": "file", "path": ".."}` for `FileIo` — and the value lives
+a handle (`{"$io": "file", "path": ".."}` for `FileIo`) and the value lives
 wherever that manager put it. the write happens before the success row, so a
 row never claims success for a value that was not persisted.
 
 `asset_materializations.value` holds the same thing for the same reason: what
 the manager returned for the asset's value, which under `Inline` is the value
-and under a file manager is the handle its op run already holds — one stored
+and under a file manager is the handle its op run already holds: one stored
 thing named twice rather than a file and a json copy of it. a row written
 before an asset's value went through a manager holds the value itself and is
 read back the same way, since a manager hands back what it did not write; no
@@ -690,8 +691,8 @@ several assets share one output and one handle, so each keeps its own slice.
 
 within a run, dependents are handed handles and resolve them as they are
 spawned; a resume and an asset build resolve the handles they seed the same
-way. the executor still never reads *outputs* back from sqlite during a run —
-it carries them — but it does read them back on a resume, which is where a
+way. the executor still never reads *outputs* back from sqlite during a run
+(it carries them), but it does read them back on a resume, which is where a
 pruned run breaks a chain: the rows that held those handles are gone, and so
 is what they pointed at, because the sweep took both.
 
@@ -701,7 +702,7 @@ is persisting and not the ops beside it.
 
 two tables are keyed by names instead of run ids and hold current state
 rather than history. `op_state`: one json value per `(job, op)`, upserted
-when an op that called `ctx.set_state` succeeds — the success row commits
+when an op that called `ctx.set_state` succeeds. the success row commits
 first, the state second, so a crash between the two re-runs from the old
 value rather than skipping a window (the reasoning is in
 [op state](state.md)). `sensors`: one cursor per sensor, committed only
@@ -711,7 +712,7 @@ runs come and go; these rows persist until overwritten.
 `asset_materializations` is the third of that family and the odd one out: it
 is append-only, and an asset's *newest* row is its current state rather than
 its only one. each is written inside the asset op just before it reports
-success — the mirror image of the op-state order, with the same
+success, the mirror image of the op-state order, with the same
 at-least-once outcome ([assets](assets.md)). `asset_checks` is append-only
 the same way, written inside the check's own op before it decides whether to
 fail, so a failing error check records its verdict as well as failing the
@@ -722,4 +723,4 @@ its `pending` op runs and its `run_queued` event, so a visible run always has
 its skeleton; the terminal `run_success`/`run_failed`/`run_canceled` event
 commits before the terminal status. one deliberate exception:
 `ctx.info/warn/error` event writes that fail only log a process-level
-warning — a lost log line doesn't fail the op.
+warning: a lost log line doesn't fail the op.

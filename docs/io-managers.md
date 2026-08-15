@@ -10,7 +10,7 @@ Hestan::new()
     .io(FileIo::new("/var/lib/hestan/io"))
 ```
 
-the default is `Inline`, which is exactly what hestan has always done — the
+the default is `Inline`, which is exactly what hestan has always done: the
 output is its own handle and lands in the run log as json. changing nothing
 changes nothing.
 
@@ -22,7 +22,7 @@ pub trait IoManager: Send + Sync + 'static {
     fn put(&self, key: &IoKey, value: Value) -> IoResult;
     /// resolve a handle back to the value
     fn get(&self, key: &IoKey, handle: &Value) -> IoResult;
-    /// drop everything stored for one run — retention calls this
+    /// drop everything stored for one run; retention calls this
     fn drop_run(&self, run_id: &str, job: &str) -> IoDropped;
 }
 
@@ -43,11 +43,11 @@ three rules:
   does that with everything; `FileIo` does it with anything that is not one of
   its own `$io` handles.
 - **`drop_run` is idempotent.** a run that wrote nothing and a run an earlier
-  sweep already collected are both `Ok(())` — [what retention
+  sweep already collected are both `Ok(())`; [what retention
   takes](#what-retention-takes) is the whole of why.
 
-resolve from the **handle**, not from the key. the key is context — useful for
-laying out storage in `put`, and for logging — but a handle read back on a
+resolve from the **handle**, not from the key. the key is context (useful for
+laying out storage in `put`, and for logging), but a handle read back on a
 resume or a [replay](replay.md) carries the run id of the run that wrote it,
 not the one reading it.
 
@@ -61,7 +61,7 @@ pool rather than on the task driving the run. write them as ordinary blocking
 code: a manager may take as long as the storage behind it takes, and the ops
 beside it keep running. the exceptions are `Runner::resume_plan` and
 `Runner::replay_plan`, which resolve an earlier run's outputs on the thread
-that called them, exactly as they do their store reads — that whole api is
+that called them, exactly as they do their store reads: that whole api is
 synchronous, and nothing is executing while a resume or a replay is being
 planned.
 
@@ -80,17 +80,17 @@ it writes `{dir}/{run_id}/{op}.json` and records
 ```
 
 the handle is an object rather than a bare path so anything reading
-`op_runs.output` — including the ui — can tell a reference from a value at a
+`op_runs.output` (including the ui) can tell a reference from a value at a
 glance.
 
 [retention](storage.md#retention) takes the files with the rows: pruning a
 run removes `{dir}/{run_id}` whole. what is never collected is a run no
-policy deletes — see [what retention takes](#what-retention-takes).
+policy deletes; see [what retention takes](#what-retention-takes).
 
 ## What a name may be
 
 `{run_id}` and `{op}` go into a path, and the rule is that the file lands
-under the directory the manager was given. that is the whole rule — it is not
+under the directory the manager was given. that is the whole rule. it is not
 "no separators", because an [asset](assets.md) name is already a path:
 `sales/orders` is a directory and a file here, exactly as the catalog groups
 it on the same prefix. one fan-out instance keeps its `fetch[0]` too.
@@ -111,7 +111,7 @@ the other would be two answers to one question.
 
 two things this does not do. a `get` resolves the path **in the handle**
 rather than recomputing one, so outputs written before the directory was
-moved still read back — the handle is the record of where the value actually
+moved still read back: the handle is the record of where the value actually
 went. and a symlink already inside the directory pointing out of it is
 outside what a name check can see: an io directory somebody else can write to
 is a problem no orchestrator can spell its way out of.
@@ -137,13 +137,13 @@ it writes `{dir}/{run_id}/{op}.parquet` and records
 ```
 
 what it stores is **a table**: a json array whose elements are objects, one
-per row — which is what an op returns when it returns rows, including a
+per row, which is what an op returns when it returns rows, including a
 [typed](typed-io.md) op returning a `Vec<T>`. the column types come from the
 values: whole numbers as `int64`, fractions as `float64`, then `utf8`, `bool`,
 lists, structs, and a column that is null the whole way down as parquet's null
 type. the op downstream reads the same rows back.
 
-`null` passes straight through — an op that produced nothing has no table to
+`null` passes straight through: an op that produced nothing has no table to
 write, and null is already its own handle. **anything else is an error**, not
 a quiet fallback to json:
 
@@ -164,7 +164,7 @@ two things do not survive the round trip, and neither can:
   has the same columns in every row.
 
 **what it is not**: a directory of files, exactly as `FileIo` is one. no
-partitioned datasets, no compaction, no manifest, no object store — one op
+partitioned datasets, no compaction, no manifest, no object store. one op
 writes one file and the op downstream reads that file. anything more is a
 table format, which is a different thing to be. names land where `FileIo`'s
 do, are refused on the same terms, and are collected on the same terms.
@@ -187,7 +187,7 @@ the run page and in the trend beside every previous build:
 
 it is a rule about handles rather than one about parquet, so a manager of your
 own gets it by putting either key in what `put` returns. anything the op
-staged under the same name wins — an op that said `rows` meant its own rows.
+staged under the same name wins: an op that said `rows` meant its own rows.
 
 ## Per-op managers
 
@@ -219,12 +219,12 @@ path, not just the happy one:
 
 - **downstream inputs.** an op's dependents are handed handles, which are
   resolved as each op is spawned. an input that cannot be fetched fails that
-  op, with `could not read the output of extract: ...` — not an op that runs
+  op, with `could not read the output of extract: ...`, not an op that runs
   believing its dep produced nothing.
 - **fan-out.** the array a mapped op expands over is an op output, so it is
   fetched back before it can be counted. each instance persists its own
   output, and the collected array downstream sees is what those handles
-  resolve to — a mapped op has no row and never puts anything of its own.
+  resolve to. a mapped op has no row and never puts anything of its own.
 - **resume.** seeds come from an earlier run's `op_runs.output`, which are
   handles; resuming across a `FileIo`-backed op reads the file the first run
   wrote.
@@ -236,7 +236,7 @@ path, not just the happy one:
 - **asset builds.** a memoized build seeds a fresh dep from its
   materialization, which holds what `put` returned for it. so seeding a
   parquet-backed asset hands the next build a handle, and the op that reads it
-  reads the file — see [an asset's value](#an-assets-value).
+  reads the file; see [an asset's value](#an-assets-value).
 
 ## An asset's value
 
@@ -251,7 +251,7 @@ Hestan::new()
     .assets([orders])
 ```
 
-`asset_materializations.value` records **what the manager returned** — the
+`asset_materializations.value` records **what the manager returned**: the
 handle under `ParquetIo`, the value itself under `Inline`. the same handle the
 op run keeps, for the same file: an asset of rows used to be stored twice, once
 as a handle in `op_runs.output` and once inline in the materialization, and the
@@ -269,14 +269,14 @@ three things worth knowing:
   source's materialization is a fingerprint of something outside hestan.
 - **a multi-asset keeps each slice inline.** one op returns one object holding
   every asset it produces, the manager has one handle for the whole of it, and
-  no part of it has a handle of its own — so each produced asset records the
+  no part of it has a handle of its own, so each produced asset records the
   value it was, as it always has. `MultiAsset::io(..)` still says where the
   op's own output goes.
 - **an existing row keeps working**, and there is no migration. a row written
   before any of this holds the value itself, which is not one of any manager's
   handles, so `get`'s pass-through rule hands it straight back. nothing has to
-  tell the two apart, and no column says which kind a row is — the same
-  arrangement `op_runs.output` has always had, with the same residual
+  tell the two apart, and no column says which kind a row is. that is the
+  same arrangement `op_runs.output` has always had, with the same residual
   ambiguity: a value that happens to look like a live manager's handle is read
   as one.
 
@@ -284,7 +284,7 @@ three things worth knowing:
 write, and a manager hands back what it did not write: a `ParquetIo` handle is
 not a value to `Inline`, so a build that memoizes that asset would seed the
 handle itself. a build of the asset writes a row the new manager wrote and
-settles it, so the window is one memoized build in between — rebuild each asset
+settles it, so the window is one memoized build in between. rebuild each asset
 you move, rather than waiting to find out.
 
 what else changes is [what retention takes](#what-retention-takes).
@@ -316,7 +316,7 @@ the rows:
 that order is not arbitrary. rows first, and a crash in between loses the
 ids: nothing is left that knows which files to collect, and the leak is
 permanent. files first, and a crash leaves rows pointing at outputs that are
-gone — for runs already past retention, which the next sweep deletes anyway.
+gone, for runs already past retention, which the next sweep deletes anyway.
 which is also why `drop_run` has to be idempotent: it will be asked twice.
 
 every manager rather than the one each op selected, because which manager
@@ -335,13 +335,13 @@ directory, and go on doing it every hour.
 a value in a manager is inside the run that wrote it, and the sweep takes what
 a run wrote when it takes the run. so a run that an asset's **current**
 materialization still reads is held back from every policy, rows and files
-together, until something rebuilds the asset — at which point it is history
+together, until something rebuilds the asset, at which point it is history
 like any other run and the next sweep takes it.
 
 the alternative is worse in both directions: prune it and the row points at
 nothing, so the next build either fails on a hole or silently redoes work
 somebody paid for. but this is a real change to what a policy promises, and it
-is stated rather than buried — `Retention::days(30)` no longer means nothing
+is stated rather than buried: `Retention::days(30)` no longer means nothing
 older than thirty days is here. an asset built a year ago and never rebuilt
 keeps its run for as long as it stays current. `hestan doctor` counts them:
 
@@ -350,7 +350,7 @@ note  values     3 run(s) are held back from retention: an asset's current value
 ```
 
 nothing is held back under `Inline`, whose values are in the materialization
-itself and go nowhere when a run is pruned — a deployment that never configured
+itself and go nowhere when a run is pruned: a deployment that never configured
 a manager prunes exactly as it did.
 
 three more things follow, and all three are worth knowing before you point a
@@ -359,11 +359,11 @@ manager at a directory:
 - **only what a policy deletes is collected.** with no `Retention`
   configured nothing is pruned and nothing is dropped, so the directory grows
   exactly as the run log does.
-- **the process that decides is the process that deletes** — see
+- **the process that decides is the process that deletes**; see
   [roles](scaling.md#roles). the directory has to be on *its* filesystem: a
   scheduler that cannot see the disk the workers wrote to cannot collect it.
 - **the whole run goes at once.** `{run_id}/{op}` means one directory per
-  run for both bundled managers, and the sweep removes it whole — after
+  run for both bundled managers, and the sweep removes it whole, after
   checking that it is under the manager's own directory, by the same rule a
   `put` is checked by. a path computed from a run id and removed without that
   check would be a much worse bug than the leak it was fixing.
@@ -373,5 +373,5 @@ manager at a directory:
 the run page shows the selected op's output on one line. an `$io` object reads
 as the reference it is (`file · /var/lib/hestan/io/019.../extract.json`)
 rather than as pretty-printed json, because the json is not the value.
-`GET /api/jobs/{name}` reports each op's `io` — the named manager it selected,
+`GET /api/jobs/{name}` reports each op's `io`: the named manager it selected,
 `null` for the default.

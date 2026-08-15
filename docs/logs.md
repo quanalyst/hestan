@@ -7,7 +7,7 @@ the **run log** is hestan narrating: `run_started`, `op_retry`,
 [events](events.md), it is structured, and it is what the run page
 has always shown.
 
-**captured output** is what the op itself produced — the `println!` of a
+**captured output** is what the op itself produced: the `println!` of a
 subprocess, the `tracing` events a library it called emitted. hestan used to
 drop all of it, which meant every op that calls a real library was half
 invisible: the run log said "attempt 1 failed", and the reason was on a
@@ -21,14 +21,14 @@ and the split is the whole design:
 | --------------------------------------- | --------------------------------------------- | --------------------------------------- |
 | [isolated](isolation.md) (a subprocess)  | **everything**, verbatim, both pipes           | always on, no configuration             |
 | in process                               | its `tracing` events, with level and target    | the `capture` feature's layer, opt in    |
-| a process hestan itself spawned          | **everything**, verbatim, both pipes           | always on — a [dbt](dbt.md) model's `dbt run` is one |
+| a process hestan itself spawned          | **everything**, verbatim, both pipes           | always on; a [dbt](dbt.md) model's `dbt run` is one |
 
 ## Why an in-process `println!` is not captured
 
 fd 1 belongs to the process, not to the op. hestan is a library inside your
 binary: redirecting stdout process-wide to catch an op's `println!` would take
-*your* application's output with it — your startup banner, your web server's
-access log, anything else running in that process — and hand it to whichever
+*your* application's output with it (your startup banner, your web server's
+access log, anything else running in that process) and hand it to whichever
 op happened to be running at the time. a library has no business doing that,
 so hestan does not.
 
@@ -37,8 +37,9 @@ that is an honest limit and it is stated here rather than discovered later:
 
 what an in-process op does emit that hestan can capture is `tracing` events,
 and those are the better half of the trade anyway. an event carries a level, a
-target, fields and a message — structured records rather than a scraped blob,
-so the pane can filter them by level and say which module they came from.
+target, fields and a message. those are structured records rather than a
+scraped blob, so the pane can filter them by level and say which module they
+came from.
 
 an isolated op is a subprocess whose stdout and stderr belong to hestan alone,
 so there the answer is simply everything.
@@ -48,17 +49,17 @@ so there the answer is simply everything.
 nothing to switch on. an [isolated op](isolation.md)'s parent pipes the
 child's stdout and stderr, reads both, tags each line with its stream, and
 stores it under that attempt. so does anything else hestan starts a process
-for — a [dbt](dbt.md) model's `dbt run --select` goes through the same reader,
+for: a [dbt](dbt.md) model's `dbt run --select` goes through the same reader,
 under the same caps.
 
 both pipes are drained **concurrently**, by a task each. this is not a
 detail: reading stdout to its end and stderr afterwards leaves stderr's pipe
-buffer to fill, and a child blocked writing into a full pipe never exits — the
+buffer to fill, and a child blocked writing into a full pipe never exits. the
 parent then waits forever for a process waiting for the parent. it looks like
 a slow op under load rather than like a bug.
 
 - per-stream order is exact. the two streams interleave in the order the lines
-  arrived, which is all a pipe can honestly tell you — hestan does not try to
+  arrived, which is all a pipe can honestly tell you. hestan does not try to
   merge them by timestamp beyond that.
 - a child that dies mid-line keeps what it wrote, and so does one that is
   killed or aborts without recording a result. the pipes are drained *after*
@@ -79,7 +80,7 @@ opt in, behind the `capture` feature:
 hestan = { version = "0.1", features = ["capture"] }
 ```
 
-hestan does not install a subscriber — that is yours — so what it offers is a
+hestan does not install a subscriber (that is yours), so what it offers is a
 layer you compose into the one you were going to build anyway:
 
 ```rust
@@ -93,7 +94,7 @@ tracing_subscriber::registry()
 ```
 
 your own logging is untouched. the layer stores an event only when the span it
-was emitted inside carries hestan's `run_id`, `op` and `attempt` — a span only
+was emitted inside carries hestan's `run_id`, `op` and `attempt`: a span only
 the executor opens, around an op body, entered across every await. an event
 from your http handler, your startup, or a background task of your own reaches
 the layer and is ignored.
@@ -101,7 +102,7 @@ the layer and is ignored.
 the level, the target and the message are stored, with any other fields after
 the message: `tracing::info!(rows = 12, "loaded")` is stored as
 `loaded rows=12`. hestan's run log has three levels, so `TRACE` and `DEBUG`
-arrive as `info` — the target says the rest. filtering is yours as it is for
+arrive as `info`; the target says the rest. filtering is yours as it is for
 any layer: `.with_filter(LevelFilter::INFO)` and hestan stores what survives.
 
 **an event from a task the op spawned is not captured.** `tokio::spawn` does
@@ -113,7 +114,7 @@ for a line that never arrives:
 // captured
 tracing::info!("what the op is doing");
 
-// not captured — no span went with it
+// not captured: no span went with it
 tokio::spawn(async { tracing::info!("from somewhere else entirely") });
 
 // captured: the span went with it
@@ -128,7 +129,7 @@ attempt rather than hiding it.
 
 **capping is a correctness property, not a nicety.** an op in a `println!`
 loop would otherwise fill the disk the run log lives on, and a run log that
-ran out of room records nothing at all — including the failure you were trying
+ran out of room records nothing at all, including the failure you were trying
 to read about.
 
 | cap                        | default | what it is                                 |
@@ -143,7 +144,7 @@ pipes share one attempt's budget, because the limit is on what the attempt
 produced and not on which pipe it came out of.
 
 past either cap, capture stops for that attempt and **one line** says what was
-dropped and why. the op carries on running — capture stopping is not the op
+dropped and why. the op carries on running: capture stopping is not the op
 failing, and the parent keeps reading the pipes so a chatty child never blocks
 on one nobody is draining.
 
@@ -160,11 +161,11 @@ not is worse than nothing.
 
 ## Reading it
 
-the run page's log pane has a source filter — `events`, `output`, or both
+the run page's log pane has a source filter: `events`, `output`, or both
 interleaved by time, which is the default. the level and op filters work
 across both. a captured line shows its op, its attempt once there has been
 more than one, and its stream or level. a line hestan wrote about the capture
-itself — "capture stopped: this attempt reached its cap" — is set apart, since
+itself ("capture stopped: this attempt reached its cap") is set apart, since
 that is hestan speaking and not the op.
 
 a line off a pipe has no level, so a level filter hides it rather than
@@ -179,9 +180,9 @@ GET /api/runs/{id}/logs/download?op=
 ```
 
 the first is cursored on `id` exactly as the events endpoint is cursored on
-`seq` — oldest first, `after` is the last id you saw, default 500 lines and at
+`seq`: oldest first, `after` is the last id you saw, default 500 lines and at
 most 2000. the second is `text/plain`, one line per line, because at some
-point everyone wants to grep it — which is also what
+point everyone wants to grep it, which is also what
 [`hestan logs <run>`](cli.md) reads, with `--follow` to stay on it:
 
 ```
@@ -192,7 +193,7 @@ point everyone wants to grep it — which is also what
 
 ## Where it lives
 
-one table, `op_logs`, with a row per line — see [storage](storage.md). the
+one table, `op_logs`, with a row per line; see [storage](storage.md). the
 `stream` column is `stdout`/`stderr` for subprocess capture and null for a
 captured event; `level` and `target` are the other way round. exactly one half
 is filled, and which half says where the line came from.

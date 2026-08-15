@@ -12,8 +12,8 @@ a **[job](concepts.md)** is a dag of ops and the unit is *the running*. you say
 what happens in what order; hestan executes it when something asks. what it
 leaves behind is a run.
 
-an **[asset](assets.md)** is a thing that exists — a table, a file, a model
-— declared by what it is made of. the unit is *the value*. what it leaves behind
+an **[asset](assets.md)** is a thing that exists (a table, a file, a model),
+declared by what it is made of. the unit is *the value*. what it leaves behind
 is a materialization: the value, a fingerprint of it, and which fingerprint of
 each input it was computed from. from those, staleness is a fact rather than a
 guess, and a build does the minimum: stale ancestors and the target, with
@@ -35,7 +35,7 @@ ops is exactly the shape of the problem.
 **take an asset** when the work produces something that other work consumes,
 and you would like to be asked less often whether it is current. a table built
 from two other tables, a model trained on a dataset, a report derived from a
-warehouse — the moment you find yourself writing "only rebuild this if the
+warehouse. the moment you find yourself writing "only rebuild this if the
 source changed", the asset is the feature that already did it.
 
 they are not exclusive and they are not layered on separate machinery: assets
@@ -48,7 +48,7 @@ ordinary.
 ## sqlite or postgres
 
 the run log is a database and there are two of them. the schema is identical,
-the api is identical, and the same test suite runs against both — so this is a
+the api is identical, and the same test suite runs against both, so this is a
 question about deployment, not about features.
 
 | | sqlite | postgres |
@@ -57,7 +57,7 @@ question about deployment, not about features.
 | processes that can share it | any number, on **one host** | any number, on any number of hosts |
 | feature flag | on by default | `--features postgres` |
 
-**take sqlite** — which is to say, do nothing — for one process, and for
+**take sqlite** (which is to say, do nothing) for one process, and for
 several processes on one host. that covers a container, a compose file and a
 great many real deployments. it is not the lesser option: one file, no service,
 and writers serialized by the file lock rather than by anything you have to
@@ -105,7 +105,7 @@ running are knowable rather than gone.
 
 a **[sensor](sensors.md)** watches everything else: a closure evaluated every
 `every`, which looks at a directory, a queue or an api and returns the runs it
-wants — usually none.
+wants, usually none.
 
 | | schedule | sensor |
 | --- | --- | --- |
@@ -121,7 +121,7 @@ catch-up mean anything.
 
 **take a sensor** when the work is *for an event*: a file appeared, a queue is
 not empty, an upstream job succeeded. polling on an interval is what a sensor
-is, so the interval is a cost you are paying for latency — and a run key is
+is, so the interval is a cost you are paying for latency. a run key is
 what stops "I saw it again" turning into a second run.
 
 a sensor whose closure only checks the clock is a schedule with worse
@@ -138,16 +138,16 @@ worth saying, because they read like pairs and are not:
 - **[`Overlap`](scheduling.md#overlap-policy) and a
   [concurrency limit](scaling.md#limits)** answer different questions. overlap
   decides whether a scheduled fire should exist at all while its job still has
-  a run outstanding — a policy about the work. a limit decides how many runs
-  execute at once — a policy about the machine. you may well want both.
+  a run outstanding, a policy about the work. a limit decides how many runs
+  execute at once, a policy about the machine. you may well want both.
 - **[freshness](freshness.md) and [staleness](assets.md#provable-staleness)**
   are not the same claim. late means "the last success is older than the policy
   allows", which is about time. stale means "an input moved since this was
   built", which is about lineage. an asset can be fresh and stale, or late and
   up to date.
 - **`Role::Scheduler` and `Role::Worker`** are not a scale-up ladder. one
-  process deciding is a *requirement* — two schedulers is two of every
-  scheduled run — while any number may execute. splitting them is how you get
+  process deciding is a *requirement* (two schedulers is two of every
+  scheduled run), while any number may execute. splitting them is how you get
   more executors, not how you get more of everything.
 - **the [run log](events.md) and [captured output](logs.md)** are two logs on
   the same page on purpose. one is hestan narrating what happened; the other is

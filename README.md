@@ -5,12 +5,12 @@
 dag-based job orchestration for rust: ops, jobs, schedules, a run log, and a
 small web ui. it is a library, not a service: the jobs are async rust in your
 own binary and the run log is a sqlite file next to it, so there is nothing to
-deploy alongside it — or a postgres database, when the workers have to live on
-more than one machine.
+deploy alongside it (or a postgres database, when the workers have to live on
+more than one machine).
 
 the ui and json api are unauthenticated by default, and `serve` refuses to bind
 anything but loopback under that default. an address anyone can reach needs an
-[authenticator](docs/auth.md) — one token, or your own check. see
+[authenticator](docs/auth.md): one token, or your own check. see
 [SECURITY.md](SECURITY.md).
 
 pin an exact version: under 0.x the api changes without a deprecation cycle.
@@ -52,8 +52,8 @@ async fn main() -> Result<(), hestan::Error> {
 
 ## Pulling from an http api
 
-with the `http` feature, a scheduled REST pull is one block — no hand-written
-ops:
+with the `http` feature, a scheduled REST pull is one block, with no
+hand-written ops:
 
 ```rust
 use hestan::{HttpSource, Hestan};
@@ -87,7 +87,7 @@ the value lowercased, with anything outside `[a-z0-9_]` replaced by `_`.
 cargo run --example demo --features cli
 ```
 
-then open http://127.0.0.1:4000 — two jobs on short schedules, so runs
+then open http://127.0.0.1:4000. two jobs on short schedules, so runs
 (including a retried op and some dropped-row warnings) accumulate on their own.
 
 `cargo run --example assets --features cli` (from the repo root) serves a second instance
@@ -122,7 +122,7 @@ $ echo $?      # 0 succeeded · 1 failed · 3 canceled · 4 timed out · 5 unrea
 what a cron line needs. `--json` for one object, `--quiet` for the id alone.
 `doctor` answers "why is nothing running" from the store, the registry and the
 disk. `explain` resolves a real plan without running it, and shell completion
-of your own job names comes out of the registry at the moment you press tab —
+of your own job names comes out of the registry at the moment you press tab,
 both only possible because the command line is the deployment. the same
 commands reach a run log directly (`--db`) or a running instance
 (`--server`), and `cargo install hestan --features cli` gives an operator a
@@ -142,14 +142,14 @@ standalone binary for those two. [docs/cli.md](docs/cli.md).
   the launch endpoint)
 - runs execute on tokio: every op whose deps are done runs concurrently
   (capped per job with `max_parallel`, and across jobs with named
-  concurrency pools — `Hestan::pool("api", 3)` plus `Op::pool("api")` is one
+  concurrency pools: `Hestan::pool("api", 3)` plus `Op::pool("api")` is one
   budget for one external resource, however many jobs overlap). a terminal op
   failure skips its downstream and fails the run, while independent branches
   keep going
 - the other shape an external limit comes in is a **rate**, and it is the one
   most apis publish: `Hestan::rate("api", 5, Duration::from_secs(1))` plus
   `Op::rate("api")` is five calls a second across every job in the process. a
-  token bucket, so five may go at once and then one every 200ms — not a fixed
+  token bucket, so five may go at once and then one every 200ms, not a fixed
   window, which admits its whole allowance either side of a boundary. a token
   is spent rather than held, waiting for one is asynchronous and first-come
   first-served, and a canceled run's waiting op hands its token to the op
@@ -161,7 +161,7 @@ standalone binary for those two. [docs/cli.md](docs/cli.md).
   for per-op managers. the default `Inline` is exactly today's behaviour, and
   `ParquetIo` (behind `--features parquet`) stores an op's rows as one parquet
   file, recording how many rows and how many bytes without the op asking. an
-  asset's value goes the same way with `Asset::io(name)` — the materialization
+  asset's value goes the same way with `Asset::io(name)`: the materialization
   records the handle and the next build seeds from the file. see
   [connecting to your data](docs/connecting.md) for the whole seam between an
   op and the system it reads: a client called from an op, a pool as a
@@ -171,13 +171,13 @@ standalone binary for those two. [docs/cli.md](docs/cli.md).
   `ctx.resource::<ApiClient>("api")?`, with `Op::requires(["api"])` turning a
   missing one into a build error. a constructor that fails aborts startup
   instead of leaving a half-live server. `Hestan::run_resource` is the other
-  scope — built when a run starts, dropped when it ends, off the runtime if
-  dropping blocks — for a scratch directory or anything else one run must not
+  scope (built when a run starts, dropped when it ends, off the runtime if
+  dropping blocks) for a scratch directory or anything else one run must not
   share with the next
 - a reusable `Graph` of ops drops into a job as many times as you like:
   `.graph("clean_a", &clean).after(["fetch"])`. it is flattened at build into
-  ordinary ops named `{instance}.{inner}`, so nothing at run time — resume,
-  fan-out, assets, the ui — has to know graphs exist
+  ordinary ops named `{instance}.{inner}`, so nothing at run time (resume,
+  fan-out, assets, the ui) has to know graphs exist
 - an op's trigger rule says when it runs: `.when(When::Always)` or
   `.when(When::AnyFailed)` makes a summary, an alert or a cleanup after a
   failure expressible, where the default `AllSucceeded` skips it. skip
@@ -194,14 +194,14 @@ standalone binary for those two. [docs/cli.md](docs/cli.md).
   retry together; `.retry_delay(d)` keeps a fixed pause
 - `.timeout(d)` fails a hung attempt instead of letting it hold a slot
   forever, and cancellation (or a timeout) is readable from the op itself via
-  `ctx.is_cancelled()` — the only way blocking work ever stops early. an op
+  `ctx.is_cancelled()`, the only way blocking work ever stops early. an op
   that stops is recorded as stopped; one that never comes back is recorded as
   exactly that, with no invented finish time
-- `Op::isolated()` runs one op's body in a child process — this same binary,
+- `Op::isolated()` runs one op's body in a child process: this same binary,
   re-executed, so there is no runtime to load and no code to re-import. it
   contains what in-process cannot: an op that segfaults or aborts fails that
   op instead of taking hestan down, and the parent records the signal that
-  killed it. it also makes stopping real — for an isolated op, cancellation
+  killed it. it also makes stopping real: for an isolated op, cancellation
   and timeouts are SIGTERM, three seconds, then SIGKILL, rather than a request
   blocking work can ignore. per op rather than per job, so the one risky
   parser is contained while the other forty stay in-process and free.
@@ -212,15 +212,15 @@ standalone binary for those two. [docs/cli.md](docs/cli.md).
   commits only when the attempt succeeds, so the next run picks up where the
   last successful one left off
 - `ctx.meta("rows", Meta::count(1_240))` attaches typed facts to what an op
-  produced — counts, sizes, durations, tables, paths, urls, markdown, json,
-  and links to another run or asset of the same deployment — staged per
+  produced (counts, sizes, durations, tables, paths, urls, markdown, json,
+  and links to another run or asset of the same deployment), staged per
   attempt like state and committed with the op's terminal write, so a failed
   attempt's numbers never get recorded. the units are not decoration: the ui
   renders `1.2 GB` and `3.4s` rather than the integers. an asset op's metadata
   lands on its materialization too, so the history says what each build
   reported
 - launching is a request rather than a start: a launch writes a **queued** run
-  and a dispatcher starts it as soon as no limit says otherwise — with no
+  and a dispatcher starts it as soon as no limit says otherwise; with no
   limits declared, the same instant. `Hestan::max_concurrent_runs(n)` caps the
   deployment, `JobBuilder::max_concurrent_runs(n)` one job, and
   `Hestan::tag_limit("env", "prod", 2)` whatever carries a tag, with
@@ -228,7 +228,7 @@ standalone binary for those two. [docs/cli.md](docs/cli.md).
   it survives a restart and something else can pull from it
 - **that something else is `Hestan::work(addr)`**: a worker process that claims
   queued runs and executes them, and fires no schedule and evaluates no sensor.
-  `Hestan::role(Role::Scheduler)` is the other half — one process owns the
+  `Hestan::role(Role::Scheduler)` is the other half: one process owns the
   decisions, any number execute. claiming is a compare-and-set with a renewed
   lease, so exactly one claimer wins a run and a claimer that dies loses it
   rather than stranding it. `Dockerfile` and `docker-compose.yml` run one
@@ -236,29 +236,29 @@ standalone binary for those two. [docs/cli.md](docs/cli.md).
   same binaries at postgres and nothing else changes
   ([scaling](docs/scaling.md))
 - every run, op attempt, output, and log event lands in a sqlite file (WAL,
-  one connection behind a mutex — plenty at this scale) with no extra services,
-  or in postgres with `--features postgres` and a url — same schema, same api,
+  one connection behind a mutex; plenty at this scale) with no extra services,
+  or in postgres with `--features postgres` and a url: same schema, same api,
   and the same test suite runs against both. with optional retention: `Retention::days(30).keep_last(20).failed_days(90)`,
   globally or per job, swept at startup and every hour after it rather than
   only at boot. a run goes only when **every** rule would take it, which is the
   conservative direction; the default keeps everything. the schema migrates
   itself forward via `PRAGMA user_version`, and runs whose claimer went away
-  are marked failed on the next start — while a run another process is holding
+  are marked failed on the next start, while a run another process is holding
   a live lease on is left exactly alone
 - **an op that failed two months ago can be re-run on the input that broke
   it**: `runner.replay(&run)` launches a new run of the ops that failed,
   seeded with what that run recorded, so the fix is tested against the value
   rather than against one reconstructed by hand. exactly those ops and nothing
-  downstream — a resume is the opposite operation, re-running what did *not*
+  downstream. a resume is the opposite operation, re-running what did *not*
   succeed, and both are still there and told apart in the run log. the
   original run is never written to. what a replay does not reproduce is
   written down rather than left to be discovered: today's code, today's
   resources, today's clock, and today's answer from anything the op fetches
-  itself — and a run whose values retention has taken is refused, naming the
+  itself, and a run whose values retention has taken is refused, naming the
   op whose input is gone, rather than run on a hole ([replay](docs/replay.md))
 - **one event log for the whole deployment**, not just for runs. each event
-  carries a `kind`, a documented json payload, and a *subject* — an asset, a
-  schedule, a sensor, a backfill, a job, a run, or hestan itself — so "what
+  carries a `kind`, a documented json payload, and a *subject* (an asset, a
+  schedule, a sensor, a backfill, a job, a run, or hestan itself), so "what
   happened last night" is one query: `GET /api/events?since=…&level=error`.
   each is written by the subsystem that does the work **in the transaction
   that does it**, because an event written next to the row instead is a claim
@@ -269,17 +269,17 @@ standalone binary for those two. [docs/cli.md](docs/cli.md).
 - **a run is a distributed trace**, with `--features otel`: the run is a span,
   each attempt is a span beneath it, a retry is its own span, and an
   [isolated op](docs/isolation.md)'s subprocess is handed the w3c trace context
-  so its spans nest under the op that spawned it — across the fork, which is
+  so its spans nest under the op that spawned it, across the fork, which is
   the part nothing else does. hestan installs no exporter and no subscriber:
   you compose `tracing-opentelemetry` into yours, exactly as with `capture`
 - **what an op *printed* is captured too**, and the two cases differ on
   purpose. an isolated op is a subprocess, so its stdout and stderr are piped
-  and stored whole — `println!`, a linked c library, all of it — with both
+  and stored whole (`println!`, a linked c library, all of it), with both
   pipes drained concurrently, because reading one while the other fills its
   buffer deadlocks the child. an in-process op emits `tracing` events instead,
   and the `capture` feature offers a **layer you compose into your own
   subscriber**: hestan installs no global subscriber and redirects no file
-  descriptor, so an in-process `println!` is *not* captured — hijacking fd 1
+  descriptor, so an in-process `println!` is *not* captured: hijacking fd 1
   would take the host application's output with it, and
   [docs/logs.md](docs/logs.md) says so rather than hiding it. capped per
   attempt (1 MiB and 10,000 lines by default), because an op in a print loop
@@ -287,7 +287,7 @@ standalone binary for those two. [docs/cli.md](docs/cli.md).
 - the scheduler keeps a **durable cursor** per schedule: the newest occurrence
   it has accounted for. everything between the cursor and now is what downtime
   swallowed, so `Catchup::{Skip, One, All { limit }}` can say what to do about
-  it — and a queue-policy fire held for a busy job is durable for the same
+  it, and a queue-policy fire held for a busy job is durable for the same
   reason, since the pending queue is the tick log rather than a `HashMap`
 - a caught-up run knows which logical time it stands for: `runs.scheduled_for`
   and `ctx.scheduled_for()`, so a pipeline can pull the data *for* the hour it
@@ -298,7 +298,7 @@ standalone binary for those two. [docs/cli.md](docs/cli.md).
   every fire lands in a tick log with the run it launched
 - assets add incremental-build semantics on top of ops: each keeps a
   persisted latest value and a fingerprint, declares explicit lineage, and
-  staleness is provable from recorded fingerprints — a build materializes
+  staleness is provable from recorded fingerprints: a build materializes
   exactly the stale ancestors plus the target, seeding fresh values instead
   of recomputing them. source assets stand for external data and carry a
   cheap fingerprint probe; `.auto()` assets rebuild themselves when a probe
@@ -307,27 +307,27 @@ standalone binary for those two. [docs/cli.md](docs/cli.md).
   static key set, and a dep between two of them declares *which* keys it reads:
   `Asset::reads(&hourly, PartitionMapping::covering())` is a daily rollup of
   hourly data, with `offset(-1)` for yesterday's key and `all` for every key at
-  once. staleness follows the mapping — a build records a fingerprint per
+  once. staleness follows the mapping (a build records a fingerprint per
   upstream key it consumed, so the day is stale when an hour under it moves and
-  says which hour — and a pairing that could never resolve fails at build
+  says which hour), and a pairing that could never resolve fails at build
   rather than at 3am
 - materializations are append-only history, capped per asset: each build
   leaves an entry, and every entry says whether the fingerprint actually
-  moved — so "when did this last change" is a question with an answer, not
+  moved, so "when did this last change" is a question with an answer, not
   the same question as "when was this last built"
 - asset checks are assertions bound to an asset, handed the value it just
   produced: `AssetCheck::new("rows_present", "orders", |_, v| ..)` plus
   `Hestan::check(..)`. they lower into ops of the same build, so retries,
   cancellation and the gantt apply unchanged; `Severity::Error` fails the run
   and `Severity::Warn` just records the failure. a check runs when its asset
-  rebuilds — a memoized asset is not re-checked
+  rebuilds: a memoized asset is not re-checked
 - sensors poll the world on an interval and launch runs when something
   changed, with a store-backed cursor committed only on fully successful
   evaluations. probes and run-status chains
-  (`RunStatusSensor::new("chain", f).on([RunStatus::Success]).for_job("etl")` —
-  "when job A succeeds, run job B") are two more sources on that same loop, not
+  (`RunStatusSensor::new("chain", f).on([RunStatus::Success]).for_job("etl")`,
+  or "when job A succeeds, run job B") are two more sources on that same loop, not
   loops of their own, so all three share pausing, cursors and tick history
-- a sensor request can carry a run key — `RunRequest::new("publish").key(day)` —
+- a sensor request can carry a run key (`RunRequest::new("publish").key(day)`),
   which turns at-least-once into effectively-once per sensor. the key is
   claimed in the same transaction that creates the run, so it can never name a
   run that did not launch
@@ -337,13 +337,13 @@ standalone binary for those two. [docs/cli.md](docs/cli.md).
   behind it
 - freshness policies are declarations, not guesses: `fresh_within(d)` on a job
   or an asset says how old its latest success may get, and past that it is
-  `late` — per key on a partitioned asset, so one late partition carries the
+  `late`, per key on a partitioned asset, so one late partition carries the
   asset. a declared policy replaces the cron-derived `overdue` heuristic
 - `on_run_finished` fires for every terminal run with the status on the event,
   `on_op_finished` once per op **attempt** with its number, and both scope to
-  one job with `JobBuilder::on_run_finished` — so an alert can cover prod
+  one job with `JobBuilder::on_run_finished`, so an alert can cover prod
   without covering every backfill. `on_failure` is that path with a filter on
-  it and is unchanged. `on_late` fires when something crosses into late — once
+  it and is unchanged. `on_late` fires when something crosses into late, once
   per crossing, not per poll, and the state survives restarts. ready-made
   webhook and slack helpers behind the `http` feature serve all of them, and a
   run that succeeded does not read like an alarm
@@ -371,13 +371,13 @@ standalone binary for those two. [docs/cli.md](docs/cli.md).
   `Dbt::from_manifest("target/manifest.json")` reads the dag dbt already
   compiled and produces one asset per model with dbt's own lineage, each
   building by invoking `dbt run --select <model>` with its output captured on
-  the run page. your dbt and your profile, invoked — see
+  the run page. your dbt and your profile, invoked; see
   [docs/dbt.md](docs/dbt.md)
 - **an address anyone can reach needs an authenticator, and `serve` refuses to
   start without one**: `Auth::bearer(token)` for one shared secret, or
   `Auth::custom(|req| …)` to compose the identities you already have. three
-  roles — viewer reads, operator drives runs, admin changes how the deployment
-  behaves — and a control a role may not use is not rendered in the ui rather
+  roles (viewer reads, operator drives runs, admin changes how the deployment
+  behaves), and a control a role may not use is not rendered in the ui rather
   than rendered and answering 403. see [docs/auth.md](docs/auth.md)
 
 ## More than one process
@@ -390,7 +390,7 @@ open http://localhost:4000
 ```
 
 `Dockerfile` and `docker-compose.yml` are at the repo root, and it is one
-image — a scheduler and its workers must build the same registry, so they
+image: a scheduler and its workers must build the same registry, so they
 differ only by `HESTAN_ROLE`. that compose file shares one sqlite file, which
 is multi-process on one host; several hosts want
 `.db("postgres://…")` instead, and [docs/scaling.md](docs/scaling.md) is
@@ -438,10 +438,10 @@ should get to decline:
 | feature | what it adds |
 | --- | --- |
 | `bundled` | **on by default**: compiles sqlite from source instead of linking the system library |
-| `postgres` | `Store::connect`, for a run log several processes share — [storage](docs/storage.md) |
-| `cli` | `hestan::cli::run`, and the standalone `hestan` binary — [the command line](docs/cli.md) |
-| `capture` | `hestan::capture_layer`, storing the `tracing` events ops emit — [logs](docs/logs.md) |
+| `postgres` | `Store::connect`, for a run log several processes share ([storage](docs/storage.md)) |
+| `cli` | `hestan::cli::run`, and the standalone `hestan` binary ([the command line](docs/cli.md)) |
+| `capture` | `hestan::capture_layer`, storing the `tracing` events ops emit ([logs](docs/logs.md)) |
 | `otel` | `hestan::otel`, a run as a distributed trace |
-| `http` | `HttpSource` and the [notification](docs/notifications.md) helpers — [http sources](docs/http-sources.md) |
-| `parquet` | `ParquetIo`, op outputs stored as parquet files — [io managers](docs/io-managers.md) |
-| `dbt` | `hestan::dbt`, a dbt project's models as assets — [dbt](docs/dbt.md) |
+| `http` | `HttpSource` and the [notification](docs/notifications.md) helpers ([http sources](docs/http-sources.md)) |
+| `parquet` | `ParquetIo`, op outputs stored as parquet files ([io managers](docs/io-managers.md)) |
+| `dbt` | `hestan::dbt`, a dbt project's models as assets ([dbt](docs/dbt.md)) |

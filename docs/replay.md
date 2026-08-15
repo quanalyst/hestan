@@ -1,7 +1,7 @@
 # Replay
 
 an op failed in production two months ago. you have a fix. the question worth
-answering is whether the fix works **on the input that broke it** — not on one
+answering is whether the fix works **on the input that broke it**, not on one
 you reconstructed by hand.
 
 ```rust
@@ -12,7 +12,7 @@ let id = runner.replay_ops(&broken, Some(&["load".into()]))?;  // or these
 that launches a **new** run of the same job which executes those ops and
 nothing else, with every dep of them seeded from what the original run
 recorded. the op reads byte for byte what it read then. the original run is
-never written to — no status, no event, no materialization: it is history and
+never written to: no status, no event, no materialization. it is history and
 stays history, and the new run records `replay_of` pointing at it.
 
 ## What it is not
@@ -34,13 +34,13 @@ the beginning, on nothing the old run produced.
 regardless, and a replay that succeeded is only evidence about the ones that
 did not matter to it:
 
-- **the code is today's.** that is the point — you are testing a fix — but it
+- **the code is today's.** that is the point (you are testing a fix), but it
   means a replay is not a bit-for-bit re-execution of what happened. an op
   whose body changed in twelve ways since is running all twelve.
 - **resources are rebuilt.** a connection, a client, a temp directory: the op
   gets [today's](resources.md), not the original's. an op that read something
-  through a resource — a table, a config row, a file the client points at —
-  read a world that has moved on, and hestan captured none of it.
+  through a resource (a table, a config row, a file the client points at) read
+  a world that has moved on, and hestan captured none of it.
 - **the clock, randomness, and anything the op fetches itself** are not
   captured and cannot be. `Utc::now()` answers today. an op that calls an api
   gets today's answer, not the one the api gave in June. only what arrived
@@ -58,7 +58,7 @@ about to conclude, the honest reading is the narrow one.
 ## The retention horizon
 
 [retention](storage.md#retention) prunes old runs, and pruning a run asks
-every registered [io manager](io-managers.md) to drop what that run wrote — so
+every registered [io manager](io-managers.md) to drop what that run wrote, so
 an old run's values go when its rows do. **a pruned run cannot be replayed**,
 and neither can one whose files a manager can no longer produce.
 
@@ -85,14 +85,14 @@ Hestan::new()
 ```
 
 with no policy configured nothing is ever pruned, which is the default and
-means every run stays replayable — and that every `FileIo` directory grows
+means every run stays replayable, and every `FileIo` directory grows
 forever. those are the same fact from two directions.
 
 ## The three ways in
 
 **in code**, `Runner::replay(run_id)` replays the ops the run recorded as
 failed, and `Runner::replay_ops(run_id, Some(&ops))` replays exactly the ops
-named — whatever they did, as long as the run ran them.
+named (whatever they did, as long as the run ran them).
 `Runner::replay_plan` answers what either would do without launching it, and
 raises every refusal the launch would.
 
@@ -112,14 +112,14 @@ the run never ran, an input that cannot be read back
 ([the command line](cli.md)).
 
 **in the ui**, the run page carries a replay control on the run and one on the
-selected op, each showing what it would do — "1 to replay · 1 input seeded" —
+selected op, each showing what it would do ("1 to replay · 1 input seeded"),
 and a replayed run's header links back to the run it replayed
 ([web ui](web-ui.md#run-page)).
 
 ## What a replay of a subset run reads
 
-a run that was itself a subset of its job — a resume, a replay, an
-[asset build](assets.md) — did not produce everything its ops read. what it
+a run that was itself a subset of its job (a resume, a replay, an
+[asset build](assets.md)) did not produce everything its ops read. what it
 was handed is recorded on the run as its plan, and that is what a replay of it
 seeds from: the ops it ran are rows, and the values it was given are the plan.
 so replaying an op of a resumed run reads what that op read, whichever run

@@ -24,7 +24,7 @@ start/finish times, and the output or error.
 
 *events* are the append-only log of the whole deployment. each carries a level
 (`info | warn | error`), a kind, a message, optional structured json `data`,
-and — this is the part that stopped being about runs in v17 — a **subject**:
+and (this is the part that stopped being about runs in v17) a **subject**:
 `subject_kind` is one of `run`, `job`, `asset`, `schedule`, `sensor`,
 `backfill` or `system`, and `subject` names which one. so an asset
 materialized, a schedule that fired or was skipped, a sensor tick, a backfill's
@@ -35,7 +35,7 @@ query.
 a run's own kinds are `run_queued`, `run_started`, `run_success`, `run_failed`,
 `run_canceled`, `run_reclaimed`, `op_started`, `op_expanded`, `op_retry`,
 `op_success`, `op_failed`, `op_skipped`, `op_canceled`, `type_check_failed`,
-and `log` — the last is what `ctx.info/warn/error` emit. [events](events.md)
+and `log`; the last is what `ctx.info/warn/error` emit. [events](events.md)
 has every kind, what each payload carries, where each one is written and which
 of them cannot be atomic, how to query and follow the log, and how a run maps
 onto a distributed trace.
@@ -56,12 +56,13 @@ the *trigger* records why a run exists: `manual` (launch endpoint,
 run on the inputs it gave them), `build` (an [asset build](assets.md): the
 endpoints, `build_asset`, and probe-driven auto builds), or `sensor` (a
 [sensor](sensors.md) evaluation asked for it). retry, resume and replay are
-for finished runs — the api answers 409 for one still queued or running, since
-a fresh copy of a live run would only double it. manual launches stay ungated: that is the documented escape hatch
-when an overlapping run is really wanted.
+for finished runs: the api answers 409 for one still queued or running, since
+a fresh copy of a live run would only double it. manual launches stay ungated,
+which is the documented escape hatch when an overlapping run is really
+wanted.
 
 an *identity* is who asked, where a person did and something
-[checked](auth.md): a name and a role — viewer, operator or admin. it lands on
+[checked](auth.md): a name and a role, viewer, operator or admin. it lands on
 the run as `actor` and on every event the request caused, so `manual` becomes
 "manual, by ada". a deployment with no authenticator records no actor rather
 than a fabricated one, which is exactly what it knows: a person asked, and
@@ -69,14 +70,14 @@ nothing was checking who.
 
 an *asset* is an op with identity: a persisted latest value, a fingerprint,
 and explicit lineage on other assets, which makes staleness provable and
-builds incremental — stale ancestors plus the target, fresh values seeded.
+builds incremental: stale ancestors plus the target, fresh values seeded.
 asset builds run as ordinary runs of an internal job named `assets`, so
 everything on this page applies to them unchanged. the model has
 [its own page](assets.md).
 
-all of it lands in the store as it happens — sqlite by default, postgres if
-you point it at one — see [storage](storage.md). op
-outputs land there too by default, which is wrong for anything bulky;
+all of it lands in the store as it happens (sqlite by default, postgres if
+you point it at one); see [storage](storage.md). op outputs land there too by
+default, which is wrong for anything bulky;
 [io managers](io-managers.md) move them somewhere else and keep a handle in
 the run log.
 
@@ -84,14 +85,14 @@ the run log.
 
 a name in a declaration is claimed once. a second claim is a build error and
 not a preference, because the alternative is a deployment that depends on the
-order things were handed over — which of two jobs called `nightly` the
+order things were handed over: which of two jobs called `nightly` the
 scheduler fires is not something a warning in a log can settle.
 
 | name | claimed within | refused by, and what it says |
 | --- | --- | --- |
-| op | its job | `Job::builder(..).build()` — `invalid job graph: duplicate op extract` |
-| job | the process | `serve`, `run_once` and `Runner::new` — `duplicate job: nightly` (`Error::DuplicateJob`) |
-| asset | the process | asset registration — `invalid job graph: assets: duplicate op sales/orders` |
+| op | its job | `Job::builder(..).build()`: `invalid job graph: duplicate op extract` |
+| job | the process | `serve`, `run_once` and `Runner::new`: `duplicate job: nightly` (`Error::DuplicateJob`) |
+| asset | the process | asset registration: `invalid job graph: assets: duplicate op sales/orders` |
 | multi-asset | the process | `invalid job graph: duplicate multi-asset split_orders` |
 | check | its asset | `invalid job graph: duplicate check row_count on asset orders` |
 | sensor | the process | `invalid job graph: duplicate sensor watch` |
@@ -104,7 +105,7 @@ cannot be read one way does not get as far as running.
 two schedules on one job are **not** a duplicate: that is a job with two
 expressions, both of which fire, and two of them landing on the same minute
 launch one run rather than two. the pair is the key because the run log keys a
-schedule on it — a second declaration of the same pair was never a second
+schedule on it: a second declaration of the same pair was never a second
 schedule, only that row carrying whichever timezone and params came last.
 
 a job named `assets` collides with the internal job that
@@ -130,16 +131,16 @@ returns `None` even if that op ran.
 
 ## How a run executes
 
-every op whose deps have all reached a terminal status — and whose
-[trigger rule](#trigger-rules) admits it — is spawned as its own tokio
-task, so independent branches run concurrently — in a diamond
+every op whose deps have all reached a terminal status (and whose
+[trigger rule](#trigger-rules) admits it) is spawned as its own tokio
+task, so independent branches run concurrently: in a diamond
 `a -> {b, c} -> d`, `b` and `c` run at the same time.
 `Job::builder(..).max_parallel(n)` caps how many ops of one run are in
 flight at once, and ready ops over the cap wait their turn in readiness
 order (first ready, first spawned). without a cap, everything ready runs
 together. an op's output is persisted through its
-[io manager](io-managers.md) before its success is recorded — a `put` that
-fails fails the op — and its dependents are handed the resulting handle,
+[io manager](io-managers.md) before its success is recorded (a `put` that
+fails fails the op), and its dependents are handed the resulting handle,
 resolved back to the value as each is spawned. under the default `Inline`
 manager a handle *is* the value, so this is the same in-memory handoff it has
 always been.
@@ -161,7 +162,7 @@ returned `Err`.
 the pause between attempts is capped exponential backoff with full jitter by
 default: the nth retry waits a uniformly random slice of `1s * 2^n`, never
 more than 30s. `.retry_backoff(base, max)` sets the two numbers.
-`.retry_delay(d)` is the fixed-pause alternative — the same wait every time,
+`.retry_delay(d)` is the fixed-pause alternative: the same wait every time,
 no jitter. prefer the default: ops that fail together (one rate limit, one
 dead dependency) also retry together under a fixed delay, and hammer whatever
 knocked them over on the same second; jitter is what pulls the herd apart.
@@ -173,11 +174,11 @@ any other failure. without one, a hung op runs forever: it holds its
 [`Overlap::Skip`](scheduling.md) never fires again. the clock starts when the
 op starts running, so time spent waiting for a pool permit or a
 [rate](#rates) token is not counted against it. expiry also trips
-`ctx.is_cancelled()` — see
+`ctx.is_cancelled()`; see
 [cancellation](#cancellation) for what that does and does not stop, and
 [isolation](isolation.md) for the op that it stops for real.
 
-a run is `failed` if any op finished `failed`, otherwise `success` — unless
+a run is `failed` if any op finished `failed`, otherwise `success`, unless
 it was canceled, which wins over both. a failed run carries an `error` of its
 own: the first op that terminally failed, as `op {name} failed: {message}`,
 which is the same pair an [`on_failure` hook](notifications.md) receives.
@@ -191,15 +192,15 @@ read its closing event.
 ## What hestan promises about writes
 
 **a run never reports an outcome the run log did not take.** every status you
-read — an op that succeeded, a run that failed, an asset that was built — is a
+read (an op that succeeded, a run that failed, an asset that was built) is a
 row that landed, not a thing the process believed at the time.
 
 there are two kinds of write behind that, and the difference is deliberate:
 
 - **what a run did** is critical: an op's terminal row, a run's terminal row,
   an op starting, a fan-out instance's row, a committed
-  [watermark](state.md). one that fails is retried — four attempts, capped
-  exponential with full jitter, under a second in the worst case — because a
+  [watermark](state.md). one that fails is retried (four attempts, capped
+  exponential with full jitter, under a second in the worst case), because a
   busy database is the ordinary reason a write does not land and it is over in
   milliseconds.
 - **what a run said** is best-effort: the [event log](events.md) and captured
@@ -218,15 +219,15 @@ compile error rather than a thing somebody has to remember not to write.
 after its retries, a critical write can still fail: a disk that is full, a
 database that is gone, a postgres connection that died. **the run stops
 there.** it does not report success, and it does not report failure either,
-because at that point this process does not know what is true — the work may
+because at that point this process does not know what is true: the work may
 well have finished, and the row that would say so is the write that did not
 land. reporting either way is picking one of two guesses.
 
 what it leaves behind is worth stating plainly, because it is not tidy:
 
 > the run sits `running`, claimed by the process that gave up on it, with a
-> lease nobody is renewing. it stays that way until the lease runs out — 60
-> seconds — and some process with a working store reclaims it, at which point
+> lease nobody is renewing. it stays that way until the lease runs out (60
+> seconds) and some process with a working store reclaims it, at which point
 > [`Reclaim`](scaling.md#claims-and-leases) decides: `Fail` marks it failed
 > with `claimer went away` and fires the failure hooks, `Requeue` puts it back
 > on the queue.
@@ -249,7 +250,7 @@ carries on working for a run nobody is going to record.
 ## Trigger rules
 
 by default an op runs when its whole upstream worked. that makes the one op
-you most want after a failure — a summary, an alert, a cleanup — exactly the
+you most want after a failure (a summary, an alert, a cleanup) exactly the
 one that gets skipped. `.when(rule)` says otherwise:
 
 ```rust
@@ -264,22 +265,22 @@ Op::new("summary", |ctx: OpCtx| async move {
 .when(When::Always)
 ```
 
-- `When::AllSucceeded` — every dep succeeded. the default, and what an op
+- `When::AllSucceeded`: every dep succeeded. the default, and what an op
   without a rule has always meant.
-- `When::AnyFailed` — at least one dep did **not** succeed: failed, skipped
-  or canceled. an op with no deps never qualifies, so it is always skipped.
-- `When::Always` — whatever the deps did.
+- `When::AnyFailed`: at least one dep did **not** succeed, whether it failed,
+  was skipped or was canceled. an op with no deps never qualifies, so it is always skipped.
+- `When::Always`: whatever the deps did.
 
 readiness is the same for all three: an op waits until every dep has reached
 a *terminal* status, not until every dep has produced output. the rule then
 decides run vs skip. an op the rule turns down is `skipped` with an
 `op_skipped` event that names the rule
-(`skipped by rule any_failed: every dep succeeded`, `data: {"when": ...}`) —
+(`skipped by rule any_failed: every dep succeeded`, `data: {"when": ...}`),
 deliberately different wording from the upstream-failure skip
 (`skipped: upstream load failed`), so the log says which of the two happened.
 
 inside such an op, `ctx.input(dep)` for a dep that produced nothing is `None`
-— there is no output to hand over — and `ctx.dep_status(dep)` is how it finds
+(there is no output to hand over), and `ctx.dep_status(dep)` is how it finds
 out what happened instead. a dep seeded from outside the run (a
 [resume](#resume)'s reused output, an [asset build](assets.md)'s memoized
 value, a source asset) reads as `success`, since that is what it stands in
@@ -296,7 +297,7 @@ worked.
 
 skip propagation asks each candidate's rule rather than assuming. when an op
 fails, the walk down its dependents stops at the first op that would still
-run — and therefore at everything hanging off that op, which waits on what it
+run, and therefore at everything hanging off that op, which waits on what it
 does rather than on what happened above it:
 
 ```
@@ -305,7 +306,7 @@ boom(failed) -> cut_off(skipped) -> deeper(skipped)
 ```
 
 everything reached through plain `all_succeeded` ops is skipped as one group
-naming the original root — one failure with one cause, not a chain of them.
+naming the original root: one failure with one cause, not a chain of them.
 if `cleanup` then fails, its own downstream is cut off naming `cleanup`.
 
 ### Rules and fan-out
@@ -315,12 +316,12 @@ are all-or-nothing already, so there is nothing finer to apply it to. a
 mapped op admitted by its rule when the array it maps over never arrived has
 nothing to expand over, so it expands into **zero instances**: no bodies run,
 no instance rows, an `op_expanded` event with `instances: 0`, and output `[]`
-downstream — exactly the empty fan-out an empty array would have given.
+downstream, exactly the empty fan-out an empty array would have given.
 
 ## Resources
 
 a *resource* is a value built once at startup and shared by every op that asks
-— an http client, a connection pool, a parsed config — instead of each op
+(an http client, a connection pool, a parsed config) instead of each op
 capturing its own in a closure:
 
 ```rust
@@ -339,7 +340,7 @@ leaving a half-live server. `Op::requires` turns a name nobody registered into
 a build error instead of a run that gets halfway.
 
 a resource declared with `Hestan::run_resource` is built when a run starts and
-dropped when it ends instead — a scratch directory, a per-tenant client, a
+dropped when it ends instead: a scratch directory, a per-tenant client, a
 token that belongs to one execution. ops read either the same way, and the
 constructor running per run is the cost: a pool built that way is a pool per
 run, which is usually a mistake. the model has [its own page](resources.md),
@@ -350,8 +351,8 @@ is no client of anybody's wrapped in here.
 ## Concurrency pools
 
 `max_parallel` is a property of one job. the limit that usually matters is a
-property of something outside every job — "at most 3 requests in flight to
-this api, ever" — and two jobs that overlap give 3 + 3.
+property of something outside every job ("at most 3 requests in flight to
+this api, ever"), and two jobs that overlap give 3 + 3.
 
 a *pool* is that budget, declared once and shared by every job in the
 process:
@@ -364,7 +365,7 @@ Hestan::new()
 ```
 
 an op with `.pool(name)` takes a permit before its body runs and gives it
-back when the attempt ends — however it ends: success, failure, panic,
+back when the attempt ends, however it ends: success, failure, panic,
 timeout, or cancel. the permit is per attempt, so an op backing off between
 retries is not sitting on the resource it is backing off from. naming a pool
 that was never declared is `Error::Graph` at build time, as is declaring the
@@ -372,20 +373,20 @@ same pool twice; a limit below 1 means 1.
 
 "ends" means the work stopped, not that hestan stopped waiting for it. a
 [cancelled](#cancellation) run abandons an op at its next await point, and
-blocking work the body started carries on — so the permit is held by the
+blocking work the body started carries on, so the permit is held by the
 `OpCtx` the body was handed rather than by the task that ran it, and the slot
 goes back when the last holder of that ctx lets go. blocking work already has
 to keep its ctx to see a cancel at all, and keeping it is what keeps the
 count true: the closure still calling the api still holds the slot that
 admitted it. an op that never stops holds its permit until the process ends,
-because the work genuinely has not stopped — the pool is a promise about that
+because the work genuinely has not stopped: the pool is a promise about that
 api, and hestan would rather hold a slot than break it. the limit of this is
 work that keeps nothing of hestan's: a thread the body spawned and handed
 nothing is work hestan cannot see the end of, and the slot goes back without
 it.
 
-pools compose with `max_parallel`: an op waits for both, in that order — a
-slot in its own run first, then a permit. an op waiting for a permit does
+pools compose with `max_parallel`: an op waits for both, in that order (a
+slot in its own run first, then a permit). an op waiting for a permit does
 hold its `max_parallel` slot, which can idle a job, but it cannot deadlock:
 permits are only ever held by work that is already running, and nothing that
 holds a permit ever waits for a slot.
@@ -403,7 +404,7 @@ queued op reads as queued instead of as an op mysteriously stuck in
 ## Rates
 
 a pool caps how many calls are in flight. the limit an api publishes is almost
-never that — it is "5 requests a second", "1000 an hour" — and three at a time
+never that (it is "5 requests a second", "1000 an hour"), and three at a time
 is a rate only if you know how long each call takes. `max_parallel(3)` is how
 that limit usually gets approximated, and the failure mode is a 429 at 06:00.
 
@@ -420,12 +421,12 @@ Hestan::new()
 an op with `.rate(name)` takes one token before its body runs. naming a rate
 that was never declared is `Error::Graph` at build time, as is declaring the
 same name twice; a limit below 1 means 1. an op may hold a pool permit and a
-rate token at once, and the two names are separate — a pool called `api` and a
+rate token at once, and the two names are separate: a pool called `api` and a
 rate called `api` are two different limits on the same thing.
 
 **a token is spent, not returned.** that is the whole difference from a pool: a
 permit comes back when the work ends, and a token does not come back at all.
-there is nothing to release and nothing to hold — the op has had its call, and
+there is nothing to release and nothing to hold: the op has had its call, and
 the bucket refills on its own clock whatever the op does next. so none of the
 "held until the work stops" that a permit needs applies here, in either
 direction. the token is per attempt, because a retry is another call, and per
@@ -436,21 +437,21 @@ too.
 
 it is a **token bucket**: `limit` tokens accrue over `per`, up to `limit` may be
 spent at once, and one more accrues every `per / limit` after that. so "5 a
-second" lets five go at once and then one every 200ms — which is what an api
+second" lets five go at once and then one every 200ms, which is what an api
 publishing a per-second limit generally tolerates, and metering them out one
 every 200ms from the start would be slower than the thing being protected asked
 for.
 
-the alternative is a fixed window — count what this second has spent, reset on
-the tick — and it is less code and it is wrong. five calls at 0.99s and five at
+the alternative is a fixed window (count what this second has spent, reset on
+the tick), and it is less code and it is wrong. five calls at 0.99s and five at
 1.01s are two legal windows and ten calls in fifty milliseconds, and the api
 sees ten. a bucket cannot do that, wherever the boundary falls, because there
 is no boundary: the second five have to wait for tokens to accrue.
 
 ### waiting
 
-an op that finds the bucket empty waits. the wait is asynchronous — nothing
-holds a runtime thread — and it does not count against
+an op that finds the bucket empty waits. the wait is asynchronous (nothing
+holds a runtime thread) and it does not count against
 [`Op::timeout`](#how-a-run-executes), whose clock starts when the body does.
 the op logs `waiting for a {name} token`, so a throttled op reads as throttled
 instead of as an op mysteriously stuck in `running`, which is the line a pool
@@ -462,7 +463,7 @@ there: an op cannot be overtaken by one that asked later, and a long queue
 cannot starve the op at the head of it.
 
 a [cancelled](#cancellation) run's waiting op stops waiting, and **does not take
-a token on its way out** — the token it was holding goes to the op behind it in
+a token on its way out**: the token it was holding goes to the op behind it in
 the queue, which is woken to find out rather than sleeping out the one it was
 given. a token spent on an op that is already dying is a call nobody makes and
 a call somebody else should have been making.
@@ -477,8 +478,8 @@ call was made" stay the same moment.
 **the bucket lives in this process.** two workers each honouring five a second
 send ten, and the system being protected sees ten. that is not a caveat worth
 burying: a rate exists to protect something outside hestan, and the deployment
-shape that makes hestan scale — [`Role::Worker`](scaling.md#roles) on several
-hosts — is exactly the one that breaks the guarantee.
+shape that makes hestan scale ([`Role::Worker`](scaling.md#roles) on several
+hosts) is exactly the one that breaks the guarantee.
 
 what to do about it is arithmetic: divide. three workers against an api that
 allows six a second is `rate("api", 2, ..)` in the registry all three build.
@@ -504,13 +505,13 @@ what actually stops, and what hestan claims about it, depends on the op:
   child process, so cancelling sends that process SIGTERM, waits three
   seconds, and then SIGKILLs it. nothing in the op gets a say. this is the
   only kind of op hestan can make that promise about, and it is the reason
-  `.isolated()` exists — everything below is what cancellation means when the
+  `.isolated()` exists; everything below is what cancellation means when the
   work shares this process.
 - an **async op** is dropped at its next await point. that is real
   cancellation, and it is what "canceled" means on its op run row. it can
   also `select!` on `ctx.cancelled()` to unwind on purpose.
-- a **blocking op** — `spawn_blocking`, a long computation, a synchronous
-  driver — cannot be dropped at all. tokio has nothing to interrupt: the
+- a **blocking op** (`spawn_blocking`, a long computation, a synchronous
+  driver) cannot be dropped at all. tokio has nothing to interrupt: the
   closure owns its thread until it returns. the only thing that stops it is
   the closure itself, polling `ctx.is_cancelled()` and bailing out:
 
@@ -534,14 +535,14 @@ what actually stops, and what hestan claims about it, depends on the op:
   records say the run did. hestan cannot stop it and does not pretend to.
 
 so cancellation is honest about what it observed rather than about what it
-asked for. the run aborts every in-process op — isolated ops are left alone,
-because each is busy killing its own child and a dropped task could not — and
+asked for. the run aborts every in-process op (isolated ops are left alone,
+because each is busy killing its own child and a dropped task could not) and
 then waits a three-second grace period for its ops to come back, doubled while
 an isolated op is spending a grace of its own inside it:
 
 - an op that comes back in time is recorded as whatever really happened. one
   that finished in the instant between the cancel request and the abort keeps
-  its real result — its success (and any staged [state](state.md)) is
+  its real result: its success (and any staged [state](state.md)) is
   recorded, not overwritten with `canceled`.
 - an op that does not come back is recorded `canceled` with the error
   `cancellation requested; this op was not observed to stop within 3s and may
@@ -554,20 +555,20 @@ an isolated op is spending a grace of its own inside it:
 note that a blocking closure launched with `spawn_blocking` is invisible to
 this: the op's own task is awaiting the join handle, so it aborts and comes
 back promptly while the closure keeps going. that is exactly why polling
-`is_cancelled()` is the contract rather than a suggestion — hestan can hand
+`is_cancelled()` is the contract rather than a suggestion: hestan can hand
 the closure the signal, but it cannot see whether the closure heeded it.
 
 one thing does outlive the abort with it. a [pool](#concurrency-pools) permit
 is held by the ctx rather than by the task, so a closure that carried its ctx
-into `spawn_blocking` — which is how it reads the cancel signal at all —
+into `spawn_blocking` (which is how it reads the cancel signal at all)
 holds the slot it was admitted into until it returns. the run is over and its
 row says canceled; the pool still counts the call that is still in flight,
 which is the only count worth having.
 
 a [rate](#rates) token is the other way round, and it is the difference between
 holding something and having spent it. an op still *waiting* for one when the
-cancel lands takes none with it — the token goes to the op behind it in the
-queue — and an op that already had one has already made its call, so there is
+cancel lands takes none with it (the token goes to the op behind it in the
+queue), and an op that already had one has already made its call, so there is
 nothing for the cancel to reach.
 
 ### the isolated contrast
@@ -585,7 +586,7 @@ a process to point a signal at:
 the op run row is where the difference shows. an in-process op that never
 came back is recorded canceled with **no finish time**, and an error saying
 hestan asked and did not see it stop. an isolated op is recorded canceled
-**with** one, and an error saying which of the two signals ended it —
+**with** one, and an error saying which of the two signals ended it:
 `canceled: it stopped when asked` or `canceled: it ignored SIGTERM for 3s and
 was killed`. the second row is a fact; the first is a request. that is worth
 knowing before you write a blocking op that matters.
@@ -593,7 +594,7 @@ knowing before you write a blocking op that matters.
 the timeout story is the same story: `Op::timeout` on an in-process op trips
 `ctx.is_cancelled()` and hopes, while on an isolated op it kills the process
 and reports `timed out after 30s: it ignored SIGTERM for 3s and was killed`.
-the attempt then retries like any other failure — a timeout is a failed
+the attempt then retries like any other failure: a timeout is a failed
 attempt, not a canceled run.
 
 `cancel` reports what it did: `Requested` (signal sent), `AlreadyFinished`
@@ -602,7 +603,7 @@ such run). canceled is terminal: the run itself never continues, but its ops
 that did finish are reusable, so a canceled run is resumable exactly like a
 failed one. a canceled run counts as inactive for the scheduler's
 [overlap policy](scheduling.md), and [failure hooks](notifications.md) do
-not fire for it — though `on_run_finished` does, with `status = canceled`, as
+not fire for it, though `on_run_finished` does, with `status = canceled`, as
 long as the run had started. cancel one still on the queue and nothing
 reports on it: it never ran.
 
@@ -611,7 +612,7 @@ reports on it: it never ran.
 `runner.resume(run_id)` (or `POST /api/runs/{id}/resume`) launches a new run
 that continues a finished one instead of redoing it. every op that did not
 succeed runs again, together with everything downstream of it; every op that
-did succeed is reused — its recorded output is seeded, and its body never
+did succeed is reused: its recorded output is seeded, and its body never
 runs. the new run carries the original run's params, trigger `resume`, and a
 `resumed_from` pointing at the run it continued.
 
@@ -621,7 +622,7 @@ let id = runner.resume_from(&id, Some(&["clean".into()]))?;  // from a chosen op
 ```
 
 `resume_from` with a selection re-runs exactly those ops and their
-transitive downstream whatever their last status was — "re-run from here" —
+transitive downstream whatever their last status was ("re-run from here"),
 which works on a successful run too. a plain resume of one is refused:
 there is nothing to continue. re-run (`POST /api/runs/{id}/retry`) stays the
 way to redo everything.
@@ -635,7 +636,7 @@ descendants' chains, and the resume says so rather than seeding a hole.
 the ops recorded across that chain must still be exactly the job's ops, or
 the resume is refused: resuming into a graph that has gained or lost an op
 would record lineage that never happened. the same rule refuses resuming a
-run that only ever covered part of the graph — an [asset build](assets.md)
+run that only ever covered part of the graph: an [asset build](assets.md)
 records rows for its plan alone. a resume is also refused when nothing is
 left to re-run, and when a chosen op's input was never produced by any run
 in the chain.
@@ -657,12 +658,12 @@ it is the opposite of a resume, and the difference is worth holding onto: a
 resume re-runs what did **not** succeed together with everything downstream,
 and a replay re-runs what **did**, exactly the ops named and nothing below
 them. the new run carries the original's params, trigger `replay`, and a
-`replay_of` — a column of its own beside `resumed_from`, because a run log
+`replay_of`, a column of its own beside `resumed_from`, because a run log
 that could not tell the two apart could not say which of two opposite things
 happened. the original run is not written to.
 
-what a replay does not reproduce — today's code, today's resources, today's
-clock, today's answer from anything the op fetches itself — and the
+what a replay does not reproduce (today's code, today's resources, today's
+clock, today's answer from anything the op fetches itself) and the
 [retention](storage.md#retention) horizon past which a run cannot be replayed
 at all are [its own page](replay.md), and are the difference between a result
 you can trust and one that misleads you.
@@ -696,19 +697,19 @@ that job has four ops: `fetch`, `clean_a.parse`, `clean_a.dedupe`, `load`.
   rewritten to match. inner names may not contain a dot, since that is the
   separator.
 - the ops named by `input` additionally wait on whatever the instance waits
-  on — that is the only way into a graph, and an inner dep that names nothing
+  on: that is the only way into a graph, and an inner dep that names nothing
   inside the graph is a build error rather than a reach outward.
 - anything depending on the instance name is rewired to the op named by
   `output`. `input` and `output` are both required, and an unknown or
   dot-containing name is a build error naming it.
-- two instances of one graph must not share a name — that is exactly what the
-  instance name is for — and an instance colliding with an op is `Error::Graph`.
+- two instances of one graph must not share a name (that is exactly what the
+  instance name is for), and an instance colliding with an op is `Error::Graph`.
 
 ### Reading inputs inside a graph
 
 a graph's ops keep their own vocabulary. inside `clean`, `dedupe` reads
 `ctx.input("parse")`, not `ctx.input("clean_a.parse")`; at job level, `load`
-reads `ctx.input("clean_a")` — the name it wrote in `.after`, not the inner op
+reads `ctx.input("clean_a")`: the name it wrote in `.after`, not the inner op
 that happened to supply it. renaming is a wiring concern, so it stays out of
 the bodies.
 
@@ -718,7 +719,7 @@ way out: every dep that produced output, name and value, sorted by name.
 
 ### Nesting
 
-a graph may contain a graph — `GraphBuilder::graph` is the same call — and
+a graph may contain a graph (`GraphBuilder::graph` is the same call), and
 `input`/`output` may name a nested instance, which resolves through it to a
 real op. names compound: `s.inner.pages`. it is all one flattening, so a
 recursive self-inclusion could not terminate; that is refused with a clear
@@ -729,7 +730,7 @@ can only contain graphs that were built before it).
 
 the dag mutes an op's `{instance}.` prefix and draws the inner name at full
 strength, so a graph instance's ops read as a group without a second layout.
-they are ordinary nodes otherwise — clickable, statused, and gantt rows like
+they are ordinary nodes otherwise: clickable, statused, and gantt rows like
 any other op.
 
 ## Dynamic fan-out
@@ -756,21 +757,21 @@ untouched by any of this.
 
 when every dep of a mapped op is satisfied the executor reads the mapped
 dep's output. it must be a json array, or the op fails with
-`mapped over pages, which produced a string rather than an array` — an
+`mapped over pages, which produced a string rather than an array`, an
 ordinary op failure that skips downstream. for an array of n elements it
-creates n **instances** named `fetch_page[0]`, `fetch_page[1]`, … Each one:
+creates n **instances** named `fetch_page[0]`, `fetch_page[1]`, … each one:
 
 - gets its own `op_runs` row, inserted the moment the instances are created,
   so the ui, the gantt and the run detail see it like any other op;
 - receives its element as the typed argument, and reads every other dep whole
-  with `ctx.input` — including the mapped dep itself, whose entry is the
+  with `ctx.input`, including the mapped dep itself, whose entry is the
   entire array;
 - is an ordinary spawned task, so `max_parallel`, [pools](#concurrency-pools),
   retries, [timeouts](#cancellation) and cancellation apply to it exactly as
   they do to a static op, with no special cases.
 
 the mapped op's own output, which downstream ops see under its plain name, is
-the json array of instance outputs **in element order** — never in completion
+the json array of instance outputs **in element order**, never in completion
 order, however the instances interleave. the mapped op itself gets **no
 `op_runs` row**: the instances are the record. its expansion is visible as an
 `op_expanded` event (`data: {"instances": n, "over": dep}`) against the
@@ -779,7 +780,7 @@ parent's name, which is also the only trace left when n is 0.
 ### All or nothing
 
 a mapped op counts as succeeded only if **every** instance succeeded. one
-instance failing fails the mapped op for skip propagation — its downstream is
+instance failing fails the mapped op for skip propagation: its downstream is
 skipped, and the run fails naming the instance
 (`op fetch_page[3] failed: 429`). there is no partial array and no partial
 success. sibling instances already in flight run to the end, exactly as an
@@ -811,21 +812,21 @@ instances carry one `[label]` per level of fan-out they sit inside, outermost
 first: `sites[0]` and `sites[1]`, then `probe[0][0]`, `probe[0][1]`,
 `probe[1][0]`, … so an inner instance names the outer one it belongs to, and
 `op_runs` still has a unique row per instance. that is the whole naming rule,
-and it goes as deep as the nesting does. a label never holds a bracket — one
-that would is refused at the expansion — so the name reads back as an op and
+and it goes as deep as the nesting does. a label never holds a bracket (one
+that would is refused at the expansion), so the name reads back as an op and
 its coordinates without ambiguity. an op named like one of those instances,
 `probe[0]` in a job that also has a mapped `probe`, fails the build rather
 than spending the deployment's life being read as an instance.
 
 the collected output keeps the **shape**: `probe`'s value downstream is one
-array per outer element — `[["north-a", "north-b"], ["south-a"]]` — not one
+array per outer element (`[["north-a", "north-b"], ["south-a"]]`), not one
 flat list. flattening would lose which region a reading came from, and that is
 the only reason to nest a fan-out rather than flatten in the outer op. an outer
 element yielding `[]` contributes an empty array in its place, not a gap.
 
 everything an instance already inherits works at every level: pools, rates,
 limits, retries, [rules](#rules-and-fan-out), timeouts and cancellation apply
-per instance with no special cases. failure works the same way one level down —
+per instance with no special cases. failure works the same way one level down:
 `probe[1][1]` failing fails `probe`, skips its downstream, and leaves the
 instances under `probe[0]` running to the end.
 
@@ -851,13 +852,13 @@ elements; with the 40 this run has already made that is past the ceiling of
 the check is made **before** any of the rows are written, which is the point:
 a runaway found by counting op rows in the ui is a runaway that already
 happened. the budget belongs to the run rather than to any one op, since what
-a nesting multiplies is the run — ten fan-outs of a hundred cost the same
+a nesting multiplies is the run: ten fan-outs of a hundred cost the same
 thousand rows as one of a thousand.
 
 a thousand is thirty times what a [partitioned build](assets.md) launches by
 default and far more than any hand-written fan-out, so a job that means it
-never meets this. raise it for a deployment that genuinely fans out wider — a
-build naming thousands of partitions by hand is the usual one — and prefer
+never meets this. raise it for a deployment that genuinely fans out wider (a
+build naming thousands of partitions by hand is the usual one), and prefer
 flattening to raising it much.
 
 ### Limits
@@ -868,15 +869,15 @@ isn't mapped.
 instance names are op names everywhere else in the system, which is what makes
 them free: `ctx.set_state` from an instance writes state keyed
 `(job, "fetch_page[3]")`, an io manager writes its value to a file of that
-name, and op stats aggregate per static op — at every level, so
-`probe[1][1]`'s history is `probe`'s — which is why a mapped op shows no
+name, and op stats aggregate per static op (at every level, so
+`probe[1][1]`'s history is `probe`'s), which is why a mapped op shows no
 history of its own.
 
 ### Resume across a mapped op
 
 a [resume](#resume) reuses instance outputs by their instance names, rebuilt
 into the collected array. because the array a mapped op expands over can
-differ on a re-run, a mapped op is reusable **only if it fully succeeded** —
+differ on a re-run, a mapped op is reusable **only if it fully succeeded**:
 every instance present, covering `0..n`, every one of them successful with a
 recorded output. anything less and the whole mapped op re-expands from its
 dep, instances and all, with its downstream. a mapped op that expanded over an
@@ -912,7 +913,7 @@ aborted mid-write.
 **`queued` is a real state now, not a millisecond on the way to `running`.**
 launching is a request to run rather than a start: the dispatcher decides when
 it starts, and it starts as soon as no [limit](scaling.md#limits) says
-otherwise — which, with no limits declared, is the same instant, and is why
+otherwise, which, with no limits declared, is the same instant, and is why
 nothing above reads any differently than it did. with limits declared the run
 waits on the queue, and `run` waits with it. the queue is the `runs` table, so
 a run enqueued by one process can be executed by [another](scaling.md#roles).
@@ -924,9 +925,9 @@ unregistered job is `Error::UnknownJob`.
 
 the [command line](cli.md) spells the same two: `run <job>` enqueues and
 returns the id, and `run <job> --wait` executes it here and exits with what it
-did. the difference between them is a role — a process that enqueues and then
+did. the difference between them is a role (a process that enqueues and then
 exits must not be one that also executes, or the launch would kill what it
-launched — and `run --dry-run` runs the params check above and stops there.
+launched), and `run --dry-run` runs the params check above and stops there.
 
 a schedule's params are checked earlier still. `schedule_with` (and
 `schedule_tz_with`) attach the params every cron fire launches with, and

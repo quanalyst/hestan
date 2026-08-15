@@ -1,7 +1,7 @@
 # Getting started
 
 from nothing to a job running on a schedule, with a ui, in one pass. it needs
-a rust toolchain (1.88 or newer) and nothing else — no server to install, no
+a rust toolchain (1.88 or newer) and nothing else: no server to install, no
 sidecar, no daemon. hestan is a library, and what you end up with is your own
 binary.
 
@@ -16,8 +16,8 @@ cargo add serde_json
 
 tokio because everything hestan runs is async and something has to drive it;
 `serde_json` because an op hands its result back as json. that is the whole of
-the setup. to track the repository instead of the release — a tag, or a
-sibling checkout for hacking on both at once:
+the setup. to track the repository instead of the release, with a tag
+or a sibling checkout for hacking on both at once:
 
 ```toml
 hestan = { git = "https://github.com/quanalyst/hestan", tag = "v0.1.0-beta.2" }
@@ -69,13 +69,13 @@ its launch button and you do not have to wait for one.
 ## What each line is
 
 an **op** is one unit of work: a name and an async closure. it is handed an
-[`OpCtx`](concepts.md#opctx) and hands back json — whatever it returns is
+[`OpCtx`](concepts.md#opctx) and hands back json. whatever it returns is
 recorded in the run log and passed to whatever depends on it.
 `ctx.input("extract")` is how `load` reads what `extract` produced, and
 `.after(["extract"])` is what makes `load` wait for it. there is no other
 wiring: the edge and the data path are one declaration.
 
-a **job** is a dag of ops, and `build()` is where it is checked — a cycle, a
+a **job** is a dag of ops, and `build()` is where it is checked: a cycle, a
 dep on a name no op has, or two ops sharing a name is an error here, at
 startup, rather than a run that gets halfway through and stops.
 
@@ -84,7 +84,7 @@ attempts if it fails, spaced by a backoff with jitter on it; each attempt is
 recorded separately, so an op that worked on the third try says so rather than
 looking like one that worked.
 
-`ctx.info` writes a line into the run log — hestan's own structured record,
+`ctx.info` writes a line into the run log: hestan's own structured record,
 which is [not the same thing](logs.md) as a `println!`. `ctx.meta("rows", n)`
 attaches a typed fact to what the op produced, and the ui renders it as a
 number and tracks it across runs. neither is required; both are what make a run
@@ -94,18 +94,18 @@ readable three months later.
 database, recovers whatever a previous process left half-done, runs the
 scheduler, and serves the ui and json api on the address given. it does not
 return until the process stops. for one headless run and no server, swap it for
-`run_once("etl", json!({})).await` — see [embedding](embedding.md).
+`run_once("etl", json!({})).await`; see [embedding](embedding.md).
 
 ## Where the state lives
 
 nothing above named a database, so the run log is `hestan.db` in the working
-directory — a sqlite file, created on first run. `.db("var/orders.db")` puts
+directory: a sqlite file, created on first run. `.db("var/orders.db")` puts
 it somewhere else, `":memory:"` keeps nothing, and a `postgres://` url with the
 `postgres` feature on is a run log several machines can share
 ([storage](storage.md)).
 
 everything is in there: runs, op attempts, outputs, events, captured output.
-delete the file and you have deleted the history, not the jobs — the jobs are
+delete the file and you have deleted the history, not the jobs. the jobs are
 in your binary.
 
 ## The ui
@@ -127,7 +127,7 @@ showing a sample of something.
 - **a command line over the same jobs.** add `features = ["cli"]` and call
   `hestan::cli::run(app, addr).await` in place of `serve`. with no arguments it
   serves exactly as before; with arguments that binary can launch, tail,
-  cancel, explain and diagnose — [the command line](cli.md).
+  cancel, explain and diagnose; see [the command line](cli.md).
 - **[choosing](choosing.md)** answers the questions this page skipped: job or
   asset, sqlite or postgres, in-process or isolated, schedule or sensor.
 - **[concepts](concepts.md)** is the execution model in full: how a run
@@ -149,6 +149,6 @@ on its own: the etl's `publish` op fails once per run and demonstrates a retry,
 and `validate` drops malformed rows with warnings you can find in the run log.
 
 `cargo run --example assets --features cli` serves a second instance on
-<http://127.0.0.1:4002> — an asset pipeline over that repository's own `docs/`
+<http://127.0.0.1:4002>, an asset pipeline over that repository's own `docs/`
 directory, where touching a file has the probe notice and the totals rebuild
 within ten seconds.

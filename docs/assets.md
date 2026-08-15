@@ -41,7 +41,7 @@ directory.
 `Op::typed` take; `.retries(n)` and `.retry_delay(d)` forward to the op.
 dep values arrive like op inputs: `ctx.input("<dep asset name>")`, or one
 typed struct field per dep with `Asset::typed`. `.from(&dep)` is repeatable
-and is the only wiring — there is no `.after` for assets.
+and is the only wiring: there is no `.after` for assets.
 
 builds run as ordinary runs of an internal job named `"assets"`, registered
 only when assets exist (a user job also named `assets` is then
@@ -52,14 +52,14 @@ appears in the jobs table like any other. one consequence: launching the
 every derived asset, ignoring staleness; the build endpoints below are the
 incremental path.
 
-a source contributes no op to that job. its "value" is null everywhere — a
+a source contributes no op to that job. its "value" is null everywhere: a
 derived fn whose dep is a source reads the external data itself, and the dep
 exists so staleness can flow, not to carry bytes.
 
 ## One op, several assets
 
 some computations produce more than one thing. a query that splits into a
-clean table and a rejected one, an api pull that yields two resources — you
+clean table and a rejected one, an api pull that yields two resources. you
 do not want to run it twice to materialize both. `MultiAsset` is one op that
 produces several assets:
 
@@ -87,7 +87,7 @@ the body returns a json **object** whose keys are exactly the produced names.
 a key it did not return, or one nothing declared, fails the op and says which:
 the alternative is materializing a `null` nobody asked for.
 
-`MultiAsset::new` names the *op*, not an asset — nothing is ever materialized
+`MultiAsset::new` names the *op*, not an asset: nothing is ever materialized
 under `split_orders`. each produced asset gets its own materialization row, its
 own fingerprint (the content hash of that key's value) and its own history,
 and behaves like any other asset from there: deps, staleness, checks, builds,
@@ -100,7 +100,7 @@ the registry is asset -> op **N:1**, and the consequences are worth stating:
   produces is.
 - **a plan holds the op once**, however many of its outputs are stale. asking
   to build `orders_clean` and `orders_rejected` in one build is one run of one
-  computation, and a build of either materializes both — there is no way to
+  computation, and a build of either materializes both: there is no way to
   produce half of one op.
 - **downstream depends on the asset**, not the op: `.from_named("orders_clean")`
   and `ctx.input("orders_clean")`. the wiring to the op that produced it is
@@ -135,14 +135,14 @@ not enable serde_json's `preserve_order`, so maps serialize with sorted keys
 and the same value always hashes the same. the caveat: the hash is of the
 *json text*, so anything json cannot see (float formatting quirks, a type
 whose serialization changes between versions) changes the fingerprint. when
-the default is wrong for you — an output embedding a timestamp, say — call
+the default is wrong for you (an output embedding a timestamp, say), call
 `ctx.set_fingerprint(s)` inside the fn. it overrides the content hash for
 that materialization and is buffered like `set_state`: last call wins,
 discarded if the attempt fails.
 
 source fingerprints come from probes and are whatever string the probe
 returns. cheap identity beats content: names, lengths and mtimes hashed
-together, an etag, a `MAX(updated_at)` — anything that moves when the data
+together, an etag, a `MAX(updated_at)`. anything that moves when the data
 moves will do.
 
 ## Provable staleness
@@ -153,19 +153,19 @@ it was consumed (the `inputs` map). an asset is stale iff:
 - it has never materialized, or
 - some dep's *current* fingerprint differs from the recorded one, or
 - some dep has no materialization at all (a source that has never probed
-  keeps its descendants stale — give sources probes), or
+  keeps its descendants stale; give sources probes), or
 - some dep is itself stale. that last one is computed in topo order, so
   staleness reaches descendants before anything rebuilds, and it is
   deliberately pessimistic: if a rebuild of the dep would come out
   fingerprint-identical, the descendant rebuilds anyway (no early cutoff).
 
 `GET /api/assets` shows the verdict with its evidence: each stale asset
-lists `{dep, partition, had, now}` reasons — the fingerprint it consumed
+lists `{dep, partition, had, now}` reasons (the fingerprint it consumed
 against the dep's current one, and which key of the dep that was where a
-[mapping](#what-a-partition-reads-of-its-dep) reads one other than its own.
+[mapping](#what-a-partition-reads-of-its-dep) reads one other than its own).
 equal `had`/`now` on a reason means the dep itself is stale and the asset is
 stale transitively. an asset that has never
-materialized is stale with an empty reasons list — nothing was recorded to
+materialized is stale with an empty reasons list: nothing was recorded to
 compare against.
 
 ## Freshness policies
@@ -199,7 +199,7 @@ let daily_orders = Asset::new("daily_orders", |ctx: OpCtx| async move {
 ```
 
 `daily` keys are `YYYY-MM-DD` and `hourly` keys are `YYYY-MM-DDTHH`, both utc,
-running from the start to now — so the set grows with the clock.
+running from the start to now, so the set grows with the clock.
 `Partitions::keys` is a fixed set of whatever strings you like. keys may not
 contain brackets, for a reason the next paragraph makes obvious.
 `ctx.partition()` is `Some(key)` inside a partitioned asset and `None`
@@ -208,8 +208,8 @@ everywhere else, exactly as it has always effectively been.
 everything an asset has is per key: its materialization, its fingerprint, its
 history, its checks and its metadata. `GET /api/assets` reports an
 unpartitioned asset exactly as before, and reports a partitioned one as
-`partitions: {total, materialized, stale, missing}` — three disjoint states
-summing to `total` — instead of a single fingerprint, because there isn't one.
+`partitions: {total, materialized, stale, missing}` (three disjoint states
+summing to `total`) instead of a single fingerprint, because there isn't one.
 
 ### Building is fan-out
 
@@ -229,7 +229,7 @@ the *unpartitioned* graph; the build endpoints and backfills are how
 partitions get built.
 
 with nothing named, a build targets the keys that are missing or stale, newest
-first, capped by `Partitions::build_limit` (default 31) — so an unbounded daily
+first, capped by `Partitions::build_limit` (default 31), so an unbounded daily
 range cannot start a thousand instances by accident. `Hestan::build_asset` and
 `POST /api/assets/{name}/build` both work this way, which means
 `build_asset`'s "a build always rebuilds its target" rule reads slightly
@@ -244,7 +244,7 @@ a key the asset's set does not hold is a 400, as is naming partitions on an
 asset that has none.
 
 naming keys outright goes past `build_limit` deliberately, but not past
-[`Hestan::max_instances`](concepts.md#the-ceiling) — the ceiling on what one
+[`Hestan::max_instances`](concepts.md#the-ceiling), the ceiling on what one
 run may expand to, 1000 by default. a build naming more keys than that fails at
 the expansion saying so, before it writes a row; chunk it into backfills, or
 raise the ceiling if the deployment means it. partitioned assets are one level
@@ -275,13 +275,13 @@ there are four shapes, and `Asset::from` is the first of them:
 | mapping | what one key reads | pairs with |
 | --- | --- | --- |
 | `identity` (the default, and what `from` declares) | the same key | two sets of the same kind, or an unpartitioned dep, whose whole value arrives |
-| `covering` | the dep keys inside this one — a day and its 24 hours | two time sets, the reader's keys no finer than the dep's |
+| `covering` | the dep keys inside this one (a day and its 24 hours) | two time sets, the reader's keys no finer than the dep's |
 | `offset(n)` | the key `n` steps along the dep's order | two sets of the same kind, with an order to step along |
 | `all` | every key the dep has | anything, including an **unpartitioned** reader |
 
 a mapping that reads one key hands the body that key's value, exactly as
 identity always has. one that reads a set hands it an object keyed by
-partition — `{"2026-01-05T00": …, "2026-01-05T01": …}` — so the body knows
+partition (`{"2026-01-05T00": …, "2026-01-05T01": …}`), so the body knows
 which key each value came from.
 
 either way the value comes from the store at `(dep, key)` rather than out of
@@ -303,8 +303,8 @@ two boundaries, and they are deliberately different:
 - an **offset off the end** of a set reads nothing. the first key has no key
   before it, and that is a fact about the edge of history rather than a broken
   dependency.
-- a **window that its dep cannot fill** — a daily key whose hourly asset starts
-  at 06:00 that day, so six of its hours are not keys of anything — is refused.
+- a **window that its dep cannot fill** (a daily key whose hourly asset starts
+  at 06:00 that day, so six of its hours are not keys of anything) is refused.
   a window promises its whole range, and 18 hours reported as a day is a wrong
   number rather than a missing one. naming that key at a build, or covering it
   with a backfill range, says which hour is missing; a build that names no keys
@@ -323,7 +323,7 @@ every partition at once is an aggregation, and it has to say so. `identity`
 there is still the error it was, because "the same key" needs a key.
 
 a key the upstream's set does not contain keeps the downstream partition stale
-forever under identity — there is nothing there to read. that is the honest
+forever under identity: there is nothing there to read. that is the honest
 reading of a range that starts later upstream than downstream.
 
 ### Staleness follows the mapping
@@ -332,7 +332,7 @@ a rollup that reported fresh because it only ever checked its own key would be
 worse than no mapping at all. so a build records the fingerprint of **every
 upstream key it consumed**: one string per dep as ever, except for a dep read
 through a mapping that names a set, which records an object of one fingerprint
-per key. no new column — `inputs` is json, and both shapes live in the one it
+per key. no new column: `inputs` is json, and both shapes live in the one it
 has always had.
 
 staleness then asks the same question of every key the mapping resolves to. a
@@ -357,9 +357,9 @@ two consequences worth knowing:
 built**. under identity that was also roughly the size of the run: 31 keys of
 a target pulled at most 31 keys of each upstream. under a mapping it is not.
 one daily key covering 24 hourly ones is 25 op instances, so a default build of
-that rollup is up to 775, and a backfill chunk — which chunks by the same limit
-— is the same multiple. `all` is the extreme: one key of the reader can pull
-the dep's whole set.
+that rollup is up to 775, and a backfill chunk (which chunks by the same
+limit) is the same multiple. `all` is the extreme: one key of the reader can
+pull the dep's whole set.
 
 so on a mapped asset, `build_limit` is the number to set deliberately, and
 [`Hestan::max_instances`](concepts.md#the-ceiling) (1000 by default) is the
@@ -381,7 +381,7 @@ missing upstream key, for the same reason naming that key at a build is: a
 chunk that silently skipped it would report a backfill complete that was not.
 
 the range resolves against the asset's key set at the moment it is made and is
-then **fixed** — a daily set grows, and a backfill should build what it was
+then **fixed**: a daily set grows, and a backfill should build what it was
 asked for rather than whatever that range means tomorrow. `only_missing`
 (default true) drops the keys that are already materialized and fresh, which
 is what makes re-running a backfill after a partial failure cheap. a range
@@ -390,7 +390,7 @@ refused: "there was nothing to do" is a better record than a 400.
 
 it then launches **in chunks of `Partitions::build_limit`**, one run at a time:
 the first goes out immediately, and each next one starts as the previous
-finishes. that is the whole point — a 400-day range fired as a single run
+finishes. that is the whole point: a 400-day range fired as a single run
 would be 400 instances at somebody's api at once. each chunk is an ordinary
 build run of the `assets` job, so the run page, the gantt, cancel and the
 event log all work on it.
@@ -401,7 +401,7 @@ last one succeeded, `failed` when one failed (chunking stops there), and
 `canceled` when one was canceled or the backfill itself was. `launched` counts
 the keys handed to a run so far, against `total`.
 
-limits: **one backfill per asset at a time** — a second is a 409 — and no
+limits: **one backfill per asset at a time** (a second is a 409) and no
 cross-asset backfills; back one asset at a time. a backfill also respects the
 one-build-at-a-time gate: while any assets run is active the next chunk simply
 waits for the following tick, the same self-heal the probe path uses.
@@ -412,7 +412,7 @@ a probe fingerprint change marks **all** partitions of a descendant stale.
 that is not a special rule; it falls out of the ordinary one. each partition
 records the source's fingerprint at the moment it was built, and an
 unpartitioned dep is read whole, so when the source moves every key's
-recorded input disagrees at once. crude but honest — hestan cannot know which
+recorded input disagrees at once. crude but honest: hestan cannot know which
 days of your data an external change touched.
 
 ## Memoized builds
@@ -436,26 +436,26 @@ and the op downstream reads the file:
 let orders = Asset::new("orders", ..).io("parquet");
 ```
 
-so an asset of rows is stored once — as parquet, where the op run's handle
-already pointed — rather than as a file plus a json copy in the run log.
+so an asset of rows is stored once (as parquet, where the op run's handle
+already pointed) rather than as a file plus a json copy in the run log.
 `docs/io-managers.md` has the whole of it, including the one thing this changes
 about [retention](io-managers.md#the-run-an-assets-value-is-inside): a run that
 an asset's current value is inside is held back from the policy until something
 rebuilds the asset.
 
-a row written before any of this holds the value itself and still seeds — a
+a row written before any of this holds the value itself and still seeds: a
 manager hands back what it did not write, so nothing has to tell an old row
 from a new one and there is no migration.
 
 `Hestan::build_asset(name)` is the headless form, like `run_once`: it always
 materializes the target itself (plus stale ancestors), so check staleness
 first if you only want conditional builds. **the http endpoint and
-`hestan build <asset>` do not** — both go through the same conditional path
+`hestan build <asset>` do not**: both go through the same conditional path
 and answer `up_to_date` on a target that is already fresh.
 
 memoization is a property of the *plan*, not of the run: retrying an assets
 run (`POST /api/runs/{id}/retry`, or re-run in the ui) relaunches the whole
-job with the original params, not the recorded subset — a full rebuild of
+job with the original params, not the recorded subset: a full rebuild of
 every derived asset, staleness ignored. cheap enough for small graphs; for
 an expensive one, prefer the build endpoints, which re-plan from current
 staleness.
@@ -475,7 +475,7 @@ and each chunk a [backfill](#backfills) launches. anything that reaches the
 executor by the ordinary run path launches regardless: a manual
 `POST /api/jobs/assets/runs`, a retry of an earlier assets run, and
 `build_asset` in a headless process. those are the documented escape
-hatches, and they cost what they cost — concurrent rebuilds can interleave,
+hatches, and they cost what they cost: concurrent rebuilds can interleave,
 so their recorded lineage is only as coherent as the interleaving.
 
 ## Probes and auto
@@ -491,19 +491,19 @@ gathered into one combined plan and launched as a single build run (trigger
 launching only what staleness says is owed, on every tick, is the self-heal.
 a build that failed to launch, or was skipped because an assets run was
 already active, is retried on the next tick without waiting for the data to
-move again — the fingerprint commits before the launch, so nothing else
+move again: the fingerprint commits before the launch, so nothing else
 would ever re-trigger it. probes are pausable and tick-logged like any
 sensor.
 
 `.auto()` marks a derived asset to rebuild whenever a probe upstream makes
-it stale. auto without a probed source somewhere upstream never fires —
+it stale. auto without a probed source somewhere upstream never fires:
 nothing else re-evaluates staleness spontaneously. non-auto assets just show
 stale in the ui until someone builds them.
 
 ## When a build is recorded
 
 an asset is built when the op that built it succeeded, so that is when the
-row is written — in the same transaction as the op run's terminal row, after
+row is written, in the same transaction as the op run's terminal row, after
 the output has been handed to the [io manager](io-managers.md) and stored.
 the body computes what only the body can know (the fingerprint, the deps it
 consumed, the value, whatever `ctx.meta` staged) and stages it; the executor
@@ -515,7 +515,7 @@ the manager refuses leaves no materialization, and the asset stays stale and
 gets built again. a retry that succeeds records one entry, not one per
 attempt. that matters most for the manager: an op whose output was never
 stored used to leave a row saying the asset was current, and the next build
-believed it and skipped — the asset was missing and nothing was stale.
+believed it and skipped: the asset was missing and nothing was stale.
 
 an op that produces [several assets](#one-op-several-assets) writes all of
 its materializations or none of them. they are one fact about one op run, and
@@ -530,13 +530,13 @@ materialization stays at-least-once, the same policy (and the same reasoning)
 as [op state](state.md): a crash between the transaction committing and
 anything downstream reading it re-runs the build, and the rebuild appends a
 second entry rather than editing the first. the direction of the uncertainty
-is the part worth knowing — a build hestan lost the record of is rebuilt, and
+is the part worth knowing: a build hestan lost the record of is rebuilt, and
 a build hestan recorded is one whose op succeeded and whose value is stored.
 
 ## Materialization history
 
 `asset_materializations` is append-only: every build adds an entry, and the
-newest entry for an asset is its current state — what staleness compares
+newest entry for an asset is its current state: what staleness compares
 against, what a memoized build seeds, what `GET /api/assets` reports. nothing
 overwrites anything.
 
@@ -545,8 +545,8 @@ rebuilt hourly has an entry per hour; the ones where the *fingerprint moved*
 are the ones where the data actually changed. `GET /api/assets/{name}/history`
 carries `changed` on each entry for exactly that: true when its fingerprint
 differs from the entry before it in time, so a list of rebuilds reads as a
-list of changes. the oldest entry of all counts as changed — nothing to
-something — and a page's oldest entry is compared against the entry just off
+list of changes. the oldest entry of all counts as changed (nothing to
+something), and a page's oldest entry is compared against the entry just off
 the page, not reported as a change the window invented.
 
 source assets append only when their probe sees a new fingerprint (the probe
@@ -557,7 +557,7 @@ fingerprints is the record of work that found nothing new.
 history grows without bound, so it is capped rather than left to grow. at
 startup every asset is trimmed to its newest 200 entries;
 `Hestan::asset_history(n)` sets the number. the newest entry is never trimmed
-whatever `n` says — it is current state, and losing it would read as an asset
+whatever `n` says: it is current state, and losing it would read as an asset
 that has never been built. unlike a [retention policy](storage.md#retention)
 this happens whether you ask or not.
 
@@ -585,7 +585,7 @@ let rows_present = AssetCheck::new("rows_present", "orders_clean", |_ctx, value:
 Hestan::new().assets(..).check(rows_present).serve(..).await
 ```
 
-the fn is handed an owned `Value` — the asset's freshly materialized output —
+the fn is handed an owned `Value` (the asset's freshly materialized output)
 and returns a `CheckResult`: `pass()` or `fail(message)`, either with
 `.meta(name, value)` facts attached, the same
 [typed values](metadata.md) an op reports. naming an asset that is not
@@ -604,8 +604,8 @@ the dag, in the run's op list, and in the gantt like anything else.
 that also decides what a failure costs, which is the whole of the severity
 distinction:
 
-- **`Severity::Error`** (the default) — the check op fails, so the run fails.
-- **`Severity::Warn`** — the check op *succeeds* while the recorded result is
+- **`Severity::Error`** (the default): the check op fails, so the run fails.
+- **`Severity::Warn`**: the check op *succeeds* while the recorded result is
   `failed`. the run carries on and the failure is a fact in the check log
   rather than in the run status.
 
@@ -618,7 +618,7 @@ other way: **a failing error check does not un-materialize the asset.** the
 materialization was written with the asset's op, which succeeded; the check
 hangs off that op rather than feeding it, so downstream assets still see the
 value and still build. what a failing error check does is fail the run that
-produced it — loudly, in the run list, through the failure hooks. if you need
+produced it, loudly, in the run list, through the failure hooks. if you need
 bad data to not reach downstream, that belongs in the asset's own fn, where
 returning an error stops everything below it.
 
@@ -629,10 +629,10 @@ was fresh and got seeded rather than rebuilt does **not** get re-checked: it
 produced no new value this run, and its last recorded result still describes
 the value that is still current. that follows from checks being ops in the
 plan rather than a separate pass, and it means a build costs nothing for the
-parts it skipped — which is the entire point of memoized builds.
+parts it skipped, which is the entire point of memoized builds.
 
 the consequence to know: a check that was added, or fixed, after an asset last
-built does not run until that asset builds again — and the build endpoint will
+built does not run until that asset builds again, and the build endpoint will
 not do it, since it answers `up_to_date` on an asset nothing made stale. what
 forces one is `Hestan::build_asset(name)`, which always materializes its
 target; naming the keys outright on a partitioned asset, which skips the
@@ -645,7 +645,7 @@ results land in `asset_checks`, capped per check by the same
 the latest one. `GET /api/assets/{name}/checks` lists them newest first, and
 each asset in `GET /api/assets` carries
 `{"passed": n, "failed": n, "last_run_at": ts}` counted from the latest result
-per check name — zero and zero when nothing has ever recorded a result, which
+per check name: zero and zero when nothing has ever recorded a result, which
 reads the same whether no check is declared or none has run yet.
 
 a check whose *body* returns an error (rather than a `CheckResult`) records
@@ -675,7 +675,7 @@ unknown name.
 results, same clamps and same 404.
 
 metadata an asset op reports lands on its materialization too, so history
-carries what each build said — with [deltas](metadata.md#deltas) against the
+carries what each build said, with [deltas](metadata.md#deltas) against the
 build before it, and `GET /api/assets/{name}/metadata/{key}` for one numeric
 key across recent builds. see [metadata](metadata.md).
 

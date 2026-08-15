@@ -35,7 +35,7 @@ one evaluation: load the committed cursor → run the closure → launch every
 returned `RunRequest` with trigger `sensor` → commit the staged cursor only
 if all of that succeeded → record a tick.
 
-- the closure returns `Err` (or panics — caught, like ops): tick `error`,
+- the closure returns `Err` (or panics, caught like ops): tick `error`,
   cursor untouched, nothing launched.
 - a launch fails (unknown job included): tick `error` with the message.
   runs launched before the failure stay launched, and the tick's `launched`
@@ -62,8 +62,8 @@ RunRequest::new("publish").params(json!({"day": day})).key(day)
 ```
 
 a keyed request launches **at most once per key, ever, for that sensor**. the
-loop reads the key before launching and skips a claimed one — the tick counts
-it under `skipped` rather than `launched` — and the key itself is written in
+loop reads the key before launching and skips a claimed one (the tick counts
+it under `skipped` rather than `launched`), and the key itself is written in
 the same transaction that creates the run. that is the part that matters: a key
 recorded for a run that never launched would drop that work forever and nobody
 would ever notice, which is strictly worse than the duplicate a key exists to
@@ -73,7 +73,7 @@ not. a launch that fails leaves no key, so the next evaluation asks again.
 so a key turns at-least-once into **effectively-once per sensor**. per sensor:
 keys are scoped to the name that used them, two sensors may use the same string
 for different things, and nothing looks across them. a keyless request is
-unchanged — at-least-once, exactly as before — which is still the right default
+unchanged (at-least-once, exactly as before), which is still the right default
 for work that is naturally idempotent.
 
 pick a key that names the *work*, not the moment: the partition, the day, the
@@ -83,8 +83,8 @@ upstream run id, the file's mtime. `"2026-08-09"` is a key; `Utc::now()` is not.
 day for as long as the database exists.
 [retention](storage.md#retention) prunes them on the same age cutoff it prunes
 runs on, on every sweep rather than only at boot; without a policy they
-accumulate. that is deliberate — a key deleted
-early is a duplicate launch, so nothing throws one away by default.
+accumulate. that is deliberate: a key deleted early is a duplicate launch, so
+nothing throws one away by default.
 
 ## Timeouts and concurrency
 
@@ -92,13 +92,13 @@ due sensors evaluate **on tasks of their own**, at most 8 at a time. in
 sequence, one closure blocking on a dead endpoint delayed every sensor and
 every probe behind it, which is the failure mode where a fifteen-second
 sensor quietly becomes a fifteen-minute one. the bound is there because the
-alternative — every due entry at once — is how a hundred sensors become a
+alternative (every due entry at once) is how a hundred sensors become a
 hundred concurrent api calls.
 
 **two evaluations of the same sensor never overlap.** a sensor whose previous
 evaluation is still going is skipped for that turn, not queued behind it: a
 queued second evaluation could commit a cursor over a newer one, and a backlog
-of them is not what `every` asked for. the skip lands as a `skipped` tick —
+of them is not what `every` asked for. the skip lands as a `skipped` tick,
 once per stall, not once per turn, so a sensor wedged for an hour cannot bury
 every other sensor's history under its own.
 
@@ -111,7 +111,7 @@ error, and the staged cursor is not committed.
 abandoning is not stopping, and this is exactly the limit ops have. an `.await`
 inside the closure is where an abandoned evaluation actually goes away; a
 closure doing blocking work between await points cannot be dropped at all, so
-it keeps its thread until that work returns — and if it does return, late, what
+it keeps its thread until that work returns, and if it does return, late, what
 it returns still counts. nothing else can have run in the meantime, because the
 sensor was held. `ctx.is_cancelled()` is the cooperative half, true once the
 deadline has passed:
@@ -136,8 +136,8 @@ the gap doubles from its own interval to a 15 minute cap, with jitter, and the
 for an hour does not need polling every five seconds, and hammering it is how
 one broken sensor becomes a log flood and a rate-limit ban.
 
-the floor doubles along with the ceiling — a gap after three failures is
-somewhere in `[4×every, 8×every]`, never below — so the wait genuinely
+the floor doubles along with the ceiling (a gap after three failures is
+somewhere in `[4×every, 8×every]`, never below), so the wait genuinely
 lengthens rather than merely lengthening on average, and the jitter is there so
 a fleet of sensors watching the same dead endpoint does not come back in
 lockstep. a sensor whose interval is already past the cap is left alone: there
@@ -161,7 +161,7 @@ staleness proves stale is launched as one combined build run (trigger
 
 re-deriving from staleness on every tick is the probe's self-heal. the
 fingerprint commits before the launch, so once it is written nothing in the
-data will ask for that build again — the source would have to change a
+data will ask for that build again: the source would have to change a
 second time. a launch that failed, or that was skipped because an assets
 build was already active (builds are serialized; see [assets](assets.md)),
 is therefore picked up by the next tick instead of stranding the descendant
@@ -188,27 +188,27 @@ Hestan::new().run_sensor(
 ```
 
 it registers as `run:{name}` and is a **third source on the one sensor loop**,
-exactly as probes are a second — same interval handling, same pausing, same
+exactly as probes are a second: same interval handling, same pausing, same
 tick history, same cursor column, same endpoint. there is no second loop and
 no second set of concepts.
 
-the closure is handed a `RunSummary` — `id`, `job`, `status`, `trigger`,
-`started_at`, `finished_at`, `error` — and not the internal `Run`. what a chain
+the closure is handed a `RunSummary` (`id`, `job`, `status`, `trigger`,
+`started_at`, `finished_at`, `error`) and not the internal `Run`. what a chain
 needs to decide is which run it was and how it went, not the params blob or the
 resume chain, and a small public struct is a promise that can be kept.
 
 ### Its cursor
 
 the cursor is the last terminal run it read, as `{"finished_at", "id"}`. each
-evaluation reads terminal runs after that pair — ordered by finish time then
+evaluation reads terminal runs after that pair (ordered by finish time then
 id, so two runs finishing in the same instant can neither be skipped nor seen
-twice — calls the closure once per run that matches the status filter, launches
+twice), calls the closure once per run that matches the status filter, launches
 what comes back, and commits the cursor **only after every launch succeeded**.
 
 that is the same at-least-once contract a user sensor has, and it has the same
 consequence: a launch that fails halfway leaves the cursor where it was, so the
 runs already handled are handed over again on the next tick. downstream work
-should tolerate a duplicate request — or the chain should give each request a
+should tolerate a duplicate request, or the chain should give each request a
 [run key](#run-keys), and `.key(run.id)` is the obvious one here.
 
 the cursor covers every run *read*, not every run matched, so a filtered-out
@@ -229,7 +229,7 @@ thing to want.
 
 what makes it safe is the filter. `for_job` restricts what it watches, the
 status list restricts which outcomes count, and the closure can look at what it
-was handed — `run.trigger != Trigger::Manual`, say — and return no requests.
+was handed (`run.trigger != Trigger::Manual`, say) and return no requests.
 one of those has to break the cycle.
 
 ## Pausing, ticks, sync
@@ -242,7 +242,7 @@ at the next interval rather than with a burst of catch-ups.
 
 **the flag fails closed.** a read of it that fails counts as paused, and the
 turn is held. it used to count as running, which is an administrative stop
-failing open — the one direction it must not fail in. a turn not taken is
+failing open, the one direction it must not fail in. a turn not taken is
 recoverable; a launch nobody asked for is not. schedules do the same with
 theirs ([scheduling](scheduling.md#pause-and-resume)). launching itself is
 deliberately still at-least-once: this is about the switch, not about making
@@ -251,7 +251,7 @@ firing stricter.
 every evaluation of an unpaused sensor lands in `sensor_ticks`: outcome
 (`fired | error | skipped`), how many runs launched, how many keyed requests
 were skipped, how long it took in milliseconds, the error message if any.
-those four are what answer "is this sensor healthy" without reading the log —
+those four are what answer "is this sensor healthy" without reading the log:
 a sensor whose duration is climbing is a sensor about to hit its timeout, and
 `launched: 0, skipped: 3` is a different fact from launching nothing. the
 sensors table shows them all against each sensor's last tick.
@@ -262,9 +262,9 @@ every pass, the same policy as schedule ticks.
 at startup the sensors table is synced to the code like schedules are: new
 names inserted, undeclared rows dropped, surviving rows keeping their paused
 flag and cursor across restarts. renaming a sensor is not a rename to the
-store — it is a new row, and the old cursor goes with the old name.
+store: it is a new row, and the old cursor goes with the old name.
 
 `GET /api/sensors` lists each sensor with its interval, paused flag, cursor,
-filter and last tick — shapes in [http api](http-api.md), tables in
+filter and last tick; shapes in [http api](http-api.md), tables in
 [storage](storage.md). the ui's sensors table shows all three kinds together,
 which is the point of them being one thing.

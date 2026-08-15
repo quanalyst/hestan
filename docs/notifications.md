@@ -1,7 +1,7 @@
 # Notifications
 
 `on_run_finished` registers a hook that runs whenever a run reaches a terminal
-status — succeeded, failed or canceled alike:
+status (succeeded, failed or canceled alike):
 
 ```rust
 Hestan::new()
@@ -11,7 +11,7 @@ Hestan::new()
     .await
 ```
 
-call it as many times as you like — every registered hook fires, each on
+call it as many times as you like: every registered hook fires, each on
 tokio's blocking pool, so a hook may block outright (sleep, sync http, a
 database write) without stalling the executor or other runs, and a panicking
 one is caught and logged as a warning without touching the others. driving
@@ -32,15 +32,15 @@ one is caught and logged as a warning without touching the others. driving
 | `error` | that op's final error message |
 | `started_at` | when it began executing; `None` for a run that never got that far |
 | `finished_at` | when it went terminal |
-| `duration` | how long it **executed** for, which is not how long it existed for — a run held on the queue by a limit was not running while it waited |
+| `duration` | how long it **executed** for, which is not how long it existed for; a run held on the queue by a limit was not running while it waited |
 
 `failed_op` is the first terminal failure; with parallel branches other ops
 may have failed after it, and their errors are in the run's op runs and
 events, queryable by `run_id`.
 
 the run row itself carries the same thing: `run.error` is
-`op {failed_op} failed: {error}`, so an alert that only ever sees a run —
-from `GET /api/runs/{id}`, or straight out of the store — is not left
+`op {failed_op} failed: {error}`, so an alert that only ever sees a run
+(from `GET /api/runs/{id}`, or straight out of the store) is not left
 guessing why it failed.
 
 ## OpEvent
@@ -67,7 +67,7 @@ per attempt rather than per op, because an op that failed twice and worked on
 the third try is three facts and only the hook knows which of them it wanted.
 a hook that only cares about the end filters on `status`; one watching for
 flakiness wants exactly the ones a per-op event would have hidden. the timing
-is the attempt's own — `op_runs.started_at` keeps the *first* attempt's, since
+is the attempt's own; `op_runs.started_at` keeps the *first* attempt's, since
 that is what "when did this op start" means on a page.
 
 an op skipped by its [trigger rule](concepts.md), or canceled before it was
@@ -100,15 +100,15 @@ is not going anywhere:
 Hestan::new().on_failure(|f: RunFailure| eprintln!("{} failed at {:?}", f.job, f.failed_op))
 ```
 
-it receives a `RunFailure` — `run_id`, `job`, `trigger`, `failed_op`, `error`,
-`finished_at` — which is what it always received. it is the same dispatch with
+it receives a `RunFailure` (`run_id`, `job`, `trigger`, `failed_op`, `error`,
+`finished_at`), which is what it always received. it is the same dispatch with
 a filter on it rather than a mechanism beside it, so there is one place an
 event can go missing from rather than two.
 
 ## When nothing fires
 
-two deliberate gaps. the startup sweep — the boot-time pass that marks runs a
-dead process left behind as failed — writes straight to the database without
+two deliberate gaps. the startup sweep (the boot-time pass that marks runs a
+dead process left behind as failed) writes straight to the database without
 touching the executor, so a restart after a crash does not replay a morning of
 old failures into your alert channel. and a run canceled before it started
 never executed, so nothing reports on it; cancel a *running* run and its hooks
@@ -137,8 +137,8 @@ Hestan::new()
 | `late_by` | how far past the policy's deadline, at the crossing |
 | `last_success` | the success the deadline was measured from |
 
-the dispatch is the same one the others use — one blocking task per hook,
-panics caught and logged — and the difference that matters is *when*: a run
+the dispatch is the same one the others use (one blocking task per hook,
+panics caught and logged), and the difference that matters is *when*: a run
 finishing is an event, so every one of them fires, while lateness is a state,
 so only the **crossing** fires. something late for a week alerts once, across
 restarts, and going fresh again re-arms the next one. [freshness](freshness.md)
@@ -174,7 +174,7 @@ reading.
 which event a helper is built for is inferred from the hook it is handed to;
 the trait behind that is `notify::Alert`, and implementing it on your own type
 is not a thing this crate needs you to do. they share one reqwest client with
-a 10s timeout that does not follow redirects — following one would replay the
+a 10s timeout that does not follow redirects: following one would replay the
 POST as a bodyless GET at whatever the `Location` header said.
 
 delivery is best-effort unless you ask for otherwise: a non-2xx response (3xx
@@ -186,7 +186,7 @@ is the next section.
 a hook is a `spawn_blocking` call. if the post fails the alert is gone; if the
 process dies between the run finishing and the hook running, the alert was
 never sent and nothing anywhere records that it should have been. for a hook
-whose job is to tell a human, that is the failure mode that matters — the
+whose job is to tell a human, that is the failure mode that matters: the
 outage that kills the process is exactly the one you wanted to hear about.
 
 ```rust
@@ -208,8 +208,8 @@ by the [lease reclaimer](scaling.md) is written the same way, in the
 transaction that fails it.
 
 a delivery loop then takes what is due, hands it to the hooks, and marks it
-delivered. it belongs to the process that [decides](scaling.md) — `Role::All`
-or `Role::Scheduler` — so register the hooks there; two processes delivering
+delivered. it belongs to the process that [decides](scaling.md) (`Role::All`
+or `Role::Scheduler`), so register the hooks there; two processes delivering
 would send every alert twice. `run_once` and `build_asset` deliver once before
 they return, since nothing else in that process will.
 
@@ -218,7 +218,7 @@ they return, since nothing else in that process will.
 **a hook can see the same event twice, and must tolerate it.** a crash between
 a hook returning and the row being marked delivered re-delivers on the next
 pass, because the alternative is marking first and losing the delivery
-instead — and of those two, a receiver seeing an alert twice is the one you
+instead. of those two, a receiver seeing an alert twice is the one you
 can do something about. key on `run_id` if it matters. exactly-once needs the
 receiver's cooperation and hestan will not pretend otherwise.
 
@@ -229,7 +229,7 @@ surprises people.
 ### Retry and giving up
 
 a hook that panics is a failed delivery. it retries on the same capped
-exponential backoff with full jitter that op retries use — 10s, doubling —
+exponential backoff with full jitter that op retries use (10s, doubling)
 for **eight attempts**, which is seven gaps and so at most about twenty
 minutes, and nearer ten once the jitter is counted: long enough to cover a
 restart of whatever is on the other end, not long enough to keep trying a url

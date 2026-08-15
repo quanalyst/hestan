@@ -17,7 +17,7 @@ this is **late**, and that is worth waking someone for.
 
 ## Fresh, late, never
 
-the verdict is computed at read time — nothing caches it — from the latest
+the verdict is computed at read time (nothing caches it) from the latest
 success:
 
 | status | when |
@@ -32,7 +32,7 @@ either way. for an **asset** it is the most recent materialization, which is
 what a build records.
 
 `never` is deliberately not late. a policy caps how old a success may get, and
-something with no success has no age to measure — reporting "infinitely late"
+something with no success has no age to measure. reporting "infinitely late"
 would be a number nobody can act on. a job that has never run and should have
 is exactly what the [cron-derived `overdue` heuristic](scheduling.md#overdue-and-interval_secs)
 already covers.
@@ -44,7 +44,7 @@ key: the asset is late as soon as **any one key** is, and `late_by` is the
 worst key's. the deadline is therefore measured from the *oldest* key's build
 time.
 
-keys that have never been built are skipped rather than counted late — a key
+keys that have never been built are skipped rather than counted late: a key
 with no build has no age either, and the `missing` count on the asset summary
 already says so. an asset with no key built at all is `never`.
 
@@ -55,7 +55,7 @@ hasn't succeeded since its last fire is behind. `fresh_within` states the same
 thing outright, in the units you actually care about.
 
 so a declared policy **replaces** the heuristic. `GET /api/jobs` keeps both
-fields, and once `freshness` is non-null, `overdue` is always `false` — two
+fields, and once `freshness` is non-null, `overdue` is always `false`: two
 answers to "is this job behind" is one answer too many. jobs that declare no
 policy keep the heuristic exactly as it was, and it needs a schedule to say
 anything at all.
@@ -90,7 +90,7 @@ Hestan::new()
 it fires **once per crossing**, not once per poll: a job late for a week pages
 once, not every minute. the last-notified state lives in the database
 (`freshness_state`), so a restart does not re-announce a crossing it already
-announced. going fresh again is not an alert — it clears the row, so the next
+announced. going fresh again is not an alert: it clears the row, so the next
 relapse is news again.
 
 hooks are dispatched exactly like [`on_failure`](notifications.md): each on
@@ -117,6 +117,6 @@ reads.
 - `GET /api/jobs` and `GET /api/assets`: `freshness: {status, late_by_secs,
   last_success}`, `null` when nothing was declared.
 - `GET /api/late`: everything currently late, in the same shape `on_late`
-  hands its hooks — jobs first, then assets, each by name.
+  hands its hooks (jobs first, then assets, each by name).
 - the ui tags late jobs and late assets with `late` (beside `overdue`, which
   is a different claim), and the jobs overview statline counts them.

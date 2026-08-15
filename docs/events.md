@@ -6,7 +6,7 @@ until v17 it could not answer that, and the reason was structural rather than
 cosmetic: `events.run_id` was `NOT NULL`, so **an event could only ever be
 about a run**. an asset materialized, a schedule that fired, a sensor tick, a
 backfill's progress, an alert that never got through, a lease reclaimed from a
-dead worker — each of those happened in a table of its own and reached no
+dead worker: each of those happened in a table of its own and reached no
 stream at all. you could ask a run what it did. you could not ask the
 deployment.
 
@@ -38,13 +38,13 @@ the same one in the ui.
   `run`, `job`, `asset`, `schedule`, `sensor`, `backfill`, `system`.
 - **`run_id`** is set on a run event and null on everything else. a schedule
   fire that launched a run puts that run in its *payload* rather than in this
-  column, because the event is about the schedule — this column is what makes
+  column, because the event is about the schedule. this column is what makes
   a run's page exactly the run's own log and nothing else.
 - **`subject` is null on a run event.** the run is `run_id`, which was already
   there and already indexed; v17 deliberately did not copy it into `subject`,
   because doing so is a full rewrite of the largest table in the database to
-  store a second copy of a column. `Event::about()` in rust — and
-  `ev.subject ?? ev.run_id` in the ui — is where the two become one answer, and
+  store a second copy of a column. `Event::about()` in rust (and
+  `ev.subject ?? ev.run_id` in the ui) is where the two become one answer, and
   the api's `subject=` filter matches either.
 - **`op`** is set on the run events that belong to one op.
 - **`level`** is `info`, `warn` or `error`, and it is not the same claim as the
@@ -53,7 +53,7 @@ the same one in the ui.
 - **`actor`** is who caused it, on the events a person caused and something
   [checked who they were](auth.md): a launch, a cancel, a pause, a backfill.
   it is the identity's **name** and never a credential, and it is null on
-  everything a loop did on its own — and on everything at all in a deployment
+  everything a loop did on its own, and on everything at all in a deployment
   with no authenticator, which has nobody to name. an empty name is not
   "system".
 
@@ -63,16 +63,16 @@ an event is a claim that something happened. if it is written *next to* the
 thing rather than *with* it, then a crash in the gap produces one of two lies:
 a log that says a thing happened which did not, or a thing that happened and
 left no record. so every event added in v17 is written by the subsystem that
-does the work, in the same transaction as the row that is the work — the same
+does the work, in the same transaction as the row that is the work, the same
 rule phase 21 applied to a run's terminal notification.
 
 | what | transaction it joins | atomic |
 | --- | --- | --- |
 | `run_queued` | the `runs` insert | yes |
-| `run_success` / `run_failed` / `run_canceled` | — | **no**, see below |
+| `run_success` / `run_failed` / `run_canceled` | none | **no**, see below |
 | `run_reclaimed` | the reclaim's status change | yes |
-| `op_*`, `type_check_failed`, `log` | — | **no**, see below |
-| `asset_materialized` | the `asset_materializations` insert — which, for a build, is the op's terminal write | yes |
+| `op_*`, `type_check_failed`, `log` | none | **no**, see below |
+| `asset_materialized` | the `asset_materializations` insert, which for a build is the op's terminal write | yes |
 | `check_passed` / `check_failed` | the `asset_checks` insert | yes |
 | `schedule_*` | the `schedule_ticks` insert | yes |
 | `sensor_tick` | the `sensor_ticks` insert | yes |
@@ -100,8 +100,8 @@ explanation, which is the worse of the two.
 
 **a fired schedule's run and its tick are two transactions.** the launch
 commits first, then the tick and its `schedule_fired` event. a crash between
-them leaves a run that is queued and will execute, with no tick and no event —
-recoverable, and visible as a run whose trigger is `schedule`. the other
+them leaves a run that is queued and will execute, with no tick and no event,
+recoverable and visible as a run whose trigger is `schedule`. the other
 direction, an event claiming a run that was never created, cannot happen. the
 same applies to `backfill_chunk`.
 
@@ -125,7 +125,7 @@ be `null` or absent.
 | `run_success` | info | `job`, `status`, `error` (null), `failed_op` (null), `duration_secs` |
 | `run_failed` | error | `job`, `status`, `error`, `failed_op`, `duration_secs` |
 | `run_canceled` | warn | `job`, `status`, `error` (optional), `failed_op` (optional), `duration_secs` |
-| `run_reclaimed` | warn | `claimer` — the instance that stopped renewing — and `policy`, `fail` or `requeue` |
+| `run_reclaimed` | warn | `claimer` (the instance that stopped renewing) and `policy`, `fail` or `requeue` |
 
 a reclaimed run under `fail` gets `run_reclaimed` **and then** `run_failed`:
 the first says why, the second says what the run did. under `requeue` it gets
@@ -138,7 +138,7 @@ all carry `run_id` and `op`.
 | kind | level | payload |
 | --- | --- | --- |
 | `op_started` | info | `attempt` |
-| `op_expanded` | info | `instances`, `over` — the dep the fan-out mapped |
+| `op_expanded` | info | `instances`, `over` (the dep the fan-out mapped) |
 | `op_success` | info | `attempt`, `output_type` (optional), `meta` (optional) |
 | `op_retry` | error | `attempt`, `error` |
 | `op_failed` | error | `attempt`, `error` |
@@ -148,7 +148,7 @@ all carry `run_id` and `op`.
 | `log` | as emitted | whatever `ctx.info`/`warn`/`error` attached, usually null |
 
 `meta` on `op_success` is [the tagged map](metadata.md) the attempt reported
-with `ctx.meta`, exactly as the op run carries it — so a consumer following the
+with `ctx.meta`, exactly as the op run carries it, so a consumer following the
 log alone sees the row counts and the byte sizes without fetching the op run.
 
 `stopped` on `op_canceled` is the one that matters: `true` means the work
@@ -198,7 +198,7 @@ whose [run key](sensors.md) was already claimed, which is a different fact from
 launching nothing.
 
 **a tick that did nothing gets no event.** every evaluation is still a row in
-`sensor_ticks` and the [sensors page](web-ui.md) still reads all of them — that
+`sensor_ticks` and the [sensors page](web-ui.md) still reads all of them: that
 is the sensor's health record. but a sensor polling every five seconds is
 seventeen thousand evaluations a day, and an activity log in which those are
 99% of the rows is one you cannot read anything else out of. so the log gets
@@ -213,9 +213,9 @@ failed.
 | `sensor_paused` | info | `paused` |
 
 one kind for both directions: `paused: false` is a resume. `subject` is the job
-for a schedule and the sensor's name for a sensor, and `actor` is whoever asked
-— a paused schedule outlives whoever paused it, which is exactly why the log
-says who.
+for a schedule and the sensor's name for a sensor, and `actor` is whoever
+asked: a paused schedule outlives whoever paused it, which is exactly why the
+log says who.
 
 ### Backfills
 
@@ -246,8 +246,8 @@ retries before that are the mechanism working, and one event apiece would bury
 the one that matters.
 
 `retention_pruned` is written only when a sweep actually deleted something, in
-the transaction that deleted it. the other caps — the two tick logs,
-materialization history, delivered notifications, and the event log's own — are
+the transaction that deleted it. the other caps (the two tick logs,
+materialization history, delivered notifications, and the event log's own) are
 size limits rather than policy and write no event.
 
 ## Schema version
@@ -266,7 +266,7 @@ while hestan is 0.x, that number promises this:
 
 so: **read the keys you know and ignore the rest.** a consumer written that way
 survives the whole of 0.x. one that matches exhaustively on `kind` does not,
-which is why hestan's own reader does not either — an unrecognised kind reads
+which is why hestan's own reader does not either: an unrecognised kind reads
 as `EventKind::Unknown("…")` carrying the stored word, rather than failing the
 query and taking the rest of the page with it. the same is true of
 `subject_kind`.
@@ -289,7 +289,7 @@ every filter composes, and every one is optional:
 | `kind` | one kind, exactly |
 | `subject_kind` | one of `run`, `job`, `asset`, `schedule`, `sensor`, `backfill`, `system` |
 | `subject` | one subject; on a run event this matches the run id |
-| `level` | that level exactly — three levels, and "show me the errors" is what anyone types |
+| `level` | that level exactly; three levels, and "show me the errors" is what anyone types |
 | `since`, `until` | rfc3339; `since` is inclusive, `until` exclusive |
 | `before` | seq, exclusive: the cursor for the next page back |
 | `limit` | default 100, max 1000 |
@@ -297,7 +297,7 @@ every filter composes, and every one is optional:
 pages go backwards: take the `seq` of the last row you got and pass it as
 `before`. an unfiltered first page plus `before` walks the whole log without
 skipping or repeating, because nothing is ever inserted below a seq that has
-already committed — see the next section for the one exception, at the very top
+already committed; see the next section for the one exception, at the very top
 of the log.
 
 a run's own log is still `GET /api/runs/{id}/events`, oldest first from a
@@ -323,7 +323,7 @@ this is the one thing worth understanding before you write a consumer.
 
 both backends allocate `seq` when the row is inserted, not when its transaction
 commits. so a writer that has taken seq 5 and not yet committed is invisible
-while a writer that took 6 and did commit is not — and a follower that takes
+while a writer that took 6 and did commit is not, and a follower that takes
 everything it can see and moves its cursor to 6 will **never come back for 5**.
 that is a real bug, it is silent, and it is the classic one for anything that
 tails an autoincrementing column.
@@ -338,7 +338,7 @@ hestan does not skip, and how it avoids it differs by backend:
   order, so the stream delivers only the **unbroken run** above its cursor. a
   missing seq stops it: that seq is either a transaction still committing or
   one that aborted, and nothing outside the database can tell those apart. so
-  it waits on the hole for **two seconds** and steps over it after that — which
+  it waits on the hole for **two seconds** and steps over it after that, which
   is the one assumption in the whole mechanism, and here it is: *a transaction
   that appends an event and takes longer than two seconds to commit may be
   skipped*. hestan's are a handful of statements each. a hole left by a
@@ -348,7 +348,7 @@ hestan does not skip, and how it avoids it differs by backend:
 `GET /api/events` has the same exposure at the very top of the log and does
 *not* apply the rule: a page of the past is exact, and the newest page on
 postgres may be missing a row that is committing as you read it. it will be
-there on the next call, at a seq below the one you already have — which is why
+there on the next call, at a seq below the one you already have, which is why
 the stream exists, and why paging forward on `before` is not how you follow a
 log.
 
@@ -380,8 +380,8 @@ under.
 ## In the ui
 
 **Activity** is the whole log, one row per event, newest first: what it was
-about, what happened, and when. the filters are the api's — subject kind,
-level, and a find box over the message and the subject — and the feed follows
+about, what happened, and when. the filters are the api's (subject kind,
+level, and a find box over the message and the subject), and the feed follows
 the stream, so a run that starts while you are looking at it appears at the
 top.
 
@@ -394,7 +394,7 @@ hestan could not previously answer at all.
 
 a run is already a causal tree: a run, its ops, an attempt each, and for an
 [isolated op](isolation.md) a subprocess under that. that is what a distributed
-trace is, and the optional `otel` feature emits it as one — so a pipeline shows
+trace is, and the optional `otel` feature emits it as one, so a pipeline shows
 up in Grafana or Jaeger beside the services it calls, rather than in a tab of
 its own.
 
@@ -406,7 +406,7 @@ hestan = { version = "0.1", features = ["otel"] }
 no environment variable of its own. it opens `tracing` spans with the right
 shape and the right fields; the host composes
 [`tracing-opentelemetry`](https://docs.rs/tracing-opentelemetry) into the
-subscriber it was going to build anyway — the same arrangement the
+subscriber it was going to build anyway, the same arrangement the
 [capture layer](logs.md) uses, and for the same reason.
 
 ```rust
@@ -424,7 +424,7 @@ tracing_subscriber::registry()
 | --- | --- |
 | a run | `hestan.run`, the root, with `run_id`, `job`, `trigger` |
 | one attempt of an op | `hestan.op` beneath it, with `run_id`, `op`, `attempt` |
-| a retry | another `hestan.op` with the next `attempt` — its own span, not an annotation on the first |
+| a retry | another `hestan.op` with the next `attempt`: its own span, not an annotation on the first |
 | an event | a span event: on the attempt's span for anything the op body said, on the run's for hestan's own narration |
 
 the span fields are exactly the ones the capture layer reads, because they are
@@ -436,8 +436,8 @@ log is mirrored under, so nothing is stored twice.
 
 an isolated op runs in a subprocess, and a subprocess is where every other
 orchestrator's trace stops. hestan hands the child its parent attempt's
-[w3c trace context](https://www.w3.org/TR/trace-context/) in the environment —
-`traceparent`, and `tracestate` if there is one — and the child parents its own
+[w3c trace context](https://www.w3.org/TR/trace-context/) in the environment
+(`traceparent`, and `tracestate` if there is one), and the child parents its own
 `hestan.op` span to it. so spans the child's code opens nest under the op that
 spawned them, in the same trace, across the fork.
 
@@ -465,7 +465,7 @@ does not own to do it would be a library taking over an application's
 telemetry, which is the thing this whole design refuses.
 
 **a context is only carried when there is one.** with the feature on and no
-layer composed, `carry` produces nothing and the child is handed nothing —
+layer composed, `carry` produces nothing and the child is handed nothing,
 rather than a synthesised trace id that leads nowhere.
 
 **nothing outside a run is traced.** a schedule firing, a sensor evaluating, a
@@ -485,7 +485,7 @@ were.
 
 everything v17 added belongs to no run and so belongs to no run's retention
 either. those events are capped instead at the newest **50,000**, swept by the
-same loop, unconditionally — an asset built every five minutes writes a row
+same loop, unconditionally: an asset built every five minutes writes a row
 here forever otherwise. the cap is not configurable today; it is a size limit
 on a table that grows with time rather than with the history anybody asked to
 keep.

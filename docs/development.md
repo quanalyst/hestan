@@ -47,7 +47,7 @@ tests/          pipeline.rs, assets.rs, isolation.rs, queue.rs, auth.rs,
 
 `just check` runs the gates ci runs. `http`, `capture`, `postgres`, `otel`,
 `cli`, `parquet` and `dbt` each compile real extra code, and all but
-`postgres` gate a test target of their own via `required-features` —
+`postgres` gate a test target of their own via `required-features`;
 postgres's extra coverage is the second half of the store suite instead. the
 crate has to be clean without any of them as well as with them, so nine
 configurations are checked rather than one:
@@ -74,8 +74,8 @@ cargo test --features dbt
 cargo test --all-features
 ```
 
-ci additionally runs the ui's own gates — `npm run lint`, `npm test` and
-`npm run build` — and fails on a `ui/dist` diff, so a stale committed bundle
+ci additionally runs the ui's own gates (`npm run lint`, `npm test` and
+`npm run build`) and fails on a `ui/dist` diff, so a stale committed bundle
 can't ship. two things it does that `just check` cannot: it sets
 `HESTAN_TEST_PG`, so the postgres half of the store suite actually runs
 (`just check-pg` is the local equivalent), and it compiles the whole thing on
@@ -91,13 +91,13 @@ assets example on :4002), `just http-source`, `just ui-dev` (vite dev server),
 ## The ui loop
 
 `cd ui && npm run dev` starts vite on its own port with `/api` proxied to
-`localhost:4000` — run `just demo` alongside and edit with hot reload. the
+`localhost:4000`. run `just demo` alongside and edit with hot reload. the
 production bundle is a separate step: `npm run build` (that's `tsc -b` then
 `vite build`) regenerates `ui/dist`, which is committed so cargo users never
 need node.
 
 the bundle is embedded at compile time via `include_dir!` in `src/server.rs`,
-and cargo does not track the embedded files — after rebuilding the ui,
+and cargo does not track the embedded files: after rebuilding the ui,
 `src/server.rs` has to be touched so the next `cargo build` re-embeds it.
 `just ui-build` does both:
 
@@ -110,7 +110,7 @@ skipping the touch serves the stale bundle. it looks exactly like your ui
 change not working.
 
 `ui/dist` is committed, so rebuild it in the same commit as any `ui/src`
-change — ci fails on a `ui/dist` diff.
+change; ci fails on a `ui/dist` diff.
 
 ## The store suite runs twice
 
@@ -122,7 +122,7 @@ HESTAN_TEST_PG=postgres://user:pw@localhost/hestan_test cargo test --features po
 ```
 
 unset, the postgres half skips itself and the suite passes on a machine with
-no postgres — which is what keeps it from being something only ci runs. each
+no postgres, which is what keeps it from being something only ci runs. each
 case gets a schema of its own on that server, dropped with the fixture, so
 they run in parallel and none of them can see another's rows.
 
@@ -130,7 +130,7 @@ it is one suite run twice rather than two suites, and that is the whole
 verification strategy for the second backend. a second set of cases is exactly
 how two backends come to disagree: the case nobody copied across is the one
 nobody misses. so when you add a store method, put its case in `both(...)`
-with the rest — the point at which a query has never been run against postgres
+with the rest: the point at which a query has never been run against postgres
 is the point at which nobody knows whether it works.
 
 `tests/queue.rs` does the same at the other end of the scale: its three cases
@@ -142,8 +142,8 @@ worker processes racing one queue either way.
 migrations live in `src/store.rs` and run forward from `PRAGMA user_version`
 on every open. **this is the sqlite chain**; a postgres database is created
 whole at the current version by `src/pg.rs`, so a new step means editing that
-schema as well. to add the next one — call it vN, one past whatever
-`SCHEMA_VERSION` says today:
+schema as well. to add the next one (call it vN, one past whatever
+`SCHEMA_VERSION` says today):
 
 1. write a `SCHEMA_VN` const with the DDL (`ALTER TABLE` / `CREATE TABLE`,
    the same style as the one below it).
@@ -157,20 +157,20 @@ schema as well. to add the next one — call it vN, one past whatever
    tables/columns work, then reopen to prove the migration doesn't run twice.
 
 keep the v0 quirk in mind: version 0 plus an existing `runs` table means a
-pre-versioning database and is stamped v1 before migrating — don't reuse
+pre-versioning database and is stamped v1 before migrating. don't reuse
 version 0 for anything.
 
 ## Tests
 
-unit tests sit at the bottom of the module they exercise — most modules have
+unit tests sit at the bottom of the module they exercise. most modules have
 some, and these are the ones worth knowing about: `graph.rs` (ordering,
 cycles), `job.rs` (graph flattening: prefixes, wiring, nesting, rejected
 shapes), `schedule.rs` (cron normalization, dow remap, windows), `op.rs` (the
 metadata tags, which are a wire format, and the delta arithmetic),
 `auth.rs` (every spelling of loopback, and what each role may), `store.rs`
-(lifecycle roundtrips, migrations, sweep, claims under real contention —
+(lifecycle roundtrips, migrations, sweep, claims under real contention;
 [twice](#the-store-suite-runs-twice)), `server.rs` (handlers called directly
-with axum extractors — no live server needed, and the two scrapers that hold
+with axum extractors, no live server needed, and the two scrapers that hold
 `docs/auth.md` and `docs/http-api.md` to the router), `io.rs` (both bundled
 managers, and the parquet round trip value for value), `dbt.rs` (the manifest
 parse and the asset graph, against the committed fixture), `app.rs` (the third
@@ -185,7 +185,7 @@ http retry policy, fan-out, and `bearer_env`; `tests/notify.rs` does the
 same for the webhook and slack hooks. both only exist under
 `--features http`.
 
-`tests/parquet.rs` is the parquet manager where a unit test cannot put it —
+`tests/parquet.rs` is the parquet manager where a unit test cannot put it:
 between two ops of a run, across a resume, and under a retention sweep.
 `tests/dbt.rs` builds the fixture project's models as assets with a shell
 script standing in for dbt, because **dbt is not installed here and must not
@@ -193,7 +193,7 @@ need to be**: everything on hestan's side of that boundary is asserted, and
 nothing pretends to test that dbt builds a warehouse. both need their feature.
 
 `tests/otel.rs` is the span tree a run opens, against a real subscriber, and it
-is a binary of its own for the same reason `tests/capture.rs` is one — see
+is a binary of its own for the same reason `tests/capture.rs` is one; see
 below. it asserts the shape (`hestan.run`, an `hestan.op` per attempt beneath
 it, events on the span they belong to) and exports nothing: turning that tree
 into otel spans is `tracing-opentelemetry`'s job.
@@ -229,6 +229,6 @@ the ui has suites of its own under `ui/test/`, run with `npm test` (or
 the injection cases asserted against the exact string react renders, the
 metadata row, the run page's log merge, the activity feed's merge and filters,
 the backfill range arithmetic, the catalog's grouping and filters, the lineage
-walk, and what each role may see. they
-need no test framework and no browser — vite bundles them for node with the
-same config the app is built with, and `node:test` runs them.
+walk, and what each role may see. they need no test framework and no browser:
+vite bundles them for node with the same config the app is built with, and
+`node:test` runs them.

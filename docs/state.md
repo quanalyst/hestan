@@ -8,7 +8,7 @@ what is new instead of re-pulling history.
 
 state is one json value per `(job, op)` pair, keyed by name rather than by
 run, so it survives restarts and outlives any particular run. it is not an
-inter-op channel: an op sees its own state only, never another op's — pass
+inter-op channel: an op sees its own state only, never another op's. pass
 data between ops through outputs and `.after`.
 
 ## Reading and staging
@@ -25,13 +25,13 @@ Op::new("pull", |ctx| async move {
 
 `state()` is loaded once per op execution, before the first attempt: retries
 within one run all see the same starting value. `state_as::<T>()`
-deserializes it — `Ok(None)` when the op has never committed state,
+deserializes it: `Ok(None)` when the op has never committed state,
 `InputError::Mismatch` when the stored value no longer fits `T` (say, after
 you changed the type; clear the row or handle both shapes).
 
 `set_state` stages the value in a buffer that lives for one attempt; the
 last call wins. the executor commits it only when the attempt succeeds. a
-failed attempt's staged value is dropped entirely — attempt 2, and the next
+failed attempt's staged value is dropped entirely: attempt 2, and the next
 run, still read the old watermark. succeeding without calling `set_state`
 leaves existing state untouched.
 
@@ -41,7 +41,7 @@ on success the executor writes the op's result row first and the state
 second, in that order deliberately. a crash between the two leaves a
 recorded success with the *old* watermark, so the next run re-fetches that
 window. the reverse order would advance the watermark past work whose
-success was never recorded — rows silently skipped. hestan picks re-do over
+success was never recorded: rows silently skipped. hestan picks re-do over
 skip: a state-driven op sees each window at least once, so whatever it
 writes downstream should be idempotent within a window (upserts keyed on id,
 not blind appends).
@@ -77,5 +77,5 @@ was committed and the next run repeats the same window.
 ```
 
 404 for an unknown job; a known job whose ops never committed anything gets
-an empty list. rows live in the `op_state` table — see
+an empty list. rows live in the `op_state` table. see
 [storage](storage.md).

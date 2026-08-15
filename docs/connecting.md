@@ -1,7 +1,7 @@
 # Connecting to your data
 
 an op is an async fn in your binary. connecting to postgres, snowflake, s3 or
-somebody's rest api is `cargo add` and then whatever that crate's client does —
+somebody's rest api is `cargo add` and then whatever that crate's client does:
 there is no hestan adapter to find, no plugin to install, and no configuration
 file that has to name your warehouse.
 
@@ -145,7 +145,7 @@ Op::new("pull", ..)
 ```
 
 - **`retries`** counts attempts *after* the first. each one is a fresh call of
-  your fn — a new client borrow, a new query — and each is recorded on the run
+  your fn (a new client borrow, a new query), and each is recorded on the run
   page as its own attempt, with what it failed with.
 - **`retry_backoff(base, max)`** doubles the pause between attempts up to
   `max`. an endpoint that is down because everyone is retrying at once is not
@@ -157,7 +157,7 @@ Op::new("pull", ..)
 
 a client that is slow rather than broken should also be kept off everything
 else: `Hestan::pool("warehouse", 4)` plus `Op::pool("warehouse")` is one budget
-of concurrent work against one system, however many jobs happen to overlap —
+of concurrent work against one system, however many jobs happen to overlap;
 see [concurrency pools](concepts.md#concurrency-pools).
 
 **what is not retried:** anything that is not an `Err` from your fn. an op that
@@ -171,18 +171,18 @@ json. that is right for `{"rows": 12}` and wrong for the rows themselves.
 - [`FileIo`](io-managers.md#fileio) writes each op's output as one json file
   and keeps a handle in `op_runs.output`.
 - [`ParquetIo`](io-managers.md#parquetio) writes a table as one parquet file,
-  which is the format this kind of work already uses — and records the row
+  which is the format this kind of work already uses. it records the row
   count and the file size as metadata without the op asking.
 
 both are a directory of files, and neither is a data lake.
 [retention](storage.md#retention) takes a pruned run's files with its rows,
-so what grows there is the history your policy keeps — and with no policy
+so what grows there is the history your policy keeps, and with no policy
 configured, all of it.
 
 the other half of the answer is that the value does not have to travel through
 hestan at all. an op that loads a table into your warehouse can return
 `{"table": "analytics.orders_daily", "rows": 41_233}` and let the data stay
-where it was written — the run log is for what happened, and a handle to the
+where it was written. the run log is for what happened, and a handle to the
 result is usually more useful than the result.
 
 ## Another tool's dag
@@ -194,13 +194,13 @@ is the one case a wrapper genuinely buys something a client call cannot.
 
 ## Where to go next
 
-- [resources](resources.md) — the two scopes, the ordering, and what
+- [resources](resources.md): the two scopes, the ordering, and what
   `GET /api/resources` will and will not show. a pool belongs in the
   process-wide one: `Hestan::run_resource` builds per run, which for a pool
   means a pool per run.
-- [io managers](io-managers.md) — the trait, the handle, and both bundled
+- [io managers](io-managers.md): the trait, the handle, and both bundled
   managers.
-- [isolation](isolation.md) — an op that segfaults a native driver, in a
+- [isolation](isolation.md): an op that segfaults a native driver, in a
   process of its own.
-- [http sources](http-sources.md) — a scheduled rest pull with no op at all,
+- [http sources](http-sources.md): a scheduled rest pull with no op at all,
   for the case where the api *is* the pipeline.

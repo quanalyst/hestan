@@ -14,7 +14,7 @@ authenticator is configured.**
 ```
 $ orders serve --addr 0.0.0.0:4000
 error: refusing to serve 0.0.0.0:4000: that address is reachable from outside
-this machine and nothing here checks who is asking — this api launches runs,
+this machine and nothing here checks who is asking. this api launches runs,
 cancels them and changes limits. bind a loopback address, give it
 Hestan::auth(Auth::bearer(…)) or Hestan::auth(Auth::custom(…)), or say
 Hestan::auth(Auth::None) if something in front of hestan already checks
@@ -28,7 +28,7 @@ stranger's run on your warehouse.
 ## What did not change
 
 **loopback, with nothing configured, serves exactly as it always has.** no
-token, no header, no login, no configuration at all — one process on one
+token, no header, no login, no configuration at all: one process on one
 machine, which is what most deployments are and what every test that binds
 `127.0.0.1` still is.
 
@@ -39,7 +39,7 @@ not look alike:
 | --- | --- | --- |
 | `127.0.0.1`, and the rest of `127.0.0.0/8` | this machine | yes |
 | `::1` | this machine | yes |
-| `::ffff:127.0.0.1` — v4 loopback wearing a v6 address | this machine | yes |
+| `::ffff:127.0.0.1`, v4 loopback wearing a v6 address | this machine | yes |
 | `0.0.0.0`, `[::]` | every interface this machine has | **no** |
 | `192.168.1.10`, `10.0.0.4`, a public address | whoever can route to it | **no** |
 
@@ -50,7 +50,7 @@ the served one two different things.
 
 ## The two authenticators
 
-### `Auth::bearer` — one token
+### `Auth::bearer`: one token
 
 ```rust
 Hestan::new()
@@ -67,7 +67,7 @@ a token in git.
 
 hestan hashes the token when you hand it over and drops the plaintext. from
 that line on the process holds a sha-256 digest and not the secret, and the
-comparison against what a request presents is **constant time** — a
+comparison against what a request presents is **constant time**: a
 byte-by-byte `==` stops at the first byte that differs, which makes how long it
 took to say no into how much of the token was right, and enough requests turn
 that into the token itself.
@@ -76,7 +76,7 @@ one token is one identity, named `bearer`. everybody holding it is that
 identity, which is why the audit trail says "somebody with the token" rather
 than a person's name.
 
-### `Auth::custom` — your own check
+### `Auth::custom`: your own check
 
 ```rust
 Hestan::new().auth(Auth::custom(|req| {
@@ -91,7 +91,7 @@ Hestan::new().auth(Auth::custom(|req| {
 ```
 
 a closure over each request's method, path and headers, answering with an
-[`Identity`] or `None` — `None` being a 401. this is how a deployment that
+[`Identity`] or `None`. `None` is a 401. this is how a deployment that
 already authenticates composes hestan into what it has rather than standing a
 second scheme up beside it: a header its proxy sets, a signature it can check,
 a session table it owns.
@@ -101,14 +101,14 @@ network round trip belongs in the thing in front of hestan, where its answer is
 already being taken. if it compares a secret of its own, compare it with
 `hestan::auth::secret_eq` and not with `==`, for the reason above.
 
-### `Auth::None` — the deliberate opt-out
+### `Auth::None`: the deliberate opt-out
 
 ```rust
 Hestan::new().auth(Auth::None).serve(([0, 0, 0, 0], 4000))
 ```
 
 nothing in hestan checks identity, and you are asserting that something in
-front of it does — a proxy that authenticates, a mesh doing mtls, a network
+front of it does: a proxy that authenticates, a mesh doing mtls, a network
 nobody else is on. it turns the refusal off for every address, and says so once
 at startup:
 
@@ -126,21 +126,21 @@ for.
 
 three roles, and they contain each other: an operator may everything a viewer
 may, an admin everything an operator may. every decision the server makes is
-one comparison — `identity.role >= what this endpoint needs`.
+one comparison: `identity.role >= what this endpoint needs`.
 
 | role | may |
 | --- | --- |
 | **viewer** | read: every `GET` |
 | **operator** | that, plus launch, cancel, retry, resume, replay, build, backfill |
-| **admin** | that, plus pause, unpause, priority, presets — anything that changes how the deployment behaves rather than what it is doing now |
+| **admin** | that, plus pause, unpause, priority, presets (anything that changes how the deployment behaves rather than what it is doing now) |
 
-endpoint by endpoint, and this table is the security surface — the code is
+endpoint by endpoint, and this table is the security surface. the code is
 derived from it, and `src/server.rs`'s suite asserts every row of it against
 the real router:
 
 | endpoint | needs |
 | --- | --- |
-| `GET /api/whoami` | nobody — see below |
+| `GET /api/whoami` | nobody; see below |
 | every other `GET /api/…` | viewer |
 | `POST /api/jobs/{name}/runs` | operator |
 | `POST /api/jobs/{name}/validate_params` | operator |
@@ -165,7 +165,7 @@ scrapes every route out of the router and fails if one of them is not asserted
 here.
 
 **401 for a credential that is absent or not recognized. 403 for an identity
-that may not.** a 401 says nothing about what was wrong with what it refused —
+that may not.** a 401 says nothing about what was wrong with what it refused:
 "that one was close" is a sentence an attacker can use and a person cannot. a
 403 says what it would have taken, which is the only useful half of a refusal:
 
@@ -181,7 +181,7 @@ check who is asking, and who does it make you":
 { "auth": true, "identity": { "name": "ada", "role": "admin" } }
 ```
 
-with no credentials that is `{"auth": true, "identity": null}` — a 200, not a
+with no credentials that is `{"auth": true, "identity": null}`, a 200, not a
 401, because it is the endpoint asked *before* there is anything to present.
 an open deployment answers `{"auth": false, "identity": null}`.
 
@@ -212,7 +212,7 @@ protect against, plainly:
   anywhere in this ui, or in anything a browser extension injects into it,
   hands over a credential that can launch runs. an `HttpOnly` cookie is the
   thing javascript cannot read, and it needs a login endpoint, a session table
-  and an expiry — a user store, which hestan does not have and is not going to
+  and an expiry: a user store, which hestan does not have and is not going to
   grow.
 - **it does not expire.** there is no session and no revocation: the only way
   to take a token back is to change it and restart the deployment.
@@ -224,7 +224,7 @@ protect against, plainly:
 
 so: reasonable for an internal deployment on a network you trust, where the
 alternative is no authentication at all. not a substitute for an identity
-provider in front of hestan — `Auth::custom` is how you compose one in, and
+provider in front of hestan. `Auth::custom` is how you compose one in, and
 then the browser holds that scheme's credential (a proxy's cookie, usually)
 rather than this one.
 
@@ -242,7 +242,7 @@ $ hestan --server https://hestan.internal --token "$(cat /run/secrets/hestan)" r
 $ HESTAN_TOKEN=… hestan --server https://hestan.internal runs
 ```
 
-`--token` for a terminal, `HESTAN_TOKEN` for a cron line — an argument is
+`--token` for a terminal, `HESTAN_TOKEN` for a cron line: an argument is
 visible in `ps` to every account on the machine for as long as the process
 runs, and a variable is not. the flag wins where both are set. the environment
 is read by hestan rather than by the argument parser, which would print the
@@ -253,14 +253,14 @@ failed from a credential that was not accepted:
 
 ```
 $ hestan --server https://hestan.internal runs
-error: authentication required: present your credentials — https://hestan.internal
+error: authentication required: present your credentials; https://hestan.internal
 is authenticated: pass --token, or set HESTAN_TOKEN, which keeps it out of ps
 $ echo $?
 8
 ```
 
 `doctor` reports whether the deployment it is pointed at is authenticated at
-all — in the deployment's own binary, from what it is configured with, and over
+all, in the deployment's own binary, from what it is configured with, and over
 `--server` from `/api/whoami`, which needs no credentials:
 
 ```
@@ -305,7 +305,7 @@ three rules about it:
 
 - **the credential is never recorded.** only the identity's name. the token
   reaches the `Authorization` header and the constant-time comparison, and
-  nothing else — not a log line, not an event, not an error message, not a
+  nothing else: not a log line, not an event, not an error message, not a
   response body. `tests/auth.rs` drives an authenticated deployment through a
   launch, a retry, a cancel and a pause, then greps both of the server's
   streams, every response it sent, every event and run row, and every byte of
@@ -315,7 +315,7 @@ three rules about it:
   asked and nothing was checking who.
 - **a cancel of a run that is already executing is two events.** the run's own
   terminal event is written by whichever process is executing it, which may not
-  be the one that took the request and does not know who asked — so the asking
+  be the one that took the request and does not know who asked, so the asking
   is a line of its own, and it is the line with the name on it.
 
 ## What this is not

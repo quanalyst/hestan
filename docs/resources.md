@@ -9,7 +9,7 @@ value should live:
 
 | declared with | built | dropped | for |
 | --- | --- | --- | --- |
-| `Hestan::resource` | once, at startup | when the process ends | a pool, a client, a config — anything every run may share |
+| `Hestan::resource` | once, at startup | when the process ends | a pool, a client, a config, or anything else every run may share |
 | `Hestan::run_resource` | when a run starts | when that run ends | a scratch directory, a per-tenant client, a token that belongs to one execution |
 
 ops read either with `ctx.resource::<T>(name)` and declare either with
@@ -41,7 +41,7 @@ a resource is one value, named, built once, and reportable.
 
 ## Building them
 
-the constructor is **async and fallible**, which is the point — most real
+the constructor is **async and fallible**, which is the point. most real
 clients need a handshake, a file read, or an environment variable that might
 not be there:
 
@@ -76,7 +76,7 @@ deadlock. declaring one name twice is `Error::Resource`.
 
 ## Reading them
 
-`ctx.resource::<T>(name)` returns `Arc<T>` — the same `Arc` for every op in
+`ctx.resource::<T>(name)` returns `Arc<T>`: the same `Arc` for every op in
 every job, so `Arc::ptr_eq` on two ops' handles holds. the error says which of
 the two things went wrong:
 
@@ -98,7 +98,7 @@ whose op names a resource nobody registered:
 invalid job graph: job pull: op query requires resource api, which is not registered
 ```
 
-ops may also just ask without declaring, and that works — `ctx.resource` is
+ops may also just ask without declaring, and that works: `ctx.resource` is
 the same call either way. declaring is how you find out at startup instead of
 at 3am, which is the same bargain [`Op::pool`](concepts.md#concurrency-pools)
 offers.
@@ -120,8 +120,8 @@ which is built before any run exists. run-scoped constructors run in
 declaration order after the process-wide ones, so one can lean on either.
 
 **what it costs.** the constructor runs for every run. a connection pool built
-this way is a pool per run — a hundred pools on a busy afternoon, each with its
-own connections, each dropped an hour later — which is almost always a mistake
+this way is a pool per run (a hundred pools on a busy afternoon, each with its
+own connections, each dropped an hour later), which is almost always a mistake
 and is the reason the two scopes have different names. build the pool with
 `resource` and put the run's own short-lived thing in `run_resource`.
 
@@ -136,7 +136,7 @@ nothing else could have been true of an op that needed it.
 
 a name used by both scopes is `Error::Resource` at build, so
 `ctx.resource("x")` never means two things. asking for a run-scoped name
-outside a run — from a sensor, say — is `no resource named x`: nothing built
+outside a run (from a sensor, say) is `no resource named x`: nothing built
 it, because there was no run for it to belong to.
 
 ### When it is dropped
@@ -144,12 +144,12 @@ it, because there was no run for it to belong to.
 when the run ends, by **every** route: it succeeded, it failed, it was
 cancelled, or the process gave up on recording its outcome. the value is held
 by the task driving the run and by nothing else, so what drops it is that task
-ending — including the task simply being dropped when the process stops caring
+ending, including the task simply being dropped when the process stops caring
 about the run.
 
 dropping happens **on the blocking pool**, not on the async runtime. a `Drop`
 that removes a directory or closes a socket blocks, and the task driving a run
-is the one thread that must not — the same reason [io manager
+is the one thread that must not, which is the same reason [io manager
 calls](io-managers.md) go to the pool. a runtime already shutting down runs
 nothing new and drops what it was handed instead: still off the run's stack,
 still dropped.
@@ -160,7 +160,7 @@ wherever that is. hestan cannot see the end of work that keeps nothing of
 hestan's.
 
 **an isolated op** runs in a child process, which builds the run's resources
-for itself — its own copy, dropped when the child exits, exactly as a
+for itself: its own copy, dropped when the child exits, exactly as a
 process-wide resource in a child is that process's copy and not the parent's.
 
 ## Lifetime
@@ -171,8 +171,8 @@ itself does.
 
 ## Seeing what exists
 
-`GET /api/resources` lists them — names, declared types and scopes, never
-values:
+`GET /api/resources` lists them (names, declared types and scopes, never
+values):
 
 ```json
 { "resources": [

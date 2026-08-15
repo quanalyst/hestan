@@ -24,7 +24,7 @@ services:
       # 0.0.0.0 plus a published port is reachable from your network, and
       # `serve` refuses that with nothing checking who is asking. so: a token,
       # which the ui asks for once and keeps for the tab. a real deployment
-      # reads this out of a secret rather than a compose file — see
+      # reads this out of a secret rather than a compose file; see
       # docs/auth.md, which also has the version where your own proxy decides
       HESTAN_TOKEN: demo-token-change-me
       # how much this deployment runs at once, across both workers

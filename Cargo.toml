@@ -11,7 +11,7 @@ categories = ["asynchronous", "development-tools", "web-programming::http-server
 repository = "https://github.com/quanalyst/hestan"
 
 # docs.rs builds with every feature on, so the postgres store, the cli, the
-# capture layer, the otel bridge and the http source are all on the page —
+# capture layer, the otel bridge and the http source are all on the page,
 # and `--cfg docsrs` is what makes each of them carry the feature it needs.
 # nothing else sets that cfg, so an ordinary `cargo doc` is unaffected
 [package.metadata.docs.rs]
@@ -21,7 +21,7 @@ rustdoc-args = ["--cfg", "docsrs"]
 [dependencies]
 # the `parquet` feature only: json rows become arrow arrays on the way into a
 # file and json rows again on the way out. `json` is the only part of arrow
-# hestan uses — no csv reader, no ipc, no compute kernels
+# hestan uses: no csv reader, no ipc, no compute kernels
 arrow = { version = "57.3", optional = true, default-features = false, features = ["json"] }
 axum = "0.8"
 chrono = { version = "0.4", features = ["serde"] }
@@ -71,7 +71,7 @@ tempfile = "3"
 # instant it did it at rather than by how long the test took on a busy machine
 tokio = { version = "1", features = ["test-util"] }
 # the worked example in `Hestan::resource` connects to a real postgres, and it
-# is a doctest rather than a snippet — so the client it calls has to be here
+# is a doctest rather than a snippet, so the client it calls has to be here
 # whether or not the `postgres` feature is on. hestan does not wrap it: that is
 # the point the example is making
 tokio-postgres = "0.7"
@@ -100,7 +100,7 @@ capture = ["dep:tracing-subscriber"]
 postgres = ["dep:tokio-postgres"]
 # a run as a distributed trace: `hestan::otel`, and the w3c context an isolated
 # op's subprocess is handed so its spans nest under the op that spawned it. off
-# by default, and it installs nothing — the host composes the layer and owns
+# by default, and it installs nothing: the host composes the layer and owns
 # the exporter, exactly as it does for `capture`
 otel = ["dep:opentelemetry", "dep:opentelemetry_sdk", "dep:tracing-opentelemetry"]
 # `hestan::ParquetIo`, an io manager that stores op outputs as parquet files
@@ -108,7 +108,7 @@ otel = ["dep:opentelemetry", "dep:opentelemetry_sdk", "dep:tracing-opentelemetry
 # dependency to hand a deployment whose outputs are `{"loaded": 4210}`
 parquet = ["dep:arrow", "dep:parquet"]
 # `hestan::dbt`: a dbt project's models as assets, read out of the manifest dbt
-# compiled. no dependency of its own — a manifest is json — and off by default
+# compiled. no dependency of its own (a manifest is json), and off by default
 # because most deployments have no dbt project to read
 dbt = []
 
@@ -140,7 +140,7 @@ name = "notify"
 required-features = ["http"]
 
 # the capture layer needs a subscriber, and a subscriber in a test binary is a
-# thread-local thing every other test in that binary can invalidate — see the
+# thread-local thing every other test in that binary can invalidate; see the
 # comment at the top of the file
 [[test]]
 name = "capture"
@@ -162,7 +162,7 @@ name = "dbt"
 required-features = ["dbt"]
 
 # an isolated op re-executes `current_exe()`, so this target needs a `main` of
-# its own that rebuilds the same jobs — see the comment at the top of the file
+# its own that rebuilds the same jobs; see the comment at the top of the file
 [[test]]
 name = "isolation"
 harness = false
@@ -174,7 +174,7 @@ name = "queue"
 harness = false
 
 # every case in the cli suite is this same binary started with argv and watched
-# for what it exits with, which is not something a function call has — so it
+# for what it exits with, which is not something a function call has, so it
 # needs a `main` of its own that can be the command line
 [[test]]
 name = "cli"

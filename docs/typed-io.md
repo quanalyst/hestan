@@ -2,7 +2,7 @@
 
 ops speak json at the boundaries: every output is a `serde_json::Value` in the
 run history. `Op::typed` puts serde structs over that boundary so the compiler
-checks your wiring — and a shape mismatch at run time fails the attempt with a
+checks your wiring, and a shape mismatch at run time fails the attempt with a
 `type check failed` error in the run log.
 
 ## Op::typed
@@ -30,7 +30,7 @@ let job = Job::builder("typed")
 ```
 
 the input type `I` is deserialized from a json object with **one entry per
-declared dep, keyed by the dep's op name** — so the field names of `TotalIn`
+declared dep, keyed by the dep's op name**, so the field names of `TotalIn`
 must match the upstream op names (or map to them via `#[serde(rename)]`). the
 return type `O` is serialized back to json and recorded as the op's output.
 
@@ -65,10 +65,9 @@ via `?`.
 
 typed and untyped ops mix freely in one job. a common shape: raw `Op::new`
 ops at the edges where payloads are still fluid, `Op::typed` at the joins
-where several branches meet and shape bugs hurt most —
-`examples/demo.rs` does exactly this (`fetch_orders`/`enrich` untyped,
-`aggregate`/`publish` typed). there is no migration step; tighten one op at a
-time.
+where several branches meet and shape bugs hurt most. `examples/demo.rs`
+does exactly this (`fetch_orders`/`enrich` untyped, `aggregate`/`publish`
+typed). there is no migration step; tighten one op at a time.
 
 ## Params validation
 
@@ -87,15 +86,15 @@ Op::new("fetch", |ctx| async move {
 
 the check runs **before the run exists**: a launch whose params don't
 deserialize into `P` is rejected with `Error::InvalidParams` (http 400 from
-the launch and retry endpoints) and writes nothing to the database — no run
-row, no events, zero traces. every op the run will actually execute is
-checked against its params, and the error names the op that rejected them —
+the launch and retry endpoints) and writes nothing to the database (no run
+row, no events, zero traces). every op the run will actually execute is
+checked against its params, and the error names the op that rejected them.
 so a [subset launch](launching.md#launching-a-subset-of-ops) is judged by the
 ops in the subset and not by the ones it is skipping.
 
 ## Type names in the api and ui
 
-hestan records `std::any::type_name` for each declared type — module-qualified
+hestan records `std::any::type_name` for each declared type: module-qualified
 strings like `pipeline::Total`. they appear as `input_type`, `output_type`,
 and `params_type` on each op in the jobs api, in the ui's op inspector and
 ops list (`aggregate -> demo::Summary`), and in the params editor's
@@ -107,9 +106,9 @@ ops list (`aggregate -> demo::Summary`), and in the params editor's
 if upstream output fails to deserialize into `I`, the attempt fails with an
 error starting `type check failed:` and emits a `type_check_failed` event
 (level `error`, `data: {"error": "<serde message>"}`). the failure then goes
-through the **normal retry policy** — with `.retries(n)` it will be retried
+through the **normal retry policy**: with `.retries(n)` it will be retried
 like any other error. inputs don't change between attempts, so retrying a
 genuine shape mismatch just burns the attempts; the retry behavior exists so a
 type failure isn't a special case in the executor. (the http source's
-`expect_json` reuses the same event but fails fast — see
+`expect_json` reuses the same event but fails fast; see
 [http sources](http-sources.md).)

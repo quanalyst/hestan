@@ -12,7 +12,7 @@ Hestan::new()
 ```
 
 a job can carry several schedules; a schedule on an unregistered job, a bad
-expression, or an unknown timezone is an error from `serve`/`run_once` — at
+expression, or an unknown timezone is an error from `serve`/`run_once`, at
 startup, not at fire time. scheduled runs carry the trigger `schedule`.
 
 the surface above is the short way to say the common thing. once a schedule
@@ -31,7 +31,7 @@ Hestan::new()
 ```
 
 `schedule`, `schedule_tz`, `schedule_with` and `schedule_tz_with` all build one
-of these with the defaults filled in — utc, `{}`, `Catchup::Skip` — so nothing
+of these with the defaults filled in (utc, `{}`, `Catchup::Skip`), so nothing
 that already works changes.
 
 ## Params
@@ -49,7 +49,7 @@ Hestan::new()
 they are validated **at build**, not at fire time: `serve`/`run_once` run each
 schedule's params through the same op validators a launch runs, so a schedule
 a job's ops could never accept is an `Error::InvalidParams` naming the op, the
-expression and the job — instead of a tick that fails every night at 3am. that
+expression and the job, instead of a tick that fails every night at 3am. that
 also means a job whose ops declare required params needs `schedule_with`; the
 plain form's `{}` is refused at startup.
 
@@ -63,7 +63,7 @@ declaration says by the time its turn comes.
 
 expressions are standard 5-field crontab: minute, hour, day-of-month, month,
 day-of-week. internally the `cron` crate wants a seconds field, so a 5-field
-expression is normalized by prepending `0` — fires always land on second zero.
+expression is normalized by prepending `0`: fires always land on second zero.
 expressions with six or more fields are passed through untouched, so you *can*
 write seconds-resolution schedules, but the day-of-week remap below only
 applies to the 5-field form.
@@ -75,13 +75,13 @@ posix crontab numbers sunday as 0 (or 7); the `cron` crate numbers the week 1
 you write**: bare numbers and range endpoints `0..=7` are converted
 (`(n % 7) + 1`), names (`MON`) and step divisors (`*/2`) are left alone.
 
-- `0 9 * * 1` — 9:00 monday
-- `0 9 * * 0` and `0 9 * * 7` — 9:00 sunday
-- `0 9 * * 1-5` — weekdays
+- `0 9 * * 1`: 9:00 monday
+- `0 9 * * 0` and `0 9 * * 7`: 9:00 sunday
+- `0 9 * * 1-5`: weekdays
 
 one caveat: a numeric range **ending in 7**, like `5-7` (friday–sunday), remaps
-to an inverted range and fails to parse — loudly, at startup, which beats
-firing on the wrong day. write `5-6,0` or `FRI-SUN` instead.
+to an inverted range and fails to parse. that failure is loud and at startup,
+which beats firing on the wrong day. write `5-6,0` or `FRI-SUN` instead.
 
 ## Timezones
 
@@ -99,7 +99,7 @@ that day (a daily 02:30 new york job next fires the day after).
 ## The cursor
 
 every `(job, expression)` pair carries a **cursor**: the newest occurrence the
-scheduler has accounted for — fired, skipped, held, or deliberately dropped.
+scheduler has accounted for (fired, skipped, held, or deliberately dropped).
 it lives in the `schedules` table and is written after every one of those, so
 it survives a restart.
 
@@ -108,7 +108,7 @@ computing fires relative to *now* means downtime is invisible: a process that
 was dead from 08:00 to 10:30 comes back, asks "when is the next fire", and the
 occurrences at 08:00, 09:00 and 10:00 are simply gone. with a cursor at 07:00,
 **everything strictly after the cursor and strictly before now is the missed
-set** — knowable, enumerable, and something a policy can be applied to.
+set**, knowable, enumerable, and something a policy can be applied to.
 
 the first time a process sees a schedule the cursor is `null`, and it is set to
 now rather than to the beginning of the expression's history: a schedule
@@ -128,14 +128,14 @@ Schedule::new("hourly_rollup", "0 * * * *").catchup(Catchup::All { limit: 24 })
 ```
 
 - `Catchup::Skip` (the default): advance the cursor over them and fire nothing.
-  exactly what the scheduler did before it had a cursor. no ticks either — a
+  exactly what the scheduler did before it had a cursor. no ticks either: a
   process down for a week would otherwise write a week of skipped ticks on
   boot.
 - `Catchup::One`: fire the most recent missed occurrence only. for a job that
   computes current state, where the last one subsumes the rest.
 - `Catchup::All { limit }`: fire every missed occurrence, oldest first, at most
   `limit` of them (below 1 means 1). past the cap the **oldest are dropped**,
-  and the drop is recorded — a `skipped` tick at the oldest dropped occurrence
+  and the drop is recorded: a `skipped` tick at the oldest dropped occurrence
   whose error reads `catch-up cap 24: dropped 9 missed occurrences up to
   2026-03-04T01:00:00Z`, plus a warning in the log. a backlog quietly losing
   its head is the failure mode this policy exists to avoid.
@@ -150,8 +150,8 @@ and firing 24 hours of backlog concurrently is not what anyone means by
 ## Which hour is this run for
 
 a caught-up run is useless to a data pipeline that cannot tell which logical
-time it stands for. `runs.scheduled_for` is that time — the cron occurrence,
-not the wall clock the run started at — and ops read it back:
+time it stands for. `runs.scheduled_for` is that time (the cron occurrence,
+not the wall clock the run started at), and ops read it back:
 
 ```rust
 Op::new("pull", |ctx: OpCtx| async move {
@@ -162,8 +162,8 @@ Op::new("pull", |ctx: OpCtx| async move {
 
 it is set on scheduled fires, caught-up fires and held fires that later drain,
 and it is `None` on a manual launch, a retry, a resume, a replay, an asset
-build and a sensor fire — all of which stand for nothing but themselves. it is on the run
-json, and the ui shows it next to the trigger.
+build and a sensor fire, all of which stand for nothing but themselves. it is
+on the run json, and the ui shows it next to the trigger.
 
 ## The scheduler loop
 
@@ -174,14 +174,14 @@ self-corrects within a minute, and at 2s while a
 [deferred](#overlap-policy) fire is waiting to drain), then fires everything
 that has come due.
 pause state is read from the database at fire time, not at startup. two
-schedules on the same job that share a fire instant launch one run, not two —
+schedules on the same job that share a fire instant launch one run, not two:
 the runner-up records a `skipped` tick, so the dedupe is visible in the fire
 history rather than silent. each fire is recorded as a tick (below) whether
 the launch succeeded or not.
 
 expressions with no future fires left (a specific date now in the past)
 are dropped with a warning; once every schedule is exhausted **and nothing is
-still held**, the scheduler task exits — a held fire keeps it alive so that
+still held**, the scheduler task exits: a held fire keeps it alive so that
 fire can still drain. that's per-process state: an exhausted schedule comes
 back on restart if it has fires again.
 
@@ -198,7 +198,7 @@ schedules table to the code (new pairs inserted, removed pairs deleted,
 timezone refreshed) while pause state on surviving pairs is kept.
 
 one consequence of the row identity being `(job, expression)`: editing a
-schedule's cron expression in code creates a *new* pair on the next startup —
+schedule's cron expression in code creates a *new* pair on the next startup:
 the old row (and its paused flag) is deleted, so the edited schedule comes
 back unpaused. editing only the timezone updates the existing row in place
 and preserves the flag.
@@ -206,8 +206,8 @@ and preserves the flag.
 **the flag fails closed.** if the read that determines pause state fails, the
 pass fires nothing and moves no cursor, rather than treating an unreadable flag
 as unpaused. that is the only direction it can fail in: a missed occurrence is
-recoverable — the next pass's catch-up sees it, and honours the flag it can
-read by then — where a launch nobody asked for is not. the pass logs a warning
+recoverable (the next pass's catch-up sees it, and honours the flag it can
+read by then), where a launch nobody asked for is not. the pass logs a warning
 and retries a second later. sensors do the same thing with theirs
 ([sensors](sensors.md#pausing-ticks-sync)); launching itself is deliberately
 still at-least-once, and this is about the administrative switch only.
@@ -215,11 +215,11 @@ still at-least-once, and this is about the administrative switch only.
 ## Ticks
 
 every actual fire lands in a tick log: the `(job, expr)` pair, the instant
-the fire was scheduled for, when it actually fired, and the outcome —
+the fire was scheduled for, when it actually fired, and the outcome. that is
 `fired` (with the launched run's id), `error` (with the failure message),
 `skipped` (a fire dropped by the overlap policy or the same-instant dedupe),
-or `deferred` (a queue-policy fire waiting its turn, below) — queryable via
-`GET /api/schedules/ticks` and shown on the job page. ticks answer "did the
+or `deferred` (a queue-policy fire waiting its turn, below). the log is
+queryable via `GET /api/schedules/ticks` and shown on the job page. ticks answer "did the
 schedule do its job at 09:00" separately from "did the run succeed".
 
 ## Upcoming projection
@@ -239,15 +239,15 @@ job's overlap policy: `Job::builder(..).overlap(Overlap::...)`.
   `deferred` tick (no run id) recorded the moment the fire is held, then a
   `fired` tick when it launches, both carrying the same `scheduled_for` (the
   `fired_at` gap shows the delay). while one fire is waiting, further fires
-  of the same job are recorded `skipped` — a job that missed three ticks
+  of the same job are recorded `skipped`: a job that missed three ticks
   catches up once, not three times.
 - `Allow`: pre-policy behavior; concurrent runs of the same job are fine.
 
 the policy gates scheduled fires only. manual launches, the retry endpoint,
 and `run_once` are never held back.
 
-"active" means the job has a run **outstanding** — queued or running, claimed
-or not — and not "a run is executing this second". the distinction only came
+"active" means the job has a run **outstanding** (queued or running, claimed
+or not) and not "a run is executing this second". the distinction only came
 up once the [queue](scaling.md) made a queued run something that can sit there
 for a while, and outstanding is the answer overlap wants: a job held back by a
 concurrency limit would otherwise collect a fire every minute behind the run
@@ -257,7 +257,7 @@ question and counts the other set.
 
 **that pair is the queue, not a record of it.** a fire is waiting exactly when
 it has a `deferred` tick with no later tick for the same occurrence, which is a
-question the database answers — so a fire held when the process died is still
+question the database answers, so a fire held when the process died is still
 held when it comes back, and drains then. nothing about the wait lives in
 memory. one consequence: a fire reconstructed after a restart launches with the
 schedule's *current* params, since the process that held the old ones is gone;
@@ -265,10 +265,10 @@ within a process it still launches with the params it was held with, which are
 the same thing unless the declaration changed across the restart.
 
 pausing a schedule drops its waiting fire (recorded as a `skipped` tick), and
-so does deleting the schedule from the code — nothing else knows what params it
+so does deleting the schedule from the code: nothing else knows what params it
 should have launched with. the tick log is pruned to the newest 5000 rows by
-the [retention sweep](storage.md#retention) — at startup and every hour after
-it — which matters under skip (a schedule firing into a long run writes one
+the [retention sweep](storage.md#retention) (at startup and every hour after
+it), which matters under skip (a schedule firing into a long run writes one
 skipped tick per fire) and is also the one way a held fire can be forgotten: a
 `deferred` tick pruned away is a fire nobody is waiting for any more.
 
@@ -276,10 +276,10 @@ skipped tick per fire) and is also the one way a held fire can be forgotten: a
 
 the jobs api derives a freshness signal per job. `interval_secs` is the gap
 between the schedule's next two fires, minimized across the job's unpaused
-schedules — `null` when the job has no active schedule. `overdue` anchors on
+schedules. it is `null` when the job has no active schedule. `overdue` anchors on
 the *previous* scheduled fire (the latest across the job's unpaused
 schedules): true when that fire is more than half an interval in the past and
-no successful run has finished since it — including the case where the job
+no successful run has finished since it, including the case where the job
 has never succeeded at all. a job with no active schedule is never overdue.
 the ui tags overdue jobs in the jobs table. anchoring on the previous fire
 rather than on interval-sized windows keeps clustered schedules honest: a
