@@ -150,11 +150,11 @@ export default function JobsPage() {
                       {job.overdue && <span className="tag">overdue</span>}
                       {job.freshness?.status === "late" && <span className="tag">late</span>}
                     </td>
-                    <td className="secondary">{job.description ?? "—"}</td>
+                    <td className="secondary">{job.description ?? "none"}</td>
                     <td className="num">{job.ops.length}</td>
                     <td className="mono">
                       {job.schedules.length === 0
-                        ? "—"
+                        ? "none"
                         : job.schedules.map((s, i) => (
                             <span key={s.expr} className={s.paused ? "muted" : undefined}>
                               {i > 0 && ", "}

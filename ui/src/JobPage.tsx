@@ -68,11 +68,11 @@ function fieldType(f: SchemaField): string {
   if (Array.isArray(f.type)) return f.type.join(" | ");
   if (typeof f.$ref === "string") return f.$ref.slice(f.$ref.lastIndexOf("/") + 1);
   if (Array.isArray(f.enum)) return "enum";
-  return "—";
+  return "none";
 }
 
 // keys the editor holds that the schema has never heard of: a typo, or a
-// schema that has not caught up. worth pointing at, never worth refusing —
+// schema that has not caught up. worth pointing at, never worth refusing:
 // the schema does not decide what launches
 function unknownKeys(text: string, known: Record<string, SchemaField>): string[] {
   if (!text.trim()) return [];
@@ -94,7 +94,7 @@ function formatTags(tags: Record<string, string>): string {
     .join(", ");
 }
 
-// null for a line that is not tags at all, which is what disables the launch —
+// null for a line that is not tags at all, which is what disables the launch:
 // dropping the fragment we could not read would launch something else
 function parseTags(text: string): Record<string, string> | null {
   const out: Record<string, string> = {};
@@ -108,7 +108,7 @@ function parseTags(text: string): Record<string, string> | null {
   return out;
 }
 
-// how many ops a "launch from here" covers, for the label only — whether the
+// how many ops a "launch from here" covers, for the label only; whether the
 // selection is launchable at all is the server's to say, and it says it
 function downstreamOf(ops: OpSummary[], root: string): string[] {
   const out = new Set<string>();
@@ -229,7 +229,7 @@ function JobView({ name }: { name: string }) {
 
   // a clone prefills rather than launches: editing is the whole point, so the
   // params and tags are fetched and dropped into the editor. fetched, not
-  // carried in the url — a run's params do not belong in a query string
+  // carried in the url: a run's params do not belong in a query string
   useEffect(() => {
     if (!from) return;
     get<{ job: string; params: unknown; tags: Record<string, string> }>(
@@ -288,7 +288,7 @@ function JobView({ name }: { name: string }) {
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
       // the server owns whether a subset is launchable, so its refusal is the
-      // message — there is no second copy of that rule here
+      // message: there is no second copy of that rule here
       if (ops) setSubsetError(msg);
       else setLaunchError(msg);
     } finally {
@@ -487,8 +487,8 @@ function JobView({ name }: { name: string }) {
                 )}
               </div>
             )}
-            {!paramsValid && !paramsOpen && <p className="muted">saved params are invalid json — open params to fix</p>}
-            {tags === null && !paramsOpen && <p className="muted">tags are not key:value — open params to fix</p>}
+            {!paramsValid && !paramsOpen && <p className="muted">saved params are invalid json; open params to fix</p>}
+            {tags === null && !paramsOpen && <p className="muted">tags are not key:value; open params to fix</p>}
             {cloneError && <p className="muted">clone failed: {cloneError}</p>}
             {launchError && <p className="muted">launch failed: {launchError}</p>}
           </div>
@@ -567,7 +567,7 @@ function JobView({ name }: { name: string }) {
                 </span>
               )}
               <span className="muted">
-                {s.paused ? "paused" : s.next_fire ? `next ${untilTime(s.next_fire)}` : "next —"}
+                {s.paused ? "paused" : s.next_fire ? `next ${untilTime(s.next_fire)}` : "no next fire"}
               </span>
               {mayConfigure && (
                 <button className="text-btn" onClick={() => setPaused(s.expr, !s.paused)}>
@@ -616,7 +616,7 @@ function JobView({ name }: { name: string }) {
       </h2>
       <DurationBars runs={runs} />
       {runs.length === 0 ? (
-        <p className="muted">no runs yet — launch one to get started</p>
+        <p className="muted">no runs yet: launch one to get started</p>
       ) : (
         <table>
           <thead>

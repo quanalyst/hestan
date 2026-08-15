@@ -3,7 +3,7 @@
 //
 // a module of its own because all four are decisions rather than markup, and
 // because one flat table is fine at twelve assets and useless at three
-// hundred — which is exactly the size at which testing them through the dom
+// hundred, which is exactly the size at which testing them through the dom
 // stops being possible.
 import type { AssetSummary } from "./types";
 
@@ -25,8 +25,8 @@ export interface Group {
   assets: AssetSummary[];
 }
 
-// never built and stale are the same verdict to the engine — nothing to
-// compare against is why it is stale — and different things to look at
+// never built and stale are the same verdict to the engine (nothing to
+// compare against is why it is stale) and different things to look at
 export function neverBuilt(a: AssetSummary): boolean {
   return a.partitions ? a.partitions.materialized + a.partitions.stale === 0 : a.built_at === null;
 }
@@ -68,7 +68,7 @@ export function groupOf(name: string): string {
 }
 
 // groups in the order their first member appears, so the api's dependency
-// order still shows through — except the unprefixed ones, which go last:
+// order still shows through, except the unprefixed ones, which go last:
 // sitting between two named groups they read as belonging to one of them.
 // with no separator anywhere there is no grouping to be had, and inventing
 // one out of common substrings would be a guess

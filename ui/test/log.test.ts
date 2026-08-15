@@ -1,6 +1,6 @@
 // the run page's log pane draws two sources at once: what hestan said about
-// the run, and what its ops printed. what goes in the pane is a decision — a
-// source filter, the level and op filters over both, and one order — so it is
+// the run, and what its ops printed. what goes in the pane is a decision (a
+// source filter, the level and op filters over both, and one order) so it is
 // a function, and this is its test.
 //
 // run with `npm test` (vite bundles this for node, node runs it).

@@ -520,7 +520,7 @@ button:disabled {
 }
 
 /* a search hit: the ink inverted, which is the one mark this palette has that
-   is not a shape — and it is marking text, where a shape has nowhere to go */
+   is not a shape, and it is marking text, where a shape has nowhere to go */
 .log mark {
   background: var(--ink);
   color: var(--page);
@@ -1399,7 +1399,7 @@ table.plain-rows tbody tr:hover {
 }
 
 /* the partition grid: one cell per key, newest first. shape carries state
-   here as everywhere — solid built, hatched stale, hollow never built */
+   here as everywhere: solid built, hatched stale, hollow never built */
 .part-grid {
   display: flex;
   flex-wrap: wrap;
@@ -1533,7 +1533,7 @@ table.plain-rows tbody tr:hover {
 }
 
 /* the staleness chain: one block per upstream that moved, nested under the
-   build it moved in. the rule down the side is the nesting — an indent alone
+   build it moved in. the rule down the side is the nesting: an indent alone
    stops reading as one at the third level */
 .chain-link {
   padding: 4px 0;

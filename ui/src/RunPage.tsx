@@ -64,7 +64,7 @@ function Instances({ nodes }: { nodes: InstanceNode[] }) {
   );
 }
 
-// captured output is paged, and a finished run's poll only fires once — so
+// captured output is paged, and a finished run's poll only fires once, so
 // this drains the cursor rather than showing the first page and stopping.
 // bounded: an op is capped at 10,000 lines and a run may hold several, and a
 // page that keeps fetching for a minute is not a page anyone is reading
@@ -226,8 +226,8 @@ function RunView({ id }: { id: string }) {
       });
   }, [id, done, opSel]);
 
-  // what a replay would re-run, and — the answer worth having before the
-  // click — whether the inputs it needs are still there to read.
+  // what a replay would re-run, and (the answer worth having before the
+  // click) whether the inputs it needs are still there to read.
   //
   // asked only where a replay of the whole run means something: its default is
   // the ops that failed, and on a run where none did, "nothing to replay" is

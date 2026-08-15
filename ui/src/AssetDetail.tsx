@@ -25,7 +25,7 @@ function mappingOf(asset: AssetSummary, dep: string): string | null {
 }
 
 // the established shapes: a solid disc for an asset whose inputs have not
-// moved, the pending ring for one whose have — with the word beside it, since
+// moved, the pending ring for one whose have, with the word beside it, since
 // the ui is monochrome and a shape alone is not a sentence
 export function StateGlyph({ stale }: { stale: boolean }) {
   return (
@@ -39,7 +39,7 @@ export function StateGlyph({ stale }: { stale: boolean }) {
 }
 
 // what an asset is and what it has done, drawn the same whether it is the
-// drawer on the assets table or the asset's own page — one implementation, so
+// drawer on the assets table or the asset's own page: one implementation, so
 // the quick look and the permanent address can never say different things.
 export default function AssetDetail({
   asset,

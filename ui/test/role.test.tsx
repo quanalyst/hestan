@@ -29,7 +29,7 @@ test("a role may whatever the roles below it may", () => {
 // the structural half of "a viewer's ui offers no launch control": every page
 // that can change something has to have asked what the role may. a new button
 // wired to a new endpoint fails this until somebody decides which role it
-// belongs to, which is the point — the ui and the api are not allowed to
+// belongs to, which is the point: the ui and the api are not allowed to
 // disagree about who may do what.
 test("every page that changes something asks what the role may first", () => {
   const pages = readdirSync(SRC).filter((f) => f.endsWith(".tsx"));

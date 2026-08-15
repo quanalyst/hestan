@@ -93,7 +93,7 @@ export default function CommandPalette() {
   }));
 
   // pausing a schedule from the palette is the same decision it is on the job
-  // page, so it is the same role — and an action a role may not take is not
+  // page, so it is the same role, and an action a role may not take is not
   // offered rather than offered and refused
   const actionItems: Item[] = !mayPause
     ? []

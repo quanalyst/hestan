@@ -14,7 +14,7 @@ export interface KeyRange {
 }
 
 // the grid draws newest key first, so a drag made either way round covers the
-// same span — and the api takes it oldest first, which is what this returns
+// same span, and the api takes it oldest first, which is what this returns
 export function rangeOf(shown: PartitionEntry[], a: string, b: string): KeyRange | null {
   const i = shown.findIndex((p) => p.key === a);
   const j = shown.findIndex((p) => p.key === b);
@@ -86,7 +86,7 @@ export function medianMs(samples: OpStatSample[]): number | null {
 // what a backfill of `count` partitions costs at that median, as work rather
 // than as wall clock: chunks go out one after another and a chunk's own
 // partitions run at whatever concurrency the deployment allows, so this is
-// the total and not the wait. null in, null out — an estimate with nothing
+// the total and not the wait. null in, null out: an estimate with nothing
 // behind it is worse than none
 export function estimateMs(count: number, median: number | null): number | null {
   return median === null ? null : count * median;
@@ -102,7 +102,7 @@ export interface Chunk {
 }
 
 // a backfill launches its keys in chunks of the asset's build limit, in
-// order, one run each — so which run built which key is arithmetic rather
+// order, one run each, so which run built which key is arithmetic rather
 // than a stored fact. the limit is not on the wire, but `launched` over the
 // runs it took to launch them is exactly it
 export function chunksOf(backfill: Backfill, runs: Run[]): Chunk[] {

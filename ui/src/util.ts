@@ -8,7 +8,7 @@ export function shortId(id: string): string {
 
 // what a run says about the run it came from. a resume continues one from
 // where it broke and a replay re-runs ops of one on the inputs it had, which
-// are opposite things — so the two are separate fields and this reads whichever
+// are opposite things, so the two are separate fields and this reads whichever
 // is set. most runs came from nothing and say nothing
 export function lineage(run: {
   resumed_from: string | null;
@@ -79,7 +79,7 @@ export function fmtBytes(bytes: number): string {
   return `${bytes} B`;
 }
 
-// a data volume in decimal units — 1.2 GB — which is how storage, warehouses
+// a data volume in decimal units (1.2 GB) which is how storage, warehouses
 // and file sizes are quoted. fmtBytes above stays binary because a memory
 // rlimit genuinely is, and the two are never showing the same kind of number.
 // signed, since a byte delta comes through here too
@@ -109,7 +109,7 @@ export function numericMetaKeys(metadata: Metadata | null): string[] {
     .map(([name]) => name);
 }
 
-// an interval the way it was declared — `6h`, not `6h 0m`. for a window or a
+// an interval the way it was declared: `6h`, not `6h 0m`. for a window or a
 // period somebody wrote down, where fmtDuration is for a span that was measured
 export function fmtEvery(secs: number): string {
   if (secs >= 86400 && secs % 86400 === 0) return `${secs / 86400}d`;
@@ -123,7 +123,7 @@ export function isTerminal(status: RunStatus): boolean {
 }
 
 export function relTime(iso: string | null): string {
-  if (!iso) return "—";
+  if (!iso) return "none";
   const s = Math.max(0, (Date.now() - new Date(iso).getTime()) / 1000);
   if (s < 60) return `${Math.floor(s)}s ago`;
   if (s < 3600) return `${Math.floor(s / 60)}m ago`;
@@ -145,7 +145,7 @@ export function durationMs(run: { started_at: string | null; finished_at: string
 }
 
 export function fmtDuration(ms: number | null): string {
-  if (ms === null) return "—";
+  if (ms === null) return "none";
   ms = Math.max(0, ms); // clock skew can put finished_at before started_at
   if (ms < 999.5) return `${Math.round(ms)}ms`; // 999.5+ rounds to "1.0s", not "1000ms"
   if (ms < 60_000) {

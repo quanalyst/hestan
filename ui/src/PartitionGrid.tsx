@@ -37,7 +37,7 @@ function cellTitle(p: PartitionEntry): string {
 }
 
 // one cell per key, newest first, in the established shape vocabulary: solid
-// materialized, hatched stale, hollow missing. clicking one builds that key —
+// materialized, hatched stale, hollow missing. clicking one builds that key,
 // unless the grid was handed a range to fill, in which case dragging across it
 // picks the span a backfill covers and a click builds nothing.
 export default function PartitionGrid({

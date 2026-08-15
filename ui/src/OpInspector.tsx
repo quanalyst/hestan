@@ -78,7 +78,7 @@ export default function OpInspector({
   // draws from the same one
   const poolLimit = pools.find((p) => p.name === op?.pool)?.limit ?? null;
   // and the rate is the same kind of fact: declared once, honoured by every job
-  // in the process — and by this process alone
+  // in the process, and by this process alone
   const declaredRate = rates.find((r) => r.name === op?.rate) ?? null;
   const stateJson = state === undefined ? null : JSON.stringify(state.value);
   const stateClipped = stateJson !== null && stateJson.length > 120;

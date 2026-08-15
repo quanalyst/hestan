@@ -76,7 +76,7 @@ function Undelivered({ rows }: { rows: Notification[] }) {
     <>
       <h2>
         undelivered notifications
-        <span className="secondary"> — {rows.length}</span>
+        <span className="secondary"> · {rows.length}</span>
       </h2>
       <table>
         <thead>
@@ -96,8 +96,8 @@ function Undelivered({ rows }: { rows: Notification[] }) {
               onClick={() => n.payload.run_id && nav(`/runs/${n.payload.run_id}`)}
             >
               <td>{n.state}</td>
-              <td className="mono">{n.payload.run_id ? shortId(n.payload.run_id) : "—"}</td>
-              <td>{n.payload.job ?? "—"}</td>
+              <td className="mono">{n.payload.run_id ? shortId(n.payload.run_id) : "none"}</td>
+              <td>{n.payload.job ?? "none"}</td>
               <td className="num">{n.attempts}</td>
               <td className="muted">{n.last_error ?? (n.attempts === 0 ? "not tried yet" : "")}</td>
               <td className="muted">{relTime(n.created_at)}</td>
@@ -307,7 +307,7 @@ export default function RunsPage() {
         {job && (
           <span className="secondary">
             {" "}
-            — {job} <Link className="head-link" to="/runs">clear</Link>
+            · {job} <Link className="head-link" to="/runs">clear</Link>
           </span>
         )}
       </h1>
@@ -317,7 +317,7 @@ export default function RunsPage() {
       <Undelivered rows={undelivered} />
       {runs.length === 0 ? (
         <p className="muted">
-          {tagQ ? `no runs tagged ${tagQ}` : "no runs yet — launch one from a job page"}
+          {tagQ ? `no runs tagged ${tagQ}` : "no runs yet: launch one from a job page"}
         </p>
       ) : (
         <>
@@ -327,7 +327,7 @@ export default function RunsPage() {
             <>
               <h2>
                 waiting for a token
-                <span className="secondary"> — this process</span>
+                <span className="secondary"> · this process</span>
               </h2>
               <table>
                 <thead>
@@ -355,7 +355,7 @@ export default function RunsPage() {
             <>
               <h2>
                 queued
-                <span className="secondary"> — {queue.depth} waiting</span>
+                <span className="secondary"> · {queue.depth} waiting</span>
               </h2>
               <table>
                 <thead>

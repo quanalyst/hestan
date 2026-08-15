@@ -45,7 +45,7 @@ async function historyOf(
   return r.materializations;
 }
 
-// what a build recorded for one dep, at the key that moved — the dep's own
+// what a build recorded for one dep, at the key that moved: the dep's own
 // fingerprint where it was read whole, and one key's where it was mapped
 function fingerprintAt(held: InputFingerprint | undefined, partition: string | null): string | null {
   if (held === undefined) return null;
@@ -113,14 +113,14 @@ function Chain({ links }: { links: ChainLink[] }) {
                   : "has never been built"}
             </span>
             {link.kind === "changed" && (
-              <span className="mono chain-fp" title={`${link.had ?? "—"} -> ${link.now ?? "—"}`}>
-                {link.had ? shortHash(link.had) : "—"} → {link.now ? shortHash(link.now) : "—"}
+              <span className="mono chain-fp" title={`${link.had ?? "none"} -> ${link.now ?? "none"}`}>
+                {link.had ? shortHash(link.had) : "none"} → {link.now ? shortHash(link.now) : "none"}
               </span>
             )}
           </div>
           <div className="chain-when muted">
             {link.kind === "pending" ? (
-              "nothing has moved here yet — rebuilding it is what would move it"
+              "nothing has moved here yet: rebuilding it is what would move it"
             ) : link.kind === "absent" ? (
               "there is no fingerprint to compare against"
             ) : link.built === null ? (
@@ -156,7 +156,7 @@ function Chain({ links }: { links: ChainLink[] }) {
 const NEIGHBOURS = 18;
 
 // one side of the lineage: names that link, wrapped rather than stacked, with
-// the rest behind a count — a hub asset's dependents are a fact about the
+// the rest behind a count: a hub asset's dependents are a fact about the
 // graph, not a list to scroll past
 function LineageList({
   label,
@@ -242,7 +242,7 @@ function AssetView({ name }: { name: string }) {
   const [shown, setShown] = useState<PartitionEntry[]>([]);
   const [backfills, setBackfills] = useState<Backfill[]>([]);
   // the walk reads every asset's reasons, but a new list every 5s is not a new
-  // chain — the reasons are what changed it, so the list is held in a ref and
+  // chain: the reasons are what changed it, so the list is held in a ref and
   // the effect turns on those
   const listRef = useRef<AssetSummary[]>([]);
 
@@ -344,7 +344,7 @@ function AssetView({ name }: { name: string }) {
             <span className="pill">
               <StateGlyph stale={asset.stale} />
             </span>
-            {/* sources are probed, never built — the endpoint 400s */}
+            {/* sources are probed, never built: the endpoint 400s */}
             {mayBuild && asset.kind !== "source" && (
               <button onClick={build} disabled={building}>
                 build
@@ -369,7 +369,7 @@ function AssetView({ name }: { name: string }) {
               nothing has ever materialized it
               {asset.kind === "source"
                 ? ", and its probe has not run yet."
-                : " — build it, and there will be something to compare against."}
+                : ". build it, and there will be something to compare against."}
             </p>
           ) : chain === null ? (
             <p className="muted">reading upstream history…</p>
@@ -398,7 +398,7 @@ function AssetView({ name }: { name: string }) {
 
       <h2>lineage</h2>
       <div className="lineage">
-        <LineageList label="upstream" names={upstream} empty="nothing — it reads the outside world" />
+        <LineageList label="upstream" names={upstream} empty="nothing: it reads the outside world" />
         <LineageList label="downstream" names={downstream} empty="nothing reads it" />
       </div>
 

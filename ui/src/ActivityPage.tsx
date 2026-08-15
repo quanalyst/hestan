@@ -70,7 +70,7 @@ function EventRow({ event }: { event: RunEvent }) {
       <td className="muted act-subject-kind">{event.subject_kind}</td>
       <td className="mono" title={subject ?? undefined}>
         {shown === null ? (
-          <span className="muted">—</span>
+          <span className="muted">none</span>
         ) : to === null ? (
           shown
         ) : (
@@ -96,8 +96,8 @@ function GapRow({ gap }: { gap: Dropped }) {
   return (
     <tr className="act-gap">
       <td colSpan={6} className="muted">
-        {gap.count} event{gap.count === 1 ? "" : "s"} dropped through seq {gap.through} — this tab
-        fell behind the stream. they are still in the log; reload to fetch them.
+        {gap.count} event{gap.count === 1 ? "" : "s"} dropped through seq {gap.through}. this
+        tab fell behind the stream. they are still in the log; reload to fetch them.
       </td>
     </tr>
   );
@@ -129,7 +129,7 @@ export default function ActivityPage() {
         newest = r.events[0]?.seq ?? 0;
         cursor.current = r.events[r.events.length - 1]?.seq ?? null;
         // an EventSource cannot carry a header, and the only other way to hand
-        // a stream a token is to put it in the url — where it lands in the
+        // a stream a token is to put it in the url, where it lands in the
         // browser's history and in every access log between here and the
         // deployment. so an authenticated tab polls instead: a second of lag
         // on "what is happening" costs less than a credential in a log
@@ -196,7 +196,7 @@ export default function ActivityPage() {
     <>
       <h1>
         Activity
-        <span className="secondary"> — {live ? "live" : "not following"}</span>
+        <span className="secondary"> · {live ? "live" : "not following"}</span>
       </h1>
       {feed.length === 0 ? (
         // a database nothing has happened in yet. no fake rows, and no bare
@@ -204,7 +204,7 @@ export default function ActivityPage() {
         <div className="act-empty">
           <p>nothing has happened yet.</p>
           <p className="muted">
-            this is every event in the deployment — a run queued, an asset materialized, a check
+            this is every event in the deployment: a run queued, an asset materialized, a check
             that failed, a schedule that fired or was skipped, a sensor tick, a backfill's chunks,
             an alert nobody received, a lease taken back from a worker that stopped answering.
           </p>
@@ -263,7 +263,7 @@ export default function ActivityPage() {
               <button className="text-btn" onClick={loadOlder} disabled={older}>
                 {older ? "loading…" : "load older"}
               </button>
-              {filtered && <span className="muted"> — filtering what has been loaded</span>}
+              {filtered && <span className="muted"> · filtering what has been loaded</span>}
             </div>
           )}
           <p className="muted act-foot">

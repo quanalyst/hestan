@@ -98,7 +98,7 @@ function fromOutput(l: OpLog): LogRow {
 
 // what the pane shows, oldest first.
 //
-// interleaved by timestamp, with ties left in source order — both lists arrive
+// interleaved by timestamp, with ties left in source order: both lists arrive
 // in the order they were written, so a stable sort keeps each source's own
 // order exactly however coarse the clock is.
 export function logRows(events: RunEvent[], output: OpLog[], f: Filters): LogRow[] {

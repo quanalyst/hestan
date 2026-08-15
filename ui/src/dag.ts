@@ -2,8 +2,8 @@
 //
 // `DagView` lays out every node it is handed, which stops working somewhere
 // past a hundred: the columns get taller than the screen and the edges become
-// a texture. these are the two ways of handing it fewer — a neighbourhood
-// around one node, and a prefix group folded into a single node — as
+// a texture. these are the two ways of handing it fewer (a neighbourhood
+// around one node, and a prefix group folded into a single node) as
 // transforms over the node list, so the drawing code stays one thing and
 // these stay testable.
 import type { DagNode } from "./DagView";
@@ -24,7 +24,7 @@ export const FOCUS_MAX = 40;
 // the nodes within `depth` hops of `focus`, following deps in both directions:
 // what feeds it and what it feeds, which are the two questions anybody has
 // about one node. nearest first up to `max`, since a hub's neighbourhood can
-// be the whole graph — the count of what was left out is the caller's to
+// be the whole graph, and the count of what was left out is the caller's to
 // print. input order is kept, so the layout is what it would have been
 export function neighbourhood(
   nodes: DagNode[],
@@ -85,7 +85,7 @@ export function collapseGroups(nodes: DagNode[], collapsed: Set<string>): DagNod
     const group = held.get(name);
     if (group === undefined) {
       // a folded node is several assets: its note and badge belong to none of
-      // them, so it carries the count instead — and the names it swallowed, so
+      // them, so it carries the count instead, and the names it swallowed, so
       // a search for one of them still finds where it went
       const node =
         name === n.name ? { ...n, deps } : { name, deps, badge: "×1", find: n.name };

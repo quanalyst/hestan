@@ -3,7 +3,7 @@ import type { JobSummary, OpRun, OpStatus, OpSummary, RunEvent } from "./types";
 // an instance's name is its op with one `[label]` per level of fan-out it sits
 // inside, so a fan-out inside a fan-out reads `probe[2026-01-05][3]`. a label
 // is the element's index, or the element itself on an op that names its
-// instances by them, and it carries no bracket — which is what makes the name
+// instances by them, and it carries no bracket, which is what makes the name
 // reversible. what makes it an instance rather than an op with brackets in its
 // name is that the part before the first `[` is a mapped op of this job
 const INSTANCE = /^([^[]+)((?:\[[^[\]]*\])+)$/;
@@ -91,7 +91,7 @@ export function rollup(rows: OpRun[]): OpStatus {
   return "success";
 }
 
-// how many instances a mapped op made, from the expansion event — the only
+// how many instances a mapped op made, from the expansion event: the only
 // place the count lives when it expanded over an empty array
 export function expansions(events: RunEvent[]): Map<string, number> {
   const out = new Map<string, number>();
@@ -104,8 +104,8 @@ export function expansions(events: RunEvent[]): Map<string, number> {
 }
 
 // what one instance actually waited for, for the gantt to lay out: its own
-// outer instance where its op fans out over a mapped one — `probe[1][0]`
-// followed `sites[1]`, not every site there was — and whatever its other deps
+// outer instance where its op fans out over a mapped one (`probe[1][0]`
+// followed `sites[1]`, not every site there was) and whatever its other deps
 // expanded into, the same way the mapped op's own row would have read them
 export function instanceDeps(op: OpSummary, name: string, fan: FanOut): string[] {
   const labels = labelsOf(name) ?? [];

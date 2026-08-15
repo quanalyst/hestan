@@ -1,4 +1,4 @@
-// the markdown subset, checked construct by construct — and then checked the
+// the markdown subset, checked construct by construct, and then checked the
 // way that actually matters: rendered through react-dom to the exact string a
 // browser would receive, so "no markup and no href gets through" is asserted
 // against the output rather than against an intention.
@@ -177,7 +177,7 @@ test("no react element in the ui is built from an html string", async () => {
   const { readdirSync, readFileSync } = await import("node:fs");
   const dir = new URL("../src/", import.meta.url);
   // the whole subset is safe because nothing in the ui ever hands react an
-  // html string — asserted over the source, since one line anywhere would
+  // html string, asserted over the source, since one line anywhere would
   // undo it
   const offenders = readdirSync(dir).filter((file) =>
     readFileSync(new URL(file, dir), "utf8").includes("dangerouslySetInnerHTML"),

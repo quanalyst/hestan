@@ -1,4 +1,4 @@
-// the catalog's four decisions — search, state filter, grouping, sort — and
+// the catalog's four decisions (search, state filter, grouping, sort) and
 // the two ways the graph is made small enough to draw. all of them are pure
 // functions over a fixture, because a table of three hundred assets is not a
 // thing to assert through the dom.
@@ -122,7 +122,7 @@ test("every column sorts both ways and leaves equal rows where they were", () =>
     "sales/orders",
     "sales/returns",
   ]);
-  // fresh, then stale, then never built — and the two fresh ones keep the
+  // fresh, then stale, then never built, and the two fresh ones keep the
   // order the api sent them in
   assert.deepEqual(names(sortAssets(catalog, "state", "asc")), [
     "sales/orders",

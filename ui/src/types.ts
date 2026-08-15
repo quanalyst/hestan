@@ -5,7 +5,7 @@ export type EventLevel = "info" | "warn" | "error";
 
 // what happened. the string is open, not closed: a build newer than this ui
 // writes kinds it has never heard of, and the api hands them through rather
-// than refusing the row — so the union documents what is known and the trailing
+// than refusing the row, so the union documents what is known and the trailing
 // `(string & {})` is what keeps an unknown one from being a type error
 export type EventKind =
   | "run_queued"
@@ -214,7 +214,7 @@ export interface Run {
   resumed_from: string | null;
   // the run this one replayed: re-ran ops of, on the inputs that run gave
   // them. null on every run that is not a replay, and never set beside
-  // resumed_from — a resume re-runs what did not succeed and a replay re-runs
+  // resumed_from: a resume re-runs what did not succeed and a replay re-runs
   // what did
   replay_of: string | null;
   // the cron occurrence this run stands for, not the clock it launched at;
@@ -267,15 +267,15 @@ export interface ResumePreview {
   reuse: string[];
 }
 
-// what a replay would do: the ops it executes — exactly those, nothing
-// downstream — and the deps it seeds from what the original run recorded
+// what a replay would do: the ops it executes (exactly those, nothing
+// downstream) and the deps it seeds from what the original run recorded
 export interface ReplayPreview {
   ops: string[];
   inputs: string[];
 }
 
 // one column of a metadata table: its name, and the type the op named when it
-// knew one — a label to print, never anything the ui parses
+// knew one: a label to print, never anything the ui parses
 export interface MetaColumn {
   name: string;
   type: string | null;
@@ -428,7 +428,7 @@ export interface Tick {
 export interface StaleReason {
   dep: string;
   // which key of the dep, when it is read through a mapping that reads one
-  // other than this asset's own — the hour under a daily rollup, not the day.
+  // other than this asset's own: the hour under a daily rollup, not the day.
   // null under identity, where the key is the reader's own
   partition: string | null;
   had: string | null; // fingerprint recorded when this asset last consumed dep
@@ -528,7 +528,7 @@ export interface PartitionEntry {
   fingerprint: string | null;
   built_at: string | null;
   run_id: string | null;
-  // what this key reads of each dep it maps, and why it is stale — per key,
+  // what this key reads of each dep it maps, and why it is stale, per key,
   // because a mapping resolves per key
   reads: KeyRead[];
   reasons: StaleReason[];
@@ -556,11 +556,11 @@ export interface MaterializationEntry {
   // the key this entry is for, on a partitioned asset
   partition: string | null;
   fingerprint: string;
-  // this build's fingerprint differs from the one before it in time — the
+  // this build's fingerprint differs from the one before it in time: the
   // difference between having been rebuilt and having actually changed
   changed: boolean;
-  // one fingerprint per dep, or — for a dep read through a mapping that names
-  // a set of its keys — one per key it consumed
+  // one fingerprint per dep, or (for a dep read through a mapping that names
+  // a set of its keys) one per key it consumed
   inputs: Record<string, InputFingerprint>;
   run_id: string | null;
   built_at: string;

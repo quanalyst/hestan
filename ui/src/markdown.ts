@@ -36,7 +36,7 @@ const EM = /^\*([^*]+)\*/;
 const LINK = /^\[([^\]]*)\]\(([^)\s]*)\)/;
 
 // the one place a url becomes an href. http and https only, so a
-// `javascript:` target — or a `data:` one, or a protocol-relative `//host` —
+// `javascript:` target (or a `data:` one, or a protocol-relative `//host`)
 // is not a link at all: the construct is left as the text it was written as,
 // which shows what it pointed at rather than silently dropping it.
 export function linkHref(target: string): string | null {
@@ -90,7 +90,7 @@ export function parseInline(src: string): Inline[] {
       i += link[0].length;
       continue;
     }
-    // an opener that never closes, an unknown construct, a stray `<` — all
+    // an opener that never closes, an unknown construct, a stray `<`: all
     // the same thing: the character it was written as
     literal += src[i];
     i += 1;

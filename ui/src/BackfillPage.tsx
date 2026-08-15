@@ -185,7 +185,7 @@ function BackfillView({ id }: { id: string }) {
                           {shortId(chunk.run_id)}
                         </Link>
                       ) : (
-                        <span className="muted">—</span>
+                        <span className="muted">none</span>
                       )}
                     </td>
                     <td>
@@ -201,7 +201,7 @@ function BackfillView({ id }: { id: string }) {
                     </td>
                     <td className="num">{chunk.keys.length}</td>
                     <td className="muted">
-                      {run ? relTime(run.started_at ?? run.created_at) : "—"}
+                      {run ? relTime(run.started_at ?? run.created_at) : "none"}
                     </td>
                   </tr>
                 );
@@ -217,7 +217,7 @@ function BackfillView({ id }: { id: string }) {
             </p>
           )}
           {runs.some((r) => !isTerminal(r.status)) && (
-            <p className="muted">a chunk is running now — the grid fills in as it lands.</p>
+            <p className="muted">a chunk is running now: the grid fills in as it lands.</p>
           )}
         </>
       )}

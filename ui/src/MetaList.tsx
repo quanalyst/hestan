@@ -20,8 +20,8 @@ const absolute = (value: MetaValue, delta: number): string => {
 
 const percent = (pct: number): string => signed(pct, `${Math.abs(pct)}%`);
 
-// a size or a duration reads as a percentage — nobody wants "+48,000,000
-// bytes" — and a count reads as itself, since "+37" is the fact and "+3%" is
+// a size or a duration reads as a percentage (nobody wants "+48,000,000
+// bytes") and a count reads as itself, since "+37" is the fact and "+3%" is
 // a derivation of it. whichever is not shown is on the hover
 function DeltaView({ value, delta }: { value: MetaValue; delta: MetaDelta }) {
   const wantsPercent = "bytes" in value || "duration_secs" in value;
@@ -42,7 +42,7 @@ function DeltaView({ value, delta }: { value: MetaValue; delta: MetaDelta }) {
 // a cell prints as itself when it is a string and as its json otherwise; a
 // null cell is the gap the source padded a short row with
 function cellText(v: unknown): string {
-  if (v === null || v === undefined) return "—";
+  if (v === null || v === undefined) return "none";
   return typeof v === "string" ? v : JSON.stringify(v);
 }
 

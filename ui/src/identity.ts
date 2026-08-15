@@ -2,11 +2,11 @@
 //
 // **sessionStorage, and here is what that does and does not buy.** it is
 // scoped to this tab and this origin, and the browser drops it when the tab
-// closes — so a shared machine does not keep a control-plane credential in a
+// closes, so a shared machine does not keep a control-plane credential in a
 // profile forever, and a second deployment on another origin cannot read it.
 //
 // what it does not protect against, plainly: any script running on this page
-// can read it. that is the whole of the risk, and it is not small — a
+// can read it. that is the whole of the risk, and it is not small: a
 // cross-site scripting hole anywhere in this ui, or in anything a browser
 // extension injects into it, hands over a token that can launch runs. an
 // HttpOnly cookie is the thing that would be out of javascript's reach, and it
@@ -18,7 +18,7 @@
 //
 // so: fine for an internal deployment behind a network you trust, where the
 // alternative is no authentication at all. not a substitute for an identity
-// provider in front of hestan — `Auth::custom` is how you compose one in, and
+// provider in front of hestan; `Auth::custom` is how you compose one in, and
 // then the browser holds that scheme's credential instead of this one.
 const KEY = "hestan.token";
 

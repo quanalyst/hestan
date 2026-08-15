@@ -1,6 +1,6 @@
 // a backfill is the one action in this ui that costs real money if it is
-// wrong, so the three things that could lie about it — what a range covers,
-// what it will cost, and why the button is off — are functions with a test.
+// wrong, so the three things that could lie about it (what a range covers,
+// what it will cost, and why the button is off) are functions with a test.
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
@@ -134,7 +134,7 @@ const run = (id: string, status: Run["status"]): Run => ({
 });
 
 test("which run built which key is arithmetic on the chunk size", () => {
-  // two chunks of two out of five, so the build limit is two — which is not on
+  // two chunks of two out of five, so the build limit is two, which is not on
   // the wire, and is exactly `launched` over the runs it took
   const b = backfill({ run_ids: ["r1", "r2"], launched: 4 });
   const chunks = chunksOf(b, [run("r1", "success"), run("r2", "running")]);

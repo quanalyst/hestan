@@ -1,6 +1,6 @@
 // the activity feed is a page of the log plus whatever the stream has pushed
-// since. these are the decisions in that — what a row is about, whether a
-// filter admits it, and how a live event joins a list that is already there —
+// since. these are the decisions in that (what a row is about, whether a
+// filter admits it, and how a live event joins a list that is already there)
 // and they are pure so they can be tested without a browser or a server.
 import type { EventKind, EventLevel, RunEvent, SubjectKind } from "./types";
 
@@ -20,7 +20,7 @@ export interface Dropped {
 export type FeedRow = { kind: "event"; event: RunEvent } | { kind: "gap"; gap: Dropped };
 
 // what an event is about, as one string. a run event carries the run in
-// `run_id` and leaves `subject` null — the v17 migration says why — so this is
+// `run_id` and leaves `subject` null (the v17 migration says why) so this is
 // where the two become one answer, exactly as `Event::about` does in rust
 export function subjectOf(e: RunEvent): string | null {
   return e.subject ?? e.run_id;

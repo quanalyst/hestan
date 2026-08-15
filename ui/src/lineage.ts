@@ -18,7 +18,7 @@ export const CHAIN_DEPTH = 4;
 
 // the three things a reason can be, which are not the same claim:
 // `changed` is content that provably moved, `pending` is an upstream that is
-// itself stale but has not been rebuilt — so nothing has moved here *yet* —
+// itself stale but has not been rebuilt (so nothing has moved here *yet*)
 // and `absent` is one that has never been built at all
 export type ChainKind = "changed" | "pending" | "absent";
 
@@ -59,8 +59,8 @@ export function downstreamOf(assets: AssetSummary[], name: string): string[] {
 //
 // history is newest first, so that is the *oldest* consecutive entry holding
 // the fingerprint: a rebuild that produced the same bytes is not when it
-// changed. null when the newest entry does not hold it at all — the history
-// was capped, or the value came from somewhere this list cannot see — because
+// changed. null when the newest entry does not hold it at all (the history
+// was capped, or the value came from somewhere this list cannot see) because
 // naming the wrong build is worse than naming none.
 export function whenChanged(
   history: MaterializationEntry[],
@@ -74,7 +74,7 @@ export function whenChanged(
 }
 
 // which of a build's inputs held a different fingerprint than they did for the
-// build before it — the reason that build produced something new. an input
+// build before it: the reason that build produced something new. an input
 // with nothing before it to compare against is not a change: the first
 // recorded build changed nothing, it started everything.
 //

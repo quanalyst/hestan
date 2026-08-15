@@ -64,7 +64,7 @@ function staleTitle(a: AssetSummary): string | undefined {
   if (a.partitions) return `${a.partitions.total} partitions`;
   if (a.reasons.length === 0) return undefined;
   return a.reasons
-    .map((r) => `${r.dep}: ${r.had ? shortHash(r.had) : "—"} -> ${r.now ? shortHash(r.now) : "—"}`)
+    .map((r) => `${r.dep}: ${r.had ? shortHash(r.had) : "none"} -> ${r.now ? shortHash(r.now) : "none"}`)
     .join("\n");
 }
 
@@ -112,7 +112,7 @@ function staleOf(assets: AssetSummary[], node: string): boolean {
 }
 
 // the established shape vocabulary: a solid glyph when everything passed, an
-// × when anything failed, and nothing at all when no check has ever run —
+// × when anything failed, and nothing at all when no check has ever run:
 // an asset without checks should not read as an asset with silent ones
 function Checks({ checks }: { checks: CheckSummary }) {
   const total = checks.passed + checks.failed;
@@ -143,7 +143,7 @@ export default function AssetsPage() {
   const [rowMsg, setRowMsg] = useState<{ asset: string; msg: string } | null>(null);
   const [sensorErr, setSensorErr] = useState<string | null>(null);
   // every control on this page lives in the url, so a filtered, grouped,
-  // sorted view is a link somebody else can open — including the selection,
+  // sorted view is a link somebody else can open, including the selection,
   // which is where a Meta::AssetRef used to point
   const [params, setParams] = useSearchParams();
   const sel = params.get("asset");
@@ -275,7 +275,7 @@ export default function AssetsPage() {
   }));
   const folded = collapseGroups(whole, closed);
   // past the threshold the whole graph is a picture of having a lot of assets
-  // rather than of how they fit together, so it opens focused — on the
+  // rather than of how they fit together, so it opens focused: on the
   // selection, or on the first thing that is stale, which is what anyone
   // opening a graph of three hundred assets came to look at
   const mode = params.get("graph") ?? (folded.length > WHOLE_GRAPH_MAX ? "focus" : "whole");
@@ -306,7 +306,7 @@ export default function AssetsPage() {
       </div>
 
       {assets.length === 0 ? (
-        <p className="muted">no assets registered — declare them with Hestan::assets</p>
+        <p className="muted">no assets registered: declare them with Hestan::assets</p>
       ) : (
         <>
           <h2>
@@ -371,7 +371,7 @@ export default function AssetsPage() {
             {shown.length !== assets.length && (
               <span className="secondary">
                 {" "}
-                — {shown.length} of {assets.length}
+                · {shown.length} of {assets.length}
               </span>
             )}
           </h2>
@@ -480,7 +480,7 @@ export default function AssetsPage() {
                           </span>
                         </td>
                         <td className="muted" title={a.built_at ?? undefined}>
-                          {a.partitions ? "—" : relTime(a.built_at)}
+                          {a.partitions ? "per key" : relTime(a.built_at)}
                         </td>
                         <td>
                           {a.run_id ? (
@@ -492,13 +492,13 @@ export default function AssetsPage() {
                               {shortId(a.run_id)}
                             </Link>
                           ) : (
-                            <span className="muted">{a.built_at ? "probe" : "—"}</span>
+                            <span className="muted">{a.built_at ? "probe" : "none"}</span>
                           )}
                         </td>
                         {anyFreshness && (
                           <td className="muted">
                             {a.freshness === null
-                              ? "—"
+                              ? "none"
                               : a.freshness.late_by_secs !== null
                                 ? `late by ${fmtDuration(a.freshness.late_by_secs * 1000)}`
                                 : `within ${fmtEvery(a.freshness.within_secs)}`}
@@ -508,14 +508,14 @@ export default function AssetsPage() {
                           <td className="mono" title={a.partitions ? coverTitle(a) : undefined}>
                             {a.partitions
                               ? `${a.partitions.materialized}/${a.partitions.total}`
-                              : <span className="muted">—</span>}
+                              : <span className="muted">none</span>}
                           </td>
                         )}
                         <td>
                           <Checks checks={a.checks} />
                         </td>
                         <td className="row-action">
-                          {/* sources are probed, never built — the endpoint 400s */}
+                          {/* sources are probed, never built: the endpoint 400s */}
                           {mayBuild && a.kind !== "source" && (
                             <button
                               className="text-btn"
@@ -592,7 +592,7 @@ export default function AssetsPage() {
                           {current.slice(0, 8)}
                         </Link>
                       ) : (
-                        <span className="muted">—</span>
+                        <span className="muted">none</span>
                       )}
                     </td>
                     <td className="muted" title={b.created_at}>
@@ -642,7 +642,7 @@ export default function AssetsPage() {
                     </td>
                     <td className="mono">{fmtEvery(s.every_secs)}</td>
                     <td className="mono" title={cursor && cursor.length > 24 ? cursor : undefined}>
-                      {cursor === null ? "—" : cursor.length > 24 ? `${cursor.slice(0, 24)}…` : cursor}
+                      {cursor === null ? "none" : cursor.length > 24 ? `${cursor.slice(0, 24)}…` : cursor}
                     </td>
                     <td>
                       {s.last_tick ? (
@@ -656,10 +656,10 @@ export default function AssetsPage() {
                         <span className="muted">no ticks</span>
                       )}
                     </td>
-                    <td className="num">{s.last_tick ? s.last_tick.launched : "—"}</td>
-                    <td className="num">{s.last_tick ? s.last_tick.skipped : "—"}</td>
+                    <td className="num">{s.last_tick ? s.last_tick.launched : "none"}</td>
+                    <td className="num">{s.last_tick ? s.last_tick.skipped : "none"}</td>
                     <td className="num mono">
-                      {s.last_tick ? fmtDuration(s.last_tick.duration_ms) : "—"}
+                      {s.last_tick ? fmtDuration(s.last_tick.duration_ms) : "none"}
                     </td>
                     <td className="muted">
                       {untilTime(s.next_eval)}

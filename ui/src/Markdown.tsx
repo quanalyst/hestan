@@ -2,8 +2,8 @@ import { parseMarkdown } from "./markdown";
 import type { Block, Inline } from "./markdown";
 
 // the parse tree rendered as react elements. every branch below is an element
-// constructor over parsed data — no html string is built anywhere in this file
-// or in markdown.ts — so a `<img onerror=...>` in the source is a text child
+// constructor over parsed data (no html string is built anywhere in this file
+// or in markdown.ts) so a `<img onerror=...>` in the source is a text child
 // react escapes, and the only href that can exist is one linkHref approved.
 // the test asserts both, against the rendered output.
 
