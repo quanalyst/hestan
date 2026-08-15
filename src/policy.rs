@@ -1,17 +1,24 @@
 use std::collections::HashMap;
 use std::fmt;
+use std::sync::Arc;
+use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 
 use crate::asset::{
-    ASSETS_JOB, AssetMeta, AssetRegistry, Mats, Staleness, key_sets, launch_plan, plan_partitions,
-    staleness,
+    ASSETS_JOB, AssetMeta, AssetRegistry, Mats, Staleness, key_sets, launch_plan, mats_map,
+    plan_partitions, staleness,
 };
 use crate::error::Error;
 use crate::executor::Runner;
 use crate::model::{RunTags, Trigger};
 use crate::partition::KeySet;
 use crate::schedule::Cron;
+
+/// how often the deciding process asks every policy whether it wants a build
+/// now. a rule is about staleness or a cron, so a minute of lag on acting is
+/// noise next to a build, and asking harder would only cost database reads.
+const EVERY: Duration = Duration::from_secs(60);
 
 /// when hestan rebuilds an asset on its own, declared with
 /// [`Asset::policy`](crate::Asset::policy).
@@ -425,7 +432,73 @@ pub(crate) fn launch(
         .collect();
     let plan = plan_partitions(reg, mats, &targets, &named)?;
     let run_id = launch_plan(runner, plan, Trigger::Build, tags)?;
+    for want in wants {
+        // after the launch, and best-effort past it: the run exists whatever
+        // the log says about it, and a pass that failed here would launch the
+        // same build again on the next one
+        if let Err(e) = runner
+            .store()
+            .policy_launched(&want.asset, want.rule, &want.keys, &run_id)
+        {
+            tracing::warn!(asset = %want.asset, "policy event write failed: {e}");
+        }
+    }
     Ok(Some(run_id))
+}
+
+/// what a policy-launched run is tagged with: the rules that wanted it, and
+/// the asset when it is the only one, so the asset page finds this run exactly
+/// as it finds a build somebody asked for.
+fn policy_tag(wants: &[Want]) -> RunTags {
+    let mut rules: Vec<&str> = wants.iter().map(|w| w.rule).collect();
+    rules.sort_unstable();
+    rules.dedup();
+    let mut tags = RunTags::from([("policy".to_string(), rules.join(","))]);
+    if let [only] = wants {
+        tags.insert("asset".to_string(), only.asset.clone());
+    }
+    tags
+}
+
+/// one pass of the policy loop: what every policy wants now, launched as one
+/// run. `now` is a parameter so a test can be at 2am.
+pub(crate) fn tick(
+    runner: &Runner,
+    reg: &AssetRegistry,
+    now: DateTime<Utc>,
+) -> Result<Option<String>, Error> {
+    let mats = mats_map(runner.store())?;
+    let wants = Pass::new(reg, &mats, now).wants(None);
+    let launched = launch(runner, reg, &mats, &wants, policy_tag(&wants))?;
+    if let Some(run_id) = &launched {
+        tracing::info!(
+            assets = %wants.iter().map(|w| w.asset.as_str()).collect::<Vec<_>>().join(", "),
+            run = %run_id,
+            "policy build launched"
+        );
+    }
+    Ok(launched)
+}
+
+/// the policy loop: [`tick`] every [`EVERY`], on the process that
+/// [decides](crate::Role), for the same reason one process decides anything.
+///
+/// nothing here queues: a pass that finds a build already running launches
+/// nothing and the next one asks again, of fresher data. a pass that wants
+/// nothing writes nothing, which is what keeps a rule that will never be
+/// satisfied from filling the log with the news that it is still waiting.
+pub(crate) async fn run_policies(runner: Runner, registry: Arc<AssetRegistry>) {
+    if registry.topo().all(|m| m.policy.is_none()) {
+        return;
+    }
+    let mut ticker = tokio::time::interval(EVERY);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        ticker.tick().await;
+        if let Err(e) = tick(&runner, &registry, Utc::now()) {
+            tracing::warn!("policy pass failed: {e}");
+        }
+    }
 }
 
 /// every asset a source nothing has observed is holding back, mapped to that
@@ -456,10 +529,22 @@ fn unobserved_sources(reg: &AssetRegistry, mats: &Mats) -> HashMap<String, Strin
 mod tests {
     use super::*;
     use crate::asset::Asset;
-    use crate::model::Materialization;
+    use crate::model::{Event, EventKind, Materialization, Role, RunStatus, SubjectKind};
     use crate::op::OpCtx;
     use crate::partition::{PartitionMapping, Partitions};
+    use crate::store::{EventQuery, Store};
     use serde_json::{Value, json};
+
+    async fn wait_terminal(runner: &Runner, id: &str) -> RunStatus {
+        for _ in 0..300 {
+            let run = runner.store().run(id).unwrap().unwrap();
+            if !matches!(run.status, RunStatus::Queued | RunStatus::Running) {
+                return run.status;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("run {id} never reached a terminal status");
+    }
 
     fn at(s: &str) -> DateTime<Utc> {
         DateTime::parse_from_rfc3339(s).unwrap().with_timezone(&Utc)
@@ -818,6 +903,220 @@ mod tests {
         assert_eq!(
             Pass::new(&reg, &mats, Utc::now()).verdict(reg.get("daily").unwrap(), Some(&yesterday)),
             Verdict::Build
+        );
+    }
+
+    fn store_with(rows: Vec<(&str, Option<&str>, &str, Value)>) -> Store {
+        let store = Store::open(":memory:").unwrap();
+        for (asset, key, fp, inputs) in rows {
+            store
+                .record_materialization(asset, key, fp, &inputs, None, None, None)
+                .unwrap();
+        }
+        store
+    }
+
+    fn runner_for(reg: &AssetRegistry, store: Store) -> Runner {
+        Runner::new([reg.lower_job().unwrap()], store).unwrap()
+    }
+
+    fn events(store: &Store) -> Vec<Event> {
+        store
+            .event_log(
+                &EventQuery {
+                    kind: Some(EventKind::PolicyLaunched),
+                    ..EventQuery::default()
+                },
+                50,
+            )
+            .unwrap()
+    }
+
+    /// source -> sales, partitioned over three keys, all stale
+    fn sales(policy: AutoPolicy) -> AssetRegistry {
+        let s = source();
+        let sales = Asset::new("sales", |ctx: OpCtx| async move {
+            Ok(json!({ "key": ctx.partition() }))
+        })
+        .from(&s)
+        .partitioned(Partitions::keys(["r1", "r2", "r3"]))
+        .policy(policy);
+        reg(vec![s, sales])
+    }
+
+    // the assets job is shared, so a second build while the first is in flight
+    // would materialize the same asset twice from two plans. the endpoints
+    // answer 409 there; a pass that answered 409 every minute would be a log
+    // nobody reads, so it holds instead and says nothing
+    #[tokio::test]
+    async fn two_passes_while_a_build_runs_launch_one_build() {
+        let reg = sales(AutoPolicy::when_stale());
+        let store = store_with(vec![("s", None, "s1", json!({}))]);
+        // a process that decides and does not execute: the run it launches
+        // stays queued, which is what "a build is in flight" looks like
+        let runner = runner_for(&reg, store.clone()).with_role(Role::Scheduler, 1);
+        let now = at("2026-08-14T09:00:00Z");
+
+        let first = tick(&runner, &reg, now).unwrap();
+        assert!(first.is_some());
+        assert_eq!(
+            tick(&runner, &reg, now).unwrap(),
+            None,
+            "one build, not two"
+        );
+        assert_eq!(tick(&runner, &reg, now).unwrap(), None);
+        let runs = store.runs(None, None, None, None, None, 10).unwrap();
+        assert_eq!(runs.len(), 1);
+        assert_eq!(events(&store).len(), 1, "one launch is one event");
+
+        // and the held passes said nothing at all, which is the point: the
+        // whole log of three passes is that one launch
+        let all = store.event_log(&EventQuery::default(), 50).unwrap();
+        assert_eq!(
+            all.iter()
+                .filter(|e| e.kind == EventKind::PolicyLaunched)
+                .count(),
+            1
+        );
+    }
+
+    // a rule waiting on something that will never arrive must sit quietly: no
+    // run, and no event per pass saying it is still waiting
+    #[tokio::test]
+    async fn a_rule_that_cannot_be_satisfied_launches_nothing_however_often_it_is_asked() {
+        let hours = Asset::new("hours", |_: OpCtx| async { Ok(json!(null)) })
+            .partitioned(Partitions::hourly(format!("{}T12", day(2))));
+        let daily = Asset::new("daily", |_: OpCtx| async { Ok(json!(null)) })
+            .reads(&hours, PartitionMapping::covering())
+            .partitioned(Partitions::daily(day(2)))
+            .policy(AutoPolicy::when_stale().and_upstream_ready());
+        let reg = reg(vec![hours, daily]);
+        let store = Store::open(":memory:").unwrap();
+        let runner = runner_for(&reg, store.clone()).with_role(Role::Scheduler, 1);
+
+        for _ in 0..5 {
+            assert_eq!(tick(&runner, &reg, Utc::now()).unwrap(), None);
+        }
+        assert!(
+            store
+                .runs(None, None, None, None, None, 10)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            store
+                .event_log(&EventQuery::default(), 50)
+                .unwrap()
+                .is_empty(),
+            "five passes of a rule that can never fire wrote something"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_event_says_which_rule_launched_the_build_and_which_keys() {
+        let reg = sales(AutoPolicy::when_missing());
+        let store = store_with(vec![
+            ("s", None, "s1", json!({})),
+            ("sales", Some("r1"), "f1", json!({"s": "s1"})),
+        ]);
+        let runner = runner_for(&reg, store.clone()).with_role(Role::Scheduler, 1);
+        let run_id = tick(&runner, &reg, at("2026-08-14T09:00:00Z"))
+            .unwrap()
+            .expect("two keys have never been built");
+
+        let log = events(&store);
+        assert_eq!(log.len(), 1);
+        let event = &log[0];
+        assert_eq!(event.subject.as_deref(), Some("sales"));
+        assert_eq!(event.subject_kind, SubjectKind::Asset);
+        let data = event.data.clone().unwrap();
+        assert_eq!(data["rule"], json!("missing"));
+        assert_eq!(data["partitions"], json!(["r3", "r2"]));
+        assert_eq!(data["run_id"], json!(run_id));
+        assert!(
+            event.message.contains("2 partitions of sales (missing)"),
+            "{}",
+            event.message
+        );
+
+        // and the run itself carries the rule and the asset, so a run somebody
+        // is looking at says what asked for it
+        let run = store.run(&run_id).unwrap().unwrap();
+        assert_eq!(run.tags["policy"], "missing");
+        assert_eq!(run.tags["asset"], "sales");
+        assert_eq!(run.trigger, Trigger::Build);
+    }
+
+    // the end of the per-key story: what the pass wanted is what the run built
+    #[tokio::test]
+    async fn a_pass_builds_the_keys_that_qualify_and_leaves_the_others_alone() {
+        let reg = sales(AutoPolicy::when_stale());
+        let store = store_with(vec![
+            ("s", None, "s1", json!({})),
+            // r1 read the source as it is; r2 read a fingerprint that has moved
+            ("sales", Some("r1"), "f1", json!({"s": "s1"})),
+            ("sales", Some("r2"), "f2", json!({"s": "s0"})),
+        ]);
+        let runner = runner_for(&reg, store.clone());
+        let run_id = tick(&runner, &reg, at("2026-08-14T09:00:00Z"))
+            .unwrap()
+            .expect("two keys are stale");
+        assert_eq!(wait_terminal(&runner, &run_id).await, RunStatus::Success);
+
+        // r2 and r3 were built by this run; r1 was not touched at all
+        for key in ["r2", "r3"] {
+            let mat = store.materialization("sales", Some(key)).unwrap().unwrap();
+            assert_eq!(mat.run_id.as_deref(), Some(run_id.as_str()));
+            assert_eq!(mat.value, Some(json!({ "key": key })));
+        }
+        let r1 = store.materializations("sales", Some("r1"), 10).unwrap();
+        assert_eq!(r1.len(), 1, "a fresh key was rebuilt");
+        assert_eq!(r1[0].mat.fingerprint, "f1");
+    }
+
+    // and the rule's keys are the run's keys, not whatever a build that named
+    // none of them would have chosen: r2 is stale, and stale is not this rule
+    #[tokio::test]
+    async fn a_missing_rule_builds_only_the_key_that_has_never_been_built() {
+        let reg = sales(AutoPolicy::when_missing());
+        let store = store_with(vec![
+            ("s", None, "s1", json!({})),
+            ("sales", Some("r1"), "f1", json!({"s": "s1"})),
+            ("sales", Some("r2"), "f2", json!({"s": "s0"})),
+        ]);
+        let runner = runner_for(&reg, store.clone());
+        let run_id = tick(&runner, &reg, at("2026-08-14T09:00:00Z"))
+            .unwrap()
+            .expect("r3 has never been built");
+        assert_eq!(wait_terminal(&runner, &run_id).await, RunStatus::Success);
+
+        let built = store.materialization("sales", Some("r3")).unwrap().unwrap();
+        assert_eq!(built.run_id.as_deref(), Some(run_id.as_str()));
+        for key in ["r1", "r2"] {
+            assert_eq!(
+                store
+                    .materializations("sales", Some(key), 10)
+                    .unwrap()
+                    .len(),
+                1,
+                "{key} was rebuilt by a rule that is only about missing keys"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_registry_with_no_policy_launches_nothing() {
+        let s = source();
+        let a = body("a").from(&s);
+        let reg = reg(vec![s, a]);
+        let store = store_with(vec![("s", None, "s1", json!({}))]);
+        let runner = runner_for(&reg, store.clone()).with_role(Role::Scheduler, 1);
+        assert_eq!(tick(&runner, &reg, Utc::now()).unwrap(), None);
+        assert!(
+            store
+                .runs(None, None, None, None, None, 10)
+                .unwrap()
+                .is_empty()
         );
     }
 

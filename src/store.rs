@@ -3640,6 +3640,38 @@ impl Store {
         Ok(())
     }
 
+    /// record that an [automation policy](crate::AutoPolicy) launched a build
+    /// of `asset`, with the rule that fired and the keys it asked for.
+    ///
+    /// one event per asset rather than one per key: a pass that wants a month
+    /// of a daily set is one decision, and thirty rows saying so is a log
+    /// nobody reads. the run it launched says `build` like every other build,
+    /// which is what it is; this is what said to.
+    pub(crate) fn policy_launched(
+        &self,
+        asset: &str,
+        rule: &str,
+        partitions: &[String],
+        run_id: &str,
+    ) -> Result<(), Error> {
+        let message = match partitions.len() {
+            0 => format!("policy launched a build of {asset} ({rule})"),
+            1 => format!(
+                "policy launched a build of {asset}[{}] ({rule})",
+                partitions[0]
+            ),
+            n => format!("policy launched a build of {n} partitions of {asset} ({rule})"),
+        };
+        let event = NewEvent::about(
+            SubjectKind::Asset,
+            asset,
+            EventKind::PolicyLaunched,
+            message,
+        )
+        .data(json!({ "rule": rule, "partitions": partitions, "run_id": run_id }));
+        write_event(&mut self.conn(), &event, Utc::now())
+    }
+
     /// the current materialization of one `(asset, partition)` pair: the newest
     /// entry of its history, which is what staleness, seeding and the assets
     /// api all read. `partition` is `None` for an unpartitioned asset.

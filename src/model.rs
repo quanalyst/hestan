@@ -247,6 +247,10 @@ pub enum EventKind {
     TypeCheckFailed,
     /// an asset (or one partition of one) was built and recorded.
     AssetMaterialized,
+    /// an [automation policy](crate::AutoPolicy) launched a build, and the
+    /// payload says which rule fired and which keys it asked for. one per asset
+    /// in the plan, since one run can carry several.
+    PolicyLaunched,
     /// an [asset check](crate::AssetCheck) passed.
     CheckPassed,
     /// an asset check failed. its level follows the check's
@@ -366,6 +370,7 @@ open_enum!(EventKind {
     OpCanceled => "op_canceled",
     TypeCheckFailed => "type_check_failed",
     AssetMaterialized => "asset_materialized",
+    PolicyLaunched => "policy_launched",
     CheckPassed => "check_passed",
     CheckFailed => "check_failed",
     ScheduleFired => "schedule_fired",

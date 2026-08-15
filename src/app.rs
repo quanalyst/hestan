@@ -1045,6 +1045,13 @@ impl Hestan {
                 built.registry.clone(),
                 Arc::new(built.late_hooks),
             )));
+            // the policy pass: which assets a declared policy wants built now,
+            // beside the checker that reads the same staleness to say what is
+            // late. one process decides, so one process launches
+            loops.push(tokio::spawn(crate::policy::run_policies(
+                built.runner.clone(),
+                built.registry.clone(),
+            )));
             // the sweeper: what a policy set at boot means three months later
             loops.push(tokio::spawn(retention::run_sweeper(
                 built.runner.clone(),
