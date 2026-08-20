@@ -18,6 +18,9 @@ import {
   sortAssets,
 } from "./catalog";
 import type { Dir, SortKey, StateFilter } from "./catalog";
+import { HUE_MODES, hueMode, legendFor, originWords, shownAndMore, stripesFor } from "./colour";
+import type { HueMode, Stripe } from "./colour";
+import Swatch, { at } from "./Swatch";
 import { FOCUS_MAX, WHOLE_GRAPH_MAX, collapseGroups, groupNode, neighbourhood } from "./dag";
 import type {
   AssetSummary,
@@ -69,10 +72,12 @@ function staleTitle(a: AssetSummary): string | undefined {
     .join("\n");
 }
 
-// inside a group the prefix is the heading, so repeating it on every row is
-// noise; an ungrouped row keeps its whole name
-const leafName = (name: string, prefix: string) =>
-  prefix === "" ? name : name.slice(prefix.length + 1);
+// inside a group the heading already says the group, so a name that repeats it
+// as a prefix drops it. a name that has nothing to do with its declared group
+// keeps every character: cutting one off it would be a lie about what it is
+// called, and the name is the thing you send somebody
+const leafName = (name: string, group: string) =>
+  group !== "" && name.startsWith(`${group}${SEPARATOR}`) ? name.slice(group.length + 1) : name;
 
 const coverTitle = (a: AssetSummary) =>
   a.partitions === null
@@ -107,9 +112,46 @@ function Column({
 
 // a node's staleness, whether it is one asset or a folded group of them
 function staleOf(assets: AssetSummary[], node: string): boolean {
-  const prefix = node.endsWith(SEPARATOR) ? node.slice(0, -1) : null;
-  if (prefix === null) return assets.some((a) => a.name === node && a.stale);
-  return assets.some((a) => groupOf(a.name) === prefix && a.stale);
+  const group = node.endsWith(SEPARATOR) ? node.slice(0, -1) : null;
+  if (group === null) return assets.some((a) => a.name === node && a.stale);
+  return assets.some((a) => groupOf(a) === group && a.stale);
+}
+
+// what each hue in the view stands for, in words, beside the view. without
+// this a colour is decoration, and with it somebody who cannot tell two hues
+// apart still has every name on the same screen
+function HueLegend({ stripes, says }: { stripes: Stripe[]; says: string }) {
+  if (stripes.length === 0) return null;
+  return (
+    <div className="hue-legend">
+      <span className="filter-label">{says}</span>
+      {stripes.map((stripe) => (
+        <span key={stripe.label} className="hue-legend-item">
+          <span className="swatch" aria-hidden="true">
+            <span className="swatch-stripe" style={at(stripe.hue)} />
+          </span>
+          {stripe.label}
+        </span>
+      ))}
+    </div>
+  );
+}
+
+// what a row descends from, in words with the colour beside them rather than
+// instead of them. the names past the cap are in the legend and on the
+// asset's own page
+function OriginCell({ asset, mode }: { asset: AssetSummary; mode: HueMode }) {
+  const words = originWords(asset);
+  const { shown, more } = shownAndMore(words.map((label) => ({ label, hue: 0 })));
+  return (
+    <span className="origin-cell" title={words.join(", ")}>
+      <Swatch stripes={stripesFor(asset, mode)} />
+      <span className="muted">
+        {shown.map((s) => s.label).join(", ")}
+        {more > 0 && ` +${more}`}
+      </span>
+    </span>
+  );
 }
 
 // the established shape vocabulary: a solid glyph when everything passed, an
@@ -152,6 +194,10 @@ export default function AssetsPage() {
   const stateFilter = (params.get("state") ?? "all") as StateFilter;
   const sortKey = (params.get("sort") ?? "name") as SortKey;
   const dir = (params.get("dir") ?? "asc") as Dir;
+  // which of the two things a hue may mean here, or neither. in the url like
+  // every other view state, so a coloured view is a link
+  const colour = hueMode(params.get("colour"));
+  const groupFilter = params.get("group");
   // one hop is what feeds it and what it feeds, which is the question that
   // brought you to a focused graph; two is already most of a wide graph
   const depth = Number(params.get("depth") ?? 1);
@@ -256,15 +302,22 @@ export default function AssetsPage() {
 
   const anyStale = assets.some((a) => a.stale);
   const selected = assets.find((a) => a.name === sel) ?? null;
-  const shown = sortAssets(filterAssets(assets, query, stateFilter), sortKey, dir);
+  const shown = sortAssets(
+    filterAssets(assets, query, stateFilter, groupFilter),
+    sortKey,
+    dir,
+  );
   const groups = groupAssets(shown);
   // the fold chips are about the registry, not about what survived a filter:
   // a group filtered down to nothing still has a name and still folds
-  const allGroups = groupAssets(assets).filter((g) => g.prefix !== "");
+  const allGroups = groupAssets(assets).filter((g) => g.name !== "");
   // a column only earns its width where something fills it
   const anyFreshness = assets.some((a) => a.freshness !== null);
   const anyPartitioned = assets.some((a) => a.partitions !== null);
-  const columns = 6 + Number(anyFreshness) + Number(anyPartitioned);
+  const anyOrigin = assets.some((a) => a.provenance.length > 0);
+  const columns = 6 + Number(anyFreshness) + Number(anyPartitioned) + Number(anyOrigin);
+  // what the colours in this view stand for, named beside them
+  const legend = legendFor(assets, colour);
 
   // the graph draws the whole registry rather than the filtered rows: what
   // feeds a thing does not stop mattering because it was filtered out. the
@@ -273,6 +326,8 @@ export default function AssetsPage() {
     name: a.name,
     deps: a.deps,
     note: a.kind === "source" ? "source" : undefined,
+    group: a.group,
+    hues: stripesFor(a, colour),
   }));
   const folded = collapseGroups(whole, closed);
   // past the threshold the whole graph is a picture of having a lot of assets
@@ -288,8 +343,8 @@ export default function AssetsPage() {
     // a folded group is stale if anything in it is: the one claim that is
     // true of the group rather than of one of its members
     ...groupAssets(assets)
-      .filter((g) => g.prefix !== "" && closed.has(g.prefix))
-      .map((g) => [groupNode(g.prefix), g.assets.some((a) => a.stale) ? "stale" : "fresh"] as const),
+      .filter((g) => g.name !== "" && closed.has(g.name))
+      .map((g) => [groupNode(g.name), g.assets.some((a) => a.stale) ? "stale" : "fresh"] as const),
   ]);
 
   return (
@@ -336,21 +391,38 @@ export default function AssetsPage() {
                 ))}
               </span>
             )}
+            {/* one meaning at a time: two hue meanings at once is noise, and
+                off is the proof that neither is carrying anything alone */}
+            <span className="log-filter">
+              {HUE_MODES.map((m) => (
+                <button
+                  key={m}
+                  className={colour === m ? "text-btn active" : "text-btn"}
+                  onClick={() => set({ colour: m })}
+                >
+                  {m === "off" ? "no colour" : `by ${m}`}
+                </button>
+              ))}
+            </span>
           </h2>
           {allGroups.length > 0 && (
             <div className="group-chips">
               <span className="filter-label">fold</span>
               {allGroups.map((g) => (
                 <button
-                  key={g.prefix}
-                  className={closed.has(g.prefix) ? "text-btn active" : "text-btn"}
-                  onClick={() => toggleGroup(g.prefix)}
+                  key={g.name}
+                  className={closed.has(g.name) ? "text-btn active" : "text-btn"}
+                  onClick={() => toggleGroup(g.name)}
                 >
-                  {g.prefix}/
+                  {g.name}/
                 </button>
               ))}
             </div>
           )}
+          <HueLegend
+            stripes={legend}
+            says={colour === "group" ? "group" : "descends from"}
+          />
           <DagView
             label="asset dependency graph"
             nodes={nodes}
@@ -389,6 +461,26 @@ export default function AssetsPage() {
                 </button>
               ))}
             </span>
+            {allGroups.length > 0 && (
+              <span className="filter-group">
+                <span className="filter-label">group</span>
+                <button
+                  className={groupFilter === null ? "text-btn active" : "text-btn"}
+                  onClick={() => set({ group: null })}
+                >
+                  all
+                </button>
+                {allGroups.map((g) => (
+                  <button
+                    key={g.name}
+                    className={groupFilter === g.name ? "text-btn active" : "text-btn"}
+                    onClick={() => set({ group: groupFilter === g.name ? null : g.name })}
+                  >
+                    {g.name}
+                  </button>
+                ))}
+              </span>
+            )}
             <span className="filter-group">
               <span className="filter-label">find</span>
               <input
@@ -430,41 +522,45 @@ export default function AssetsPage() {
                       onSort={sortBy}
                     />
                   )}
+                  {anyOrigin && <th>descends from</th>}
                   <th>checks</th>
                   <th />
                 </tr>
               </thead>
               {groups.map((g) => (
-                <tbody key={g.prefix}>
-                  {/* the unprefixed assets are a heading too, or the first of
+                <tbody key={g.name}>
+                  {/* the ungrouped assets are a heading too, or the first of
                       them reads as the last row of the group above */}
-                  {groups.length > 1 && g.prefix === "" && (
+                  {groups.length > 1 && g.name === "" && (
                     <tr className="group-row plain-row">
                       <td colSpan={columns}>
                         <span className="group-mark" aria-hidden="true" />
-                        <span className="muted">no prefix · {g.assets.length}</span>
+                        <span className="muted">no group · {g.assets.length}</span>
                       </td>
                     </tr>
                   )}
-                  {g.prefix !== "" && (
-                    <tr className="group-row" onClick={() => toggleGroup(g.prefix)}>
+                  {g.name !== "" && (
+                    <tr className="group-row" onClick={() => toggleGroup(g.name)}>
                       <td colSpan={columns}>
                         <span className="group-mark" aria-hidden="true">
-                          {closed.has(g.prefix) ? "▸" : "▾"}
+                          {closed.has(g.name) ? "▸" : "▾"}
                         </span>
-                        {g.prefix}
+                        {/* the colour sits beside the name it stands for, so
+                            the heading is the legend for its own section */}
+                        <Swatch stripes={stripesFor(g.assets[0], colour === "group" ? "group" : "off")} />
+                        {g.name}
                         <span className="muted"> · {g.assets.length}</span>
                       </td>
                     </tr>
                   )}
-                  {(g.prefix === "" || !closed.has(g.prefix)) &&
+                  {(g.name === "" || !closed.has(g.name)) &&
                     g.assets.map((a) => (
                       <tr key={a.name} onClick={() => select(a.name)}>
                         <td>
                           {/* the row opens the panel; the name is the permanent
                               address, which is the thing you send somebody */}
                           <Link to={assetPath(a.name)} onClick={(e) => e.stopPropagation()}>
-                            {leafName(a.name, g.prefix)}
+                            {leafName(a.name, g.name)}
                           </Link>
                           {a.kind === "source" && <span className="tag">source</span>}
                           {a.policy && (
@@ -514,6 +610,11 @@ export default function AssetsPage() {
                             {a.partitions
                               ? `${a.partitions.materialized}/${a.partitions.total}`
                               : <span className="muted">none</span>}
+                          </td>
+                        )}
+                        {anyOrigin && (
+                          <td>
+                            <OriginCell asset={a} mode={colour === "origin" ? "origin" : "off"} />
                           </td>
                         )}
                         <td>

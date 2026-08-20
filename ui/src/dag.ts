@@ -8,6 +8,7 @@
 // these stay testable.
 import type { DagNode } from "./DagView";
 import { SEPARATOR } from "./catalog";
+import type { Stripe } from "./colour";
 
 // past this many nodes the whole graph is a picture of having a lot of assets
 // rather than of how they fit together, so the view opens focused instead.
@@ -60,20 +61,38 @@ export function neighbourhood(
 }
 
 // the name a folded group draws under. the trailing separator is the point:
-// `sales/` is visibly a group and could not collide with an asset name, which
-// has to have something after the separator to have a prefix at all
-export const groupNode = (prefix: string) => `${prefix}${SEPARATOR}`;
+// `sales/` is visibly a group rather than an asset. a group name may not
+// contain the separator (the build refuses one that does), so the fold never
+// invents a name with two of them in it, and an asset that resolved into the
+// group by its name prefix has something after the separator and so is not
+// `sales/` either
+export const groupNode = (group: string) => `${group}${SEPARATOR}`;
 
-// fold every named prefix into one node, with the edges that crossed into or
+// fold every named group into one node, with the edges that crossed into or
 // out of the group rewired to it. an edge that was inside the group is gone,
 // which is the whole point: what you wanted to see was the group's own place
-// in the graph
+// in the graph.
+//
+// the group is the one a node declares, which is the answer the api resolved,
+// rather than a prefix sliced off the name here. a node with no group of its
+// own (an op, which is what the other graphs in this ui draw) folds into
+// nothing
+// what a folded node is coloured by: every label its members carry, once each,
+// in name order. under `group` that is one label, since they share a group;
+// under `origin` it is everything the group descends from, which is the claim
+// the folded node can honestly make
+function mergeHues(into: Stripe[] | undefined, from: Stripe[] | undefined): Stripe[] {
+  const held = new Map((into ?? []).map((s) => [s.label, s]));
+  for (const s of from ?? []) held.set(s.label, s);
+  return [...held.values()].sort((a, b) => a.label.localeCompare(b.label));
+}
+
 export function collapseGroups(nodes: DagNode[], collapsed: Set<string>): DagNode[] {
   if (collapsed.size === 0) return nodes;
+  const groups = new Map(nodes.map((n) => [n.name, n.group ?? null]));
   const fold = (name: string) => {
-    const cut = name.indexOf(SEPARATOR);
-    const prefix = cut < 0 ? null : name.slice(0, cut);
-    return prefix !== null && collapsed.has(prefix) ? groupNode(prefix) : name;
+    const group = groups.get(name) ?? null;
+    return group !== null && collapsed.has(group) ? groupNode(group) : name;
   };
   const held = new Map<string, DagNode>();
   const counts = new Map<string, number>();
@@ -88,13 +107,18 @@ export function collapseGroups(nodes: DagNode[], collapsed: Set<string>): DagNod
       // them, so it carries the count instead, and the names it swallowed, so
       // a search for one of them still finds where it went
       const node =
-        name === n.name ? { ...n, deps } : { name, deps, badge: "×1", find: n.name };
+        name === n.name
+          ? { ...n, deps }
+          : // the folded node stands for the group, so it carries what its
+            // members are coloured by rather than one member's share of it
+            { name, deps, group: n.group, hues: n.hues, badge: "×1", find: n.name };
       held.set(name, node);
       out.push(node);
     } else {
       group.deps = [...new Set([...group.deps, ...deps])];
       group.badge = `×${counts.get(name)}`;
       group.find = `${group.find ?? ""} ${n.name}`;
+      group.hues = mergeHues(group.hues, n.hues);
     }
   }
   return out;

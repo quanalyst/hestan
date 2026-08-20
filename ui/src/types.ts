@@ -493,6 +493,15 @@ export interface PolicyWait {
 
 export interface AssetSummary {
   name: string;
+  // where it belongs: what it declared, else the part of the name before the
+  // first "/", else null for an asset in no group at all
+  group: string | null;
+  // and the angle that group is drawn at; null wherever the group is
+  group_hue: number | null;
+  // where it came from: the source groups it descends from, sorted by name.
+  // a source's own origin is itself. empty is a real answer and means no
+  // source is upstream of it
+  provenance: Origin[];
   kind: "source" | "derived";
   deps: string[];
   // whether hestan rebuilds this one itself, which is what a policy says
@@ -517,6 +526,14 @@ export interface AssetSummary {
   // stale and late are different claims: stale means a dep moved, late means
   // time passed. null unless a policy was declared
   freshness: Freshness | null;
+}
+
+// one source group an asset descends from, and the hue the server picked for
+// it. a hue rather than a colour: the lightness that is legible depends on the
+// theme, which is this end's business
+export interface Origin {
+  name: string;
+  hue: number;
 }
 
 export interface PartitionCounts {

@@ -1,5 +1,8 @@
+import { shownAndMore } from "./colour";
+import type { Stripe } from "./colour";
 import { GlyphShape } from "./StatusGlyph";
 import type { Status } from "./StatusGlyph";
+import { at } from "./Swatch";
 import type { OpStatus } from "./types";
 
 const PAD_X = 14;
@@ -24,6 +27,14 @@ export interface DagNode {
   // extra text a search should find this node by, for a node that stands for
   // several things: a folded group is findable by what is inside it
   find?: string;
+  // the group this node belongs to, which is what `collapseGroups` folds by.
+  // absent on an op, which belongs to no asset group
+  group?: string | null;
+  // what it is coloured by, already decided by the caller: one stripe under
+  // `group`, one per origin under `origin`, none at all with colour off. the
+  // labels are named in the legend beside the graph, so the hue is never the
+  // only thing saying which
+  hues?: Stripe[];
 }
 
 // "absent" is a node a subset run never contained: no status to claim, no glyph
@@ -31,6 +42,19 @@ export type NodeStatus = OpStatus | "fresh" | "stale" | "absent";
 
 const glyphFor = (st: Exclude<NodeStatus, "absent">): Status =>
   st === "fresh" ? "success" : st === "stale" ? "pending" : st;
+
+// a stripe and the gap after it, and the room "+k" needs past the cap
+const STRIPE_W = 4;
+const STRIPE_GAP = 2;
+const MORE_W = 15;
+
+// how much of a node's width its swatch takes, which is nothing at all where
+// there is no swatch: colour off leaves the layout exactly as it was
+function swatchWidth(node: DagNode): number {
+  const { shown, more } = shownAndMore(node.hues ?? []);
+  if (shown.length === 0) return 0;
+  return shown.length * (STRIPE_W + STRIPE_GAP) + (more > 0 ? MORE_W : 0) + 4;
+}
 
 // ops flattened out of a graph instance are named "{instance}.{inner}", so
 // everything up to the last dot is the group this node belongs to
@@ -111,7 +135,7 @@ export default function DagView({
       Math.round(n.name.length * 7.5) + glyphW + badge,
       sub ? Math.round(sub.length * 5.6) : 0,
     );
-    return Math.max(72, text + PAD_X * 2);
+    return Math.max(72, text + swatchWidth(n) + PAD_X * 2);
   };
   const colW = cols.map((c) => Math.max(...c.map(width)));
   const colX: number[] = [];
@@ -158,6 +182,8 @@ export default function DagView({
         )}
         {[...placed.values()].map(({ node, x: nx, y, w }) => {
           const st = statusOf(node);
+          const swatch = shownAndMore(node.hues ?? []);
+          const textX = nx + PAD_X + swatchWidth(node) + glyphW;
           const labelCy = statuses ? y + LABEL_ROW_Y : y + nodeH / 2;
           const hit = needle !== "" && hay(node).includes(needle);
           const cls =
@@ -174,20 +200,47 @@ export default function DagView({
           return (
             <g key={node.name} className={cls} onClick={onSelect ? () => onSelect(node.name) : undefined}>
               {node.output_type && <title>{`${node.name} -> ${node.output_type}`}</title>}
+              {!node.output_type && node.hues && node.hues.length > 0 && (
+                <title>{`${node.name} · ${node.hues.map((h) => h.label).join(", ")}`}</title>
+              )}
               <rect className="dag-node" x={nx} y={y} width={w} height={nodeH} rx={4} />
+              {/* one stripe per label, side by side and never blended: two
+                  hues averaged make a third that stands for nothing */}
+              {swatch.shown.map((stripe, i) => (
+                <rect
+                  key={stripe.label}
+                  className="dag-swatch"
+                  style={at(stripe.hue)}
+                  x={nx + PAD_X + i * (STRIPE_W + STRIPE_GAP)}
+                  y={labelCy - 6}
+                  width={STRIPE_W}
+                  height={12}
+                  rx={1}
+                />
+              ))}
+              {swatch.more > 0 && (
+                <text
+                  className="dag-badge"
+                  x={nx + PAD_X + swatch.shown.length * (STRIPE_W + STRIPE_GAP)}
+                  y={labelCy}
+                  dominantBaseline="central"
+                >
+                  +{swatch.more}
+                </text>
+              )}
               {st && st !== "absent" && (
-                <g transform={`translate(${nx + PAD_X + 5}, ${labelCy})`}>
+                <g transform={`translate(${nx + PAD_X + swatchWidth(node) + 5}, ${labelCy})`}>
                   <GlyphShape status={glyphFor(st)} />
                 </g>
               )}
-              <text className="dag-label" x={nx + PAD_X + glyphW} y={labelCy} dominantBaseline="central">
+              <text className="dag-label" x={textX} y={labelCy} dominantBaseline="central">
                 {/* a graph instance's ops share a prefix; muting it groups them by eye */}
                 {prefixOf(node.name) && <tspan className="dag-prefix">{prefixOf(node.name)}</tspan>}
                 {leafOf(node.name)}
                 {node.badge && <tspan className="dag-badge"> {node.badge}</tspan>}
               </text>
               {st && (
-                <text className="dag-status" x={nx + PAD_X + glyphW} y={y + STATUS_ROW_Y} dominantBaseline="central">
+                <text className="dag-status" x={textX} y={y + STATUS_ROW_Y} dominantBaseline="central">
                   {subOf(node)}
                 </text>
               )}

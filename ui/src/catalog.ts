@@ -7,8 +7,9 @@
 // stops being possible.
 import type { AssetPolicy, AssetSummary } from "./types";
 
-// the separator a name uses to say which group it is in. one character, and
-// the one every catalog in the world already uses
+// the separator a folded group node's name ends in. it is also the character a
+// name falls back to when nothing declared a group, but that fallback is the
+// server's to apply: what arrives here is already resolved
 export const SEPARATOR = "/";
 
 export type StateFilter = "all" | "fresh" | "stale" | "never" | "failed";
@@ -20,8 +21,8 @@ export type SortKey = "name" | "state" | "built" | "freshness" | "coverage";
 export type Dir = "asc" | "desc";
 
 export interface Group {
-  // "" for the assets whose names carry no separator at all
-  prefix: string;
+  // "" for the assets that are in no group at all
+  name: string;
   assets: AssetSummary[];
 }
 
@@ -60,43 +61,48 @@ export function matchesState(a: AssetSummary, filter: StateFilter): boolean {
 }
 
 // substring on the name, case-insensitively, as you type. no fuzzy matching:
-// the names are a namespace, and `sales` should not find `stale_orders`
+// the names are a namespace, and `sales` should not find `stale_orders`.
+// `group` is exact and is a different question from the search: it is which
+// group, not which letters
 export function filterAssets(
   assets: AssetSummary[],
   query: string,
   filter: StateFilter,
+  group: string | null = null,
 ): AssetSummary[] {
   const needle = query.trim().toLowerCase();
   return assets.filter(
-    (a) => matchesState(a, filter) && (needle === "" || a.name.toLowerCase().includes(needle)),
+    (a) =>
+      matchesState(a, filter) &&
+      (group === null || a.group === group) &&
+      (needle === "" || a.name.toLowerCase().includes(needle)),
   );
 }
 
-// the group a name declares by carrying a separator: everything up to the
-// first one. `sales/orders` and `sales/returns` are one group; `heartbeat` is
-// in no group at all
-export function groupOf(name: string): string {
-  const cut = name.indexOf(SEPARATOR);
-  return cut < 0 ? "" : name.slice(0, cut);
+// the group an asset belongs to, which the api resolved: what it declared,
+// else the part of its name before the first separator, else none. "" here is
+// "no group", which is the bucket the ungrouped ones share
+export function groupOf(a: AssetSummary): string {
+  return a.group ?? "";
 }
 
 // groups in the order their first member appears, so the api's dependency
-// order still shows through, except the unprefixed ones, which go last:
-// sitting between two named groups they read as belonging to one of them.
-// with no separator anywhere there is no grouping to be had, and inventing
-// one out of common substrings would be a guess
+// order still shows through, except the ungrouped ones, which go last: sitting
+// between two named groups they read as belonging to one of them. with no
+// group anywhere there is no grouping to be had, and inventing one out of
+// common substrings would be a guess
 export function groupAssets(assets: AssetSummary[]): Group[] {
-  if (!assets.some((a) => a.name.includes(SEPARATOR))) {
-    return assets.length === 0 ? [] : [{ prefix: "", assets }];
+  if (!assets.some((a) => a.group !== null)) {
+    return assets.length === 0 ? [] : [{ name: "", assets }];
   }
   const groups: Group[] = [];
   for (const a of assets) {
-    const prefix = groupOf(a.name);
-    const held = groups.find((g) => g.prefix === prefix);
+    const name = groupOf(a);
+    const held = groups.find((g) => g.name === name);
     if (held) held.assets.push(a);
-    else groups.push({ prefix, assets: [a] });
+    else groups.push({ name, assets: [a] });
   }
-  return groups.sort((a, b) => Number(a.prefix === "") - Number(b.prefix === ""));
+  return groups.sort((a, b) => Number(a.name === "") - Number(b.name === ""));
 }
 
 const stateRank = (a: AssetSummary) => (neverBuilt(a) ? 2 : a.stale ? 1 : 0);

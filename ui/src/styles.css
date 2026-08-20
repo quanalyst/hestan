@@ -11,6 +11,17 @@
   --mark: #1a1a1a;
   --mark-muted: #6e6e6e;
   --dim: 0.55; /* recedes a mark without changing its ink; DIM mirrors it in tsx */
+
+  /* the one channel here that is not grey. a hue means where an asset belongs
+     or where it came from, and never how it is doing: shape carries state, and
+     that is exactly what leaves colour free. the angle arrives per element in
+     --h; saturation and lightness are pinned per theme, because what is
+     legible depends on the ground and the server does not know the theme.
+     checked across all 360 angles against both grounds of this theme: the
+     worst is 3.13:1 at hue 60 on --page, which clears the 3:1 a non-text mark
+     needs, and at 60% saturation none of them can be read as a status grey */
+  --hue-sat: 60%;
+  --hue-light: 36%;
 }
 
 @media (prefers-color-scheme: dark) {
@@ -25,6 +36,12 @@
     --wash: rgba(255, 255, 255, 0.05);
     --mark: #e8e8e8;
     --mark-muted: #8c8c8c;
+    /* the same angles, lifted off a dark ground: worst 5.02:1 at hue 240 on
+       --surface, checked the same way. the saturation happens to be the same
+       number on both grounds, and it is written out rather than inherited so
+       that changing one theme cannot quietly change the other */
+    --hue-sat: 60%;
+    --hue-light: 68%;
   }
 }
 
@@ -1368,6 +1385,67 @@ tbody tr.plain-row {
 
 tbody tr.plain-row:hover {
   background: none;
+}
+
+/* a swatch: one stripe per label, side by side. **never blended**, because an
+   average of two hues is a third hue standing for a source nobody has */
+.swatch {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  vertical-align: -1px;
+}
+
+.swatch-stripe {
+  display: block;
+  width: 4px;
+  height: 11px;
+  border-radius: 1px;
+  background: hsl(var(--h) var(--hue-sat) var(--hue-light));
+}
+
+.swatch-more {
+  color: var(--muted);
+  font-size: 10px;
+}
+
+/* what each hue is, in words, on the same screen as the hues. without it a
+   colour is decoration */
+.hue-legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 18px;
+  margin: 2px 0 14px;
+  font-size: 12px;
+  color: var(--ink2);
+}
+
+.hue-legend-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+/* what an asset is ultimately made of, under its lineage rather than in it */
+.origin-line {
+  display: block;
+  margin-top: 16px;
+}
+
+/* the origin cell: names first, colour beside them */
+.origin-cell {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+}
+
+/* a group heading carries its own colour, right beside the name it stands for */
+.group-row .swatch {
+  margin-right: 8px;
+}
+
+.dag-swatch {
+  fill: hsl(var(--h) var(--hue-sat) var(--hue-light));
 }
 
 .group-chips {

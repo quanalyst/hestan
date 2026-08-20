@@ -3,6 +3,7 @@
 import "./activity.test";
 import "./backfill.test";
 import "./catalog.test";
+import "./colour.test";
 import "./fanout.test";
 import "./lineage.test";
 import "./log.test";
@@ -11,3 +12,4 @@ import "./metalist.test";
 import "./rate.test";
 import "./replay.test";
 import "./role.test";
+import "./swatch.test";

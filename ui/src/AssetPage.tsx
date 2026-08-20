@@ -5,6 +5,7 @@ import AssetDetail, { StateGlyph } from "./AssetDetail";
 import BackfillLauncher from "./BackfillLauncher";
 import type { KeyRange } from "./backfill";
 import { policySays } from "./catalog";
+import { originWords } from "./colour";
 import { CHAIN_DEPTH, downstreamOf, linkKind, movedInputs, whenChanged } from "./lineage";
 import type { ChainLink } from "./lineage";
 import { useMay } from "./role";
@@ -325,8 +326,14 @@ function AssetView({ name }: { name: string }) {
               all assets
             </Link>
           </h1>
+          {/* no colour on this page, on purpose: one asset is nothing to tell
+              apart from anything, and a group hue beside an origin hue would
+              be two meanings of one channel on one screen. the names are the
+              information, so the names are what is here */}
           <p className="muted">
             {asset.kind}
+            {" · "}
+            {asset.group === null ? "in no group" : `in ${asset.group}`}
             {" · "}
             <span title={asset.built_at ?? undefined}>{built}</span>
             {asset.run_id && (
@@ -402,6 +409,11 @@ function AssetView({ name }: { name: string }) {
         <LineageList label="upstream" names={upstream} empty="nothing: it reads the outside world" />
         <LineageList label="downstream" names={downstream} empty="nothing reads it" />
       </div>
+      {/* the deps say what it reads; this says what it is ultimately made of,
+          which is a different question once there are four hops between the
+          two. a source stands for itself here */}
+      <div className="filter-label origin-line">descends from</div>
+      <p className="muted">{originWords(asset).join(", ")}</p>
 
       <h2>detail</h2>
       <AssetDetail

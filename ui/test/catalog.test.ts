@@ -14,7 +14,7 @@ import {
 } from "../src/catalog";
 import { collapseGroups, neighbourhood } from "../src/dag";
 import type { DagNode } from "../src/DagView";
-import type { AssetPolicy, AssetSummary, PartitionCounts } from "../src/types";
+import type { AssetPolicy, AssetSummary, Origin, PartitionCounts } from "../src/types";
 
 interface Over {
   stale?: boolean;
@@ -23,10 +23,24 @@ interface Over {
   partitions?: PartitionCounts | null;
   within_secs?: number;
   last_success?: string | null;
+  group?: string | null;
+  provenance?: Origin[];
 }
 
-const asset = (name: string, over: Over = {}): AssetSummary => ({
+// the group falls back to the name prefix on the way out of the api, not here.
+// this fixture stands in for what the api sent, so it applies the same
+// fallback: everything before the first separator, and nothing where there is
+// nothing before it
+const prefixGroup = (name: string): string | null => {
+  const cut = name.indexOf("/");
+  return cut > 0 ? name.slice(0, cut) : null;
+};
+
+export const asset = (name: string, over: Over = {}): AssetSummary => ({
   name,
+  group: over.group === undefined ? prefixGroup(name) : over.group,
+  group_hue: 200,
+  provenance: over.provenance ?? [],
   kind: "derived",
   deps: [],
   auto: false,
@@ -94,26 +108,52 @@ test("search is a substring of the name, and it composes with the state", () => 
   assert.deepEqual(names(filterAssets(catalog, "nothing", "all")), []);
 });
 
-test("grouping follows the separator, and is not invented where there is none", () => {
+test("grouping follows the group the api resolved, not the name", () => {
   const groups = groupAssets(catalog);
   assert.deepEqual(
-    groups.map((g) => [g.prefix, g.assets.length]),
+    groups.map((g) => [g.name, g.assets.length]),
     [
       ["sales", 3],
       ["marketing", 1],
       ["", 1],
     ],
   );
-  // no separator anywhere: one flat list, not one group per asset
+  // no group anywhere: one flat list, not one group per asset
   const flat = groupAssets([asset("orders"), asset("returns")]);
   assert.deepEqual(
-    flat.map((g) => [g.prefix, g.assets.length]),
+    flat.map((g) => [g.name, g.assets.length]),
     [["", 2]],
   );
   assert.deepEqual(groupAssets([]), []);
-  // only the first separator names the group: deeper ones are inside it
-  assert.equal(groupOf("sales/eu/orders"), "sales");
-  assert.equal(groupOf("heartbeat"), "");
+  // a declared group wins over the prefix in the name, and the row goes with
+  // the group rather than with the letters it starts with
+  const moved = groupAssets([
+    asset("sales/orders", { group: "finance" }),
+    asset("sales/returns"),
+  ]);
+  assert.deepEqual(
+    moved.map((g) => [g.name, g.assets.map((a) => a.name)]),
+    [
+      ["finance", ["sales/orders"]],
+      ["sales", ["sales/returns"]],
+    ],
+  );
+  assert.equal(groupOf(asset("sales/eu/orders")), "sales");
+  assert.equal(groupOf(asset("heartbeat")), "");
+});
+
+test("the group filter is exact, and it composes with the other two", () => {
+  assert.deepEqual(names(filterAssets(catalog, "", "all", "sales")), [
+    "sales/orders",
+    "sales/returns",
+    "sales/customers",
+  ]);
+  // exact, so it is not the search under another name
+  assert.deepEqual(names(filterAssets(catalog, "", "all", "sale")), []);
+  assert.deepEqual(names(filterAssets(catalog, "", "stale", "sales")), ["sales/returns"]);
+  assert.deepEqual(names(filterAssets(catalog, "cust", "all", "sales")), ["sales/customers"]);
+  // no group named is every group, which is not the same as the ungrouped ones
+  assert.equal(filterAssets(catalog, "", "all", null).length, 5);
 });
 
 test("every column sorts both ways and leaves equal rows where they were", () => {
@@ -163,7 +203,12 @@ test("freshness sorts by how much of its own window is spent", () => {
   assert.deepEqual(names(sortAssets(list, "freshness", "desc")), ["tight", "wide", "none"]);
 });
 
-const node = (name: string, deps: string[] = []): DagNode => ({ name, deps });
+// the group is on the node, resolved, exactly as `AssetsPage` puts it there
+const node = (name: string, deps: string[] = []): DagNode => ({
+  name,
+  deps,
+  group: prefixGroup(name),
+});
 
 const graph: DagNode[] = [
   node("raw"),
@@ -229,7 +274,10 @@ test("a neighbourhood reaches both ways, and stops at the depth asked for", () =
   assert.deepEqual(at("gone", 2), []);
 });
 
-test("folding a group leaves one node with the edges that crossed its boundary", () => {
+// the fold used to slice the prefix off the name; it now reads the group the
+// api resolved. on a graph where the two agree it has to rewire exactly the
+// same edges, which is what every existing deployment sees
+test("folding by the declared group rewires what folding by the prefix did", () => {
   const folded = collapseGroups(graph, new Set(["sales"]));
   assert.deepEqual(
     folded.map((n) => [n.name, n.deps, n.badge]),
@@ -250,4 +298,21 @@ test("folding a group leaves one node with the edges that crossed its boundary",
   assert.match(folded[1].find ?? "", /sales\/customers/);
   // folding nothing is the graph itself, not a copy of it with the same shape
   assert.equal(collapseGroups(graph, new Set()), graph);
+
+  // and a node whose group is not its prefix folds with the group. the prefix
+  // fold could not have done this at all, which is the point of declaring one
+  const moved: DagNode[] = [
+    { name: "raw", deps: [], group: null },
+    { name: "sales/orders", deps: ["raw"], group: "finance" },
+    { name: "finance/revenue", deps: ["sales/orders"], group: "finance" },
+    { name: "elsewhere", deps: [], group: null },
+  ];
+  assert.deepEqual(
+    collapseGroups(moved, new Set(["finance"])).map((n) => [n.name, n.deps, n.badge]),
+    [
+      ["raw", [], undefined],
+      ["finance/", ["raw"], "×2"],
+      ["elsewhere", [], undefined],
+    ],
+  );
 });
