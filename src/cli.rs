@@ -236,7 +236,7 @@ enum Command {
     /// every job this deployment defines
     Jobs,
     /// every asset, and whether it is stale
-    Assets,
+    Assets(AssetsArgs),
     /// materialize an asset and whatever upstream of it is stale
     Build(BuildArgs),
     /// launch a range of an asset's partitions, a chunk at a time
@@ -273,6 +273,13 @@ enum Command {
     },
     /// the ui and whatever loops this process's role owns
     Serve(ServeArgs),
+}
+
+#[derive(Args)]
+struct AssetsArgs {
+    /// only the assets in this group, which is what one team owns
+    #[arg(long, value_name = "NAME")]
+    group: Option<String>,
 }
 
 #[derive(Args)]
@@ -845,7 +852,7 @@ async fn dispatch(reach: Reach, command: Command, out: &Out) -> Result<(), Fail>
             Ok(())
         }
 
-        Command::Assets => {
+        Command::Assets(args) => {
             let answer = match reach {
                 Reach::Server(api) => api.get("/api/assets").await?,
                 Reach::Local(app) => {
@@ -871,7 +878,7 @@ async fn dispatch(reach: Reach, command: Command, out: &Out) -> Result<(), Fail>
                     json!({ "assets": built })
                 }
             };
-            render_assets(&answer, out);
+            render_assets(&in_group(answer, args.group.as_deref()), out);
             Ok(())
         }
 
@@ -1942,6 +1949,25 @@ fn render_jobs(answer: &Value, out: &Out) {
     table.print(out, "no jobs");
 }
 
+/// the assets in one group, `--group` having named one.
+///
+/// filtered here rather than asked for over the wire, because the three ways
+/// of reaching a deployment answer this list differently and only one of them
+/// could take a query. a run log opened directly carries no registry and so no
+/// groups, and a `--group` against one is empty rather than unfiltered: saying
+/// "no assets" is right, and showing every asset because the filter could not
+/// be applied would not be.
+fn in_group(answer: Value, group: Option<&str>) -> Value {
+    let Some(group) = group else {
+        return answer;
+    };
+    let kept: Vec<Value> = list(&answer, "assets")
+        .into_iter()
+        .filter(|a| a["group"] == json!(group))
+        .collect();
+    json!({ "assets": kept })
+}
+
 /// how one dep's keys are read, for the deps that are read at anything but
 /// the same key.
 fn mapping_of(asset: &Value, dep: &str) -> Option<String> {
@@ -1967,7 +1993,7 @@ fn render_assets(answer: &Value, out: &Out) {
     // "stale" is a claim about the registry, so the column only exists where
     // one was there to make it
     let known = assets.iter().any(|a| a.get("stale").is_some());
-    let mut table = Table::new(["ASSET", "STATE", "BUILT", "DEPS"]);
+    let mut table = Table::new(["ASSET", "GROUP", "STATE", "BUILT", "DEPS"]);
     for asset in &assets {
         let state = match (known, asset["stale"] == json!(true)) {
             (false, _) => Cell::plain("-"),
@@ -1976,6 +2002,9 @@ fn render_assets(answer: &Value, out: &Out) {
         };
         table.row([
             Cell::plain(s(asset, "name")),
+            // written out rather than coloured: the group is the answer to
+            // "whose is this", and a column of names is what a pipe carries
+            Cell::plain(asset["group"].as_str().unwrap_or("-")),
             state,
             Cell::plain(match asset["built_at"].as_str() {
                 Some(at) => when(at),
@@ -2372,14 +2401,16 @@ async fn doctor(reach: Reach, out: &Out) -> Result<(), Fail> {
         Some(app) => {
             findings.extend(check_queue(app)?);
             findings.extend(check_policies(app)?);
+            findings.push(check_asset_groups(app));
             findings.push(check_rates(app));
             findings.extend(check_retention(app));
             findings.push(check_auth(app.auth.as_ref()));
         }
         None => unchecked.push(
-            "the queue, the automation policies, the retention policy and whether \
-             anything checks who is asking, which are read off limits, an asset graph, \
-             a role and an authenticator that only the deployment's own binary carries",
+            "the queue, the automation policies, the asset groups, the retention policy \
+             and whether anything checks who is asking, which are read off limits, an \
+             asset graph, a role and an authenticator that only the deployment's own \
+             binary carries",
         ),
     }
     match disk_free(&target) {
@@ -2618,6 +2649,51 @@ fn check_policies(app: &Inspected) -> Result<Vec<Finding>, Fail> {
              a dep that holds the keys it covers, or drop the policy"
         ),
     )])
+}
+
+/// a declared group that disagrees with the name it is on.
+///
+/// grouping fell back to the name prefix before it could be declared, so an
+/// asset called `sales/orders` that now declares `finance` is a rename
+/// somebody started and did not finish: the catalog says finance and the name
+/// still says sales, and whoever greps for one of them finds the other. a
+/// note rather than an error, because the pair is also exactly what a careful
+/// move looks like on the day it is made.
+fn check_asset_groups(app: &Inspected) -> Finding {
+    let declared = app
+        .registry
+        .topo()
+        .filter(|m| m.declared_group.is_some())
+        .count();
+    if declared == 0 {
+        return Finding::ok("groups", "none declared; every group is a name prefix");
+    }
+    let drifted: Vec<String> = app
+        .registry
+        .topo()
+        .filter_map(|m| {
+            let group = m.declared_group.as_deref()?;
+            let prefix = crate::asset::resolve_group(None, &m.name)?;
+            (prefix != group).then(|| format!("{} is in {group} and is named {prefix}/…", m.name))
+        })
+        .collect();
+    match drifted.first() {
+        None => Finding::ok(
+            "groups",
+            format!("{declared} declared, none at odds with a name"),
+        ),
+        Some(first) => Finding::note(
+            "groups",
+            format!(
+                "{} of {declared} declared group(s) disagree with the name they are on: {}",
+                drifted.len(),
+                drifted.join("; ")
+            ),
+            format!(
+                "{first}. the group is what the catalog and the graph go by, so the                  prefix is now decoration: rename the asset to match, or drop the                  prefix from the name"
+            ),
+        ),
+    }
 }
 
 fn check_rates(app: &Inspected) -> Finding {
@@ -3838,6 +3914,62 @@ mod tests {
             check_policies(&app(store, Vec::new())).unwrap()[0].says,
             "none declared"
         );
+    }
+
+    // grouping fell back to the name prefix before it could be declared, so a
+    // half-finished move leaves two answers on one asset and nothing says so
+    #[test]
+    fn doctor_finds_a_declared_group_at_odds_with_the_name_it_is_on() {
+        let mut deployment = app(Store::open(":memory:").unwrap(), Vec::new());
+        deployment.registry = Arc::new(AssetRegistry::empty());
+        assert_eq!(check_asset_groups(&deployment).level, Level::Ok);
+
+        let moved =
+            crate::Asset::new("sales/orders", |_| async { Ok(json!(null)) }).group("finance");
+        let settled =
+            crate::Asset::new("finance/revenue", |_| async { Ok(json!(null)) }).group("finance");
+        deployment.registry =
+            Arc::new(AssetRegistry::new(vec![moved, settled], Vec::new(), Vec::new()).unwrap());
+        let found = check_asset_groups(&deployment);
+        assert_eq!(found.level, Level::Note);
+        assert!(found.says.contains("sales/orders"), "{}", found.says);
+        assert!(found.says.contains("finance"), "{}", found.says);
+        // the one that agrees with its own name is not reported
+        assert!(!found.says.contains("finance/revenue"), "{}", found.says);
+        assert_eq!(found.says.matches("1 of 2").count(), 1, "{}", found.says);
+
+        // a declaration on a name with no prefix at all is not a disagreement:
+        // there is nothing there to disagree with
+        deployment.registry = Arc::new(
+            AssetRegistry::new(
+                vec![crate::Asset::source("orders").group("warehouse")],
+                Vec::new(),
+                Vec::new(),
+            )
+            .unwrap(),
+        );
+        assert_eq!(check_asset_groups(&deployment).level, Level::Ok);
+    }
+
+    #[test]
+    fn the_asset_list_can_be_cut_down_to_one_group() {
+        let answer = json!({"assets": [
+            {"name": "sales/orders", "group": "sales"},
+            {"name": "returns", "group": "warehouse"},
+            {"name": "heartbeat", "group": Value::Null},
+        ]});
+        let named = |group| {
+            list(&in_group(answer.clone(), group), "assets")
+                .iter()
+                .map(|a| s(a, "name"))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(named(None), ["sales/orders", "returns", "heartbeat"]);
+        assert_eq!(named(Some("warehouse")), ["returns"]);
+        // a group nothing is in is an empty list, not everything
+        assert!(named(Some("finance")).is_empty());
+        // and an ungrouped asset is in no group, so nothing names it
+        assert!(named(Some("")).is_empty());
     }
 
     #[test]

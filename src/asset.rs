@@ -28,6 +28,26 @@ pub(crate) fn partition_keys_name(asset: &str) -> String {
     format!("partitions:{asset}")
 }
 
+/// the character a name uses to say which group it is in when nothing was
+/// declared: everything before the first one names the group. one character,
+/// and the one every catalog already uses.
+pub(crate) const GROUP_SEPARATOR: char = '/';
+
+/// where an asset belongs: the group it declared, else the part of its name
+/// before the first [`GROUP_SEPARATOR`], else nothing.
+///
+/// an empty prefix is not a group. `/orders` has nothing before the separator
+/// to name a group with, so it is ungrouped, which is what it has always been.
+pub(crate) fn resolve_group<'a>(declared: Option<&'a str>, name: &'a str) -> Option<&'a str> {
+    match declared {
+        Some(group) => Some(group),
+        None => name
+            .split_once(GROUP_SEPARATOR)
+            .map(|(prefix, _)| prefix)
+            .filter(|prefix| !prefix.is_empty()),
+    }
+}
+
 pub(crate) type ProbeFn = dyn Fn() -> BoxFuture<'static, Result<String, Box<dyn std::error::Error + Send + Sync>>>
     + Send
     + Sync;
@@ -64,6 +84,7 @@ pub(crate) type ProbeFn = dyn Fn() -> BoxFuture<'static, Result<String, Box<dyn 
 pub struct Asset {
     name: String,
     source: bool,
+    group: Option<String>,
     deps: Vec<String>,
     maps: BTreeMap<String, PartitionMapping>,
     op: Option<Op>,
@@ -85,6 +106,7 @@ impl Asset {
         Asset {
             name: name.into(),
             source: true,
+            group: None,
             deps: Vec::new(),
             maps: BTreeMap::new(),
             op: None,
@@ -112,6 +134,7 @@ impl Asset {
             op: Some(Op::new(name.clone(), f)),
             name,
             source: false,
+            group: None,
             deps: Vec::new(),
             maps: BTreeMap::new(),
             io: None,
@@ -140,6 +163,7 @@ impl Asset {
             op: Some(Op::typed(name.clone(), f)),
             name,
             source: false,
+            group: None,
             deps: Vec::new(),
             maps: BTreeMap::new(),
             io: None,
@@ -240,6 +264,38 @@ impl Asset {
     /// [`from`](Asset::from) and [`from_named`](Asset::from_named) took.
     pub fn deps(&self) -> &[String] {
         &self.deps
+    }
+
+    /// the group this asset belongs to: one flat name, with nothing nested
+    /// inside it and no separator parsed out of it.
+    ///
+    /// **the resolution order is the declared group, else the part of the name
+    /// before the first `/`, else no group at all**, so a graph that never
+    /// calls this groups exactly as it always did.
+    ///
+    /// declaring it is what makes regrouping cheap. the name is the key in
+    /// every materialization, every lineage ref and every op run, so moving
+    /// `sales/orders` into `finance` by renaming it starts the asset's history
+    /// over; moving it with this leaves the history where it is.
+    ///
+    /// on a [source](Asset::source) the group names the external system the
+    /// data stands for, which is what makes two tables out of one warehouse
+    /// read as one origin downstream.
+    ///
+    /// ```
+    /// # use hestan::Asset;
+    /// let orders = Asset::source("orders").group("warehouse");
+    /// let returns = Asset::source("returns").group("warehouse");
+    /// let fx = Asset::source("fx_rates").group("vendor");
+    /// # let _ = (orders, returns, fx);
+    /// ```
+    ///
+    /// the build refuses an empty group, one containing `/`, and one that is
+    /// the name of an ungrouped source, since an origin label is a group name
+    /// falling back to a bare source name and the two would be one entry.
+    pub fn group(mut self, name: impl Into<String>) -> Asset {
+        self.group = Some(name.into());
+        self
     }
 
     /// store this asset's value through the [io manager](crate::IoManager)
@@ -593,6 +649,10 @@ pub(crate) fn check_op_name(asset: &str, check: &str) -> String {
 pub(crate) struct AssetMeta {
     pub name: String,
     pub source: bool,
+    /// the group [`Asset::group`] declared; `None` when nothing was declared,
+    /// in which case the name prefix answers instead. kept as declared rather
+    /// than resolved so `doctor` can see the two disagree.
+    pub declared_group: Option<String>,
     pub deps: Vec<String>,
     /// the [mapping](PartitionMapping) declared on each dep it reads, for the
     /// deps that declared one; everything else is identity.
@@ -619,6 +679,12 @@ pub(crate) struct AssetMeta {
 }
 
 impl AssetMeta {
+    /// where this asset belongs: what [`Asset::group`] declared, else the part
+    /// of the name before the first `/`, else nothing.
+    pub(crate) fn group(&self) -> Option<&str> {
+        resolve_group(self.declared_group.as_deref(), &self.name)
+    }
+
     /// which of `dep`'s keys one of this asset's partitions reads. identity
     /// unless the dep was declared with [`Asset::reads`], which is what makes
     /// every graph written before mappings existed read exactly as it did.
@@ -758,6 +824,7 @@ impl AssetRegistry {
             metas.push(AssetMeta {
                 name: a.name.clone(),
                 source: a.source,
+                declared_group: a.group,
                 deps: a.deps,
                 maps: a.maps,
                 policy: a.policy,
@@ -784,6 +851,10 @@ impl AssetRegistry {
                 metas.push(AssetMeta {
                     name: produced.clone(),
                     source: false,
+                    // a multi-asset produces names rather than `Asset` values,
+                    // so there is nowhere to declare a group on one of them;
+                    // the name prefix is what answers for them
+                    declared_group: None,
                     deps: m.deps.clone(),
                     maps: BTreeMap::new(),
                     policy: m.policy.clone(),
@@ -817,6 +888,7 @@ impl AssetRegistry {
         // whatever the op-level checks below would make of it
         let order = graph::topo_order(&pairs).map_err(|e| Error::Graph(format!("assets: {e}")))?;
         check_partition_deps(&metas)?;
+        check_groups(&metas)?;
         let mut seen_ops: HashSet<&str> = HashSet::new();
         for o in &ops {
             // ops and assets share one namespace inside the job, so a
@@ -1003,6 +1075,46 @@ impl AssetRegistry {
             external,
         )
     }
+}
+
+/// what a declared group is allowed to be.
+///
+/// three refusals, and each is about something the group would otherwise be
+/// drawn as: a name with nothing in it, a name with a separator in it that a
+/// folded node would draw as nesting, and a name a legend entry could not
+/// point at unambiguously.
+fn check_groups(metas: &[AssetMeta]) -> Result<(), Error> {
+    // the sources whose bare names an origin label falls back to, which is the
+    // set a declared group must not walk into
+    let bare: HashSet<&str> = metas
+        .iter()
+        .filter(|m| m.source && m.group().is_none())
+        .map(|m| m.name.as_str())
+        .collect();
+    for meta in metas {
+        let Some(group) = meta.declared_group.as_deref() else {
+            continue;
+        };
+        if group.trim().is_empty() {
+            return Err(Error::Graph(format!(
+                "asset {}: declared group {group:?} has no name in it, and an asset in a                  group with no name is an asset in no group",
+                meta.name
+            )));
+        }
+        if group.contains(GROUP_SEPARATOR) {
+            return Err(Error::Graph(format!(
+                "asset {}: declared group {group:?} contains {GROUP_SEPARATOR:?}, and a                  folded group is drawn as {group}{GROUP_SEPARATOR}, which reads as                  nesting that is not there. a group is flat",
+                meta.name
+            )));
+        }
+        if bare.contains(group) {
+            return Err(Error::Graph(format!(
+                "asset {}: declared group {group} is also the name of the ungrouped                  source {group}. an origin label is a group name falling back to a bare                  source name, so one legend entry would point at both: give the source                  a group of its own, or rename one of the two",
+                meta.name
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// what lineage across a partition boundary is allowed to look like.
@@ -2323,6 +2435,137 @@ mod tests {
 
         let err = reg_err(vec![Asset::source("s").io("parquet")]);
         assert!(err.to_string().contains("io on a source"), "{err}");
+    }
+
+    // ------------------------------------------------------------ groups
+
+    // the whole point of declaring a group: the name is the key in every
+    // materialization row, so regrouping by renaming starts the history over
+    // and regrouping by declaring does not
+    #[tokio::test]
+    async fn moving_a_group_keeps_the_history_and_renaming_into_one_loses_it() {
+        let store = Store::open(":memory:").unwrap();
+        let reg = AssetRegistry::new(vec![echo("sales/orders")], Vec::new(), Vec::new()).unwrap();
+        // as it groups today, with nothing declared
+        assert_eq!(reg.get("sales/orders").unwrap().group(), Some("sales"));
+        let runner = Runner::new([reg.lower_job().unwrap()], store.clone()).unwrap();
+        assert_eq!(build_all(&reg, &runner).await.status, RunStatus::Success);
+        let before = store
+            .materialization("sales/orders", None)
+            .unwrap()
+            .expect("a build recorded one");
+
+        // moved to another group, name untouched
+        let moved = AssetRegistry::new(
+            vec![echo("sales/orders").group("finance")],
+            Vec::new(),
+            Vec::new(),
+        )
+        .unwrap();
+        assert_eq!(moved.get("sales/orders").unwrap().group(), Some("finance"));
+        let after = store
+            .materialization("sales/orders", None)
+            .unwrap()
+            .expect("still there");
+        assert_eq!(after.fingerprint, before.fingerprint);
+        assert_eq!(after.built_at, before.built_at);
+        assert_eq!(
+            store
+                .materializations("sales/orders", None, 10)
+                .unwrap()
+                .len(),
+            1
+        );
+
+        // the same move made by renaming: the group is right and the past is
+        // gone, which is the thing declaring a group is for
+        let renamed =
+            AssetRegistry::new(vec![echo("finance/orders")], Vec::new(), Vec::new()).unwrap();
+        assert_eq!(
+            renamed.get("finance/orders").unwrap().group(),
+            Some("finance")
+        );
+        assert!(
+            store
+                .materialization("finance/orders", None)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    // every deployment that never calls `group` has to group exactly as it did
+    #[test]
+    fn a_name_with_no_declaration_groups_by_its_prefix_as_it_always_has() {
+        let group = |name: &str| {
+            let reg = AssetRegistry::new(vec![echo(name)], Vec::new(), Vec::new()).unwrap();
+            reg.get(name).unwrap().group().map(str::to_string)
+        };
+        assert_eq!(group("sales/orders").as_deref(), Some("sales"));
+        // only the first separator names the group: deeper ones are inside it
+        assert_eq!(group("sales/eu/orders").as_deref(), Some("sales"));
+        assert_eq!(group("heartbeat"), None);
+        // nothing before the separator is nothing to name a group with
+        assert_eq!(group("/orders"), None);
+        // and a name that ends in one still names a group, as the prefix
+        // read has always given it
+        assert_eq!(group("orders/").as_deref(), Some("orders"));
+    }
+
+    #[test]
+    fn a_declared_group_wins_over_the_prefix_in_the_name() {
+        let reg = AssetRegistry::new(
+            vec![echo("sales/orders").group("finance")],
+            Vec::new(),
+            Vec::new(),
+        )
+        .unwrap();
+        let meta = reg.get("sales/orders").unwrap();
+        assert_eq!(meta.group(), Some("finance"));
+        // and the name is untouched, which is what the store is keyed by
+        assert_eq!(meta.name, "sales/orders");
+        // the declaration is kept as declared, so a tool can see the two
+        // disagree rather than only the answer
+        assert_eq!(meta.declared_group.as_deref(), Some("finance"));
+    }
+
+    #[test]
+    fn a_group_that_could_not_be_drawn_fails_the_build_naming_both() {
+        let empty = reg_err(vec![echo("daily").group("")]);
+        let said = empty.to_string();
+        assert!(
+            said.contains("daily") && said.contains("no name in it"),
+            "{said}"
+        );
+        let blank = reg_err(vec![echo("daily").group("   ")]).to_string();
+        assert!(
+            blank.contains("daily") && blank.contains("no name in it"),
+            "{blank}"
+        );
+
+        // a folded group is drawn as "a/b/", which reads as nesting there is
+        // no such thing as
+        let nested = reg_err(vec![echo("daily").group("a/b")]).to_string();
+        assert!(
+            nested.contains("daily") && nested.contains("a/b"),
+            "{nested}"
+        );
+
+        // an origin label falls back to a bare source name, so a group called
+        // after one would be a legend entry pointing at two things
+        let clash = reg_err(vec![Asset::source("orders"), echo("daily").group("orders")]);
+        let said = clash.to_string();
+        assert!(said.contains("daily") && said.contains("orders"), "{said}");
+        // the same source in a group of its own is no longer bare, and the
+        // name is free again
+        AssetRegistry::new(
+            vec![
+                Asset::source("orders").group("warehouse"),
+                echo("daily").group("orders"),
+            ],
+            Vec::new(),
+            Vec::new(),
+        )
+        .expect("no collision left");
     }
 
     // the manager an asset selected has to reach the op the run executes, or

@@ -1064,6 +1064,9 @@ pub(crate) fn assets_json(registry: &AssetRegistry, store: &Store) -> Result<Val
                 .collect();
             json!({
                 "name": meta.name,
+                // where it belongs: what it declared, else the part of the
+                // name before the first "/", else null
+                "group": meta.group(),
                 "kind": if meta.source { "source" } else { "derived" },
                 "deps": meta.deps,
                 "mappings": mappings,
@@ -5196,6 +5199,34 @@ mod tests {
                 .unwrap()
                 .tags
                 .is_empty()
+        );
+    }
+
+    // the payload carries the resolved answer rather than the declaration, so
+    // no reader has to know the fallback rule to draw a catalog
+    #[test]
+    fn the_assets_payload_says_which_group_each_asset_resolved_to() {
+        let orders = crate::Asset::source("orders").group("warehouse");
+        let prefixed =
+            crate::Asset::new("sales/daily", |_| async { Ok(json!(null)) }).from(&orders);
+        let loose = crate::Asset::new("heartbeat", |_| async { Ok(json!(null)) });
+        let registry =
+            AssetRegistry::new(vec![orders, prefixed, loose], Vec::new(), Vec::new()).unwrap();
+        let store = Store::open(":memory:").unwrap();
+        let body = assets_json(&registry, &store).unwrap();
+        let groups: Vec<(&str, &Value)> = body["assets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|a| (a["name"].as_str().unwrap(), &a["group"]))
+            .collect();
+        assert_eq!(
+            groups,
+            [
+                ("orders", &json!("warehouse")),
+                ("sales/daily", &json!("sales")),
+                ("heartbeat", &json!(null)),
+            ]
         );
     }
 
