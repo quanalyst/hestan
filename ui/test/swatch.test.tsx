@@ -9,6 +9,7 @@ import { renderToStaticMarkup } from "react-dom/server";
 import DagView from "../src/DagView";
 import type { DagNode } from "../src/DagView";
 import Swatch from "../src/Swatch";
+import { HueLegend, OriginCell } from "../src/AssetsPage";
 import { stripesFor } from "../src/colour";
 import { asset } from "./catalog.test";
 
@@ -68,4 +69,34 @@ test("colour off leaves the graph with no hue in its markup", () => {
   // the node names are still there, which is the whole of what colour was
   // adding: it carries nothing on its own
   assert.ok(off.includes("orders") && off.includes("margin"), off);
+});
+
+// the third place a hue is drawn. `Swatch.tsx` exports the only function that
+// emits one, and `Swatch` and `DagView` are asserted above; the legend and the
+// origin cell reach for it directly, so the rule that a colour is never the
+// only carrier is asserted here too rather than left to the two that were
+// convenient to render
+test("every hue in the legend and the origin cell is drawn beside its own name", () => {
+  const legend = renderToStaticMarkup(<HueLegend stripes={stripes} says="by group" />);
+  // one angle drawn, one name written, for every stripe: no bare colour
+  assert.deepEqual(angles(legend), [12, 105, 274, 300]);
+  for (const s of stripes) assert.ok(legend.includes(s.label), `${s.label} missing: ${legend}`);
+  // the block of colour is decoration and says so, so a screen reader is not
+  // told about a swatch it cannot use
+  assert.equal((legend.match(/aria-hidden="true"/g) ?? []).length, stripes.length);
+
+  // and the cell: the words do not depend on the mode, which is what makes
+  // turning colour off cost a reader nothing
+  const a = asset("margin", {
+    provenance: [
+      { name: "vendor", hue: 105 },
+      { name: "warehouse", hue: 274 },
+    ],
+  });
+  for (const mode of ["group", "origin", "off"] as const) {
+    const cell = renderToStaticMarkup(<OriginCell asset={a} mode={mode} />);
+    assert.ok(cell.includes("vendor") && cell.includes("warehouse"), `${mode}: ${cell}`);
+  }
+  // off draws the words and no angle at all
+  assert.deepEqual(angles(renderToStaticMarkup(<OriginCell asset={a} mode="off" />)), []);
 });

@@ -120,7 +120,7 @@ function staleOf(assets: AssetSummary[], node: string): boolean {
 // what each hue in the view stands for, in words, beside the view. without
 // this a colour is decoration, and with it somebody who cannot tell two hues
 // apart still has every name on the same screen
-function HueLegend({ stripes, says }: { stripes: Stripe[]; says: string }) {
+export function HueLegend({ stripes, says }: { stripes: Stripe[]; says: string }) {
   if (stripes.length === 0) return null;
   return (
     <div className="hue-legend">
@@ -140,7 +140,7 @@ function HueLegend({ stripes, says }: { stripes: Stripe[]; says: string }) {
 // what a row descends from, in words with the colour beside them rather than
 // instead of them. the names past the cap are in the legend and on the
 // asset's own page
-function OriginCell({ asset, mode }: { asset: AssetSummary; mode: HueMode }) {
+export function OriginCell({ asset, mode }: { asset: AssetSummary; mode: HueMode }) {
   const words = originWords(asset);
   const { shown, more } = shownAndMore(words.map((label) => ({ label, hue: 0 })));
   return (
