@@ -128,6 +128,99 @@ names live in one namespace inside the lowered job, so a multi-asset called
 after an existing asset is a build error, as are two multi-assets with one
 name, one that produces nothing, and two claiming the same output.
 
+## Where an asset belongs, and where it came from
+
+two questions about one asset, and they are not the same question. **group**
+is where it belongs. **origin** is where it came from.
+
+### Group
+
+one flat name, one per asset, declared on the asset:
+
+```rust
+let orders  = Asset::source("orders").group("warehouse");
+let returns = Asset::source("returns").group("warehouse");
+let daily   = Asset::new("daily_revenue", ..).from(&orders).group("finance");
+```
+
+**the resolution order is the declared group, else the part of the name before
+the first `/`, else no group at all.** a graph that never calls `.group`
+groups exactly as it always did.
+
+declaring it rather than spelling it into the name is the whole point. the
+name is the key in `asset_materializations`, in every recorded lineage ref and
+in every op run, so moving `sales/orders` into `finance` by renaming it is not
+a reorganisation: it is a new asset with no past. moving it with `.group`
+leaves the name, and therefore the history, exactly where it was.
+
+a group is flat. there is no nesting inside one, and nothing is parsed out of
+the name you give it. three groups are refused at build, each naming both the
+asset and the group:
+
+- an empty or whitespace-only name, since an asset in a group with no name is
+  an asset in no group;
+- a name containing `/`, since a folded group draws as `sales/` and a group
+  called `a/b` would draw as `a/b/`, which reads as nesting that is not there;
+- a name that is also the name of an ungrouped source, since an origin label
+  is a group name falling back to a bare source name and one legend entry
+  would then point at two things.
+
+a source's group names the **external system** the data stands for, which is
+what makes `orders` and `returns` above one thing downstream rather than two.
+
+### Origin
+
+the set of source groups an asset descends from, transitively, computed rather
+than declared. a source with no group contributes its own name; a source's own
+origin is itself.
+
+so `daily_revenue` above descends from `warehouse`, and so does anything built
+out of it, however many hops down. an asset with **no source anywhere
+upstream** has an empty set, which is a real state and reads as "no source"
+rather than as a blank.
+
+it is one forward pass over the topological order the build already walks,
+made once when the registry is built, so `GET /api/assets`, `hestan assets`
+and `hestan doctor` all read the same answer. the set is ordered by name
+everywhere it is exposed, because a set that reorders between two requests
+makes a swatch flicker.
+
+a partition [mapping](#what-a-partition-reads-of-its-dep) changes nothing
+here: a mapping says which keys a read takes, and where the data came from is
+the same answer at every key.
+
+### Colour
+
+a group and an origin each have a **hue**: an integer 0..=359 degrees around
+the colour wheel, from `hestan::hue(name)`.
+
+it is a pure function of the name and nothing else, so a group keeps its
+colour across restarts, across processes, across machines, and across however
+many other groups appear beside it. it is deliberately **not** an index into a
+palette: an index renumbers every group after the one you added, and a graph
+that repaints itself when somebody declares an asset is a graph nobody trusts
+the colours of.
+
+the number is a hue and not a colour. what lightness is legible depends on the
+ground it is drawn on, so the reader picks saturation and lightness and hestan
+picks the angle: the web ui does that in css per theme, and anything painting
+a terminal gets the same angle to work from.
+
+**the limit, stated plainly**: two names can hash close enough together to be
+hard to tell apart, and no pure function of a single name can prevent that,
+because preventing it needs the whole set of names and a function of the whole
+set is exactly the unstable thing above. so `hestan doctor` reports the pairs
+it finds, naming both and how far apart they are, and `Asset::hue(n)` pins one
+of the two. a hue belongs to the label rather than to one asset, so two assets
+in one group may not pin two different angles, and a hue outside 0..=359 fails
+the build.
+
+**colour never means status.** the palette everywhere else in the ui is grey
+and shape carries state, which is exactly what leaves colour free; the moment
+a hue meant "failed" the channel would be carrying two things. and colour is
+never the only carrier: every group and origin name is written on the same
+screen as the hue that stands for it. `docs/web-ui.md` is where that is drawn.
+
 ## Fingerprints
 
 when a derived asset materializes, its fingerprint is the sha256 hex of its

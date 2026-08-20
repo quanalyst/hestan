@@ -2,6 +2,77 @@
 
 ## unreleased
 
+an asset declares the group it belongs to, hestan computes what it descends
+from, and the ui colours by one or the other.
+
+**every existing deployment sees one change, and it is visible: colour appears
+on the assets page where there was none.** the ui opens coloured by group, so
+a section heading and a graph node now carry a hue beside the name they
+already had, there is a legend under the graph and a `descends from` column in
+the table, and `no colour` in the toggle beside the graph puts the page back
+to exactly the monochrome it was. nothing else moves: **no public signature
+changed**, grouping resolves byte for byte as it did on any graph that does
+not call the new `.group`, and nothing about what runs, or when, is different.
+`hestan assets` grew two columns, which is a change to what a script parsing
+that table reads, and `GET /api/assets` gained three keys with nothing removed
+or renamed.
+
+**colour never means status, and it is never the only carrier.** the palette
+everywhere else is grey and shape carries state, which is exactly what leaves
+a hue free to mean something else; the moment one meant "failed" the channel
+would be carrying two answers and neither reliably. every hue has its name
+written on the same screen, so somebody who cannot tell two of them apart
+loses speed and loses no information.
+
+- **`Asset::group(name)`, on sources and derived assets alike.** one flat name,
+  and **the resolution order is the declared group, else the part of the name
+  before the first `/`, else no group at all**. the point is that regrouping
+  stops being renaming: the name is the key in `asset_materializations`, in
+  every lineage ref and in every op run, so moving `sales/orders` into
+  `finance` by renaming it leaves a new asset with no past, and moving it with
+  `.group` leaves the history where it is. three groups fail the build, each
+  naming both the asset and the group: an empty one, one containing `/` (a
+  folded group draws as `sales/`, so `a/b` would draw as nesting that is not
+  there), and one that is also the name of an ungrouped source, which would
+  make one legend entry point at two things
+- **what an asset descends from, computed once.** the set of source groups it
+  reaches transitively, in one forward pass over the topological order the
+  build already walks, so the api, the command line and `doctor` read one
+  answer rather than three. a source's own origin is itself, an ungrouped
+  source contributes its own name, and an asset with no source anywhere
+  upstream has an empty set, which is a real state and reads as "no source"
+  rather than as a blank. ordered by name wherever it is exposed, because a
+  set that reorders between requests makes a swatch flicker. a partition
+  mapping changes nothing here: a mapping is about keys, not about lineage
+- **a hue for a group and for a source**, 0..=359 degrees from
+  `hestan::hue(name)`. a pure function of the name and **not an index into a
+  palette**: an index renumbers every group after the one somebody added, and
+  a graph that repaints itself when an asset is declared is a graph nobody
+  trusts the colours of. the server sends the angle and the client picks the
+  shade, since what lightness is legible depends on a theme the server cannot
+  see. the limit is stated rather than hidden: two names can hash close enough
+  to be hard to tell apart, no function of one name can prevent it, so
+  `hestan doctor` reports any pair within eight degrees, names both, and
+  `Asset::hue(n)` pins one of the two
+- **the ui colours by group, by origin, or not at all**, in the url with every
+  other view state. one meaning at a time, because two hue meanings on one
+  screen is noise. an asset descending from several sources gets a **split
+  swatch, one stripe per source in name order and never a blend**: averaging
+  two hues makes a third that stands for a source nobody has. the catalog
+  sections by the declared group and gains a `group` filter; the graph folds
+  by it too, rewiring exactly the edges the prefix fold rewired. saturation and
+  lightness are pinned per theme and checked across all 360 angles against both
+  grounds of both themes, so nothing generated is illegible and nothing can be
+  read as a status grey
+- `GET /api/assets` gained `group`, `group_hue` and `provenance` (a name and a
+  hue per origin) on every asset. `hestan assets` gained group and origin
+  columns and a `--group` filter, and prints `-` for both against a bare run
+  log, which has no registry to resolve either from and is not the same claim
+  as "no source". `doctor` gained `groups`, which finds a declared group at
+  odds with the name it is on (a rename somebody started and did not finish),
+  and `colours`, which finds the hue collisions above; both are notes and
+  neither changes an exit code
+
 a policy on an asset says when hestan rebuilds it, evaluated per key, and one
 process acts on it.
 

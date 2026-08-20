@@ -125,6 +125,13 @@ a claim about a registry, and `--db queue` has no "waiting for" column because
 the blame belongs to whoever owns the limits. an absent key is a mode saying it
 does not know; there are no invented nulls.
 
+the same rule tells `--db assets`' group and origin columns apart from a real
+answer: both print `-`, because a run log has no registry to resolve either
+from, and that is not the same as `no source`, which is a registry saying an
+asset descends from nothing. `--db assets --group finance` is empty for the
+same reason: the filter could not be applied, and showing every asset instead
+would be worse than showing none.
+
 ### Reaching an authenticated one
 
 a deployment that [checks who is asking](auth.md) wants a token, and there are
@@ -227,7 +234,7 @@ show <run>                      the run and every op of it
 logs <run> [--op NAME] [--follow]
 events [--kind K] [--subject S] [--level L] [--since 2h] [--follow [--after SEQ]]
 jobs                            every job this deployment defines
-assets                          every asset, and whether it is stale
+assets [--group NAME]           every asset: its group, what it descends from, whether it is stale
 schedules                       every schedule, when it fires next, paused or not
 queue                           what is waiting, in the order it will be taken
 ```
@@ -302,6 +309,8 @@ what it checks, and what each one can actually see:
 | leases | runs claimed by a process that stopped renewing, which nothing is reclaiming if nothing is running a lease loop | a store |
 | queue | runs waiting on a limit, and (separately) runs waiting on **nothing**, which is a deployment where no process executes | the limits, so the deployment's own binary |
 | policies | an [automation policy](assets.md#automation-policies) that can never fire, because a source it reads has no probe to observe it or a window promises keys its dep will never hold. a policy that will wait forever looks exactly like one with nothing to do: both are quiet | the asset graph, so the deployment's own binary |
+| groups | a declared [group](assets.md#where-an-asset-belongs-and-where-it-came-from) that disagrees with the name it is on, which is a rename somebody started and did not finish: the catalog says one thing and the name says another | the asset graph, so the deployment's own binary |
+| colours | two group or origin labels whose [hues](assets.md#colour) land within eight degrees of each other. the hue is a hash of one name, so nothing reading one name at a time can stop two of them colliding; this names both and `Asset::hue(n)` moves one | the asset graph, so the deployment's own binary |
 | rates | what this registry declares, and that a [rate](concepts.md#rates) is per process: a deployment that scaled by adding a worker doubled every one of them without changing a line. over `--server`, the live half instead: how many ops are queued for a token there | the registry, or a running deployment |
 | retention | a policy in a process whose [role](scaling.md#roles) never sweeps, so the database grows and nothing says why | the role, so the deployment's own binary |
 | disk | free space where the run log lives | a local file |

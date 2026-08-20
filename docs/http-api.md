@@ -792,10 +792,14 @@ startup's sweep marks failed.
 ```json
 { "assets": [
   { "name": "docs_dir", "kind": "source", "deps": [], "auto": false,
+    "group": "repo", "group_hue": 184,
+    "provenance": [ { "name": "repo", "hue": 184 } ],
     "policy": null, "op": null,
     "fingerprint": "14a61f3c...", "built_at": "2026-08-08T11:01:36Z",
     "run_id": null, "stale": false, "reasons": [] },
   { "name": "doc_stats", "kind": "derived", "deps": ["docs_dir"], "auto": true,
+    "group": "docs", "group_hue": 49,
+    "provenance": [ { "name": "repo", "hue": 184 } ],
     "policy": { "rule": "stale", "cron": null, "tz": null,
                 "upstream_ready": true, "says": "when stale, once upstream is ready",
                 "waiting": { "key": "2026-08-08", "for": "hourly_traffic[2026-08-08T23]",
@@ -810,6 +814,22 @@ startup's sweep marks failed.
                    "last_success": "2026-08-08T10:01:36Z" } }
 ] }
 ```
+
+`group` is where the asset [belongs](assets.md#where-an-asset-belongs-and-where-it-came-from):
+what it declared, else the part of its name before the first `/`, else null
+for an asset in no group at all. the fallback is applied here, so nothing
+reading this has to know the rule. `provenance` is where it came from: the
+source groups it descends from transitively, ordered by name, each with the
+hue that label is drawn in. a source's own origin is itself, an ungrouped
+source contributes its own name, and `[]` is a real answer meaning no source
+is upstream of it. `group_hue` is the same number for the group, and null
+wherever `group` is.
+
+**the hues are angles, 0..=359, and not colours**: what lightness is legible
+depends on the reader's theme and this end does not know it, so the client
+picks saturation and lightness. the angle is a pure function of the label's
+name, stable across restarts and processes, and `hestan doctor` reports any
+two labels whose angles are too close to tell apart.
 
 `op` is the op that materializes the asset: its own name, unless a
 [multi-asset](assets.md#one-op-several-assets) produces it alongside others,

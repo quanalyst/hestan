@@ -363,9 +363,18 @@ standalone binary for those two. [docs/cli.md](docs/cli.md).
   moved**: the dep whose content changed, the recorded fingerprint against the
   one it holds now, the build that fingerprint arrived in, and then the same
   question asked of that build. inferring staleness from clocks cannot say any
-  of it. the catalog beside it searches, filters by state, groups by name
-  prefix and folds a group in the graph, because one flat table is fine at
-  twelve assets and useless at three hundred
+  of it. the catalog beside it searches, filters by state and by group, and
+  folds a group in the graph, because one flat table is fine at twelve assets
+  and useless at three hundred
+- **an asset declares the group it belongs to**, so regrouping is not
+  renaming: the name is the key every materialization is recorded under, and
+  moving `sales/orders` into `finance` by renaming it would leave a new asset
+  with no past. the name prefix is still the fallback, so a graph that never
+  declares one groups exactly as it always did. from a source's group, which
+  names the external system it stands for, hestan computes what every
+  downstream asset descends from, and the ui colours by group or by origin:
+  colour never means status, the legend names every hue, and turning it off
+  loses nothing
 - **backfills you can start**: drag a range across the partition grid, see
   which keys it covers and what it will cost from what a build of one has
   actually taken, then start it. no timings on record means it says so rather

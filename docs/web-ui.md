@@ -178,10 +178,10 @@ ways of drawing fewer:
   directions, out to 1, 2 or 3 hops. capped at 40 nodes, because a source with
   sixty dependents has a neighbourhood the size of the graph; past the cap the
   caption says to fold a group instead.
-- **fold.** the `fold` chips collapse a prefix group to a single node carrying
-  its count, with the edges that crossed the group's boundary rewired to it
-  and the ones inside it gone. the same chips fold the table's groups: one set
-  of folded groups, two views of it.
+- **fold.** the `fold` chips collapse a [group](assets.md#where-an-asset-belongs-and-where-it-came-from)
+  to a single node carrying its count, with the edges that crossed the group's
+  boundary rewired to it and the ones inside it gone. the same chips fold the
+  table's groups: one set of folded groups, two views of it.
 - **find.** what the search box below matches is marked in the graph with a
   heavy outline and everything else recedes. a folded group is findable by
   what it swallowed, and a search nothing matches marks nothing rather than
@@ -200,17 +200,23 @@ separates four questions the engine answers with one word: `fresh`, `stale`,
 `never built` (which is the same verdict as stale, and a different thing to
 look at), and `failed check`, which cuts across the other three.
 
-names carrying a `/` are grouped under the part before the first one:
-`sales/orders` and `sales/returns` are one collapsible `sales` group, and the
-prefix is dropped from the rows underneath since the heading already says it.
-**with no separator anywhere there is no grouping**, since a common substring
-is not a namespace; assets that carry none sort last under their own heading,
-or the first of them reads as the last row of the group above.
+rows are sectioned by the [group](assets.md#where-an-asset-belongs-and-where-it-came-from)
+the api resolved: what the asset declared, else the part of its name before
+the first `/`, else none. `sales/orders` and `sales/returns` are one
+collapsible `sales` group, and where the name repeats the group as a prefix it
+is dropped from the rows underneath, since the heading already says it. a name
+that has nothing to do with its declared group keeps every character: cutting
+one off would be a lie about what the asset is called. **with no group
+anywhere there is no grouping**; assets in none sort last under their own
+heading, or the first of them reads as the last row of the group above. a
+`group` filter beside the search narrows to one, exactly, and lives in the url
+with everything else.
 
 the columns are state (with the reason beside it), when it was last built, the
-run that built it, freshness where a policy is declared, and partition
-coverage where the asset is [partitioned](assets.md#partitioned-assets); the
-last two only when something fills them. all of them sort, and clicking the
+run that built it, freshness where a policy is declared, partition coverage
+where the asset is [partitioned](assets.md#partitioned-assets), and what it
+descends from where anything does; the last three only when something fills
+them. all of them sort, and clicking the
 column already sorted turns it around. deps and the current fingerprint are
 not columns: both live on the asset's own page, and neither was ever read
 across three hundred rows.
@@ -226,6 +232,43 @@ recorded anything. `source`, `auto` and `waiting` are tags beside the name, as
 becomes `waiting` when the policy wants a build it cannot have yet, with the
 whole sentence ("when stale, once upstream is ready · 2026-08-14 waiting for
 `hours[2026-08-14T23]`") on hover and on the asset's own page.
+
+### Colour
+
+**everywhere else in this ui the palette is grey and shape carries state.**
+that is exactly what leaves colour free, and it stays free only while it means
+one thing: a hue here is where an asset [belongs or where it came
+from](assets.md#where-an-asset-belongs-and-where-it-came-from), and never how
+it is doing. the moment a hue meant "failed" the channel would be carrying two
+answers and neither reliably.
+
+the toggle beside the graph picks which: `by group`, `by origin`, or
+`no colour`. one meaning at a time, because two hue meanings on one screen is
+noise, and the choice is in the url like every other view state. **`no colour`
+returns the page to the monochrome it was**, which is both something somebody
+will want and the proof that colour is carrying nothing on its own.
+
+the server sends an angle rather than a colour, and this end picks the shade:
+saturation and lightness are pinned per theme in `styles.css`, checked across
+all 360 angles against both grounds of both themes, so no generated colour is
+illegible and none of them can be read as a status grey.
+
+three things follow from "colour is never the only carrier":
+
+- a **legend** under the graph names every hue in the view. without it a
+  colour is decoration.
+- every swatch sits beside its own name: the group's on the section heading it
+  belongs to, the origins' in the row's own `descends from` cell.
+- an asset descending from several sources gets a **split swatch, one stripe
+  per source in name order, never a blend.** averaging two hues produces a
+  third hue, and a third hue stands for a source nobody has. past three
+  stripes the rest become `+k`, and they are still named in the legend and on
+  the asset's own page.
+
+the asset's own page carries no colour at all: one asset is nothing to tell
+apart from anything, and a group hue beside an origin hue would be two
+meanings of one channel on one screen. it says both in words instead, the
+group beside the kind and what it descends from under its lineage.
 
 every derived row has a `build` action; sources have none, since the endpoint
 400s on them. a launched build (202) navigates straight to the new run, while

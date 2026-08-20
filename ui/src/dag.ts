@@ -65,7 +65,12 @@ export function neighbourhood(
 // contain the separator (the build refuses one that does), so the fold never
 // invents a name with two of them in it, and an asset that resolved into the
 // group by its name prefix has something after the separator and so is not
-// `sales/` either
+// `sales/` either.
+//
+// **the one name this does not clear** is an asset called exactly `sales/`
+// while some other asset is in a group called `sales`. that was already the
+// case when the fold sliced the prefix off the name, and it is left alone
+// here rather than fixed in passing
 export const groupNode = (group: string) => `${group}${SEPARATOR}`;
 
 // fold every named group into one node, with the edges that crossed into or
