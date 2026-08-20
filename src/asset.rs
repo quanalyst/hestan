@@ -1197,7 +1197,9 @@ fn check_hues(metas: &[AssetMeta]) -> Result<BTreeMap<String, u16>, Error> {
         match pinned.insert(label.to_string(), hue) {
             Some(held) if held != hue => {
                 return Err(Error::Graph(format!(
-                    "asset {}: hue {hue} on {label}, which {} already pinned to {held}.                      a hue belongs to the label rather than to one asset, so a group                      has one",
+                    "asset {}: hue {hue} on {label}, which {} already pinned to \
+                     {held}. a hue belongs to the label rather than to one \
+                     asset, so a group has one",
                     meta.name, by_whom[label]
                 )));
             }
@@ -1277,19 +1279,25 @@ fn check_groups(metas: &[AssetMeta]) -> Result<(), Error> {
         };
         if group.trim().is_empty() {
             return Err(Error::Graph(format!(
-                "asset {}: declared group {group:?} has no name in it, and an asset in a                  group with no name is an asset in no group",
+                "asset {}: declared group {group:?} has no name in it, and an asset in a group \
+                 with no name is an asset in no group",
                 meta.name
             )));
         }
         if group.contains(GROUP_SEPARATOR) {
             return Err(Error::Graph(format!(
-                "asset {}: declared group {group:?} contains {GROUP_SEPARATOR:?}, and a                  folded group is drawn as {group}{GROUP_SEPARATOR}, which reads as                  nesting that is not there. a group is flat",
+                "asset {}: declared group {group:?} contains {GROUP_SEPARATOR:?}, and a folded \
+                 group is drawn as {group}{GROUP_SEPARATOR}, which reads as nesting that is not \
+                 there. a group is flat",
                 meta.name
             )));
         }
         if bare.contains(group) {
             return Err(Error::Graph(format!(
-                "asset {}: declared group {group} is also the name of the ungrouped                  source {group}. an origin label is a group name falling back to a bare                  source name, so one legend entry would point at both: give the source                  a group of its own, or rename one of the two",
+                "asset {}: declared group {group} is also the name of the ungrouped source \
+                 {group}. an origin label is a group name falling back to a bare source name, \
+                 so one legend entry would point at both: give the source a group of its own, \
+                 or rename one of the two",
                 meta.name
             )));
         }
@@ -2800,6 +2808,10 @@ mod tests {
             "{clash}"
         );
         assert!(clash.contains("finance"), "{clash}");
+        // a message somebody reads at a build failure, so it reads as prose:
+        // a wrapped literal that loses its continuation leaves a run of
+        // spaces, which no assertion on a substring would ever notice
+        assert!(!clash.contains("  "), "gap in the message: {clash}");
         // the same angle twice is one answer, not a disagreement
         AssetRegistry::new(
             vec![

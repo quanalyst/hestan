@@ -2710,7 +2710,8 @@ fn check_asset_groups(app: &Inspected) -> Finding {
                 drifted.join("; ")
             ),
             format!(
-                "{first}. the group is what the catalog and the graph go by, so the                  prefix is now decoration: rename the asset to match, or drop the                  prefix from the name"
+                "{first}. the group is what the catalog and the graph go by, so the prefix is \
+                 now decoration: rename the asset to match, or drop the prefix from the name"
             ),
         ),
     }
