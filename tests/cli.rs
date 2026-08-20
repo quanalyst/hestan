@@ -58,6 +58,7 @@ fn main() {
 fn app(db: &str) -> Hestan {
     let app = Hestan::new()
         .jobs(jobs())
+        .assets(assets())
         // one at a time, so a case can hold the only slot and watch another
         // run queue up behind it
         .max_concurrent_runs(1)
@@ -72,6 +73,21 @@ fn app(db: &str) -> Hestan {
 #[allow(dead_code)]
 struct Window {
     days: u32,
+}
+
+/// two warehouse tables, a vendor feed and something built out of them: the
+/// smallest registry that has a group, an origin and an asset in neither.
+fn assets() -> Vec<Asset> {
+    let orders = Asset::source("orders").group("warehouse");
+    let returns = Asset::source("returns").group("warehouse");
+    let fx = Asset::source("fx_rates");
+    let margin = Asset::new("margin", |_| async { Ok(json!({ "margin": 1 })) })
+        .from(&orders)
+        .from(&fx)
+        .group("finance");
+    // and one whose group is the prefix in its name, with nothing declared
+    let netted = Asset::new("finance/netted", |_| async { Ok(json!(null)) }).from(&returns);
+    vec![orders, returns, fx, margin, netted]
 }
 
 fn jobs() -> Vec<Job> {
@@ -156,6 +172,7 @@ async fn cases(dir: &Path) {
         completing(dir),
     )
     .await;
+    case("a_hue_is_the_same_number_in_another_process", coloured(dir)).await;
     #[cfg(unix)]
     case(
         "an_isolated_op_is_served_its_op_and_not_a_socket",
@@ -658,6 +675,87 @@ async fn diagnosed(dir: &Path) {
         .collect();
     assert_eq!(wrong.len(), 1, "{:?}", value["findings"]);
     assert!(wrong[0]["fix"].is_string(), "a finding with no fix");
+}
+
+/// the stability claim, made across a process boundary.
+///
+/// the numbers below are computed twice: once by the child, which built the
+/// registry and answered `assets`, and once here out of the same names. a hue
+/// seeded per process (which is what `std`'s hasher is) would agree with
+/// itself and not with anybody else, and that is the failure this catches.
+/// the group and origin columns and the `--group` filter are the same
+/// invocation, so they are asserted here too.
+async fn coloured(dir: &Path) {
+    let db = db(dir, "colours");
+    let listed = cli(&db, &["--json", "assets"]);
+    listed.assert(0);
+    let body: Value = serde_json::from_str(&listed.stdout).expect("one json object");
+    let rows = body["assets"].as_array().expect("assets");
+    assert_eq!(rows.len(), 5, "{rows:?}");
+
+    let mut seen = 0;
+    for row in rows {
+        if let Some(group) = row["group"].as_str() {
+            assert_eq!(
+                row["group_hue"],
+                json!(hestan::hue(group)),
+                "the child painted {group} differently: {row}"
+            );
+            seen += 1;
+        }
+        for origin in row["provenance"].as_array().expect("provenance") {
+            let name = origin["name"].as_str().expect("a name");
+            assert_eq!(
+                origin["hue"],
+                json!(hestan::hue(name)),
+                "the child painted {name} differently: {row}"
+            );
+            seen += 1;
+        }
+    }
+    assert!(seen >= 8, "only {seen} hues came back to compare");
+
+    // an origin is the group of the source it descends from, so the two
+    // warehouse tables are one label and the vendor feed is another
+    let margin = rows.iter().find(|a| a["name"] == json!("margin")).unwrap();
+    assert_eq!(margin["group"], json!("finance"));
+    assert_eq!(
+        margin["provenance"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|o| o["name"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        ["fx_rates", "warehouse"]
+    );
+    // an ungrouped source stands for itself, and its group is null
+    let fx = rows
+        .iter()
+        .find(|a| a["name"] == json!("fx_rates"))
+        .unwrap();
+    assert_eq!(fx["group"], json!(null));
+
+    // the filter is on the resolved group, so it finds the one that declared
+    // it and the one that only has it in its name
+    let finance = cli(&db, &["--json", "assets", "--group", "finance"]);
+    finance.assert(0);
+    let body: Value = serde_json::from_str(&finance.stdout).expect("one json object");
+    let names: Vec<&str> = body["assets"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|a| a["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, ["margin", "finance/netted"]);
+
+    // and the table says both, in words, since a colour is never the only
+    // thing carrying an answer
+    let table = cli(&db, &["assets"]);
+    table.assert(0);
+    assert!(table.stdout.contains("GROUP"), "{table:?}");
+    assert!(table.stdout.contains("ORIGIN"), "{table:?}");
+    assert!(table.stdout.contains("warehouse"), "{table:?}");
+    assert!(table.stdout.contains("fx_rates, warehouse"), "{table:?}");
 }
 
 /// the params a dry run checks are the ones a launch would check, and nothing

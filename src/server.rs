@@ -1067,10 +1067,18 @@ pub(crate) fn assets_json(registry: &AssetRegistry, store: &Store) -> Result<Val
                 // where it belongs: what it declared, else the part of the
                 // name before the first "/", else null
                 "group": meta.group(),
+                // an angle on the colour wheel rather than a colour, because
+                // what lightness is legible depends on the reader's theme and
+                // this end does not know it
+                "group_hue": meta.group().map(|g| registry.hue_of(g)),
                 // and where it came from: the source groups it descends from,
-                // sorted by name. a source's own is itself. [] is a real
-                // answer and means no source is upstream of it at all
-                "provenance": meta.provenance,
+                // sorted by name, each with its own angle. a source's own
+                // origin is itself. [] is a real answer and means no source is
+                // upstream of it at all
+                "provenance": meta.provenance.iter().map(|from| json!({
+                    "name": from,
+                    "hue": registry.hue_of(from),
+                })).collect::<Vec<Value>>(),
                 "kind": if meta.source { "source" } else { "derived" },
                 "deps": meta.deps,
                 "mappings": mappings,
@@ -5224,16 +5232,22 @@ mod tests {
             .iter()
             .map(|a| (a["name"].as_str().unwrap(), &a["group"], &a["provenance"]))
             .collect();
+        let warehouse = json!([{"name": "warehouse", "hue": crate::hue("warehouse")}]);
         assert_eq!(
             said,
             [
-                ("orders", &json!("warehouse"), &json!(["warehouse"])),
-                ("sales/daily", &json!("sales"), &json!(["warehouse"])),
+                ("orders", &json!("warehouse"), &warehouse),
+                ("sales/daily", &json!("sales"), &warehouse),
                 // no source upstream at all, which is [] rather than null: the
                 // answer is known and it is empty
                 ("heartbeat", &json!(null), &json!([])),
             ]
         );
+        // the group's angle is the same function of the same name, so a
+        // catalog and a legend cannot disagree about what colour sales is
+        let assets = body["assets"].as_array().unwrap();
+        assert_eq!(assets[1]["group_hue"], json!(crate::hue("sales")));
+        assert_eq!(assets[2]["group_hue"], json!(null));
     }
 
     #[tokio::test]

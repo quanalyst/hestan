@@ -31,7 +31,7 @@
 //!   serves. no new endpoints: everything asked for over the network is
 //!   something the ui already asks for.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io::IsTerminal;
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
@@ -1981,7 +1981,7 @@ fn origin_of(asset: &Value) -> String {
         return "no source".into();
     }
     from.iter()
-        .filter_map(|o| o.as_str())
+        .filter_map(|o| o["name"].as_str())
         .collect::<Vec<_>>()
         .join(", ")
 }
@@ -2421,6 +2421,7 @@ async fn doctor(reach: Reach, out: &Out) -> Result<(), Fail> {
             findings.extend(check_queue(app)?);
             findings.extend(check_policies(app)?);
             findings.push(check_asset_groups(app));
+            findings.push(check_colours(app));
             findings.push(check_rates(app));
             findings.extend(check_retention(app));
             findings.push(check_auth(app.auth.as_ref()));
@@ -2713,6 +2714,81 @@ fn check_asset_groups(app: &Inspected) -> Finding {
             ),
         ),
     }
+}
+
+/// how close two hues may sit before they stop being two colours, in degrees
+/// of the 360.
+///
+/// eight, and the number is a compromise said out loud. two swatches that
+/// close, at one saturation and lightness, are not reliably told apart when
+/// they are rows apart on a page rather than edge to edge. it is also where
+/// the check earns its keep: labels land on the wheel wherever their names
+/// hash to, so with n of them the pairs inside eight degrees come to roughly
+/// n squared over 45. five groups and this is almost always quiet; twenty and
+/// it almost always has something to say, which is the truth about one hue per
+/// name rather than a fault in the check.
+const HUE_APART: u16 = 8;
+
+/// the pairs of live labels whose hues are too close to tell apart.
+///
+/// [`hue`](crate::hue) is a pure function of one name, which is what keeps a
+/// colour still when somebody adds a group, and the price is that two names
+/// can land next to each other. nothing that reads one name at a time can
+/// prevent that, so this reports it instead: a limit found with a tool rather
+/// than by squinting at a screen.
+fn check_colours(app: &Inspected) -> Finding {
+    // both channels at once: a group is a colour and so is an origin, and a
+    // pair that collides collides in whichever view is showing
+    let mut labels: BTreeSet<&str> = BTreeSet::new();
+    for meta in app.registry.topo() {
+        if let Some(group) = meta.group() {
+            labels.insert(group);
+        }
+        labels.extend(meta.provenance.iter().map(String::as_str));
+    }
+    if labels.len() < 2 {
+        return Finding::ok(
+            "colours",
+            format!("{} label(s) to colour; nothing to confuse", labels.len()),
+        );
+    }
+    let hues: Vec<(&str, u16)> = labels
+        .iter()
+        .map(|label| (*label, app.registry.hue_of(label)))
+        .collect();
+    let mut close: Vec<String> = Vec::new();
+    for (i, (a, one)) in hues.iter().enumerate() {
+        for (b, other) in &hues[i + 1..] {
+            let round = one.abs_diff(*other);
+            let apart = round.min(360 - round);
+            if apart <= HUE_APART {
+                close.push(format!(
+                    "{a} at {one} and {b} at {other}, {apart} degrees apart"
+                ));
+            }
+        }
+    }
+    let Some(first) = close.first() else {
+        return Finding::ok(
+            "colours",
+            format!(
+                "{} label(s), no two within {HUE_APART} degrees of each other",
+                hues.len()
+            ),
+        );
+    };
+    Finding::note(
+        "colours",
+        format!(
+            "{} pair(s) of labels are too close to tell apart: {}",
+            close.len(),
+            close.join("; ")
+        ),
+        format!(
+            "{first}. the hue is a hash of the name, so the two are stuck there \
+             until one is moved: pin one with Asset::hue(n), which is what it is for"
+        ),
+    )
 }
 
 fn check_rates(app: &Inspected) -> Finding {
@@ -3972,10 +4048,61 @@ mod tests {
 
     // three answers, because "nothing upstream" and "this mode cannot see the
     // graph" would otherwise both be a blank cell
+    // a hue is a hash of one name, so two names can land next to each other
+    // and nothing that reads one name at a time can stop them. this is the
+    // check that says so instead of leaving it to be noticed on a screen
+    #[test]
+    fn doctor_names_two_labels_whose_colours_are_too_close_together() {
+        let mut deployment = app(Store::open(":memory:").unwrap(), Vec::new());
+        assert_eq!(check_colours(&deployment).level, Level::Ok);
+
+        // warehouse hashes to 274 and orders to 268, six degrees apart, which
+        // is the failure mode written down rather than described
+        let orders = crate::Asset::source("orders");
+        let stock = crate::Asset::source("stock").group("warehouse");
+        let joined = crate::Asset::new("joined", |_| async { Ok(json!(null)) })
+            .from(&orders)
+            .from(&stock);
+        deployment.registry = Arc::new(
+            AssetRegistry::new(vec![orders, stock, joined], Vec::new(), Vec::new()).unwrap(),
+        );
+        let found = check_colours(&deployment);
+        assert_eq!(found.level, Level::Note);
+        assert!(found.says.contains("orders at 268"), "{}", found.says);
+        assert!(found.says.contains("warehouse at 274"), "{}", found.says);
+        assert!(found.says.contains("6 degrees apart"), "{}", found.says);
+        assert!(
+            found
+                .fix
+                .as_deref()
+                .unwrap_or_default()
+                .contains("Asset::hue"),
+            "{:?}",
+            found.fix
+        );
+
+        // pinning one of the two is the fix, and taking it makes the check
+        // quiet again
+        let orders = crate::Asset::source("orders").hue(60);
+        let stock = crate::Asset::source("stock").group("warehouse");
+        let joined = crate::Asset::new("joined", |_| async { Ok(json!(null)) })
+            .from(&orders)
+            .from(&stock);
+        deployment.registry = Arc::new(
+            AssetRegistry::new(vec![orders, stock, joined], Vec::new(), Vec::new()).unwrap(),
+        );
+        let quiet = check_colours(&deployment);
+        assert_eq!(quiet.level, Level::Ok);
+        assert!(quiet.says.contains("no two within 8"), "{}", quiet.says);
+    }
+
     #[test]
     fn the_origin_cell_tells_no_source_apart_from_no_registry() {
         assert_eq!(
-            origin_of(&json!({"provenance": ["vendor", "warehouse"]})),
+            origin_of(&json!({"provenance": [
+                {"name": "vendor", "hue": 105},
+                {"name": "warehouse", "hue": 274},
+            ]})),
             "vendor, warehouse"
         );
         assert_eq!(origin_of(&json!({"provenance": []})), "no source");

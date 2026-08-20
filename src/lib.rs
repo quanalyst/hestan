@@ -139,7 +139,7 @@ mod server;
 mod store;
 
 pub use app::Hestan;
-pub use asset::{Asset, AssetCheck, CheckOutcome, CheckResult, MultiAsset};
+pub use asset::{Asset, AssetCheck, CheckOutcome, CheckResult, MultiAsset, hue};
 pub use auth::{Access, Auth, Identity};
 #[cfg(feature = "capture")]
 #[cfg_attr(docsrs, doc(cfg(feature = "capture")))]

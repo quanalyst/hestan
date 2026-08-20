@@ -48,6 +48,48 @@ pub(crate) fn resolve_group<'a>(declared: Option<&'a str>, name: &'a str) -> Opt
     }
 }
 
+/// the hue a name is drawn in, 0..=359 degrees around the colour wheel.
+///
+/// **a pure function of the name and nothing else**, so a group keeps its
+/// colour across restarts, across processes, across machines and across
+/// however many other groups appear beside it. an index into a palette would
+/// not: adding one group renumbers every group after it, and a graph that
+/// repaints itself when somebody adds an asset is a graph nobody trusts the
+/// colours of.
+///
+/// the number is a hue and not a colour. what lightness is legible depends on
+/// the ground it is drawn on, and the server does not know the reader's theme,
+/// so the reader picks saturation and lightness and this picks the angle. the
+/// web ui does that in css; a terminal doing it in ansi gets the same angle.
+///
+/// sha-256 rather than a hasher out of `std`, because [`DefaultHasher`] is
+/// documented as free to change between releases and is seeded per process:
+/// either would repaint every graph, one on a toolchain upgrade and one on a
+/// restart. the first eight bytes of the digest, big-endian, modulo 360.
+///
+/// **the limit, stated**: two names can hash close enough together to be hard
+/// to tell apart, and no pure function of one name can prevent it, because
+/// preventing it needs the whole set of names and a function of the whole set
+/// is exactly the unstable thing above. `hestan doctor` reports the pairs it
+/// finds rather than leaving them to be noticed on a screen, and
+/// [`Asset::hue`] pins one of the two.
+///
+/// ```
+/// // the same name, the same angle, wherever it is asked
+/// assert_eq!(hestan::hue("warehouse"), hestan::hue("warehouse"));
+/// assert!(hestan::hue("warehouse") <= 359);
+/// ```
+///
+/// [`DefaultHasher`]: std::collections::hash_map::DefaultHasher
+pub fn hue(name: &str) -> u16 {
+    let digest = Sha256::digest(name.as_bytes());
+    let head = u64::from_be_bytes(digest[..8].try_into().expect("sha-256 is 32 bytes"));
+    (head % 360) as u16
+}
+
+/// the widest a hue may be, past which [`Asset::hue`] fails the build.
+pub(crate) const MAX_HUE: u16 = 359;
+
 pub(crate) type ProbeFn = dyn Fn() -> BoxFuture<'static, Result<String, Box<dyn std::error::Error + Send + Sync>>>
     + Send
     + Sync;
@@ -85,6 +127,7 @@ pub struct Asset {
     name: String,
     source: bool,
     group: Option<String>,
+    hue: Option<u16>,
     deps: Vec<String>,
     maps: BTreeMap<String, PartitionMapping>,
     op: Option<Op>,
@@ -107,6 +150,7 @@ impl Asset {
             name: name.into(),
             source: true,
             group: None,
+            hue: None,
             deps: Vec::new(),
             maps: BTreeMap::new(),
             op: None,
@@ -135,6 +179,7 @@ impl Asset {
             name,
             source: false,
             group: None,
+            hue: None,
             deps: Vec::new(),
             maps: BTreeMap::new(),
             io: None,
@@ -164,6 +209,7 @@ impl Asset {
             name,
             source: false,
             group: None,
+            hue: None,
             deps: Vec::new(),
             maps: BTreeMap::new(),
             io: None,
@@ -295,6 +341,22 @@ impl Asset {
     /// falling back to a bare source name and the two would be one entry.
     pub fn group(mut self, name: impl Into<String>) -> Asset {
         self.group = Some(name.into());
+        self
+    }
+
+    /// pin the [hue](crate::hue) this asset's label is drawn in, 0..=359
+    /// degrees; outside that range fails the build.
+    ///
+    /// the label is the group where there is one and the asset's own name
+    /// where there is not, so this pins a colour for a whole group and two
+    /// assets in one group may not pin it to two different angles.
+    ///
+    /// worth reaching for in one case: `hestan doctor` named two labels whose
+    /// hashed hues sit too close to tell apart, and one of them should move.
+    /// pinning every group by hand is the palette-index failure the hash
+    /// exists to avoid, only done by hand.
+    pub fn hue(mut self, hue: u16) -> Asset {
+        self.hue = Some(hue);
         self
     }
 
@@ -653,6 +715,9 @@ pub(crate) struct AssetMeta {
     /// in which case the name prefix answers instead. kept as declared rather
     /// than resolved so `doctor` can see the two disagree.
     pub declared_group: Option<String>,
+    /// the hue [`Asset::hue`] pinned on this asset's label; `None` when
+    /// nothing was pinned, in which case [`hue`] answers from the label.
+    pub declared_hue: Option<u16>,
     pub deps: Vec<String>,
     /// the [mapping](PartitionMapping) declared on each dep it reads, for the
     /// deps that declared one; everything else is identity.
@@ -688,6 +753,13 @@ impl AssetMeta {
     /// of the name before the first `/`, else nothing.
     pub(crate) fn group(&self) -> Option<&str> {
         resolve_group(self.declared_group.as_deref(), &self.name)
+    }
+
+    /// the name this asset's colour hangs on: its group, or its own name where
+    /// it is in no group. for a source that is exactly the label its origin is
+    /// reported under, which is what makes one hue serve both channels.
+    pub(crate) fn label(&self) -> &str {
+        self.group().unwrap_or(&self.name)
     }
 
     /// which of `dep`'s keys one of this asset's partitions reads. identity
@@ -750,6 +822,9 @@ struct DepLink {
 pub(crate) struct AssetRegistry {
     metas: Vec<AssetMeta>,
     by_name: HashMap<String, usize>,
+    /// the labels somebody pinned a hue on, from [`Asset::hue`]. everything
+    /// else answers from [`hue`], so this holds only the exceptions.
+    hues: BTreeMap<String, u16>,
     ops: Vec<OpMeta>,
     by_op: HashMap<String, usize>,
     checks: Vec<CheckMeta>,
@@ -760,6 +835,7 @@ impl AssetRegistry {
         AssetRegistry {
             metas: Vec::new(),
             by_name: HashMap::new(),
+            hues: BTreeMap::new(),
             ops: Vec::new(),
             by_op: HashMap::new(),
             checks: Vec::new(),
@@ -830,6 +906,7 @@ impl AssetRegistry {
                 name: a.name.clone(),
                 source: a.source,
                 declared_group: a.group,
+                declared_hue: a.hue,
                 deps: a.deps,
                 maps: a.maps,
                 policy: a.policy,
@@ -861,6 +938,7 @@ impl AssetRegistry {
                     // so there is nowhere to declare a group on one of them;
                     // the name prefix is what answers for them
                     declared_group: None,
+                    declared_hue: None,
                     deps: m.deps.clone(),
                     maps: BTreeMap::new(),
                     policy: m.policy.clone(),
@@ -929,6 +1007,7 @@ impl AssetRegistry {
             .map(|(i, m)| (m.name.clone(), i))
             .collect();
         walk_provenance(&mut ordered, &by_name);
+        let pinned = check_hues(&ordered)?;
         // ops in the topo order of the first asset each produces, so lowering
         // and planning list them the same way every time
         ops.sort_by_key(|o| {
@@ -980,6 +1059,7 @@ impl AssetRegistry {
         checked.sort_by_key(|c| by_name[&c.asset]);
 
         Ok(AssetRegistry {
+            hues: pinned,
             metas: ordered,
             by_name,
             ops,
@@ -995,6 +1075,13 @@ impl AssetRegistry {
 
     pub(crate) fn topo(&self) -> impl Iterator<Item = &AssetMeta> {
         self.metas.iter()
+    }
+
+    /// the hue a label is drawn in: what somebody pinned on it, else what
+    /// [`hue`] makes of the name. one answer, so the api, the ui and the
+    /// command line cannot disagree about what colour a group is.
+    pub(crate) fn hue_of(&self, label: &str) -> u16 {
+        self.hues.get(label).copied().unwrap_or_else(|| hue(label))
     }
 
     pub(crate) fn get(&self, name: &str) -> Option<&AssetMeta> {
@@ -1083,6 +1170,43 @@ impl AssetRegistry {
             external,
         )
     }
+}
+
+/// the hues somebody pinned, and the two ways a pinned one is refused.
+///
+/// a hue is an angle, so a number that is not on the wheel is a mistake rather
+/// than a value to wrap around: 400 could mean 40, and quietly meaning 40 is
+/// how a typo becomes a colour nobody chose. and a hue is pinned on a label
+/// rather than on an asset, so two assets in one group pinning two angles is a
+/// question with no answer, said here rather than resolved by declaration
+/// order.
+fn check_hues(metas: &[AssetMeta]) -> Result<BTreeMap<String, u16>, Error> {
+    let mut pinned: BTreeMap<String, u16> = BTreeMap::new();
+    let mut by_whom: HashMap<&str, &str> = HashMap::new();
+    for meta in metas {
+        let Some(hue) = meta.declared_hue else {
+            continue;
+        };
+        if hue > MAX_HUE {
+            return Err(Error::Graph(format!(
+                "asset {}: hue {hue} is not on the wheel, which is 0..={MAX_HUE} degrees",
+                meta.name
+            )));
+        }
+        let label = meta.label();
+        match pinned.insert(label.to_string(), hue) {
+            Some(held) if held != hue => {
+                return Err(Error::Graph(format!(
+                    "asset {}: hue {hue} on {label}, which {} already pinned to {held}.                      a hue belongs to the label rather than to one asset, so a group                      has one",
+                    meta.name, by_whom[label]
+                )));
+            }
+            _ => {
+                by_whom.insert(label, &meta.name);
+            }
+        }
+    }
+    Ok(pinned)
 }
 
 /// where every asset came from, in one forward pass over the topo order.
@@ -2622,6 +2746,83 @@ mod tests {
             Vec::new(),
         )
         .expect("no collision left");
+    }
+
+    // ------------------------------------------------------------- hues
+
+    // **the point of the stability claim.** these numbers are what somebody's
+    // graph is painted with, so a refactor of the hash is a repaint of every
+    // deployment, and it has to be a decision rather than a side effect. if
+    // this fails, the hash changed and everybody's colours changed with it.
+    #[test]
+    fn a_name_hashes_to_the_same_angle_it_always_has() {
+        assert_eq!(hue("sales"), 1);
+        assert_eq!(hue("finance"), 216);
+        assert_eq!(hue("marketing"), 120);
+        assert_eq!(hue("warehouse"), 274);
+        assert_eq!(hue("vendor"), 105);
+        assert_eq!(hue("orders"), 268);
+        assert_eq!(hue("fx_rates"), 357);
+        assert_eq!(hue("heartbeat"), 141);
+        // and it is a function, so asking twice is asking once
+        assert_eq!(hue("sales"), hue("sales"));
+        // every answer is on the wheel, including the empty name
+        for name in ["", "a", "warehouse", "a much longer label than that one"] {
+            assert!(hue(name) <= MAX_HUE, "{name} hashed off the wheel");
+        }
+        // adding a group does not move any other group, which an index into a
+        // palette could not promise
+        assert_eq!(hue("sales"), 1);
+    }
+
+    #[test]
+    fn a_pinned_hue_is_refused_off_the_wheel_and_when_two_assets_disagree() {
+        let off = reg_err(vec![echo("daily").group("finance").hue(360)]).to_string();
+        assert!(off.contains("daily") && off.contains("360"), "{off}");
+        assert!(off.contains("0..=359"), "{off}");
+
+        // 359 is the last one that is on it
+        AssetRegistry::new(
+            vec![echo("daily").group("finance").hue(359)],
+            Vec::new(),
+            Vec::new(),
+        )
+        .expect("359 is on the wheel");
+
+        // a hue belongs to the label, so a group cannot have two
+        let clash = reg_err(vec![
+            echo("daily").group("finance").hue(10),
+            echo("weekly").group("finance").hue(200),
+        ])
+        .to_string();
+        assert!(
+            clash.contains("weekly") && clash.contains("daily"),
+            "{clash}"
+        );
+        assert!(clash.contains("finance"), "{clash}");
+        // the same angle twice is one answer, not a disagreement
+        AssetRegistry::new(
+            vec![
+                echo("daily").group("finance").hue(10),
+                echo("weekly").group("finance").hue(10),
+            ],
+            Vec::new(),
+            Vec::new(),
+        )
+        .expect("agreeing is not a clash");
+    }
+
+    #[test]
+    fn a_pinned_hue_answers_for_the_whole_label_and_the_rest_hash() {
+        let orders = Asset::source("orders").group("warehouse").hue(30);
+        let daily = echo("sales/daily").from(&orders);
+        let loose = echo("heartbeat");
+        let reg = AssetRegistry::new(vec![orders, daily, loose], Vec::new(), Vec::new()).unwrap();
+        // the label the pin was on, which is both a group and an origin
+        assert_eq!(reg.hue_of("warehouse"), 30);
+        // and everything else is the hash of its own name
+        assert_eq!(reg.hue_of("sales"), hue("sales"));
+        assert_eq!(reg.hue_of("heartbeat"), hue("heartbeat"));
     }
 
     // ------------------------------------------------------- provenance
