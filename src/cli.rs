@@ -1968,6 +1968,24 @@ fn in_group(answer: Value, group: Option<&str>) -> Value {
     json!({ "assets": kept })
 }
 
+/// what an asset descends from, as one cell.
+///
+/// three answers rather than two, because "no source is upstream of this" and
+/// "this mode cannot see the graph" are different things and a blank would
+/// read as both. a run log opened directly carries no registry, so it says so.
+fn origin_of(asset: &Value) -> String {
+    let Some(from) = asset["provenance"].as_array() else {
+        return "-".into();
+    };
+    if from.is_empty() {
+        return "no source".into();
+    }
+    from.iter()
+        .filter_map(|o| o.as_str())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 /// how one dep's keys are read, for the deps that are read at anything but
 /// the same key.
 fn mapping_of(asset: &Value, dep: &str) -> Option<String> {
@@ -1993,7 +2011,7 @@ fn render_assets(answer: &Value, out: &Out) {
     // "stale" is a claim about the registry, so the column only exists where
     // one was there to make it
     let known = assets.iter().any(|a| a.get("stale").is_some());
-    let mut table = Table::new(["ASSET", "GROUP", "STATE", "BUILT", "DEPS"]);
+    let mut table = Table::new(["ASSET", "GROUP", "ORIGIN", "STATE", "BUILT", "DEPS"]);
     for asset in &assets {
         let state = match (known, asset["stale"] == json!(true)) {
             (false, _) => Cell::plain("-"),
@@ -2005,6 +2023,7 @@ fn render_assets(answer: &Value, out: &Out) {
             // written out rather than coloured: the group is the answer to
             // "whose is this", and a column of names is what a pipe carries
             Cell::plain(asset["group"].as_str().unwrap_or("-")),
+            Cell::plain(origin_of(asset)),
             state,
             Cell::plain(match asset["built_at"].as_str() {
                 Some(at) => when(at),
@@ -3949,6 +3968,18 @@ mod tests {
             .unwrap(),
         );
         assert_eq!(check_asset_groups(&deployment).level, Level::Ok);
+    }
+
+    // three answers, because "nothing upstream" and "this mode cannot see the
+    // graph" would otherwise both be a blank cell
+    #[test]
+    fn the_origin_cell_tells_no_source_apart_from_no_registry() {
+        assert_eq!(
+            origin_of(&json!({"provenance": ["vendor", "warehouse"]})),
+            "vendor, warehouse"
+        );
+        assert_eq!(origin_of(&json!({"provenance": []})), "no source");
+        assert_eq!(origin_of(&json!({"name": "orders"})), "-");
     }
 
     #[test]

@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -676,6 +676,11 @@ pub(crate) struct AssetMeta {
     /// how old the latest materialization may get before this asset is late,
     /// from [`Asset::fresh_within`]; `None` when nothing was declared.
     pub fresh_within: Option<Duration>,
+    /// where this asset came from: the source groups it descends from
+    /// transitively, sorted by name, filled in by [`walk_provenance`] once the
+    /// whole graph is in topo order. empty is a real answer, and it means no
+    /// source is upstream of this asset at all.
+    pub provenance: Vec<String>,
 }
 
 impl AssetMeta {
@@ -834,6 +839,7 @@ impl AssetRegistry {
                 op: (!a.source).then_some(a.name),
                 partitions: a.partitions,
                 fresh_within: a.fresh_within,
+                provenance: Vec::new(),
             });
         }
         for m in multis {
@@ -866,6 +872,7 @@ impl AssetRegistry {
                     // a multi-asset produces names, not `Asset` values, so
                     // there is nowhere to hang a freshness policy on one of them
                     fresh_within: None,
+                    provenance: Vec::new(),
                 });
             }
             ops.push(OpMeta {
@@ -908,7 +915,7 @@ impl AssetRegistry {
         }
         let mut by_declared: HashMap<String, AssetMeta> =
             metas.into_iter().map(|m| (m.name.clone(), m)).collect();
-        let ordered: Vec<AssetMeta> = order
+        let mut ordered: Vec<AssetMeta> = order
             .iter()
             .map(|name| {
                 by_declared
@@ -921,6 +928,7 @@ impl AssetRegistry {
             .enumerate()
             .map(|(i, m)| (m.name.clone(), i))
             .collect();
+        walk_provenance(&mut ordered, &by_name);
         // ops in the topo order of the first asset each produces, so lowering
         // and planning list them the same way every time
         ops.sort_by_key(|o| {
@@ -1074,6 +1082,54 @@ impl AssetRegistry {
             ops,
             external,
         )
+    }
+}
+
+/// where every asset came from, in one forward pass over the topo order.
+///
+/// a source contributes one label, its group where it has one and its own name
+/// where it has none, and every other asset is the union of what its deps
+/// contribute. one pass suffices because `metas` is already sorted so that a
+/// dep is seen before anything that reads it, which is the order
+/// [`graph::topo_order`] produced a few lines above.
+///
+/// **it is a forward pass and not a traversal.** each asset is visited once
+/// and each edge is read once, over a graph the build is already walking. the
+/// honest bound is not quite O(V+E): each edge copies a set rather than a
+/// value, so it is O((V+E)·L) with L the number of distinct origin labels a
+/// node can reach, and L is the number of source groups in the deployment.
+/// `the_origin_pass_stays_flat_on_a_wide_graph` prints the number for 2040
+/// assets and 8000 edges rather than leaving this as an assertion.
+///
+/// one implementation, because the api, the command line and `doctor` all want
+/// the same answer and two would drift.
+///
+/// the labels are collected in a [`BTreeSet`], so what comes out is sorted by
+/// name and identical between two calls. a set that reorders between requests
+/// makes a swatch flicker.
+fn walk_provenance(metas: &mut [AssetMeta], by_name: &HashMap<String, usize>) {
+    let mut sets: Vec<BTreeSet<String>> = Vec::with_capacity(metas.len());
+    for meta in metas.iter() {
+        let mut from = BTreeSet::new();
+        if meta.source {
+            // a source is its own origin: the system its group names, or
+            // itself where it names no system
+            from.insert(meta.group().unwrap_or(&meta.name).to_string());
+        } else {
+            for dep in &meta.deps {
+                // topo order, so the dep's own set is already final. a
+                // partition mapping is not consulted: it says which keys a
+                // read takes, and where the data came from is the same answer
+                // at every key
+                if let Some(&at) = by_name.get(dep) {
+                    from.extend(sets[at].iter().cloned());
+                }
+            }
+        }
+        sets.push(from);
+    }
+    for (meta, from) in metas.iter_mut().zip(sets) {
+        meta.provenance = from.into_iter().collect();
     }
 }
 
@@ -2566,6 +2622,151 @@ mod tests {
             Vec::new(),
         )
         .expect("no collision left");
+    }
+
+    // ------------------------------------------------------- provenance
+
+    fn origins(reg: &AssetRegistry, name: &str) -> Vec<String> {
+        reg.get(name).unwrap().provenance.clone()
+    }
+
+    #[test]
+    fn a_diamond_names_both_the_sources_it_descends_from_once_each() {
+        let orders = Asset::source("orders").group("warehouse");
+        let returns = Asset::source("returns").group("warehouse");
+        let fx = Asset::source("fx_rates").group("vendor");
+        let priced = echo("priced").from(&orders).from(&fx);
+        let netted = echo("netted").from(&returns).from(&fx);
+        let margin = echo("margin").from(&priced).from(&netted);
+        let reg = AssetRegistry::new(
+            vec![orders, returns, fx, priced, netted, margin],
+            Vec::new(),
+            Vec::new(),
+        )
+        .unwrap();
+
+        // two tables out of one warehouse are one origin, which is the whole
+        // reason a source's group names the system rather than the table
+        assert_eq!(origins(&reg, "orders"), ["warehouse"]);
+        assert_eq!(origins(&reg, "returns"), ["warehouse"]);
+        assert_eq!(origins(&reg, "fx_rates"), ["vendor"]);
+        assert_eq!(origins(&reg, "priced"), ["vendor", "warehouse"]);
+        // the diamond reaches the warehouse down both sides and says it once
+        assert_eq!(origins(&reg, "margin"), ["vendor", "warehouse"]);
+    }
+
+    #[test]
+    fn an_origin_carries_ten_hops_down_and_an_ungrouped_source_is_its_own_name() {
+        let root = Asset::source("root");
+        let mut assets = vec![root];
+        for i in 0..10 {
+            let dep = assets.last().unwrap().name().to_string();
+            assets.push(echo(&format!("step{i}")).from_named(dep));
+        }
+        let reg = AssetRegistry::new(assets, Vec::new(), Vec::new()).unwrap();
+        // a source in no group contributes its own name, so the label at the
+        // far end names the thing it actually came from
+        assert_eq!(origins(&reg, "root"), ["root"]);
+        assert_eq!(origins(&reg, "step9"), ["root"]);
+    }
+
+    #[test]
+    fn an_asset_with_no_source_upstream_has_an_empty_origin_and_that_is_an_answer() {
+        let seed = echo("seed");
+        let leaf = echo("leaf").from(&seed);
+        let reg = AssetRegistry::new(vec![seed, leaf], Vec::new(), Vec::new()).unwrap();
+        assert!(origins(&reg, "seed").is_empty());
+        assert!(origins(&reg, "leaf").is_empty());
+    }
+
+    // a set that reorders between two requests makes a swatch flicker, so the
+    // order is part of the answer rather than a detail of the container
+    #[test]
+    fn the_origin_order_is_by_name_and_the_same_every_time() {
+        let build = || {
+            let zulu = Asset::source("zulu").group("zeta");
+            let alpha = Asset::source("alpha").group("alpha");
+            let mid = Asset::source("mid").group("mid");
+            let sink = echo("sink").from(&zulu).from(&mid).from(&alpha);
+            AssetRegistry::new(vec![zulu, mid, alpha, sink], Vec::new(), Vec::new()).unwrap()
+        };
+        let once = origins(&build(), "sink");
+        let twice = origins(&build(), "sink");
+        assert_eq!(once, ["alpha", "mid", "zeta"]);
+        assert_eq!(once, twice);
+    }
+
+    // a mapping says which keys a read takes; where the data came from is the
+    // same answer at every key
+    #[test]
+    fn a_mapped_partition_edge_changes_nothing_about_where_the_data_came_from() {
+        let raw = Asset::source("raw").group("warehouse");
+        let hours = hourly("hours").from(&raw);
+        let rollup = daily("rollup", "hours", PartitionMapping::covering()).from(&raw);
+        let identity = Asset::new("mirror", |_| async { Ok(json!(null)) })
+            .from_named("hours")
+            .partitioned(Partitions::hourly("2026-01-01T00"));
+        let reg =
+            AssetRegistry::new(vec![raw, hours, rollup, identity], Vec::new(), Vec::new()).unwrap();
+        assert_eq!(origins(&reg, "rollup"), ["warehouse"]);
+        assert_eq!(origins(&reg, "mirror"), origins(&reg, "rollup"));
+    }
+
+    // the honest version of "it costs nothing": a wide graph, timed. this
+    // rules out a pass that walks upward from every node, which is what a
+    // second traversal would have been; it does not measure the constant
+    #[test]
+    fn the_origin_pass_stays_flat_on_a_wide_graph() {
+        // 40 sources, then 8 layers of 250, each reading four of the layer
+        // below: 2040 assets and 8000 edges
+        let (sources, layers, wide, fan) = (40, 8, 250, 4);
+        let mut assets: Vec<Asset> = (0..sources)
+            .map(|i| Asset::source(format!("src{i}")).group(format!("system{i}")))
+            .collect();
+        for layer in 0..layers {
+            for i in 0..wide {
+                let mut node = echo(&format!("n{layer}_{i}"));
+                for f in 0..fan {
+                    let at = (i * fan + f) % if layer == 0 { sources } else { wide };
+                    node = node.from_named(match layer {
+                        0 => format!("src{at}"),
+                        _ => format!("n{}_{at}", layer - 1),
+                    });
+                }
+                assets.push(node);
+            }
+        }
+        let count = assets.len();
+        let whole = std::time::Instant::now();
+        let reg = AssetRegistry::new(assets, Vec::new(), Vec::new()).unwrap();
+        let whole = whole.elapsed();
+        assert_eq!(count, 2040);
+        // every sink reaches every system through eight layers of fan-in
+        assert_eq!(reg.get("n7_0").unwrap().provenance.len(), sources);
+
+        // and the pass on its own, over the same graph, which is the number
+        // the claim is about. it is run a second time on an already-filled
+        // registry, so this also says the pass is idempotent
+        let AssetRegistry {
+            mut metas, by_name, ..
+        } = reg;
+        let before: Vec<Vec<String>> = metas.iter().map(|m| m.provenance.clone()).collect();
+        let pass = std::time::Instant::now();
+        walk_provenance(&mut metas, &by_name);
+        let pass = pass.elapsed();
+        let after: Vec<Vec<String>> = metas.iter().map(|m| m.provenance.clone()).collect();
+        assert_eq!(before, after);
+        println!(
+            "{count} assets, {} edges: {pass:?} for the pass, {whole:?} for the whole build",
+            layers * wide * fan
+        );
+        // a bound loose enough that a busy machine cannot fail it. it guards
+        // against a blow-up rather than measuring the constant: the number
+        // printed above is the measurement
+        assert!(
+            pass < std::time::Duration::from_secs(2),
+            "the pass over {count} assets took {pass:?}"
+        );
     }
 
     // the manager an asset selected has to reach the op the run executes, or

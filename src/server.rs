@@ -1067,6 +1067,10 @@ pub(crate) fn assets_json(registry: &AssetRegistry, store: &Store) -> Result<Val
                 // where it belongs: what it declared, else the part of the
                 // name before the first "/", else null
                 "group": meta.group(),
+                // and where it came from: the source groups it descends from,
+                // sorted by name. a source's own is itself. [] is a real
+                // answer and means no source is upstream of it at all
+                "provenance": meta.provenance,
                 "kind": if meta.source { "source" } else { "derived" },
                 "deps": meta.deps,
                 "mappings": mappings,
@@ -5205,7 +5209,7 @@ mod tests {
     // the payload carries the resolved answer rather than the declaration, so
     // no reader has to know the fallback rule to draw a catalog
     #[test]
-    fn the_assets_payload_says_which_group_each_asset_resolved_to() {
+    fn the_assets_payload_says_where_each_asset_belongs_and_came_from() {
         let orders = crate::Asset::source("orders").group("warehouse");
         let prefixed =
             crate::Asset::new("sales/daily", |_| async { Ok(json!(null)) }).from(&orders);
@@ -5214,18 +5218,20 @@ mod tests {
             AssetRegistry::new(vec![orders, prefixed, loose], Vec::new(), Vec::new()).unwrap();
         let store = Store::open(":memory:").unwrap();
         let body = assets_json(&registry, &store).unwrap();
-        let groups: Vec<(&str, &Value)> = body["assets"]
+        let said: Vec<(&str, &Value, &Value)> = body["assets"]
             .as_array()
             .unwrap()
             .iter()
-            .map(|a| (a["name"].as_str().unwrap(), &a["group"]))
+            .map(|a| (a["name"].as_str().unwrap(), &a["group"], &a["provenance"]))
             .collect();
         assert_eq!(
-            groups,
+            said,
             [
-                ("orders", &json!("warehouse")),
-                ("sales/daily", &json!("sales")),
-                ("heartbeat", &json!(null)),
+                ("orders", &json!("warehouse"), &json!(["warehouse"])),
+                ("sales/daily", &json!("sales"), &json!(["warehouse"])),
+                // no source upstream at all, which is [] rather than null: the
+                // answer is known and it is empty
+                ("heartbeat", &json!(null), &json!([])),
             ]
         );
     }
