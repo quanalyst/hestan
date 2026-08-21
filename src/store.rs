@@ -10029,8 +10029,19 @@ mod tests {
         let (claimed, _) = claiming.join().unwrap().unwrap();
         assert_eq!(claimed.id, "r1");
 
-        // and once the holder lets go, the head of the queue is claimable again
-        drop(holding);
+        // and once the holder lets go, the head of the queue is claimable again.
+        //
+        // **committed rather than dropped, and that is the fix rather than a
+        // tidy-up.** dropping a `tokio_postgres::Transaction` hands a
+        // `ROLLBACK` to the connection task and returns without waiting for
+        // it, so the row lock outlives the drop by however long that task
+        // takes to be polled. under load that is long enough for the claim
+        // below to find `r0` still locked, skip it exactly as it is supposed
+        // to, and come away with nothing at all. committing drives the round
+        // trip on this thread, so the lock is provably gone before the next
+        // statement. nothing was written in that transaction, so which of the
+        // two ends it is not a difference to anything else.
+        holding.commit().unwrap();
         let defined = HashSet::from(["etl".to_string()]);
         let (claimed, _) = store
             .claim_next("gamma", Duration::from_secs(30), &Limits::new(), &defined)
