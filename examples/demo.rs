@@ -155,6 +155,48 @@ async fn main() -> Result<(), hestan::Error> {
                 if flaky.fetch_add(1, Ordering::SeqCst).is_multiple_of(2) {
                     return Err("warehouse connection reset".into());
                 }
+                let db = warehouse()?;
+                let today = chrono::Utc::now().date_naive().to_string();
+                db.execute(
+                    "INSERT INTO daily_revenue (at, orders, revenue) VALUES (?1, ?2, ?3)
+                     ON CONFLICT(at) DO UPDATE SET orders = ?2, revenue = ?3",
+                    rusqlite::params![
+                        today,
+                        input.aggregate.orders as i64,
+                        input.aggregate.revenue
+                    ],
+                )?;
+
+                // and now the op selects its own sample back out of the table
+                // it just wrote to. this is the whole shape of `ctx.saved`:
+                // the op holds the connection and writes the sql, hestan is
+                // handed rows. it never goes and gets them, has no credentials
+                // and knows no dialect
+                let mut select =
+                    db.prepare("SELECT at, orders, revenue FROM daily_revenue ORDER BY at")?;
+                let days: Vec<(String, i64, f64)> = select
+                    .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
+                    .collect::<Result<_, _>>()?;
+
+                ctx.saved(
+                    "daily_revenue",
+                    Meta::table(
+                        [("at", "text"), ("orders", "int"), ("revenue", "float")],
+                        days.iter().rev().map(|(at, orders, revenue)| {
+                            vec![json!(at), json!(orders), json!(revenue)]
+                        }),
+                    ),
+                );
+                // a year of days is past the cap, so what gets stored spans
+                // the range at a coarser step rather than stopping in january
+                ctx.saved(
+                    "revenue_by_day",
+                    Meta::series(days.iter().filter_map(|(at, _, revenue)| {
+                        let day = chrono::NaiveDate::parse_from_str(at, "%Y-%m-%d").ok()?;
+                        Some((day.and_hms_opt(0, 0, 0)?.and_utc(), *revenue))
+                    })),
+                );
+
                 ctx.info("published");
                 Ok(input.aggregate)
             }
@@ -219,6 +261,36 @@ async fn main() -> Result<(), hestan::Error> {
         // the registry two hundred lines above
         None => hestan::cli::run(app, addr).await,
     }
+}
+
+// the warehouse this demo publishes to: a real sqlite file rather than a
+// stand-in, because a sample of what an op wrote has to come out of somewhere
+// the op actually wrote to
+fn warehouse() -> Result<rusqlite::Connection, rusqlite::Error> {
+    let db = rusqlite::Connection::open(
+        env("HESTAN_WAREHOUSE").unwrap_or_else(|| "warehouse.db".into()),
+    )?;
+    db.execute(
+        "CREATE TABLE IF NOT EXISTS daily_revenue (
+             at TEXT PRIMARY KEY, orders INTEGER NOT NULL, revenue REAL NOT NULL)",
+        [],
+    )?;
+    // one row draws a chart of one point, so an empty table gets a year of
+    // history first. seeded, not pretended: these rows go into the table and
+    // come back out of it like every other row does
+    let rows: i64 = db.query_row("SELECT COUNT(*) FROM daily_revenue", [], |row| row.get(0))?;
+    if rows == 0 {
+        let today = chrono::Utc::now().date_naive();
+        for back in 1..=365i64 {
+            let day = today - chrono::Duration::days(back);
+            let revenue = 900.0 + f64::from((back % 37) as i32) * 11.5;
+            db.execute(
+                "INSERT INTO daily_revenue (at, orders, revenue) VALUES (?1, ?2, ?3)",
+                rusqlite::params![day.to_string(), 20 + back % 9, revenue],
+            )?;
+        }
+    }
+    Ok(db)
 }
 
 fn env(key: &str) -> Option<String> {

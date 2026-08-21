@@ -2,6 +2,64 @@
 
 ## unreleased
 
+a finished run's page shows the data the run produced, and not only that it
+succeeded and how long it took.
+
+**an existing deployment sees no change until an op calls `saved`.** the
+section is absent from every run that has none, every metadata value written
+so far is stored byte for byte as it was, **no public signature changed**, and
+nothing about what runs, or when, is different. what is added is two `Meta`
+variants, one method on `OpCtx`, and a section on the run page that appears
+when there is something to put in it.
+
+**hestan runs no query.** the op supplies the sample, because the op is the
+one already holding the connection; three lines of its own sql select its own
+rows back. there are no credentials to hand hestan, no dialect for it to know,
+and nothing to configure for a warehouse it has never heard of.
+`examples/demo.rs` writes to a real sqlite table and reads its own sample back
+out of it.
+
+- **`ctx.saved(name, value)`, beside `ctx.meta`.** the same staging and the
+  same storage, marked as a sample of what the op wrote, and stamped with the
+  moment it was taken. the mark is what makes a run-level section possible:
+  without it a sample is one entry among counts and paths, reachable only by
+  selecting the op it belongs to
+- **it is a snapshot, and the page says so.** what is stored is what the op
+  read when it called `saved`; a later write to that table does not reach it
+  and nothing goes back to look again. that is right for a record of a run and
+  it is not what "what is in the table now" means, so the section leads with
+  the sentence, every entry carries when it was taken, and a saved value
+  anywhere else in the ui is marked `snapshot`. the cost of the mark is that
+  `Meta::as_f64` reports no number for one, so a saved key gets no delta and
+  no trend: a key that wants those wants `ctx.meta`
+- **`Meta::series(points)`, sampled across its range rather than off its
+  head.** `Meta::table` keeps the first hundred rows, which is right for rows
+  and wrong for a series in a way that looks right: the first two hundred
+  points of an hourly year are January, drawn across an axis labelled as a
+  year. a series keeps its first and last points always, spreads the rest
+  evenly between them, and records how many points the sample stands for, so
+  the ui says "200 of 8,760 points". **the cap is 200 and it was chosen**:
+  past what a chart the width of a run page resolves, and about seven and a
+  half kilobytes of json, which rides on the op run and again on every
+  materialization the op wrote, so ten ops each saving one put roughly a
+  hundred and fifty kilobytes on a run. retention prunes them with the rows
+  they sit on and nothing else does
+- **every awkward series has a decided answer**, documented and tested one by
+  one. non-finite values are dropped before anything else and are not counted
+  either, since json has no NaN and one of them makes the range meaningless;
+  points are sorted, because a warehouse returns what it returns and unsorted
+  is the common case; two points sharing a timestamp are both kept in the
+  order they were given, because which of two readings for one instant is
+  right is not hestan's to decide; an empty series is an empty series, which
+  is the op having looked and found nothing; one point is one mark
+- **the section on the run page**, under the gantt and above the log: every
+  sample from every op, in op order, each labelled with the op that took it. a
+  series draws with its value range on the axis, its first and last timestamps
+  under it in utc as the op stored them, and every point reachable as a number
+  under that. **it takes no hue.** colour means group or origin in this ui and
+  shape carries status; one series has neither to say, so it is drawn in the
+  monochrome everything else is
+
 more than one process may now decide, and the store rather than a lock is what
 makes that safe.
 

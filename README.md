@@ -219,6 +219,14 @@ standalone binary for those two. [docs/cli.md](docs/cli.md).
   renders `1.2 GB` and `3.4s` rather than the integers. an asset op's metadata
   lands on its materialization too, so the history says what each build
   reported
+- `ctx.saved("by_region", table)` is the same fact **marked as a sample of
+  what the op wrote**, which is what collects every op's into one section on
+  the run page rather than leaving each behind selecting an op.
+  `Meta::series` is the timeseries shape, kept across its range rather than
+  off its head, since the first hundred points of an hourly year are January
+  drawn as a year. the op selects its own sample back, so hestan runs no query
+  and holds no credentials, and what is stored is a snapshot of the moment the
+  run wrote rather than a view of the table now, which the page says out loud
 - launching is a request rather than a start: a launch writes a **queued** run
   and a dispatcher starts it as soon as no limit says otherwise; with no
   limits declared, the same instant. `Hestan::max_concurrent_runs(n)` caps the

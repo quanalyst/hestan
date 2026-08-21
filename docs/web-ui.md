@@ -577,6 +577,36 @@ hatched; canceled ops draw dim and muted whatever their path position, with
 the diamond for any that never got to start. it answers "what would I speed
 up to make this run faster".
 
+### What the run saved
+
+under the gantt, a **saved** section collects every sample every op of the run
+marked with [`ctx.saved`](metadata.md#what-a-run-saved), in op order, each one
+labelled with the op that took it and the name it was saved under. it is not
+behind selecting an op: the question it answers is what this run wrote, and
+that is a question about the run.
+
+it leads with the line that matters most, which is that **this is a
+snapshot**: what each op read at the moment it wrote, not a reading of the
+table now. every entry says when it was taken, relative, with the exact
+instant on the hover. a run that saved nothing has no section at all rather
+than an empty one.
+
+a table sample draws as the same small table every metadata table draws as. a
+series draws as a chart: the value range down the left of the axis, the first
+and last timestamps under it in utc exactly as the op stored them, and under
+that a line saying what the sample stands for ("200 of 8,760 points", or
+"200 points" when that is all of them) which opens onto every point as a
+number, since a shape nobody can read a value off is half an answer. a series
+is [sampled across its range](metadata.md#series), so what is drawn is the
+whole range at a coarser step and never the front of it. an empty series says
+"no points" and draws nothing.
+
+the chart takes **no hue**. [colour means group or origin](#colour) in this ui
+and shape carries status; one series has neither to say, so it is drawn in the
+same ink as everything else.
+
+### The log
+
 the log streams while the run is live (polling every 1.5s on a cursor,
 stopping once the run is terminal). while it does, a **follow** toggle pins
 the pane to the newest line, and **scrolling up releases it**. scrolling back

@@ -33,12 +33,14 @@ without anything reading the value having to guess.
 | `Markdown(String)` | `{"markdown": "…"}` | [a rendered subset](#the-markdown-subset) |
 | `Json(Value)` | `{"json": …}` | a preformatted block |
 | `Table(MetaTable)` | `{"table": {…}}` | a small table |
+| `Series(MetaSeries)` | `{"series": {…}}` | a chart, its range on the axis |
 | `Bytes(u64)` | `{"bytes": 1152000000}` | `1.2 GB` |
 | `Duration(Duration)` | `{"duration_secs": 3.4}` | `3.4s` |
 | `Count(u64)` | `{"count": 1240}` | `1,240`, tabular |
 | `Path(String)` | `{"path": "/tmp/x.parquet"}` | monospace, basename emphasised |
 | `RunRef(String)` | `{"run": "019fe109-…"}` | a link to that run |
 | `AssetRef(String)` | `{"asset": "orders"}` | a link to that asset |
+| `Saved(Sample)` | `{"saved": {…}}` | whatever it wraps, marked as a sample |
 
 the obvious rust types convert on their own: `i64`, `i32`, `u32`, `f64`,
 `String`, `&str`, `std::time::Duration`, and `serde_json::Value` (which
@@ -94,6 +96,53 @@ construction, so nothing downstream has to check them:
 - **rectangular**: every row is padded with `null` and trimmed to the column
   count, so a short row is a visible gap rather than a shape question.
 
+### Series
+
+```rust
+ctx.saved("revenue_by_day", Meta::series(points));
+```
+
+a series is `(timestamp, value)` points, for a sample of something measured
+over time. `points` is anything that iterates `(DateTime<Utc>, f64)`, which is
+what a `SELECT at, value FROM … ORDER BY at` maps to in three lines of the
+op's own code.
+
+three things happen at construction, and the third is why this is not
+`Meta::table` with a time column:
+
+- **non-finite values are dropped**, before anything else. json has no NaN and
+  no infinity, and one of either makes the whole range meaningless to draw. a
+  dropped point is not counted in `of` either, so a series of nothing but NaN
+  is empty rather than a sample standing for points it cannot show. if how
+  many there were is a fact you want, count them before handing them over.
+- **points are sorted by timestamp**, because a warehouse returns what it
+  returns and arriving unsorted is the common case. the sort is stable, so two
+  points sharing a timestamp keep the order they were given in and neither is
+  dropped: which of two readings for one instant is right is not hestan's to
+  decide.
+- **over `META_SERIES_POINTS` (200) it is sampled across its range**, never
+  truncated. the first and the last point are always kept, the rest are spread
+  evenly by position between them, and `of` records how many points the sample
+  stands for, which is what the ui says as "200 of 8,760 points".
+
+**that last rule is the point of the type.** `Meta::table` keeps the first
+hundred rows, which is right for rows and wrong for a series in a way that
+looks right: the first two hundred points of an hourly year are January, drawn
+across an axis labelled as a year. a sample that spans its range is coarser
+than the data and it is not a different picture from it.
+
+the cap is two hundred because that is past what a chart the width of a run
+page resolves, and because of what it costs. a point is an rfc3339 timestamp
+and a number, so a full series is about seven and a half kilobytes of json,
+and it rides in `op_runs.metadata` and again on every materialization the op
+wrote: ten ops each saving one put roughly a hundred and fifty kilobytes on
+one run. [retention](storage.md#retention) prunes them with the rows they sit
+on; nothing else does.
+
+an empty series stores as an empty series: the op looked and there was
+nothing, which is not the same fact as an op saving no series at all. one
+point is one point, drawn as a mark rather than as a line.
+
 ### Reading it back
 
 `Meta::tagged` produces the stored value and `Meta::from_tagged` reads one,
@@ -107,6 +156,57 @@ on disk, so `int`, `float`, `text`, `url`, `markdown` and `json` mean today
 exactly what they meant then; this phase added tags beside them rather than
 changing any. there is a test with a phase-12 row in it that fails if that
 ever stops being true.
+
+## What a run saved
+
+`ctx.meta` says something *about* the work. `ctx.saved` says **this is a
+sample of what I wrote**:
+
+```rust
+ctx.saved("by_region", Meta::table(
+    [("region", "text"), ("orders", "int")],
+    rows.iter().map(|r| vec![json!(r.region), json!(r.orders)]),
+));
+```
+
+it stages and stores exactly like `ctx.meta`, and the mark is the whole
+difference. it is what lets the run page collect every sample from every op of
+a run into [one section](web-ui.md#what-the-run-saved) without anybody
+selecting an op first, and it is what carries the moment the sample was taken.
+
+**the op supplies the sample.** the op is the one already holding the
+connection, so it selects its own rows back in three lines of its own sql.
+hestan runs no query, holds no credentials and knows no dialect, and there is
+nothing to configure for a warehouse it has never heard of. `examples/demo.rs`
+does exactly this against a real sqlite table: the op writes, the op reads its
+own rows back, and hestan is handed the result.
+
+### It is a snapshot, not a view
+
+what is stored is what the op read at the moment it called `saved`, stamped
+with that moment. a later write to the same table does not reach it, and
+nothing goes back to look again. that is correct for a record of what a run
+wrote, and it is **not** what "what is in the table now" means. the failure
+mode is somebody trusting it as live, so the run page leads with the sentence,
+every entry carries when it was taken, and a saved value anywhere else in the
+ui is marked `snapshot`.
+
+### What the mark costs
+
+- **no delta and no trend.** `Meta::as_f64` reports no number for a saved
+  value, whatever it wraps, so `ctx.saved("rows", 1_234)` puts the number on
+  the page with no `+37` beside it. the unit a delta needs to render sits
+  inside the wrapper, where nothing computing over metadata looks. a key that
+  wants a delta wants `ctx.meta`.
+- **no per-asset form.** an op producing [several assets](assets.md) stages
+  per-asset facts with `meta_of`, and there is no `saved_of` beside it: write
+  `ctx.meta_of(asset, name, Meta::saved(value))`, which is the same thing
+  spelled out. an op producing one asset needs none of that, since `ctx.saved`
+  lands on the op run and on the materialization the way every other fact
+  does.
+- **marking twice is marking once.** `Meta::saved(Meta::saved(v))` is one
+  sample at the outer moment, not a wrapper around a wrapper for everything
+  downstream to unpick.
 
 ## The markdown subset
 
@@ -258,6 +358,17 @@ value:
 the tag is the wire format the api and the ui both read, which is why it is
 written out rather than inferred. keys come out sorted.
 
+a sample wraps the value it is a sample of, and a series is points and the
+count they stand for:
+
+```json
+{ "revenue_by_day": {"saved": {
+    "taken_at": "2026-08-20T09:00:00+00:00",
+    "value": {"series": {"points": [["2026-08-19T00:00:00+00:00", 1240.5],
+                                    ["2026-08-20T00:00:00+00:00", 1301.0]],
+                         "of": 8760}}}} }
+```
+
 ## Assets carry it twice
 
 when an asset op reports metadata, the same map is written to that
@@ -279,6 +390,9 @@ metadata for an identical value is still fresh.
 - `GET /api/assets/{name}/metadata/{key}` and
   `GET /api/jobs/{name}/ops/{op}/metadata/{key}`: one numeric key over
   recent history.
+- the run page's **saved** section: every sample every op of the run marked,
+  in op order, each labelled with the op that took it and when. not behind
+  selecting an op, and absent entirely from a run that saved nothing.
 - the run page renders the selected op's metadata by type: numbers
   right-aligned and tabular in their unit, urls as links, runs and assets as
   links into the ui, paths monospace, tables as tables, text inline, markdown
