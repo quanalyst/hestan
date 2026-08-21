@@ -88,6 +88,24 @@ impl Deciding {
         }
     }
 
+    /// a process that never decides, whatever the lease says: a
+    /// [`Role::Worker`](crate::Role), which executes and decides nothing.
+    ///
+    /// [`sole`](Self::sole) would be wrong here and quietly so. it answers
+    /// [`leading`](Self::leading) with `true`, which is right for a one-shot
+    /// that must run what it was asked for and wrong for a worker, whose whole
+    /// definition is that it decides nothing. no deciding loop is spawned on a
+    /// worker today, so nothing asks; a loop added later that checks the lease
+    /// and not the role would decide on every worker in the deployment, which
+    /// is the failure this phase exists to make impossible.
+    pub(crate) fn never() -> Deciding {
+        Deciding {
+            held: Some(Arc::new(Held {
+                term: watch::Sender::new(0),
+            })),
+        }
+    }
+
     /// whether this process may decide right now.
     pub(crate) fn leading(&self) -> bool {
         self.held.as_ref().is_none_or(|h| *h.term.borrow() != 0)

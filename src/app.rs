@@ -1400,6 +1400,10 @@ impl Hestan {
         if self.elects && self.role.decides() {
             runner = runner.with_deciding(crate::decider::Deciding::elected());
             crate::decider::take_now(&runner);
+        } else if !self.role.decides() {
+            // a worker decides nothing by definition, so it says so here rather
+            // than relying on no loop ever asking
+            runner = runner.with_deciding(crate::decider::Deciding::never());
         }
         // before anything new launches, and before the loop that takes it from
         // here: a process that runs for an hour and exits should still tidy up
@@ -1561,6 +1565,39 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(run.status, RunStatus::Success);
+    }
+
+    // a worker executes and decides nothing, and says so in what it carries
+    // rather than in the absence of a loop that would ask
+    #[tokio::test]
+    async fn a_worker_never_leads_and_a_decider_starts_out_not_leading() {
+        let noop = Job::builder("etl")
+            .op(Op::new("step", |_| async { Ok(serde_json::json!(null)) }))
+            .build()
+            .unwrap();
+        let worker = Hestan::new()
+            .job(noop.clone())
+            .db(":memory:")
+            .role(Role::Worker)
+            .build()
+            .await
+            .unwrap();
+        assert!(
+            !worker.runner.may_decide(),
+            "a worker held a deciding claim it has no business with"
+        );
+
+        // and the process that does elect starts out holding nothing, so it
+        // waits for the lease rather than assuming it
+        let scheduler = Hestan::new()
+            .job(noop)
+            .db(":memory:")
+            .role(Role::Scheduler)
+            .build()
+            .await
+            .unwrap();
+        // it took the lease at boot, being the only one on this store
+        assert!(scheduler.runner.may_decide(), "a free lease was not taken");
     }
 
     fn throttled(job: &str) -> Job {
