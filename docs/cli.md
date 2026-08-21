@@ -276,12 +276,13 @@ thing it is about is worse than no check at all.
 
 ```
 $ orders doctor
-ok    store      sqlite at /var/lib/hestan.db, schema v18
+ok    store      sqlite at /var/lib/hestan.db, schema v21
 ok    writes     the store took a write lock and gave it back
 ok    schedules  2 of 2 parse
 note  schedules  paused, so they will not fire: warehouse_healthcheck
                  unpause schedule warehouse_healthcheck
 ok    leases     every claim is current
+ok    deciding   3f2a91cc holds the deciding lease on term 4, 8s left
 wrong queue      1 run(s) are queued with nothing holding them back, so no
                  process is taking them off the queue
                  start a process whose role executes (`serve` with the default
@@ -307,6 +308,7 @@ what it checks, and what each one can actually see:
 | schedules | a cron expression or a timezone that no longer resolves, so the schedule silently never fires again | a store |
 | schedules, sensors | anything paused, which is the answer to "why is nothing running" often enough to be worth a line | a store |
 | leases | runs claimed by a process that stopped renewing, which nothing is reclaiming if nothing is running a lease loop | a store |
+| deciding | who holds the [deciding lease](scaling.md#the-deciding-lease), and whether anybody does. a deployment where nothing decides fires no schedule and evaluates no sensor, and has no other symptom. over `--server` it answers the sharper question instead: whether the process you are pointed at is that one | a store, or a running deployment |
 | queue | runs waiting on a limit, and (separately) runs waiting on **nothing**, which is a deployment where no process executes | the limits, so the deployment's own binary |
 | policies | an [automation policy](assets.md#automation-policies) that can never fire, because a source it reads has no probe to observe it or a window promises keys its dep will never hold. a policy that will wait forever looks exactly like one with nothing to do: both are quiet | the asset graph, so the deployment's own binary |
 | groups | a declared [group](assets.md#where-an-asset-belongs-and-where-it-came-from) that disagrees with the name it is on, which is a rename somebody started and did not finish: the catalog says one thing and the name says another | the asset graph, so the deployment's own binary |
@@ -324,12 +326,15 @@ be, which is what makes the other two believable.
 `--json` gives `{"ok": bool, "findings": [...], "unchecked": [...]}` with a
 `fix` on everything actionable.
 
-over `--server` doctor answers the three questions http can, and says plainly
+over `--server` doctor answers the four questions http can, and says plainly
 that it saw nothing else. whether the deployment [checks who is
 asking](auth.md), and (with a token) who it makes you; with that same token,
-whether its store is taking the writes it makes, and what is queued behind each
-of its [rates](concepts.md#rates), the two things only the running process
-knows. that second one is `wrong` when run outcomes are going unrecorded (the
+whether its store is taking the writes it makes, what is queued behind each
+of its [rates](concepts.md#rates), and whether the process on the other end is
+the one doing the [deciding](scaling.md#running-more-than-one-scheduler), the
+three things only the running process knows. that last one is the answer to
+"this schedule has not fired and this process looks fine", which is a question
+about a different process. that second one is `wrong` when run outcomes are going unrecorded (the
 process has stopped claiming and is leaving what it holds for a reclaimer), and
 a `note` when it lost something and recovered. the schedules, the sensors, the
 leases, the queue, the retention policy and the disk are listed as not checked,

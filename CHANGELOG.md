@@ -2,6 +2,88 @@
 
 ## unreleased
 
+more than one process may now decide, and the store rather than a lock is what
+makes that safe.
+
+**an existing single-process deployment sees almost nothing.** two new rows in
+its database (a `decider` row and, on upgrade, a `schedule_ticks_fire` index)
+and one new line on `GET /api/health` and on the activity page saying this
+process is the one deciding. **no public signature changed**; nothing about
+what runs, or when, is different; one process on one database takes the
+deciding lease before `serve` binds its socket and starts deciding with nothing
+added to its boot.
+
+the exceptions, both stated rather than buried:
+
+- a process **killed** without handing the lease back leaves it held until it
+  expires, so a restart inside that window waits up to ten seconds before it
+  decides anything. a clean stop hands it back and a first boot finds it free.
+  ten seconds of nobody deciding is ten more seconds of downtime, which
+  catch-up already has an answer for.
+- a database that has **already** been run with two schedulers has duplicate
+  fires in its tick log, and the v20 migration collapses them to the earliest
+  of each occurrence and says how many at warn level. those duplicate runs
+  executed; deleting a tick does not unlaunch one. the count is how many times
+  that deployment fired an occurrence twice.
+
+**the constraint is the guarantee and the election is an optimisation**, and
+the order is the point. a distributed lock fails exactly when a process pauses,
+a disk stalls or a network splits, which is to say at the moment its holder is
+most certain it still holds it. so the unique index went in first, alone, and
+the lease went in on top of it.
+
+- **schema v20: one `fired` tick per `(job, expr, scheduled_for)`**, on a
+  unique index, on both backends. the tick and the run are written in one
+  transaction, so a refused tick launches nothing at all: no run row, no op
+  rows, no event. two processes reaching for the same occurrence produce one
+  run because the database refuses the second, not because either of them
+  looked first. the index is **partial, over `fired` alone**: the tick log is
+  also the queue, an occurrence legitimately holds a `deferred` tick and then
+  the `fired` tick that drained it, and what has to be unique is the decision
+  that launched something. the loser records a `skipped` tick saying another
+  process had already fired the occurrence, so the refusal is visible in the
+  log an operator is already reading
+- **schema v21: the deciding lease.** one row in a `decider` table, in the run
+  lease's vocabulary (`claimed_by`, `claimed_at`, `lease_until`) because it is
+  the same mechanism aimed at a different thing. ten seconds, renewed every
+  two: a quarter of the run lease, because losing this one wrongly costs a
+  handover and losing a run lease wrongly costs a whole re-execution. what it
+  adds is a **term**, a counter that goes up on every acquisition and never on
+  a renewal
+- **every deciding loop takes it**: schedules, sensors, freshness, automation
+  policies, backfill chunking, the retention sweep and durable delivery. each
+  one waits on the lease rather than polling for it, so a process that takes it
+  starts its first pass at once rather than on its next tick, and each one has
+  a case that asserts it does nothing without it and then does it with it
+- **a decision names the term it was made under**, checked in the transaction
+  that writes it. this is the part a lease cannot do: a leader that stops the
+  world past its own expiry and resumes agrees with every check it makes in its
+  own memory, and disagrees with the row. fenced this way: cron fires, sensor
+  requests keyed or not, policy builds and backfill chunks, all of which create
+  a run for the term to ride on. **not fenced, and each one's cost written down
+  in `docs/scaling.md`**: the retention sweep, freshness crossings, durable
+  delivery and the sensor cursor
+- **handover is downtime.** an occurrence that comes due while one decider is
+  going and the next has not taken over is an occurrence due during downtime,
+  and the schedule's own catch-up policy decides: skipped by default, fired
+  late under `Catchup::One` or `Catchup::All`. the schedule cursor is how far
+  the *deployment* has accounted for rather than how far a process has, so the
+  next decider reads the dead one's cursor and sees the gap. a fire already
+  queued survives either way, because the tick log is the queue
+- **`GET /api/health` gained `deciding`**, and `hestan doctor` gained a
+  `deciding` check. pointed at a database it says who holds the lease and
+  whether anybody does; pointed at a deployment over `--server` it answers the
+  sharper question, which is whether the process you are talking to is that
+  one. a schedule that has not fired is a question about the deciding process,
+  and pointing at a process that is not it and finding nothing wrong is the
+  confusion this ends. the activity page says the same thing in one line
+- **`Role::All` and `Role::Scheduler` are no longer "exactly one process".**
+  starting a second is a warm spare: it holds a connection, builds the same
+  registry, evaluates nothing, and takes over within ten seconds of the first
+  one going away. `src/app.rs`, `src/model.rs`, `docs/scaling.md`,
+  `docs/embedding.md` and `docs/scheduling.md` all said otherwise and now say
+  this
+
 an asset declares the group it belongs to, hestan computes what it descends
 from, and the ui colours by one or the other.
 

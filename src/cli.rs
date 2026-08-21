@@ -2418,6 +2418,7 @@ async fn doctor(reach: Reach, out: &Out) -> Result<(), Fail> {
     findings.extend(check_schedules(store)?);
     findings.extend(check_sensors(store)?);
     findings.extend(check_leases(store, Utc::now())?);
+    findings.push(check_deciding(store, Utc::now())?);
     findings.push(check_held_values(store)?);
     match &app {
         Some(app) => {
@@ -2585,6 +2586,48 @@ fn check_leases(store: &Store, now: DateTime<Utc>) -> Result<Vec<Finding>, Fail>
         "any hestan process runs the lease loop that reclaims these: start one, \
          and they are failed or requeued as `reclaim` says",
     )])
+}
+
+/// who is doing the deciding, which is the answer to "why is nothing running
+/// here" in any deployment with more than one process in it.
+///
+/// **this says who holds the lease, not whether the process you are asking
+/// about is that one.** a command line reading a database is not a process in
+/// the deployment and has no instance id in it; only a running process knows
+/// whether it is the decider, and that is `GET /api/health`, which
+/// [`remote_doctor`] reads. so this stops exactly where its evidence does.
+fn check_deciding(store: &Store, now: DateTime<Utc>) -> Result<Finding, Fail> {
+    let decider = store.decider()?;
+    let Some(holder) = decider.holder.as_deref() else {
+        return Ok(Finding::note(
+            "deciding",
+            "nothing holds the deciding lease: no schedule is being fired, no sensor \
+             evaluated and no policy looked at",
+            "start a process with Role::All or Role::Scheduler. a lease a killed \
+             process left behind expires on its own within ten seconds, so this \
+             lasting is a deployment with nothing in it that decides",
+        ));
+    };
+    let left = decider.lease_until.map(|until| until - now);
+    match left {
+        Some(left) if left >= chrono::Duration::zero() => Ok(Finding::ok(
+            "deciding",
+            format!(
+                "{holder} holds the deciding lease on term {}, {}s left",
+                decider.term,
+                left.num_seconds()
+            ),
+        )),
+        _ => Ok(Finding::note(
+            "deciding",
+            format!(
+                "{holder} held the deciding lease on term {} and stopped renewing it",
+                decider.term
+            ),
+            "any process with a deciding role takes an expired lease within a couple \
+             of seconds, so if this is still true nothing that decides is running",
+        )),
+    }
 }
 
 /// what is waiting, and whether anything is going to take it.
@@ -2945,9 +2988,13 @@ async fn remote_doctor(api: &Api, out: &Out) -> Result<(), Fail> {
         ),
     }
     match api.get("/api/health").await {
-        Ok(health) => findings.push(check_remote_store(&health)),
+        Ok(health) => {
+            findings.push(check_remote_deciding(&health));
+            findings.push(check_remote_store(&health));
+        }
         Err(_) => unchecked.push(
-            "whether its store is taking writes, which is behind the guard: pass \
+            "whether its store is taking writes and whether it is the process \
+             doing the deciding, both of which are behind the guard: pass \
              --token, or set HESTAN_TOKEN",
         ),
     }
@@ -2982,6 +3029,49 @@ async fn remote_doctor(api: &Api, out: &Out) -> Result<(), Fail> {
     match wrong {
         true => Err(Fail::new(Exit::Actionable, "something above is actionable")),
         false => Ok(()),
+    }
+}
+
+/// whether the process on the other end is the one deciding anything.
+///
+/// this is the finding [`check_deciding`] cannot make. a schedule that has not
+/// fired is a question about the *deciding* process, and pointing at a process
+/// that is not it and finding nothing wrong is the confusion this whole answer
+/// exists to end.
+fn check_remote_deciding(health: &Value) -> Finding {
+    let deciding = &health["deciding"];
+    let me = s(health, "instance");
+    if deciding.is_null() {
+        return Finding::note(
+            "deciding",
+            format!("{me} could not read its own deciding lease"),
+            "its store is the thing to look at: see the writes line below",
+        );
+    }
+    let holder = deciding["holder"].as_str().unwrap_or("nobody");
+    let term = deciding["term"].as_u64().unwrap_or(0);
+    if !deciding["decides"].as_bool().unwrap_or(false) {
+        return Finding::ok(
+            "deciding",
+            format!(
+                "{me} is a worker and decides nothing, by design; {holder} holds \
+                 the deciding lease"
+            ),
+        );
+    }
+    match deciding["leader"].as_bool() {
+        Some(true) => Finding::ok(
+            "deciding",
+            format!("{me} holds the deciding lease, on term {term}"),
+        ),
+        _ => Finding::note(
+            "deciding",
+            format!("{me} is not the deciding process; {holder} is, on term {term}"),
+            "nothing here fires a schedule, evaluates a sensor or builds a policy \
+             while that is true, which is the point of it. ask that process \
+             instead, or wait: this one takes over within ten seconds of it \
+             going away",
+        ),
     }
 }
 
@@ -4176,6 +4266,92 @@ mod tests {
         let sensors = check_sensors(&store).unwrap();
         assert_eq!(levels(&sensors), [Level::Note]);
         assert!(sensors[0].fix.as_deref() == Some("unpause sensor inbox"));
+    }
+
+    // the question this phase creates: a deployment where two processes could
+    // decide and one of them is
+    #[test]
+    fn doctor_says_who_holds_the_deciding_lease_and_when_nobody_does() {
+        let store = Store::open(":memory:").unwrap();
+        let now = Utc::now();
+
+        // a database nothing has ever decided against
+        let empty = check_deciding(&store, now).unwrap();
+        assert_eq!(empty.level, Level::Note);
+        assert!(empty.says.contains("nothing holds"), "{}", empty.says);
+        assert!(no_gaps(&empty), "{}", empty.says);
+
+        store
+            .take_decision_lease("a1b2c3d4", Duration::from_secs(10))
+            .unwrap();
+        let held = check_deciding(&store, now).unwrap();
+        assert_eq!(held.level, Level::Ok);
+        assert!(held.says.contains("a1b2c3d4"), "{}", held.says);
+        assert!(held.says.contains("term 1"), "{}", held.says);
+
+        // and one nobody has renewed, which is a deployment with nothing in it
+        // that decides rather than a deployment that is fine
+        let lapsed = check_deciding(&store, now + chrono::Duration::minutes(1)).unwrap();
+        assert_eq!(lapsed.level, Level::Note);
+        assert!(lapsed.says.contains("stopped renewing"), "{}", lapsed.says);
+        assert!(no_gaps(&lapsed), "{}", lapsed.says);
+    }
+
+    // and over http, where the process can say whether it is that one
+    #[test]
+    fn a_remote_doctor_says_whether_the_process_it_asked_is_the_decider() {
+        let leading = check_remote_deciding(&json!({
+            "instance": "a1b2c3d4",
+            "deciding": {
+                "leader": true, "holder": "a1b2c3d4", "term": 4,
+                "lease_secs": 8.0, "decides": true,
+            },
+        }));
+        assert_eq!(leading.level, Level::Ok);
+        assert!(leading.says.contains("a1b2c3d4"), "{}", leading.says);
+
+        let following = check_remote_deciding(&json!({
+            "instance": "a1b2c3d4",
+            "deciding": {
+                "leader": false, "holder": "e5f6a7b8", "term": 4,
+                "lease_secs": 8.0, "decides": true,
+            },
+        }));
+        assert_eq!(following.level, Level::Note);
+        assert!(
+            following.says.contains("is not the deciding process"),
+            "{}",
+            following.says
+        );
+        assert!(following.says.contains("e5f6a7b8"), "{}", following.says);
+        assert!(
+            no_gaps(&following),
+            "{} / {:?}",
+            following.says,
+            following.fix
+        );
+
+        // a worker is not the decider and that is not a finding about anything
+        let worker = check_remote_deciding(&json!({
+            "instance": "a1b2c3d4",
+            "deciding": {
+                "leader": false, "holder": "e5f6a7b8", "term": 4,
+                "lease_secs": 8.0, "decides": false,
+            },
+        }));
+        assert_eq!(worker.level, Level::Ok);
+        assert!(worker.says.contains("worker"), "{}", worker.says);
+    }
+
+    /// whether a finding's text was wrapped in the source without leaving the
+    /// wrapping in the string.
+    ///
+    /// a hand-wrapped literal that keeps its indentation reads as a run of
+    /// spaces in the middle of a sentence, `cargo fmt` cannot see it and a
+    /// `contains` assertion on one side of the break does not catch it.
+    fn no_gaps(finding: &Finding) -> bool {
+        !finding.says.contains("  ")
+            && !finding.fix.as_deref().is_some_and(|fix| fix.contains("  "))
     }
 
     // a claimer that stopped renewing leaves rows nothing else will notice,

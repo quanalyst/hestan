@@ -707,10 +707,18 @@ str_enum!(Reclaim { Fail => "fail", Requeue => "requeue" });
 /// off it, or both.
 ///
 /// the split exists because the two halves have opposite multiplicities.
-/// **exactly one** process should own the schedules, the sensors, the freshness
-/// checks and the backfill chunking: those are decisions, and two processes
-/// deciding independently is two of every scheduled run. **any number** of
-/// processes may execute, which is the entire point of a claimable queue.
+/// **one process at a time** owns the schedules, the sensors, the freshness
+/// checks and the backfill chunking: those are decisions, and a deployment
+/// makes each one once. **any number** of processes may execute, which is the
+/// entire point of a claimable queue.
+///
+/// which process decides is settled in the store rather than by counting
+/// containers. a [deciding lease](crate::Store::decider) means one of them is
+/// looking, and the unique index over a cron occurrence means one that looked
+/// anyway launches nothing: correctness is the index and the lease is what
+/// stops the second attempt being made. so a second `All` or `Scheduler` is a
+/// warm spare, and it decides nothing until the first one stops saying it is
+/// there.
 ///
 /// this is not [isolation](crate::Op::isolated), which is a different mechanism
 /// that also spawns processes: an op subprocess runs one op and exits, and a

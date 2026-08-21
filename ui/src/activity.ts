@@ -2,7 +2,7 @@
 // since. these are the decisions in that (what a row is about, whether a
 // filter admits it, and how a live event joins a list that is already there)
 // and they are pure so they can be tested without a browser or a server.
-import type { EventKind, EventLevel, RunEvent, SubjectKind } from "./types";
+import type { EventKind, EventLevel, Health, RunEvent, SubjectKind } from "./types";
 
 // how many rows the feed holds. the api pages at 100; live events push onto
 // the front, and past this the oldest fall off the bottom rather than the tab
@@ -97,4 +97,24 @@ export function kindLabel(kind: EventKind): string {
   const prefix = prefixes.find((p) => kind.startsWith(p));
   const rest = prefix ? kind.slice(prefix.length) : kind;
   return rest.replace(/_/g, " ");
+}
+
+// what to say about who is deciding, in one line, or null when there is
+// nothing worth a line.
+//
+// said on this page and nowhere else: this is the log of what the *deployment*
+// did, so it is where somebody asking "why has nothing fired" already is, and
+// saying it on every page would be a fact about the deployment repeated at
+// somebody reading about one run.
+export function decidingLine(health: Health): string | null {
+  const d = health.deciding;
+  if (d === null) return null;
+  if (d.leader) return `this process (${health.instance}) is deciding, on term ${d.term}`;
+  if (d.holder === null) {
+    return "nothing is deciding: no schedule is being fired and no sensor evaluated";
+  }
+  if (!d.decides) {
+    return `${d.holder} is deciding; this process (${health.instance}) is a worker and decides nothing`;
+  }
+  return `${d.holder} is deciding; this process (${health.instance}) is standing by`;
 }

@@ -4,8 +4,8 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import type { FeedRow } from "../src/activity";
-import { kindLabel, linkFor, matches, merge, subjectOf } from "../src/activity";
-import type { EventKind, EventLevel, RunEvent, SubjectKind } from "../src/types";
+import { decidingLine, kindLabel, linkFor, matches, merge, subjectOf } from "../src/activity";
+import type { EventKind, EventLevel, Health, RunEvent, SubjectKind } from "../src/types";
 
 const ev = (
   seq: number,
@@ -101,4 +101,44 @@ test("a kind reads without saying its subject twice", () => {
   assert.equal(kindLabel("policy_launched"), "policy launched");
   // a kind from a newer writer reads as itself rather than as nothing
   assert.equal(kindLabel("quantum_entangled"), "quantum entangled");
+});
+
+// several processes may serve this ui and exactly one of them decides, so the
+// line has to say which one this is rather than only what is happening
+const health = (deciding: Health["deciding"]): Health => ({
+  ok: true,
+  instance: "a1b2c3d4",
+  holding: [],
+  deciding,
+});
+
+test("the deciding line says whether this is the process that decides", () => {
+  assert.equal(
+    decidingLine(
+      health({ leader: true, holder: "a1b2c3d4", term: 3, lease_secs: 8, decides: true }),
+    ),
+    "this process (a1b2c3d4) is deciding, on term 3",
+  );
+  assert.equal(
+    decidingLine(
+      health({ leader: false, holder: "e5f6a7b8", term: 3, lease_secs: 8, decides: true }),
+    ),
+    "e5f6a7b8 is deciding; this process (a1b2c3d4) is standing by",
+  );
+  // a worker is not standing by to decide: it never would
+  assert.equal(
+    decidingLine(
+      health({ leader: false, holder: "e5f6a7b8", term: 3, lease_secs: 8, decides: false }),
+    ),
+    "e5f6a7b8 is deciding; this process (a1b2c3d4) is a worker and decides nothing",
+  );
+  // and a deployment with nothing in it that decides says so, because that is
+  // the answer to the question this line exists for
+  assert.match(
+    decidingLine(health({ leader: false, holder: null, term: 3, lease_secs: null, decides: true }))!,
+    /nothing is deciding/,
+  );
+  // a process that could not read its own lease says nothing rather than
+  // guessing
+  assert.equal(decidingLine(health(null)), null);
 });

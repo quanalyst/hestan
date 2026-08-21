@@ -621,6 +621,16 @@ merged into the same list so there is no seam between the two. the header says
 `live` or `not following`, because a feed that quietly stopped updating is
 worse than one that says it has. `load older` walks back a page at a time.
 
+under the heading, one line saying **who is deciding**: whether the process
+serving this page is the one firing schedules and evaluating sensors, or which
+one is. schedules, sensors and [automation policies](assets.md#automation-policies)
+run on exactly one process at a time (see
+[scaling](scaling.md#running-more-than-one-scheduler)) and every other process
+is doing nothing about them on purpose, so "nothing has fired" is a question
+about that process rather than about whichever one this tab is talking to. it
+is said here and nowhere else: this is the log of what the deployment did, so
+it is where somebody asking already is.
+
 the filters are `about` (run, job, asset, schedule, sensor, backfill, system),
 `level`, and a text `find` over the message, kind and subject. they narrow
 **what has been loaded**, not the query, which is why the load-older button

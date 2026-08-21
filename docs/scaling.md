@@ -428,12 +428,16 @@ Hestan::new().db("postgres://user:pw@db.internal/hestan").work(None).await
 
 built with `--features postgres`. nothing else about a deployment changes. the
 queue, the claims, the leases and the roles were always backend-agnostic and
-they still are: one scheduler, any number of workers, the same registry in
-every process.
+they still are: one scheduler deciding at a time, any number of workers, the
+same registry in every process.
 
 **what is proven and what merely follows.** hestan's suite runs the queue
 cases twice: worker processes racing one sqlite file, and worker processes
-racing one postgres schema, asserting in both that no run executed twice. both
+racing one postgres schema, asserting in both that no run executed twice. it
+runs the deciding cases the same way twice: two scheduler processes against
+one database, asserting that no occurrence is fired twice, that one of them
+decides and the other fires nothing at all, and that killing the one that
+decides hands the next occurrence to the other. both
 of those are several *processes* against one database. nobody has run hestan's
 workers on several *hosts*, because the machine the suite runs on is one
 machine, and a process on another host differs from a process on this one

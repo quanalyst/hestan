@@ -298,11 +298,16 @@ impl Hestan {
     /// and sensors, executes nothing) or [`Role::Worker`] (executes, decides
     /// nothing).
     ///
-    /// **exactly one process** in a deployment should be `All` or `Scheduler`.
-    /// schedules, sensors, freshness checks, [automation
-    /// policies](crate::AutoPolicy) and backfill chunking are decisions, and two processes making them independently is two of every
-    /// scheduled run: the store has no lock that would stop it. any number of
-    /// processes may be `Worker`; that is what the queue is for.
+    /// **one process at a time** is `All` or `Scheduler`, and the store is what
+    /// settles which. schedules, sensors, freshness checks, [automation
+    /// policies](crate::AutoPolicy) and backfill chunking are decisions, and a
+    /// deployment makes each one once: a
+    /// [deciding lease](crate::Store::decider) means one process is looking,
+    /// and a unique index over the cron occurrence means a second one that
+    /// looked anyway launches nothing. so starting two is a warm spare rather
+    /// than a mistake, and a killed decider is a ten-second gap rather than an
+    /// outage. any number of processes may be `Worker`; that is what the queue
+    /// is for.
     ///
     /// [`work`](Self::work) is `role(Role::Worker)` with the address made
     /// optional, and is the shorter way to say the common thing.
@@ -966,9 +971,11 @@ impl Hestan {
 
     /// [`serve`](Self::serve) as a **queue worker**: it claims queued runs and
     /// executes them, and fires no schedule, evaluates no sensor, checks no
-    /// freshness policy and chunks no backfill. exactly one process in a
-    /// deployment should own those, and `Hestan::serve` under
-    /// [`Role::Scheduler`] is that process.
+    /// freshness policy and chunks no backfill. one process at a time owns
+    /// those, whichever process holds the
+    /// [deciding lease](crate::Store::decider), and a worker never reaches for
+    /// it: `Hestan::serve` under [`Role::All`] or [`Role::Scheduler`] is what
+    /// does.
     ///
     /// `addr` is optional because a worker has nothing to show: with `None` it
     /// binds no socket at all. give it one and you get the same ui, which is

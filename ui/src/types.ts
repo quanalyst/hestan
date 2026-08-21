@@ -666,3 +666,31 @@ export interface Notification {
   last_error: string | null;
   state: DeliveryState;
 }
+
+// who is doing the deciding in this deployment, off `GET /api/health`.
+//
+// schedules fire, sensors evaluate and policies build on exactly one process
+// at a time, and every other process is doing nothing about them on purpose.
+// so "nothing has fired" is a question about the deciding process rather than
+// about whichever one this browser happens to be talking to.
+export interface Deciding {
+  // whether the process serving this page is the one deciding
+  leader: boolean;
+  // and which one is, as the store has it. null when nothing holds the lease
+  holder: string | null;
+  // the term the holder is on; it moves on every handover
+  term: number;
+  // how long the holder has before anybody may take it; null when nothing
+  // holds it
+  lease_secs: number | null;
+  // whether this process would ever take it. a worker never does
+  decides: boolean;
+}
+
+export interface Health {
+  ok: boolean;
+  instance: string;
+  holding: string[];
+  // null when the process could not read its own lease
+  deciding: Deciding | null;
+}

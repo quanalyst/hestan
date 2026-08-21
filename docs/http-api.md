@@ -15,7 +15,7 @@ page is for writing something that is not hestan.
 
 | method | path | purpose |
 | --- | --- | --- |
-| GET | `/api/health` | liveness, this process's instance id, what it is holding, and whether its store is taking writes |
+| GET | `/api/health` | liveness, this process's instance id, what it is holding, whether it is the deciding process, and whether its store is taking writes |
 | GET | `/api/resources` | registered resources: names and types |
 | GET | `/api/jobs` | all job summaries, sorted by name |
 | GET | `/api/jobs/{name}` | one job summary |
@@ -193,6 +193,13 @@ my run" and "which one has gone quiet".
   "ok": true,
   "instance": "3f2a91cc",
   "holding": ["0192...", "0192..."],
+  "deciding": {
+    "leader": true,
+    "holder": "3f2a91cc",
+    "term": 4,
+    "lease_secs": 8.4,
+    "decides": true
+  },
   "store": {
     "writing": true,
     "dropped_writes": 0,
@@ -201,6 +208,22 @@ my run" and "which one has gone quiet".
   }
 }
 ```
+
+`deciding` is the answer to "why is nothing running **here**". schedules fire,
+sensors evaluate and [automation policies](assets.md#automation-policies) build
+on exactly one process at a time, held by a
+[lease in the store](scaling.md#the-deciding-lease), and every other process is
+doing nothing about them entirely on purpose. `leader` is whether this process
+is that one; `holder` is which one is, or `null` when nothing is;
+`term` is the counter that moves on every handover; `lease_secs` is how long
+the holder has before anybody may take it, and is never negative. `decides` is
+whether this process would ever take it, which a [worker](scaling.md#roles)
+would not.
+
+it is read off the store rather than off this process's own belief, because a
+process that has stopped being the decider is exactly the one whose belief
+about it is wrong. `deciding` is `null` when the store could not be asked at
+all.
 
 `store` is what this process has seen its run log do. **`ok` is `false`
 whenever `writing` is**: a process whose store is refusing writes has also

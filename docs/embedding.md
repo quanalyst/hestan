@@ -129,14 +129,15 @@ has it open.
 
 ## Single-process assumptions
 
-one *decider* per database, and as many executors as you like. that split is
-what [scaling](scaling.md) is about: schedules, sensors, freshness checks,
-automation policies and backfill chunking are decisions, and two processes making them independently
-is two of every scheduled run, so exactly one process may be `Role::All` or
-`Role::Scheduler`. any number may be `Role::Worker`, because a run is claimed
+one *decider* at a time per database, and as many executors as you like. that
+split is what [scaling](scaling.md) is about: schedules, sensors, freshness
+checks, automation policies and backfill chunking are decisions, and the
+deployment makes each one once. which process makes them is settled by a
+[lease in the store](scaling.md#the-deciding-lease), so starting a second
+`Role::All` or `Role::Scheduler` gives you a warm spare rather than two of
+every scheduled run. any number may be `Role::Worker`, because a run is claimed
 by exactly one of them and the startup sweep respects a live claim rather than
-assuming it is alone. two processes both running `serve()` with the default
-role against one file is the mistake this replaced, and it is still a mistake.
+assuming it is alone.
 
 hestan's own extra process is a third thing again: an [isolated
 op](isolation.md) runs in an op subprocess that opens the same file, takes

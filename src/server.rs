@@ -464,6 +464,7 @@ async fn health(State(st): State<AppState>) -> Json<Value> {
         "ok": !store.failing(),
         "instance": st.runner.instance(),
         "holding": holding,
+        "deciding": deciding(&st.runner),
         "store": {
             // what the last write did, which is what decides whether this
             // process is claiming anything
@@ -478,6 +479,45 @@ async fn health(State(st): State<AppState>) -> Json<Value> {
             "given_up": st.runner.given_up(),
         },
     }))
+}
+
+/// who is doing the deciding in this deployment, and whether it is this
+/// process.
+///
+/// this is the answer to "why is nothing running *here*", which is the question
+/// a deployment with more than one process that could decide creates. schedules
+/// fire, sensors evaluate and policies build on exactly one process at a time,
+/// and every other process is doing nothing about them entirely on purpose.
+///
+/// **read off the store, not off this process's own belief.** a process that
+/// has stopped being the decider is precisely the one whose belief about it is
+/// wrong, and an endpoint that reported the belief would agree with the wrong
+/// process. `null` when the store could not be asked at all, which is the shape
+/// every other unreadable thing on this page has.
+fn deciding(runner: &Runner) -> Value {
+    let Ok(decider) = runner.store().decider() else {
+        return Value::Null;
+    };
+    let now = Utc::now();
+    json!({
+        // whether the loops in *this* process are the ones deciding
+        "leader": decider.held_by(runner.instance(), now),
+        // and who is, if not. null when nothing holds it at all, which is a
+        // deployment with no deciding process running
+        "holder": decider.holder,
+        // the term the holder is on. a decision names it and the store refuses
+        // one that names an older one, so this moving is a handover
+        "term": decider.term,
+        // how long the holder has before anybody may take it. never negative:
+        // an expired lease is nobody's, and reporting it as "-4s left" would
+        // be reporting a lease
+        "lease_secs": decider.lease_until.map(|until| {
+            (until - now).num_milliseconds().max(0) as f64 / 1000.0
+        }),
+        // whether this process would ever take it. a worker never does, and
+        // "not the leader" is not a complaint about a worker
+        "decides": runner.role().decides(),
+    })
 }
 
 /// whether this deployment checks who is asking, and who it makes you.

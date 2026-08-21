@@ -1720,6 +1720,13 @@ table.plain-rows tbody tr:hover {
   font-size: 12px;
 }
 
+/* which process is deciding, under the heading and above the filters: one
+   line, and only on this page */
+.act-deciding {
+  margin: -8px 0 16px;
+  font-size: 12px;
+}
+
 .act-empty {
   max-width: 52ch;
   margin-top: 28px;
