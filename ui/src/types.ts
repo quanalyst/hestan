@@ -292,6 +292,23 @@ export interface MetaTable {
   truncated: boolean;
 }
 
+// a time-indexed sample of what an op wrote: [timestamp, value] pairs oldest
+// first, and how many points the sample stands for. fewer points than `of`
+// means it was sampled across its range rather than cut off at the front, so
+// the first and the last point are always among them
+export interface MetaSeries {
+  points: [string, number][];
+  of: number;
+}
+
+// a metadata entry an op marked as a sample of what it wrote, with the moment
+// it took it. the moment is the point: what is stored is what the op read
+// then, and nothing goes back to look again
+export interface MetaSaved {
+  taken_at: string;
+  value: MetaValue;
+}
+
 // a typed fact an op reported with ctx.meta, stored tagged by its type so
 // nothing downstream has to guess how to show it. bytes, duration_secs and
 // count are display types over one number: the same integer an `int` carries,
@@ -304,13 +321,16 @@ export type MetaValue =
   | { markdown: string }
   | { json: unknown }
   | { table: MetaTable }
+  | { series: MetaSeries }
   | { bytes: number }
   | { duration_secs: number }
   | { count: number }
   | { path: string }
   // a run id and an asset name of this deployment, which the ui links to
   | { run: string }
-  | { asset: string };
+  | { asset: string }
+  // any of the above, marked as a sample of what the op wrote
+  | { saved: MetaSaved };
 
 export type Metadata = Record<string, MetaValue>;
 

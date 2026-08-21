@@ -12,4 +12,5 @@ import "./metalist.test";
 import "./rate.test";
 import "./replay.test";
 import "./role.test";
+import "./saved.test";
 import "./swatch.test";

@@ -1124,6 +1124,69 @@ button.text-btn.active {
   font-size: 10px;
 }
 
+/* a marked sample says so beside its name, in words, because there is no
+   colour free to say it with */
+.meta-snapshot {
+  flex: none;
+  font-size: 10px;
+}
+
+/* a series is drawn in the same ink as everything else: hue means group or
+   origin in this ui and a chart of one series has neither to say */
+.meta-series-wrap {
+  padding: 4px 0;
+}
+
+.meta-series {
+  display: block;
+  max-width: 100%;
+  height: auto;
+}
+
+.meta-axis {
+  fill: var(--muted);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 9px;
+}
+
+/* what the sample stands for, and the way to the numbers behind the shape */
+.meta-series-note {
+  padding-top: 2px;
+  font-size: 10px;
+  cursor: pointer;
+}
+
+.meta-series-points > summary::marker {
+  color: var(--muted);
+}
+
+/* one block per op and name, under the run's own heading */
+.saved-note {
+  margin: 2px 0 8px;
+}
+
+.saved-entry {
+  padding: 8px 0;
+  border-top: 1px solid var(--hairline);
+}
+
+.saved-head {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  font-size: 12px;
+}
+
+.saved-name {
+  color: var(--muted);
+  font-size: 10px;
+}
+
+.saved-taken {
+  margin-left: auto;
+  font-size: 10px;
+}
+
 /* the sparkline sits under the value it belongs to, right-aligned with the
    number rather than with the name */
 .meta-trend {

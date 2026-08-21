@@ -174,6 +174,14 @@ export function fmtRate(limit: number, perSecs: number): string {
   return `${limit} per ${fmtPeriod(perSecs)}`;
 }
 
+// a series timestamp, in utc exactly as it was stored. everything else in
+// this ui prints times in the reader's zone; a series is the exception on
+// purpose, because its points are indexed by the clock the data was written
+// against and an axis has to agree with the numbers under it
+export function stamp(iso: string, seconds = false): string {
+  return iso.slice(0, seconds ? 19 : 16).replace("T", " ");
+}
+
 export function clockTime(iso: string): string {
   return new Date(iso).toLocaleTimeString([], { hour12: false });
 }

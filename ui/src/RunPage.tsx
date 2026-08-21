@@ -5,6 +5,7 @@ import DagView from "./DagView";
 import type { NodeStatus } from "./DagView";
 import GanttChart from "./GanttChart";
 import MetaList from "./MetaList";
+import SavedList from "./SavedList";
 import StatusDot from "./StatusDot";
 import { GlyphShape } from "./StatusGlyph";
 import { expansions, fanOut, instanceDeps, instanceTree, rollup } from "./fanout";
@@ -529,6 +530,9 @@ function RunView({ id }: { id: string }) {
       )}
 
       {job && <GanttChart ops={ganttOps} opRuns={ops} />}
+
+      {/* what the run wrote, from every op of it, without selecting one */}
+      <SavedList ops={ops} />
 
       <h2>
         log

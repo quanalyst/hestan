@@ -1,6 +1,7 @@
 import { Link } from "react-router-dom";
 import Markdown from "./Markdown";
 import MicroBars from "./MicroBars";
+import SeriesChart from "./SeriesChart";
 import type { Deltas, MetaDelta, MetaPoint, MetaTable, MetaValue, Metadata, Trends } from "./types";
 import { assetPath, fmtDataSize, fmtDuration, shortId } from "./util";
 
@@ -95,7 +96,7 @@ function PathView({ path }: { path: string }) {
 // metadata is typed at the source, so it renders by type rather than as json:
 // numbers as numbers in their unit, a url as a link, a run or asset reference
 // as a link into this ui, markdown rendered, json as source
-function MetaValueView({ value }: { value: MetaValue }) {
+export function MetaValueView({ value }: { value: MetaValue }) {
   if ("int" in value || "float" in value || "count" in value) {
     const n = "int" in value ? value.int : "float" in value ? value.float : value.count;
     return <span className="mono num meta-num">{n.toLocaleString()}</span>;
@@ -133,6 +134,10 @@ function MetaValueView({ value }: { value: MetaValue }) {
     );
   }
   if ("table" in value) return <TableView table={value.table} />;
+  if ("series" in value) return <SeriesChart series={value.series} />;
+  // a sample renders as what it is a sample of; that it is one is said by
+  // whatever is showing it, which here is the row below
+  if ("saved" in value) return <MetaValueView value={value.saved.value} />;
   if ("text" in value) {
     return <span className="meta-val">{value.text}</span>;
   }
@@ -167,14 +172,24 @@ export default function MetaList({
     <div className="meta-list">
       {entries.map(([name, value]) => {
         const trend = trends[name] ?? [];
+        // a marked sample is one word different here: it is a snapshot of
+        // what the op wrote, and the run page's saved section is where it is
+        // collected and dated
+        const sample = "saved" in value ? value.saved : null;
+        const shown = sample ? sample.value : value;
         return (
           <div key={name} className="meta-entry">
             <div className="meta-row">
               <span className="meta-name">{name}</span>
-              <MetaValueView value={value} />
+              {sample && (
+                <span className="muted meta-snapshot" title={`taken ${sample.taken_at}`}>
+                  snapshot
+                </span>
+              )}
+              <MetaValueView value={shown} />
               {/* a key with nothing to compare against shows nothing at all,
                   which is a different claim from having not moved */}
-              {deltas[name] && <DeltaView value={value} delta={deltas[name]} />}
+              {deltas[name] && <DeltaView value={shown} delta={deltas[name]} />}
             </div>
             {/* fewer than three points is not a trend, so it draws nothing */}
             {trend.length >= TREND_MIN && (
