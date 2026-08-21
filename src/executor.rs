@@ -22,7 +22,7 @@ use crate::model::{
 use crate::op::{self, Cancel, MetaBuf, Op, OpCtx};
 use crate::rate::{Rate, RateStatus, Rates, Ticket};
 use crate::resource::{self, Resources, RunResource, RunResources};
-use crate::store::{Built, RunKey, Store, note};
+use crate::store::{Built, Claimed, Fire, RunKey, Store, note};
 
 /// how far back a resume follows `resumed_from` links. resuming a resume is
 /// normal; a chain this long is a bug, and the walk says so instead of looping.
@@ -1039,11 +1039,11 @@ impl Runner {
                 trigger,
                 Lineage::None,
                 None,
-                None,
+                Claimed::Nothing,
                 tags,
                 priority,
             )?
-            .expect("only a claimed run key skips a launch"))
+            .expect("only a claim already taken skips a launch"))
     }
 
     /// [`Runner::launch`] for a run that stands for a logical time: the cron
@@ -1066,11 +1066,48 @@ impl Runner {
                 trigger,
                 Lineage::None,
                 scheduled_for,
-                None,
+                Claimed::Nothing,
                 RunTags::new(),
                 None,
             )?
-            .expect("only a claimed run key skips a launch"))
+            .expect("only a claim already taken skips a launch"))
+    }
+
+    /// [`Runner::launch_at`] for one cron occurrence, with the
+    /// [tick](crate::Tick) that records the fire written in the same
+    /// transaction as the run.
+    ///
+    /// `Ok(None)` is a refusal rather than a failure: some process, this one on
+    /// an earlier pass or another one entirely, has already fired this
+    /// occurrence, the unique index over `(job, expr, scheduled_for)` said so,
+    /// and this call wrote nothing at all. that is the whole backstop: two
+    /// schedulers racing the same occurrence produce one tick and one run
+    /// because the *store* refuses the second, not because either of them
+    /// checked first.
+    pub(crate) fn fire_scheduled(
+        &self,
+        job: &str,
+        expr: &str,
+        at: DateTime<Utc>,
+        params: Value,
+        caught_up: bool,
+    ) -> Result<Option<String>, Error> {
+        self.enqueue(
+            job,
+            None,
+            params,
+            Trigger::Schedule,
+            Lineage::None,
+            Some(at),
+            Claimed::Fire(Fire {
+                job,
+                expr,
+                scheduled_for: at,
+                caught_up,
+            }),
+            RunTags::new(),
+            None,
+        )
     }
 
     /// [`Runner::launch`] for a request carrying a [run
@@ -1093,7 +1130,7 @@ impl Runner {
             trigger,
             Lineage::None,
             None,
-            Some(key),
+            Claimed::Key(key),
             tags,
             None,
         )
@@ -1354,11 +1391,11 @@ impl Runner {
                 trigger,
                 lineage,
                 None,
-                None,
+                Claimed::Nothing,
                 tags,
                 priority,
             )?
-            .expect("only a claimed run key skips a launch"))
+            .expect("only a claim already taken skips a launch"))
     }
 
     /// re-run a finished run from where it broke: every op that did not
@@ -1848,7 +1885,7 @@ impl Runner {
         trigger: Trigger,
         lineage: Lineage<'_>,
         scheduled_for: Option<DateTime<Utc>>,
-        key: Option<RunKey<'_>>,
+        claimed: Claimed<'_>,
         tags: RunTags,
         priority: Option<i64>,
     ) -> Result<Option<String>, Error> {
@@ -1951,9 +1988,9 @@ impl Runner {
         let plan = subset_plan.then(|| json!({ "ops": &pending, "seeds": &seeded }));
         if !self
             .store
-            .create_run_keyed(&run, &rows, key, plan.as_ref())?
+            .create_run_keyed(&run, &rows, claimed, plan.as_ref())?
         {
-            // the key was claimed between the caller's check and this insert:
+            // the claim was taken between the caller's check and this insert:
             // no run row was written, and nothing launched
             return Ok(None);
         }

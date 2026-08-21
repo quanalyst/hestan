@@ -8,7 +8,7 @@ use serde_json::{Value, json};
 
 use crate::error::Error;
 use crate::executor::Runner;
-use crate::model::{Catchup, Overlap, ScheduleRow, TickOutcome, Trigger};
+use crate::model::{Catchup, Overlap, ScheduleRow, TickOutcome};
 use crate::store::Store;
 
 /// how far back a catch-up scan will walk to enumerate missed occurrences. a
@@ -539,9 +539,18 @@ fn note_runless_tick(
     }
 }
 
+/// what a refused fire leaves in the tick log, so the refusal is visible where
+/// somebody is already looking rather than only in this process's stderr.
+const ALREADY_FIRED: &str = "another process had already fired this occurrence";
+
 /// launch one occurrence and record what happened to it. `caught_up` says the
 /// occurrence came due while nothing was running to fire it: the tick row
 /// cannot tell the two apart, and the event kind does.
+///
+/// the tick and the run are one transaction, so this either launches a run and
+/// records the fire or does neither. a refusal is the store saying the
+/// occurrence already has a fire against it, which on a single scheduler cannot
+/// happen and beside a second one is exactly what stops the second run.
 fn note_tick(
     runner: &Runner,
     job: &str,
@@ -550,16 +559,21 @@ fn note_tick(
     params: &Value,
     caught_up: bool,
 ) {
-    let tick = match runner.launch_at(job, params.clone(), Trigger::Schedule, Some(due)) {
-        Ok(run_id) => runner.store().record_tick(
-            job,
-            expr,
-            due,
-            TickOutcome::Fired,
-            caught_up,
-            Some(&run_id),
-            None,
-        ),
+    let tick = match runner.fire_scheduled(job, expr, due, params.clone(), caught_up) {
+        // the fire and its tick landed together; nothing more to record
+        Ok(Some(_)) => Ok(()),
+        Ok(None) => {
+            tracing::info!(job = %job, expr = %expr, "fire refused: {ALREADY_FIRED}");
+            runner.store().record_tick(
+                job,
+                expr,
+                due,
+                TickOutcome::Skipped,
+                caught_up,
+                None,
+                Some(ALREADY_FIRED),
+            )
+        }
         Err(err) => {
             tracing::error!(job = %job, error = %err, "scheduled launch failed");
             runner.store().record_tick(
@@ -582,7 +596,7 @@ fn note_tick(
 mod tests {
     use super::*;
     use crate::job::Job;
-    use crate::model::Tick;
+    use crate::model::{Tick, Trigger};
     use crate::op::Op;
     use crate::store::Store;
     use chrono::Timelike;

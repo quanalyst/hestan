@@ -23,7 +23,7 @@ use std::process::{Child, Command};
 use std::time::{Duration, Instant};
 
 use hestan::prelude::*;
-use hestan::{Role, RunStatus, Runner, Store, Trigger};
+use hestan::{Overlap, Role, RunStatus, Runner, Store, TickOutcome, Trigger};
 
 /// where every process in this test finds the run log. a deployment reads this
 /// out of its own config; a test has to hand it to its children somehow, and
@@ -48,6 +48,13 @@ fn main() {
             "worker" => rt.block_on(app(&db).slots(2).work(None)),
             // the other half: decides, enqueues, executes nothing
             "scheduler" => rt.block_on(app(&db).role(Role::Scheduler).serve(([127, 0, 0, 1], 0))),
+            // a registry of its own, with one schedule fast enough that a
+            // twenty-second test sees several occurrences of it
+            "beat" => rt.block_on(
+                beat_app(&db)
+                    .role(Role::Scheduler)
+                    .serve(([127, 0, 0, 1], 0)),
+            ),
             other => panic!("unknown role {other}"),
         };
         // only ever reached by a bind failure or a store that would not open
@@ -169,6 +176,32 @@ fn app(db: &str) -> Hestan {
         .db(db)
 }
 
+/// the deployment the double-fire cases run: one job on a two-second cron,
+/// declared once in a registry every process building it shares.
+///
+/// its own app rather than a schedule on [`app`], so that the cases above go on
+/// racing exactly the deployment they were written against. the job overlaps
+/// freely because nothing here executes it: the runs pile up queued, and a job
+/// that skipped an occurrence while its last run was outstanding would fire
+/// once and never again, which is a test with nothing left to race.
+fn beat_app(db: &str) -> Hestan {
+    Hestan::new()
+        .jobs(vec![
+            Job::builder(BEAT)
+                .op(Op::new("tick", |_: OpCtx| async { Ok(json!(null)) }))
+                .overlap(Overlap::Allow)
+                .build()
+                .unwrap(),
+        ])
+        .schedule(BEAT, BEAT_CRON)
+        .db(db)
+}
+
+/// the job the double-fire cases watch, and the six-field cron it is on:
+/// seconds first, so this is every two seconds rather than every two minutes.
+const BEAT: &str = "beat";
+const BEAT_CRON: &str = "*/2 * * * * *";
+
 fn jobs() -> Vec<Job> {
     vec![
         Job::builder("chunk")
@@ -253,6 +286,11 @@ async fn cases(db: &str) {
     case(
         "a_declared_rate_is_per_process_and_two_workers_are_two_of_them",
         a_rate_is_per_process(db),
+    )
+    .await;
+    case(
+        "two_schedulers_never_fire_one_occurrence_twice",
+        two_schedulers_fire_each_occurrence_once(db),
     )
     .await;
 }
@@ -441,6 +479,67 @@ async fn a_rate_is_per_process(db: &str) {
     assert!(
         at[1] - at[0] < 2_000,
         "two workers spaced their calls as if they shared a bucket: {at:?}"
+    );
+}
+
+/// two deciding processes against one database, both wanting the same
+/// occurrences, for long enough that several come round.
+///
+/// what is asserted is the invariant rather than the mechanism: **no occurrence
+/// has two fires and no two runs stand for the same occurrence**, however the
+/// two processes arranged that between them. the unique index over
+/// `(job, expr, scheduled_for)` is what makes it true whoever asks, and a
+/// process that believed it was alone and was not is exactly the case it is
+/// there for.
+///
+/// this does not assert that only one process *tried*. that is a different
+/// claim about a different mechanism, and it is made where that mechanism is.
+async fn two_schedulers_fire_each_occurrence_once(db: &str) {
+    let store = open(db);
+    let mut beats = [spawn("beat"), spawn("beat")];
+    // several two-second occurrences, and both processes up for all of them
+    let fires = wait_for("three occurrences to come round", || {
+        let fired: Vec<_> = store
+            .ticks(Some(BEAT), 200)
+            .unwrap()
+            .into_iter()
+            .filter(|t| t.outcome == TickOutcome::Fired)
+            .collect();
+        (fired.len() >= 3).then_some(fired)
+    })
+    .await;
+    for beat in &mut beats {
+        stop(beat);
+    }
+
+    let mut occurrences: Vec<String> = fires.iter().map(|t| t.scheduled_for.to_rfc3339()).collect();
+    occurrences.sort();
+    let mut once = occurrences.clone();
+    once.dedup();
+    assert_eq!(
+        occurrences, once,
+        "an occurrence was fired twice: {occurrences:?}"
+    );
+
+    // and the run log agrees, which is the half that costs money: a second
+    // tick would have been a second run of the job
+    let mut stood_for: Vec<String> = store
+        .runs(None, None, None, None, None, 500)
+        .unwrap()
+        .into_iter()
+        .filter(|r| r.job == BEAT && r.trigger == Trigger::Schedule)
+        .filter_map(|r| r.scheduled_for.map(|t| t.to_rfc3339()))
+        .collect();
+    stood_for.sort();
+    let mut distinct = stood_for.clone();
+    distinct.dedup();
+    assert_eq!(
+        stood_for, distinct,
+        "two runs stand for the same occurrence: {stood_for:?}"
+    );
+    assert!(
+        stood_for.len() >= 3,
+        "the fixture fired nothing worth checking: {stood_for:?}"
     );
 }
 

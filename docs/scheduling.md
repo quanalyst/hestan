@@ -222,6 +222,32 @@ or `deferred` (a queue-policy fire waiting its turn, below). the log is
 queryable via `GET /api/schedules/ticks` and shown on the job page. ticks answer "did the
 schedule do its job at 09:00" separately from "did the run succeed".
 
+## One fire per occurrence
+
+**the store holds at most one `fired` tick per `(job, expr, scheduled_for)`,
+ever**, on a unique index added in
+[schema v20](storage.md#one-fire-per-occurrence). the tick and the run are
+written in one transaction, so a fire the index refuses launches nothing at
+all: no run row, no op rows, no event.
+
+this is what makes a second deciding process safe rather than merely
+discouraged. two processes reaching for the same occurrence produce one run,
+because the database refuses the second one, not because either of them looked
+first. the loser records a `skipped` tick saying
+`another process had already fired this occurrence`, so a refusal is visible in
+the log an operator is already reading rather than only in one process's
+stderr.
+
+a single scheduler never meets the index: it fires each occurrence once, and
+the `deferred` ticks that make the tick log a queue are untouched, because the
+index covers `fired` and nothing else.
+
+what this does **not** cover: a sensor that declares no
+[run key](sensors.md#run-keys), an [automation policy](assets.md#automation-policies)
+build, a [backfill](assets.md#backfills) chunk, a freshness hook and the
+retention sweep are all decisions with no occurrence to key on, and no index
+refuses a second one. see [scaling](scaling.md).
+
 ## Upcoming projection
 
 `GET /api/schedules/upcoming?window=<secs>` projects future fires inside the

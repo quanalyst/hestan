@@ -128,6 +128,8 @@ CREATE TABLE schedule_ticks (
     run_id TEXT COLLATE "C",
     error TEXT COLLATE "C"
 );
+CREATE UNIQUE INDEX schedule_ticks_fire
+    ON schedule_ticks(job, expr, scheduled_for) WHERE outcome = 'fired';
 CREATE TABLE op_state (
     job TEXT COLLATE "C" NOT NULL,
     op TEXT COLLATE "C" NOT NULL,
@@ -446,6 +448,15 @@ const MIGRATE_V19: &str = r#"
 ALTER TABLE runs ADD COLUMN replay_of TEXT COLLATE "C";
 "#;
 
+/// one fire per occurrence. the postgres half of `SCHEMA_V20`, the same index
+/// over the same three columns, and preceded by the same collapse: this is the
+/// backend two schedulers actually share, so it is the one most likely to have
+/// duplicates in it already.
+const MIGRATE_V20: &str = r#"
+CREATE UNIQUE INDEX schedule_ticks_fire
+    ON schedule_ticks(job, expr, scheduled_for) WHERE outcome = 'fired';
+"#;
+
 const MIGRATE_V17: &str = r#"
 ALTER TABLE events ALTER COLUMN run_id DROP NOT NULL;
 ALTER TABLE events ADD COLUMN subject_kind TEXT COLLATE "C" NOT NULL DEFAULT 'run';
@@ -462,6 +473,8 @@ CREATE INDEX events_subject ON events(subject_kind, subject, seq DESC);
 /// chain is forward-only: a step is a `if version < n` below, in order, and
 /// the stamp moves once at the end.
 fn migrate(client: &mut Client) -> Result<(), Error> {
+    // said after the commit, for the reason the sqlite chain says it there
+    let mut collapsed = 0;
     let mut tx = client.transaction()?;
     tx.execute("SELECT pg_advisory_xact_lock(?1)", args![BOOT_LOCK])?;
     // asked this way rather than by reading the table, because a failed read
@@ -491,6 +504,10 @@ fn migrate(client: &mut Client) -> Result<(), Error> {
             if version < 19 {
                 tx.batch(MIGRATE_V19)?;
             }
+            if version < 20 {
+                collapsed = tx.execute(crate::store::COLLAPSE_DUPLICATE_FIRES, args![])?;
+                tx.batch(MIGRATE_V20)?;
+            }
             if version != SCHEMA_VERSION {
                 tx.execute(
                     "UPDATE schema_version SET version = ?1",
@@ -507,6 +524,7 @@ fn migrate(client: &mut Client) -> Result<(), Error> {
         }
     }
     tx.commit()?;
+    crate::store::report_collapsed(collapsed);
     Ok(())
 }
 

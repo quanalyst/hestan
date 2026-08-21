@@ -191,6 +191,9 @@ CREATE TABLE schedule_ticks (
     run_id TEXT,
     error TEXT
 );
+-- added in v20: one fire per occurrence, whoever asks
+CREATE UNIQUE INDEX schedule_ticks_fire
+    ON schedule_ticks(job, expr, scheduled_for) WHERE outcome = 'fired';
 
 CREATE TABLE op_state (          -- added in v3
     job TEXT NOT NULL,
@@ -434,7 +437,12 @@ thing twice; version 18 adds `runs.actor` and `events.actor`, the name of the
 [identity](auth.md) that asked for a run, a cancel, a pause or a backfill:
 null on every row written before it, and null on everything a schedule, a
 sensor or a loop did on its own, which is the same thing those rows always
-meant.
+meant; version 19 adds `runs.replay_of`, the run a
+[replay](replay.md) re-ran, beside `resumed_from` rather than sharing it,
+because a resume continues a run and a replay re-runs one; version 20 adds the
+`schedule_ticks_fire` unique index, which is
+[one fire per occurrence](#one-fire-per-occurrence) and is the only unique
+constraint in this schema that was not already a primary key.
 
 an older file at any version opens straight into the current one, rows
 intact: the v8 rebuild copies every keyed materialization across, where it becomes
@@ -443,8 +451,46 @@ existing row with a null partition, which is exactly what an unpartitioned
 asset is. every pending step and the version stamp run in one transaction
 (sqlite DDL is transactional), so a crash or failure mid-migration leaves the
 file exactly as it was found, never half-migrated. a database stamped
-with a version newer than the build refuses to open (`db schema v19 is newer
+with a version newer than the build refuses to open (`db schema v21 is newer
 than this build`) instead of quietly writing an older stamp over it.
+
+### One fire per occurrence
+
+`schedule_ticks` had an autoincrement id and no unique index on anything, so
+two processes firing the same `(job, expr, scheduled_for)` each inserted a tick
+and each launched a run, and nothing refused either. v20 adds the index that
+refuses the second one, and the [scheduler](scheduling.md#one-fire-per-occurrence)
+records the tick and creates the run in one transaction, so a refused tick
+launches nothing.
+
+the index is **partial, over `fired` alone.** the tick log is also the queue: a
+`deferred` tick with no later tick for the same occurrence is a fire still
+waiting, and that occurrence legitimately holds a `deferred` tick and then the
+`fired` tick that drained it. what has to be unique is the decision that
+launched something. `deferred`, `skipped` and `error` ticks stay
+unconstrained, and a duplicate among them is a duplicate line in a log rather
+than a duplicate run.
+
+**the migration is the hazard.** a deployment that has already been running two
+schedulers has duplicate `fired` ticks in this table now, and
+`CREATE UNIQUE INDEX` over them fails outright. so v20 collapses them first,
+keeping the earliest `fired_at` of each occurrence and deleting the rest, and
+reports the count at warn level:
+
+```
+schema v20: 37 duplicate schedule fires collapsed. more than one process has
+been firing the same occurrences against this store. each collapsed tick may
+have launched a run of its own: those runs are still in the run log, they still
+executed, and deleting a tick does not unlaunch one. check the run log for
+scheduled runs that came in pairs
+```
+
+that last sentence is the point. **the collapse does not undo anything.** each
+deleted tick may have launched a run; that run executed, wrote what it wrote and
+is still in the run log. the count is how many times this deployment fired an
+occurrence twice, and the runs are the thing to go and look at. the report is a
+`tracing` warning emitted from `Store::open`, before there is a store to write
+an event to, so a process with no subscriber installed will not see it.
 
 **v17 is the one step where the two backends do genuinely different amounts of
 work,** and it is worth knowing which way round. sqlite has no

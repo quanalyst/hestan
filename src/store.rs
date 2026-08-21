@@ -428,7 +428,74 @@ const SCHEMA_V19: &str = r#"
 ALTER TABLE runs ADD COLUMN replay_of TEXT;
 "#;
 
-pub(crate) const SCHEMA_VERSION: u32 = 19;
+/// **one fire per occurrence, enforced by the database.**
+///
+/// `schedule_ticks` had an autoincrement id and no unique index on anything,
+/// so two processes firing the same `(job, expr, scheduled_for)` each inserted
+/// a tick and each launched a run, and nothing refused either. this is the
+/// index that refuses the second one, and it is the correctness guarantee this
+/// backstop is: a lease can be believed by a process that no longer holds it,
+/// and a unique index cannot.
+///
+/// **partial, over `fired` alone.** the tick log is also the queue (a
+/// `deferred` tick with no later tick for the same occurrence is a fire still
+/// waiting; see [`pending_fires`](Store::pending_fires)), so an occurrence
+/// legitimately holds a `deferred` tick and then the `fired` tick that drained
+/// it. an index over every outcome would refuse that second row and break the
+/// queue. what has to be unique is the decision that *launched something*, and
+/// that is exactly one outcome.
+///
+/// `deferred`, `skipped` and `error` ticks are still unconstrained: none of
+/// them launches a run, so a duplicate is a duplicate line in a log rather
+/// than a duplicate run.
+const SCHEMA_V20: &str = r#"
+CREATE UNIQUE INDEX schedule_ticks_fire
+    ON schedule_ticks(job, expr, scheduled_for) WHERE outcome = 'fired';
+"#;
+
+/// what [`SCHEMA_V20`] has to clear out of the way first, on both backends.
+///
+/// a deployment that has already run two schedulers has duplicate `fired` ticks
+/// in this table now, and `CREATE UNIQUE INDEX` over them fails outright. the
+/// earliest fire of each occurrence is kept and the rest are deleted, which is
+/// what makes the index creatable.
+///
+/// **this does not undo anything.** each deleted tick may have launched a run
+/// of its own; those runs are still in the run log, they still executed, and
+/// deleting the row that recorded the fire does not unlaunch one. the count is
+/// reported at warn level for exactly that reason: it is the number of times
+/// this deployment fired an occurrence twice, and the runs are the thing to go
+/// and look at.
+pub(crate) const COLLAPSE_DUPLICATE_FIRES: &str = r#"
+DELETE FROM schedule_ticks WHERE id IN (
+    SELECT id FROM (
+        SELECT id, ROW_NUMBER() OVER (
+            PARTITION BY job, expr, scheduled_for ORDER BY fired_at, id
+        ) AS seen
+        FROM schedule_ticks WHERE outcome = 'fired'
+    ) ranked WHERE seen > 1
+)
+"#;
+
+/// say what the collapse found, at the level a duplicate fire deserves.
+///
+/// a silent migration here would be the store quietly tidying away the
+/// evidence that this deployment has been double-firing, which is the one
+/// thing an operator needs to know before they read another number off it.
+pub(crate) fn report_collapsed(n: usize) {
+    if n == 0 {
+        return;
+    }
+    tracing::warn!(
+        "schema v20: {n} duplicate schedule fires collapsed. more than one process \
+         has been firing the same occurrences against this store. each collapsed \
+         tick may have launched a run of its own: those runs are still in the run \
+         log, they still executed, and deleting a tick does not unlaunch one. check \
+         the run log for scheduled runs that came in pairs"
+    );
+}
+
+pub(crate) const SCHEMA_VERSION: u32 = 20;
 
 // one transaction around every pending step and the version stamp (sqlite DDL
 // is transactional), so a crash mid-migration leaves the db exactly as found
@@ -499,10 +566,19 @@ fn migrate(conn: &mut Connection) -> Result<(), Error> {
     if version < 19 {
         tx.execute_batch(SCHEMA_V19)?;
     }
+    // counted rather than batched, because the count is the whole report and
+    // `execute_batch` does not return one. said after the commit, so nothing
+    // announces a collapse a rolled-back migration did not make
+    let mut collapsed = 0;
+    if version < 20 {
+        collapsed = tx.execute(COLLAPSE_DUPLICATE_FIRES, [])?;
+        tx.execute_batch(SCHEMA_V20)?;
+    }
     if version != SCHEMA_VERSION {
         tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     }
     tx.commit()?;
+    report_collapsed(collapsed);
     Ok(())
 }
 
@@ -524,6 +600,38 @@ fn table_exists(conn: &Connection, name: &str) -> Result<bool, Error> {
 pub(crate) struct RunKey<'a> {
     pub sensor: &'a str,
     pub key: &'a str,
+}
+
+/// the cron occurrence a scheduled run fires for: at most one run per
+/// `(job, expr, scheduled_for)`, ever, by [`SCHEMA_V20`].
+///
+/// `caught_up` is the one thing the tick row cannot say for itself, and it goes
+/// on the event rather than the row; see [`Store::record_tick`].
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Fire<'a> {
+    pub job: &'a str,
+    pub expr: &'a str,
+    pub scheduled_for: DateTime<Utc>,
+    pub caught_up: bool,
+}
+
+/// what a launch has to claim before it is allowed to exist.
+///
+/// [`Store::create_run_keyed`] takes the claim in the same transaction as the
+/// run row, so a claim that loses launches nothing at all: no run, no key, no
+/// tick. the variants are exclusive because the decisions are: a sensor request
+/// carries a run key and no occurrence, a cron fire carries an occurrence and
+/// no run key, and everything else carries neither.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) enum Claimed<'a> {
+    /// a manual launch, an api launch, a resume, a replay: nothing to be the
+    /// second of, so nothing to claim.
+    #[default]
+    Nothing,
+    /// a [sensor request with a run key](RunKey).
+    Key(RunKey<'a>),
+    /// a [cron occurrence](Fire).
+    Fire(Fire<'a>),
 }
 
 /// every column [`event_from_row`] reads, in the order it reads them.
@@ -1514,11 +1622,12 @@ impl Store {
     /// form.
     #[cfg(test)]
     pub(crate) fn create_run(&self, run: &Run, ops: &[String]) -> Result<(), Error> {
-        self.create_run_keyed(run, ops, None, None).map(|_| ())
+        self.create_run_keyed(run, ops, Claimed::Nothing, None)
+            .map(|_| ())
     }
 
-    /// [`create_run`](Self::create_run) with the [run key](RunKey) this run
-    /// claims, inserted in the same transaction as the run row.
+    /// [`create_run`](Self::create_run) with whatever this run
+    /// [claims](Claimed), taken in the same transaction as the run row.
     ///
     /// same transaction rather than insert-then-delete-on-failure, because the
     /// two failure modes are not equally bad: a duplicate launch is a request
@@ -1528,8 +1637,11 @@ impl Store {
     /// still leaves the window where the process dies between the insert and
     /// the launch.
     ///
-    /// returns false when the key was already claimed: nothing is written, and
-    /// the caller launches nothing.
+    /// returns false when the claim was already taken: nothing is written, and
+    /// the caller launches nothing. for a [fire](Fire) that is another process
+    /// having already fired this occurrence, and it is a refusal rather than an
+    /// error: the occurrence *was* fired, once, and the caller is being told it
+    /// was not the one that fired it.
     ///
     /// `plan` is what this run will execute when something claims it; see the
     /// `runs.plan` note on the v14 migration. `None` means the whole job.
@@ -1537,25 +1649,35 @@ impl Store {
         &self,
         run: &Run,
         ops: &[String],
-        key: Option<RunKey<'_>>,
+        claimed: Claimed<'_>,
         plan: Option<&Value>,
     ) -> Result<bool, Error> {
+        let at = Utc::now();
         let mut conn = self.conn();
         let (insert, ignore) = conn.dialect().insert_or_ignore();
         let mut tx = conn.begin()?;
-        if let Some(k) = key {
-            let claimed = tx.execute(
-                &format!(
-                    "{insert} sensor_run_keys (sensor, run_key, run_id, launched_at)
-                     VALUES (?1, ?2, ?3, ?4) {ignore}"
-                ),
-                args![k.sensor, k.key, &run.id, Utc::now().to_rfc3339()],
-            )?;
-            // dropping the transaction rolls it back, so losing the claim
-            // leaves neither a run nor a key behind
-            if claimed == 0 {
-                return Ok(false);
+        match claimed {
+            Claimed::Nothing => {}
+            Claimed::Key(k) => {
+                let claimed = tx.execute(
+                    &format!(
+                        "{insert} sensor_run_keys (sensor, run_key, run_id, launched_at)
+                         VALUES (?1, ?2, ?3, ?4) {ignore}"
+                    ),
+                    args![k.sensor, k.key, &run.id, at.to_rfc3339()],
+                )?;
+                // dropping the transaction rolls it back, so losing the claim
+                // leaves neither a run nor a key behind
+                if claimed == 0 {
+                    return Ok(false);
+                }
             }
+            // written after the run below rather than here, so a single
+            // scheduler's event log reads in exactly the order it always did:
+            // the run queued, then the schedule fired. inside one transaction
+            // the order is only ever about that, since a refused fire rolls
+            // the whole thing back either way
+            Claimed::Fire(_) => {}
         }
         tx.execute(
             r#"INSERT INTO runs (id, job, status, "trigger", params, created_at, started_at,
@@ -1600,6 +1722,13 @@ impl Store {
                 })),
             Utc::now(),
         )?;
+        // and the tick last: the fire and the run land together or neither
+        // does, and a fired tick can never name a run that was never created
+        if let Claimed::Fire(fire) = claimed
+            && !write_tick(&mut tx, fire, TickOutcome::Fired, Some(&run.id), None, at)?
+        {
+            return Ok(false);
+        }
         tx.commit()?;
         Ok(true)
     }
@@ -3019,11 +3148,11 @@ impl Store {
     /// like an ordinary one except for the gap between `scheduled_for` and
     /// `fired_at`, and only the caller knows which it made.
     ///
-    /// **the run is not in this transaction.** a fired tick's run was created
-    /// by a launch that committed first, so a crash in between leaves a run
-    /// with no tick and no event: the run is still there, still queued, and
-    /// still executes. the other direction, a tick claiming a run that was
-    /// never created, is the one that cannot happen.
+    /// **this is the runless half of the tick log**: deferred, skipped and
+    /// error, the outcomes that launch nothing. a *fire* is written by
+    /// [`create_run_keyed`](Self::create_run_keyed), in the same transaction as
+    /// the run it launched, which is what makes a fired tick and its run
+    /// impossible to disagree about.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn record_tick(
         &self,
@@ -3038,44 +3167,13 @@ impl Store {
         let at = Utc::now();
         let mut conn = self.conn();
         let mut tx = conn.begin()?;
-        tx.execute(
-            "INSERT INTO schedule_ticks (job, expr, scheduled_for, fired_at, outcome, run_id, error)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            args![
-                job,
-                expr,
-                scheduled_for.to_rfc3339(),
-                at.to_rfc3339(),
-                outcome.as_str(),
-                run_id,
-                error
-            ],
-        )?;
-        let (kind, level) = match (outcome, caught_up) {
-            (TickOutcome::Fired, false) => (EventKind::ScheduleFired, EventLevel::Info),
-            (TickOutcome::Fired, true) => (EventKind::ScheduleCaughtUp, EventLevel::Info),
-            (TickOutcome::Skipped, _) => (EventKind::ScheduleSkipped, EventLevel::Info),
-            (TickOutcome::Deferred, _) => (EventKind::ScheduleDeferred, EventLevel::Info),
-            (TickOutcome::Error, _) => (EventKind::ScheduleError, EventLevel::Error),
+        let fire = Fire {
+            job,
+            expr,
+            scheduled_for,
+            caught_up,
         };
-        let message = match error {
-            Some(why) => format!("{expr}: {} ({why})", outcome.as_str()),
-            None => format!("{expr}: {}", outcome.as_str()),
-        };
-        write_event(
-            &mut tx,
-            &NewEvent::about(SubjectKind::Schedule, job, kind, message)
-                .level(level)
-                .data(json!({
-                    "job": job,
-                    "expr": expr,
-                    "scheduled_for": scheduled_for,
-                    "outcome": outcome,
-                    "run_id": run_id,
-                    "error": error,
-                })),
-            at,
-        )?;
+        write_tick(&mut tx, fire, outcome, run_id, error, at)?;
         tx.commit()?;
         Ok(())
     }
@@ -4803,6 +4901,86 @@ fn write_event(tx: &mut impl Exec, ev: &NewEvent<'_>, at: DateTime<Utc>) -> Resu
     Ok(())
 }
 
+/// one occurrence and what the scheduler did about it, plus the
+/// [event](EventKind::ScheduleFired) that says the same thing on the activity
+/// feed, in whatever transaction the caller is already in.
+///
+/// returns whether the tick landed. **false is only ever a refused fire**:
+/// [`SCHEMA_V20`] holds one `fired` tick per occurrence and the insert yields
+/// to whatever is already there, so a second process firing the same occurrence
+/// writes nothing and is told so. no other outcome is constrained, so no other
+/// outcome can come back false.
+///
+/// the caller decides what a refusal means. [`Store::create_run_keyed`] rolls
+/// the whole transaction back, which is what makes "the tick and the run land
+/// together or neither does" true rather than hopeful.
+fn write_tick(
+    tx: &mut impl Exec,
+    fire: Fire<'_>,
+    outcome: TickOutcome,
+    run_id: Option<&str>,
+    error: Option<&str>,
+    at: DateTime<Utc>,
+) -> Result<bool, Error> {
+    let Fire {
+        job,
+        expr,
+        scheduled_for,
+        caught_up,
+    } = fire;
+    // the yield-to-what-is-there form for a fire and a plain insert for
+    // everything else, so that an ignored insert can only ever mean the one
+    // conflict this index exists to cause
+    let (insert, ignore) = match outcome {
+        TickOutcome::Fired => tx.dialect().insert_or_ignore(),
+        _ => ("INSERT INTO", ""),
+    };
+    let landed = tx.execute(
+        &format!(
+            "{insert} schedule_ticks (job, expr, scheduled_for, fired_at, outcome, run_id, error)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) {ignore}"
+        ),
+        args![
+            job,
+            expr,
+            scheduled_for.to_rfc3339(),
+            at.to_rfc3339(),
+            outcome.as_str(),
+            run_id,
+            error
+        ],
+    )?;
+    if landed == 0 {
+        return Ok(false);
+    }
+    let (kind, level) = match (outcome, caught_up) {
+        (TickOutcome::Fired, false) => (EventKind::ScheduleFired, EventLevel::Info),
+        (TickOutcome::Fired, true) => (EventKind::ScheduleCaughtUp, EventLevel::Info),
+        (TickOutcome::Skipped, _) => (EventKind::ScheduleSkipped, EventLevel::Info),
+        (TickOutcome::Deferred, _) => (EventKind::ScheduleDeferred, EventLevel::Info),
+        (TickOutcome::Error, _) => (EventKind::ScheduleError, EventLevel::Error),
+    };
+    let message = match error {
+        Some(why) => format!("{expr}: {} ({why})", outcome.as_str()),
+        None => format!("{expr}: {}", outcome.as_str()),
+    };
+    write_event(
+        tx,
+        &NewEvent::about(SubjectKind::Schedule, job, kind, message)
+            .level(level)
+            .data(json!({
+                "job": job,
+                "expr": expr,
+                "scheduled_for": scheduled_for,
+                "outcome": outcome,
+                "run_id": run_id,
+                "error": error,
+            })),
+        at,
+    )?;
+    Ok(true)
+}
+
 /// one asset build on its way into the history, everything about it that only
 /// the op body could know.
 ///
@@ -5389,12 +5567,14 @@ mod tests {
 
             // the same tick outcome, for an occurrence downtime swallowed: a
             // different kind, because "it fired" and "it caught up" are the two
-            // things anybody asks a schedule after a restart
+            // things anybody asks a schedule after a restart. a different
+            // occurrence, because one occurrence holds one fire and this is the
+            // hour before the one above
             store
                 .record_tick(
                     "etl",
                     "0 * * * *",
-                    due,
+                    due - chrono::Duration::hours(1),
                     TickOutcome::Fired,
                     true,
                     Some("r1"),
@@ -6691,14 +6871,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("future.db");
         let path = path.to_str().unwrap();
-        phase1_db(path, 20);
+        phase1_db(path, 21);
         let err = Store::open(path).err().unwrap();
-        assert_eq!(err.to_string(), "db schema v20 is newer than this build");
+        assert_eq!(err.to_string(), "db schema v21 is newer than this build");
         let conn = Connection::open(path).unwrap();
         let version: u32 = conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 20);
+        assert_eq!(version, 21);
     }
 
     #[test]
@@ -6867,6 +7047,7 @@ mod tests {
                          ALTER TABLE runs DROP COLUMN actor;
                          ALTER TABLE events DROP COLUMN actor;
                          ALTER TABLE runs DROP COLUMN replay_of;
+                         DROP INDEX schedule_ticks_fire;
                          UPDATE schema_version SET version = 16;"
                     ))
                     .unwrap();
@@ -6964,6 +7145,7 @@ mod tests {
                         "ALTER TABLE runs DROP COLUMN actor;
                          ALTER TABLE events DROP COLUMN actor;
                          ALTER TABLE runs DROP COLUMN replay_of;
+                         DROP INDEX schedule_ticks_fire;
                          UPDATE schema_version SET version = 17;",
                     )
                     .unwrap();
@@ -7057,6 +7239,7 @@ mod tests {
                     .conn()
                     .batch(
                         "ALTER TABLE runs DROP COLUMN replay_of;
+                         DROP INDEX schedule_ticks_fire;
                          UPDATE schema_version SET version = 18;",
                     )
                     .unwrap();
@@ -7095,6 +7278,299 @@ mod tests {
                 store.run("r9").unwrap().unwrap().replay_of.as_deref(),
                 Some("r1")
             );
+        });
+    }
+
+    /// a database at v19 with `dupes` copies of one occurrence's fire already
+    /// in it: what a deployment that has been running two schedulers looks
+    /// like on the morning it upgrades.
+    ///
+    /// the two backends get there differently, for the reason [`at_v17`]
+    /// gives, and the duplicates go in by hand either way: no build of hestan
+    /// from v20 on can write them, which is the point.
+    fn at_v19(db: &Backend, dupes: usize) {
+        // three occurrences: one fired `dupes` times, one fired once, and one
+        // that four processes deferred and one of them then fired, so the
+        // collapse has something it must not touch beside what it must
+        let mut ticks = String::new();
+        for i in 0..dupes {
+            ticks.push_str(&format!(
+                "INSERT INTO schedule_ticks
+                     (job, expr, scheduled_for, fired_at, outcome, run_id)
+                 VALUES ('etl', '0 * * * *', '2026-01-01T00:00:00+00:00',
+                         '2026-01-01T00:00:0{i}+00:00', 'fired', 'dup{i}');"
+            ));
+        }
+        ticks.push_str(
+            "INSERT INTO schedule_ticks
+                 (job, expr, scheduled_for, fired_at, outcome, run_id)
+             VALUES ('etl', '0 * * * *', '2026-01-01T01:00:00+00:00',
+                     '2026-01-01T01:00:00+00:00', 'fired', 'solo');
+             INSERT INTO schedule_ticks
+                 (job, expr, scheduled_for, fired_at, outcome)
+             VALUES ('etl', '0 * * * *', '2026-01-01T02:00:00+00:00',
+                     '2026-01-01T02:00:00+00:00', 'deferred'),
+                    ('etl', '0 * * * *', '2026-01-01T02:00:00+00:00',
+                     '2026-01-01T02:00:01+00:00', 'deferred'),
+                    ('etl', '0 * * * *', '2026-01-01T02:00:00+00:00',
+                     '2026-01-01T02:00:02+00:00', 'skipped');
+             INSERT INTO schedule_ticks
+                 (job, expr, scheduled_for, fired_at, outcome, run_id)
+             VALUES ('etl', '0 * * * *', '2026-01-01T02:00:00+00:00',
+                     '2026-01-01T02:00:03+00:00', 'fired', 'drained');",
+        );
+        match db {
+            Backend::Sqlite(dir) => {
+                let conn = Connection::open(dir.path().join("hestan.db")).unwrap();
+                for batch in [
+                    PHASE1_SCHEMA,
+                    SCHEMA_V2,
+                    SCHEMA_V3,
+                    SCHEMA_V4,
+                    SCHEMA_V5,
+                    SCHEMA_V6,
+                    SCHEMA_V7,
+                    SCHEMA_V8,
+                    SCHEMA_V9,
+                    SCHEMA_V10,
+                    SCHEMA_V11,
+                    SCHEMA_V12,
+                    SCHEMA_V13,
+                    SCHEMA_V14,
+                    SCHEMA_V15,
+                    SCHEMA_V16,
+                    SCHEMA_V17,
+                    SCHEMA_V18,
+                    SCHEMA_V19,
+                    &ticks,
+                ] {
+                    conn.execute_batch(batch).unwrap();
+                }
+                conn.pragma_update(None, "user_version", 19).unwrap();
+            }
+            #[cfg(feature = "postgres")]
+            Backend::Postgres(pg) => {
+                pg.store()
+                    .conn()
+                    .batch(&format!(
+                        "DROP INDEX schedule_ticks_fire;
+                         {ticks}
+                         UPDATE schema_version SET version = 19;"
+                    ))
+                    .unwrap();
+            }
+        }
+    }
+
+    // the migration's hazard, on a store that has the damage in it already:
+    // `CREATE UNIQUE INDEX` over duplicate fires fails outright, so the
+    // duplicates have to go first, and which one survives has to be the one
+    // that fired first
+    #[test]
+    fn a_v19_db_holding_duplicate_fires_collapses_them_to_the_earliest() {
+        both(|db| {
+            at_v19(db, 4);
+            // and it says so where somebody upgrading will see it, with the
+            // count and with what the count does not mean
+            let said = Said::default();
+            let store = tracing::subscriber::with_default(said.subscriber(), || db.store());
+            let said = said.text();
+            assert!(
+                said.contains("3 duplicate schedule fires collapsed"),
+                "the migration did not report the count: {said}"
+            );
+            assert!(
+                said.contains("deleting a tick does not unlaunch one"),
+                "the migration reported the count as if it were a fix: {said}"
+            );
+
+            let ticks = store.ticks(Some("etl"), 50).unwrap();
+            let fired: Vec<&Tick> = ticks
+                .iter()
+                .filter(|t| t.outcome == TickOutcome::Fired)
+                .collect();
+            assert_eq!(fired.len(), 3, "one fire per occurrence, and no more");
+            let first = fired
+                .iter()
+                .find(|t| t.scheduled_for == at_utc("2026-01-01T00:00:00+00:00"))
+                .expect("the collapsed occurrence kept a fire");
+            assert_eq!(
+                first.run_id.as_deref(),
+                Some("dup0"),
+                "the surviving fire is not the earliest one"
+            );
+
+            // and the queue the tick log also is came through untouched: three
+            // non-fire ticks for the deferred occurrence, still all there
+            let queued: Vec<&Tick> = ticks
+                .iter()
+                .filter(|t| t.scheduled_for == at_utc("2026-01-01T02:00:00+00:00"))
+                .collect();
+            assert_eq!(queued.len(), 4, "the collapse ate a deferred tick");
+
+            // from here the store is what refuses the second fire, whoever
+            // asks it
+            assert!(!fires_again(&store, "2026-01-01T00:00:00+00:00"));
+            assert!(fires_again(&store, "2026-01-01T03:00:00+00:00"));
+        });
+    }
+
+    /// whatever was traced while it was installed, as text.
+    ///
+    /// the migration's report is a `warn!` and nothing else: it happens inside
+    /// `Store::open`, before there is a store to write an event to and before
+    /// any caller has a handle to ask. so the assertion has to be made on the
+    /// same thing an operator would be reading.
+    #[derive(Clone, Default)]
+    struct Said(Arc<Mutex<Vec<u8>>>);
+
+    impl Said {
+        fn subscriber(&self) -> impl tracing::Subscriber {
+            tracing_subscriber::fmt()
+                .with_writer(self.clone())
+                .without_time()
+                .with_ansi(false)
+                .finish()
+        }
+
+        fn text(&self) -> String {
+            String::from_utf8(self.0.lock().unwrap().clone()).unwrap()
+        }
+    }
+
+    impl std::io::Write for Said {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Said {
+        type Writer = Said;
+
+        fn make_writer(&'a self) -> Said {
+            self.clone()
+        }
+    }
+
+    /// whether the store will take a fire for `due` on the fixture's schedule:
+    /// true when the run and its tick landed, false when the index refused
+    /// them.
+    fn fires_again(store: &Store, due: &str) -> bool {
+        let at = at_utc(due);
+        let id = format!("run-{due}");
+        store
+            .create_run_keyed(
+                &mk_run(&id, "etl", Utc::now()),
+                &["a".into()],
+                Claimed::Fire(Fire {
+                    job: "etl",
+                    expr: "0 * * * *",
+                    scheduled_for: at,
+                    caught_up: false,
+                }),
+                None,
+            )
+            .unwrap()
+    }
+
+    fn at_utc(s: &str) -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339(s).unwrap().with_timezone(&Utc)
+    }
+
+    // a fire is now one transaction where it used to be two, and the one thing
+    // a reader would notice is the order the two events land in. it is the
+    // order they always landed in
+    #[test]
+    fn a_fire_and_its_run_land_in_one_transaction_in_the_order_they_always_did() {
+        both(|db| {
+            let store = db.store();
+            let at = at_utc("2026-06-01T08:00:00+00:00");
+            let fire = |id: &str| {
+                store
+                    .create_run_keyed(
+                        &mk_run(id, "etl", Utc::now()),
+                        &["a".into()],
+                        Claimed::Fire(Fire {
+                            job: "etl",
+                            expr: "0 * * * *",
+                            scheduled_for: at,
+                            caught_up: false,
+                        }),
+                        None,
+                    )
+                    .unwrap()
+            };
+            assert!(fire("r1"));
+
+            let log = store.event_log(&EventQuery::default(), 10).unwrap();
+            let kinds: Vec<EventKind> = log.iter().rev().map(|e| e.kind.clone()).collect();
+            assert_eq!(kinds, [EventKind::RunQueued, EventKind::ScheduleFired]);
+
+            // and a refused one leaves neither, which is the half that is new
+            assert!(!fire("r2"));
+            assert_eq!(
+                store.event_log(&EventQuery::default(), 10).unwrap().len(),
+                2
+            );
+            assert!(store.run("r2").unwrap().is_none());
+        });
+    }
+
+    // the other half of the backstop, and the half that matters at 3am: two
+    // handles on one database, both firing the same occurrence, one run
+    #[test]
+    fn two_processes_firing_one_occurrence_produce_one_tick_and_one_run() {
+        both(|db| {
+            let alpha = db.store();
+            let beta = db.store();
+            let at = at_utc("2026-03-01T09:00:00+00:00");
+            let fire = |store: &Store, id: &str| {
+                store
+                    .create_run_keyed(
+                        &mk_run(id, "etl", Utc::now()),
+                        &["a".into()],
+                        Claimed::Fire(Fire {
+                            job: "etl",
+                            expr: "0 * * * *",
+                            scheduled_for: at,
+                            caught_up: false,
+                        }),
+                        None,
+                    )
+                    .unwrap()
+            };
+
+            assert!(fire(&alpha, "won"));
+            // a refusal, not an error: the loser is told the occurrence is
+            // spoken for, in a value it can act on rather than a database
+            // message it would have to parse
+            assert!(!fire(&beta, "lost"));
+
+            assert!(alpha.run("won").unwrap().is_some());
+            assert!(
+                beta.run("lost").unwrap().is_none(),
+                "the loser left a run behind"
+            );
+            assert!(beta.op_runs("lost").unwrap().is_empty());
+            let fired: Vec<Tick> = alpha
+                .ticks(Some("etl"), 50)
+                .unwrap()
+                .into_iter()
+                .filter(|t| t.outcome == TickOutcome::Fired)
+                .collect();
+            assert_eq!(fired.len(), 1);
+            assert_eq!(fired[0].run_id.as_deref(), Some("won"));
+            // and one event, because the tick and the event are one write
+            let q = EventQuery {
+                kind: Some(EventKind::ScheduleFired),
+                ..EventQuery::default()
+            };
+            assert_eq!(alpha.event_log(&q, 10).unwrap().len(), 1);
         });
     }
 
@@ -7430,7 +7906,7 @@ mod tests {
                 .create_run_keyed(
                     &mk_run("r1", "etl", Utc::now()),
                     &["load".into()],
-                    None,
+                    Claimed::Nothing,
                     Some(&plan),
                 )
                 .unwrap();
@@ -7457,7 +7933,7 @@ mod tests {
                     .create_run_keyed(
                         &mk_run("r1", "etl", Utc::now()),
                         &["a".into()],
-                        Some(key),
+                        Claimed::Key(key),
                         None
                     )
                     .unwrap()
@@ -7472,7 +7948,7 @@ mod tests {
                     .create_run_keyed(
                         &mk_run("r2", "etl", Utc::now()),
                         &["a".into()],
-                        Some(key),
+                        Claimed::Key(key),
                         None
                     )
                     .unwrap()
@@ -9314,20 +9790,20 @@ mod tests {
         let store = pg.store();
         store
             .conn()
-            .execute("UPDATE schema_version SET version = ?1", args![20_i64])
+            .execute("UPDATE schema_version SET version = ?1", args![21_i64])
             .unwrap();
         drop(store);
 
         let err = Store::connect(&pg.url).err().unwrap();
-        assert_eq!(err.to_string(), "db schema v20 is newer than this build");
+        assert_eq!(err.to_string(), "db schema v21 is newer than this build");
 
-        // and it is still v20: a build that cannot read a database must not
+        // and it is still v21: a build that cannot read a database must not
         // rewrite it either
         let version = crate::pg::unmigrated(&pg.url)
             .unwrap()
             .query("SELECT version FROM schema_version", args![], |r| r.int(0))
             .unwrap();
-        assert_eq!(version, [20]);
+        assert_eq!(version, [21]);
     }
 
     // ------------------------------------------- what a write is worth losing
