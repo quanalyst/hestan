@@ -10,6 +10,7 @@ use tokio::sync::{Notify, Semaphore, watch};
 use tokio::task::{Id, JoinSet};
 use tracing::Instrument;
 
+use crate::decider::Deciding;
 use crate::error::Error;
 use crate::graph;
 use crate::hooks::{FailureHook, Hooks, OpEvent, OpHook, RunEvent, RunHook, fire_hooks};
@@ -480,6 +481,10 @@ pub struct Runner {
     durable: bool,
     // what this process does about the queue at all
     role: Role,
+    // whether this process may decide right now, and under which term. a
+    // process that runs no election says yes to everything, which is what
+    // every one-shot and every directly built runner is
+    deciding: Deciding,
     // how many runs this process will execute at once, whatever the queue holds
     slots: usize,
     // the most op runs one run may expand its fan-outs into, across every
@@ -560,6 +565,7 @@ impl Runner {
             reclaim: Reclaim::default(),
             durable: false,
             role: Role::default(),
+            deciding: Deciding::sole(),
             slots: usize::MAX,
             max_instances: DEFAULT_MAX_INSTANCES,
             dispatching: Arc::new(Mutex::new(())),
@@ -655,6 +661,29 @@ impl Runner {
     /// what this process does about the queue.
     pub fn role(&self) -> Role {
         self.role
+    }
+
+    /// this process's [election](crate::decider), for the loops that ask it
+    /// whether they may decide and for the handle that reports it.
+    ///
+    /// a runner built anywhere but `Hestan::serve` runs no election: it decides
+    /// whenever it is asked to, exactly as it always has.
+    pub(crate) fn deciding(&self) -> &Deciding {
+        &self.deciding
+    }
+
+    /// the same runner, deciding only while it holds `deciding`.
+    pub(crate) fn with_deciding(self, deciding: Deciding) -> Runner {
+        Runner { deciding, ..self }
+    }
+
+    /// whether a deciding loop in this process may act, now.
+    ///
+    /// **an atomic read, never a query.** a loop asks this on every pass, and a
+    /// pass that spent a round trip to find out whether it was allowed to look
+    /// would cost more than the looking.
+    pub(crate) fn may_decide(&self) -> bool {
+        self.deciding.leading()
     }
 
     /// what happens to a run this deployment loses track of.

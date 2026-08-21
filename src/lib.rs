@@ -78,6 +78,7 @@ mod asset;
 pub mod auth;
 mod backfill;
 mod backoff;
+mod decider;
 // the tracing layer a host composes into its own subscriber. optional because
 // hestan installs no subscriber and will not make anyone depend on one. public
 // so that what it deliberately does not capture is written somewhere a reader
@@ -161,11 +162,11 @@ pub use io::{FileIo, Inline, IoDropped, IoKey, IoManager, IoResult};
 pub use job::{Graph, GraphBuilder, Job, JobBuilder};
 pub use model::EVENT_SCHEMA;
 pub use model::{
-    AssetCheckRow, Backfill, BackfillStatus, Catchup, CheckStatus, DeliveryState, Event, EventKind,
-    EventLevel, Freshness, FreshnessRow, HistoryEntry, LogStream, Materialization, MetaPoint,
-    Notification, OpLog, OpRun, OpStatus, Overlap, Preset, Reclaim, Role, Run, RunStatus, RunTags,
-    ScheduleRow, SensorOutcome, SensorRow, SensorTick, Severity, SubjectKind, Tick, TickOutcome,
-    Trigger, When,
+    AssetCheckRow, Backfill, BackfillStatus, Catchup, CheckStatus, Decider, DeliveryState, Event,
+    EventKind, EventLevel, Freshness, FreshnessRow, HistoryEntry, LogStream, Materialization,
+    MetaPoint, Notification, OpLog, OpRun, OpStatus, Overlap, Preset, Reclaim, Role, Run,
+    RunStatus, RunTags, ScheduleRow, SensorOutcome, SensorRow, SensorTick, Severity, SubjectKind,
+    Tick, TickOutcome, Trigger, When,
 };
 pub use op::{InputError, META_TABLE_ROWS, Meta, MetaColumn, MetaTable, Op, OpCtx, OpResult};
 pub use partition::{PartitionMapping, Partitions};

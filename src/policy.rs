@@ -596,6 +596,9 @@ pub(crate) async fn run_policies(runner: Runner, registry: Arc<AssetRegistry>) {
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         ticker.tick().await;
+        // "is a build already in flight" is a read followed by a write, and
+        // two processes can both pass it. only the decider asks
+        runner.deciding().wait().await;
         if let Err(e) = tick(&runner, &registry, Utc::now()) {
             tracing::warn!("policy pass failed: {e}");
         }

@@ -637,6 +637,11 @@ pub(crate) async fn run_sensors(
     let entries: Vec<Arc<SensorEntry>> = entries.into_iter().map(Arc::new).collect();
     let limit = Arc::new(Semaphore::new(MAX_CONCURRENT_EVALS));
     loop {
+        // a process that is not the decider evaluates nothing: no tick, no
+        // cursor write, no launch. the sensors' own timers go on running, so
+        // one that comes due while this process waits is due the moment it
+        // takes the lease
+        runner.deciding().wait().await;
         let (i, at) = entries
             .iter()
             .enumerate()
@@ -644,6 +649,10 @@ pub(crate) async fn run_sensors(
             .min_by_key(|(_, t)| *t)
             .expect("entries is non-empty");
         tokio::time::sleep_until(at).await;
+        // and again after the sleep, for the reason the scheduler asks twice
+        if !runner.may_decide() {
+            continue;
+        }
         let entry = entries[i].clone();
         // an evaluation that finished while the loop slept may have moved this
         // one out from under it

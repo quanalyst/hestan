@@ -112,7 +112,7 @@ on both.
 
 ## Schema
 
-sixteen tables. `trigger` is a reserved word in sqlite, hence the quoted
+seventeen tables. `trigger` is a reserved word in sqlite, hence the quoted
 column name in the schema and every statement that touches it.
 
 ```sql
@@ -306,6 +306,14 @@ CREATE TABLE notifications (            -- added in v16
 CREATE INDEX notifications_due ON notifications(next_attempt_at)
     WHERE delivered_at IS NULL;
 CREATE INDEX notifications_delivered ON notifications(delivered_at);
+
+CREATE TABLE decider (                  -- added in v21
+    only_row INTEGER PRIMARY KEY CHECK (only_row = 1),
+    term INTEGER NOT NULL DEFAULT 0,    -- +1 on every acquisition, never on a renewal
+    claimed_by TEXT,                    -- the instance id holding it
+    claimed_at TEXT,
+    lease_until TEXT
+);
 ```
 
 `notifications` is empty unless
@@ -442,7 +450,9 @@ meant; version 19 adds `runs.replay_of`, the run a
 because a resume continues a run and a replay re-runs one; version 20 adds the
 `schedule_ticks_fire` unique index, which is
 [one fire per occurrence](#one-fire-per-occurrence) and is the only unique
-constraint in this schema that was not already a primary key.
+constraint in this schema that was not already a primary key; version 21 adds
+the `decider` table, one row holding the
+[deciding lease](scaling.md#the-deciding-lease) and the term it is on.
 
 an older file at any version opens straight into the current one, rows
 intact: the v8 rebuild copies every keyed materialization across, where it becomes

@@ -412,6 +412,11 @@ pub(crate) async fn run_scheduler(mut entries: Vec<ScheduleEntry>, runner: Runne
         return;
     }
     loop {
+        // nothing below this line happens on a process that is not the
+        // decider: no cursor moves, no tick is written and no run is launched.
+        // it waits rather than polls, so a handover starts the next pass at
+        // the instant the lease is taken
+        runner.deciding().wait().await;
         let now = Utc::now();
         // fail closed: a pass that cannot read the paused flag fires nothing
         // and moves no cursor, rather than treating unknown as unpaused
@@ -469,6 +474,12 @@ pub(crate) async fn run_scheduler(mut entries: Vec<ScheduleEntry>, runner: Runne
             if !fires.iter().any(|(t, ..)| *t <= now) {
                 continue;
             }
+        }
+        // asked again after the sleep, because a lease can lapse inside one:
+        // the fires below are the writes, and a pass that decided it was the
+        // decider a minute ago is not evidence about now
+        if !runner.may_decide() {
+            continue;
         }
         let now = Utc::now();
         // same again for the fires this pass is about to make: an occurrence

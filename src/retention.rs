@@ -133,11 +133,13 @@ impl Cutoffs {
 /// one pass: the tick logs down to their caps, then whatever each job's policy
 /// says it may no longer keep.
 ///
-/// **role-gated.** pruning is a decision like firing a schedule is, and a
-/// worker that took it would be deleting the history of runs it did not own:
-/// several processes share one database, and only one of them decides.
+/// **role-gated, and lease-gated.** pruning is a decision like firing a
+/// schedule is, and a worker that took it would be deleting the history of runs
+/// it did not own: several processes share one database, and only one of them
+/// decides. the role says whether this process is that kind of process and the
+/// [lease](crate::decider) says whether it is that process today.
 pub(crate) fn sweep(runner: &Runner, policy: &Retention, now: DateTime<Utc>) {
-    if !runner.role().decides() {
+    if !runner.role().decides() || !runner.may_decide() {
         return;
     }
     let store = runner.store();
@@ -259,6 +261,10 @@ pub(crate) async fn run_sweeper(runner: Runner, policy: Retention, every: Durati
     ticker.tick().await;
     loop {
         ticker.tick().await;
+        // the sweep itself checks the lease too, because the one at boot goes
+        // through `sweep` and not through here. this is what stops a process
+        // that is not the decider waking up every hour to be told so
+        runner.deciding().wait().await;
         // off the runtime, for the reason every io manager call is: a sweep
         // is store writes and now file deletes, and the ops of this process's
         // runs should not be queued behind either

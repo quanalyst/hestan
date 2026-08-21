@@ -1084,7 +1084,7 @@ async fn launch(reach: Reach, args: RunArgs, out: &Out) -> Result<(), Fail> {
             let id = runner
                 .launch_prioritized(&args.job, params, Trigger::Manual, tags, args.priority)
                 .map_err(Fail::from)?;
-            (id, Watched::Here(runner))
+            (id, Watched::Here(Box::new(runner)))
         }
     };
     if !args.wait {
@@ -1120,7 +1120,7 @@ async fn build(reach: Reach, args: BuildArgs, out: &Out) -> Result<(), Fail> {
                 Some(id) => json!({ "run_id": id }),
                 None => json!({ "up_to_date": true }),
             };
-            (answer, Watched::Here(built.runner))
+            (answer, Watched::Here(Box::new(built.runner)))
         }
     };
     if answer["up_to_date"] == json!(true) {
@@ -1168,7 +1168,10 @@ async fn settle(
 /// wait is the same either way and this is the whole of the difference: where
 /// the rows come from, and whether there is a dispatcher here to poke.
 enum Watched {
-    Here(Runner),
+    /// boxed because a `Runner` is a great deal of handle and an [`Api`] is a
+    /// url: an enum sized for the larger of the two is what every `Watched`
+    /// on the stack would cost.
+    Here(Box<Runner>),
     There(Api),
 }
 
@@ -1376,7 +1379,7 @@ async fn logs(reach: Reach, args: LogsArgs, out: &Out) -> Result<(), Fail> {
             // a runner over no jobs at all, because a log tail only ever
             // reads: `Watched` is the two places a row can come from, and this
             // is the local one
-            Watched::Here(Runner::new([], store)?)
+            Watched::Here(Box::new(Runner::new([], store)?))
         }
     };
     if !args.follow {

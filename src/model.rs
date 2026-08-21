@@ -732,6 +732,37 @@ pub enum Role {
 }
 str_enum!(Role { All => "all", Scheduler => "scheduler", Worker => "worker" });
 
+/// who holds the deciding lease in this deployment, as the store has it.
+///
+/// one row shared by every process, so this is the same answer whichever
+/// process is asked, which is the point: a process that has stopped deciding
+/// and does not know it would give a different one about itself.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct Decider {
+    /// the instance id holding it, as it appears on a run row's `claimed_by`
+    /// and on `GET /api/health`. `None` when nothing holds it: a deployment
+    /// with no deciding process running, or the moment between one letting go
+    /// and the next taking it.
+    pub holder: Option<String>,
+    /// how many times the lease has been acquired since this database was
+    /// made. a decision names the term it was made under, and a term that has
+    /// moved on is a decision the store refuses.
+    pub term: u64,
+    /// when the current holder took it. `None` when nothing holds it.
+    pub claimed_at: Option<DateTime<Utc>>,
+    /// when the current holder's lease runs out unless it renews. past this
+    /// instant anybody may take it, and the holder may not decide under its
+    /// term any more.
+    pub lease_until: Option<DateTime<Utc>>,
+}
+
+impl Decider {
+    /// whether `who` holds it, with a lease that has not run out at `now`.
+    pub fn held_by(&self, who: &str, now: DateTime<Utc>) -> bool {
+        self.holder.as_deref() == Some(who) && self.lease_until.is_some_and(|until| until >= now)
+    }
+}
+
 impl Role {
     /// whether this process claims runs off the queue and executes them.
     pub fn executes(&self) -> bool {

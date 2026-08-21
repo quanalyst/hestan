@@ -201,6 +201,11 @@ pub(crate) async fn run_backfills(runner: Runner, registry: Arc<AssetRegistry>) 
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         ticker.tick().await;
+        // a chunk is a decision: two processes sending the next one is two
+        // runs over the same partitions, writing each other's lineage. waited
+        // on rather than polled, so a process that takes the lease sends the
+        // next chunk at once rather than on its next tick
+        runner.deciding().wait().await;
         if let Err(e) = tick(&runner, &registry) {
             tracing::warn!("backfill tick failed: {e}");
         }

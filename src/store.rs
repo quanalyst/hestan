@@ -13,7 +13,7 @@ use crate::error::Error;
 use crate::executor::{Blocked, InFlight, Limits, QUEUE_SCAN, Queued};
 use crate::logs::{Attempt, Source};
 use crate::model::{
-    AssetCheckRow, Backfill, BackfillStatus, CheckStatus, DeliveryState, Event, EventKind,
+    AssetCheckRow, Backfill, BackfillStatus, CheckStatus, Decider, DeliveryState, Event, EventKind,
     EventLevel, FreshnessRow, HistoryEntry, Materialization, MetaPoint, Notification, OpLog, OpRun,
     OpStatus, Preset, Reclaim, Run, RunCursor, RunStatus, RunTags, ScheduleRow, SensorOutcome,
     SensorRow, SensorTick, Severity, SubjectKind, Tick, TickOutcome,
@@ -495,7 +495,31 @@ pub(crate) fn report_collapsed(n: usize) {
     );
 }
 
-pub(crate) const SCHEMA_VERSION: u32 = 20;
+/// the one lease that says who is doing the deciding.
+///
+/// one row, and the check says so: this is a fact about the deployment, not a
+/// log of them. the vocabulary is the run lease's
+/// (`claimed_by` / `claimed_at` / `lease_until`, `runs` since v14) because it is
+/// the same mechanism pointed at a different thing, and a second vocabulary for
+/// it would be a second thing to learn for nothing.
+///
+/// `term` is what the run lease has no need of. it counts acquisitions, so a
+/// decision can name the term it was made under and the store can refuse one
+/// made under a term that has moved on. a lease can be believed by a process
+/// that paused past its expiry and woke up still holding the memory of it; a
+/// term written into the same transaction as the decision cannot.
+const SCHEMA_V21: &str = r#"
+CREATE TABLE decider (
+    only_row INTEGER PRIMARY KEY CHECK (only_row = 1),
+    term INTEGER NOT NULL DEFAULT 0,
+    claimed_by TEXT,
+    claimed_at TEXT,
+    lease_until TEXT
+);
+INSERT INTO decider (only_row, term) VALUES (1, 0);
+"#;
+
+pub(crate) const SCHEMA_VERSION: u32 = 21;
 
 // one transaction around every pending step and the version stamp (sqlite DDL
 // is transactional), so a crash mid-migration leaves the db exactly as found
@@ -573,6 +597,9 @@ fn migrate(conn: &mut Connection) -> Result<(), Error> {
     if version < 20 {
         collapsed = tx.execute(COLLAPSE_DUPLICATE_FIRES, [])?;
         tx.execute_batch(SCHEMA_V20)?;
+    }
+    if version < 21 {
+        tx.execute_batch(SCHEMA_V21)?;
     }
     if version != SCHEMA_VERSION {
         tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
@@ -2136,6 +2163,102 @@ impl Store {
             Err(_) => self.health.unrecorded(),
         }
         moved
+    }
+
+    /// take the deciding lease, if it is free or its holder stopped saying it
+    /// was there.
+    ///
+    /// returns the **new term** on success and `None` when somebody else holds
+    /// it with a lease that has not run out. the term increments on every
+    /// acquisition and never on a renewal, so a decision that names a term
+    /// names a stretch of time with exactly one decider in it, which is what
+    /// makes [`fence`](Self::fence) able to refuse a decision made under an
+    /// expired one.
+    ///
+    /// a process reaching for a lease it already holds gets a *new* term rather
+    /// than its old one: it is asking because it stopped believing it held one,
+    /// and a term it might have decided under while it was unsure is not one to
+    /// carry forward.
+    pub(crate) fn take_decision_lease(
+        &self,
+        who: &str,
+        lease: Duration,
+    ) -> Result<Option<u64>, Error> {
+        let at = Utc::now();
+        let until = at + chrono::Duration::from_std(lease).unwrap_or(chrono::Duration::MAX);
+        let mut conn = self.conn();
+        let mut tx = conn.begin_immediate()?;
+        let took = tx.execute(
+            "UPDATE decider SET term = term + 1, claimed_by = ?1, claimed_at = ?2,
+                 lease_until = ?3
+             WHERE claimed_by IS NULL OR claimed_by = ?1
+                OR lease_until IS NULL OR lease_until < ?2",
+            args![who, at.to_rfc3339(), until.to_rfc3339()],
+        )?;
+        if took == 0 {
+            return Ok(None);
+        }
+        let term = tx.query_opt("SELECT term FROM decider", args![], |r| r.int(0))?;
+        tx.commit()?;
+        Ok(term.map(|t| t.max(0) as u64))
+    }
+
+    /// say that the holder of `term` is still here, and push its lease out.
+    ///
+    /// false is the lease lost: somebody else holds it now, or this one expired
+    /// and has to be [taken](Self::take_decision_lease) again under a new term.
+    /// an expired lease is deliberately not renewable in place: there was a
+    /// stretch of time when this process was not the decider, and a term that
+    /// spanned it would say otherwise.
+    pub(crate) fn renew_decision_lease(
+        &self,
+        who: &str,
+        term: u64,
+        lease: Duration,
+    ) -> Result<bool, Error> {
+        let at = Utc::now();
+        let until = at + chrono::Duration::from_std(lease).unwrap_or(chrono::Duration::MAX);
+        let moved = self.conn().execute(
+            "UPDATE decider SET lease_until = ?3
+             WHERE claimed_by = ?1 AND term = ?4 AND lease_until IS NOT NULL
+               AND lease_until >= ?2",
+            args![who, at.to_rfc3339(), until.to_rfc3339(), term as i64],
+        )?;
+        Ok(moved > 0)
+    }
+
+    /// hand the deciding lease back, so whoever is next does not have to wait
+    /// it out. false when this process no longer held it anyway.
+    ///
+    /// the term is left where it is: the next acquisition moves it, and a
+    /// release that moved it would burn a term nothing ever decided under.
+    pub(crate) fn release_decision_lease(&self, who: &str, term: u64) -> Result<bool, Error> {
+        let released = self.conn().execute(
+            "UPDATE decider SET claimed_by = NULL, claimed_at = NULL, lease_until = NULL
+             WHERE claimed_by = ?1 AND term = ?2",
+            args![who, term as i64],
+        )?;
+        Ok(released > 0)
+    }
+
+    /// who is doing the deciding in this deployment, as the store has it.
+    ///
+    /// the answer to "why is nothing running here", asked of the database
+    /// rather than of a process that may be the one that is wrong about it.
+    pub fn decider(&self) -> Result<Decider, Error> {
+        let row = self.conn().query_opt(
+            "SELECT claimed_by, term, claimed_at, lease_until FROM decider",
+            args![],
+            |r| {
+                Ok(Decider {
+                    holder: r.opt_text(0)?,
+                    term: r.int(1)?.max(0) as u64,
+                    claimed_at: r.opt_ts(2)?,
+                    lease_until: r.opt_ts(3)?,
+                })
+            },
+        )?;
+        Ok(row.unwrap_or_default())
     }
 
     /// the runs `claimer` currently holds, so a process can say what it is
@@ -6871,14 +6994,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("future.db");
         let path = path.to_str().unwrap();
-        phase1_db(path, 21);
+        phase1_db(path, 22);
         let err = Store::open(path).err().unwrap();
-        assert_eq!(err.to_string(), "db schema v21 is newer than this build");
+        assert_eq!(err.to_string(), "db schema v22 is newer than this build");
         let conn = Connection::open(path).unwrap();
         let version: u32 = conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 21);
+        assert_eq!(version, 22);
     }
 
     #[test]
@@ -7048,6 +7171,7 @@ mod tests {
                          ALTER TABLE events DROP COLUMN actor;
                          ALTER TABLE runs DROP COLUMN replay_of;
                          DROP INDEX schedule_ticks_fire;
+                         DROP TABLE decider;
                          UPDATE schema_version SET version = 16;"
                     ))
                     .unwrap();
@@ -7146,6 +7270,7 @@ mod tests {
                          ALTER TABLE events DROP COLUMN actor;
                          ALTER TABLE runs DROP COLUMN replay_of;
                          DROP INDEX schedule_ticks_fire;
+                         DROP TABLE decider;
                          UPDATE schema_version SET version = 17;",
                     )
                     .unwrap();
@@ -7240,6 +7365,7 @@ mod tests {
                     .batch(
                         "ALTER TABLE runs DROP COLUMN replay_of;
                          DROP INDEX schedule_ticks_fire;
+                         DROP TABLE decider;
                          UPDATE schema_version SET version = 18;",
                     )
                     .unwrap();
@@ -7354,6 +7480,7 @@ mod tests {
                     .conn()
                     .batch(&format!(
                         "DROP INDEX schedule_ticks_fire;
+                         DROP TABLE decider;
                          {ticks}
                          UPDATE schema_version SET version = 19;"
                     ))
@@ -7518,6 +7645,89 @@ mod tests {
                 2
             );
             assert!(store.run("r2").unwrap().is_none());
+        });
+    }
+
+    // the lease itself: taken when free, refused when held, renewed by its
+    // holder and nobody else, and a new term every time it changes hands
+    #[test]
+    fn the_deciding_lease_is_taken_by_one_and_refused_to_the_other() {
+        both(|db| {
+            let store = db.store();
+            let minute = Duration::from_secs(60);
+
+            let empty = store.decider().unwrap();
+            assert_eq!(empty.holder, None);
+            assert_eq!(empty.term, 0);
+            assert_eq!(empty.lease_until, None);
+
+            assert_eq!(store.take_decision_lease("alpha", minute).unwrap(), Some(1));
+            assert_eq!(store.take_decision_lease("beta", minute).unwrap(), None);
+            let held = store.decider().unwrap();
+            assert_eq!(held.holder.as_deref(), Some("alpha"));
+            assert_eq!(held.term, 1);
+            assert!(held.held_by("alpha", Utc::now()));
+            assert!(!held.held_by("beta", Utc::now()));
+
+            // a renewal is the holder saying it is still there, and it is not
+            // an acquisition: the term does not move, or every decision made
+            // under it would be refused fifteen seconds later
+            assert!(store.renew_decision_lease("alpha", 1, minute).unwrap());
+            assert_eq!(store.decider().unwrap().term, 1);
+            // and nobody else can renew it, with the right term or without
+            assert!(!store.renew_decision_lease("beta", 1, minute).unwrap());
+            assert!(!store.renew_decision_lease("alpha", 2, minute).unwrap());
+
+            // handed back rather than waited out, which is what a process that
+            // stops on purpose owes the next one
+            assert!(!store.release_decision_lease("beta", 1).unwrap());
+            assert!(store.release_decision_lease("alpha", 1).unwrap());
+            let free = store.decider().unwrap();
+            assert_eq!(free.holder, None);
+            assert_eq!(free.lease_until, None);
+            // the term stays where it was: a release nothing decided under
+            // must not burn one
+            assert_eq!(free.term, 1);
+
+            assert_eq!(store.take_decision_lease("beta", minute).unwrap(), Some(2));
+        });
+    }
+
+    // the case a lock exists for: the holder is gone and said nothing about it
+    #[test]
+    fn a_lease_its_holder_stopped_renewing_is_takeable_and_not_before() {
+        both(|db| {
+            let store = db.store();
+            let blink = Duration::from_millis(20);
+
+            assert_eq!(store.take_decision_lease("alpha", blink).unwrap(), Some(1));
+            assert_eq!(
+                store.take_decision_lease("beta", blink).unwrap(),
+                None,
+                "a live lease was taken out from under its holder"
+            );
+
+            std::thread::sleep(Duration::from_millis(50));
+            // expired, so it is beta's, under a term of its own
+            assert_eq!(store.take_decision_lease("beta", blink).unwrap(), Some(2));
+            // and alpha cannot renew its way back in: there was a stretch of
+            // time when it was not the decider, and a term spanning it would
+            // say otherwise
+            assert!(
+                !store
+                    .renew_decision_lease("alpha", 1, Duration::from_secs(60))
+                    .unwrap()
+            );
+
+            std::thread::sleep(Duration::from_millis(50));
+            // an expired lease is not renewable by its own holder either: it
+            // has to be taken again, and taking it is what moves the term
+            assert!(
+                !store
+                    .renew_decision_lease("beta", 2, Duration::from_secs(60))
+                    .unwrap()
+            );
+            assert_eq!(store.take_decision_lease("beta", blink).unwrap(), Some(3));
         });
     }
 
@@ -9710,13 +9920,14 @@ mod tests {
         assert!(Store::open(":memory:").unwrap().is_private());
     }
 
-    /// every table the sqlite chain arrives at after sixteen migrations. a
-    /// fresh postgres database has all of them from its first statement.
+    /// every table the sqlite chain arrives at. a fresh postgres database has
+    /// all of them from its first statement.
     #[cfg(feature = "postgres")]
-    const TABLES: [&str; 17] = [
+    const TABLES: [&str; 18] = [
         "asset_checks",
         "asset_materializations",
         "backfills",
+        "decider",
         "events",
         "freshness_state",
         "notifications",
@@ -9790,20 +10001,20 @@ mod tests {
         let store = pg.store();
         store
             .conn()
-            .execute("UPDATE schema_version SET version = ?1", args![21_i64])
+            .execute("UPDATE schema_version SET version = ?1", args![22_i64])
             .unwrap();
         drop(store);
 
         let err = Store::connect(&pg.url).err().unwrap();
-        assert_eq!(err.to_string(), "db schema v21 is newer than this build");
+        assert_eq!(err.to_string(), "db schema v22 is newer than this build");
 
-        // and it is still v21: a build that cannot read a database must not
+        // and it is still v22: a build that cannot read a database must not
         // rewrite it either
         let version = crate::pg::unmigrated(&pg.url)
             .unwrap()
             .query("SELECT version FROM schema_version", args![], |r| r.int(0))
             .unwrap();
-        assert_eq!(version, [21]);
+        assert_eq!(version, [22]);
     }
 
     // ------------------------------------------- what a write is worth losing

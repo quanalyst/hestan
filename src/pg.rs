@@ -41,7 +41,7 @@ use crate::store::{AnyRow, SCHEMA_VERSION, Val, args};
 
 /// the whole schema at [`SCHEMA_VERSION`], created in one statement batch.
 ///
-/// the same sixteen tables the sqlite chain arrives at, with the same columns
+/// the same seventeen tables the sqlite chain arrives at, with the same columns
 /// and the same indexes; what each one is for is written on the migration that
 /// added it. the differences are `BIGSERIAL` where sqlite writes `INTEGER
 /// PRIMARY KEY AUTOINCREMENT`, `BIGINT` where it writes `INTEGER`, and the
@@ -239,6 +239,14 @@ CREATE TABLE notifications (
 CREATE INDEX notifications_due ON notifications(next_attempt_at)
     WHERE delivered_at IS NULL;
 CREATE INDEX notifications_delivered ON notifications(delivered_at);
+CREATE TABLE decider (
+    only_row BOOLEAN PRIMARY KEY DEFAULT TRUE CHECK (only_row),
+    term BIGINT NOT NULL DEFAULT 0,
+    claimed_by TEXT COLLATE "C",
+    claimed_at TEXT COLLATE "C",
+    lease_until TEXT COLLATE "C"
+);
+INSERT INTO decider (term) VALUES (0);
 "#;
 
 /// the lock two processes booting against the same empty database take turns
@@ -457,6 +465,19 @@ CREATE UNIQUE INDEX schedule_ticks_fire
     ON schedule_ticks(job, expr, scheduled_for) WHERE outcome = 'fired';
 "#;
 
+/// the one lease that says who is doing the deciding. the postgres half of
+/// `SCHEMA_V21`: one table, one row in it, and nothing read or rewritten.
+const MIGRATE_V21: &str = r#"
+CREATE TABLE decider (
+    only_row BOOLEAN PRIMARY KEY DEFAULT TRUE CHECK (only_row),
+    term BIGINT NOT NULL DEFAULT 0,
+    claimed_by TEXT COLLATE "C",
+    claimed_at TEXT COLLATE "C",
+    lease_until TEXT COLLATE "C"
+);
+INSERT INTO decider (term) VALUES (0);
+"#;
+
 const MIGRATE_V17: &str = r#"
 ALTER TABLE events ALTER COLUMN run_id DROP NOT NULL;
 ALTER TABLE events ADD COLUMN subject_kind TEXT COLLATE "C" NOT NULL DEFAULT 'run';
@@ -507,6 +528,9 @@ fn migrate(client: &mut Client) -> Result<(), Error> {
             if version < 20 {
                 collapsed = tx.execute(crate::store::COLLAPSE_DUPLICATE_FIRES, args![])?;
                 tx.batch(MIGRATE_V20)?;
+            }
+            if version < 21 {
+                tx.batch(MIGRATE_V21)?;
             }
             if version != SCHEMA_VERSION {
                 tx.execute(

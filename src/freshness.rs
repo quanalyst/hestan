@@ -231,6 +231,10 @@ pub(crate) async fn run_checker(
         return;
     }
     loop {
+        // the crossing is written down and the hooks are called once, by the
+        // decider: two processes checking would page somebody twice for one
+        // asset going late
+        runner.deciding().wait().await;
         for event in check_once(&runner, &registry, Utc::now()) {
             fire_hooks(&hooks, event, "late");
         }

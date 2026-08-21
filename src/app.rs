@@ -10,6 +10,7 @@ use crate::asset::{
     Asset, AssetCheck, AssetRegistry, MultiAsset, asset_tag, mats_map, plan_target,
 };
 use crate::auth::{self, Auth};
+use crate::decider;
 use crate::error::Error;
 use crate::executor::{self, Limits, Runner};
 use crate::freshness::{self, LateEvent, LateHook};
@@ -80,6 +81,11 @@ pub struct Hestan {
     priority: i64,
     reclaim: Reclaim,
     role: Role,
+    /// whether this process will hold an [election](crate::decider) for the
+    /// right to decide. only [`up`](Hestan::up) sets it: a headless one-shot
+    /// has to execute the run it was asked for, and waiting on a lease a live
+    /// server is holding would leave it waiting for something never coming.
+    elects: bool,
     slots: usize,
     max_instances: usize,
     retention: Retention,
@@ -120,6 +126,7 @@ impl Default for Hestan {
             priority: 0,
             reclaim: Reclaim::default(),
             role: Role::default(),
+            elects: false,
             slots: usize::MAX,
             max_instances: executor::DEFAULT_MAX_INSTANCES,
             retention: Retention::default(),
@@ -980,7 +987,7 @@ impl Hestan {
         self.role(Role::Worker).up(addr).await
     }
 
-    async fn up(self, addr: Option<SocketAddr>) -> Result<(), Error> {
+    async fn up(mut self, addr: Option<SocketAddr>) -> Result<(), Error> {
         // before the address, before the store, before anything: this process
         // may be an op subprocess of a hestan already running against this
         // database, and every line of boot behaviour below assumes otherwise:
@@ -1011,6 +1018,9 @@ impl Hestan {
         {
             tracing::warn!("{said}");
         }
+        // the election happens inside `build`, before the boot sweep and before
+        // anything else this process would decide
+        self.elects = true;
         let built = self.build().await?;
         let sensor_infos: Vec<SensorInfo> = built
             .sensor_entries
@@ -1064,6 +1074,10 @@ impl Hestan {
             if built.runner.durable() {
                 loops.push(tokio::spawn(hooks::run_delivery(built.runner.clone())));
             }
+            // and the loop that holds the lease every one of them just took a
+            // reading of. last, so nothing above it can be started by a lease
+            // taken before it existed
+            loops.push(tokio::spawn(decider::run_decider(built.runner.clone())));
         }
         if role.executes() {
             // the dispatcher: the queue's own loop. every launch pokes it and
@@ -1081,6 +1095,7 @@ impl Hestan {
             built.runner.clone(),
         )));
         let instance = built.runner.instance().to_string();
+        let state_runner = built.runner.clone();
         let state = AppState {
             jobs: Arc::new(built.runner.jobs().clone()),
             runner: built.runner,
@@ -1104,6 +1119,9 @@ impl Hestan {
         for handle in loops {
             handle.abort();
         }
+        // the loops are stopped, so nothing in this process will decide again:
+        // hand the lease back rather than making the next process wait it out
+        decider::hand_back(&state_runner);
         served?;
         Ok(())
     }
@@ -1358,6 +1376,15 @@ impl Hestan {
         .with_max_instances(self.max_instances);
         if self.durable {
             runner = runner.with_durable_notifications();
+        }
+        // the election, before the sweep below and before any loop exists. a
+        // process that finds the lease free is holding it by the time this
+        // returns, so one process on one database is exactly as fast to start
+        // deciding as it was; one that finds it held waits, doing nothing.
+        // a one-shot never gets here and never waits for anybody
+        if self.elects && self.role.decides() {
+            runner = runner.with_deciding(crate::decider::Deciding::elected());
+            crate::decider::take_now(&runner);
         }
         // before anything new launches, and before the loop that takes it from
         // here: a process that runs for an hour and exits should still tidy up

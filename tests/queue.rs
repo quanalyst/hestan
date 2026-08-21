@@ -176,7 +176,7 @@ fn app(db: &str) -> Hestan {
         .db(db)
 }
 
-/// the deployment the double-fire cases run: one job on a two-second cron,
+/// the deployment the double-fire cases run: one job on a one-second cron,
 /// declared once in a registry every process building it shares.
 ///
 /// its own app rather than a schedule on [`app`], so that the cases above go on
@@ -194,13 +194,47 @@ fn beat_app(db: &str) -> Hestan {
                 .unwrap(),
         ])
         .schedule(BEAT, BEAT_CRON)
+        // every run this process launches says which process launched it,
+        // which is the only way from the outside to tell one decider from two
+        .run_tags([("pid", std::process::id().to_string())])
         .db(db)
+}
+
+/// which process launched each `beat` run so far, oldest first.
+fn deciders(store: &Store) -> Vec<String> {
+    let mut runs: Vec<hestan::Run> = store
+        .runs(None, None, None, None, None, 500)
+        .unwrap()
+        .into_iter()
+        .filter(|r| r.job == BEAT && r.trigger == Trigger::Schedule)
+        .collect();
+    runs.sort_by_key(|r| r.created_at);
+    runs.into_iter()
+        .filter_map(|r| r.tags.get("pid").map(|v| v.as_str().to_string()))
+        .collect()
+}
+
+/// the distinct processes that have decided anything, in the order they first
+/// did.
+fn distinct_deciders(store: &Store) -> Vec<String> {
+    let mut seen: Vec<String> = Vec::new();
+    for pid in deciders(store) {
+        if !seen.contains(&pid) {
+            seen.push(pid);
+        }
+    }
+    seen
 }
 
 /// the job the double-fire cases watch, and the six-field cron it is on:
 /// seconds first, so this is every two seconds rather than every two minutes.
 const BEAT: &str = "beat";
-const BEAT_CRON: &str = "*/2 * * * * *";
+const BEAT_CRON: &str = "* * * * * *";
+
+/// how long a survivor may take to notice the leader is gone and start
+/// deciding: one deciding lease, plus enough slack for a spawn and an
+/// occurrence to come round on a loaded machine.
+const HANDOVER: Duration = Duration::from_secs(20);
 
 fn jobs() -> Vec<Job> {
     vec![
@@ -268,6 +302,13 @@ fn enqueuer(db: &str) -> Runner {
 }
 
 async fn cases(db: &str) {
+    // first, on a database nobody has ever held the lease on, because "a
+    // single process starts deciding at once" is a claim about exactly that
+    case(
+        "the_lease_picks_one_decider_and_hands_over_when_that_process_goes",
+        one_decider_and_a_handover(db),
+    )
+    .await;
     case(
         "a_worker_runs_a_queued_run_another_process_wrote",
         another_process_executes(db),
@@ -496,14 +537,23 @@ async fn a_rate_is_per_process(db: &str) {
 /// claim about a different mechanism, and it is made where that mechanism is.
 async fn two_schedulers_fire_each_occurrence_once(db: &str) {
     let store = open(db);
+    // only what these two processes do, not what an earlier case left in the
+    // log: a case that read somebody else's fires would pass having watched
+    // nothing at all
+    let before = store
+        .ticks(Some(BEAT), 1)
+        .unwrap()
+        .first()
+        .map_or(0, |t| t.id);
+    let since = |t: &hestan::Tick| t.id > before;
     let mut beats = [spawn("beat"), spawn("beat")];
-    // several two-second occurrences, and both processes up for all of them
+    // several one-second occurrences, and both processes up for all of them
     let fires = wait_for("three occurrences to come round", || {
         let fired: Vec<_> = store
             .ticks(Some(BEAT), 200)
             .unwrap()
             .into_iter()
-            .filter(|t| t.outcome == TickOutcome::Fired)
+            .filter(|t| since(t) && t.outcome == TickOutcome::Fired)
             .collect();
         (fired.len() >= 3).then_some(fired)
     })
@@ -523,11 +573,12 @@ async fn two_schedulers_fire_each_occurrence_once(db: &str) {
 
     // and the run log agrees, which is the half that costs money: a second
     // tick would have been a second run of the job
+    let launched: Vec<String> = fires.iter().filter_map(|t| t.run_id.clone()).collect();
     let mut stood_for: Vec<String> = store
         .runs(None, None, None, None, None, 500)
         .unwrap()
         .into_iter()
-        .filter(|r| r.job == BEAT && r.trigger == Trigger::Schedule)
+        .filter(|r| launched.contains(&r.id))
         .filter_map(|r| r.scheduled_for.map(|t| t.to_rfc3339()))
         .collect();
     stood_for.sort();
@@ -541,6 +592,66 @@ async fn two_schedulers_fire_each_occurrence_once(db: &str) {
         stood_for.len() >= 3,
         "the fixture fired nothing worth checking: {stood_for:?}"
     );
+}
+
+/// the election, end to end, across three of them: one process alone, two
+/// processes contending, and one process left after the other is killed.
+///
+/// **the invariant here is about who tried**, which is the half the store
+/// cannot say anything about. every `beat` run carries the pid of the process
+/// that launched it, so "one process decided" is read off the run log rather
+/// than inferred from there being no duplicates.
+async fn one_decider_and_a_handover(db: &str) {
+    let store = open(db);
+
+    // nobody holds the lease, so the first process takes it on boot and fires
+    // the next occurrence it sees. no waiting on anything
+    let started = Instant::now();
+    let mut first = spawn("beat");
+    wait_for("the first process to fire", || {
+        (!deciders(&store).is_empty()).then_some(())
+    })
+    .await;
+    let alone = started.elapsed();
+    assert!(
+        alone < Duration::from_secs(6),
+        "a process alone waited {alone:?} to start deciding"
+    );
+    let leader = first.id().to_string();
+    assert_eq!(distinct_deciders(&store), vec![leader.clone()]);
+    let held = store.decider().unwrap();
+    assert!(held.holder.is_some());
+    let term = held.term;
+
+    // a second process against the same database decides nothing at all while
+    // the first is up: not a late fire, not a refused one, nothing
+    let mut second = spawn("beat");
+    tokio::time::sleep(Duration::from_secs(4)).await;
+    assert_eq!(
+        distinct_deciders(&store),
+        vec![leader.clone()],
+        "two processes decided at once"
+    );
+    assert_eq!(
+        store.decider().unwrap().term,
+        term,
+        "the lease changed hands while both processes were up"
+    );
+
+    // and now the leader is gone. the other one takes over inside a lease and
+    // fires the next occurrence it sees, under a term of its own
+    stop(&mut first);
+    let handover = Instant::now();
+    let survivor = second.id().to_string();
+    wait_for("the other process to take over", || {
+        distinct_deciders(&store).contains(&survivor).then_some(())
+    })
+    .await;
+    let took = handover.elapsed();
+    assert!(took < HANDOVER, "the handover took {took:?}");
+    let after = store.decider().unwrap();
+    assert!(after.term > term, "a handover did not move the term");
+    stop(&mut second);
 }
 
 // ---------------------------------------------------------------- the harness
@@ -576,12 +687,14 @@ async fn wait_terminal(store: &Store, id: &str) -> hestan::Run {
     .await
 }
 
+/// wait for something, up to long enough that a process waiting out a lease
+/// somebody else left behind is not mistaken for one that is never coming.
 async fn wait_for<T>(what: &str, mut ready: impl FnMut() -> Option<T>) -> T {
-    for _ in 0..2_000 {
+    for _ in 0..4_500 {
         if let Some(value) = ready() {
             return value;
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
-    panic!("waited 20s for {what}");
+    panic!("waited 45s for {what}");
 }

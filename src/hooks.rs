@@ -325,6 +325,9 @@ pub(crate) async fn run_delivery(runner: Runner) {
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         ticker.tick().await;
+        // delivery is a decision like any other: two deliverers would send
+        // every alert twice, and the row is marked after the hook returns
+        runner.deciding().wait().await;
         deliver_once(&runner, Utc::now()).await;
     }
 }
