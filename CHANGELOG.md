@@ -12,6 +12,11 @@ nothing about what runs, or when, is different. what is added is two `Meta`
 variants, one method on `OpCtx`, and a section on the run page that appears
 when there is something to put in it.
 
+**breaking, at compile time only**: `Meta` gains `Series` and `Saved`. the enum
+is not `#[non_exhaustive]`, so an exhaustive `match` on it needs two more arms.
+no signature moved and nothing stored changed, so this reaches only code that
+matches `Meta` without a `_`.
+
 **hestan runs no query.** the op supplies the sample, because the op is the
 one already holding the connection; three lines of its own sql select its own
 rows back. there are no credentials to hand hestan, no dialect for it to know,
@@ -53,7 +58,8 @@ out of it.
   right is not hestan's to decide; an empty series is an empty series, which
   is the op having looked and found nothing; one point is one mark
 - **the section on the run page**, under the gantt and above the log: every
-  sample from every op, in op order, each labelled with the op that took it. a
+  sample from every op, ordered by op name (which is how the api returns
+  them, not dag order), each labelled with the op that took it. a
   series draws with its value range on the axis, its first and last timestamps
   under it in utc as the op stored them, and every point reachable as a number
   under that. **it takes no hue.** colour means group or origin in this ui and
