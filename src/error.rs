@@ -71,6 +71,21 @@ pub enum Error {
     /// rather than queued.
     #[error("{0}")]
     Conflict(String),
+    /// this process stopped being the deciding process before its decision
+    /// reached the store, so the store refused the write.
+    ///
+    /// not a failure of the thing being decided: nothing was written, and
+    /// whichever process holds the [deciding
+    /// lease](crate::Store::decider) now will make the decision on its next
+    /// pass, of fresher data than this one had. a process only ever sees this
+    /// on a loop that decides, and only when it paused long enough for its
+    /// lease to run out under it: the ordinary way to stop deciding is to
+    /// notice the lease is gone and not to act at all.
+    #[error(
+        "the deciding lease moved on before this decision reached the store, \
+         so nothing was written"
+    )]
+    NotDeciding,
     /// two jobs registered under one name. also what a user job called
     /// `assets` collides with, since registering any asset defines one.
     #[error("duplicate job: {0}")]

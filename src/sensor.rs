@@ -15,7 +15,7 @@ use tokio::time::Instant;
 use crate::asset::{AssetRegistry, ProbeFn, mats_map};
 use crate::backoff::{capped_exponential, full_jitter};
 use crate::error::Error;
-use crate::executor::Runner;
+use crate::executor::{Launched, Runner};
 use crate::model::{Run, RunCursor, RunStatus, RunTags, SensorOutcome, Trigger};
 use crate::op::InputError;
 use crate::policy::{self, Pass};
@@ -850,12 +850,16 @@ fn launch_request(sensor: &str, req: RunRequest, runner: &Runner) -> Result<Fire
         RunKey { sensor, key },
         sensor_tag(sensor),
     ) {
-        Ok(Some(run_id)) => {
+        Ok(Launched::Queued(run_id)) => {
             tracing::info!(sensor = %sensor, job = %job, key = %key, run = %run_id, "sensor fired");
             Ok(Fired::Launched(run_id))
         }
         // claimed between the read and the insert; one launch either way
-        Ok(None) => Ok(Fired::Skipped),
+        Ok(Launched::Taken) => Ok(Fired::Skipped),
+        // and this process stopped being the decider between the evaluation
+        // and the launch. nothing launched and nothing is claimed, so whoever
+        // holds the lease now will make the same request on its next turn
+        Ok(Launched::Stale) => Err(fail(Error::NotDeciding)),
         Err(e) => Err(fail(e)),
     }
 }

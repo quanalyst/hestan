@@ -7,7 +7,7 @@ use chrono_tz::Tz;
 use serde_json::{Value, json};
 
 use crate::error::Error;
-use crate::executor::Runner;
+use crate::executor::{Launched, Runner};
 use crate::model::{Catchup, Overlap, ScheduleRow, TickOutcome};
 use crate::store::Store;
 
@@ -554,6 +554,12 @@ fn note_runless_tick(
 /// somebody is already looking rather than only in this process's stderr.
 const ALREADY_FIRED: &str = "another process had already fired this occurrence";
 
+/// and what a fire refused by the [term fence](crate::Store::decider) is. it
+/// leaves no tick: nothing fired, and the occurrence is downtime as far as the
+/// next decider's catch-up is concerned, which is the honest thing for it to
+/// be.
+const NOT_DECIDING: &str = "the deciding lease moved on before the fire landed";
+
 /// launch one occurrence and record what happened to it. `caught_up` says the
 /// occurrence came due while nothing was running to fire it: the tick row
 /// cannot tell the two apart, and the event kind does.
@@ -572,8 +578,8 @@ fn note_tick(
 ) {
     let tick = match runner.fire_scheduled(job, expr, due, params.clone(), caught_up) {
         // the fire and its tick landed together; nothing more to record
-        Ok(Some(_)) => Ok(()),
-        Ok(None) => {
+        Ok(Launched::Queued(_)) => Ok(()),
+        Ok(Launched::Taken) => {
             tracing::info!(job = %job, expr = %expr, "fire refused: {ALREADY_FIRED}");
             runner.store().record_tick(
                 job,
@@ -584,6 +590,13 @@ fn note_tick(
                 None,
                 Some(ALREADY_FIRED),
             )
+        }
+        // this process stopped being the decider mid-pass. nothing was
+        // written, including no tick: the occurrence is un-accounted for, and
+        // the new decider's catch-up is what will account for it
+        Ok(Launched::Stale) => {
+            tracing::warn!(job = %job, expr = %expr, "fire refused: {NOT_DECIDING}");
+            Ok(())
         }
         Err(err) => {
             tracing::error!(job = %job, error = %err, "scheduled launch failed");

@@ -228,12 +228,14 @@ mod tests {
 
     use super::*;
     use crate::asset::{Asset, AssetRegistry};
+    use crate::executor::Launched;
     use crate::hooks::RunEvent;
     use crate::job::Job;
-    use crate::model::{Role, Run, RunStatus, RunTags, Trigger};
+    use crate::model::{Catchup, Role, Run, RunStatus, RunTags, Trigger};
     use crate::op::{Op, OpCtx};
     use crate::partition::Partitions;
     use crate::policy::AutoPolicy;
+    use crate::schedule::Schedule;
     use crate::sensor::{RunRequest, Sensor, SensorEntry};
     use crate::store::Store;
 
@@ -579,6 +581,305 @@ mod tests {
         did_nothing("the delivery loop sent an alert", delivered).await;
         elect(&runner);
         then_does("a delivery", task, delivered).await;
+    }
+
+    // ------------------------------------------------------------- the fence
+
+    // the handle the deciding loops launch through, and the one everything else
+    // does. a process that has stopped being the decider and does not know it
+    // is refused by the store on the first, and untouched on the second
+    #[tokio::test]
+    async fn a_deciding_handle_is_refused_once_its_term_has_moved_on() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("hestan.db").to_str().unwrap()).unwrap();
+        let runner = waiting(Runner::new([noop_job("etl")], store.clone()).unwrap());
+        assert!(take_now(&runner));
+        let decides = runner.as_decider();
+        let hour = |h: u32| {
+            chrono::DateTime::parse_from_rfc3339(&format!("2026-05-01T{h:02}:00:00+00:00"))
+                .unwrap()
+                .with_timezone(&Utc)
+        };
+
+        // while it holds the lease, a fire lands exactly as it always did
+        assert!(matches!(
+            decides
+                .fire_scheduled("etl", "0 * * * *", hour(9), json!({}), false)
+                .unwrap(),
+            Launched::Queued(_)
+        ));
+
+        // the lease moves on. this handle still believes it holds term 1: the
+        // whole point is that nothing in this process has noticed
+        let term = runner.deciding().term().unwrap();
+        assert!(
+            store
+                .release_decision_lease(runner.instance(), term)
+                .unwrap()
+        );
+        assert_eq!(
+            store
+                .take_decision_lease("somebody-else", Duration::from_secs(600))
+                .unwrap(),
+            Some(term + 1)
+        );
+        assert!(
+            runner.may_decide(),
+            "the fixture is not the case being made"
+        );
+
+        assert_eq!(
+            decides
+                .fire_scheduled("etl", "0 * * * *", hour(10), json!({}), false)
+                .unwrap(),
+            Launched::Stale
+        );
+        assert!(
+            store
+                .ticks(Some("etl"), 50)
+                .unwrap()
+                .iter()
+                .all(|t| t.scheduled_for != hour(10)),
+            "a stale decider left a tick behind"
+        );
+        assert_eq!(
+            store.runs(None, None, None, None, None, 50).unwrap().len(),
+            1
+        );
+
+        // and a launch that is not a decision is not fenced by any of this:
+        // the api and the ui go on working on a process that is not the
+        // decider, which is most of them
+        runner
+            .launch("etl", json!({}), Trigger::Manual)
+            .expect("a manual launch is nobody's decision to lose");
+        assert_eq!(
+            store.runs(None, None, None, None, None, 50).unwrap().len(),
+            2
+        );
+    }
+
+    // ------------------------------------------------------------- handover
+
+    /// a scheduler on an hourly cron, with the cursor left where a decider
+    /// that died `hours` ago left it, and this process not the decider yet.
+    ///
+    /// this is a handover as the store sees one: the cursor is the record of
+    /// how far the *deployment* has accounted for, and it does not care which
+    /// process wrote it.
+    fn after_a_gap(
+        catchup: Catchup,
+        hours: i64,
+    ) -> (Store, Runner, Vec<crate::schedule::ScheduleEntry>) {
+        let store = Store::open(":memory:").unwrap();
+        let schedule = Schedule::new("etl", "0 * * * *").catchup(catchup);
+        store
+            .sync_schedules(std::slice::from_ref(&schedule))
+            .unwrap();
+        store
+            .set_schedule_cursor(
+                "etl",
+                "0 * * * *",
+                Utc::now() - chrono::Duration::hours(hours),
+            )
+            .unwrap();
+        // scheduler, so a caught-up run stays queued: this is the deployment
+        // shape a handover happens in
+        let runner = waiting(
+            Runner::new([noop_job("etl")], store.clone())
+                .unwrap()
+                .with_role(Role::Scheduler, 1),
+        );
+        let entries = vec![
+            crate::schedule::parse("etl", "0 * * * *", "UTC")
+                .unwrap()
+                .with_catchup(catchup),
+        ];
+        (store, runner, entries)
+    }
+
+    /// every occurrence the tick log has anything to say about, newest first.
+    fn accounted(store: &Store) -> Vec<(crate::model::TickOutcome, chrono::DateTime<Utc>)> {
+        store
+            .ticks(Some("etl"), 50)
+            .unwrap()
+            .into_iter()
+            .map(|t| (t.outcome, t.scheduled_for))
+            .collect()
+    }
+
+    // **the documented answer**: an occurrence due while nobody was deciding is
+    // an occurrence due during downtime, and the schedule's own catch-up policy
+    // is what decides. the default is to skip it.
+    #[tokio::test]
+    async fn an_occurrence_due_during_a_handover_is_skipped_under_the_default_policy() {
+        let (store, runner, entries) = after_a_gap(Catchup::Skip, 3);
+        let task = tokio::spawn(crate::schedule::run_scheduler(entries, runner.clone()));
+        did_nothing("the scheduler caught up", || !accounted(&store).is_empty()).await;
+
+        elect(&runner);
+        // the cursor jumping the gap is the whole of what `skip` does, so that
+        // is what is waited for: no tick is ever written for a skipped gap
+        let cursor = wait_cursor(&store).await;
+        task.abort();
+        assert!(
+            cursor > Utc::now() - chrono::Duration::hours(1),
+            "the gap was not accounted for: {cursor}"
+        );
+        assert_eq!(
+            accounted(&store),
+            Vec::new(),
+            "skip fired something, or logged the occurrences it did not fire"
+        );
+        assert!(
+            store
+                .runs(None, None, None, None, None, 10)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    // and under `one`, it is fired late: the most recent missed occurrence,
+    // and only that one
+    #[tokio::test]
+    async fn an_occurrence_due_during_a_handover_is_fired_late_under_catchup_one() {
+        let (store, runner, entries) = after_a_gap(Catchup::One, 3);
+        let task = tokio::spawn(crate::schedule::run_scheduler(entries, runner.clone()));
+        did_nothing("the scheduler caught up", || !accounted(&store).is_empty()).await;
+
+        elect(&runner);
+        let ticks = wait_ticks(&store, 1).await;
+        task.abort();
+        assert_eq!(ticks.len(), 1, "{ticks:?}");
+        assert_eq!(ticks[0].0, crate::model::TickOutcome::Fired);
+        // the occurrence it stands for is the missed one, not the wall clock
+        // it was fired at
+        let run = store
+            .runs(None, None, None, None, None, 10)
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert_eq!(run.scheduled_for, Some(ticks[0].1));
+        assert!(run.scheduled_for.unwrap() < Utc::now());
+    }
+
+    // and under `all`, every one of them is accounted for, oldest first: the
+    // ones the job has room for fire and the rest are held, which is the same
+    // thing `all` does after any other downtime
+    #[tokio::test]
+    async fn every_occurrence_due_during_a_handover_is_accounted_for_under_catchup_all() {
+        let (store, runner, entries) = after_a_gap(Catchup::All { limit: 10 }, 3);
+        let task = tokio::spawn(crate::schedule::run_scheduler(entries, runner.clone()));
+        did_nothing("the scheduler caught up", || !accounted(&store).is_empty()).await;
+
+        elect(&runner);
+        let ticks = wait_ticks(&store, 3).await;
+        task.abort();
+        let mut occurrences: Vec<chrono::DateTime<Utc>> = ticks.iter().map(|(_, at)| *at).collect();
+        occurrences.sort();
+        occurrences.dedup();
+        assert!(
+            occurrences.len() >= 3,
+            "the gap held three occurrences and {} were accounted for",
+            occurrences.len()
+        );
+        assert_eq!(
+            ticks
+                .iter()
+                .filter(|(o, _)| *o == crate::model::TickOutcome::Fired)
+                .count(),
+            1,
+            "a job that overlaps by skipping launched more than one at a time"
+        );
+    }
+
+    // the other half of the handover: a fire that was already *queued* when the
+    // decider went away. the tick log is the queue (phase 18), so it survives,
+    // and the new decider drains it as its own
+    #[tokio::test]
+    async fn a_fire_queued_before_a_handover_is_launched_after_it() {
+        let store = Store::open(":memory:").unwrap();
+        let schedule = Schedule::new("etl", "0 * * * *");
+        store
+            .sync_schedules(std::slice::from_ref(&schedule))
+            .unwrap();
+        // the cursor is up to date, so nothing here is catch-up: this is one
+        // occurrence the dead decider deferred and nothing else
+        let held = Utc::now() - chrono::Duration::minutes(20);
+        store
+            .set_schedule_cursor("etl", "0 * * * *", Utc::now())
+            .unwrap();
+        store
+            .record_tick(
+                "etl",
+                "0 * * * *",
+                held,
+                crate::model::TickOutcome::Deferred,
+                false,
+                None,
+                None,
+            )
+            .unwrap();
+        let runner = waiting(
+            Runner::new([noop_job("etl")], store.clone())
+                .unwrap()
+                .with_role(Role::Scheduler, 1),
+        );
+        let entries = vec![crate::schedule::parse("etl", "0 * * * *", "UTC").unwrap()];
+        let drained =
+            || {
+                store.ticks(Some("etl"), 50).unwrap().iter().any(|t| {
+                    t.outcome == crate::model::TickOutcome::Fired && t.scheduled_for == held
+                })
+            };
+
+        let task = tokio::spawn(crate::schedule::run_scheduler(entries, runner.clone()));
+        did_nothing("the held fire was drained", drained).await;
+        assert!(
+            !store.pending_fires().unwrap().is_empty(),
+            "the fixture lost its queued fire before the handover"
+        );
+        elect(&runner);
+        then_does("the queued fire launching", task, drained).await;
+        assert!(
+            store.pending_fires().unwrap().is_empty(),
+            "the fire is still queued after it launched"
+        );
+    }
+
+    /// this schedule's cursor, once it has moved off the gap.
+    async fn wait_cursor(store: &Store) -> chrono::DateTime<Utc> {
+        for _ in 0..500 {
+            if let Some(at) = store
+                .schedules()
+                .unwrap()
+                .first()
+                .and_then(|r| r.cursor)
+                .filter(|at| *at > Utc::now() - chrono::Duration::hours(2))
+            {
+                return at;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("the cursor never moved off the gap");
+    }
+
+    /// the tick log once it holds at least `n` rows.
+    async fn wait_ticks(
+        store: &Store,
+        n: usize,
+    ) -> Vec<(crate::model::TickOutcome, chrono::DateTime<Utc>)> {
+        for _ in 0..500 {
+            let ticks = accounted(store);
+            if ticks.len() >= n {
+                // one more turn, so a pass that was going to write a fourth is
+                // not read halfway through
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                return accounted(store);
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("the tick log never reached {n} rows");
     }
 
     /// a queued run of `job`, created at `at`.

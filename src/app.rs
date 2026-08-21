@@ -1034,24 +1034,30 @@ impl Hestan {
             .collect();
         let mut loops = Vec::new();
         if role.decides() {
+            // every loop below launches through this handle, and every run it
+            // launches carries the term this process is deciding under: a
+            // decision made under a term that has moved on is refused by the
+            // store rather than argued about here. the handle the api and the
+            // ui use is deliberately not this one
+            let decides = built.runner.as_decider();
             loops.push(tokio::spawn(schedule::run_scheduler(
                 built.entries,
-                built.runner.clone(),
+                decides.clone(),
             )));
             loops.push(tokio::spawn(run_sensors(
                 built.sensor_entries,
-                built.runner.clone(),
+                decides.clone(),
                 built.registry.clone(),
             )));
             // the chunker: it launches each backfill's next range as the last
             // one finishes, so a long backfill never fires every partition at
             // once
             loops.push(tokio::spawn(crate::backfill::run_backfills(
-                built.runner.clone(),
+                decides.clone(),
                 built.registry.clone(),
             )));
             loops.push(tokio::spawn(freshness::run_checker(
-                built.runner.clone(),
+                decides.clone(),
                 built.registry.clone(),
                 Arc::new(built.late_hooks),
             )));
@@ -1059,12 +1065,14 @@ impl Hestan {
             // beside the checker that reads the same staleness to say what is
             // late. one process decides, so one process launches
             loops.push(tokio::spawn(crate::policy::run_policies(
-                built.runner.clone(),
+                decides.clone(),
                 built.registry.clone(),
             )));
-            // the sweeper: what a policy set at boot means three months later
+            // the sweeper: what a policy set at boot means three months later.
+            // it launches nothing, so the fence has nothing to fence; see
+            // `docs/scaling.md` on what a stale decider can still delete
             loops.push(tokio::spawn(retention::run_sweeper(
-                built.runner.clone(),
+                decides.clone(),
                 built.retention,
                 built.retention_every,
             )));
@@ -1072,7 +1080,7 @@ impl Hestan {
             // process delivers, for the same reason one process decides: two
             // of them would send every alert twice
             if built.runner.durable() {
-                loops.push(tokio::spawn(hooks::run_delivery(built.runner.clone())));
+                loops.push(tokio::spawn(hooks::run_delivery(decides.clone())));
             }
             // and the loop that holds the lease every one of them just took a
             // reading of. last, so nothing above it can be started by a lease

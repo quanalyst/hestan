@@ -246,7 +246,13 @@ what this does **not** cover: a sensor that declares no
 [run key](sensors.md#run-keys), an [automation policy](assets.md#automation-policies)
 build, a [backfill](assets.md#backfills) chunk, a freshness hook and the
 retention sweep are all decisions with no occurrence to key on, and no index
-refuses a second one. see [scaling](scaling.md).
+refuses a second one. what covers most of them instead is the
+[deciding lease and the term it is on](scaling.md#running-more-than-one-scheduler),
+which is also where the ones nothing covers are listed.
+
+an occurrence that comes due while one deciding process is going and the next
+has not taken over is [an occurrence due during downtime](scaling.md#handover-fired-late-or-missed),
+and the catch-up policy below is what decides what happens to it.
 
 ## Upcoming projection
 

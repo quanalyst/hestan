@@ -23,7 +23,7 @@ use crate::model::{
 use crate::op::{self, Cancel, MetaBuf, Op, OpCtx};
 use crate::rate::{Rate, RateStatus, Rates, Ticket};
 use crate::resource::{self, Resources, RunResource, RunResources};
-use crate::store::{Built, Claimed, Fire, RunKey, Store, note};
+use crate::store::{Built, Claimed, Fenced, Fire, Landed, RunKey, Store, note};
 
 /// how far back a resume follows `resumed_from` links. resuming a resume is
 /// normal; a chain this long is a bug, and the walk says so instead of looping.
@@ -442,6 +442,42 @@ pub(crate) fn instance_id() -> &'static str {
     &ID
 }
 
+/// what came of a launch that had something to claim or a term to name.
+///
+/// [`Runner::launch`] and the rest cannot see this: they claim nothing, so they
+/// are always [`Queued`](Launched::Queued). only a launch made *as a decision*
+/// can come back refused, and there are exactly two ways for that to happen and
+/// they mean opposite things.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Launched {
+    /// on the queue, by id.
+    Queued(String),
+    /// somebody already made this decision. the work is done, or being done, by
+    /// whoever got there first; nothing was written here.
+    Taken,
+    /// this process stopped being the decider before the write reached the
+    /// store. the work is *not* done, and the process that holds the lease now
+    /// will decide it on its next pass, of fresher data. nothing was written.
+    Stale,
+}
+
+impl Launched {
+    /// the run id of a launch that had nothing to claim.
+    ///
+    /// [`Taken`](Launched::Taken) is unreachable for those: there is no claim
+    /// to have been taken. [`Stale`](Launched::Stale) is reachable, on a
+    /// [deciding handle](Runner::as_decider) whose term ran out mid-pass, and
+    /// it becomes [`Error::NotDeciding`] rather than a lost launch nobody
+    /// hears about.
+    fn queued(self) -> Result<String, Error> {
+        match self {
+            Launched::Queued(id) => Ok(id),
+            Launched::Stale => Err(Error::NotDeciding),
+            Launched::Taken => unreachable!("a launch with nothing to claim cannot lose it"),
+        }
+    }
+}
+
 /// executes jobs against a store. cheap to clone.
 #[derive(Clone)]
 pub struct Runner {
@@ -485,6 +521,12 @@ pub struct Runner {
     // process that runs no election says yes to everything, which is what
     // every one-shot and every directly built runner is
     deciding: Deciding,
+    // whether a launch through this handle is a *decision*, and so is fenced
+    // against the term above. set by `as_decider` and nothing else: an api
+    // launch on a process that is not the decider is still a launch, and
+    // refusing it because a cron loop would have been refused would be a
+    // control plane that stops working for the wrong reason
+    fenced: bool,
     // how many runs this process will execute at once, whatever the queue holds
     slots: usize,
     // the most op runs one run may expand its fan-outs into, across every
@@ -566,6 +608,7 @@ impl Runner {
             durable: false,
             role: Role::default(),
             deciding: Deciding::sole(),
+            fenced: false,
             slots: usize::MAX,
             max_instances: DEFAULT_MAX_INSTANCES,
             dispatching: Arc::new(Mutex::new(())),
@@ -681,9 +724,38 @@ impl Runner {
     ///
     /// **an atomic read, never a query.** a loop asks this on every pass, and a
     /// pass that spent a round trip to find out whether it was allowed to look
-    /// would cost more than the looking.
+    /// would cost more than the looking. it is also only ever *this process's*
+    /// opinion, which is why [`as_decider`](Self::as_decider) exists.
     pub(crate) fn may_decide(&self) -> bool {
         self.deciding.leading()
+    }
+
+    /// the same runner, with every run it launches fenced against the deciding
+    /// term at the moment the store takes the write.
+    ///
+    /// the deciding loops launch through this and nothing else does. a launch
+    /// made through it while this process is not the decider is refused by the
+    /// store rather than by the check above, which is the difference between a
+    /// process that has stopped deciding and a process that *believes* it has
+    /// stopped deciding: after a long enough pause the second one is the only
+    /// one there is.
+    pub(crate) fn as_decider(&self) -> Runner {
+        Runner {
+            fenced: true,
+            ..self.clone()
+        }
+    }
+
+    /// the term this handle's launches are checked against.
+    fn fence(&self) -> Fenced<'_> {
+        match (self.fenced, self.deciding.term()) {
+            (true, Some(term)) => Fenced::Under {
+                holder: self.claimer,
+                term,
+            },
+            // an unfenced handle, or a process that runs no election at all
+            _ => Fenced::Never,
+        }
     }
 
     /// what happens to a run this deployment loses track of.
@@ -1060,19 +1132,18 @@ impl Runner {
         tags: RunTags,
         priority: Option<i64>,
     ) -> Result<String, Error> {
-        Ok(self
-            .enqueue(
-                job,
-                None,
-                params,
-                trigger,
-                Lineage::None,
-                None,
-                Claimed::Nothing,
-                tags,
-                priority,
-            )?
-            .expect("only a claim already taken skips a launch"))
+        self.enqueue(
+            job,
+            None,
+            params,
+            trigger,
+            Lineage::None,
+            None,
+            Claimed::Nothing,
+            tags,
+            priority,
+        )?
+        .queued()
     }
 
     /// [`Runner::launch`] for a run that stands for a logical time: the cron
@@ -1087,32 +1158,36 @@ impl Runner {
         trigger: Trigger,
         scheduled_for: Option<DateTime<Utc>>,
     ) -> Result<String, Error> {
-        Ok(self
-            .enqueue(
-                job,
-                None,
-                params,
-                trigger,
-                Lineage::None,
-                scheduled_for,
-                Claimed::Nothing,
-                RunTags::new(),
-                None,
-            )?
-            .expect("only a claim already taken skips a launch"))
+        self.enqueue(
+            job,
+            None,
+            params,
+            trigger,
+            Lineage::None,
+            scheduled_for,
+            Claimed::Nothing,
+            RunTags::new(),
+            None,
+        )?
+        .queued()
     }
 
     /// [`Runner::launch_at`] for one cron occurrence, with the
     /// [tick](crate::Tick) that records the fire written in the same
     /// transaction as the run.
     ///
-    /// `Ok(None)` is a refusal rather than a failure: some process, this one on
-    /// an earlier pass or another one entirely, has already fired this
-    /// occurrence, the unique index over `(job, expr, scheduled_for)` said so,
-    /// and this call wrote nothing at all. that is the whole backstop: two
+    /// [`Launched::Taken`] is a refusal rather than a failure: some process,
+    /// this one on an earlier pass or another one entirely, has already fired
+    /// this occurrence, the unique index over `(job, expr, scheduled_for)` said
+    /// so, and this call wrote nothing at all. that is the whole backstop: two
     /// schedulers racing the same occurrence produce one tick and one run
     /// because the *store* refuses the second, not because either of them
     /// checked first.
+    ///
+    /// [`Launched::Stale`] is the other refusal: this process was the decider
+    /// when the pass began and was not by the time the write landed. nobody
+    /// fired the occurrence, and the new decider's catch-up is what will
+    /// account for it.
     pub(crate) fn fire_scheduled(
         &self,
         job: &str,
@@ -1120,7 +1195,7 @@ impl Runner {
         at: DateTime<Utc>,
         params: Value,
         caught_up: bool,
-    ) -> Result<Option<String>, Error> {
+    ) -> Result<Launched, Error> {
         self.enqueue(
             job,
             None,
@@ -1142,8 +1217,8 @@ impl Runner {
     /// [`Runner::launch`] for a request carrying a [run
     /// key](crate::RunRequest::key): the key is claimed in the same
     /// transaction that creates the run, so it can never name a run that was
-    /// not created. `Ok(None)` is a key already claimed: nothing launched,
-    /// and nothing failed.
+    /// not created. [`Launched::Taken`] is a key already claimed: nothing
+    /// launched, and nothing failed.
     pub(crate) fn launch_keyed(
         &self,
         job: &str,
@@ -1151,7 +1226,7 @@ impl Runner {
         trigger: Trigger,
         key: RunKey<'_>,
         tags: RunTags,
-    ) -> Result<Option<String>, Error> {
+    ) -> Result<Launched, Error> {
         self.enqueue(
             job,
             None,
@@ -1412,19 +1487,18 @@ impl Runner {
         tags: RunTags,
         priority: Option<i64>,
     ) -> Result<String, Error> {
-        Ok(self
-            .enqueue(
-                job,
-                Some((ops, seeded)),
-                params,
-                trigger,
-                lineage,
-                None,
-                Claimed::Nothing,
-                tags,
-                priority,
-            )?
-            .expect("only a claim already taken skips a launch"))
+        self.enqueue(
+            job,
+            Some((ops, seeded)),
+            params,
+            trigger,
+            lineage,
+            None,
+            Claimed::Nothing,
+            tags,
+            priority,
+        )?
+        .queued()
     }
 
     /// re-run a finished run from where it broke: every op that did not
@@ -1917,7 +1991,7 @@ impl Runner {
         claimed: Claimed<'_>,
         tags: RunTags,
         priority: Option<i64>,
-    ) -> Result<Option<String>, Error> {
+    ) -> Result<Launched, Error> {
         let job = self
             .jobs
             .get(job)
@@ -2015,18 +2089,22 @@ impl Runner {
         // an earlier run that live in this process's memory and nowhere a
         // claimer in another process could look
         let plan = subset_plan.then(|| json!({ "ops": &pending, "seeds": &seeded }));
-        if !self
+        match self
             .store
-            .create_run_keyed(&run, &rows, claimed, plan.as_ref())?
+            .create_run_keyed(&run, &rows, claimed, plan.as_ref(), self.fence())?
         {
+            Landed::Yes => {}
             // the claim was taken between the caller's check and this insert:
             // no run row was written, and nothing launched
-            return Ok(None);
+            Landed::Taken => return Ok(Launched::Taken),
+            // and this process was not the decider by the time the write got
+            // there. same outcome, opposite meaning
+            Landed::Stale => return Ok(Launched::Stale),
         }
         // enqueued and on disk; whether it starts now is the dispatcher's
         // business, and with no limits declared "now" is this call
         self.dispatch();
-        Ok(Some(run.id))
+        Ok(Launched::Queued(run.id))
     }
 }
 

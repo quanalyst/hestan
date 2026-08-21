@@ -642,6 +642,39 @@ pub(crate) struct Fire<'a> {
     pub caught_up: bool,
 }
 
+/// the [deciding term](Decider) a write is checked against, in the transaction
+/// that makes it.
+///
+/// this is the answer to the one thing a lease cannot do. a leader that stops
+/// the world past its own expiry and resumes still holds the memory of holding
+/// it, and every check it makes in its own process agrees with that memory.
+/// the store does not: the term it writes under is compared against the term
+/// the row actually has, inside the transaction, so the decision is refused
+/// where it lands rather than argued about where it was made.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) enum Fenced<'a> {
+    /// not a decision, or a process running no election: there is no term to
+    /// be stale, so nothing is checked.
+    #[default]
+    Never,
+    /// refuse this write unless `holder` still holds the deciding lease under
+    /// `term`, with a lease that has not run out.
+    Under { holder: &'a str, term: u64 },
+}
+
+/// what came of a write that had something to claim or a term to name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Landed {
+    /// on disk, claim and all.
+    Yes,
+    /// somebody already made this decision: the occurrence has a fire against
+    /// it, or the run key is claimed. nothing was written.
+    Taken,
+    /// the deciding lease moved on before this reached the store. nothing was
+    /// written.
+    Stale,
+}
+
 /// what a launch has to claim before it is allowed to exist.
 ///
 /// [`Store::create_run_keyed`] takes the claim in the same transaction as the
@@ -1649,7 +1682,7 @@ impl Store {
     /// form.
     #[cfg(test)]
     pub(crate) fn create_run(&self, run: &Run, ops: &[String]) -> Result<(), Error> {
-        self.create_run_keyed(run, ops, Claimed::Nothing, None)
+        self.create_run_keyed(run, ops, Claimed::Nothing, None, Fenced::Never)
             .map(|_| ())
     }
 
@@ -1664,11 +1697,16 @@ impl Store {
     /// still leaves the window where the process dies between the insert and
     /// the launch.
     ///
-    /// returns false when the claim was already taken: nothing is written, and
-    /// the caller launches nothing. for a [fire](Fire) that is another process
+    /// [`Landed::Taken`] is a claim already taken: nothing is written, and the
+    /// caller launches nothing. for a [fire](Fire) that is another process
     /// having already fired this occurrence, and it is a refusal rather than an
     /// error: the occurrence *was* fired, once, and the caller is being told it
     /// was not the one that fired it.
+    ///
+    /// [`Landed::Stale`] is the [term fence](Fenced) refusing a decision made
+    /// by a process that has stopped being the decider. nothing is written
+    /// there either, and the two are told apart because they mean opposite
+    /// things: one is work already done and the other is work nobody has done.
     ///
     /// `plan` is what this run will execute when something claims it; see the
     /// `runs.plan` note on the v14 migration. `None` means the whole job.
@@ -1678,11 +1716,19 @@ impl Store {
         ops: &[String],
         claimed: Claimed<'_>,
         plan: Option<&Value>,
-    ) -> Result<bool, Error> {
+        fenced: Fenced<'_>,
+    ) -> Result<Landed, Error> {
         let at = Utc::now();
         let mut conn = self.conn();
         let (insert, ignore) = conn.dialect().insert_or_ignore();
         let mut tx = conn.begin()?;
+        // the fence first, because the lock it takes is what makes everything
+        // under it part of the same term
+        if let Fenced::Under { holder, term } = fenced
+            && !fence(&mut tx, holder, term, at)?
+        {
+            return Ok(Landed::Stale);
+        }
         match claimed {
             Claimed::Nothing => {}
             Claimed::Key(k) => {
@@ -1696,7 +1742,7 @@ impl Store {
                 // dropping the transaction rolls it back, so losing the claim
                 // leaves neither a run nor a key behind
                 if claimed == 0 {
-                    return Ok(false);
+                    return Ok(Landed::Taken);
                 }
             }
             // written after the run below rather than here, so a single
@@ -1754,10 +1800,10 @@ impl Store {
         if let Claimed::Fire(fire) = claimed
             && !write_tick(&mut tx, fire, TickOutcome::Fired, Some(&run.id), None, at)?
         {
-            return Ok(false);
+            return Ok(Landed::Taken);
         }
         tx.commit()?;
-        Ok(true)
+        Ok(Landed::Yes)
     }
 
     /// whether `sensor` has already launched a run under `key`.
@@ -5024,6 +5070,29 @@ fn write_event(tx: &mut impl Exec, ev: &NewEvent<'_>, at: DateTime<Utc>) -> Resu
     Ok(())
 }
 
+/// refuse this transaction unless `holder` still holds the deciding lease under
+/// `term`, and hold the row against anybody taking it until this transaction
+/// ends.
+///
+/// **a write, not a read, and that is the whole of it.** the row is set to what
+/// it already says, which changes nothing and locks everything: postgres takes
+/// a row lock, so an acquisition racing this one blocks until the decision
+/// commits or rolls back, and one that got in first is what this statement then
+/// reads and refuses against. sqlite makes the transaction a write transaction
+/// at the same moment, which is the same guarantee spelled the way that backend
+/// spells it. a `SELECT` here would be a read of a row somebody else could
+/// change a microsecond later, which is exactly the argument this exists to
+/// stop having.
+fn fence(tx: &mut impl Exec, holder: &str, term: u64, now: DateTime<Utc>) -> Result<bool, Error> {
+    let held = tx.execute(
+        "UPDATE decider SET term = term
+         WHERE claimed_by = ?1 AND term = ?2
+           AND lease_until IS NOT NULL AND lease_until >= ?3",
+        args![holder, term as i64, now.to_rfc3339()],
+    )?;
+    Ok(held > 0)
+}
+
 /// one occurrence and what the scheduler did about it, plus the
 /// [event](EventKind::ScheduleFired) that says the same thing on the activity
 /// feed, in whatever transaction the caller is already in.
@@ -5337,7 +5406,7 @@ mod tests {
     use super::*;
     use crate::model::Trigger;
     use crate::schedule::Schedule;
-    use chrono::TimeZone;
+    use chrono::{TimeZone, Timelike};
     use serde_json::json;
 
     fn mk_run(id: &str, job: &str, created_at: DateTime<Utc>) -> Run {
@@ -7590,7 +7659,7 @@ mod tests {
     fn fires_again(store: &Store, due: &str) -> bool {
         let at = at_utc(due);
         let id = format!("run-{due}");
-        store
+        let landed = store
             .create_run_keyed(
                 &mk_run(&id, "etl", Utc::now()),
                 &["a".into()],
@@ -7601,8 +7670,10 @@ mod tests {
                     caught_up: false,
                 }),
                 None,
+                Fenced::Never,
             )
-            .unwrap()
+            .unwrap();
+        landed == Landed::Yes
     }
 
     fn at_utc(s: &str) -> DateTime<Utc> {
@@ -7629,22 +7700,133 @@ mod tests {
                             caught_up: false,
                         }),
                         None,
+                        Fenced::Never,
                     )
                     .unwrap()
             };
-            assert!(fire("r1"));
+            assert_eq!(fire("r1"), Landed::Yes);
 
             let log = store.event_log(&EventQuery::default(), 10).unwrap();
             let kinds: Vec<EventKind> = log.iter().rev().map(|e| e.kind.clone()).collect();
             assert_eq!(kinds, [EventKind::RunQueued, EventKind::ScheduleFired]);
 
             // and a refused one leaves neither, which is the half that is new
-            assert!(!fire("r2"));
+            assert_eq!(fire("r2"), Landed::Taken);
             assert_eq!(
                 store.event_log(&EventQuery::default(), 10).unwrap().len(),
                 2
             );
             assert!(store.run("r2").unwrap().is_none());
+        });
+    }
+
+    // the part a lease cannot do on its own. a process that paused past its
+    // expiry believes every check it makes in its own memory; this is the one
+    // it makes in the transaction that writes the decision
+    #[test]
+    fn a_decision_written_under_a_term_that_moved_on_is_refused() {
+        both(|db| {
+            let store = db.store();
+            let minute = Duration::from_secs(60);
+            let fire = |id: &str, hour: u32, fenced: Fenced<'_>| {
+                store
+                    .create_run_keyed(
+                        &mk_run(id, "etl", Utc::now()),
+                        &["a".into()],
+                        Claimed::Fire(Fire {
+                            job: "etl",
+                            expr: "0 * * * *",
+                            scheduled_for: Utc.with_ymd_and_hms(2026, 4, 1, hour, 0, 0).unwrap(),
+                            caught_up: false,
+                        }),
+                        None,
+                        fenced,
+                    )
+                    .unwrap()
+            };
+
+            assert_eq!(store.take_decision_lease("alpha", minute).unwrap(), Some(1));
+            let alpha = Fenced::Under {
+                holder: "alpha",
+                term: 1,
+            };
+            assert_eq!(fire("under-1", 9, alpha), Landed::Yes);
+
+            // the lease moves on, and alpha is none the wiser: it still holds
+            // term 1 in its own memory and would still say it leads
+            assert!(store.release_decision_lease("alpha", 1).unwrap());
+            assert_eq!(store.take_decision_lease("beta", minute).unwrap(), Some(2));
+            assert_eq!(
+                fire("under-1-again", 10, alpha),
+                Landed::Stale,
+                "a decision under a term that moved on was written"
+            );
+            assert!(store.run("under-1-again").unwrap().is_none());
+            assert!(store.op_runs("under-1-again").unwrap().is_empty());
+            assert!(
+                store
+                    .ticks(Some("etl"), 50)
+                    .unwrap()
+                    .iter()
+                    .all(|t| t.scheduled_for.hour() != 10),
+                "a refused decision left a tick"
+            );
+
+            // and beta, which does hold it, gets the same occurrence
+            let beta = Fenced::Under {
+                holder: "beta",
+                term: 2,
+            };
+            assert_eq!(fire("under-2", 10, beta), Landed::Yes);
+
+            // an expired lease is as stale as somebody else's, and for the
+            // same reason: there was a stretch of time this process was not
+            // the decider, whether or not anybody else took it
+            assert!(store.release_decision_lease("beta", 2).unwrap());
+            assert_eq!(
+                store
+                    .take_decision_lease("gamma", Duration::from_millis(20))
+                    .unwrap(),
+                Some(3)
+            );
+            std::thread::sleep(Duration::from_millis(50));
+            let gamma = Fenced::Under {
+                holder: "gamma",
+                term: 3,
+            };
+            assert_eq!(fire("under-3", 11, gamma), Landed::Stale);
+
+            // a launch with nothing to claim is fenced just the same: a policy
+            // build and a backfill chunk have no occurrence to be second of,
+            // and the term is the whole of what refuses them
+            assert_eq!(
+                store
+                    .create_run_keyed(
+                        &mk_run("unclaimed", "etl", Utc::now()),
+                        &["a".into()],
+                        Claimed::Nothing,
+                        None,
+                        gamma,
+                    )
+                    .unwrap(),
+                Landed::Stale
+            );
+            assert!(store.run("unclaimed").unwrap().is_none());
+
+            // and a write that names no term at all is untouched by any of
+            // this, which is every manual launch and every api launch
+            assert_eq!(
+                store
+                    .create_run_keyed(
+                        &mk_run("by-hand", "etl", Utc::now()),
+                        &["a".into()],
+                        Claimed::Nothing,
+                        None,
+                        Fenced::Never,
+                    )
+                    .unwrap(),
+                Landed::Yes
+            );
         });
     }
 
@@ -7751,15 +7933,16 @@ mod tests {
                             caught_up: false,
                         }),
                         None,
+                        Fenced::Never,
                     )
                     .unwrap()
             };
 
-            assert!(fire(&alpha, "won"));
-            // a refusal, not an error: the loser is told the occurrence is
-            // spoken for, in a value it can act on rather than a database
-            // message it would have to parse
-            assert!(!fire(&beta, "lost"));
+            assert_eq!(fire(&alpha, "won"), Landed::Yes);
+            // a refusal, not an error, and one that says which refusal it is:
+            // the loser is told the occurrence is spoken for, in a value it can
+            // act on rather than a database message it would have to parse
+            assert_eq!(fire(&beta, "lost"), Landed::Taken);
 
             assert!(alpha.run("won").unwrap().is_some());
             assert!(
@@ -8118,6 +8301,7 @@ mod tests {
                     &["load".into()],
                     Claimed::Nothing,
                     Some(&plan),
+                    Fenced::Never,
                 )
                 .unwrap();
             store
@@ -8138,30 +8322,34 @@ mod tests {
                 sensor: "watch",
                 key: "2026-08-09",
             };
-            assert!(
+            assert_eq!(
                 store
                     .create_run_keyed(
                         &mk_run("r1", "etl", Utc::now()),
                         &["a".into()],
                         Claimed::Key(key),
-                        None
+                        None,
+                        Fenced::Never,
                     )
-                    .unwrap()
+                    .unwrap(),
+                Landed::Yes
             );
             assert!(store.run_key_claimed("watch", "2026-08-09").unwrap());
             assert_eq!(store.op_runs("r1").unwrap().len(), 1);
 
             // the same key again writes nothing at all (no run, no op rows, no
             // second key) because the whole thing is one transaction
-            assert!(
-                !store
+            assert_eq!(
+                store
                     .create_run_keyed(
                         &mk_run("r2", "etl", Utc::now()),
                         &["a".into()],
                         Claimed::Key(key),
-                        None
+                        None,
+                        Fenced::Never,
                     )
-                    .unwrap()
+                    .unwrap(),
+                Landed::Taken
             );
             assert!(store.run("r2").unwrap().is_none());
             assert!(store.op_runs("r2").unwrap().is_empty());

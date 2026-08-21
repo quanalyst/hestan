@@ -184,12 +184,12 @@ Hestan::new().serve(addr).await                         // both; the default
 | `Role::Scheduler` | yes | no |
 | `Role::Worker` | no | yes |
 
-**exactly one process may be `All` or `Scheduler`.** schedules, sensors,
-freshness checks, [automation policies](assets.md#automation-policies) and
-backfill chunking are decisions, and two processes making
-them independently is two of every scheduled run: there is no lock that would
-stop it. **any number of processes may be `Worker`**; that is the entire point
-of a claimable queue.
+**one process at a time is `All` or `Scheduler`**, and which one is now settled
+by [a lease in the store](#running-more-than-one-scheduler) rather than by you
+counting containers. schedules, sensors, freshness checks,
+[automation policies](assets.md#automation-policies) and backfill chunking are
+decisions, and the deployment makes each one once. **any number of processes may
+be `Worker`**; that is the entire point of a claimable queue.
 
 the [retention sweep](storage.md#retention) is on the same side of that line
 and for a sharper reason: a worker owns none of the history, and one pruning
@@ -210,6 +210,107 @@ scheduler wrote, and the two have to agree about what a job is; a run whose
 job this process does not define is left on the queue and reported as blocked
 rather than claimed and failed. in practice this means one binary started with
 different roles, which is what the compose file below does.
+
+## Running more than one scheduler
+
+start two, or ten. one of them decides and the rest wait, and nothing about
+that is your job to arrange.
+
+### The constraint is the guarantee
+
+**this is not built on the lease, and the order matters.** what makes a
+duplicate decision impossible is the store:
+
+- one `fired` tick per `(job, expr, scheduled_for)`, on a
+  [unique index](storage.md#one-fire-per-occurrence), with the tick and the run
+  written in one transaction so a refused tick launches nothing.
+- one run per `(sensor, run_key)`, on the `sensor_run_keys` primary key, the
+  same way and since [run keys](sensors.md#run-keys) existed.
+
+a distributed lock fails exactly when a process pauses, a disk stalls or a
+network splits, which is to say it fails at the moment its holder is most
+certain it still holds it. a unique index does not have moments. so the
+constraint went in first and the lease went in on top of it: **correctness comes
+from the constraint, and the lease is what stops the duplicate being
+attempted.**
+
+### The deciding lease
+
+one row in the `decider` table, in the same vocabulary the
+[run lease](#claims-and-leases) uses: `claimed_by`, `claimed_at`,
+`lease_until`. a process that decides takes it at boot, renews it every two
+seconds, and loses it by failing to renew for ten. anybody may take an expired
+one.
+
+what the run lease has no need of is the **term**, a counter that goes up on
+every acquisition and never on a renewal. a decision is written under the term
+its process believes it holds, and the store checks that term in the same
+transaction as the write. that is what a lease alone cannot do: a leader that
+stops the world past its own expiry and resumes agrees with every check it makes
+in its own memory, and disagrees with the row.
+
+`Role::All` pays nothing for this in the ordinary case. one process on one
+database finds the row free, takes it before `serve` binds its socket, and never
+contends with anybody. the exception is worth stating: a process **killed**
+without handing the lease back leaves it held until it expires, so a restart
+inside that window waits up to ten seconds before it decides anything. a clean
+stop hands it back and a first boot finds it free. ten seconds of nobody
+deciding is ten more seconds of downtime, and
+[catch-up](scheduling.md#missed-fire-catch-up) already has an answer for
+downtime.
+
+### What the term fences, and what it does not
+
+**fenced**: every run a deciding loop launches. a cron fire, a sensor request
+(keyed or not), an [automation policy](assets.md#automation-policies) build and
+a [backfill](assets.md#backfills) chunk are all refused by the store if the term
+they name has moved on, in the transaction that would have written them. nothing
+is written and no run exists.
+
+**not fenced**, and here is what each one costs if a leader pauses past its
+lease and wakes up:
+
+| decision | what a stale decider can still do | what it costs |
+| --- | --- | --- |
+| the [retention sweep](storage.md#retention) | delete rows and files its policy says are past their policy | nothing the live decider would not also have deleted; the sweep is the same sweep whoever runs it |
+| a [freshness](freshness.md) crossing | write `freshness_state` and call a late hook | one duplicate page for one asset going late |
+| [durable delivery](notifications.md#durable-delivery) | send a notification and mark it delivered | one duplicate alert, which durable delivery is [already at-least-once](notifications.md#durable-delivery) about |
+| a sensor cursor | commit a cursor over a newer one | a sensor re-reading a window, or skipping one |
+| a schedule cursor | move it forward | nothing: the column only ever moves forward, so a stale writer cannot un-account for anything |
+| the one boot sweep | it is lease-gated too, so nothing | nothing |
+
+none of these launches a run, which is why none of them is on the fenced list:
+the term rides on the run insert, and a decision with no run to insert has
+nowhere to put it. if any of them mattered enough to fence it would want a
+constraint of its own rather than a second lock, for the reason at the top of
+this section.
+
+### Handover: fired late, or missed?
+
+**an occurrence that comes due while nobody is deciding is an occurrence that
+came due during downtime, and the schedule's own
+[catch-up policy](scheduling.md#missed-fire-catch-up) decides what happens to
+it.** the `schedules.cursor` column is how far the *deployment* has accounted
+for, not how far a process has, so the process that takes over reads the dead
+one's cursor and sees the gap.
+
+- `Catchup::Skip`, the default: skipped. the cursor jumps the gap and no tick is
+  written for it, exactly as after any other downtime.
+- `Catchup::One`: the most recent missed occurrence fires, late, marked as a
+  catch-up.
+- `Catchup::All { limit }`: every missed occurrence up to the cap is accounted
+  for, oldest first, subject to the job's [overlap policy](scheduling.md#overlap-policy).
+
+a fire that was already **queued** when the decider went away survives the
+handover whatever the policy says, because the tick log *is* the queue: a
+`deferred` tick with no later tick for the same occurrence is on disk, and the
+new decider drains it as its own.
+
+### What two schedulers cost you
+
+a second scheduler is a warm spare, not more throughput. it holds a connection,
+builds the same registry and evaluates nothing. what it buys is that a killed
+decider is a ten-second gap rather than an outage until somebody notices.
 
 ### A queue worker is not an op subprocess
 
@@ -339,12 +440,15 @@ machine, and a process on another host differs from a process on this one
 only in which socket it opens. it follows, and the difference between "it
 follows" and "it was run" is the difference this paragraph exists to keep.
 
-two things do still hold whatever the backend. **exactly one process may be
-`All` or `Scheduler`**: postgres does not change that, because two processes
-independently deciding to fire a schedule is two runs and there is no lock
-that would stop it. and **sqlite is still right** for one host: it needs no
+two things do still hold whatever the backend. **one process at a time
+decides**, and both backends enforce it the same way: the unique index over the
+occurrence and the [deciding lease](#running-more-than-one-scheduler) are the
+same schema on either. and **sqlite is still right** for one host: it needs no
 server, and reaching for postgres to run one container is a database to
-operate for nothing.
+operate for nothing. two deciding processes on one sqlite file work, and are a
+strange thing to want: they have to share a filesystem to share the file, so
+they are on one host, and a spare decider on the host that just died is not a
+spare.
 
 ## What this does not do
 
