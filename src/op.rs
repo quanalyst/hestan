@@ -3,6 +3,7 @@ use std::fmt;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use chrono::{DateTime, Utc};
 use futures::future::BoxFuture;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -119,6 +120,33 @@ impl MetaTable {
     }
 }
 
+/// a sample of what an op wrote, and the moment it was taken: what
+/// [`OpCtx::saved`] stages, and what marks one metadata entry out from the
+/// counts and paths beside it.
+///
+/// the moment is the point of the wrapper. a sample is what the table held
+/// when the op read it back, so anything showing it can say when that was
+/// rather than let it read as the table now.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Sample {
+    taken_at: DateTime<Utc>,
+    value: Box<Meta>,
+}
+
+impl Sample {
+    /// when the op took it.
+    pub fn taken_at(&self) -> DateTime<Utc> {
+        self.taken_at
+    }
+
+    /// the value itself, of whatever type the op reported it as. never
+    /// another [`Saved`](Meta::Saved): marking a marked value is one sample,
+    /// not two.
+    pub fn value(&self) -> &Meta {
+        &self.value
+    }
+}
+
 /// a typed fact an op attaches to what it produced, via [`OpCtx::meta`]. the
 /// type is not decoration: it is what lets a row count render as a number, a
 /// source as a link, and a blob as a blob, without anything downstream
@@ -165,6 +193,10 @@ pub enum Meta {
     RunRef(String),
     /// an asset of this deployment, by name, rendered as a link to it.
     AssetRef(String),
+    /// a sample of what the op wrote, wrapping the value it reported; build
+    /// it with [`OpCtx::saved`], or with [`Meta::saved`] to place one
+    /// somewhere `saved` cannot reach.
+    Saved(Sample),
 }
 
 impl Meta {
@@ -238,13 +270,37 @@ impl Meta {
         Meta::AssetRef(name.into())
     }
 
+    /// mark a value as a sample of what the op wrote, taken now.
+    /// [`OpCtx::saved`] is the call site this is for; reach for this one when
+    /// the value is going somewhere else, such as
+    /// [`meta_of`](OpCtx::meta_of) on an op producing several assets.
+    pub fn saved(value: impl Into<Meta>) -> Meta {
+        Meta::saved_at(Utc::now(), value)
+    }
+
+    /// the same, taken at a moment the op names rather than at the moment it
+    /// says so. for a sample read at a snapshot the op knows the time of, and
+    /// for tests that want a fixed one.
+    pub fn saved_at(taken_at: DateTime<Utc>, value: impl Into<Meta>) -> Meta {
+        // marking a marked value is one sample at the outer moment, not a
+        // wrapper around a wrapper for everything downstream to unpick
+        let value = match value.into() {
+            Meta::Saved(inner) => *inner.value,
+            value => value,
+        };
+        Meta::Saved(Sample {
+            taken_at,
+            value: Box::new(value),
+        })
+    }
+
     /// the stored shape: one tagged value per name, so
     /// `{"rows": {"int": 1234}, "source": {"url": ".."}}`. written out rather
     /// than derived, because it is a wire format the api and the ui read, and
     /// a format nothing may quietly renumber, since rows written by an older
     /// hestan are still on disk. every tag ever emitted still reads
-    /// ([`from_tagged`](Self::from_tagged)); the ones this phase added are
-    /// `table`, `bytes`, `duration_secs`, `count`, `path`, `run` and `asset`.
+    /// ([`from_tagged`](Self::from_tagged)), and a new type arrives as a new
+    /// tag beside the old ones rather than as a change to one.
     ///
     /// a duration's tag names its unit, because the number alone cannot: it is
     /// seconds, as a float.
@@ -269,6 +325,10 @@ impl Meta {
             Meta::Path(v) => json!({ "path": v }),
             Meta::RunRef(v) => json!({ "run": v }),
             Meta::AssetRef(v) => json!({ "asset": v }),
+            Meta::Saved(s) => json!({ "saved": {
+                "taken_at": s.taken_at.to_rfc3339(),
+                "value": s.value.tagged(),
+            }}),
         }
     }
 
@@ -322,6 +382,17 @@ impl Meta {
             "path" => Meta::Path(v.as_str()?.to_string()),
             "run" => Meta::RunRef(v.as_str()?.to_string()),
             "asset" => Meta::AssetRef(v.as_str()?.to_string()),
+            "saved" => {
+                let s = v.as_object()?;
+                let taken_at = DateTime::parse_from_rfc3339(s.get("taken_at")?.as_str()?)
+                    .ok()?
+                    .with_timezone(&Utc);
+                let value = Meta::from_tagged(s.get("value")?)?;
+                Meta::Saved(Sample {
+                    taken_at,
+                    value: Box::new(value),
+                })
+            }
             _ => return None,
         })
     }
@@ -331,6 +402,12 @@ impl Meta {
     /// not a number. this is what deltas and trends are computed over, so the
     /// units are display types over the same one number and a `Count` compares
     /// against an `Int` of the same value.
+    ///
+    /// a [`Saved`](Self::Saved) sample is not a number either, whatever it
+    /// wraps. a delta needs the unit to render, and the unit sits inside the
+    /// wrapper, where nothing computing over metadata looks; a key that wants
+    /// a delta wants [`meta`](OpCtx::meta) rather than
+    /// [`saved`](OpCtx::saved).
     pub fn as_f64(&self) -> Option<f64> {
         let n = match self {
             Meta::Int(v) => *v as f64,
@@ -1633,6 +1710,42 @@ impl OpCtx {
             .insert(name.into(), value.into());
     }
 
+    /// attach a typed fact as **a sample of what this op wrote**: the rows it
+    /// left behind, the series it appended to. staged and stored exactly like
+    /// [`meta`](Self::meta), and marked, which is what puts it in the run
+    /// page's saved section without anybody selecting the op first:
+    ///
+    /// ```no_run
+    /// # use hestan::{Meta, Op, OpCtx};
+    /// # use serde_json::json;
+    /// # fn top_regions() -> Vec<Vec<serde_json::Value>> { vec![] }
+    /// Op::new("load", |ctx: OpCtx| async move {
+    ///     ctx.meta("rows", 1_234);
+    ///     ctx.saved("by_region", Meta::table(
+    ///         [("region", "text"), ("orders", "int")],
+    ///         top_regions(),
+    ///     ));
+    ///     Ok(json!({"loaded": true}))
+    /// });
+    /// ```
+    ///
+    /// the op supplies the sample because the op is the one holding the
+    /// connection. it selects its own rows back in the three lines above;
+    /// hestan runs no query of its own, holds no credentials and knows no
+    /// dialect.
+    ///
+    /// **it is a snapshot, not a view.** what is stored is what the op read
+    /// at the moment it called this, stamped with that moment. a later write
+    /// to the same table does not reach it, and nothing goes back to look:
+    /// this is a record of what a run wrote, which is a different question
+    /// from what the table holds now.
+    ///
+    /// a saved value carries no [delta](Self::meta), because
+    /// [`as_f64`](Meta::as_f64) reports no number for one.
+    pub fn saved(&self, name: impl Into<String>, value: impl Into<Meta>) {
+        self.meta(name, Meta::saved(value));
+    }
+
     /// what this op has staged so far, in stored form. the asset wrapper
     /// reads it without taking it: the same map goes on the materialization
     /// and on the op run.
@@ -1862,6 +1975,8 @@ mod tests {
             Meta::path("/tmp/orders.parquet".to_string()),
             Meta::run_ref("019fe109"),
             Meta::asset_ref("orders"),
+            Meta::saved_at(at("2026-08-20T09:00:00Z"), Meta::count(3)),
+            Meta::saved_at(at("2026-08-20T09:00:00.123456789Z"), Meta::Text("t".into())),
         ];
         for meta in all {
             assert_eq!(
@@ -1880,6 +1995,47 @@ mod tests {
         );
         assert_eq!(Meta::run_ref("r1").tagged(), json!({"run": "r1"}));
         assert_eq!(Meta::asset_ref("a").tagged(), json!({"asset": "a"}));
+        assert_eq!(
+            Meta::saved_at(at("2026-08-20T09:00:00Z"), Meta::count(3)).tagged(),
+            json!({"saved": {"taken_at": "2026-08-20T09:00:00+00:00", "value": {"count": 3}}})
+        );
+    }
+
+    fn at(iso: &str) -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339(iso)
+            .unwrap()
+            .with_timezone(&Utc)
+    }
+
+    // the mark is what makes a run-level section possible, so what it carries
+    // and what it refuses to carry twice are both part of the format
+    #[test]
+    fn a_sample_carries_the_moment_it_was_taken_and_is_marked_once() {
+        let taken = at("2026-08-20T09:00:00Z");
+        let Meta::Saved(sample) = Meta::saved_at(taken, Meta::count(3)) else {
+            unreachable!()
+        };
+        assert_eq!(sample.taken_at(), taken);
+        assert_eq!(sample.value(), &Meta::count(3));
+
+        // marking a marked value is one sample at the outer moment
+        let later = at("2026-08-20T10:00:00Z");
+        assert_eq!(
+            Meta::saved_at(later, Meta::saved_at(taken, Meta::count(3))),
+            Meta::saved_at(later, Meta::count(3))
+        );
+
+        // the unstamped constructor stamps now, which is the whole claim it
+        // makes: the sample is of the moment the op called it
+        let before = Utc::now();
+        let Meta::Saved(now) = Meta::saved(Meta::count(3)) else {
+            unreachable!()
+        };
+        assert!(
+            now.taken_at() >= before && now.taken_at() <= Utc::now(),
+            "stamped {} outside the call",
+            now.taken_at()
+        );
     }
 
     // a value from a newer hestan, and a few shapes that are not values at all
@@ -1951,6 +2107,9 @@ mod tests {
             Meta::run_ref("12"),
             Meta::asset_ref("12"),
             Meta::table(["n"], [vec![json!(12)]]),
+            // a sample of a count is not a count: the unit a delta would need
+            // to render is inside the wrapper, where nothing looks
+            Meta::saved(Meta::count(12)),
         ] {
             assert_eq!(meta.as_f64(), None, "{meta:?} reported a number");
         }

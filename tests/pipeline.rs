@@ -557,6 +557,119 @@ async fn every_metadata_variant_round_trips_on_the_op_run() {
     assert_eq!(quiet.metadata, None);
 }
 
+// what an op marked as a sample, unwrapped, after checking the mark carries a
+// moment that parses. the moment itself is wall clock and no test asserts it
+fn saved_value(metadata: &Value, name: &str) -> Value {
+    let saved = metadata
+        .get(name)
+        .unwrap_or_else(|| panic!("{name} is not in the metadata"))
+        .get("saved")
+        .unwrap_or_else(|| panic!("{name} is not marked as a sample"));
+    chrono::DateTime::parse_from_rfc3339(saved["taken_at"].as_str().unwrap()).unwrap();
+    saved["value"].clone()
+}
+
+// ctx.meta and ctx.saved are the same staging and the same storage; the mark
+// is the whole difference, and an op that reports facts without saving a
+// sample carries none of it
+#[tokio::test]
+async fn only_what_an_op_saved_is_marked_as_a_sample() {
+    let job = Job::builder("report")
+        .op(Op::new("emit", |ctx: OpCtx| async move {
+            ctx.meta("rows", 1_234);
+            ctx.saved("head", Meta::table([("id", "int")], [vec![json!(1)]]));
+            Ok(json!(null))
+        }))
+        .op(Op::new("facts", |ctx: OpCtx| async move {
+            ctx.meta("rows", 7);
+            Ok(json!(null))
+        }))
+        .op(Op::new("quiet", |_| async { Ok(json!(null)) }))
+        .build()
+        .unwrap();
+    let runner = Runner::new([job], Store::open(":memory:").unwrap()).unwrap();
+    let run = runner
+        .run("report", json!({}), Trigger::Manual)
+        .await
+        .unwrap();
+    assert_eq!(run.status, RunStatus::Success);
+
+    let ops = runner.store().op_runs(&run.id).unwrap();
+    let meta = |op: &str| ops.iter().find(|o| o.op == op).unwrap().metadata.clone();
+    let emit = meta("emit").unwrap();
+    // the unmarked fact is stored exactly as it always was
+    assert_eq!(emit["rows"], json!({"int": 1234}));
+    assert_eq!(
+        saved_value(&emit, "head"),
+        json!({"table": {
+            "columns": [{"name": "id", "type": "int"}],
+            "rows": [[1]],
+            "truncated": false,
+        }})
+    );
+    // an op reporting facts and saving nothing has nothing marked, so there
+    // is nothing for a saved section to collect from it
+    let facts = meta("facts").unwrap();
+    assert_eq!(facts, json!({"rows": {"int": 7}}));
+    assert!(!facts.to_string().contains("saved"));
+    assert_eq!(meta("quiet"), None);
+}
+
+// staged per attempt like every other fact: the attempt that failed took its
+// sample with it, and the resume that reran the op wrote the sample the
+// attempt that worked took
+#[tokio::test]
+async fn a_saved_sample_is_staged_per_attempt_and_survives_a_resume() {
+    let fixed = Arc::new(AtomicBool::new(false));
+    let flag = fixed.clone();
+    let job = Job::builder("chain")
+        .op(Op::new("a", |ctx: OpCtx| async move {
+            ctx.saved("head", Meta::table(["id"], [vec![json!(1)]]));
+            Ok(json!(null))
+        }))
+        .op(Op::new("b", move |ctx: OpCtx| {
+            let fixed = flag.clone();
+            async move {
+                ctx.saved("head", Meta::table(["id"], [vec![json!(2)]]));
+                if !fixed.load(Ordering::SeqCst) {
+                    return Err("not yet".into());
+                }
+                Ok(json!(null))
+            }
+        })
+        .after(["a"]))
+        .build()
+        .unwrap();
+    let runner = Runner::new([job], Store::open(":memory:").unwrap()).unwrap();
+    let first = runner
+        .run("chain", json!({}), Trigger::Manual)
+        .await
+        .unwrap();
+    assert_eq!(first.status, RunStatus::Failed);
+    let ops = runner.store().op_runs(&first.id).unwrap();
+    assert_eq!(ops.iter().find(|o| o.op == "b").unwrap().metadata, None);
+    let a = ops.iter().find(|o| o.op == "a").unwrap().metadata.clone();
+    assert_eq!(
+        saved_value(&a.unwrap(), "head")["table"]["rows"],
+        json!([[1]])
+    );
+
+    fixed.store(true, Ordering::SeqCst);
+    let second = runner.resume(&first.id).unwrap();
+    let second = settled(&runner, &second).await;
+    assert_eq!(second.status, RunStatus::Success);
+    // a did not run again, so its sample stays on the run that took it: a
+    // resume writes rows for what it reran and nothing else
+    assert_eq!(op_names(&runner, &second.id), ["b"]);
+    let b = runner.store().op_runs(&second.id).unwrap()[0]
+        .metadata
+        .clone();
+    assert_eq!(
+        saved_value(&b.unwrap(), "head")["table"]["rows"],
+        json!([[2]])
+    );
+}
+
 #[tokio::test]
 async fn failed_attempt_metadata_dropped_on_retry() {
     let calls = Arc::new(AtomicU32::new(0));

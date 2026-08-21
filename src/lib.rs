@@ -168,7 +168,9 @@ pub use model::{
     RunStatus, RunTags, ScheduleRow, SensorOutcome, SensorRow, SensorTick, Severity, SubjectKind,
     Tick, TickOutcome, Trigger, When,
 };
-pub use op::{InputError, META_TABLE_ROWS, Meta, MetaColumn, MetaTable, Op, OpCtx, OpResult};
+pub use op::{
+    InputError, META_TABLE_ROWS, Meta, MetaColumn, MetaTable, Op, OpCtx, OpResult, Sample,
+};
 pub use partition::{PartitionMapping, Partitions};
 pub use policy::AutoPolicy;
 pub use rate::RateStatus;

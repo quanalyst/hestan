@@ -21,6 +21,46 @@ fn doc_assets() -> Vec<Asset> {
     vec![docs, stats, totals]
 }
 
+// an asset op's metadata is written twice, and a sample is metadata: the op
+// run is what that run did, the materialization is what that build reported
+// and outlives the run
+#[tokio::test]
+async fn a_saved_sample_lands_on_the_op_run_and_on_the_materialization() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("hestan.db");
+    let db = db.to_str().unwrap();
+
+    let rows = Asset::new("rows", |ctx: OpCtx| async move {
+        ctx.meta("rows", 2);
+        // the op holds the connection, so it selects its own sample back;
+        // nothing here asks hestan to run a query
+        ctx.saved(
+            "head",
+            Meta::table([("id", "int")], [vec![json!(1)], vec![json!(2)]]),
+        );
+        Ok(json!({"rows": 2}))
+    });
+    let run = Hestan::new()
+        .assets(vec![rows])
+        .db(db)
+        .build_asset("rows")
+        .await
+        .unwrap();
+    assert_eq!(run.status, RunStatus::Success);
+
+    let store = Store::open(db).unwrap();
+    let op = store.op_runs(&run.id).unwrap()[0].metadata.clone().unwrap();
+    let history = store.materializations("rows", None, 10).unwrap();
+    let built = history[0].mat.metadata.clone().unwrap();
+    assert_eq!(op, built, "the two copies are the same map");
+
+    let head = built.get("head").unwrap().get("saved").expect("not marked");
+    chrono::DateTime::parse_from_rfc3339(head["taken_at"].as_str().unwrap()).unwrap();
+    assert_eq!(head["value"]["table"]["rows"], json!([[1], [2]]));
+    // the fact beside it is stored exactly as it was before samples existed
+    assert_eq!(built["rows"], json!({"int": 2}));
+}
+
 #[tokio::test]
 async fn build_asset_runs_headless_like_run_once() {
     let dir = tempfile::tempdir().unwrap();
