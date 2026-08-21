@@ -25,6 +25,20 @@ pub type OpResult = Result<Value, Box<dyn std::error::Error + Send + Sync>>;
 /// api response.
 pub const META_TABLE_ROWS: usize = 100;
 
+/// how many points a [`Meta::series`] keeps, applied at construction. a
+/// series is drawn as a shape and read off an axis, and two hundred points is
+/// past what a chart the width of a run page resolves: the line stops
+/// changing before the cap does.
+///
+/// it is also what the sample costs. a point is an rfc3339 timestamp and a
+/// number, so a full series is about seven and a half kilobytes of json, and
+/// it rides in `op_runs.metadata` and again on every materialization the op
+/// wrote: ten ops each saving one put roughly a hundred and fifty kilobytes
+/// on a single run. retention prunes them with the rows they sit on and
+/// nothing else does, which is why the number is chosen here rather than
+/// inherited from the table cap.
+pub const META_SERIES_POINTS: usize = 200;
+
 /// one column of a [`MetaTable`]: a name, and the type it holds when the op
 /// knows it. `"orders"` and `("orders", "int")` both convert, so a table's
 /// columns are usually written as a literal array.
@@ -147,6 +161,60 @@ impl Sample {
     }
 }
 
+/// a time-indexed sample of what an op wrote: `(timestamp, value)` points
+/// oldest first, and how many points the sample stands for. built with
+/// [`Meta::series`], which is the only way to make one: the ordering, the
+/// finiteness and the sampling are invariants rather than things a caller is
+/// asked to maintain.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MetaSeries {
+    points: Vec<(DateTime<Utc>, f64)>,
+    of: usize,
+}
+
+impl MetaSeries {
+    /// the points, oldest first. at most [`META_SERIES_POINTS`] of them, and
+    /// they span the whole range the op supplied: the first and the last are
+    /// always among them.
+    pub fn points(&self) -> &[(DateTime<Utc>, f64)] {
+        &self.points
+    }
+
+    /// how many points the sample stands for: what the op handed over, less
+    /// the non-finite values dropped at construction. this is the number that
+    /// makes "120 of 8,760 points" a true sentence.
+    pub fn of(&self) -> usize {
+        self.of
+    }
+
+    /// whether points were dropped to fit [`META_SERIES_POINTS`]. the series
+    /// answer to [`MetaTable::truncated`], and a different sentence: a
+    /// truncated table is the head of its rows, a sampled series is the whole
+    /// of its range at a coarser step.
+    pub fn sampled(&self) -> bool {
+        self.points.len() < self.of
+    }
+}
+
+/// keep at most [`META_SERIES_POINTS`] points, spanning the whole range: the
+/// first and the last always, and the rest spread evenly by position between
+/// them. evenly by position rather than by time, since a series with a gap in
+/// it has no even step to take and the points that exist are the only ones
+/// there are to keep.
+fn sample_across(points: Vec<(DateTime<Utc>, f64)>) -> Vec<(DateTime<Utc>, f64)> {
+    let (have, keep) = (points.len(), META_SERIES_POINTS);
+    if have <= keep {
+        return points;
+    }
+    // in u128 because the multiplication is the only place this could
+    // overflow, and the arithmetic is exact there for any length that fits in
+    // memory. keep >= 2 and have > keep, so the step never repeats an index
+    let last = (have - 1) as u128;
+    (0..keep)
+        .map(|i| points[(i as u128 * last / (keep - 1) as u128) as usize])
+        .collect()
+}
+
 /// a typed fact an op attaches to what it produced, via [`OpCtx::meta`]. the
 /// type is not decoration: it is what lets a row count render as a number, a
 /// source as a link, and a blob as a blob, without anything downstream
@@ -178,6 +246,9 @@ pub enum Meta {
     Json(Value),
     /// a sample of rows with named columns; build it with [`Meta::table`].
     Table(MetaTable),
+    /// a time-indexed sample of what the op wrote, drawn as a chart; build it
+    /// with [`Meta::series`].
+    Series(MetaSeries),
     /// a size in bytes, rendered `1.2 GB` rather than as the integer.
     Bytes(u64),
     /// an elapsed time, rendered `3.4s`. stored as seconds.
@@ -233,6 +304,50 @@ impl Meta {
             columns,
             rows: kept,
             truncated,
+        })
+    }
+
+    /// a time-indexed series of at most [`META_SERIES_POINTS`] points, for a
+    /// sample of something an op wrote that is measured over time:
+    ///
+    /// ```no_run
+    /// # use hestan::Meta;
+    /// # let hourly: Vec<(chrono::DateTime<chrono::Utc>, f64)> = vec![];
+    /// Meta::series(hourly);
+    /// ```
+    ///
+    /// three things happen here, and each is a decision rather than an
+    /// accident:
+    ///
+    /// - **non-finite values are dropped**, before anything else. json has no
+    ///   NaN and no infinity, and one of either makes the range meaningless
+    ///   to draw. a dropped point is not counted in [`of`](MetaSeries::of)
+    ///   either, so a series of nothing but NaN is empty rather than a sample
+    ///   standing for points it cannot show. count them yourself first if how
+    ///   many there were is a fact you want.
+    /// - **points are sorted by timestamp**, because a warehouse returns what
+    ///   it returns and arriving unsorted is the common case. the sort is
+    ///   stable, so two points sharing a timestamp keep the order they were
+    ///   given in, and neither is dropped: which of two readings for one
+    ///   instant is the right one is not hestan's to decide.
+    /// - **over the cap it is sampled across its range**, never truncated.
+    ///   the first and last points are always kept and the rest are spread
+    ///   evenly between them, so what is drawn covers the range the op read.
+    ///   keeping the first two hundred instead would draw January and label
+    ///   it a year.
+    pub fn series<P>(points: P) -> Meta
+    where
+        P: IntoIterator<Item = (DateTime<Utc>, f64)>,
+    {
+        let mut points: Vec<(DateTime<Utc>, f64)> = points
+            .into_iter()
+            .filter(|(_, value)| value.is_finite())
+            .collect();
+        points.sort_by_key(|(at, _)| *at);
+        let of = points.len();
+        Meta::Series(MetaSeries {
+            points: sample_across(points),
+            of,
         })
     }
 
@@ -319,6 +434,12 @@ impl Meta {
                 "rows": t.rows,
                 "truncated": t.truncated,
             }}),
+            Meta::Series(s) => json!({ "series": {
+                "points": s.points.iter()
+                    .map(|(at, value)| json!([at.to_rfc3339(), value]))
+                    .collect::<Vec<Value>>(),
+                "of": s.of,
+            }}),
             Meta::Bytes(v) => json!({ "bytes": v }),
             Meta::Duration(d) => json!({ "duration_secs": d.as_secs_f64() }),
             Meta::Count(v) => json!({ "count": v }),
@@ -374,6 +495,34 @@ impl Meta {
                     columns,
                     rows,
                     truncated: t.get("truncated").and_then(Value::as_bool).unwrap_or(false),
+                })
+            }
+            "series" => {
+                let s = v.as_object()?;
+                let points = s
+                    .get("points")?
+                    .as_array()?
+                    .iter()
+                    .map(|point| {
+                        let [at, value] = point.as_array()?.as_slice() else {
+                            return None;
+                        };
+                        let at = DateTime::parse_from_rfc3339(at.as_str()?)
+                            .ok()?
+                            .with_timezone(&Utc);
+                        let value = value.as_f64()?;
+                        value.is_finite().then_some((at, value))
+                    })
+                    .collect::<Option<Vec<(DateTime<Utc>, f64)>>>()?;
+                // a stored `of` below the points it is stored beside is not a
+                // sample of anything; the points win, since they are there
+                let of = s
+                    .get("of")
+                    .and_then(Value::as_u64)
+                    .map_or(points.len(), |n| n as usize);
+                Meta::Series(MetaSeries {
+                    of: of.max(points.len()),
+                    points,
                 })
             }
             "bytes" => Meta::Bytes(v.as_u64()?),
@@ -1823,6 +1972,8 @@ impl OpCtx {
 
 #[cfg(test)]
 mod tests {
+    use chrono::Datelike;
+
     use super::*;
 
     fn op() -> Op {
@@ -1975,6 +2126,11 @@ mod tests {
             Meta::path("/tmp/orders.parquet".to_string()),
             Meta::run_ref("019fe109"),
             Meta::asset_ref("orders"),
+            Meta::series([
+                (at("2026-01-01T00:00:00Z"), 1.5),
+                (at("2026-01-01T01:00:00Z"), 2.0),
+            ]),
+            Meta::series([]),
             Meta::saved_at(at("2026-08-20T09:00:00Z"), Meta::count(3)),
             Meta::saved_at(at("2026-08-20T09:00:00.123456789Z"), Meta::Text("t".into())),
         ];
@@ -1995,6 +2151,10 @@ mod tests {
         );
         assert_eq!(Meta::run_ref("r1").tagged(), json!({"run": "r1"}));
         assert_eq!(Meta::asset_ref("a").tagged(), json!({"asset": "a"}));
+        assert_eq!(
+            Meta::series([(at("2026-01-01T00:00:00Z"), 1.5)]).tagged(),
+            json!({"series": {"points": [["2026-01-01T00:00:00+00:00", 1.5]], "of": 1}})
+        );
         assert_eq!(
             Meta::saved_at(at("2026-08-20T09:00:00Z"), Meta::count(3)).tagged(),
             json!({"saved": {"taken_at": "2026-08-20T09:00:00+00:00", "value": {"count": 3}}})
@@ -2107,12 +2267,123 @@ mod tests {
             Meta::run_ref("12"),
             Meta::asset_ref("12"),
             Meta::table(["n"], [vec![json!(12)]]),
+            Meta::series([(at("2026-01-01T00:00:00Z"), 12.0)]),
             // a sample of a count is not a count: the unit a delta would need
             // to render is inside the wrapper, where nothing looks
             Meta::saved(Meta::count(12)),
         ] {
             assert_eq!(meta.as_f64(), None, "{meta:?} reported a number");
         }
+    }
+
+    // the rule this part exists for. a table keeps its head; a series that
+    // did the same would draw January and label it a year
+    #[test]
+    fn a_series_spans_its_range_rather_than_keeping_its_head() {
+        let start = at("2026-01-01T00:00:00Z");
+        let hourly: Vec<(DateTime<Utc>, f64)> = (0..8_760)
+            .map(|h| (start + chrono::Duration::hours(h), h as f64))
+            .collect();
+        let Meta::Series(s) = Meta::series(hourly.clone()) else {
+            unreachable!()
+        };
+
+        assert_eq!(s.points().len(), META_SERIES_POINTS);
+        assert!(s.sampled());
+        assert_eq!(s.of(), hourly.len(), "the count it stands for");
+        assert_eq!(s.points()[0], hourly[0], "the first point is always kept");
+        assert_eq!(
+            s.points().last(),
+            hourly.last(),
+            "the last point is always kept"
+        );
+
+        // against the head truncation this replaces, which is the comparison
+        // that says what the rule buys: the head stops in january
+        let head: Vec<(DateTime<Utc>, f64)> =
+            hourly.iter().take(META_SERIES_POINTS).copied().collect();
+        assert_eq!(head.last().unwrap().0.month(), 1);
+        assert_eq!(s.points().last().unwrap().0.month(), 12);
+
+        // and the step is even, so no stretch of the year is drawn finer than
+        // any other
+        let steps: Vec<i64> = s
+            .points()
+            .windows(2)
+            .map(|w| (w[1].0 - w[0].0).num_hours())
+            .collect();
+        assert!(
+            steps.iter().all(|hours| (44..=45).contains(hours)),
+            "uneven steps: {steps:?}"
+        );
+    }
+
+    // every awkward series has a decided answer rather than a lucky one
+    #[test]
+    fn the_awkward_series_each_have_an_answer() {
+        let series = |points: &[(DateTime<Utc>, f64)]| match Meta::series(points.to_vec()) {
+            Meta::Series(s) => s,
+            _ => unreachable!(),
+        };
+        let (a, b, c) = (
+            at("2026-01-01T00:00:00Z"),
+            at("2026-01-01T01:00:00Z"),
+            at("2026-01-01T02:00:00Z"),
+        );
+
+        // empty: an empty series, which is what the op found. not a missing
+        // one, and not an error
+        let s = series(&[]);
+        assert!(s.points().is_empty());
+        assert_eq!(s.of(), 0);
+        assert!(!s.sampled());
+
+        // one point: kept. a single reading is a fact, drawn as one mark
+        let s = series(&[(a, 1.0)]);
+        assert_eq!(s.points(), [(a, 1.0)]);
+        assert_eq!(s.of(), 1);
+
+        // out of order: sorted, since a warehouse returns what it returns
+        let s = series(&[(c, 3.0), (a, 1.0), (b, 2.0)]);
+        assert_eq!(s.points(), [(a, 1.0), (b, 2.0), (c, 3.0)]);
+
+        // duplicate timestamps: both kept, in the order they were given.
+        // dropping one would be a claim about which reading is right
+        let s = series(&[(a, 2.0), (a, 1.0), (b, 3.0)]);
+        assert_eq!(s.points(), [(a, 2.0), (a, 1.0), (b, 3.0)]);
+        assert_eq!(s.of(), 3);
+
+        // non-finite: dropped, and not counted either, so `of` is what the
+        // sample could ever have stood for
+        let s = series(&[(a, f64::NAN), (b, 2.0), (c, f64::INFINITY)]);
+        assert_eq!(s.points(), [(b, 2.0)]);
+        assert_eq!(s.of(), 1);
+        let s = series(&[(a, f64::NAN), (b, f64::NEG_INFINITY)]);
+        assert!(s.points().is_empty());
+        assert_eq!(s.of(), 0);
+
+        // exactly the cap is not a sample: nothing was dropped
+        let full: Vec<(DateTime<Utc>, f64)> = (0..META_SERIES_POINTS as i64)
+            .map(|i| (a + chrono::Duration::minutes(i), i as f64))
+            .collect();
+        let s = series(&full);
+        assert_eq!(s.points().len(), META_SERIES_POINTS);
+        assert!(!s.sampled());
+    }
+
+    // the cap is a storage decision as much as a drawing one, so the cost is
+    // asserted rather than estimated: this is what one series adds to an op
+    // run's metadata blob, and again to a materialization's
+    #[test]
+    fn a_full_series_costs_under_eight_kilobytes() {
+        let start = at("2026-01-01T00:00:00Z");
+        let minutely =
+            (0..50_000).map(|i| (start + chrono::Duration::minutes(i), 1_234.5 + i as f64));
+        let bytes = Meta::series(minutely).tagged().to_string().len();
+        assert!(
+            (7_000..8_000).contains(&bytes),
+            "a full series is {bytes} bytes of json"
+        );
     }
 
     fn delta_of(now: Value, was: Value) -> Value {

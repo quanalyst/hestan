@@ -169,7 +169,8 @@ pub use model::{
     Tick, TickOutcome, Trigger, When,
 };
 pub use op::{
-    InputError, META_TABLE_ROWS, Meta, MetaColumn, MetaTable, Op, OpCtx, OpResult, Sample,
+    InputError, META_SERIES_POINTS, META_TABLE_ROWS, Meta, MetaColumn, MetaSeries, MetaTable, Op,
+    OpCtx, OpResult, Sample,
 };
 pub use partition::{PartitionMapping, Partitions};
 pub use policy::AutoPolicy;
