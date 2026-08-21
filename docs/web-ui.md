@@ -580,7 +580,7 @@ up to make this run faster".
 ### What the run saved
 
 under the gantt, a **saved** section collects every sample every op of the run
-marked with [`ctx.saved`](metadata.md#what-a-run-saved), in op order, each one
+marked with [`ctx.saved`](metadata.md#what-a-run-saved), ordered by op name, each one
 labelled with the op that took it and the name it was saved under. it is not
 behind selecting an op: the question it answers is what this run wrote, and
 that is a question about the run.

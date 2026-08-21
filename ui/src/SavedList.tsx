@@ -9,7 +9,8 @@ interface SavedEntry {
   value: MetaValue;
 }
 
-// every sample every op of this run marked, in the order the ops come back
+// every sample every op of this run marked, in the order the ops come back,
+// which the store sorts by op name rather than by when they ran
 // and, within an op, the order the api stored them: the section is the run's,
 // so each entry keeps the name of the op that took it
 function savedEntries(ops: OpRun[]): SavedEntry[] {

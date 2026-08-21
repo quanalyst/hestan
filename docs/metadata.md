@@ -391,7 +391,7 @@ metadata for an identical value is still fresh.
   `GET /api/jobs/{name}/ops/{op}/metadata/{key}`: one numeric key over
   recent history.
 - the run page's **saved** section: every sample every op of the run marked,
-  in op order, each labelled with the op that took it and when. not behind
+  ordered by op name, each labelled with the op that took it and when. not behind
   selecting an op, and absent entirely from a run that saved nothing.
 - the run page renders the selected op's metadata by type: numbers
   right-aligned and tabular in their unit, urls as links, runs and assets as
