@@ -1,0 +1,139 @@
+# NOT RUN AGAINST A CLUSTER. nothing in deploy/k8s has been applied to a
+# cluster, scheduled by a kubelet or probed by one. the probe paths below were
+# checked against hestan's route table rather than invented, and that is a
+# different and much weaker thing than having been probed.
+#
+# the pods that decide: schedules, sensors, freshness checks, automation
+# policies, backfill chunking, retention and notification delivery. they
+# execute nothing, because `HESTAN_ROLE=scheduler` is `Role::Scheduler`.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: hestan-scheduler
+  labels:
+    app.kubernetes.io/name: hestan
+    app.kubernetes.io/component: scheduler
+spec:
+  # **two, and this is the field worth reading the comment for.**
+  #
+  # one process at a time decides, and which one is settled by a lease in the
+  # store rather than by this number. so two is safe rather than forbidden:
+  # both pods build the same registry, one holds the deciding lease and the
+  # other evaluates nothing at all until that lease runs out.
+  #
+  # what the second one buys is not throughput. it is that a pod going away
+  # becomes a gap of about one lease rather than an outage lasting however long
+  # a replacement pod takes to be scheduled, pull an image and open a database.
+  # the deciding lease is ten seconds and four handovers were measured between
+  # 8.3s and 10.4s on a compose stack on one host
+  # (`deploy/checks/handover.sh`); how long a pod takes to come back on your
+  # cluster is a number nobody here has.
+  #
+  # one is also correct, and is what you want if you would rather the deployment
+  # simply stop deciding when the scheduler is gone. more than two buys nothing
+  # over two: the spares are all doing the same nothing.
+  replicas: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: hestan
+      app.kubernetes.io/component: scheduler
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: hestan
+        app.kubernetes.io/component: scheduler
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: hestan
+          # the image built by the Dockerfile at the repository root, pushed
+          # somewhere your cluster can pull it from. a scheduler and a worker
+          # are the same image: they must build the same registry, because a
+          # worker executes runs a scheduler wrote
+          image: hestan-demo:latest
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: HESTAN_ROLE
+              value: scheduler
+          envFrom:
+            - configMapRef:
+                name: hestan
+            - secretRef:
+                name: hestan
+          ports:
+            - name: http
+              containerPort: 4000
+          # **what these probe, and what they do not.**
+          #
+          # `/api/whoami` is the one endpoint outside the auth guard, because
+          # the ui has to be able to ask whether there is a guard before it
+          # holds a token. a kubelet cannot carry a bearer token out of a
+          # secret into an httpGet header, so it is the only endpoint a probe
+          # can reach at all here.
+          #
+          # what a 200 from it proves: the process is up and its http server is
+          # answering. what it does not prove: that the store is reachable.
+          # `GET /api/health` is where that lives, in an `ok` field, and it
+          # answers 200 either way on purpose, because the endpoint answering
+          # is the news. so this is a liveness and readiness probe about
+          # *serving*, and something that can hold a token has to watch
+          # `/api/health`'s body for the rest.
+          livenessProbe:
+            httpGet:
+              path: /api/whoami
+              port: http
+            periodSeconds: 10
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /api/whoami
+              port: http
+            periodSeconds: 5
+            failureThreshold: 2
+          # opening a postgres and bringing the schema forward is the slow part
+          # of a boot, and it is slower the first time
+          startupProbe:
+            httpGet:
+              path: /api/whoami
+              port: http
+            periodSeconds: 2
+            failureThreshold: 30
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+          # guesses, not measurements. hestan itself is small; what your ops do
+          # is not, and this is the number to change first
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              memory: 512Mi
+          volumeMounts:
+            - name: work
+              mountPath: /var/lib/hestan
+      volumes:
+        # not the run log. on postgres the run log is in the database, and this
+        # is only what this pod writes for itself
+        - name: work
+          emptyDir: {}
+      # **SIGTERM does nothing to this process, and that is measured.** hestan
+      # installs no signal handler in `serve`, and the kernel drops an
+      # unhandled signal sent to pid 1 of a container rather than applying its
+      # default action. so a pod being deleted goes on running normally until
+      # this timer runs out and SIGKILL arrives. `docker stop` on this image
+      # waited its full ten seconds and reported exit 137; the same image with
+      # `--init` in front of it, so the process is not pid 1, exited on the
+      # signal in 196ms with 143.
+      #
+      # two things follow. this number is how long every scheduler pod deletion
+      # takes, not a budget it might not spend. and the deciding lease is left
+      # to expire rather than handed back: `serve` hands it back when `serve`
+      # returns, which is not what a signal does here. short, because a
+      # scheduler holds no work that more time would finish.
+      terminationGracePeriodSeconds: 10

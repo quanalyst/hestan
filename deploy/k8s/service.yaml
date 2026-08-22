@@ -1,0 +1,30 @@
+# NOT RUN AGAINST A CLUSTER. nothing in deploy/k8s has been applied to a
+# cluster, scheduled by a kubelet or probed by one.
+#
+# the ui and the api, in front of the scheduler pods.
+#
+# it selects the schedulers rather than everything with the hestan label, and
+# that is deliberate: every process serves the same ui off the same database,
+# so any of them would do, but the schedulers are the ones there are a known
+# small number of. `/api/health` is per process, so a service in front of
+# several answers about whichever one it picked, which is worth knowing before
+# you use it to diagnose one.
+#
+# ClusterIP, because a reachable hestan wants something in front of it that
+# knows about tls. see docs/auth.md for the version where that proxy decides
+# who is asking and hestan checks nothing.
+apiVersion: v1
+kind: Service
+metadata:
+  name: hestan
+  labels:
+    app.kubernetes.io/name: hestan
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: hestan
+    app.kubernetes.io/component: scheduler
+  ports:
+    - name: http
+      port: 4000
+      targetPort: http

@@ -1,0 +1,105 @@
+# NOT RUN AGAINST A CLUSTER. nothing in deploy/k8s has been applied to a
+# cluster, scheduled by a kubelet or probed by one.
+#
+# the pods that execute: they claim runs off the queue and run them, and decide
+# nothing. `HESTAN_ROLE=worker` is `Role::Worker`, which never takes the
+# deciding lease however free it looks.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: hestan-worker
+  labels:
+    app.kubernetes.io/name: hestan
+    app.kubernetes.io/component: worker
+spec:
+  # any number. this is the one that is genuinely just a dial, because a
+  # claimable queue is what makes workers interchangeable.
+  #
+  # two things scale with it and are not obvious. `HESTAN_SLOTS` is per pod, so
+  # the deployment executes at most `replicas * slots` unless
+  # `HESTAN_MAX_CONCURRENT_RUNS` is lower, which it should be. and a declared
+  # rate is per **process**: three workers each honouring "five a second" send
+  # fifteen, and the api on the other side sees fifteen. divide by this number
+  # in the registry all of them build. see docs/scaling.md#a-rate-is-per-process
+  replicas: 3
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: hestan
+      app.kubernetes.io/component: worker
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: hestan
+        app.kubernetes.io/component: worker
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: hestan
+          image: hestan-demo:latest
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: HESTAN_ROLE
+              value: worker
+          envFrom:
+            - configMapRef:
+                name: hestan
+            - secretRef:
+                name: hestan
+          # a worker needs no socket at all, and gets one here because
+          # `/api/health` is where it says which runs it is currently holding.
+          # no service points at it; the port is for probes and for you
+          ports:
+            - name: http
+              containerPort: 4000
+          # the same probe as the scheduler's, proving the same thing and not
+          # proving the same other thing; see scheduler.yaml
+          livenessProbe:
+            httpGet:
+              path: /api/whoami
+              port: http
+            periodSeconds: 10
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /api/whoami
+              port: http
+            periodSeconds: 5
+            failureThreshold: 2
+          startupProbe:
+            httpGet:
+              path: /api/whoami
+              port: http
+            periodSeconds: 2
+            failureThreshold: 30
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              cpu: 200m
+              memory: 256Mi
+            limits:
+              memory: 1Gi
+          volumeMounts:
+            - name: work
+              mountPath: /var/lib/hestan
+      volumes:
+        - name: work
+          emptyDir: {}
+      # SIGTERM does nothing to this process either; see the long version on
+      # `terminationGracePeriodSeconds` in scheduler.yaml. so a worker pod
+      # being deleted goes on claiming and executing for this long and is then
+      # killed outright.
+      #
+      # what the number buys is that a run already in flight has that much
+      # longer to finish. what it costs is that every rolling update is that
+      # much slower and the pod takes new work the whole way through it. a run
+      # that does not finish is abandoned mid-op; its claim expires one lease
+      # later and `Reclaim` decides, which by default fails the run rather than
+      # quietly doing half its side effects a second time.
+      terminationGracePeriodSeconds: 30

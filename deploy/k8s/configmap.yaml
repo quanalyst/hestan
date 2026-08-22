@@ -1,0 +1,29 @@
+# NOT RUN AGAINST A CLUSTER. no kubernetes exists on the machine this was
+# written on, so nothing in deploy/k8s has been applied, scheduled or probed.
+# it is written from the route table and the environment variables the demo
+# actually reads, and that is all it is.
+#
+# the settings that are not secrets. everything here is what
+# `docker-compose.yml` sets, in the form a pod takes it.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: hestan
+  labels:
+    app.kubernetes.io/name: hestan
+data:
+  # every pod listens on the same port; a service is what makes one of them
+  # reachable. 0.0.0.0 is a reachable address, so `serve` refuses it without an
+  # authenticator, which is what the token in the secret beside this is for
+  HESTAN_ADDR: "0.0.0.0:4000"
+  # how much the whole deployment executes at once. a stored limit: every
+  # process reads the same number out of the database
+  HESTAN_MAX_CONCURRENT_RUNS: "8"
+  # and how much of it lands in one pod. without this the first worker to look
+  # claims the whole queue and the others have nothing to do
+  HESTAN_SLOTS: "2"
+  # the demo publishes to a sqlite file of its own, which is a stand-in for
+  # whatever your ops write to. it goes on the pod's own emptyDir, because it
+  # is not shared and is not meant to be
+  HESTAN_WAREHOUSE: "/var/lib/hestan/warehouse.db"
+  RUST_LOG: "info"

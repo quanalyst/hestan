@@ -1,0 +1,31 @@
+# NOT RUN AGAINST A CLUSTER. nothing in deploy/k8s has been applied to a
+# cluster, scheduled by a kubelet or probed by one. `kubectl kustomize
+# deploy/k8s` renders it; that is the only thing here anybody has done.
+#
+# there is no helm chart beside this, and that is a decision rather than an
+# omission. a chart would have to earn a templating language and a values file
+# over five plain manifests, and what changes between deployments here is the
+# image, two replica counts and a secret. all three are what kustomize already
+# does, with a tool that ships inside kubectl. a chart nobody has rendered
+# against a cluster would be more untested surface wearing the shape of a
+# product, and this part of the repository has enough of that already.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - configmap.yaml
+  - secret.yaml
+  - scheduler.yaml
+  - worker.yaml
+  - service.yaml
+
+# the two edits a deployment actually makes:
+#
+#     images:
+#       - name: hestan-demo
+#         newName: registry.internal/orders
+#         newTag: 2026-08-22
+#
+#     replicas:
+#       - name: hestan-worker
+#         count: 8
