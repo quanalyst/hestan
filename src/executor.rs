@@ -7,7 +7,7 @@ use chrono::{DateTime, Utc};
 use futures::FutureExt;
 use serde_json::{Value, json};
 use tokio::sync::{Notify, Semaphore, watch};
-use tokio::task::{Id, JoinSet};
+use tokio::task::{Id, JoinHandle, JoinSet};
 use tracing::Instrument;
 
 use crate::decider::Deciding;
@@ -28,6 +28,17 @@ use crate::store::{Built, Claimed, Fenced, Fire, Landed, RunKey, Store, note};
 /// how far back a resume follows `resumed_from` links. resuming a resume is
 /// normal; a chain this long is a bug, and the walk says so instead of looping.
 const MAX_RESUME_CHAIN: usize = 256;
+
+/// how long a stopping process waits for a run it has aborted to actually stop
+/// being executed, before it hands the run back anyway.
+///
+/// much shorter than [`CANCEL_GRACE`], and it has to be: this one is spent
+/// **after** the stop deadline rather than inside it, and the whole of a stop
+/// has to fit in what a container gives. what is being waited for is a task
+/// noticing it was aborted, which is one poll; an op body that blocks its own
+/// thread cannot be interrupted at all, and the release is worth more than the
+/// wait.
+pub(crate) const ABORT_GRACE: Duration = Duration::from_millis(500);
 
 /// how long a canceled run waits for its aborted tasks to actually join before
 /// recording them as never observed to stop. aborting an async op lands at its
@@ -478,13 +489,25 @@ impl Launched {
     }
 }
 
+/// one run this process is executing: what a cancel flips, and the task doing
+/// the work.
+///
+/// the task is `None` for the instant between the entry being registered and
+/// `tokio::spawn` handing back a handle. registering first is deliberate: a
+/// cancel racing a claim must find a live sender rather than nothing.
+struct Active {
+    cancel: watch::Sender<bool>,
+    task: Option<JoinHandle<()>>,
+}
+
 /// executes jobs against a store. cheap to clone.
 #[derive(Clone)]
 pub struct Runner {
     jobs: Arc<HashMap<String, Job>>,
     store: Store,
-    // one watch sender per in-flight run; cancel() flips it to true
-    active: Arc<Mutex<HashMap<String, watch::Sender<bool>>>>,
+    // one entry per in-flight run: what a cancel flips, and the task doing
+    // the work
+    active: Arc<Mutex<HashMap<String, Active>>>,
     // runs this process claimed and stopped executing without recording an
     // outcome, because the store would not take the write that says what
     // happened. their leases are deliberately left to lapse; see
@@ -1362,11 +1385,15 @@ impl Runner {
         // registered before the task is spawned, so a cancel that can see the
         // claimed run always finds a live sender
         let (cancel_tx, cancel_rx) = watch::channel(false);
-        self.active
-            .lock()
-            .unwrap()
-            .insert(run.id.clone(), cancel_tx);
-        tokio::spawn(execute(
+        let id = run.id.clone();
+        self.active.lock().unwrap().insert(
+            id.clone(),
+            Active {
+                cancel: cancel_tx,
+                task: None,
+            },
+        );
+        let task = tokio::spawn(execute(
             job,
             run.id,
             run.params,
@@ -1377,6 +1404,13 @@ impl Runner {
             pending,
             seeded,
         ));
+        // and the handle after it, because the handle does not exist until the
+        // task does. a cancel arriving in between finds the sender, which is
+        // the half a cancel uses; the half that has to wait is a stop, and a
+        // run this new has nothing recorded to hand back yet
+        if let Some(active) = self.active.lock().unwrap().get_mut(&id) {
+            active.task = Some(task);
+        }
     }
 
     /// stop touching a run this process cannot record.
@@ -1447,6 +1481,70 @@ impl Runner {
     pub(crate) async fn stopped(&self) {
         let mut rx = self.stopping.subscribe();
         let _ = rx.wait_for(|stopping| *stopping).await;
+    }
+
+    /// hand back what this process claimed and will not finish, so another
+    /// process can take it now rather than when the lease runs out. returns
+    /// the ids it released.
+    ///
+    /// the runs it [gave up on](Self::abandon) are left alone: their leases
+    /// are lapsing on purpose, and putting them back on the queue would be
+    /// claiming to know something this process does not.
+    pub(crate) async fn release_claims(&self) -> Vec<String> {
+        // stopped first, and stopped for real. a run released while something
+        // in this process is still executing it is a run another worker may
+        // claim and start while the first copy is still going, and for an
+        // [isolated](crate::Op::isolated) op that first copy is a child
+        // process. dropping the task drops the child, and dropping the child
+        // kills it
+        let mut running: Vec<Active> = self
+            .active
+            .lock()
+            .unwrap()
+            .drain()
+            .map(|(_, active)| active)
+            .collect();
+        for active in &running {
+            if let Some(task) = &active.task {
+                task.abort();
+            }
+        }
+        // awaited rather than only asked: an abort takes effect the next time
+        // the task is polled, and "next" has to be before the release below
+        // rather than after this process has gone
+        let stopped = futures::future::join_all(
+            running
+                .iter_mut()
+                .filter_map(|active| active.task.as_mut())
+                .map(|task| async move {
+                    let _ = task.await;
+                }),
+        );
+        if tokio::time::timeout(ABORT_GRACE, stopped).await.is_err() {
+            tracing::warn!(
+                "stopping: something in this process would not stop being executed \
+                 inside {ABORT_GRACE:?}; handing its run back anyway"
+            );
+        }
+        let given_up: Vec<String> = self.abandoned.lock().unwrap().iter().cloned().collect();
+        let released = match self.store.release_claims(self.claimer, &given_up) {
+            Ok(released) => released,
+            Err(e) => {
+                tracing::warn!(
+                    "stopping: what this process was holding could not be handed back, \
+                     so it waits out the lease instead: {e}"
+                );
+                Vec::new()
+            }
+        };
+        // and the cancel senders last of all. a run watching one cannot tell a
+        // dropped sender from a cancel, and it is right not to: a dropped
+        // sender has always meant the runner was going away. so they are held
+        // until every task that could act on one is gone, or a released run
+        // would record itself canceled on its way out, which is a lie about
+        // work that was only interrupted
+        drop(running);
+        released
     }
 
     /// the runs this process claimed and could not record, waiting on a
@@ -2004,13 +2102,13 @@ impl Runner {
             return Ok(CancelOutcome::Requested);
         }
         match self.active.lock().unwrap().get(run_id) {
-            Some(tx) => {
+            Some(active) => {
                 // the run's own terminal event is written by whatever is
                 // executing it, and that is not this call and has no idea who
                 // asked, so the asking is a line of its own, and it is the
                 // line with the name on it
                 note(self.store.cancel_requested(run_id, self.actor()));
-                let _ = tx.send(true);
+                let _ = active.cancel.send(true);
                 Ok(CancelOutcome::Requested)
             }
             // active status but no live sender: a run from before a restart

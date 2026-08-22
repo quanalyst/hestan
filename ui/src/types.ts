@@ -14,6 +14,7 @@ export type EventKind =
   | "run_failed"
   | "run_canceled"
   | "run_reclaimed"
+  | "run_released"
   | "op_started"
   | "op_expanded"
   | "op_retry"

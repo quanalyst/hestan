@@ -2318,6 +2318,77 @@ impl Store {
         )
     }
 
+    /// hand back every run `claimer` holds and will not finish, so another
+    /// process can take it now rather than when the lease runs out.
+    ///
+    /// **not a failure and not a cancellation.** nothing about the run went
+    /// wrong: the process holding it was asked to stop. so the row goes back
+    /// to exactly what an unclaimed queued run is, and an op that had started
+    /// goes back to `pending` with what it had recorded cleared, because the
+    /// next claimer starts it again.
+    ///
+    /// `given_up` names the claims to leave alone. a run this process stopped
+    /// recording because the store would not take the write is one whose
+    /// outcome it does not know, and putting that back on the queue would be
+    /// asserting it did not happen; its lease is lapsing on purpose and
+    /// [`reclaim_expired`](Self::reclaim_expired) decides. see
+    /// `Runner::abandon`.
+    ///
+    /// returns the ids it released.
+    pub(crate) fn release_claims(
+        &self,
+        claimer: &str,
+        given_up: &[String],
+    ) -> Result<Vec<String>, Error> {
+        let mut conn = self.conn();
+        let mut tx = conn.begin_immediate()?;
+        let at = Utc::now();
+        let held: Vec<String> = tx.query(
+            "SELECT id FROM runs
+             WHERE claimed_by = ?1 AND status IN ('queued', 'running') ORDER BY created_at",
+            args![claimer],
+            |r| r.text(0),
+        )?;
+        let mut released = Vec::new();
+        for id in held {
+            if given_up.contains(&id) {
+                continue;
+            }
+            // pending rather than anything terminal, and cleared rather than
+            // annotated: this op did not fail and did not finish, and the row
+            // the next claimer starts from should say neither
+            tx.execute(
+                "UPDATE op_runs SET status = 'pending', started_at = NULL, finished_at = NULL,
+                     error = NULL, pid = NULL
+                 WHERE run_id = ?1 AND status = 'running'",
+                args![&id],
+            )?;
+            write_event(
+                &mut tx,
+                &NewEvent::run(
+                    &id,
+                    EventKind::RunReleased,
+                    format!(
+                        "released by {claimer}, which is stopping; \
+                         back on the queue for another claimer"
+                    ),
+                )
+                .level(EventLevel::Warn)
+                .data(json!({ "claimer": claimer })),
+                at,
+            )?;
+            tx.execute(
+                "UPDATE runs SET status = 'queued', claimed_by = NULL, claimed_at = NULL,
+                     lease_until = NULL, started_at = NULL
+                 WHERE id = ?1",
+                args![&id],
+            )?;
+            released.push(id);
+        }
+        tx.commit()?;
+        Ok(released)
+    }
+
     /// take back every run whose claimer stopped saying it was there, and
     /// either fail it or put it back on the queue.
     ///
@@ -7880,7 +7951,15 @@ mod tests {
     fn a_lease_its_holder_stopped_renewing_is_takeable_and_not_before() {
         both(|db| {
             let store = db.store();
-            let blink = Duration::from_millis(20);
+            // half a second, and it was twenty milliseconds. the assertion
+            // below is that a lease that is still **live** cannot be taken,
+            // and the call that makes it is a round trip to the store: on
+            // postgres, with four hundred other cases running beside this one,
+            // twenty milliseconds can be gone by the time the second call
+            // arrives, and the case then fails saying the opposite of what
+            // happened. short enough that nobody waits, long enough that it is
+            // measuring the rule rather than the machine
+            let blink = Duration::from_millis(500);
 
             assert_eq!(store.take_decision_lease("alpha", blink).unwrap(), Some(1));
             assert_eq!(
@@ -7889,7 +7968,7 @@ mod tests {
                 "a live lease was taken out from under its holder"
             );
 
-            std::thread::sleep(Duration::from_millis(50));
+            std::thread::sleep(Duration::from_millis(700));
             // expired, so it is beta's, under a term of its own
             assert_eq!(store.take_decision_lease("beta", blink).unwrap(), Some(2));
             // and alpha cannot renew its way back in: there was a stretch of
@@ -7901,7 +7980,7 @@ mod tests {
                     .unwrap()
             );
 
-            std::thread::sleep(Duration::from_millis(50));
+            std::thread::sleep(Duration::from_millis(700));
             // an expired lease is not renewable by its own holder either: it
             // has to be taken again, and taking it is what moves the term
             assert!(
@@ -9983,6 +10062,70 @@ mod tests {
                     .iter()
                     .any(|e| e.message.contains("requeued for another claimer"))
             );
+        });
+    }
+
+    #[test]
+    fn a_released_claim_goes_back_on_the_queue_and_is_not_a_failure() {
+        both(|db| {
+            let store = db.store();
+            for id in ["leaving", "given-up-on", "somebody-elses"] {
+                store
+                    .create_run(&mk_run(id, "etl", Utc::now()), &["work".into()])
+                    .unwrap();
+                store.run_started(id, Utc::now()).unwrap();
+                store.op_started(id, "work", 1).unwrap();
+            }
+            let minute = chrono::Duration::seconds(60);
+            for id in ["leaving", "given-up-on"] {
+                store
+                    .plant_claim(id, "stopping", Some(Utc::now() + minute))
+                    .unwrap();
+            }
+            store
+                .plant_claim("somebody-elses", "still-here", Some(Utc::now() + minute))
+                .unwrap();
+
+            let released = store
+                .release_claims("stopping", &["given-up-on".to_string()])
+                .unwrap();
+            assert_eq!(released, ["leaving"]);
+
+            // back to exactly what an unclaimed queued run is
+            let run = store.run("leaving").unwrap().unwrap();
+            assert_eq!(run.status, RunStatus::Queued);
+            assert_eq!(run.claimed_by, None);
+            assert_eq!(run.claimed_at, None);
+            assert_eq!(run.lease_until, None);
+            assert_eq!(run.started_at, None);
+            assert_eq!(run.error, None);
+            // and its op is pending rather than anything terminal: it did not
+            // fail, it was not finished
+            let op = store.op_run("leaving", "work").unwrap().unwrap();
+            assert_eq!(op.status, OpStatus::Pending);
+            assert_eq!(op.error, None);
+            assert_eq!(op.finished_at, None);
+            let kinds: Vec<EventKind> = store
+                .events("leaving", 0)
+                .unwrap()
+                .into_iter()
+                .map(|e| e.kind)
+                .collect();
+            assert!(kinds.contains(&EventKind::RunReleased), "{kinds:?}");
+            assert!(!kinds.contains(&EventKind::RunFailed), "{kinds:?}");
+
+            // the claim this process gave up on is left where it is: its lease
+            // is lapsing on purpose and a reclaimer is what decides
+            let abandoned = store.run("given-up-on").unwrap().unwrap();
+            assert_eq!(abandoned.status, RunStatus::Running);
+            assert_eq!(abandoned.claimed_by.as_deref(), Some("stopping"));
+            // and so is somebody else's, whatever this process is doing
+            let theirs = store.run("somebody-elses").unwrap().unwrap();
+            assert_eq!(theirs.status, RunStatus::Running);
+            assert_eq!(theirs.claimed_by.as_deref(), Some("still-here"));
+
+            // released means claimable: it is on the queue for the next one
+            assert_eq!(store.queue_depth().unwrap(), 1);
         });
     }
 

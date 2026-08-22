@@ -223,6 +223,10 @@ pub enum EventKind {
     RunCanceled,
     /// a claim expired and the run was taken back from whoever held it.
     RunReclaimed,
+    /// a run was handed back by the process that claimed it, on its way out,
+    /// and is on the queue again. **not a failure**: nothing about the run
+    /// went wrong, and whoever claims it next runs it from the beginning.
+    RunReleased,
     /// one **attempt** of an op began.
     OpStarted,
     /// a [fan-out](crate::Op::mapped) resolved into its instances, and the
@@ -362,6 +366,7 @@ open_enum!(EventKind {
     RunFailed => "run_failed",
     RunCanceled => "run_canceled",
     RunReclaimed => "run_reclaimed",
+    RunReleased => "run_released",
     OpStarted => "op_started",
     OpExpanded => "op_expanded",
     OpRetry => "op_retry",

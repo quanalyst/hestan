@@ -95,6 +95,9 @@ pub struct Hestan {
     asset_history: usize,
     log_bytes: u64,
     log_line_cap: u64,
+    /// how long a stopping process waits for what it is already doing; see
+    /// [`stop_within`](Hestan::stop_within).
+    stop_within: Duration,
     #[cfg(feature = "http")]
     sources: Vec<crate::http::HttpSource>,
 }
@@ -136,6 +139,7 @@ impl Default for Hestan {
             asset_history: DEFAULT_ASSET_HISTORY,
             log_bytes: logs::DEFAULT_BYTES,
             log_line_cap: logs::DEFAULT_LINES,
+            stop_within: stop::WITHIN,
             #[cfg(feature = "http")]
             sources: Vec::new(),
         }
@@ -921,6 +925,38 @@ impl Hestan {
         self
     }
 
+    /// how long a stopping process waits for what it is already doing, before
+    /// it hands the rest back.
+    ///
+    /// **eight seconds by default, because ten is what a container gives.**
+    /// `docker stop` waits ten seconds and then sends SIGKILL; a kubernetes
+    /// pod gets `terminationGracePeriodSeconds`, thirty by default. the
+    /// deadline has to fit inside whichever of those applies with room left
+    /// for the handback and the exit, or the process spends its whole grace
+    /// period waiting and is killed halfway through giving its claims up,
+    /// which is the failure it was there to avoid.
+    ///
+    /// what a longer one buys is that an op taking half a minute gets to
+    /// finish rather than being handed to another worker to start over. what
+    /// it costs is that every deploy is that much slower, and that the
+    /// container runtime has to be told to wait that long as well, because it
+    /// is the one holding the axe.
+    ///
+    /// ```no_run
+    /// # use hestan::Hestan;
+    /// # use std::time::Duration;
+    /// Hestan::new().stop_within(Duration::from_secs(25));
+    /// ```
+    ///
+    /// a run still going when this runs out is **released**: it goes back on
+    /// the queue for another process, and is not recorded as failed, because
+    /// it did not fail. only [`serve`](Self::serve) and [`work`](Self::work)
+    /// ever reach this; a one-shot has no deadline and no signal handler.
+    pub fn stop_within(mut self, deadline: Duration) -> Self {
+        self.stop_within = deadline;
+        self
+    }
+
     /// run one job to completion and return it, with no ui and no loops. the
     /// [role](Self::role) does not apply: a one-shot executes its own run.
     pub async fn run_once(self, job: &str, params: Value) -> Result<Run, Error> {
@@ -1008,6 +1044,7 @@ impl Hestan {
         }
         let role = self.role;
         let auth = self.auth.clone();
+        let stop_within = self.stop_within;
         // the socket first, before the store is opened and before a loop
         // exists to abort: a deployment that is going to be refused should be
         // refused having done nothing. a bind failure must not leave detached
@@ -1169,14 +1206,18 @@ impl Hestan {
         for handle in loops {
             handle.abort();
         }
+        // nothing in this process will decide again, so the lease goes back
+        // now, before anything is waited for. whoever takes the term next has
+        // nothing to do with the work this one is finishing, and every second
+        // it waits is a second the deployment decides nothing at all
+        decider::hand_back(&state_runner);
         // which of the two ended the wait is asked of the counter rather than
         // of the select. both arms are ready in the same instant when a signal
         // is what ended the server, and `select!` picks one at random: reading
         // the arm it picked would make draining a coin toss
         if stop.was_asked() {
             tracing::info!(
-                "stopping: finishing what is already in flight, for up to {:?}",
-                stop::WITHIN
+                "stopping: finishing what is already in flight, for up to {stop_within:?}"
             );
             let finishing = async {
                 // the connections this server already has, then the runs it is
@@ -1190,9 +1231,9 @@ impl Hestan {
             tokio::pin!(finishing);
             tokio::select! {
                 () = &mut finishing => tracing::info!("stopping: nothing left in flight"),
-                () = tokio::time::sleep(stop::WITHIN) => tracing::warn!(
-                    "stopping: {:?} is up and this process is still busy; going anyway",
-                    stop::WITHIN
+                () = tokio::time::sleep(stop_within) => tracing::warn!(
+                    "stopping: {stop_within:?} is up and this process is still busy, \
+                     so what is left goes back on the queue"
                 ),
                 () = stop.asked_again() => tracing::warn!(
                     "stopping: asked a second time, so this process goes now \
@@ -1201,9 +1242,18 @@ impl Hestan {
             }
         }
         leases.abort();
-        // the loops are stopped, so nothing in this process will decide again:
-        // hand the lease back rather than making the next process wait it out
-        decider::hand_back(&state_runner);
+        // and what this process claimed and did not finish goes back on the
+        // queue, rather than sitting claimed by something that has left until
+        // the lease runs out. it is not recorded as anything: it did not fail,
+        // it was not finished
+        let released = state_runner.release_claims().await;
+        if !released.is_empty() {
+            tracing::info!(
+                "stopping: {} run(s) handed back to the queue: {}",
+                released.len(),
+                released.join(", ")
+            );
+        }
         served?;
         Ok(())
     }

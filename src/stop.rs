@@ -34,7 +34,8 @@ use tokio::sync::watch;
 
 use crate::executor::Runner;
 
-/// how long a stopping process waits for what it is already doing.
+/// how long a stopping process waits for what it is already doing, unless
+/// `Hestan::stop_within` says otherwise.
 ///
 /// **eight seconds, because ten is what a container gives.** `docker stop`
 /// waits ten seconds and then sends SIGKILL; kubernetes' default

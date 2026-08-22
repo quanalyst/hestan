@@ -208,6 +208,13 @@ pub(crate) async fn run_decider(runner: Runner) {
     let mut renewed = Instant::now();
     loop {
         tokio::time::sleep(DECIDE_RENEW).await;
+        // a process on its way out has handed the lease back, or is about to.
+        // taking it again here would leave the next process waiting out an
+        // expiry on a lease held by something that has already left, which is
+        // the wait a handback exists to remove
+        if runner.stopping() {
+            return;
+        }
         match deciding.term() {
             Some(0) | None => {
                 if take_now(&runner) {
