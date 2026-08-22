@@ -1,0 +1,18 @@
+# what the daemon reads before a build starts. an allowlist rather than a list
+# of exclusions, because `target/` here is hundreds of gigabytes and a context
+# that picks it up by accident is a build nobody waits out.
+#
+# everything is out:
+*
+# and back in: exactly what `cargo build --example demo` opens.
+!Cargo.toml
+!Cargo.lock
+!README.md
+!LICENSE
+!src
+!examples
+# cargo will not parse a manifest whose [[test]] targets are missing, whatever
+# it was asked to build
+!tests
+# the embedded ui, committed rather than built here; see the Dockerfile
+!ui/dist
