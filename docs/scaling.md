@@ -259,6 +259,13 @@ deciding is ten more seconds of downtime, and
 [catch-up](scheduling.md#missed-fire-catch-up) already has an answer for
 downtime.
 
+**in a container there is no clean stop**, so the handback is not the case to
+plan around. hestan installs no signal handler and the kernel drops an
+unhandled signal sent to pid 1 of a container, which makes a stopped container
+a killed one:
+[containers](containers.md#signals-and-why-a-container-takes-ten-seconds-to-stop)
+has the measurement.
+
 ### What the term fences, and what it does not
 
 **fenced**: every run a deciding loop launches. a cron fire, a sensor request
@@ -277,11 +284,17 @@ lease and wakes up:
 | [durable delivery](notifications.md#durable-delivery) | send a notification and mark it delivered | one duplicate alert, which durable delivery is [already at-least-once](notifications.md#durable-delivery) about |
 | a sensor cursor | commit a cursor over a newer one | a sensor re-reading a window, or skipping one |
 | a schedule cursor | move it forward | nothing: the column only ever moves forward, so a stale writer cannot un-account for anything |
+| a runless tick | record an occurrence as `skipped` or `deferred`, which is the [overlap policy](scheduling.md#overlap-policy) declining to make a run | a tick log row no live decider wrote. the unique index is over `fired` alone, so it neither blocks a real fire nor becomes one |
 | the one boot sweep | it is lease-gated too, so nothing | nothing |
 
 none of these launches a run, which is why none of them is on the fenced list:
 the term rides on the run insert, and a decision with no run to insert has
-nowhere to put it. if any of them mattered enough to fence it would want a
+nowhere to put it. the runless tick is the one that is easy to miss, because it
+comes out of the same pass as a fire: a stale decider that wakes to find a run
+of the job already active records a skip rather than attempting the fire the
+store would have refused. `deploy/checks/partition.sh` saw that happen and
+cycles until it gets a fire, because a partition where nothing was fenced
+proves nothing about the fence. if any of them mattered enough to fence it would want a
 constraint of its own rather than a second lock, for the reason at the top of
 this section.
 
@@ -392,11 +405,12 @@ the local bucket still the default.
 
 ## The compose example
 
-`Dockerfile` and `docker-compose.yml` at the repo root run the demo as one
-scheduler and two workers against a shared volume:
+`Dockerfile` and `docker-compose.yml` at the repo root run the demo as
+postgres, one scheduler and three workers, all from one image against one
+database:
 
 ```
-docker compose up --build
+docker compose up -d --build
 open http://localhost:4000
 ```
 
@@ -408,18 +422,22 @@ file deserves to be called; [auth.md](auth.md) has where a real one comes
 from.
 
 watch the queued section on the runs page fill and drain, and `claimed_by` on
-a run say which worker took it. both workers have `HESTAN_SLOTS=2` and the
+a run say which worker took it. each worker has `HESTAN_SLOTS=2` and the
 deployment has `HESTAN_MAX_CONCURRENT_RUNS=4`.
 
 it is one image. the scheduler and the workers differ only by `HESTAN_ROLE`,
 because they must build the same registry.
 
+[containers](containers.md) is the whole of it: what is in the image and what
+is not, the role split as five containers, the second scheduler, and what
+happened when the deciding process was cut off the network while it was still
+running.
+
 ## Several hosts
 
 everything above works on one host with the default sqlite file: several
-containers, one volume, and the compose example just above. past one host you
-need
-a store every host can reach, and that is what the
+processes, one file, and no server to operate. past one host you need a store
+every host can reach, and that is what the
 [postgres backend](storage.md#postgres) is:
 
 ```rust
@@ -438,11 +456,22 @@ runs the deciding cases the same way twice: two scheduler processes against
 one database, asserting that no occurrence is fired twice, that one of them
 decides and the other fires nothing at all, and that killing the one that
 decides hands the next occurrence to the other. both
-of those are several *processes* against one database. nobody has run hestan's
-workers on several *hosts*, because the machine the suite runs on is one
-machine, and a process on another host differs from a process on this one
-only in which socket it opens. it follows, and the difference between "it
-follows" and "it was run" is the difference this paragraph exists to keep.
+of those are several *processes* against one database.
+
+[containers](containers.md) adds a third shape and one fault the others cannot
+produce. the compose stack is four hestan *containers* against one postgres,
+so every process has a pid and network namespace of its own, and a network is then a
+thing that can be taken away: `deploy/checks/partition.sh` cuts the process
+holding the deciding lease off the database while it goes on running, and finds
+its next decision refused by the store on the term it named. that is the first
+time the [fence](#what-the-term-fences-and-what-it-does-not) has been tested
+rather than reasoned about. it is still one host.
+
+nobody has run hestan's workers on several *hosts*, because the machine the
+suite runs on is one machine, and a process on another host differs from a
+process on this one only in which socket it opens. it follows, and the
+difference between "it follows" and "it was run" is the difference this
+paragraph exists to keep.
 
 two things do still hold whatever the backend. **one process at a time
 decides**, and both backends enforce it the same way: the unique index over the
@@ -468,6 +497,8 @@ not there.
 
 ## See also
 
+- [containers](containers.md): the image, the compose stack, and what a
+  partitioned decider actually did.
 - [scheduling](scheduling.md): overlap policies, and why a queued run counts
   as outstanding.
 - [isolation](isolation.md): the other mechanism that spawns processes.

@@ -25,6 +25,7 @@
 - [web ui](web-ui.md): a page-by-page tour of the embedded ui and how it draws status.
 - [authentication](auth.md): the refusal that keeps an unguarded deployment off a public address, the two authenticators, the three roles endpoint by endpoint, where the ui keeps a token and what that does not protect against, the audit trail, and what this deliberately is not.
 - [scaling](scaling.md): the run queue, concurrency limits, priority, claims and leases, scheduler and worker roles, the compose example, and what several hosts needs.
+- [containers](containers.md): the image and what is in it, the compose stack of one scheduler and three workers, the signal a hestan container ignores, what happened when the deciding process was cut off the network, and the kubernetes manifests nobody has applied to a cluster.
 - [http api](http-api.md): every endpoint, parameter, response shape, and error code.
 - [storage](storage.md): the two backends and how to choose, the schema, migrations, and crash recovery.
 - [embedding](embedding.md): `serve` vs `run_once` vs `Runner`, testing, consuming from another repo.

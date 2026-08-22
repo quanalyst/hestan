@@ -239,10 +239,9 @@ standalone binary for those two. [docs/cli.md](docs/cli.md).
   `Hestan::role(Role::Scheduler)` is the other half: one process owns the
   decisions, any number execute. claiming is a compare-and-set with a renewed
   lease, so exactly one claimer wins a run and a claimer that dies loses it
-  rather than stranding it. `Dockerfile` and `docker-compose.yml` run one
-  scheduler and two workers against a shared volume; past one host, point the
-  same binaries at postgres and nothing else changes
-  ([scaling](docs/scaling.md))
+  rather than stranding it. `Dockerfile` and `docker-compose.yml` run postgres,
+  one scheduler and three workers from one image against one database
+  ([scaling](docs/scaling.md), [containers](docs/containers.md))
 - every run, op attempt, output, and log event lands in a sqlite file (WAL,
   one connection behind a mutex; plenty at this scale) with no extra services,
   or in postgres with `--features postgres` and a url: same schema, same api,
@@ -408,16 +407,21 @@ standalone binary for those two. [docs/cli.md](docs/cli.md).
 the demo is one process because that is right until it is not. when it is not:
 
 ```
-docker compose up --build      # one scheduler, two workers, one run log
+docker compose up -d --build   # postgres, one scheduler, three workers
 open http://localhost:4000
 ```
 
 `Dockerfile` and `docker-compose.yml` are at the repo root, and it is one
 image: a scheduler and its workers must build the same registry, so they
-differ only by `HESTAN_ROLE`. that compose file shares one sqlite file, which
-is multi-process on one host; several hosts want
-`.db("postgres://…")` instead, and [docs/scaling.md](docs/scaling.md) is
-careful about which of that has been run and which of it follows.
+differ only by `HESTAN_ROLE`. it is still five containers on one host, which
+[docs/scaling.md](docs/scaling.md) is careful about: on one host it was run,
+and on several it follows.
+
+what containers do buy is a network that can be taken away.
+`deploy/checks/partition.sh` cuts the process holding the deciding lease off
+the database while it keeps running, and its next decision comes back refused
+by the store on the term it named. [docs/containers.md](docs/containers.md)
+has the image, the stack and what the fault injection measured.
 
 ## Docs
 
@@ -439,7 +443,8 @@ the details live in [docs/](docs/README.md):
 [the command line](docs/cli.md),
 [authentication](docs/auth.md),
 [the http api](docs/http-api.md), [storage](docs/storage.md),
-[scaling](docs/scaling.md), [embedding](docs/embedding.md), and
+[scaling](docs/scaling.md), [containers](docs/containers.md),
+[embedding](docs/embedding.md), and
 [development](docs/development.md).
 release notes are in [CHANGELOG.md](CHANGELOG.md).
 

@@ -2,6 +2,119 @@
 
 ## unreleased
 
+a hestan deployment in containers, and the first test of the term fence
+against a network that was actually taken away.
+
+**no library code changed.** `src/` is byte for byte what it was: no public
+signature moved, no schema version, no behaviour, no dependency. the ui is
+unchanged. one line of `examples/demo.rs` changed, which is published crate
+content and is called out below. everything else is new files, and the manifest
+declares no `include` or `exclude`, so they do ship in the `.crate`: about 70kb
+of Dockerfile, compose files, shell scripts, kubernetes manifests and a docs
+page, none of which is compiled or read by anything at build time.
+
+- **a `Dockerfile` that builds a hestan application**, using `examples/demo.rs`
+  as the worked case, because hestan is a library and there is no hestan server
+  to publish an image of. two stages, `rust:1.88-slim-bookworm` to
+  `debian:bookworm-slim`, neither a `latest` tag. **164mb unpacked and 35.5mb
+  to pull on arm64**, of which the debian base is 108mb and the binary is
+  18.8mb. the runtime layer holds those two, the ca-certificates bundle copied
+  out of the build stage, and a uid 10001 to run as; no package manager runs in
+  it and there is no curl, no wget and no psql, so every health check is made
+  from outside the container
+- **the ui is copied in, not built.** `ui/dist` is committed because
+  `include_dir!` needs it before rustc runs and the crate has to compile with
+  no node anywhere, so the image installs no node and runs no npm. the price is
+  that it carries whatever `just ui-build` last wrote
+- **`docker-compose.yml` is now postgres, one scheduler and three workers**
+  rather than two workers against a shared sqlite volume. the role split from
+  `docs/scaling.md` as five containers that run. `docker-compose.spare.yml`
+  adds a second scheduler, which is what a handover needs somewhere to hand to.
+  **it is still one host**, and the file, the docs and this entry all say so
+- **`examples/demo.rs` reads `HESTAN_SCHEDULE`**, defaulting to the
+  `*/2 * * * *` it always had. six fields is seconds first, so the checks can
+  drive it at an occurrence every ten seconds instead of waiting two minutes
+  for each one. this is the only change to anything the crate compiles
+- **`deploy/checks/`: the fault injection, as scripts somebody can run.**
+  `bash deploy/checks/run.sh`, or `just checks`. they are not `cargo test`
+  cases and will not become them: a partition takes a minute of wall clock to
+  be a partition. each one brings up a stack of its own, does one thing to it,
+  and asks the **store** what happened rather than asking a process that may be
+  the one that is wrong about it
+
+**the term fence held under a real partition, and this is the first time it has
+been tested rather than reasoned about.** `docker network disconnect` leaves a
+process running with its clock going and no route to the database, which
+several processes on one box cannot produce: there a leader that has lost the
+store is a leader somebody stopped. cut off for 65 seconds, the process decided
+nothing, another took the term, and when its blocked store calls returned it
+went straight on with the pass it had been in the middle of:
+
+```
+16:14:41.915307  INFO  schedule fired job=orders_etl expr=*/10 * * * * *
+16:14:41.915615  WARN  fire refused: the deciding lease moved on before the fire landed
+16:14:41.915706  WARN  deciding: the lease is no longer this process's term=1
+```
+
+read the order. it decided to fire, the store refused it, and **only then** did
+its own decider loop find out the lease had moved on, so the term that fire
+named was 1 and 1 was out of date. nothing in the process stopped it. the store
+did, in the transaction that would have written the run, and it left no tick and
+no run.
+
+- **handover measured rather than asserted**: 8954ms from `docker kill` to
+  another process holding the term, with 8.91s left on the ten second lease at
+  the moment of the kill, and 9152ms to the first occurrence the new decider
+  fired. over four kills it was 8286ms, 8954ms, 9934ms and 10425ms, which is
+  whatever was left of the lease plus up to one two second renewal interval.
+  time to the next *decision* is not that bound and was 9152ms on that run and
+  19435ms on another, because the occurrence that came due inside the gap was
+  not fired at all: `Catchup::Skip` treating a handover as downtime, exactly as
+  documented
+- **no occurrence fired twice** across a partition, a handover and a reconnect
+  run one after the other, which is the unique index over
+  `(job, expr, scheduled_for)` doing the job it was built first to do
+- **a partitioned process is unreachable for longer than the partition**, and
+  by an amount nothing in hestan controls: its store calls sit in a tcp write
+  that has been backing off, and came back between 3.2 and 44.5 seconds after
+  the interface did, over seven partitions of 50 to 95 seconds. new, and worth
+  knowing before you time a deploy around one
+- **a runless tick is not fenced, and `docs/scaling.md` did not say so.** a
+  stale decider that wakes to find a run of the job already active applies the
+  overlap policy and records a `skipped` tick instead of attempting the fire the
+  store would have refused. it creates no run, so it names no term and goes in
+  unrefused; what it costs is a tick log row no live decider wrote, and the
+  unique index is over `fired` alone so it neither blocks a real fire nor
+  becomes one. the not-fenced table has a row for it now, and
+  `partition.sh` cycles until it gets a fire, because a partition where nothing
+  was fenced proves nothing about the fence
+- **a hestan container ignores SIGTERM**, measured: `docker stop` waited its
+  full ten seconds and killed it (exit 137), while the same image behind
+  `docker run --init` exited on the signal in 196ms (exit 143). hestan installs
+  no signal handler and the kernel drops an unhandled signal sent to pid 1 of a
+  container. so `docker compose down` takes ten seconds a container, a
+  container being stopped keeps working until SIGKILL, and **the deciding lease
+  is never handed back on a stop**: `docs/scaling.md` said a clean stop hands it
+  back, and in a container there is no clean stop. the sentence now says so
+- **`deploy/k8s/`: manifests that have never been applied to a cluster**, and
+  every file says that on its first line. a ConfigMap, a Secret, a Deployment
+  for the schedulers, a Deployment for the workers, a Service and a
+  kustomization. `kubectl kustomize` renders them and that is the whole of what
+  anybody has done to them. the scheduler defaults to **two replicas**, which
+  the deciding lease is what makes safe rather than forbidden, and the probes
+  point at `/api/whoami` because it is the one endpoint outside the auth guard
+  and a kubelet cannot carry a token into an httpGet header. what that probe
+  proves is that the process is serving, not that its store is reachable, and
+  the file says which. there is no helm chart, deliberately: what changes
+  between deployments here is an image, two replica counts and a secret, and a
+  chart nobody has rendered against a cluster is untested surface in the shape
+  of a product
+- **`docs/containers.md`**, linked from `docs/scaling.md` where it talks about
+  several hosts, with the image, the stack, the fault injection numbers, the
+  signal, and what none of it tested: a partition between hosts, a clock that
+  jumps, or a process paused past its own expiry, which is the case the fence's
+  own doc comment is written about and is still reasoning
+
 a finished run's page shows the data the run produced, and not only that it
 succeeded and how long it took.
 
