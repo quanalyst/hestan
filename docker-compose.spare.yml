@@ -1,0 +1,33 @@
+# a second scheduler, for the case where the first one goes away.
+#
+#     docker compose -f docker-compose.yml -f docker-compose.spare.yml up -d
+#     open http://localhost:4001        # the spare's ui, same token
+#
+# it holds a connection, builds the same registry and evaluates nothing, until
+# the deciding lease it is not holding runs out. that is what
+# docs/scaling.md#what-two-schedulers-cost-you means by a warm spare: not more
+# throughput, a shorter gap.
+#
+# it is a second service rather than `--scale scheduler=2` because a scaled
+# service cannot publish a fixed host port, and because `deploy/checks` needs to
+# name one container to cut off and the other to watch.
+
+services:
+  spare:
+    build: .
+    image: hestan-demo
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: unless-stopped
+    environment:
+      HESTAN_DB: postgres://hestan:hestan@db:5432/hestan
+      HESTAN_ADDR: 0.0.0.0:4000
+      HESTAN_TOKEN: demo-token-change-me
+      HESTAN_MAX_CONCURRENT_RUNS: "4"
+      HESTAN_WAREHOUSE: /var/lib/hestan/warehouse.db
+      HESTAN_SCHEDULE: ${HESTAN_SCHEDULE:-}
+      RUST_LOG: ${RUST_LOG:-info}
+      HESTAN_ROLE: scheduler
+    ports:
+      - "4001:4000"

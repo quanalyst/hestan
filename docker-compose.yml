@@ -1,59 +1,110 @@
-# one scheduler, two workers, one run log.
+# postgres, one scheduler and three workers: the role split in
+# docs/scaling.md as five containers rather than as a paragraph.
 #
-#     docker compose up --build
+#     docker compose up -d --build
 #     open http://localhost:4000        # the scheduler's ui, token below
 #
-# the scheduler fires the demo's schedules and enqueues runs; it executes
-# none of them. the two workers claim runs off the queue and run them. watch
-# the queued section on the runs page fill and drain, and `claimed_by` on a
-# run tell you which worker took it.
+# the scheduler fires the demo's schedules and enqueues runs, and executes none
+# of them. the three workers claim runs off the queue and run them. watch the
+# queued section on the runs page fill and drain, and `claimed_by` on a run say
+# which worker took it.
 #
-# the honest limit: this works because all three containers share one host and
-# one file. sqlite is not reachable over a network, so this is multi-process,
-# not multi-node. see docs/scaling.md.
+# **the honest limit.** this is five containers on one host. each one is its own
+# pid and network namespace with its own loopback and its own view of the
+# process table, which is closer to a real deployment than five processes
+# sharing one namespace, and it is still not several hosts: one kernel, one
+# clock, one machine to lose. nothing in hestan has been run on several hosts.
+#
+# `docker-compose.spare.yml` adds a second scheduler, which is what the fault
+# injection in `deploy/checks` needs: a handover wants somewhere to hand to.
+
+name: hestan
+
+# the environment every hestan container in this file shares. the difference
+# between a scheduler and a worker is one variable, because they are one image
+# building one registry, which is the constraint a split deployment is under.
+x-hestan-env: &hestan-env
+  # the run log, and therefore the queue, and therefore the deciding lease.
+  # `db` is the service name, which is a dns name on the compose network
+  HESTAN_DB: postgres://hestan:hestan@db:5432/hestan
+  HESTAN_ADDR: 0.0.0.0:4000
+  # 0.0.0.0 is a reachable address and `serve` refuses one with nothing
+  # checking who is asking. so: a token, which the ui asks for once and keeps
+  # for the tab. a real deployment reads this out of a secret rather than out
+  # of a compose file, which is what this one is named for; see docs/auth.md
+  HESTAN_TOKEN: demo-token-change-me
+  # how much this deployment runs at once, across all three workers. a stored
+  # limit, so every process reads the same number
+  HESTAN_MAX_CONCURRENT_RUNS: "4"
+  # the demo publishes to a sqlite file of its own, which is the warehouse an
+  # op writes to rather than the run log. one per container, on that
+  # container's own volume: it is not shared and is not meant to be
+  HESTAN_WAREHOUSE: /var/lib/hestan/warehouse.db
+  # unset in ordinary use, so the demo's schedule is its own `*/2 * * * *`.
+  # `deploy/checks` sets it to a six-field expression to get an occurrence
+  # every ten seconds, because a fault it has to wait two minutes to see is a
+  # fault nobody runs the script for
+  HESTAN_SCHEDULE: ${HESTAN_SCHEDULE:-}
+  RUST_LOG: ${RUST_LOG:-info}
+
+x-hestan: &hestan
+  build: .
+  # named, so compose builds it once and every hestan container runs the same
+  # bytes
+  image: hestan-demo
+  depends_on:
+    db:
+      condition: service_healthy
+  restart: unless-stopped
 
 services:
-  scheduler:
-    build: .
-    # exactly one process may own the schedules, sensors, freshness checks and
-    # backfill chunking. two would be two of every scheduled run.
+  db:
+    image: postgres:18-bookworm
     environment:
+      POSTGRES_USER: hestan
+      POSTGRES_PASSWORD: hestan
+      POSTGRES_DB: hestan
+    # published so you can read the run log with psql from the host, which is
+    # also how `deploy/checks` asks the store what it thinks rather than asking
+    # a process that may be the one that is wrong about it
+    ports:
+      - "55432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U hestan -d hestan"]
+      interval: 2s
+      timeout: 3s
+      retries: 20
+    volumes:
+      - pgdata:/var/lib/postgresql
+
+  scheduler:
+    <<: *hestan
+    # exactly one process at a time owns the schedules, sensors, freshness
+    # checks, automation policies and backfill chunking. that is settled by a
+    # lease in the store rather than by this replica count, which is why
+    # `docker-compose.spare.yml` can add a second one and nothing fires twice
+    environment:
+      <<: *hestan-env
       HESTAN_ROLE: scheduler
-      HESTAN_ADDR: 0.0.0.0:4000
-      HESTAN_DB: /var/lib/hestan/hestan.db
-      # 0.0.0.0 plus a published port is reachable from your network, and
-      # `serve` refuses that with nothing checking who is asking. so: a token,
-      # which the ui asks for once and keeps for the tab. a real deployment
-      # reads this out of a secret rather than a compose file; see
-      # docs/auth.md, which also has the version where your own proxy decides
-      HESTAN_TOKEN: demo-token-change-me
-      # how much this deployment runs at once, across both workers
-      HESTAN_MAX_CONCURRENT_RUNS: "4"
     ports:
       - "4000:4000"
-    volumes:
-      - runlog:/var/lib/hestan
 
   worker:
-    build: .
-    # `deploy.replicas` rather than two service blocks: workers are
-    # interchangeable, which is the point of a claimable queue
+    <<: *hestan
+    # `deploy.replicas` rather than three service blocks: workers are
+    # interchangeable, which is the whole point of a claimable queue. they
+    # publish no port for the same reason, since there is nothing to reach a
+    # particular one of them for; their ui is served on 4000 inside the
+    # compose network, and `docs/containers.md` has how to look at it
     deploy:
-      replicas: 2
+      replicas: 3
     environment:
+      <<: *hestan-env
       HESTAN_ROLE: worker
-      HESTAN_ADDR: 0.0.0.0:4000
-      HESTAN_DB: /var/lib/hestan/hestan.db
-      HESTAN_TOKEN: demo-token-change-me
-      # how much of it lands in *this* container. without a cap the first
-      # worker to look claims the whole queue and the other has nothing to do
+      # how much of the deployment's four lands in *this* container. without a
+      # cap the first worker to look claims the whole queue and the other two
+      # have nothing to do
       HESTAN_SLOTS: "2"
-    volumes:
-      - runlog:/var/lib/hestan
-    depends_on:
-      - scheduler
 
 volumes:
-  # the queue is the run log, so sharing it is what makes these one deployment
-  # rather than three
-  runlog:
+  pgdata:
