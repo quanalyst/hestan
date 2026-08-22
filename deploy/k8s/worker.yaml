@@ -91,15 +91,17 @@ spec:
       volumes:
         - name: work
           emptyDir: {}
-      # SIGTERM does nothing to this process either; see the long version on
-      # `terminationGracePeriodSeconds` in scheduler.yaml. so a worker pod
-      # being deleted goes on claiming and executing for this long and is then
-      # killed outright.
+      # this is the pod the number matters for, because this one is holding
+      # runs; see the long version in scheduler.yaml.
       #
-      # what the number buys is that a run already in flight has that much
-      # longer to finish. what it costs is that every rolling update is that
-      # much slower and the pod takes new work the whole way through it. a run
-      # that does not finish is abandoned mid-op; its claim expires one lease
-      # later and `Reclaim` decides, which by default fails the run rather than
-      # quietly doing half its side effects a second time.
+      # SIGTERM stops it claiming anything new, gives what it is already
+      # executing up to `Hestan::stop_within` to finish, and puts whatever did
+      # not finish back on the queue for another worker. a released run is
+      # **not** recorded as failed: it did not fail, this pod left.
+      #
+      # thirty is room for a deployment that raises `stop_within` to match how
+      # long its ops take. with the default deadline the pod is gone in about
+      # eight seconds whatever this says, because hestan's number is the one
+      # that decides and this is only the ceiling on it. what a longer deadline
+      # costs is that a rolling update is that much slower.
       terminationGracePeriodSeconds: 30

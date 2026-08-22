@@ -122,18 +122,16 @@ spec:
         # is only what this pod writes for itself
         - name: work
           emptyDir: {}
-      # **SIGTERM does nothing to this process, and that is measured.** hestan
-      # installs no signal handler in `serve`, and the kernel drops an
-      # unhandled signal sent to pid 1 of a container rather than applying its
-      # default action. so a pod being deleted goes on running normally until
-      # this timer runs out and SIGKILL arrives. `docker stop` on this image
-      # waited its full ten seconds and reported exit 137; the same image with
-      # `--init` in front of it, so the process is not pid 1, exited on the
-      # signal in 196ms with 143.
+      # **the ceiling on a stop, and hestan's own deadline inside it.**
       #
-      # two things follow. this number is how long every scheduler pod deletion
-      # takes, not a budget it might not spend. and the deciding lease is left
-      # to expire rather than handed back: `serve` hands it back when `serve`
-      # returns, which is not what a signal does here. short, because a
-      # scheduler holds no work that more time would finish.
+      # `serve` listens for SIGTERM. it stops accepting new connections,
+      # finishes the requests it has, hands the deciding lease back so the
+      # other pod can take the term without waiting for the expiry, and exits.
+      # a scheduler holds no runs, so it is gone in well under a second: this
+      # number is a ceiling it does not spend rather than a timer it runs out.
+      #
+      # ten, because hestan waits at most eight seconds for what it is already
+      # doing (`Hestan::stop_within`) and the handback and the exit go in what
+      # is left. raising this alone buys nothing: hestan's deadline is the
+      # number that decides, and it is the one to raise first.
       terminationGracePeriodSeconds: 10

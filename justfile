@@ -25,9 +25,9 @@ check-pg url="postgres://hestan:hestan@localhost/hestan_test":
     HESTAN_TEST_PG={{url}} cargo test --features postgres
 
 # the container checks: the image builds and serves, the compose stack splits
-# the roles, and what happens to the deciding process when its network is taken
-# away. wants a docker daemon, the compose plugin and psql; about six minutes.
-# see docs/containers.md
+# the roles, what happens to the deciding process when its network is taken
+# away, and what a stop is worth next to a kill. wants a docker daemon, the
+# compose plugin and psql; about ten minutes. see docs/containers.md
 checks:
     bash deploy/checks/run.sh
 
