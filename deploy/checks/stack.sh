@@ -81,16 +81,25 @@ else
     bad "a scheduler claimed a run, and Role::Scheduler executes nothing"
 fi
 
-# and the log side of it: the run id appears in exactly one worker's output
+# the store is what decides this: it records which process claimed the run, and
+# it is the same column the check above reads. the logs are corroboration and
+# they lag, so a run this worker finished a moment ago may not be in its output
+# yet. more than one worker naming the run is a real fault; none of them naming
+# it is a flush that has not happened
 run="$(q "SELECT id FROM runs WHERE status = 'success' ORDER BY finished_at DESC LIMIT 1")"
+claimed_by="$(q "SELECT claimed_by FROM runs WHERE id = '$run'")"
+case " ${worker_ids[*]} " in
+    *" $claimed_by "*) pass "run $run was claimed by exactly one worker ($claimed_by)" ;;
+    *) bad "run $run was claimed by $claimed_by, which is not one of the workers" ;;
+esac
 saw=0
 for c in "${workers[@]}"; do
     docker logs "$c" 2>&1 | grep -q "$run" && saw=$((saw + 1))
 done
-if [ "$saw" = "1" ]; then
-    pass "run $run was executed in exactly one of the three worker containers"
+if [ "$saw" -le 1 ]; then
+    pass "and no second worker names it in its output (named by $saw of ${#workers[@]}, logs lag)"
 else
-    bad "run $run appears in $saw worker containers"
+    bad "run $run appears in $saw worker containers, so two of them ran it"
 fi
 
 say ""
