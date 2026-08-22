@@ -2214,17 +2214,17 @@ async fn stream_events(
             .and_then(|v| v.to_str().ok())
             .and_then(|v| v.parse().ok())
     });
-    let store = st.runner.store().clone();
+    let runner = st.runner.clone();
     // where a follower with no cursor starts: now, not the beginning of the
     // log. "show me what happens from here" is what opening a live feed means,
     // and the whole history is one query away for anyone who wants it
     let start = match resume {
         Some(seq) => seq,
-        None => store.event_watermark().map_err(internal)?,
+        None => runner.store().event_watermark().map_err(internal)?,
     };
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<SseEvent, Infallible>>(STREAM_QUEUE);
     tokio::spawn(async move {
-        follow(store, filter, start, tx).await;
+        follow(runner, filter, start, tx).await;
     });
     let stream = futures::stream::unfold(rx, |mut rx| async move {
         rx.recv().await.map(|item| (item, rx))
@@ -2232,13 +2232,22 @@ async fn stream_events(
     Ok(Sse::new(stream).keep_alive(KeepAlive::default()))
 }
 
-/// the task behind one stream: read what has settled, hand it over, repeat.
+/// the task behind one stream: read what has settled, hand it over, repeat,
+/// until the client goes away or this process does.
+///
+/// **the second of those is why it holds a runner rather than a store.** an
+/// open event stream is a connection with no natural end, and axum's graceful
+/// shutdown finishes the connections it has: a stream that went on polling
+/// would be the one connection keeping a stopping process alive. so a stop
+/// ends the stream, and the client reconnects to whatever is serving next with
+/// the `last-event-id` it already has.
 async fn follow(
-    store: Store,
+    runner: Runner,
     filter: EventQuery,
     start: i64,
     tx: tokio::sync::mpsc::Sender<Result<SseEvent, Infallible>>,
 ) {
+    let store = runner.store();
     let mut cursor = start;
     let mut waiting: Option<(i64, std::time::Instant)> = None;
     let mut lost: Option<(u64, i64)> = None;
@@ -2304,7 +2313,10 @@ async fn follow(
         if tx.is_closed() {
             return;
         }
-        tokio::time::sleep(STREAM_POLL).await;
+        tokio::select! {
+            () = tokio::time::sleep(STREAM_POLL) => {}
+            () = runner.stopped() => return,
+        }
     }
 }
 

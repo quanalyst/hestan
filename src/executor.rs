@@ -535,6 +535,12 @@ pub struct Runner {
     // one dispatch pass at a time in this process: two passes counting the same
     // free slot would both fill it
     dispatching: Arc<Mutex<()>>,
+    // whether this process has been asked to stop. flipped once, on the way
+    // out, and never back: from there it claims nothing more and anything
+    // holding a connection open knows the last thing it will be handed has
+    // been handed to it. a watch rather than a flag so a waiter is woken at
+    // the moment of the signal rather than on its next poll
+    stopping: Arc<watch::Sender<bool>>,
     // woken whenever a run reaches a terminal status, which is what `run` waits
     // on instead of polling
     settled: Arc<Notify>,
@@ -612,6 +618,7 @@ impl Runner {
             slots: usize::MAX,
             max_instances: DEFAULT_MAX_INSTANCES,
             dispatching: Arc::new(Mutex::new(())),
+            stopping: Arc::new(watch::Sender::new(false)),
             settled: Arc::new(Notify::new()),
             actor: None,
         })
@@ -1286,6 +1293,12 @@ impl Runner {
         if !self.role.executes() {
             return;
         }
+        // and neither has a process on its way out. a run claimed during a stop
+        // is a run this process is about to hand straight back, and the queue
+        // it came off is where somebody who can finish it will look
+        if self.stopping() {
+            return;
+        }
         // and neither has one whose store is refusing writes. claiming a run is
         // promising to record what it does, and a process that cannot keep that
         // promise draining the queue into itself is how a backlog becomes a
@@ -1406,6 +1419,34 @@ impl Runner {
             .into_iter()
             .filter(|id| !given_up.contains(id))
             .collect())
+    }
+
+    /// the runs this process has a live task for, by id.
+    ///
+    /// what [`holding`](Self::holding) reads out of the store, read out of this
+    /// process's own memory instead: a stop wants to know what it is executing
+    /// rather than what the row says it claimed, and the two differ for exactly
+    /// as long as a release takes.
+    pub(crate) fn executing(&self) -> Vec<String> {
+        self.active.lock().unwrap().keys().cloned().collect()
+    }
+
+    /// whether this process has been asked to stop.
+    pub(crate) fn stopping(&self) -> bool {
+        *self.stopping.borrow()
+    }
+
+    /// say that it has. once, on the way out: nothing sets it back.
+    pub(crate) fn begin_stop(&self) {
+        self.stopping.send_replace(true);
+    }
+
+    /// resolves when this process begins stopping, and at once if it already
+    /// has. what anything holding a connection open waits on beside its own
+    /// work.
+    pub(crate) async fn stopped(&self) {
+        let mut rx = self.stopping.subscribe();
+        let _ = rx.wait_for(|stopping| *stopping).await;
     }
 
     /// the runs this process claimed and could not record, waiting on a

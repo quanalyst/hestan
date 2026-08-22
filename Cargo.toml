@@ -186,3 +186,10 @@ required-features = ["cli"]
 [[test]]
 name = "auth"
 harness = false
+
+# a served process signalled from outside and watched for how it exits, which
+# is a fact about a process rather than about a function call, so this one
+# needs a `main` that can be the deployment being stopped
+[[test]]
+name = "stopping"
+harness = false

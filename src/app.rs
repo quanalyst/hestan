@@ -24,6 +24,7 @@ use crate::retention::{self, Retention};
 use crate::schedule::{self, Schedule, ScheduleEntry};
 use crate::sensor::{RunStatusSensor, Sensor, SensorEntry, run_sensors};
 use crate::server::{AppState, SensorInfo, router};
+use crate::stop;
 use crate::store::Store;
 
 /// how many materializations each asset keeps unless
@@ -1105,10 +1106,15 @@ impl Hestan {
         }
         // the lease loop runs whatever the role is: a process holding nothing
         // still notices a claimer that went away, and a deployment where only
-        // the dead process could have noticed would never notice
-        loops.push(tokio::spawn(crate::executor::run_leases(
-            built.runner.clone(),
-        )));
+        // the dead process could have noticed would never notice. it is kept
+        // out of `loops` because it is the one loop a stopping process wants
+        // alive to the end: a run this process is still finishing has to keep
+        // its lease, or somebody else reclaims work that is going fine
+        let leases = tokio::spawn(crate::executor::run_leases(built.runner.clone()));
+        // and the signal, from here on. installed only on this path: a
+        // one-shot goes nowhere near it, and `src/stop.rs` says why that
+        // matters
+        let stop = stop::listen();
         let instance = built.runner.instance().to_string();
         let state_runner = built.runner.clone();
         let state = AppState {
@@ -1118,22 +1124,83 @@ impl Hestan {
             sensors: Arc::new(sensor_infos),
             auth,
         };
-        let served = match listener {
-            Some(listener) => {
-                let addr = addr.expect("a listener came from an address");
-                tracing::info!("hestan {role} {instance} on http://{addr}");
-                axum::serve(listener, router(state)).await
-            }
-            // a worker with no socket: the loops are the process, and there is
-            // nothing to serve them to
-            None => {
-                tracing::info!("hestan {role} {instance}, no listener");
-                std::future::pending().await
+        let asked = stop.clone();
+        let serve = async move {
+            match listener {
+                Some(listener) => {
+                    let addr = addr.expect("a listener came from an address");
+                    tracing::info!("hestan {role} {instance} on http://{addr}");
+                    // graceful, rather than dropping the listener: the socket
+                    // stops accepting and the requests already in it are
+                    // answered. somebody is waiting on the other end of each
+                    // one, and a connection reset is not an answer
+                    axum::serve(listener, router(state))
+                        .with_graceful_shutdown(async move { asked.asked().await })
+                        .await
+                }
+                // a worker with no socket: the loops are the process, and there
+                // is nothing to serve them to. it still stops when it is told to
+                None => {
+                    tracing::info!("hestan {role} {instance}, no listener");
+                    asked.asked().await;
+                    Ok(())
+                }
             }
         };
+        tokio::pin!(serve);
+        // what ends the wait: the signal, or an http server that gave up on
+        // its own, which is an accept loop that failed and not a stop
+        let mut served = Ok(());
+        // whether the server still has to be waited on below. a future polled
+        // after it has finished panics, and this one finishes here about half
+        // the time: the graceful shutdown ends it the moment the signal lands
+        let mut serving = true;
+        tokio::select! {
+            ended = &mut serve => {
+                served = ended;
+                serving = false;
+            }
+            () = stop.asked() => {}
+        }
+        // nothing else is claimed or decided from here, whatever is still
+        // running. the flag first, so a dispatch pass already inside the
+        // aborted loop cannot win a race against the abort
+        state_runner.begin_stop();
         for handle in loops {
             handle.abort();
         }
+        // which of the two ended the wait is asked of the counter rather than
+        // of the select. both arms are ready in the same instant when a signal
+        // is what ended the server, and `select!` picks one at random: reading
+        // the arm it picked would make draining a coin toss
+        if stop.was_asked() {
+            tracing::info!(
+                "stopping: finishing what is already in flight, for up to {:?}",
+                stop::WITHIN
+            );
+            let finishing = async {
+                // the connections this server already has, then the runs it is
+                // already executing. both are things somebody is waiting for,
+                // and the http half is first because it is the quick one
+                if serving {
+                    served = (&mut serve).await;
+                }
+                stop::settled(&state_runner).await;
+            };
+            tokio::pin!(finishing);
+            tokio::select! {
+                () = &mut finishing => tracing::info!("stopping: nothing left in flight"),
+                () = tokio::time::sleep(stop::WITHIN) => tracing::warn!(
+                    "stopping: {:?} is up and this process is still busy; going anyway",
+                    stop::WITHIN
+                ),
+                () = stop.asked_again() => tracing::warn!(
+                    "stopping: asked a second time, so this process goes now \
+                     rather than finishing what it was doing"
+                ),
+            }
+        }
+        leases.abort();
         // the loops are stopped, so nothing in this process will decide again:
         // hand the lease back rather than making the next process wait it out
         decider::hand_back(&state_runner);

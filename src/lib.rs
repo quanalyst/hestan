@@ -137,6 +137,9 @@ mod retention;
 mod schedule;
 mod sensor;
 mod server;
+// what a long-lived process does between the signal and the exit. only `serve`
+// and `work` reach it: a one-shot installs no handler at all
+mod stop;
 mod store;
 
 pub use app::Hestan;
