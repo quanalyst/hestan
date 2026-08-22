@@ -231,7 +231,15 @@ async fn main() -> Result<(), hestan::Error> {
         .job(health)
         .pool("warehouse", 1)
         .rate("orders_api", 5, Duration::from_secs(1))
-        .schedule("orders_etl", "*/2 * * * *")
+        // every two minutes, unless the deployment says otherwise. the fault
+        // injection in `deploy/checks` drives this stack for a minute or two at
+        // a time and wants occurrences inside that, so it sets
+        // `HESTAN_SCHEDULE` to a six-field expression, where the first field
+        // is seconds: `*/10 * * * * *` is every ten seconds
+        .schedule(
+            "orders_etl",
+            env("HESTAN_SCHEDULE").unwrap_or_else(|| "*/2 * * * *".into()),
+        )
         .schedule("warehouse_healthcheck", "*/5 * * * *")
         .max_concurrent_runs(env_num("HESTAN_MAX_CONCURRENT_RUNS").unwrap_or(4))
         .slots(env_num("HESTAN_SLOTS").unwrap_or(2))
