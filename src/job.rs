@@ -157,14 +157,43 @@ impl Job {
         self.params_schema.as_ref()
     }
 
+    /// every param this job's ops declared with
+    /// [`Op::secret_params`](crate::Op::secret_params), merged.
+    ///
+    /// params go to every op of the run, so one op calling a param a
+    /// credential makes it one for the job: the store writes
+    /// [`REDACTED`](crate::secret::REDACTED) in its place wherever this job's
+    /// params are written. [`hestan::secret`](crate::secret) is what that
+    /// does and does not promise.
+    ///
+    /// computed rather than stored: it is read once when a
+    /// [`Runner`](crate::Runner) registers the job, and never on a hot path.
+    pub fn secret_params(&self) -> BTreeSet<String> {
+        self.ops
+            .iter()
+            .flat_map(|op| op.declared_secret_params().iter().cloned())
+            .collect()
+    }
+
     /// the first op that refuses `params`, with its reason: the same check a
     /// launch runs, minus the store and the run. `None` means every op that
     /// declared [`Op::params`](crate::Op::params) accepts them.
+    ///
+    /// the reason comes from serde and quotes back what it was given, which is
+    /// how a credential reaches a log without anything having stored it. so it
+    /// arrives with this job's [secret params](Self::secret_params) already
+    /// replaced by [`REDACTED`](crate::secret::REDACTED): the api, the cli and
+    /// the launch itself all read the reason off here, and a caller that finds
+    /// this later gets the same treatment without having to know to ask.
     pub fn params_error(&self, params: &Value) -> Option<(String, String)> {
+        let secrets = crate::secret::secrets_with(&self.secret_params(), params);
         self.ops.iter().find_map(|op| {
-            op.validate_params(params)
-                .err()
-                .map(|reason| (op.name().to_string(), reason))
+            op.validate_params(params).err().map(|reason| {
+                (
+                    op.name().to_string(),
+                    crate::secret::hide(&secrets, &reason),
+                )
+            })
         })
     }
 

@@ -134,6 +134,27 @@ pub enum Error {
         /// what it objected to.
         reason: String,
     },
+    /// a launch whose params carry [`REDACTED`](crate::secret::REDACTED) where
+    /// a value should be: a retry, a resume or a replay reading a run's stored
+    /// params back, when that run was launched with a
+    /// [secret param](crate::Op::secret_params).
+    ///
+    /// the value was never written down, so there is nothing to re-run it
+    /// with. refused rather than launched, because a run given the literal
+    /// marker as its credential fails confusingly at best and authenticates as
+    /// something unintended at worst. launch again and supply the value.
+    #[error(
+        "job {job}: {} declared secret and not stored, so what came back is the marker \
+         and not the value. a retry, a resume or a replay cannot re-read one: launch \
+         again and pass it",
+        list(.params)
+    )]
+    RedactedParams {
+        /// the job the launch was for.
+        job: String,
+        /// the params that came back as the marker.
+        params: Vec<String>,
+    },
     /// an op asked for a resource nothing declared, or one declared as another
     /// type.
     #[error("resource {name}: {reason}")]
@@ -182,6 +203,16 @@ pub enum Error {
     /// take its address.
     #[error(transparent)]
     Io(#[from] std::io::Error),
+}
+
+/// `a`, `a and b`, `a, b and c`: a list of names in a sentence, for the
+/// refusals that name more than one thing and are read by a person.
+fn list(names: &[String]) -> String {
+    match names {
+        [] => String::new(),
+        [one] => format!("param {one} is"),
+        [rest @ .., last] => format!("params {} and {last} are", rest.join(", ")),
+    }
 }
 
 /// a postgres error and everything under it, in one line.

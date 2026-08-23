@@ -149,6 +149,11 @@ mod pg;
 mod resource;
 mod retention;
 mod schedule;
+// a param a caller declares secret: where hestan redacts one, what it does to
+// a replay, and what it deliberately does not promise. public because a
+// deployment has to read the limits before trusting the guarantee, and a
+// private module's rustdoc is a page nobody lands on
+pub mod secret;
 mod sensor;
 mod server;
 // what a long-lived process does between the signal and the exit. only `serve`
@@ -195,6 +200,7 @@ pub use rate::RateStatus;
 pub use resource::ResourceCtx;
 pub use retention::Retention;
 pub use schedule::Schedule;
+pub use secret::REDACTED;
 pub use sensor::{RunRequest, RunStatusSensor, RunSummary, Sensor, SensorCtx};
 pub use store::{EventQuery, Settled, Store};
 

@@ -75,6 +75,13 @@ struct Window {
     days: u32,
 }
 
+#[derive(serde::Deserialize)]
+#[allow(dead_code)]
+struct Deploy {
+    token: String,
+    env: u32,
+}
+
 /// two warehouse tables, a vendor feed and something built out of them: the
 /// smallest registry that has a group, an origin and an asset in neither.
 fn assets() -> Vec<Asset> {
@@ -129,6 +136,17 @@ fn jobs() -> Vec<Job> {
         // and a job with a params schema, for the dry run to reject against
         Job::builder("windowed")
             .op(Op::new("render", |_| async { Ok(json!(null)) }).params::<Window>())
+            .build()
+            .unwrap(),
+        // a job whose token is a credential, for the dry run to redact and the
+        // run log not to hold
+        Job::builder("deploy")
+            .op(Op::new("push", |ctx: OpCtx| async move {
+                ctx.info("pushing");
+                Ok(ctx.params().clone())
+            })
+            .params::<Deploy>()
+            .secret_params(["token"]))
             .build()
             .unwrap(),
         Job::builder("slow")
@@ -793,6 +811,45 @@ async fn dry(dir: &Path) {
         .collect();
     middle.sort_unstable();
     assert_eq!(middle, ["left", "right"], "the parallel pair is one stage");
+
+    // a dry run resolves a plan without touching the store, so it is the one
+    // place params are rendered that the store never sees. it redacts off the
+    // same declaration, because a token typed on a command line in ci ends up
+    // in the same log the run page would have
+    let planned = cli(
+        &db,
+        &[
+            "--json",
+            "run",
+            "deploy",
+            "--params",
+            "{\"token\":\"a-deploy-token-nobody-should-see\",\"env\":1}",
+            "--dry-run",
+        ],
+    );
+    planned.assert(0);
+    assert!(
+        !planned.stdout.contains("a-deploy-token-nobody-should-see"),
+        "{planned:?}"
+    );
+    assert!(planned.stdout.contains("[hestan:redacted]"), "{planned:?}");
+
+    // and the classic leak: a refusal that prints what it was given
+    let refused = cli(
+        &db,
+        &[
+            "run",
+            "deploy",
+            "--params",
+            "{\"token\":\"a-deploy-token-nobody-should-see\",\"env\":\"prod\"}",
+            "--dry-run",
+        ],
+    );
+    refused.assert(2);
+    assert!(
+        !refused.stderr.contains("a-deploy-token-nobody-should-see"),
+        "{refused:?}"
+    );
 
     let after = cli(&db, &["--quiet", "runs", "--limit", "500"])
         .stdout

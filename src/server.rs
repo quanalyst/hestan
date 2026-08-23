@@ -726,6 +726,10 @@ async fn launch_run(
         // a subset the job cannot satisfy is Error::Graph, raised by the same
         // check asset builds and resumes go through, and it names what is
         // missing, which is the request's fault, so a 400
+        // and a preset holding the marker where a secret was: nothing is wrong
+        // with the request, the value was deliberately never stored, and the
+        // fix is to pass it rather than to correct the body
+        Err(e @ Error::RedactedParams { .. }) => Err(err(StatusCode::CONFLICT, e.to_string())),
         Err(e @ (Error::InvalidParams { .. } | Error::Graph(_))) => {
             Err(err(StatusCode::BAD_REQUEST, e.to_string()))
         }
@@ -1926,6 +1930,9 @@ async fn retry_run(
             format!("job no longer defined: {job}"),
         )),
         Err(e @ Error::InvalidParams { .. }) => Err(err(StatusCode::BAD_REQUEST, e.to_string())),
+        // the run carried a secret param, which is not in the run log, so
+        // there is nothing to retry it with
+        Err(e @ Error::RedactedParams { .. }) => Err(err(StatusCode::CONFLICT, e.to_string())),
         Err(e) => Err(internal(e)),
     }
 }
@@ -1950,9 +1957,12 @@ fn resume_from_body(body: &Bytes) -> Result<Vec<String>, ApiError> {
 fn rerun_error(e: Error) -> ApiError {
     match e {
         e @ Error::UnknownRun(_) => err(StatusCode::NOT_FOUND, e.to_string()),
-        e @ (Error::RunActive(_) | Error::RunNotFailed(_)) => {
-            err(StatusCode::CONFLICT, e.to_string())
-        }
+        e @ (Error::RunActive(_)
+        | Error::RunNotFailed(_)
+        // nothing about the request is wrong: the value it would need was
+        // deliberately never written down. 409 rather than 400, because the
+        // fix is a fresh launch and not a corrected body
+        | Error::RedactedParams { .. }) => err(StatusCode::CONFLICT, e.to_string()),
         // the run exists but its job left the code since; a 404 would lie
         Error::UnknownJob(job) => err(
             StatusCode::CONFLICT,
@@ -5201,6 +5211,66 @@ mod tests {
 
         let just_after = prev + Duration::minutes(10);
         assert!(!is_overdue(prev, 86400, None, just_after));
+    }
+
+    // what the api and the ui show is what the store holds, which is the whole
+    // reason the redaction is in the store: there is nothing here for this
+    // test to check that a new endpoint could get wrong
+    #[tokio::test]
+    async fn the_api_shows_the_marker_where_a_secret_param_was() {
+        let job = Job::builder("deploy")
+            .op(Op::new("push", |_| async { Ok(json!(null)) }).secret_params(["token"]))
+            .build()
+            .unwrap();
+        let st = state(vec![job]);
+        let id = st
+            .runner
+            .launch(
+                "deploy",
+                json!({"token": "a-deploy-token-nobody-should-see", "env": "prod"}),
+                Trigger::Manual,
+            )
+            .unwrap();
+
+        for (path, renders_params) in [
+            ("/api/runs".to_string(), true),
+            (format!("/api/runs/{id}"), true),
+            // the launchpad's prefill, which is the one read that turns back
+            // into a launch
+            (format!("/api/runs/{id}/clone"), true),
+            (format!("/api/runs/{id}/events"), false),
+        ] {
+            let (status, body, _) = request(router(st.clone()), Method::GET, &path).await;
+            assert_eq!(status, StatusCode::OK, "{path}");
+            let body = body.unwrap().to_string();
+            assert!(
+                !body.contains("a-deploy-token-nobody-should-see"),
+                "{path}: {body}"
+            );
+            assert_eq!(
+                body.contains(crate::secret::REDACTED),
+                renders_params,
+                "{path}: {body}"
+            );
+        }
+
+        // and the launchpad's prefill cannot be launched back as it stands:
+        // the marker is refused, naming what to type in its place
+        use tower::util::ServiceExt;
+        let body = json!({"params": {"token": crate::secret::REDACTED, "env": "prod"}});
+        let req = axum::http::Request::builder()
+            .method(Method::POST)
+            .uri("/api/jobs/deploy/runs")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(axum::body::Body::from(body.to_string()))
+            .unwrap();
+        let resp = router(st.clone()).oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+        let said = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let said = String::from_utf8_lossy(&said).into_owned();
+        assert!(said.contains("param token is"), "{said}");
     }
 
     async fn request(

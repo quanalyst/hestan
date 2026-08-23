@@ -621,6 +621,10 @@ impl Runner {
         let mut map = HashMap::new();
         for job in jobs {
             let name = job.name().to_string();
+            // what this job calls a credential, told to the store once here
+            // rather than looked up per write: from now on nothing can put one
+            // of these in a params column, whoever asks it to
+            store.secrets().declare(&name, job.secret_params());
             if map.insert(name.clone(), job).is_some() {
                 return Err(Error::DuplicateJob(name));
             }
@@ -1448,6 +1452,9 @@ impl Runner {
         );
         self.abandoned.lock().unwrap().insert(run_id.to_string());
         self.active.lock().unwrap().remove(run_id);
+        // this process is not going to record anything else about this run, so
+        // it has no business still holding the credential it was launched with
+        self.store.secrets().release(run_id);
     }
 
     /// the runs this process is executing, by id.
@@ -1821,6 +1828,7 @@ impl Runner {
             .collect();
         // externals are seeded null by a full launch; a resume of one keeps that
         seeded.extend(job.external_seeds());
+        refuse_marked(&run.job, &run.params)?;
         Ok(ResumePlan {
             job: run.job,
             rerun,
@@ -2064,6 +2072,7 @@ impl Runner {
             .collect();
         // externals are seeded null by a full launch; a replay of one keeps that
         seeds.extend(job.external_seeds());
+        refuse_marked(&run.job, &run.params)?;
         Ok(ReplayPlan {
             job: run.job,
             ops: replayed,
@@ -2184,7 +2193,18 @@ impl Runner {
                 (pending, seeded)
             }
         };
-        // validated before the run row exists, so a rejected launch leaves no trace
+        // a launch reading a stored run's params back rather than being given
+        // the values: the marker is what the store holds where a secret was,
+        // and running the op on the literal string is the one outcome worse
+        // than refusing. this is the funnel every run goes through, so a
+        // retry, a resume, a replay and whatever reads params back next month
+        // all land here rather than each remembering to check
+        refuse_marked(job.name(), &params)?;
+        // validated before the run row exists, so a rejected launch leaves no
+        // trace. the reason comes from serde and quotes what it was given, so
+        // it is scrubbed of this launch's own secrets before it is a message
+        let secrets = self.store.secrets();
+        let held = secrets.secrets_in(job.name(), &params);
         for op in job.ops() {
             if !pending.iter().any(|n| n == op.name()) {
                 continue;
@@ -2192,7 +2212,7 @@ impl Runner {
             if let Err(reason) = op.validate_params(&params) {
                 return Err(Error::InvalidParams {
                     op: op.name().to_string(),
-                    reason,
+                    reason: crate::secret::hide(&held, &reason),
                 });
             }
         }
@@ -2238,22 +2258,52 @@ impl Runner {
         // an earlier run that live in this process's memory and nowhere a
         // claimer in another process could look
         let plan = subset_plan.then(|| json!({ "ops": &pending, "seeds": &seeded }));
+        // held before the insert, so that the insert itself is already a write
+        // this process refuses to let a secret into
+        secrets.hold(&run.id, held);
         match self
             .store
             .create_run_keyed(&run, &rows, claimed, plan.as_ref(), self.fence())?
         {
             Landed::Yes => {}
             // the claim was taken between the caller's check and this insert:
-            // no run row was written, and nothing launched
-            Landed::Taken => return Ok(Launched::Taken),
+            // no run row was written, and nothing launched. so nothing is
+            // going to execute under that id and nothing should still be
+            // holding a credential for it
+            Landed::Taken => {
+                secrets.release(&run.id);
+                return Ok(Launched::Taken);
+            }
             // and this process was not the decider by the time the write got
             // there. same outcome, opposite meaning
-            Landed::Stale => return Ok(Launched::Stale),
+            Landed::Stale => {
+                secrets.release(&run.id);
+                return Ok(Launched::Stale);
+            }
         }
         // enqueued and on disk; whether it starts now is the dispatcher's
         // business, and with no limits declared "now" is this call
         self.dispatch();
         Ok(Launched::Queued(run.id))
+    }
+}
+
+/// refuse params carrying [`REDACTED`](crate::secret::REDACTED) where a value
+/// should be.
+///
+/// the enforcement is the call in [`Runner::enqueue`](Runner::enqueue), which
+/// every run in hestan goes through: a retry, a resume, a replay and whatever
+/// reads stored params back next month land on it without having been written
+/// to. the resume and replay *previews* call it too, so that what a preview
+/// promises and what the launch after it does cannot disagree.
+fn refuse_marked(job: &str, params: &Value) -> Result<(), Error> {
+    let marked = crate::secret::Vault::marked(params);
+    match marked.is_empty() {
+        true => Ok(()),
+        false => Err(Error::RedactedParams {
+            job: job.to_string(),
+            params: marked,
+        }),
     }
 }
 
@@ -2564,7 +2614,7 @@ async fn execute(
 async fn execute_in_span(
     job: Job,
     run_id: String,
-    params: Value,
+    mut params: Value,
     trigger: Trigger,
     scheduled_for: Option<DateTime<Utc>>,
     runner: Runner,
@@ -2649,6 +2699,28 @@ async fn execute_in_span(
             resource::none()
         }
     };
+
+    // the run row holds the marker where a [secret param](crate::secret) was,
+    // and the value is in the memory of whatever took the launch. usually that
+    // is this process and this puts it back. when it is not, the op would be
+    // handed the literal marker as its credential, so no op of this run runs
+    // and every row says why, exactly as a resource that could not be built
+    // does above
+    let missing = store.secrets().restore(&run_id, &mut params);
+    if !missing.is_empty() {
+        let e = format!(
+            "params {} were declared secret, so they are not in the run log, and this \
+             process is not the one that was given them. relaunch from here, or move \
+             the credential to a resource, which is built where the op runs",
+            missing.join(", ")
+        );
+        let reason = format!("skipped: {e}");
+        for name in pending.drain(..) {
+            unrecorded |= !op_skipped(&store, &run_id, &name, &reason, None).await;
+        }
+        failed = true;
+        run_error = Some(e);
+    }
 
     'run: while !unrecorded {
         // settle every unit whose deps have all reached a terminal status: its
@@ -3511,6 +3583,10 @@ async fn execute_in_span(
         return;
     }
     runner.active.lock().unwrap().remove(&run_id);
+    // and the credential it was launched with goes with it. that is what makes
+    // a replay of this run a refusal rather than a re-run on a value nobody
+    // could see any more
+    store.secrets().release(&run_id);
     // this run's slot is free: wake anything waiting on it, then go and see
     // what the queue can start in its place
     runner.settled.notify_waiters();
@@ -4422,6 +4498,197 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         panic!("run {id} never reached a terminal status");
+    }
+
+    // a value long enough for the second line to scan for, so that one job
+    // covers both the declaration and the substring pass
+    const TOKEN: &str = "a-deploy-token-nobody-should-see";
+
+    /// a job whose `token` param is a credential, whose op reports what it was
+    /// actually handed, and which copies it into a log line and a metadata
+    /// value on the way, the way an op written in a hurry does.
+    fn deploy_job(seen: Arc<Mutex<Vec<Value>>>, fails: bool) -> Job {
+        Job::builder("deploy")
+            .op(Op::new("push", move |ctx: OpCtx| {
+                let seen = seen.clone();
+                async move {
+                    seen.lock().unwrap().push(ctx.params().clone());
+                    let token = ctx.params()["token"].as_str().unwrap_or_default();
+                    ctx.info(format!("pushing with {token}"));
+                    ctx.meta("used", token);
+                    match fails {
+                        true => Err(format!("upstream refused {token}").into()),
+                        false => Ok(json!({ "pushed": true })),
+                    }
+                }
+            })
+            .secret_params(["token"]))
+            .build()
+            .unwrap()
+    }
+
+    fn launched(runner: &Runner) -> Result<String, Error> {
+        runner.launch(
+            "deploy",
+            json!({ "token": TOKEN, "env": "prod", "wait": 30 }),
+            Trigger::Manual,
+        )
+    }
+
+    // the whole of part one in one assertion: the op is handed the credential,
+    // the database is not, and everything else about the launch is untouched
+    #[tokio::test]
+    async fn a_declared_secret_reaches_the_op_and_not_the_database() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let store = Store::open(":memory:").unwrap();
+        let runner = Runner::new([deploy_job(seen.clone(), false)], store.clone()).unwrap();
+        let id = launched(&runner).unwrap();
+        assert_eq!(wait_terminal(&runner, &id).await, RunStatus::Success);
+
+        // the op ran on the credential, not on the marker
+        assert_eq!(seen.lock().unwrap()[0]["token"], TOKEN);
+
+        // and the run log has the marker where it was, with everything else
+        // byte for byte what was passed
+        let run = store.run(&id).unwrap().unwrap();
+        assert_eq!(
+            run.params,
+            json!({ "token": crate::secret::REDACTED, "env": "prod", "wait": 30 })
+        );
+
+        // not in the params column, and not anywhere else either: the op put
+        // it in a log line, in a metadata value and in the message of the
+        // error it failed with, and none of those reached the disk with it
+        assert!(
+            !store.all_values().contains(TOKEN),
+            "the token is somewhere in the database"
+        );
+        let rows = store.op_runs(&id).unwrap();
+        assert_eq!(
+            rows[0].metadata.as_ref().unwrap()["used"]["text"],
+            crate::secret::REDACTED
+        );
+        let events = store.events(&id, 0).unwrap();
+        assert!(
+            events
+                .iter()
+                .any(|e| e.message.contains(crate::secret::REDACTED)),
+            "{events:?}"
+        );
+    }
+
+    // and a job that declared nothing is exactly as it was, which is the
+    // assertion every existing deployment cares about
+    #[tokio::test]
+    async fn a_param_nobody_declared_is_stored_as_it_was_passed() {
+        let store = Store::open(":memory:").unwrap();
+        let runner = Runner::new([sleepy_job("etl", 1)], store.clone()).unwrap();
+        let params = json!({ "token": TOKEN, "env": "prod", "wait": 30 });
+        let id = runner
+            .launch("etl", params.clone(), Trigger::Manual)
+            .unwrap();
+        assert_eq!(wait_terminal(&runner, &id).await, RunStatus::Success);
+        assert_eq!(store.run(&id).unwrap().unwrap().params, params);
+    }
+
+    // the sharp edge: the store holds the marker, so a re-launch from a stored
+    // row would run the deploy with the literal string as its credential
+    #[tokio::test]
+    async fn a_run_that_carried_a_secret_cannot_be_replayed_resumed_or_retried() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let store = Store::open(":memory:").unwrap();
+        let runner = Runner::new([deploy_job(seen, true)], store.clone()).unwrap();
+        let id = launched(&runner).unwrap();
+        assert_eq!(wait_terminal(&runner, &id).await, RunStatus::Failed);
+
+        let stored = store.run(&id).unwrap().unwrap().params;
+        let refusals = [
+            runner.replay(&id).unwrap_err(),
+            runner.resume(&id).unwrap_err(),
+            // a retry is a fresh launch of the stored params, which is the
+            // shape every future caller of "run that again" will have
+            runner.launch("deploy", stored, Trigger::Retry).unwrap_err(),
+            // and a preview refuses whatever the launch after it would, so the
+            // ui never offers a button that cannot work
+            runner.replay_plan(&id, None).unwrap_err(),
+            runner.resume_plan(&id, None).unwrap_err(),
+        ];
+        for said in refusals {
+            assert!(
+                matches!(&said, Error::RedactedParams { params, .. } if params == &["token"]),
+                "{said:?}"
+            );
+            let said = said.to_string();
+            // it names the param and says what to do instead
+            assert!(said.contains("param token is"), "{said}");
+            assert!(said.contains("launch again and pass it"), "{said}");
+        }
+
+        // and the same launch with the value supplied again is an ordinary one
+        assert!(launched(&runner).is_ok());
+    }
+
+    // the limit, asserted rather than described: the value is in the memory of
+    // the process that took the launch, so another one has the marker and
+    // refuses to execute on it
+    #[tokio::test]
+    async fn a_process_that_was_not_given_the_secret_fails_the_run_rather_than_using_the_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hestan.db");
+        let path = path.to_str().unwrap();
+
+        // one store per process, which is what makes these two vaults and not
+        // one: the database is shared and the memory holding the value is not
+        let scheduler = Store::open(path).unwrap();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let enqueuer = Runner::new([deploy_job(seen.clone(), false)], scheduler)
+            .unwrap()
+            .with_role(Role::Scheduler, 1);
+        let id = launched(&enqueuer).unwrap();
+
+        let worker_store = Store::open(path).unwrap();
+        let worker = Runner::new([deploy_job(seen.clone(), false)], worker_store.clone()).unwrap();
+        worker.dispatch();
+        assert_eq!(wait_terminal(&worker, &id).await, RunStatus::Failed);
+
+        // no op of it ran on the marker
+        assert!(
+            seen.lock().unwrap().is_empty(),
+            "an op ran without the token"
+        );
+        let said = worker_store.run(&id).unwrap().unwrap().error.unwrap();
+        assert!(said.contains("token"), "{said}");
+        assert!(said.contains("declared secret"), "{said}");
+        assert!(said.contains("resource"), "{said}");
+    }
+
+    // the classic leak: a launch is refused and the refusal prints what it was
+    // given
+    #[tokio::test]
+    async fn a_params_check_that_quotes_the_value_back_quotes_the_marker() {
+        #[derive(serde::Deserialize)]
+        struct Push {
+            #[allow(dead_code)]
+            token: u64,
+        }
+        let job = Job::builder("deploy")
+            .op(Op::new("push", |_| async { Ok(json!(null)) })
+                .params::<Push>()
+                .secret_params(["token"]))
+            .build()
+            .unwrap();
+        let store = Store::open(":memory:").unwrap();
+        let runner = Runner::new([job], store.clone()).unwrap();
+        let said = launched(&runner).unwrap_err().to_string();
+        assert!(!said.contains(TOKEN), "{said}");
+        assert!(said.contains(crate::secret::REDACTED), "{said}");
+        // and nothing was written, so there is no run row carrying it either
+        assert!(
+            store
+                .runs(None, None, None, None, None, 10)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     // which of the two you got used to depend on the order they were handed

@@ -22,6 +22,7 @@ use crate::model::{
 use crate::op;
 use crate::retention::Retention;
 use crate::schedule::Schedule;
+use crate::secret;
 
 // `trigger` is a reserved word in sqlite, hence the quoted column name in
 // every statement that touches it.
@@ -871,7 +872,7 @@ enum Db {
 ///
 /// three shapes, because the schema has three: text (which is every
 /// timestamp, every status word and every piece of json), integers, and null.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) enum Val<'a> {
     Null,
     Text(Cow<'a, str>),
@@ -988,8 +989,21 @@ trait Exec {
     }
 }
 
-/// an open connection with the store's mutex held.
-enum Conn<'a> {
+/// an open connection with the store's mutex held, and the
+/// [vault](crate::secret) whose held values no statement issued on it may
+/// write down.
+///
+/// the vault is carried here rather than consulted at each call site because
+/// this and [`Tx`] are the only two things in this file that run a statement:
+/// a write added tomorrow binds its values through [`Exec::execute`] like
+/// every other, and is scrubbed by being ordinary rather than by remembering
+/// to be.
+struct Conn<'a> {
+    db: ConnDb<'a>,
+    secrets: &'a secret::Vault,
+}
+
+enum ConnDb<'a> {
     Sqlite(MutexGuard<'a, Connection>),
     #[cfg(feature = "postgres")]
     Postgres(MutexGuard<'a, crate::pg::Client>),
@@ -999,11 +1013,13 @@ impl Conn<'_> {
     /// a transaction. sqlite gets a deferred one, which is what the callers
     /// that only write want.
     fn begin(&mut self) -> Result<Tx<'_>, Error> {
-        match self {
-            Conn::Sqlite(c) => Ok(Tx::Sqlite(c.transaction()?)),
+        let secrets = self.secrets;
+        let db = match &mut self.db {
+            ConnDb::Sqlite(c) => TxDb::Sqlite(c.transaction()?),
             #[cfg(feature = "postgres")]
-            Conn::Postgres(c) => Ok(Tx::Postgres(c.transaction()?)),
-        }
+            ConnDb::Postgres(c) => TxDb::Postgres(c.transaction()?),
+        };
+        Ok(Tx { db, secrets })
     }
 
     /// a transaction that takes the write lock at `BEGIN` rather than at the
@@ -1015,40 +1031,43 @@ impl Conn<'_> {
     /// lock or a conditional update, both of which hold inside an ordinary
     /// transaction.
     fn begin_immediate(&mut self) -> Result<Tx<'_>, Error> {
-        match self {
-            Conn::Sqlite(c) => Ok(Tx::Sqlite(
-                c.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?,
-            )),
+        let secrets = self.secrets;
+        let db = match &mut self.db {
+            ConnDb::Sqlite(c) => {
+                TxDb::Sqlite(c.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?)
+            }
             #[cfg(feature = "postgres")]
-            Conn::Postgres(c) => Ok(Tx::Postgres(c.transaction()?)),
-        }
+            ConnDb::Postgres(c) => TxDb::Postgres(c.transaction()?),
+        };
+        Ok(Tx { db, secrets })
     }
 
     /// several statements at once, no parameters: ddl and nothing else.
     #[cfg(test)]
     fn batch(&mut self, sql: &str) -> Result<(), Error> {
-        match self {
-            Conn::Sqlite(c) => Ok(c.execute_batch(sql)?),
+        match &mut self.db {
+            ConnDb::Sqlite(c) => Ok(c.execute_batch(sql)?),
             #[cfg(feature = "postgres")]
-            Conn::Postgres(c) => c.batch(sql),
+            ConnDb::Postgres(c) => c.batch(sql),
         }
     }
 }
 
 impl Exec for Conn<'_> {
     fn dialect(&self) -> Dialect {
-        match self {
-            Conn::Sqlite(_) => Dialect::Sqlite,
+        match &self.db {
+            ConnDb::Sqlite(_) => Dialect::Sqlite,
             #[cfg(feature = "postgres")]
-            Conn::Postgres(_) => Dialect::Postgres,
+            ConnDb::Postgres(_) => Dialect::Postgres,
         }
     }
 
     fn execute(&mut self, sql: &str, args: &[Val<'_>]) -> Result<usize, Error> {
-        match self {
-            Conn::Sqlite(c) => sqlite_execute(c, sql, args),
+        let args = scrubbed(self.secrets, args);
+        match &mut self.db {
+            ConnDb::Sqlite(c) => sqlite_execute(c, sql, &args),
             #[cfg(feature = "postgres")]
-            Conn::Postgres(c) => c.execute(sql, args),
+            ConnDb::Postgres(c) => c.execute(sql, &args),
         }
     }
 
@@ -1058,17 +1077,22 @@ impl Exec for Conn<'_> {
         args: &[Val<'_>],
         row: impl FnMut(&AnyRow<'_>) -> Result<T, Error>,
     ) -> Result<Vec<T>, Error> {
-        match self {
-            Conn::Sqlite(c) => sqlite_query(c, sql, args, row),
+        match &mut self.db {
+            ConnDb::Sqlite(c) => sqlite_query(c, sql, args, row),
             #[cfg(feature = "postgres")]
-            Conn::Postgres(c) => c.query(sql, args, row),
+            ConnDb::Postgres(c) => c.query(sql, args, row),
         }
     }
 }
 
 /// a transaction on either backend. dropping one rolls it back, which is what
 /// several of the methods below use to abandon a write they decided against.
-enum Tx<'a> {
+struct Tx<'a> {
+    db: TxDb<'a>,
+    secrets: &'a secret::Vault,
+}
+
+enum TxDb<'a> {
     Sqlite(rusqlite::Transaction<'a>),
     #[cfg(feature = "postgres")]
     Postgres(crate::pg::Transaction<'a>),
@@ -1087,36 +1111,37 @@ impl Tx<'_> {
     /// [`Limits::binding`]) so that the ordinary case, where nothing is
     /// capped, still has dispatchers never meeting.
     fn take_turns(&mut self) -> Result<(), Error> {
-        match self {
-            Tx::Sqlite(_) => Ok(()),
+        match &mut self.db {
+            TxDb::Sqlite(_) => Ok(()),
             #[cfg(feature = "postgres")]
-            Tx::Postgres(tx) => tx.claim_lock(),
+            TxDb::Postgres(tx) => tx.claim_lock(),
         }
     }
 
     fn commit(self) -> Result<(), Error> {
-        match self {
-            Tx::Sqlite(tx) => Ok(tx.commit()?),
+        match self.db {
+            TxDb::Sqlite(tx) => Ok(tx.commit()?),
             #[cfg(feature = "postgres")]
-            Tx::Postgres(tx) => tx.commit(),
+            TxDb::Postgres(tx) => tx.commit(),
         }
     }
 }
 
 impl Exec for Tx<'_> {
     fn dialect(&self) -> Dialect {
-        match self {
-            Tx::Sqlite(_) => Dialect::Sqlite,
+        match &self.db {
+            TxDb::Sqlite(_) => Dialect::Sqlite,
             #[cfg(feature = "postgres")]
-            Tx::Postgres(_) => Dialect::Postgres,
+            TxDb::Postgres(_) => Dialect::Postgres,
         }
     }
 
     fn execute(&mut self, sql: &str, args: &[Val<'_>]) -> Result<usize, Error> {
-        match self {
-            Tx::Sqlite(tx) => sqlite_execute(tx, sql, args),
+        let args = scrubbed(self.secrets, args);
+        match &mut self.db {
+            TxDb::Sqlite(tx) => sqlite_execute(tx, sql, &args),
             #[cfg(feature = "postgres")]
-            Tx::Postgres(tx) => tx.execute(sql, args),
+            TxDb::Postgres(tx) => tx.execute(sql, &args),
         }
     }
 
@@ -1126,12 +1151,38 @@ impl Exec for Tx<'_> {
         args: &[Val<'_>],
         row: impl FnMut(&AnyRow<'_>) -> Result<T, Error>,
     ) -> Result<Vec<T>, Error> {
-        match self {
-            Tx::Sqlite(tx) => sqlite_query(tx, sql, args, row),
+        match &mut self.db {
+            TxDb::Sqlite(tx) => sqlite_query(tx, sql, args, row),
             #[cfg(feature = "postgres")]
-            Tx::Postgres(tx) => tx.query(sql, args, row),
+            TxDb::Postgres(tx) => tx.query(sql, args, row),
         }
     }
+}
+
+/// every bound string of a write, with any secret value this process is
+/// holding replaced by the marker.
+///
+/// **writes only.** a read binds the same way and is left alone: a `WHERE`
+/// clause rewritten under a query would match nothing and answer wrongly, and
+/// what a secret must not do is get *into* the database. borrowed and
+/// untouched whenever nothing is held, which is every deployment that
+/// declares no secret params.
+fn scrubbed<'a>(secrets: &secret::Vault, args: &'a [Val<'a>]) -> Cow<'a, [Val<'a>]> {
+    let dirty = args.iter().any(|v| match v {
+        Val::Text(s) => matches!(secrets.scrub(s), Cow::Owned(_)),
+        _ => false,
+    });
+    if !dirty {
+        return Cow::Borrowed(args);
+    }
+    Cow::Owned(
+        args.iter()
+            .map(|v| match v {
+                Val::Text(s) => Val::Text(Cow::Owned(secrets.scrub(s).into_owned())),
+                other => other.clone(),
+            })
+            .collect(),
+    )
 }
 
 fn sqlite_execute(conn: &Connection, sql: &str, args: &[Val<'_>]) -> Result<usize, Error> {
@@ -1528,6 +1579,10 @@ pub struct Store {
     health: Arc<Health>,
     /// what this process has counted itself doing to it, shared the same way.
     meters: Arc<Meters>,
+    /// which params this deployment declared secret, and the values it is
+    /// holding for the runs it took. shared by every clone, so a store handed
+    /// on is a store that still refuses to write them.
+    secrets: Arc<secret::Vault>,
 }
 
 impl Store {
@@ -1549,7 +1604,28 @@ impl Store {
             target: target.into(),
             health: Arc::new(Health::default()),
             meters: Arc::new(Meters::default()),
+            secrets: Arc::new(secret::Vault::default()),
         }
+    }
+
+    /// what this deployment calls a secret, and what it is holding.
+    ///
+    /// a [`Runner`](crate::Runner) declares its jobs' secret params here when
+    /// it is built and holds a run's values here when it takes a launch. see
+    /// [`hestan::secret`](crate::secret).
+    pub(crate) fn secrets(&self) -> &Arc<secret::Vault> {
+        &self.secrets
+    }
+
+    /// what goes in a params column: `params`, with every param `job`
+    /// declared secret replaced by [`REDACTED`](crate::secret::REDACTED).
+    ///
+    /// **the one place launch params become stored params.** every params
+    /// column in the schema (`runs`, `schedules`, `presets`) is written
+    /// through this, so a reader cannot bypass the redaction by being new:
+    /// the row it reads never held the value.
+    fn params_col(&self, job: &str, params: &Value) -> String {
+        self.secrets.redact(job, params).to_string()
     }
 
     /// open (and migrate) the postgres database at `url`:
@@ -1583,11 +1659,55 @@ impl Store {
     /// the connection, with the mutex held. every method below goes through
     /// one of these or a [transaction](Conn::begin) on one.
     fn conn(&self) -> Conn<'_> {
-        match &*self.db {
-            Db::Sqlite(db) => Conn::Sqlite(db.lock().unwrap()),
+        let db = match &*self.db {
+            Db::Sqlite(db) => ConnDb::Sqlite(db.lock().unwrap()),
             #[cfg(feature = "postgres")]
-            Db::Postgres(db) => Conn::Postgres(db.lock().unwrap()),
+            Db::Postgres(db) => ConnDb::Postgres(db.lock().unwrap()),
+        };
+        Conn {
+            db,
+            secrets: &self.secrets,
         }
+    }
+
+    /// every value this database holds, as one string, for the tests that
+    /// assert a secret is not in it *anywhere* rather than not in the three
+    /// columns somebody thought of.
+    ///
+    /// sqlite only, and reflective on purpose: it reads the table list out of
+    /// `sqlite_master` and every column of every row, so a table added
+    /// tomorrow is scanned without this being edited.
+    #[cfg(test)]
+    pub(crate) fn all_values(&self) -> String {
+        #[cfg(feature = "postgres")]
+        let Db::Sqlite(db) = &*self.db else {
+            return String::new();
+        };
+        #[cfg(not(feature = "postgres"))]
+        let Db::Sqlite(db) = &*self.db;
+        let conn = db.lock().unwrap();
+        let tables: Vec<String> = conn
+            .prepare("SELECT name FROM sqlite_master WHERE type = 'table'")
+            .expect("the table list")
+            .query_map([], |r| r.get(0))
+            .expect("the table list")
+            .map(|n| n.expect("a table name"))
+            .collect();
+        let mut out = String::new();
+        for table in tables {
+            let mut stmt = conn
+                .prepare(&format!("SELECT * FROM \"{table}\""))
+                .expect("a table");
+            let columns = stmt.column_count();
+            let mut rows = stmt.query([]).expect("a table's rows");
+            while let Some(row) = rows.next().expect("a row") {
+                for i in 0..columns {
+                    let value: rusqlite::types::Value = row.get(i).expect("a column");
+                    out.push_str(&format!("{value:?}\n"));
+                }
+            }
+        }
+        out
     }
 
     /// whether this database lives only in this process's memory, and so
@@ -1791,7 +1911,7 @@ impl Store {
                 &run.job,
                 run.status.as_str(),
                 run.trigger.as_str(),
-                run.params.to_string(),
+                self.params_col(&run.job, &run.params),
                 run.created_at.to_rfc3339(),
                 run.started_at.map(|t| t.to_rfc3339()),
                 run.finished_at.map(|t| t.to_rfc3339()),
@@ -3157,7 +3277,7 @@ impl Store {
         let (insert, ignore) = conn.dialect().insert_or_ignore();
         let mut tx = conn.begin()?;
         for s in defined {
-            let declared = s.params.to_string();
+            let declared = self.params_col(&s.job, &s.params);
             let catchup = s.catchup.to_string();
             tx.execute(
                 &format!(
@@ -3324,7 +3444,12 @@ impl Store {
         self.conn().execute(
             "INSERT INTO presets (job, name, params, created_at) VALUES (?1, ?2, ?3, ?4)
              ON CONFLICT (job, name) DO UPDATE SET params = excluded.params",
-            args![job, name, params.to_string(), Utc::now().to_rfc3339()],
+            args![
+                job,
+                name,
+                self.params_col(job, params),
+                Utc::now().to_rfc3339()
+            ],
         )?;
         Ok(())
     }
@@ -5655,6 +5780,7 @@ mod tests {
     use crate::schedule::Schedule;
     use chrono::{TimeZone, Timelike};
     use serde_json::json;
+    use std::collections::BTreeSet;
 
     fn mk_run(id: &str, job: &str, created_at: DateTime<Utc>) -> Run {
         Run {
@@ -5677,6 +5803,75 @@ mod tests {
             lease_until: None,
             actor: None,
         }
+    }
+
+    // params reach the database through three columns and one function, so
+    // this is the whole of what a declaration has to cover
+    #[test]
+    fn every_params_column_is_written_through_the_declaration() {
+        let store = Store::open(":memory:").unwrap();
+        store
+            .secrets()
+            .declare("deploy", BTreeSet::from(["token".to_string()]));
+        let given = json!({"token": "hunter2", "env": "prod"});
+        let redacted = json!({"token": crate::secret::REDACTED, "env": "prod"});
+
+        // a run
+        let mut run = mk_run("r1", "deploy", Utc::now());
+        run.params = given.clone();
+        store
+            .create_run_keyed(
+                &run,
+                &["push".to_string()],
+                Claimed::Nothing,
+                None,
+                Fenced::Never,
+            )
+            .unwrap();
+        assert_eq!(store.run("r1").unwrap().unwrap().params, redacted);
+
+        // a schedule
+        store
+            .sync_schedules(&[Schedule::new("deploy", "0 * * * *").params(given.clone())])
+            .unwrap();
+        assert_eq!(store.schedules().unwrap()[0].params, redacted);
+
+        // and a preset
+        store.put_preset("deploy", "nightly", &given).unwrap();
+        assert_eq!(
+            store.preset("deploy", "nightly").unwrap().unwrap().params,
+            redacted
+        );
+
+        // a job that declared nothing writes what it was given, in all three
+        let mut run = mk_run("r2", "report", Utc::now());
+        run.params = given.clone();
+        store
+            .create_run_keyed(
+                &run,
+                &["push".to_string()],
+                Claimed::Nothing,
+                None,
+                Fenced::Never,
+            )
+            .unwrap();
+        assert_eq!(store.run("r2").unwrap().unwrap().params, given);
+        store
+            .sync_schedules(&[
+                Schedule::new("deploy", "0 * * * *").params(given.clone()),
+                Schedule::new("report", "0 * * * *").params(given.clone()),
+            ])
+            .unwrap();
+        let rows = store.schedules().unwrap();
+        assert_eq!(
+            rows.iter().find(|r| r.job == "report").unwrap().params,
+            given
+        );
+        store.put_preset("report", "nightly", &given).unwrap();
+        assert_eq!(
+            store.preset("report", "nightly").unwrap().unwrap().params,
+            given
+        );
     }
 
     /// where the postgres cases connect. unset means no postgres on this

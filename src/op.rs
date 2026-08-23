@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -845,6 +845,9 @@ pub struct Op {
     params_check: Option<Arc<ParamsCheck>>,
     // a json schema for the launchpad to read; never consulted by the check
     params_schema: Option<Value>,
+    // the params this op says are credentials, from `secret_params`. the
+    // store reads them off the job and writes the marker instead of the value
+    secret_params: BTreeSet<String>,
     // built by `mapped`, so `over` missing is a build error rather than an op
     // that silently runs once over nothing
     mapped: bool,
@@ -893,6 +896,7 @@ impl Op {
             params_type: None,
             params_check: None,
             params_schema: None,
+            secret_params: BTreeSet::new(),
             mapped: false,
             over: None,
             labeled: false,
@@ -931,6 +935,7 @@ impl Op {
             params_type: None,
             params_check: None,
             params_schema: None,
+            secret_params: BTreeSet::new(),
             mapped: false,
             over: None,
             labeled: false,
@@ -1153,6 +1158,40 @@ impl Op {
     /// one property name different shapes is a build error.
     pub fn params_schema(mut self, schema: Value) -> Op {
         self.params_schema = Some(schema);
+        self
+    }
+
+    /// name the params of this op that are credentials, so that the store
+    /// writes [`REDACTED`](crate::secret::REDACTED) where the value was.
+    ///
+    /// ```
+    /// # use hestan::{Op, OpCtx};
+    /// # use serde_json::json;
+    /// Op::new("deploy", |ctx: OpCtx| async move {
+    ///     let token = ctx.params()["token"].as_str().unwrap_or_default();
+    ///     # let _ = token;
+    ///     Ok(json!(null))
+    /// })
+    /// .secret_params(["token"]);
+    /// ```
+    ///
+    /// the op still reads the value: what changes is that it is not in
+    /// `runs.params`, so it is not on the run page, not in `GET /api/runs`,
+    /// not in the event log and not in the database. the value stays in the
+    /// memory of the process that took the launch and goes when the run does.
+    ///
+    /// **a run launched with one cannot be replayed, resumed or retried.**
+    /// there is nothing stored to re-run it with, and hestan refuses rather
+    /// than launching with the marker as the credential. the whole of what
+    /// that costs, and the rest of what is and is not covered, is in
+    /// [`hestan::secret`](crate::secret): read it before declaring one.
+    ///
+    /// params belong to the run rather than to one op, so this is merged with
+    /// every other op's into one set for the job, the way
+    /// [`params_schema`](Self::params_schema) is. names are top-level keys of
+    /// the params object; a name no launch ever passes costs nothing.
+    pub fn secret_params<S: Into<String>>(mut self, names: impl IntoIterator<Item = S>) -> Op {
+        self.secret_params.extend(names.into_iter().map(Into::into));
         self
     }
 
@@ -1468,6 +1507,13 @@ impl Op {
     /// exactly as it was handed over.
     pub fn declared_params_schema(&self) -> Option<&Value> {
         self.params_schema.as_ref()
+    }
+
+    /// the params this op declared with
+    /// [`secret_params`](Self::secret_params), empty for an op that declared
+    /// none.
+    pub fn declared_secret_params(&self) -> &BTreeSet<String> {
+        &self.secret_params
     }
 
     /// the dep this op fans out over, from [`over`](Self::over). `Some` only

@@ -162,7 +162,11 @@ impl From<Error> for Fail {
             | Error::RunNotFailed(_)
             | Error::NothingToResume(_)
             | Error::NothingToReplay(_)
-            | Error::ReplayInput { .. } => Exit::Usage,
+            | Error::ReplayInput { .. }
+            // what the caller asked for cannot be done with what is stored,
+            // and the message says what to pass instead: a usage answer, like
+            // every other refusal that is about the request
+            | Error::RedactedParams { .. } => Exit::Usage,
             Error::Sqlite(_) | Error::Io(_) | Error::UnsupportedDb(_) | Error::SchemaTooNew(_) => {
                 Exit::Unreachable
             }
@@ -3300,7 +3304,11 @@ fn explain(
     let answer = json!({
         "job": job.name(),
         "description": job.description(),
-        "params": params,
+        // a dry run never touches the store, so this is the one place params
+        // are rendered without having been through it. the same redaction, off
+        // the same declaration: a token typed on a command line does not end
+        // up in a ci log because the run it described was only a plan
+        "params": *crate::secret::redact_with(&job.secret_params(), &params),
         "max_parallel": job.max_parallel(),
         "pools": pools,
         "rates": rates,
