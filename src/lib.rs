@@ -122,6 +122,10 @@ mod io;
 mod isolate;
 mod job;
 mod logs;
+// the numbers a scrape reads, and the text it reads them off. not behind a
+// feature: it adds no dependency, and every feature hestan has is a dependency
+// somebody should get to decline
+mod metrics;
 mod model;
 #[cfg(feature = "http")]
 #[cfg_attr(docsrs, doc(cfg(feature = "http")))]

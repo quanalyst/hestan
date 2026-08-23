@@ -12,6 +12,7 @@ use serde_json::{Value, json};
 use crate::error::Error;
 use crate::executor::{Blocked, InFlight, Limits, QUEUE_SCAN, Queued};
 use crate::logs::{Attempt, Source};
+use crate::metrics::Meters;
 use crate::model::{
     AssetCheckRow, Backfill, BackfillStatus, CheckStatus, Decider, DeliveryState, Event, EventKind,
     EventLevel, FreshnessRow, HistoryEntry, Materialization, MetaPoint, Notification, OpLog, OpRun,
@@ -1429,6 +1430,7 @@ fn postgres_transient(e: &tokio_postgres::Error) -> bool {
 pub(crate) struct Health {
     dropped: AtomicU64,
     unrecorded: AtomicU64,
+    retried: AtomicU64,
     /// whether the last write this process attempted did not land and none
     /// has landed since. what a process asks before it claims anything.
     failing: AtomicBool,
@@ -1451,6 +1453,16 @@ impl Health {
     fn dropped(&self) {
         self.dropped.fetch_add(1, Ordering::Relaxed);
         self.failing.store(true, Ordering::Relaxed);
+    }
+
+    /// a write that records authoritative state was refused and is about to
+    /// be attempted again.
+    ///
+    /// counted apart from the two above because it is the one of the three
+    /// that ends well: a database stumbling under load moves this and nothing
+    /// else, which is the warning that arrives before anything is lost.
+    fn retried(&self) {
+        self.retried.fetch_add(1, Ordering::Relaxed);
     }
 
     /// a write that records authoritative state did not land.
@@ -1507,6 +1519,8 @@ pub struct Store {
     target: Arc<str>,
     /// what this process has seen this database do, shared by every clone.
     health: Arc<Health>,
+    /// what this process has counted itself doing to it, shared the same way.
+    meters: Arc<Meters>,
 }
 
 impl Store {
@@ -1527,6 +1541,7 @@ impl Store {
             db: Arc::new(db),
             target: target.into(),
             health: Arc::new(Health::default()),
+            meters: Arc::new(Meters::default()),
         }
     }
 
@@ -1612,6 +1627,7 @@ impl Store {
                 self.health.unrecorded();
                 return false;
             }
+            self.health.retried();
             tracing::warn!("{what} did not land, trying again: {e}");
             tokio::time::sleep(crate::backoff::jittered_exponential(
                 WRITE_BASE, attempt, WRITE_MAX,
@@ -1803,6 +1819,14 @@ impl Store {
             return Ok(Landed::Taken);
         }
         tx.commit()?;
+        // the other half of the fire counter. an occurrence that launched a
+        // run writes its tick **here**, in the transaction that created the
+        // run, and never through `record_tick`, which only ever sees the
+        // occurrences that launched nothing
+        if let Claimed::Fire(fire) = claimed {
+            self.meters
+                .tick(TickOutcome::Fired, fire.caught_up, at - fire.scheduled_for);
+        }
         Ok(Landed::Yes)
     }
 
@@ -1898,7 +1922,7 @@ impl Store {
             ),
             args![&now],
         )?;
-        tx.execute(
+        let failed = tx.execute(
             &format!(
                 "UPDATE runs SET status = 'failed', finished_at = ?1, lease_until = NULL,
                      error = COALESCE(error, 'interrupted: process exited')
@@ -1908,6 +1932,9 @@ impl Store {
             args![&now],
         )?;
         tx.commit()?;
+        // a sweep at startup, so this lands on a counter that has just been
+        // reset: whatever the process that died had counted died with it
+        self.meters.run_finished(RunStatus::Failed, failed as u64);
         Ok(())
     }
 
@@ -2007,6 +2034,10 @@ impl Store {
                 continue;
             }
             tx.commit()?;
+            // the claim is a fact now, so the counter moves now: written
+            // before the commit it would count a transaction that rolled back
+            // and was retried twice over
+            self.meters.claimed(now - run.created_at);
             run.claimed_by = Some(claimer.to_string());
             run.claimed_at = Some(now);
             run.lease_until = Some(until);
@@ -2484,6 +2515,13 @@ impl Store {
             }
         }
         tx.commit()?;
+        let taken = expired.len() as u64;
+        self.meters.reclaimed(policy, taken);
+        // a reclaim under `Fail` is also how those runs ended, and the run
+        // that ended is the same one either way
+        if matches!(policy, Reclaim::Fail) {
+            self.meters.run_finished(RunStatus::Failed, taken);
+        }
         Ok(expired)
     }
 
@@ -2541,6 +2579,9 @@ impl Store {
             at,
         )?;
         tx.commit()?;
+        // a run taken off the queue never reaches `run_finished`, and it is
+        // still a run that ended: counted here or it is counted nowhere
+        self.meters.run_finished(RunStatus::Canceled, 1);
         Ok(true)
     }
 
@@ -2619,6 +2660,7 @@ impl Store {
             queue_note(&mut tx, note, at)?;
         }
         tx.commit()?;
+        self.meters.run_finished(status, 1);
         Ok(())
     }
 
@@ -2932,11 +2974,20 @@ impl Store {
                 return self.best_effort(Err(e));
             }
         }
+        let retry = matches!(kind, EventKind::OpRetry);
         let mut event = NewEvent::run(run_id, kind, message).op(op).level(level);
         if let Some(data) = data {
             event = event.data(data.clone());
         }
-        self.best_effort(write_event(&mut self.conn(), &event, Utc::now()))
+        let wrote = write_event(&mut self.conn(), &event, Utc::now());
+        // the retry counter is the retry event, counted where it is written
+        // and only when it was: a run whose events are being dropped has a
+        // gap in the run log and the same gap in the metric, which is one
+        // story rather than two
+        if retry && wrote.is_ok() {
+            self.meters.op_retried();
+        }
+        self.best_effort(wrote)
     }
 
     /// append one captured line. the cap lives in [`logs::Budget`], which is
@@ -3415,6 +3466,9 @@ impl Store {
         };
         write_tick(&mut tx, fire, outcome, run_id, error, at)?;
         tx.commit()?;
+        // only half the fires reach here: one that launched a run wrote its
+        // tick in that run's transaction, and counts itself there
+        self.meters.tick(outcome, caught_up, at - scheduled_for);
         Ok(())
     }
 
@@ -5633,6 +5687,228 @@ mod tests {
                 let _ = admin.batch(&format!("DROP SCHEMA {} CASCADE", self.schema));
             }
         }
+    }
+
+    /// every counter and histogram this store keeps for `/metrics`, against
+    /// the write that records the same fact.
+    ///
+    /// it ends by asserting the whole map rather than the entries it moved,
+    /// because the failure worth catching is not a counter that stayed still,
+    /// it is one that moved *twice*, or one that moved when something else
+    /// happened.
+    ///
+    /// the three counters on [`Health`] are not in here: they are the store's
+    /// own and are about writes that did not land rather than about work.
+    #[test]
+    fn every_counter_moves_at_the_write_that_records_the_same_fact() {
+        both(|db| {
+            let store = db.store();
+            let defined = HashSet::from(["etl".to_string()]);
+            let none = |store: &Store| {
+                assert!(
+                    store.meters.counted().values().all(|n| *n == 0),
+                    "{:?}",
+                    store.meters.counted()
+                );
+            };
+            let count = |store: &Store, key: &str| store.meters.counted()[key];
+            none(&store);
+
+            // a claim, and how long the run had been waiting for it
+            let waited = Utc::now() - Duration::from_secs(2);
+            store
+                .create_run(&mk_run("claimed", "etl", waited), &["a".into()])
+                .unwrap();
+            store
+                .claim_next("worker", Duration::from_secs(60), &Limits::new(), &defined)
+                .unwrap()
+                .expect("the run was there to claim");
+            assert_eq!(count(&store, "claims"), 1);
+            assert_eq!(count(&store, "claim_delay:count"), 1);
+            assert!(
+                (2_000..4_000).contains(&count(&store, "claim_delay:millis")),
+                "{}ms",
+                count(&store, "claim_delay:millis")
+            );
+
+            // and how it ended
+            store
+                .run_finished("claimed", RunStatus::Success, None, Utc::now(), None)
+                .unwrap();
+            assert_eq!(count(&store, "runs:success"), 1);
+
+            // a run taken off the queue ends without ever reaching
+            // `run_finished`, and is still a run that ended
+            store
+                .create_run(&mk_run("dropped", "etl", Utc::now()), &["a".into()])
+                .unwrap();
+            assert!(store.cancel_queued("dropped", None).unwrap());
+            assert_eq!(count(&store, "runs:canceled"), 1);
+            // and asking again does nothing, so nothing is counted again
+            assert!(!store.cancel_queued("dropped", None).unwrap());
+            assert_eq!(count(&store, "runs:canceled"), 1);
+
+            // a retry is counted where the event that says so is written, and
+            // the event that ends an op is not a retry
+            store
+                .append_event(
+                    "claimed",
+                    Some("a"),
+                    EventLevel::Error,
+                    EventKind::OpRetry,
+                    "attempt 1 failed",
+                    None,
+                )
+                .unwrap();
+            store
+                .append_event(
+                    "claimed",
+                    Some("a"),
+                    EventLevel::Error,
+                    EventKind::OpFailed,
+                    "out of attempts",
+                    None,
+                )
+                .unwrap();
+            assert_eq!(count(&store, "op_retries"), 1);
+
+            // an occurrence, and how far behind it the fire was
+            let due = Utc::now() - Duration::from_secs(300);
+            store
+                .record_tick(
+                    "etl",
+                    "0 * * * *",
+                    due,
+                    TickOutcome::Fired,
+                    false,
+                    None,
+                    None,
+                )
+                .unwrap();
+            store
+                .record_tick(
+                    "etl",
+                    "0 * * * *",
+                    Utc::now(),
+                    TickOutcome::Skipped,
+                    false,
+                    None,
+                    None,
+                )
+                .unwrap();
+            assert_eq!(count(&store, "fires:fired"), 1);
+            assert_eq!(count(&store, "fires:skipped"), 1);
+            // a skip was decided about rather than late, so only the fire is
+            // in the histogram
+            assert_eq!(count(&store, "lateness:count"), 1);
+            assert!(count(&store, "lateness:millis") >= 300_000);
+
+            // a claim taken back, which under the default policy is also how
+            // that run ended
+            store
+                .create_run(&mk_run("lost", "etl", Utc::now()), &["a".into()])
+                .unwrap();
+            store
+                .plant_claim("lost", "gone", Some(Utc::now() - Duration::from_secs(1)))
+                .unwrap();
+            let taken = store.reclaim_expired(Reclaim::Fail, |_| None).unwrap();
+            assert_eq!(taken.len(), 1);
+            assert_eq!(count(&store, "reclaims:failed"), 1);
+            assert_eq!(count(&store, "runs:failed"), 1);
+
+            // the other policy puts the run back on the queue instead, so it
+            // is a reclaim and not a run that ended
+            store
+                .create_run(&mk_run("requeued", "etl", Utc::now()), &["a".into()])
+                .unwrap();
+            store
+                .plant_claim(
+                    "requeued",
+                    "gone",
+                    Some(Utc::now() - Duration::from_secs(1)),
+                )
+                .unwrap();
+            let taken = store.reclaim_expired(Reclaim::Requeue, |_| None).unwrap();
+            assert_eq!(taken.len(), 1);
+            assert_eq!(count(&store, "reclaims:requeued"), 1);
+            assert_eq!(
+                count(&store, "runs:failed"),
+                1,
+                "a requeue is not an ending"
+            );
+
+            // the three occurrences that are not a fire on time. a caught-up
+            // one is a fire, so it is in the lateness histogram too, and it is
+            // the reason that histogram has hours in it
+            let long_ago = Utc::now() - Duration::from_secs(3_600);
+            for (due, outcome, caught_up) in [
+                (long_ago, TickOutcome::Fired, true),
+                (Utc::now(), TickOutcome::Deferred, false),
+                (Utc::now(), TickOutcome::Error, false),
+            ] {
+                store
+                    .record_tick("etl", "0 * * * *", due, outcome, caught_up, None, None)
+                    .unwrap();
+            }
+            assert_eq!(count(&store, "fires:caught_up"), 1);
+            assert_eq!(count(&store, "fires:deferred"), 1);
+            assert_eq!(count(&store, "fires:error"), 1);
+            assert_eq!(count(&store, "lateness:count"), 2);
+
+            // a fire that launched a run does not come through `record_tick`
+            // at all: its tick is written in the transaction that created the
+            // run, so the counter has to move there too. this is the half a
+            // deployment actually has, since most occurrences fire
+            let landed = store
+                .create_run_keyed(
+                    &mk_run("fired", "etl", Utc::now()),
+                    &["a".into()],
+                    Claimed::Fire(Fire {
+                        job: "etl",
+                        expr: "*/2 * * * *",
+                        scheduled_for: Utc::now() - Duration::from_secs(30),
+                        caught_up: false,
+                    }),
+                    None,
+                    Fenced::Never,
+                )
+                .unwrap();
+            assert!(matches!(landed, Landed::Yes));
+            assert_eq!(count(&store, "fires:fired"), 2);
+            assert_eq!(count(&store, "lateness:count"), 3);
+
+            // and the sweep a process makes at startup over what the process
+            // before it was executing when it died
+            store
+                .create_run(&mk_run("interrupted", "etl", Utc::now()), &["a".into()])
+                .unwrap();
+            store.run_started("interrupted", Utc::now()).unwrap();
+            store.fail_interrupted().unwrap();
+            assert_eq!(count(&store, "runs:failed"), 2);
+
+            // the whole map, so a counter that moved twice or moved for the
+            // wrong reason fails here rather than passing quietly
+            let counted = store.meters.counted();
+            assert_eq!(counted["runs:success"], 1);
+            assert_eq!(counted["runs:failed"], 2);
+            assert_eq!(counted["runs:canceled"], 1);
+            assert_eq!(counted["claims"], 1);
+            assert_eq!(counted["reclaims:failed"], 1);
+            assert_eq!(counted["reclaims:requeued"], 1);
+            assert_eq!(counted["op_retries"], 1);
+            assert_eq!(counted["fires:fired"], 2);
+            assert_eq!(counted["fires:caught_up"], 1);
+            assert_eq!(counted["fires:skipped"], 1);
+            assert_eq!(counted["fires:deferred"], 1);
+            assert_eq!(counted["fires:error"], 1);
+            assert_eq!(counted["claim_delay:count"], 1);
+            assert_eq!(counted["lateness:count"], 3);
+
+            // and a second handle on the same database is what a restarted
+            // process is: the rows are all still there and none of the
+            // counters are
+            none(&db.store());
+        });
     }
 
     #[test]
