@@ -7,8 +7,8 @@ import test from "node:test";
 import { fileURLToPath } from "node:url";
 import { renderToStaticMarkup } from "react-dom/server";
 import SignIn from "../src/SignIn";
-import type { Role } from "../src/identity";
-import { may } from "../src/identity";
+import type { Role, Scope } from "../src/identity";
+import { may, scopeLabel } from "../src/identity";
 
 const SRC = join(dirname(fileURLToPath(import.meta.url)), "..", "src");
 
@@ -43,6 +43,29 @@ test("every page that changes something asks what the role may first", () => {
     const source = readFileSync(join(SRC, page), "utf8");
     assert.ok(source.includes("useMay("), `${page} changes something without asking the role`);
   }
+});
+
+// the header says what a token is limited to, because the controls do not:
+// somebody whose launch is about to be refused is entitled to know why before
+// they press it
+test("a scope reads back as what it may change, and an unscoped one as nothing", () => {
+  const scope = (over: Partial<Scope>): Scope => ({
+    everything: false,
+    jobs: [],
+    assets: [],
+    ...over,
+  });
+  assert.equal(scopeLabel(scope({ everything: true, jobs: ["etl"] })), null);
+  assert.equal(scopeLabel(scope({ jobs: ["etl", "load"] })), "jobs etl, load");
+  assert.equal(
+    scopeLabel(scope({ jobs: ["etl"], assets: ["orders"] })),
+    "jobs etl · assets orders",
+  );
+  // a scope naming nothing may change nothing, and says so rather than
+  // reading as an unscoped token
+  assert.equal(scopeLabel(scope({})), "nothing");
+  // and a payload from a deployment that predates the field
+  assert.equal(scopeLabel(undefined), null);
 });
 
 test("the token prompt says what holding a token in a browser costs", () => {

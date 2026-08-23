@@ -6,7 +6,7 @@ use std::time::Duration as StdDuration;
 
 use axum::body::Bytes;
 use axum::extract::rejection::QueryRejection;
-use axum::extract::{Path, Query, State};
+use axum::extract::{FromRequestParts, Path, Query, State};
 use axum::http::{HeaderMap, Method, StatusCode, Uri, header};
 use axum::response::sse::{Event as SseEvent, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
@@ -71,7 +71,7 @@ pub(crate) struct AppState {
 }
 
 pub(crate) fn router(state: AppState) -> Router {
-    let auth = state.auth.clone();
+    let guarded = state.clone();
     Router::new()
         .route("/api/health", get(health))
         // the one endpoint that is neither json nor under `/api`, and it is
@@ -136,7 +136,7 @@ pub(crate) fn router(state: AppState) -> Router {
         // every route above and nothing below it: the ui's own files are
         // served by the fallback, which is outside this on purpose: a login
         // page that needs a credential to load is a login page nobody can use
-        .route_layer(axum::middleware::from_fn_with_state(auth, guard))
+        .route_layer(axum::middleware::from_fn_with_state(guarded, guard))
         .route("/api/whoami", get(whoami))
         .fallback(static_ui)
         .with_state(state)
@@ -175,12 +175,117 @@ const ADMIN_ONLY: [&str; 4] = [
 
 /// what this request needs of whoever is making it.
 fn needed(method: &Method, route: Option<&str>) -> Access {
-    if method == Method::GET || method == Method::HEAD {
+    if reads(method) {
         return Access::Viewer;
     }
     match route {
         Some(route) if ADMIN_ONLY.contains(&route) => Access::Admin,
         _ => Access::Operator,
+    }
+}
+
+/// whether this method only looks. everything else changes something and is
+/// what a [scope](Scope) rules on.
+fn reads(method: &Method) -> bool {
+    method == Method::GET || method == Method::HEAD
+}
+
+/// what one request is about, read off the route it matched rather than off a
+/// list of routes.
+///
+/// the rule is the shape of the path: the first `{placeholder}` in the matched
+/// route names the thing, and the literal segment before it says what kind of
+/// thing it is. `/api/jobs/{name}/runs` is about a job, `/api/runs/{id}/cancel`
+/// is about a run, and `/api/assets/build`, which has no placeholder at all,
+/// is about the deployment.
+///
+/// **[`Subject::Deployment`] is the default, and a scope may not touch it.**
+/// that is what makes a route added tomorrow land on the rule: a new mutation
+/// that does not name a job or an asset in its path is refused for a scoped
+/// token without anybody adding it to anything.
+#[derive(Debug, PartialEq, Eq)]
+enum Subject<'a> {
+    Job(&'a str),
+    Asset(&'a str),
+    /// a run, which is about whichever job it is a run of.
+    Run(&'a str),
+    /// a backfill, which is about the asset it is filling in.
+    Backfill(&'a str),
+    /// the deployment itself, or anything this cannot name.
+    Deployment,
+}
+
+fn subject<'a>(route: &str, params: &'a HashMap<String, String>) -> Subject<'a> {
+    let mut kind = "";
+    for segment in route.split('/') {
+        let Some(name) = segment
+            .strip_prefix('{')
+            .and_then(|rest| rest.strip_suffix('}'))
+        else {
+            kind = segment;
+            continue;
+        };
+        let Some(value) = params.get(name) else {
+            return Subject::Deployment;
+        };
+        return match kind {
+            "jobs" => Subject::Job(value),
+            "assets" => Subject::Asset(value),
+            "runs" => Subject::Run(value),
+            "backfills" => Subject::Backfill(value),
+            // a placeholder under a noun this does not know is a route from a
+            // future version of this file, and the safe reading of one is that
+            // a scope may not touch it
+            _ => Subject::Deployment,
+        };
+    }
+    Subject::Deployment
+}
+
+/// why a scoped identity may not make this request, or `None` for one it may.
+///
+/// **the one place a scope is enforced.** it is called from [`guard`] and
+/// nowhere else, so there is no call site for a new handler to forget: a route
+/// is decided here before its handler is reached, or it is not reached.
+fn out_of_scope(st: &AppState, who: &Identity, subject: Subject<'_>) -> Option<String> {
+    let refuse = |what: String| {
+        Some(format!(
+            "{} is scoped to {}, and this changes {what}",
+            who.name, who.scope
+        ))
+    };
+    match subject {
+        Subject::Job(job) => {
+            (!who.scope.may_touch_job(job)).then(|| refuse(format!("job {job}")))?
+        }
+        Subject::Asset(asset) => {
+            (!who.scope.may_touch_asset(asset)).then(|| refuse(format!("asset {asset}")))?
+        }
+        // a run is whatever job it is a run of, read off the row. a run this
+        // store does not have is refused rather than looked past: a scope that
+        // let an unknown id through would be a scope an id nobody can resolve
+        // walks around
+        Subject::Run(id) => match st.runner.store().run(id) {
+            Ok(Some(run)) if who.scope.may_touch_job(&run.job) => None,
+            Ok(Some(run)) => refuse(format!("run {id}, which is a run of job {}", run.job)),
+            _ => refuse(format!(
+                "run {id}, which this deployment cannot resolve to a job"
+            )),
+        },
+        Subject::Backfill(id) => match id.parse().map(|id: i64| st.runner.store().backfill(id)) {
+            Ok(Ok(Some(bf))) if who.scope.may_touch_asset(&bf.asset) => None,
+            Ok(Ok(Some(bf))) => refuse(format!(
+                "backfill {id}, which is a backfill of asset {}",
+                bf.asset
+            )),
+            _ => refuse(format!(
+                "backfill {id}, which this deployment cannot resolve to an asset"
+            )),
+        },
+        Subject::Deployment => refuse(
+            "the deployment rather than one job or one asset, which a scoped token may not"
+                .to_string(),
+        ),
     }
 }
 
@@ -191,14 +296,14 @@ fn needed(method: &Method, route: Option<&str>) -> Access {
 /// handler for the reason every check that happens twice eventually happens
 /// differently: this is the only place that decides.
 async fn guard(
-    State(auth): State<Option<Auth>>,
+    State(st): State<AppState>,
     mut req: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> Response {
     // nothing configured, or the deliberate opt-out: served exactly as it was
     // before any of this existed, and with no identity, because there is
     // nobody here to name
-    let Some(auth) = auth.filter(Auth::checks) else {
+    let Some(auth) = st.auth.clone().filter(Auth::checks) else {
         return next.run(req).await;
     };
     // the route that matched, not the path that arrived: `/api/runs/{id}/cancel`
@@ -237,6 +342,32 @@ async fn guard(
             ),
         )
         .into_response();
+    }
+    // and then what it may be done to. an unscoped identity is every identity
+    // that existed before scopes did and skips all of this, which is what
+    // makes an existing deployment's requests byte for byte what they were.
+    // reads are not narrowed: see `docs/auth.md` for the decision
+    if !identity.scope.is_everything() && !reads(req.method()) {
+        // the path's own placeholders, decoded, from the extractor that
+        // already knows how the route was matched: an asset called
+        // `finance/netted` arrives here under that name rather than as the
+        // escape somebody wrote in the url
+        let (mut parts, body) = req.into_parts();
+        let named = Path::<HashMap<String, String>>::from_request_parts(&mut parts, &())
+            .await
+            .map(|Path(named)| named)
+            .unwrap_or_default();
+        let refused = route
+            .as_deref()
+            .map(|route| subject(route, &named))
+            // no matched route is nothing this can name, and a scope may not
+            // touch what cannot be named
+            .or(Some(Subject::Deployment))
+            .and_then(|subject| out_of_scope(&st, &identity, subject));
+        req = axum::extract::Request::from_parts(parts, body);
+        if let Some(said) = refused {
+            return err(StatusCode::FORBIDDEN, said).into_response();
+        }
     }
     req.extensions_mut().insert(identity);
     next.run(req).await
@@ -2483,6 +2614,7 @@ async fn static_ui(method: Method, uri: Uri) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::auth::Scope;
     use crate::model::{Run, RunStatus};
     use crate::op::{Meta, Op, OpCtx};
     use crate::schedule::Schedule;
@@ -7059,6 +7191,215 @@ mod tests {
         // and the count, so that a scraper that quietly stopped finding
         // anything cannot pass this by covering nothing
         assert_eq!(declared_routes().len(), 50);
+    }
+
+    /// the same three people, plus two scoped tokens: one that owns the
+    /// `deploy` job and one that owns the `docs` asset.
+    fn scoped_people() -> Auth {
+        Auth::custom(|req| match req.header("x-user")? {
+            "ada" => Some(Identity::admin("ada")),
+            "ci" => Some(
+                Identity::admin("ci")
+                    // an admin, so that nothing below is a role refusal
+                    // wearing a scope's clothes
+                    .scoped_to(Scope::jobs(["etl"]).and_assets(["docs"])),
+            ),
+            "other" => Some(Identity::admin("other").scoped_to(Scope::jobs(["billing"]))),
+            _ => None,
+        })
+    }
+
+    // a scoped token drives its own job and is a stranger to everything else,
+    // with a refusal that says which token, what it is limited to, and what it
+    // was reaching for
+    #[tokio::test]
+    async fn a_scoped_token_changes_what_it_owns_and_is_refused_the_rest() {
+        let st = guarded(scoped_people());
+        // it owns etl and the docs asset, and r1 is a run of etl
+        for (method, path) in [
+            ("POST", "/api/jobs/etl/runs"),
+            ("PUT", "/api/jobs/etl/presets/nightly"),
+            ("POST", "/api/runs/r1/cancel"),
+            ("POST", "/api/runs/r1/retry"),
+            ("POST", "/api/assets/docs/build"),
+        ] {
+            let status = status_of(&st, method, path, Some(("x-user", "ci"))).await;
+            assert!(!refused(status), "ci was refused {method} {path}: {status}");
+        }
+
+        // and nothing else, whatever its role would allow
+        for (method, path, what) in [
+            ("POST", "/api/jobs/billing/runs", "job billing"),
+            ("PUT", "/api/jobs/billing/presets/nightly", "job billing"),
+            ("POST", "/api/assets/orders/build", "asset orders"),
+            // one job's scope does not reach the asset of the same name
+            ("POST", "/api/assets/etl/build", "asset etl"),
+            // and the deployment-wide mutations, which name nothing
+            ("POST", "/api/schedules/state", "the deployment"),
+            ("POST", "/api/sensors/state", "the deployment"),
+            ("POST", "/api/assets/build", "the deployment"),
+        ] {
+            let (status, body) = asked(&st, method, path, Some(("x-user", "ci"))).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{method} {path}");
+            let said = body["error"].as_str().unwrap_or_default();
+            assert!(said.contains("ci is scoped to"), "{method} {path}: {said}");
+            assert!(said.contains("job etl and asset docs"), "{said}");
+            assert!(said.contains(what), "{method} {path}: {said}");
+        }
+
+        // a run of a job outside the scope is refused as that job, named
+        insert_run(&st, "r9", "billing", RunStatus::Success, json!({}));
+        let (status, body) =
+            asked(&st, "POST", "/api/runs/r9/cancel", Some(("x-user", "ci"))).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert!(
+            body["error"]
+                .as_str()
+                .unwrap()
+                .contains("run of job billing"),
+            "{body}"
+        );
+    }
+
+    // the decision, asserted rather than described: a scope narrows what a
+    // token may change and does nothing at all to what it may read
+    #[tokio::test]
+    async fn a_scope_does_not_narrow_a_read() {
+        let st = guarded(scoped_people());
+        for path in READS {
+            let status = status_of(&st, "GET", path, Some(("x-user", "other"))).await;
+            assert!(
+                !refused(status),
+                "a token scoped to billing could not read {path}: {status}"
+            );
+        }
+    }
+
+    // the promise an existing deployment is owed: an identity nobody scoped is
+    // decided by the ladder alone, exactly as it was
+    #[tokio::test]
+    async fn an_unscoped_token_is_what_it_always_was() {
+        let st = guarded(scoped_people());
+        assert!(Identity::admin("ada").scope.is_everything());
+        for (method, path, _) in MUTATIONS {
+            let status = status_of(&st, method, path, Some(("x-user", "ada"))).await;
+            assert!(
+                !refused(status),
+                "ada was refused {method} {path}: {status}"
+            );
+        }
+    }
+
+    // a scope is built by the authenticator, in this process, from nothing the
+    // request carries: there is no input to widen it through, so the holder of
+    // a token cannot
+    #[tokio::test]
+    async fn a_scope_is_not_something_the_holder_can_widen() {
+        use tower::util::ServiceExt;
+        let st = guarded(scoped_people());
+        // whatever the request says about itself, the scope is the one the
+        // authenticator returned: these are actually sent, and none of them
+        // reaches it, because nothing reads a scope off a request
+        for claimed in [
+            ("x-hestan-scope", "billing"),
+            ("x-scope", "*"),
+            ("authorization", "Bearer everything"),
+            ("x-forwarded-groups", "ops"),
+        ] {
+            let req = axum::http::Request::builder()
+                .method("POST")
+                .uri("/api/jobs/billing/runs")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header("x-user", "ci")
+                .header(claimed.0, claimed.1)
+                .body(axum::body::Body::from(
+                    json!({ "scope": "billing", "params": {} }).to_string(),
+                ))
+                .unwrap();
+            let resp = router(st.clone()).oneshot(req).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::FORBIDDEN, "{claimed:?}");
+        }
+        // and the identity type itself: a scope replaces a scope, and the only
+        // way to one is a constructor in this process
+        let ci = Identity::operator("ci").scoped_to(Scope::jobs(["deploy"]));
+        assert!(!ci.scope.may_touch_job("billing"));
+        assert!(ci.scope.may_touch_job("deploy"));
+    }
+
+    // **the structural half.** every route this file declares, including the
+    // ones added after this test was written, refused for a token scoped to
+    // something else. nothing here lists an endpoint: a mutation that names no
+    // job or asset lands on `Subject::Deployment` and is refused for being
+    // unnameable, and one that names another job is refused for naming it
+    #[tokio::test]
+    async fn a_scope_holds_over_every_route_including_one_added_later() {
+        let st = guarded(scoped_people());
+        let routes: Vec<String> = declared_routes()
+            .into_iter()
+            // the one endpoint outside the guard on purpose: it is how a
+            // browser finds out who it is, and it changes nothing
+            .filter(|route| route != "/api/whoami")
+            .collect();
+        assert!(routes.len() >= 40, "only {} routes found", routes.len());
+        for route in &routes {
+            // a value no scope in this test names, in every placeholder: an
+            // unknown job, an unknown run, an unresolvable backfill id
+            let path: Vec<String> = route
+                .split('/')
+                .map(|segment| match segment.starts_with('{') {
+                    true => "nothing-of-theirs".to_string(),
+                    false => segment.to_string(),
+                })
+                .collect();
+            let path = path.join("/");
+            let (status, body) = asked(&st, "POST", &path, Some(("x-user", "ci"))).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "POST {path}: {body}");
+            assert!(
+                body["error"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("ci is scoped to"),
+                "POST {path}: {body}"
+            );
+        }
+    }
+
+    // and the reading of a path that produces those refusals, on its own, so
+    // that what the rule is does not have to be inferred from statuses
+    #[test]
+    fn what_a_request_is_about_is_read_off_the_route_it_matched() {
+        let named = |pairs: [(&str, &str); 1]| -> HashMap<String, String> {
+            pairs
+                .into_iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect()
+        };
+        let job = named([("name", "etl")]);
+        assert_eq!(subject("/api/jobs/{name}/runs", &job), Subject::Job("etl"));
+        assert_eq!(
+            subject("/api/jobs/{name}/presets/{preset}", &job),
+            Subject::Job("etl")
+        );
+        assert_eq!(
+            subject("/api/assets/{name}/build", &job),
+            Subject::Asset("etl")
+        );
+        let run = named([("id", "r1")]);
+        assert_eq!(subject("/api/runs/{id}/cancel", &run), Subject::Run("r1"));
+        assert_eq!(
+            subject("/api/backfills/{id}/cancel", &run),
+            Subject::Backfill("r1")
+        );
+        // no placeholder at all, a noun this does not know, and a placeholder
+        // the router did not fill: all of them are the deployment, which is
+        // what a scope may not touch
+        assert_eq!(subject("/api/assets/build", &job), Subject::Deployment);
+        assert_eq!(subject("/api/schedules/state", &job), Subject::Deployment);
+        assert_eq!(
+            subject("/api/pipelines/{name}/runs", &job),
+            Subject::Deployment
+        );
+        assert_eq!(subject("/api/jobs/{other}/runs", &job), Subject::Deployment);
     }
 
     /// every `| METHOD | \`/api/path\` |` row of the table at the top of

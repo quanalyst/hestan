@@ -24,9 +24,19 @@ const KEY = "hestan.token";
 
 export type Role = "viewer" | "operator" | "admin";
 
+// which jobs and assets this identity may change. `everything` is every
+// identity a deployment had before scopes existed, and is what an unscoped
+// token still is.
+export interface Scope {
+  everything: boolean;
+  jobs: string[];
+  assets: string[];
+}
+
 export interface Identity {
   name: string;
   role: Role;
+  scope: Scope;
 }
 
 export interface Who {
@@ -66,3 +76,20 @@ export function may(role: Role, needs: Role): boolean {
 // what an unauthenticated deployment makes everyone: it is loopback, which is
 // one process on one machine, and the ui has never asked who was driving it
 export const OPEN: Role = "admin";
+
+// a scope in one line for the header, or null for a token that is not limited.
+//
+// **the ui shows a scope and does not act on one.** the role gate above keeps
+// a control a role may not use off the page; there is no equivalent for a
+// scope, so a token scoped to one job still sees another job's launch button
+// and the api answers 403 naming the scope. that is the one place this ui and
+// the api are allowed to disagree, and saying so here is cheaper than a gate
+// that would have to be remembered at every list, tile and palette entry and
+// would be forgotten at one. `docs/auth.md` says the same thing.
+export function scopeLabel(scope: Scope | undefined): string | null {
+  if (!scope || scope.everything) return null;
+  const parts: string[] = [];
+  if (scope.jobs.length) parts.push(`jobs ${scope.jobs.join(", ")}`);
+  if (scope.assets.length) parts.push(`assets ${scope.assets.join(", ")}`);
+  return parts.length ? parts.join(" · ") : "nothing";
+}

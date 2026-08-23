@@ -12,7 +12,7 @@ import RunPage from "./RunPage";
 import SignIn from "./SignIn";
 import { get } from "./api";
 import type { Who } from "./identity";
-import { OPEN, setToken, token } from "./identity";
+import { OPEN, scopeLabel, setToken, token } from "./identity";
 import { RoleContext } from "./role";
 
 export default function App() {
@@ -69,6 +69,9 @@ export default function App() {
           {identity && (
             <span className="whoami muted">
               {identity.name} · {identity.role}
+              {/* what this token may change, where that is not everything.
+                  shown rather than acted on: see the note in identity.ts */}
+              {scopeLabel(identity.scope) && ` · ${scopeLabel(identity.scope)}`}
               {/* only where there is one to forget: an identity a proxy
                   asserted is not this tab's to drop */}
               {token() !== null && (

@@ -50,7 +50,43 @@
 //! it is derived from the table rather than the table from the code, and
 //! anything the table does not name is a mutation and needs an operator: a
 //! route added tomorrow lands on the rule and not in a hole.
+//!
+//! # The scopes
+//!
+//! the ladder says how much somebody may do and nothing about *what to*, and
+//! there is one case it is too coarse for: a ci pipeline that may launch one
+//! deploy job and must not be able to cancel a production run. a [`Scope`]
+//! narrows the second question without touching the first, so an operator
+//! scoped to `deploy` is an operator on `deploy` and a stranger everywhere
+//! else:
+//!
+//! ```no_run
+//! # use hestan::{Auth, Hestan, Identity, Scope};
+//! # fn f(app: Hestan) -> Hestan {
+//! app.auth(Auth::custom(|req| {
+//!     match req.bearer()? {
+//!         t if hestan::auth::secret_eq(t, "the-ci-token") => {
+//!             Some(Identity::operator("ci").scoped_to(Scope::jobs(["deploy"])))
+//!         }
+//!         t if hestan::auth::secret_eq(t, "the-ops-token") => Some(Identity::admin("ops")),
+//!         _ => None,
+//!     }
+//! }))
+//! # }
+//! ```
+//!
+//! **a scope limits what a token may change, and does nothing to what it may
+//! read.** that is a decision rather than an omission, and the reasoning is in
+//! `docs/auth.md`: a write names in its path what it is about, so one check in
+//! one place can rule on every write there will ever be, and a read is mostly
+//! a list, which can only be narrowed inside each handler that builds one. a
+//! filter that has to be remembered at every list is a filter that will be
+//! missed at one, and a confidentiality promise that holds in nine places out
+//! of ten is worse than none, because people plan around it. so hestan makes
+//! the small exact promise instead: **a scope is not a confidentiality
+//! boundary**, and a token that can read reads the whole deployment.
 
+use std::collections::BTreeSet;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 
@@ -59,14 +95,18 @@ use sha2::{Digest, Sha256};
 use crate::error::Error;
 
 /// what someone may do, in the order the roles contain each other: an operator
-/// may everything a viewer may, and the whole of every decision in the server
-/// is `identity.role >= needed`.
+/// may everything a viewer may, and how much of the api a request needs is
+/// decided by `identity.role >= needed` and nothing else.
 ///
-/// **a closed set**, and it stays one: the roles contain each other and
-/// every decision in the server is `identity.role >= needed`, so a fourth
-/// role changes what these three mean rather than adding to them, and a
-/// build error is the right way to make a custom authenticator's mapping be
-/// read again.
+/// *what* it may be done to is the other question, and a [`Scope`] is where
+/// that one is answered. the two are separate on purpose: a scope narrows a
+/// role rather than replacing it, so nothing here changes meaning when one is
+/// in play.
+///
+/// **a closed set**, and it stays one: the roles contain each other and the
+/// ladder decision is this comparison, so a fourth role changes what these
+/// three mean rather than adding to them, and a build error is the right way
+/// to make a custom authenticator's mapping be read again.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Access {
@@ -99,13 +139,135 @@ impl std::fmt::Display for Access {
     }
 }
 
-/// who is asking: a name for the audit trail, and a [role](Access) for the
-/// decision.
+/// which jobs and assets a token may change, for the token that should be able
+/// to do one thing.
+///
+/// [`Scope::everything()`] is the default and is every identity that existed
+/// before scopes did: unlimited, and exactly as it was. anything else is a
+/// list, and **the list is the whole of what may be touched**: a scope naming
+/// jobs may touch no asset, and a scope naming an asset may launch no job. a
+/// name nothing matches is a scope that may change nothing at all, which is
+/// the right way round for a thing whose job is to say no.
+///
+/// ```
+/// # use hestan::Scope;
+/// // an operator on `deploy`, a stranger everywhere else
+/// let ci = Scope::jobs(["deploy"]);
+/// assert!(ci.may_touch_job("deploy"));
+/// assert!(!ci.may_touch_job("billing"));
+/// assert!(!ci.may_touch_asset("deploy"));
+///
+/// // and both halves, for the token that owns one pipeline end to end
+/// let owner = Scope::jobs(["etl"]).and_assets(["orders"]);
+/// assert!(owner.may_touch_asset("orders"));
+/// ```
+///
+/// **reads are not scoped.** see the [module docs](crate::auth) for why, and
+/// `docs/auth.md` for the whole of it. a scope says what a token may change.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
+pub struct Scope {
+    /// nothing is narrowed: the jobs and assets lists are not consulted.
+    everything: bool,
+    jobs: BTreeSet<String>,
+    assets: BTreeSet<String>,
+}
+
+impl Scope {
+    /// no limit: what every identity is unless something says otherwise, and
+    /// what an unscoped deployment keeps being.
+    pub fn everything() -> Scope {
+        Scope {
+            everything: true,
+            ..Scope::default()
+        }
+    }
+
+    /// these jobs and no assets.
+    pub fn jobs<S: Into<String>>(names: impl IntoIterator<Item = S>) -> Scope {
+        Scope {
+            everything: false,
+            jobs: names.into_iter().map(Into::into).collect(),
+            assets: BTreeSet::new(),
+        }
+    }
+
+    /// these assets and no jobs.
+    pub fn assets<S: Into<String>>(names: impl IntoIterator<Item = S>) -> Scope {
+        Scope {
+            everything: false,
+            jobs: BTreeSet::new(),
+            assets: names.into_iter().map(Into::into).collect(),
+        }
+    }
+
+    /// these jobs as well.
+    pub fn and_jobs<S: Into<String>>(mut self, names: impl IntoIterator<Item = S>) -> Scope {
+        self.everything = false;
+        self.jobs.extend(names.into_iter().map(Into::into));
+        self
+    }
+
+    /// these assets as well.
+    pub fn and_assets<S: Into<String>>(mut self, names: impl IntoIterator<Item = S>) -> Scope {
+        self.everything = false;
+        self.assets.extend(names.into_iter().map(Into::into));
+        self
+    }
+
+    /// whether this narrows anything. `true` is the unscoped identity, whose
+    /// requests are decided by the [role ladder](Access) alone, exactly as
+    /// they were before scopes existed.
+    pub fn is_everything(&self) -> bool {
+        self.everything
+    }
+
+    /// whether a request that changes job `name` is in this scope.
+    pub fn may_touch_job(&self, name: &str) -> bool {
+        self.everything || self.jobs.contains(name)
+    }
+
+    /// whether a request that changes asset `name` is in this scope.
+    pub fn may_touch_asset(&self, name: &str) -> bool {
+        self.everything || self.assets.contains(name)
+    }
+}
+
+impl std::fmt::Display for Scope {
+    /// what a refusal says the token was limited to: `job deploy`,
+    /// `assets a and b`, `jobs etl, load and asset orders`, or `nothing`.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.everything {
+            return f.write_str("everything");
+        }
+        let mut parts: Vec<String> = Vec::new();
+        for (what, names) in [("job", &self.jobs), ("asset", &self.assets)] {
+            if names.is_empty() {
+                continue;
+            }
+            let plural = if names.len() == 1 { "" } else { "s" };
+            let names: Vec<&str> = names.iter().map(String::as_str).collect();
+            parts.push(format!("{what}{plural} {}", names.join(", ")));
+        }
+        match parts.is_empty() {
+            true => f.write_str("nothing"),
+            false => f.write_str(&parts.join(" and ")),
+        }
+    }
+}
+
+/// who is asking: a name for the audit trail, a [role](Access) for how much
+/// they may do, and a [scope](Scope) for what to.
 ///
 /// the name is what the event log records and what the ui shows. it is never a
 /// credential (see [`Auth::bearer`]) and it is never invented: a deployment
 /// with no authenticator records no actor at all rather than a name that means
 /// nothing.
+///
+/// **hestan builds this, never a request.** an [authenticator](Auth) is the
+/// only thing that produces one, it runs in the deployment's own process, and
+/// nothing in a header or a body reaches the scope on it. that is what makes a
+/// scope something the holder of a token cannot widen: there is no input for
+/// them to widen it through.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct Identity {
     /// what goes in the audit trail. use something a person would recognize
@@ -113,15 +275,31 @@ pub struct Identity {
     pub name: String,
     /// what they may do.
     pub role: Access,
+    /// what they may do it to. [`Scope::everything()`] unless
+    /// [`scoped_to`](Identity::scoped_to) said otherwise, which is every
+    /// identity a deployment built before this field existed.
+    pub scope: Scope,
 }
 
 impl Identity {
-    /// somebody, with a role.
+    /// somebody, with a role, over the whole deployment.
     pub fn new(name: impl Into<String>, role: Access) -> Identity {
         Identity {
             name: name.into(),
             role,
+            scope: Scope::everything(),
         }
+    }
+
+    /// the same identity, limited to the jobs and assets `scope` names.
+    ///
+    /// ```
+    /// # use hestan::{Identity, Scope};
+    /// Identity::operator("ci").scoped_to(Scope::jobs(["deploy"]));
+    /// ```
+    pub fn scoped_to(mut self, scope: Scope) -> Identity {
+        self.scope = scope;
+        self
     }
 
     /// somebody who may only read.
