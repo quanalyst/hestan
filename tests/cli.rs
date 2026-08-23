@@ -191,6 +191,11 @@ async fn cases(dir: &Path) {
     )
     .await;
     case("doctor_answers_why_nothing_is_running", diagnosed(dir)).await;
+    case(
+        "a_deployment_will_not_come_up_on_a_copy_until_it_is_resettled",
+        restored(dir),
+    )
+    .await;
     case("the_command_line_says_who_owns_something", owned(dir)).await;
     case("a_dry_run_checks_the_params_and_creates_nothing", dry(dir)).await;
     case(
@@ -982,6 +987,72 @@ fn cli(db: &Path, args: &[&str]) -> Ran {
             .output()
             .expect("the command starts"),
     )
+}
+
+/// a backup, and the whole of what a restored run log does to a deployment
+/// that is pointed at it: refuses to start, says so in `doctor`, and starts
+/// once somebody has resettled it.
+///
+/// `--watch 0` because this case is the only thing on the database and it
+/// knows that. an operator is not in that position, which is why the default
+/// is twenty seconds of watching the leases rather than zero.
+async fn restored(dir: &Path) {
+    let live = db(dir, "restored");
+    cli(&live, &["run", "quick", "--wait"]).assert(0);
+
+    let copy = db(dir, "restored-copy");
+    let took = cli(&live, &["backup", copy.to_str().unwrap()]);
+    took.assert(0);
+    assert!(
+        took.stdout.contains("io manager"),
+        "the backup did not say what is missing from it: {:?}",
+        took.stdout
+    );
+    assert!(copy.exists(), "no copy was written");
+
+    // the original is not a copy and goes on serving
+    cli(&live, &["run", "quick", "--wait"]).assert(0);
+
+    // and the copy refuses, by name, with the command that fixes it
+    let refused = cli(&copy, &["run", "quick", "--wait"]);
+    refused.assert(1);
+    assert!(
+        refused.stderr.contains("hestan resettle"),
+        "the refusal did not say what to do: {:?}",
+        refused.stderr
+    );
+
+    // reading it still works, which is the ordinary reason to have a copy
+    let read = cli(&copy, &["runs"]);
+    read.assert(0);
+
+    // doctor calls it actionable, which is exit 7
+    let looked = cli(&copy, &["doctor"]);
+    looked.assert(7);
+    assert!(
+        looked.stdout.contains("nothing has resettled it"),
+        "doctor did not report the copy: {:?}",
+        looked.stdout
+    );
+
+    let settled = cli(&copy, &["resettle", "--watch", "0"]);
+    settled.assert(0);
+    assert!(
+        settled.stdout.contains("resettled"),
+        "resettle said nothing: {:?}",
+        settled.stdout
+    );
+
+    // and now the same deployment comes up on it
+    cli(&copy, &["run", "quick", "--wait"]).assert(0);
+    // doctor still says what this database is, and is no longer actionable
+    let after = cli(&copy, &["doctor"]);
+    after.assert(0);
+    assert!(
+        after.stdout.contains("resettled at"),
+        "doctor forgot the database had been restored: {:?}",
+        after.stdout
+    );
 }
 
 /// the standalone `hestan`, which has no registry of its own: the binary an

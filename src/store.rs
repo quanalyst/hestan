@@ -16,8 +16,8 @@ use crate::metrics::Meters;
 use crate::model::{
     AssetCheckRow, Backfill, BackfillStatus, CheckStatus, Decider, DeliveryState, Event, EventKind,
     EventLevel, FreshnessRow, HistoryEntry, Materialization, MetaPoint, Notification, OpLog, OpRun,
-    OpStatus, Preset, Reclaim, Run, RunCursor, RunStatus, RunTags, ScheduleRow, SensorOutcome,
-    SensorRow, SensorTick, Severity, SubjectKind, Tick, TickOutcome,
+    OpStatus, Preset, Reclaim, Resettled, Restored, Run, RunCursor, RunStatus, RunTags,
+    ScheduleRow, SensorOutcome, SensorRow, SensorTick, Severity, SubjectKind, Tick, TickOutcome,
 };
 use crate::op;
 use crate::retention::Retention;
@@ -521,7 +521,40 @@ CREATE TABLE decider (
 INSERT INTO decider (only_row, term) VALUES (1, 0);
 "#;
 
-pub(crate) const SCHEMA_VERSION: u32 = 21;
+/// whether this database is a **copy**, and whether anybody has resettled it.
+///
+/// [`Store::backup_to`] writes the row into the copy it takes, so a restored
+/// run log says what it is before a deployment comes up on it. every other
+/// database has no row here at all, which is the ordinary state and costs a
+/// table nothing reads on a hot path.
+///
+/// the row matters because **a restored store is a lie about the present**.
+/// its `running` runs point at processes that ended long ago, its claims are
+/// held by instance ids that are not here, and its deciding lease names a
+/// holder that cannot renew it. none of that is distinguishable, row by row,
+/// from a deployment that crashed a moment ago, which is exactly why the copy
+/// has to be the thing that says so rather than a heuristic over the rows.
+///
+/// `settled_at` is what [`Store::resettle`] sets. until it is set,
+/// [`Hestan::serve`](crate::Hestan) refuses to come up on the database, which
+/// is the "refuse until told" half: a deployment must not start and quietly
+/// act on claims and leases that describe another machine.
+///
+/// **it catches only the copies hestan took.** a `cp` of the file, an lvm
+/// snapshot and a `pg_dump` reloaded into an empty database all produce a run
+/// log identical to the one they came from, and nothing inside it can know it
+/// is a second copy of itself. `docs/backup.md` says so and says what an
+/// operator does instead, which is to run `hestan resettle` by hand.
+const SCHEMA_V22: &str = r#"
+CREATE TABLE store_copy (
+    only_row INTEGER PRIMARY KEY CHECK (only_row = 1),
+    taken_at TEXT,
+    taken_from TEXT,
+    settled_at TEXT
+);
+"#;
+
+pub(crate) const SCHEMA_VERSION: u32 = 22;
 
 // one transaction around every pending step and the version stamp (sqlite DDL
 // is transactional), so a crash mid-migration leaves the db exactly as found
@@ -602,6 +635,9 @@ fn migrate(conn: &mut Connection) -> Result<(), Error> {
     }
     if version < 21 {
         tx.execute_batch(SCHEMA_V21)?;
+    }
+    if version < 22 {
+        tx.execute_batch(SCHEMA_V22)?;
     }
     if version != SCHEMA_VERSION {
         tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
@@ -2069,6 +2105,270 @@ impl Store {
         // reset: whatever the process that died had counted died with it
         self.meters.run_finished(RunStatus::Failed, failed as u64);
         Ok(())
+    }
+
+    // ------------------------------------------------ a copy, and coming back from one
+
+    /// take a consistent copy of this run log while it is being written to.
+    ///
+    /// **sqlite only**, and the reason is the whole of why this exists rather
+    /// than a line in a runbook saying `cp`. the database runs in wal mode, so
+    /// what a `cp` of `hestan.db` gets is the file without the writes still in
+    /// `hestan.db-wal`, which is a copy that is missing whatever happened most
+    /// recently and gives no sign of it. this runs sqlite's `VACUUM INTO`,
+    /// which takes a read transaction and writes a whole database out of it:
+    /// one instant's worth of rows, taken while runs go on being recorded, with
+    /// no lock a writer waits on for longer than a statement.
+    ///
+    /// the copy is written beside `path` and renamed onto it, so a file that
+    /// appears under the name asked for is a finished copy carrying its
+    /// [mark](Restored) rather than a half-written one. an existing `path` is
+    /// refused rather than overwritten.
+    ///
+    /// **postgres is your own tooling's job**, and this says so rather than
+    /// pretending: `pg_dump` of the database, or a base backup of the server.
+    /// see `docs/backup.md` for what such a dump must not leave out.
+    ///
+    /// **what is not in it.** the store, and only the store. an
+    /// [io manager](crate::IoManager) writes op outputs to files outside the
+    /// database, and this copies none of them: a materialization restored out
+    /// of here can hold a handle to a parquet file that is no longer on disk.
+    /// back the io directory up beside this, from the same instant.
+    pub fn backup_to(&self, path: &str) -> Result<(), Error> {
+        let from = self.target.to_string();
+        let at = Utc::now();
+        if std::path::Path::new(path).exists() {
+            return Err(Error::Io(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                format!(
+                    "{path} is already there, and a backup does not write over one: \
+                     name a path that does not exist"
+                ),
+            )));
+        }
+        let part = format!("{path}.part");
+        {
+            let mut conn = self.conn();
+            match conn.dialect() {
+                Dialect::Sqlite => {}
+                #[cfg(feature = "postgres")]
+                Dialect::Postgres => return Err(Error::NoBackup(from)),
+            }
+            conn.execute("VACUUM INTO ?1", args![part.as_str()])?;
+        }
+        // opened, marked and closed before the rename: the mark is what makes
+        // a deployment refuse to come up on this file by accident, and a copy
+        // that reached its final name without one would be exactly the silent
+        // case this is here to remove
+        let copy = Store::open(&part)?;
+        copy.mark_copy(Some(at), Some(&from), None)?;
+        drop(copy);
+        std::fs::rename(&part, path)?;
+        Ok(())
+    }
+
+    /// what this run log says about having come out of a copy, or `None` for
+    /// an ordinary one.
+    ///
+    /// see [`Restored`] for what it records and, more to the point, for what it
+    /// cannot: only a copy [`backup_to`](Self::backup_to) took carries a mark.
+    pub fn restored(&self) -> Result<Option<Restored>, Error> {
+        self.conn().query_opt(
+            "SELECT taken_at, taken_from, settled_at FROM store_copy",
+            args![],
+            |r| Ok(Restored::new(r.opt_ts(0)?, r.opt_text(1)?, r.opt_ts(2)?)),
+        )
+    }
+
+    /// hand back every claim and the deciding lease a restored copy carries,
+    /// and record that it was done.
+    ///
+    /// **this is not boot recovery again.** boot recovery believes the leases,
+    /// and it has to: on a live database a claim whose lease has not run out is
+    /// a run some other process is executing this second, and taking it away
+    /// would be starting it twice. on a restored database there is no such
+    /// process. every claim in the copy was written
+    /// by an instance that is not executing against *this* database, whether
+    /// its lease has thirty seconds left on it or ran out last week, so the
+    /// lease is exactly the thing that must not be consulted.
+    ///
+    /// what it does, and the split is deliberate:
+    ///
+    /// - a run that was **`running`** is recorded as failed, with its ops
+    ///   marked the way boot recovery marks them. nothing is requeued: it may
+    ///   well have finished in the original after the copy was taken, and
+    ///   re-running it would be hestan deciding on its own to do somebody's
+    ///   work a second time. a resume or a replay is there for whoever decides
+    ///   otherwise.
+    /// - a run that was **`queued` and claimed** goes back on the queue with
+    ///   the claim cleared. it never started, so there is nothing it could
+    ///   have done twice.
+    /// - a run that was **`queued` and unclaimed** is left alone. that is the
+    ///   queue, and a durable queue surviving a restore is the point of it.
+    /// - the **deciding lease** is cleared, so the next process to come up
+    ///   takes it now rather than waiting out a lease held by an instance that
+    ///   cannot renew it.
+    ///
+    /// **it does not check whether anything is still running against this
+    /// database**, because a store method cannot: telling a copied lease from
+    /// a live one means watching whether it moves, which takes seconds rather
+    /// than a statement. `hestan resettle` does that watch and then calls this.
+    ///
+    /// works on any run log, marked or not, because most restores are
+    /// `pg_restore` and `cp` and those carry no mark. on an unmarked one it
+    /// leaves a row saying it was resettled and that when the copy was taken
+    /// is not recorded.
+    pub fn resettle(&self) -> Result<Resettled, Error> {
+        let mut conn = self.conn();
+        let mut tx = conn.begin_immediate()?;
+        let at = Utc::now();
+        let now = at.to_rfc3339();
+        let why = "the run log was restored from a copy: this run was executing when the \
+                   copy was taken, and the process that was executing it is not here";
+        let running = "SELECT id FROM runs WHERE status = 'running'";
+        tx.execute(
+            &format!(
+                "UPDATE op_runs SET
+                     status = CASE status WHEN 'running' THEN 'failed' ELSE 'skipped' END,
+                     error = CASE status WHEN 'running' THEN ?2 ELSE error END,
+                     finished_at = ?1, pid = NULL
+                 WHERE status IN ('pending', 'running') AND run_id IN ({running})"
+            ),
+            args![&now, why],
+        )?;
+        tx.execute(
+            "INSERT INTO events (run_id, subject_kind, level, kind, message, ts)
+             SELECT id, 'run', 'error', 'run_failed', ?2, ?1 FROM runs
+             WHERE status = 'running'",
+            args![&now, why],
+        )?;
+        let failed = tx.execute(
+            "UPDATE runs SET status = 'failed', finished_at = ?1, claimed_by = NULL,
+                 claimed_at = NULL, lease_until = NULL, error = COALESCE(error, ?2)
+             WHERE status = 'running'",
+            args![&now, why],
+        )?;
+        // and the ones that never started: back to what an unclaimed queued
+        // run is, which is what the next dispatcher will take. the event is
+        // the one a handed-back claim already has, because that is what this
+        // is: nothing about the run went wrong and nothing about it ran
+        let released = "the run log was restored from a copy: the claim on this run was \
+                        taken by a process that is not here, and the run never started. \
+                        back on the queue for whoever claims it next";
+        tx.execute(
+            "INSERT INTO events (run_id, subject_kind, level, kind, message, ts)
+             SELECT id, 'run', 'warn', 'run_released', ?2, ?1 FROM runs
+             WHERE status = 'queued' AND claimed_by IS NOT NULL",
+            args![&now, released],
+        )?;
+        let requeued = tx.execute(
+            "UPDATE runs SET claimed_by = NULL, claimed_at = NULL, lease_until = NULL,
+                 started_at = NULL
+             WHERE status = 'queued' AND claimed_by IS NOT NULL",
+            args![],
+        )?;
+        // the lease nobody holds. the term is deliberately left where the copy
+        // has it: it counts acquisitions of *this* database and there is no
+        // honest number to move it to, which is one more reason nothing from
+        // before the copy may still be running. see docs/backup.md
+        tx.execute(
+            "UPDATE decider SET claimed_by = NULL, claimed_at = NULL, lease_until = NULL",
+            args![],
+        )?;
+        let was = tx.query_opt(
+            "SELECT taken_at, taken_from FROM store_copy",
+            args![],
+            |r| Ok((r.opt_text(0)?, r.opt_text(1)?)),
+        )?;
+        let (taken_at, taken_from) = was.unwrap_or((None, None));
+        write_copy_row(
+            &mut tx,
+            taken_at.as_deref(),
+            taken_from.as_deref(),
+            Some(&now),
+        )?;
+        tx.commit()?;
+        // said here rather than as an event of its own: the runs above each
+        // carry the reason in the log already, and a summary line is for the
+        // operator who is watching this command, not for the log
+        tracing::warn!(
+            "restored run log resettled: {failed} runs that were executing recorded as \
+             failed, {requeued} claimed runs back on the queue, the deciding lease handed \
+             back. nothing that was running before the copy was taken may still be \
+             writing to this database"
+        );
+        Ok(Resettled::new(failed, requeued))
+    }
+
+    /// write the [copy mark](Restored), replacing whatever is there.
+    fn mark_copy(
+        &self,
+        taken_at: Option<DateTime<Utc>>,
+        taken_from: Option<&str>,
+        settled_at: Option<DateTime<Utc>>,
+    ) -> Result<(), Error> {
+        let mut conn = self.conn();
+        let mut tx = conn.begin_immediate()?;
+        write_copy_row(
+            &mut tx,
+            taken_at.map(|t| t.to_rfc3339()).as_deref(),
+            taken_from,
+            settled_at.map(|t| t.to_rfc3339()).as_deref(),
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// every lease in this database that a live process moves on a timer, as
+    /// one string to compare against itself a moment later.
+    ///
+    /// the run leases and the deciding lease, and nothing else, because those
+    /// are the two things a hestan process **necessarily** writes while it is
+    /// up: a claimer renews its run leases every `HEARTBEAT` and a decider
+    /// renews the deciding lease every `DECIDE_RENEW`. a copied lease sits
+    /// still; a live one does not.
+    ///
+    /// compared for difference rather than for order: a run finishing takes
+    /// its lease out of the set, so the value can go backwards, and any change
+    /// at all is something writing here.
+    ///
+    /// the command line is the only caller, and it is not public: what the
+    /// string holds is a comparison against itself and nothing else, and an
+    /// api that promised a shape for it would be promising something no
+    /// reader should be parsing.
+    #[cfg(any(test, feature = "cli"))]
+    pub(crate) fn leases(&self) -> Result<String, Error> {
+        let mut conn = self.conn();
+        let runs: Vec<String> = conn.query(
+            "SELECT id, lease_until FROM runs
+             WHERE claimed_by IS NOT NULL AND status IN ('queued', 'running')
+             ORDER BY id",
+            args![],
+            |r| {
+                Ok(format!(
+                    "{}={}",
+                    r.text(0)?,
+                    r.opt_text(1)?.unwrap_or_default()
+                ))
+            },
+        )?;
+        let deciding = conn.query_opt(
+            "SELECT term, claimed_by, lease_until FROM decider",
+            args![],
+            |r| {
+                Ok(format!(
+                    "{}/{}/{}",
+                    r.int(0)?,
+                    r.opt_text(1)?.unwrap_or_default(),
+                    r.opt_text(2)?.unwrap_or_default()
+                ))
+            },
+        )?;
+        Ok(format!(
+            "{}|{}",
+            runs.join(","),
+            deciding.unwrap_or_default()
+        ))
     }
 
     /// whether `job` has work outstanding: a run of it queued or running,
@@ -5431,6 +5731,29 @@ fn trace_event(ev: &NewEvent<'_>) {
     }
 }
 
+/// the one [copy mark](Restored) row, replacing whatever is there.
+///
+/// delete and insert rather than an upsert, because the two backends spell an
+/// upsert differently and this runs once per backup and once per resettle.
+fn write_copy_row(
+    tx: &mut Tx<'_>,
+    taken_at: Option<&str>,
+    taken_from: Option<&str>,
+    settled_at: Option<&str>,
+) -> Result<(), Error> {
+    tx.execute("DELETE FROM store_copy", args![])?;
+    // `only_row` is left to the column: postgres has a `DEFAULT TRUE` on it and
+    // sqlite's `INTEGER PRIMARY KEY` is the rowid, which is 1 in a table the
+    // statement above just emptied. binding it would mean binding a boolean on
+    // one backend and an integer on the other, and the check constraint is
+    // what enforces the one row either way
+    tx.execute(
+        "INSERT INTO store_copy (taken_at, taken_from, settled_at) VALUES (?1, ?2, ?3)",
+        args![taken_at, taken_from, settled_at],
+    )?;
+    Ok(())
+}
+
 /// append one event, inside whatever the caller is already in.
 fn write_event(tx: &mut impl Exec, ev: &NewEvent<'_>, at: DateTime<Utc>) -> Result<(), Error> {
     trace_event(ev);
@@ -7771,14 +8094,20 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("future.db");
         let path = path.to_str().unwrap();
-        phase1_db(path, 22);
+        // one past whatever this build is at, so the case keeps asking the
+        // question it was written to ask after the next migration lands
+        let future = SCHEMA_VERSION + 1;
+        phase1_db(path, future);
         let err = Store::open(path).err().unwrap();
-        assert_eq!(err.to_string(), "db schema v22 is newer than this build");
+        assert_eq!(
+            err.to_string(),
+            format!("db schema v{future} is newer than this build")
+        );
         let conn = Connection::open(path).unwrap();
         let version: u32 = conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 22);
+        assert_eq!(version, future);
     }
 
     #[test]
@@ -7949,6 +8278,7 @@ mod tests {
                          ALTER TABLE runs DROP COLUMN replay_of;
                          DROP INDEX schedule_ticks_fire;
                          DROP TABLE decider;
+                         DROP TABLE store_copy;
                          UPDATE schema_version SET version = 16;"
                     ))
                     .unwrap();
@@ -8048,6 +8378,7 @@ mod tests {
                          ALTER TABLE runs DROP COLUMN replay_of;
                          DROP INDEX schedule_ticks_fire;
                          DROP TABLE decider;
+                         DROP TABLE store_copy;
                          UPDATE schema_version SET version = 17;",
                     )
                     .unwrap();
@@ -8143,6 +8474,7 @@ mod tests {
                         "ALTER TABLE runs DROP COLUMN replay_of;
                          DROP INDEX schedule_ticks_fire;
                          DROP TABLE decider;
+                         DROP TABLE store_copy;
                          UPDATE schema_version SET version = 18;",
                     )
                     .unwrap();
@@ -8258,6 +8590,7 @@ mod tests {
                     .batch(&format!(
                         "DROP INDEX schedule_ticks_fire;
                          DROP TABLE decider;
+                         DROP TABLE store_copy;
                          {ticks}
                          UPDATE schema_version SET version = 19;"
                     ))
@@ -10902,7 +11235,7 @@ mod tests {
     /// every table the sqlite chain arrives at. a fresh postgres database has
     /// all of them from its first statement.
     #[cfg(feature = "postgres")]
-    const TABLES: [&str; 18] = [
+    const TABLES: [&str; 19] = [
         "asset_checks",
         "asset_materializations",
         "backfills",
@@ -10921,6 +11254,7 @@ mod tests {
         "sensor_run_keys",
         "sensor_ticks",
         "sensors",
+        "store_copy",
     ];
 
     #[cfg(feature = "postgres")]
@@ -10977,23 +11311,29 @@ mod tests {
         let Some(pg) = Scratch::new() else {
             return;
         };
+        // one past whatever this build is at, so the case keeps asking the
+        // question it was written to ask after the next migration lands
+        let future = i64::from(SCHEMA_VERSION) + 1;
         let store = pg.store();
         store
             .conn()
-            .execute("UPDATE schema_version SET version = ?1", args![22_i64])
+            .execute("UPDATE schema_version SET version = ?1", args![future])
             .unwrap();
         drop(store);
 
         let err = Store::connect(&pg.url).err().unwrap();
-        assert_eq!(err.to_string(), "db schema v22 is newer than this build");
+        assert_eq!(
+            err.to_string(),
+            format!("db schema v{future} is newer than this build")
+        );
 
-        // and it is still v22: a build that cannot read a database must not
+        // and it is still there: a build that cannot read a database must not
         // rewrite it either
         let version = crate::pg::unmigrated(&pg.url)
             .unwrap()
             .query("SELECT version FROM schema_version", args![], |r| r.int(0))
             .unwrap();
-        assert_eq!(version, [22]);
+        assert_eq!(version, [future]);
     }
 
     // ------------------------------------------- what a write is worth losing
@@ -11366,5 +11706,459 @@ mod tests {
         // the next one lands, and is not counted
         note(store.append_event("r1", None, EventLevel::Info, EventKind::Log, "hello", None));
         assert_eq!(store.health().dropped_writes(), 1);
+    }
+
+    // ----------------------------------------------- a copy, and coming back from one
+    // a copy of a run log is easy; what a copy *means* once it is opened is
+    // the part these cover. the rows in it were true at one instant and every
+    // claim in them names a process that is somewhere else.
+
+    /// `dir` with a `hestan.db` in it and one run recorded, for the cases that
+    /// need a live sqlite database rather than a `Backend`: `VACUUM INTO` is
+    /// sqlite's and these are about sqlite.
+    fn planted(dir: &std::path::Path) -> Store {
+        let store = Store::open(dir.join("hestan.db").to_str().unwrap()).unwrap();
+        store
+            .create_run(&mk_run("r1", "etl", Utc::now()), &["a".into()])
+            .unwrap();
+        store
+    }
+
+    // the whole point of an online backup rather than a `cp`: the database is
+    // being written to the entire time, and what comes out the other end opens
+    // and reads
+    #[test]
+    fn a_copy_taken_while_runs_are_being_recorded_opens_and_reads() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = planted(dir.path());
+        let dest = dir.path().join("copy.db").display().to_string();
+
+        // a second connection writing flat out for the whole of the backup,
+        // which is what makes this a copy taken mid-run rather than a copy of
+        // a quiet file
+        let stop = Arc::new(AtomicBool::new(false));
+        let writer = {
+            let (path, stop) = (dir.path().join("hestan.db"), stop.clone());
+            std::thread::spawn(move || {
+                let store = Store::open(path.to_str().unwrap()).unwrap();
+                let mut n = 0u64;
+                while !stop.load(Ordering::Relaxed) {
+                    n += 1;
+                    store
+                        .create_run(&mk_run(&format!("w{n}"), "etl", Utc::now()), &["a".into()])
+                        .unwrap();
+                }
+                n
+            })
+        };
+        // enough writes to be sure some of them landed inside the window
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        store.backup_to(&dest).unwrap();
+        stop.store(true, Ordering::Relaxed);
+        let wrote = writer.join().unwrap();
+        assert!(wrote > 0, "the writer never wrote anything");
+
+        let copy = Store::open(&dest).unwrap();
+        assert_eq!(copy.schema_version().unwrap(), SCHEMA_VERSION);
+        // the run that was there before the window is in it, its op row is in
+        // it, and the event written in the same transaction is in it: a copy
+        // torn between the three would have one and not the others
+        assert!(copy.run("r1").unwrap().is_some());
+        assert_eq!(copy.op_runs("r1").unwrap().len(), 1);
+        assert_eq!(copy.events("r1", 0).unwrap().len(), 1);
+        // and every run the copy caught out of the writer's stream is whole,
+        // which is what "consistent" is being claimed to mean here
+        let caught = copy.runs(None, None, None, None, None, 10_000).unwrap();
+        assert!(caught.len() <= wrote as usize + 1);
+        for run in &caught {
+            assert_eq!(
+                copy.op_runs(&run.id).unwrap().len(),
+                1,
+                "run {} is in the copy without its op row",
+                run.id
+            );
+        }
+    }
+
+    // and the copy says what it is, which is what stops a deployment coming up
+    // on it and acting on claims that describe another machine
+    #[test]
+    fn a_copy_is_marked_as_one_and_the_original_is_not() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = planted(dir.path());
+        let dest = dir.path().join("copy.db").display().to_string();
+        store.backup_to(&dest).unwrap();
+
+        assert_eq!(store.restored().unwrap(), None, "the original was marked");
+        let copy = Store::open(&dest).unwrap();
+        let mark = copy.restored().unwrap().expect("the copy is not marked");
+        assert!(mark.unsettled());
+        assert_eq!(mark.settled_at(), None);
+        assert!(mark.taken_at().is_some());
+        assert_eq!(
+            mark.taken_from(),
+            Some(dir.path().join("hestan.db").display().to_string().as_str())
+        );
+        assert!(mark.describe().contains("taken at"));
+    }
+
+    // a name already taken is refused rather than written over: a backup that
+    // silently replaced last night's is worse than one that did not run
+    #[test]
+    fn a_backup_will_not_write_over_a_file_that_is_already_there() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = planted(dir.path());
+        let dest = dir.path().join("copy.db").display().to_string();
+        store.backup_to(&dest).unwrap();
+        let again = store.backup_to(&dest).unwrap_err();
+        assert!(again.to_string().contains("already there"), "{again}");
+        // and nothing half-written is left beside it
+        assert!(!dir.path().join("copy.db.part").exists());
+    }
+
+    // postgres is not hestan's to copy and it says so rather than doing
+    // something that looks like a backup and is not one
+    #[cfg(feature = "postgres")]
+    #[test]
+    fn a_postgres_run_log_is_not_something_hestan_copies() {
+        let Some(pg) = Scratch::new() else { return };
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("copy.db").display().to_string();
+        let refused = pg.store().backup_to(&dest).unwrap_err();
+        assert!(refused.to_string().contains("pg_dump"), "{refused}");
+        assert!(!std::path::Path::new(&dest).exists());
+    }
+
+    /// a run in each of the three states a restored store finds runs in, plus
+    /// a deciding lease somebody holds, with every lease **still good**: that
+    /// is what a copy taken a moment before the original was lost looks like,
+    /// and it is exactly the case boot recovery is built to leave alone.
+    fn as_a_copy_has_it(store: &Store) {
+        let good = Utc::now() + chrono::Duration::hours(1);
+        for (id, status) in [
+            ("running", RunStatus::Running),
+            ("claimed", RunStatus::Queued),
+            ("waiting", RunStatus::Queued),
+        ] {
+            let mut run = mk_run(id, "etl", Utc::now());
+            run.status = status;
+            store.create_run(&run, &["a".into()]).unwrap();
+            store
+                .conn()
+                .execute(
+                    "UPDATE runs SET status = ?2 WHERE id = ?1",
+                    args![id, status.as_str()],
+                )
+                .unwrap();
+            if id != "waiting" {
+                store
+                    .plant_claim(id, "worker-that-is-gone", Some(good))
+                    .unwrap();
+            }
+        }
+        store
+            .conn()
+            .execute(
+                "UPDATE op_runs SET status = 'running' WHERE run_id = 'running'",
+                args![],
+            )
+            .unwrap();
+        assert_eq!(
+            store
+                .take_decision_lease("scheduler-that-is-gone", Duration::from_secs(3600))
+                .unwrap(),
+            Some(1)
+        );
+    }
+
+    // the contrast that says why a resettle is not boot recovery run again.
+    // `fail_interrupted` believes leases, and on a live database it has to:
+    // a claim with time left on it is a run somebody is executing
+    #[test]
+    fn boot_recovery_leaves_a_copy_exactly_as_the_copy_has_it() {
+        both(|db| {
+            let store = db.store();
+            as_a_copy_has_it(&store);
+            store.fail_interrupted().unwrap();
+
+            for id in ["running", "claimed"] {
+                let run = store.run(id).unwrap().unwrap();
+                assert_eq!(
+                    run.claimed_by.as_deref(),
+                    Some("worker-that-is-gone"),
+                    "boot recovery took a claim whose lease had not run out"
+                );
+            }
+            assert_eq!(
+                store.run("running").unwrap().unwrap().status,
+                RunStatus::Running
+            );
+            assert_eq!(
+                store.decider().unwrap().holder.as_deref(),
+                Some("scheduler-that-is-gone")
+            );
+        });
+    }
+
+    // and what a resettle does instead: the lease is the one thing it must not
+    // consult, because nothing is executing against a copy however much time
+    // its claims have left on them
+    #[test]
+    fn a_resettle_takes_every_claim_back_whatever_the_lease_says() {
+        both(|db| {
+            let store = db.store();
+            as_a_copy_has_it(&store);
+
+            let done = store.resettle().unwrap();
+            assert_eq!((done.failed(), done.requeued()), (1, 1));
+
+            // the run that was executing: failed, with the reason, and its op
+            // marked rather than left saying it is still running
+            let ran = store.run("running").unwrap().unwrap();
+            assert_eq!(ran.status, RunStatus::Failed);
+            assert_eq!(ran.claimed_by, None);
+            assert_eq!(ran.lease_until, None);
+            assert!(
+                ran.error
+                    .as_deref()
+                    .unwrap()
+                    .contains("restored from a copy"),
+                "{:?}",
+                ran.error
+            );
+            assert_eq!(
+                store.op_runs("running").unwrap()[0].status,
+                OpStatus::Failed
+            );
+            assert!(
+                store
+                    .events("running", 0)
+                    .unwrap()
+                    .iter()
+                    .any(|e| e.kind == EventKind::RunFailed),
+                "the run log does not say why the run ended"
+            );
+
+            // the one that was claimed and had not started: back on the queue,
+            // unclaimed, because nothing about it happened even once
+            let claimed = store.run("claimed").unwrap().unwrap();
+            assert_eq!(claimed.status, RunStatus::Queued);
+            assert_eq!(claimed.claimed_by, None);
+            assert_eq!(claimed.lease_until, None);
+            assert!(
+                store
+                    .events("claimed", 0)
+                    .unwrap()
+                    .iter()
+                    .any(|e| e.kind == EventKind::RunReleased),
+                "a requeued claim left no trace"
+            );
+
+            // the queue itself is untouched: a durable queue that did not
+            // survive a restore would not be one
+            let waiting = store.run("waiting").unwrap().unwrap();
+            assert_eq!(waiting.status, RunStatus::Queued);
+            assert_eq!(waiting.claimed_by, None);
+
+            // the deciding lease is free, so the next process takes it now
+            // rather than waiting out an hour of a lease nobody holds. the
+            // term stays where the copy has it: there is no honest number to
+            // move it to
+            let decider = store.decider().unwrap();
+            assert_eq!(decider.holder, None);
+            assert_eq!(decider.lease_until, None);
+            assert_eq!(decider.term, 1);
+
+            // and the store records that this happened, which is what stops a
+            // deployment refusing to come up on it a second time
+            let mark = store.restored().unwrap().expect("no resettle was recorded");
+            assert!(!mark.unsettled());
+            assert!(mark.settled_at().is_some());
+            // restored by something other than `backup_to`, and the row says
+            // so rather than inventing an age for the copy
+            assert_eq!(mark.taken_at(), None);
+            assert!(
+                mark.describe().contains("unrecorded age"),
+                "{}",
+                mark.describe()
+            );
+        });
+    }
+
+    // the copy a backup took carries its age through the resettle, because
+    // when the rows stopped being true is the one fact worth keeping
+    #[test]
+    fn resettling_a_marked_copy_keeps_what_it_is_a_copy_of() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = planted(dir.path());
+        let dest = dir.path().join("copy.db").display().to_string();
+        store.backup_to(&dest).unwrap();
+
+        let copy = Store::open(&dest).unwrap();
+        copy.resettle().unwrap();
+        let mark = copy.restored().unwrap().unwrap();
+        assert!(!mark.unsettled());
+        assert!(mark.taken_at().is_some());
+        assert!(mark.describe().contains("taken at"));
+    }
+
+    // what the `resettle` command watches. a lease a live process holds moves
+    // because holding one is renewing it; one that came out of a copy does not
+    #[test]
+    fn the_leases_read_the_same_twice_until_something_renews_one() {
+        both(|db| {
+            let store = db.store();
+            as_a_copy_has_it(&store);
+            let before = store.leases().unwrap();
+            assert_eq!(store.leases().unwrap(), before, "a still store looked busy");
+
+            // a decider renewing its lease is a process that is up
+            assert!(
+                store
+                    .renew_decision_lease("scheduler-that-is-gone", 1, Duration::from_secs(7200))
+                    .unwrap()
+            );
+            assert_ne!(
+                store.leases().unwrap(),
+                before,
+                "a renewed deciding lease did not show"
+            );
+
+            // and so is a claimer renewing a run lease
+            let between = store.leases().unwrap();
+            store
+                .plant_claim(
+                    "running",
+                    "worker-that-is-gone",
+                    Some(Utc::now() + chrono::Duration::hours(3)),
+                )
+                .unwrap();
+            assert_ne!(
+                store.leases().unwrap(),
+                between,
+                "a renewed run lease did not show"
+            );
+        });
+    }
+
+    // **what a backup does not contain.** an io manager's files live outside
+    // the store, so a copy of the store is a copy of the handles and not of
+    // what they point at
+    #[test]
+    fn a_restored_materialization_can_hold_a_handle_to_a_file_that_is_gone() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = planted(dir.path());
+        use crate::io::IoManager;
+        let outputs = dir.path().join("io");
+        let io = crate::io::FileIo::new(&outputs);
+        let key = crate::io::IoKey {
+            run_id: "r1".into(),
+            job: "etl".into(),
+            op: "sales/orders".into(),
+        };
+        let handle = io.put(&key, json!([{ "id": 1 }])).unwrap();
+        store
+            .record_materialization(
+                "sales/orders",
+                None,
+                "fp1",
+                &json!({}),
+                Some(&handle),
+                Some("r1"),
+                None,
+            )
+            .unwrap();
+        let dest = dir.path().join("copy.db").display().to_string();
+        store.backup_to(&dest).unwrap();
+
+        // the io directory is not in the copy, so anything that happens to it
+        // after this happens to what the copy points at too. a scratch disk
+        // reprovisioned with the host is the ordinary way
+        std::fs::remove_dir_all(&outputs).unwrap();
+
+        let copy = Store::open(&dest).unwrap();
+        let row = copy.materialization("sales/orders", None).unwrap().unwrap();
+        // the row came through whole: the asset is materialized, as far as the
+        // restored run log is concerned
+        assert_eq!(row.value.as_ref(), Some(&handle));
+        assert_eq!(row.fingerprint, "fp1");
+        // and the value it names is not there, which nothing in the store can
+        // tell you
+        let gone = io.get(&key, &handle).unwrap_err();
+        assert!(
+            gone.to_string().contains("No such file")
+                || gone.to_string().contains("not found")
+                || gone.to_string().contains("cannot find"),
+            "{gone}"
+        );
+    }
+
+    /// a database at v21: everything but the table that says whether it is a
+    /// copy.
+    fn at_v21(db: &Backend) {
+        match db {
+            Backend::Sqlite(dir) => {
+                let conn = Connection::open(dir.path().join("hestan.db")).unwrap();
+                for batch in [
+                    PHASE1_SCHEMA,
+                    SCHEMA_V2,
+                    SCHEMA_V3,
+                    SCHEMA_V4,
+                    SCHEMA_V5,
+                    SCHEMA_V6,
+                    SCHEMA_V7,
+                    SCHEMA_V8,
+                    SCHEMA_V9,
+                    SCHEMA_V10,
+                    SCHEMA_V11,
+                    SCHEMA_V12,
+                    SCHEMA_V13,
+                    SCHEMA_V14,
+                    SCHEMA_V15,
+                    SCHEMA_V16,
+                    SCHEMA_V17,
+                    SCHEMA_V18,
+                    SCHEMA_V19,
+                    SCHEMA_V20,
+                    SCHEMA_V21,
+                ] {
+                    conn.execute_batch(batch).unwrap();
+                }
+                conn.pragma_update(None, "user_version", 21).unwrap();
+            }
+            #[cfg(feature = "postgres")]
+            Backend::Postgres(pg) => {
+                pg.store()
+                    .conn()
+                    .batch(
+                        "DROP TABLE store_copy;
+                         UPDATE schema_version SET version = 21;",
+                    )
+                    .unwrap();
+            }
+        }
+    }
+
+    // the migration an existing deployment sees: one empty table, nothing read
+    // and nothing rewritten, and a run log that is not a copy goes on saying so
+    #[test]
+    fn a_v21_db_migrates_to_v22_and_says_it_is_not_a_copy() {
+        both(|db| {
+            at_v21(db);
+            let store = db.store();
+            assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
+            assert_eq!(store.restored().unwrap(), None);
+
+            store
+                .create_run(&mk_run("after", "etl", Utc::now()), &["a".into()])
+                .unwrap();
+            assert!(store.run("after").unwrap().is_some());
+
+            // reopening does not migrate a second time
+            drop(store);
+            let store = db.store();
+            assert_eq!(store.restored().unwrap(), None);
+            assert!(store.run("after").unwrap().is_some());
+        });
     }
 }

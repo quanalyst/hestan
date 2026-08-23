@@ -190,9 +190,9 @@ pub use model::EVENT_SCHEMA;
 pub use model::{
     AssetCheckRow, Backfill, BackfillStatus, Catchup, CheckStatus, Decider, DeliveryState, Event,
     EventKind, EventLevel, Freshness, FreshnessRow, HistoryEntry, LogStream, Materialization,
-    MetaPoint, Notification, OpLog, OpRun, OpStatus, Overlap, Preset, Reclaim, Role, Run,
-    RunStatus, RunTags, ScheduleRow, SensorOutcome, SensorRow, SensorTick, Severity, SubjectKind,
-    Tick, TickOutcome, Trigger, When,
+    MetaPoint, Notification, OpLog, OpRun, OpStatus, Overlap, Preset, Reclaim, Resettled, Restored,
+    Role, Run, RunStatus, RunTags, ScheduleRow, SensorOutcome, SensorRow, SensorTick, Severity,
+    SubjectKind, Tick, TickOutcome, Trigger, When,
 };
 pub use op::{
     InputError, META_SERIES_POINTS, META_TABLE_ROWS, Meta, MetaColumn, MetaSeries, MetaTable, Op,

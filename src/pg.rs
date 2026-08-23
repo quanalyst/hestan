@@ -41,7 +41,7 @@ use crate::store::{AnyRow, SCHEMA_VERSION, Val, args};
 
 /// the whole schema at [`SCHEMA_VERSION`], created in one statement batch.
 ///
-/// the same seventeen tables the sqlite chain arrives at, with the same columns
+/// the same eighteen tables the sqlite chain arrives at, with the same columns
 /// and the same indexes; what each one is for is written on the migration that
 /// added it. the differences are `BIGSERIAL` where sqlite writes `INTEGER
 /// PRIMARY KEY AUTOINCREMENT`, `BIGINT` where it writes `INTEGER`, and the
@@ -247,6 +247,12 @@ CREATE TABLE decider (
     lease_until TEXT COLLATE "C"
 );
 INSERT INTO decider (term) VALUES (0);
+CREATE TABLE store_copy (
+    only_row BOOLEAN PRIMARY KEY DEFAULT TRUE CHECK (only_row),
+    taken_at TEXT COLLATE "C",
+    taken_from TEXT COLLATE "C",
+    settled_at TEXT COLLATE "C"
+);
 "#;
 
 /// the lock two processes booting against the same empty database take turns
@@ -478,6 +484,21 @@ CREATE TABLE decider (
 INSERT INTO decider (term) VALUES (0);
 "#;
 
+/// whether this database is a copy, and whether anybody has resettled it. the
+/// postgres half of `SCHEMA_V22`: one empty table, nothing read or rewritten.
+///
+/// `only_row` is a boolean here and an integer with a `CHECK` on sqlite, which
+/// is what `decider` already does for the same reason: one row, and the
+/// constraint says so.
+const MIGRATE_V22: &str = r#"
+CREATE TABLE store_copy (
+    only_row BOOLEAN PRIMARY KEY DEFAULT TRUE CHECK (only_row),
+    taken_at TEXT COLLATE "C",
+    taken_from TEXT COLLATE "C",
+    settled_at TEXT COLLATE "C"
+);
+"#;
+
 const MIGRATE_V17: &str = r#"
 ALTER TABLE events ALTER COLUMN run_id DROP NOT NULL;
 ALTER TABLE events ADD COLUMN subject_kind TEXT COLLATE "C" NOT NULL DEFAULT 'run';
@@ -531,6 +552,9 @@ fn migrate(client: &mut Client) -> Result<(), Error> {
             }
             if version < 21 {
                 tx.batch(MIGRATE_V21)?;
+            }
+            if version < 22 {
+                tx.batch(MIGRATE_V22)?;
             }
             if version != SCHEMA_VERSION {
                 tx.execute(

@@ -868,6 +868,112 @@ impl Decider {
     }
 }
 
+/// what a run log says about having come out of a copy.
+///
+/// [`Store::backup_to`](crate::Store::backup_to) writes this into the copy it
+/// takes, so a database restored from one says so before anything runs against
+/// it. an ordinary run log has no row here at all and
+/// [`Store::restored`](crate::Store::restored) answers `None`.
+///
+/// **only a copy hestan took carries it.** a `cp` of a database file and a
+/// `pg_restore` into an empty database both produce a run log that is
+/// byte-for-byte what it was copied from, mark and all, and no row anywhere
+/// can say otherwise. the fields are `None` on the row
+/// [`Store::resettle`](crate::Store::resettle) leaves behind on such a
+/// database: it was restored by other means, and when it was taken is not
+/// something this database knows.
+///
+/// built with private fields on purpose, so that what it records can grow
+/// without breaking a caller; see `docs/stability.md`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Restored {
+    taken_at: Option<DateTime<Utc>>,
+    taken_from: Option<String>,
+    settled_at: Option<DateTime<Utc>>,
+}
+
+impl Restored {
+    pub(crate) fn new(
+        taken_at: Option<DateTime<Utc>>,
+        taken_from: Option<String>,
+        settled_at: Option<DateTime<Utc>>,
+    ) -> Restored {
+        Restored {
+            taken_at,
+            taken_from,
+            settled_at,
+        }
+    }
+
+    /// when the copy was taken, which is the instant the rows in it are true
+    /// as of. `None` on a database restored by something other than
+    /// [`Store::backup_to`](crate::Store::backup_to).
+    pub fn taken_at(&self) -> Option<DateTime<Utc>> {
+        self.taken_at
+    }
+
+    /// the store it was copied from, as that store was opened: a path or a
+    /// url. `None` for the same reason `taken_at` is.
+    pub fn taken_from(&self) -> Option<&str> {
+        self.taken_from.as_deref()
+    }
+
+    /// when [`Store::resettle`](crate::Store::resettle) handed back the claims
+    /// and the deciding lease this copy carries. `None` is a copy nothing has
+    /// resettled, and a deployment refuses to come up on one.
+    pub fn settled_at(&self) -> Option<DateTime<Utc>> {
+        self.settled_at
+    }
+
+    /// whether this copy still has to be resettled before anything runs
+    /// against it.
+    pub fn unsettled(&self) -> bool {
+        self.settled_at.is_none()
+    }
+
+    /// the one line that says which copy this is, for an error and for
+    /// `hestan doctor`.
+    pub(crate) fn describe(&self) -> String {
+        match (self.taken_at, self.taken_from.as_deref()) {
+            (Some(at), Some(from)) => format!("taken at {at} from {from}"),
+            (Some(at), None) => format!("taken at {at}"),
+            _ => "of unrecorded age, restored by something other than hestan".to_string(),
+        }
+    }
+}
+
+/// what a [resettle](crate::Store::resettle) did to a restored run log.
+///
+/// private fields, so that a later resettle which has more to hand back can
+/// say so without breaking a caller.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize)]
+pub struct Resettled {
+    failed: usize,
+    requeued: usize,
+}
+
+impl Resettled {
+    pub(crate) fn new(failed: usize, requeued: usize) -> Resettled {
+        Resettled { failed, requeued }
+    }
+
+    /// how many runs were `running` in the copy and were recorded as failed.
+    /// nothing is requeued for them: a run that was executing when the copy
+    /// was taken may well have finished in the original afterwards, and
+    /// running it again would be hestan deciding on its own to do the work
+    /// twice.
+    pub fn failed(&self) -> usize {
+        self.failed
+    }
+
+    /// how many runs were claimed but had not started, and went back on the
+    /// queue with the claim cleared. those never executed, so there is nothing
+    /// to have happened twice.
+    pub fn requeued(&self) -> usize {
+        self.requeued
+    }
+}
+
 impl Role {
     /// whether this process claims runs off the queue and executes them.
     pub fn executes(&self) -> bool {

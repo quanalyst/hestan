@@ -65,6 +65,17 @@ const FOLLOW_POLL: Duration = Duration::from_secs(1);
 /// printed a million lines is paged through rather than read whole.
 const TAIL_PAGE: u32 = 500;
 
+/// how long `resettle` watches the leases before it believes nothing is
+/// writing to the database.
+///
+/// a claimer renews its run leases every fifteen seconds and a decider renews
+/// the deciding lease every two, so a window a little over the longer of the
+/// two sees any process that is executing a run or running an election move
+/// something. shorter would only catch the decider; longer buys nothing,
+/// because a process that renews neither writes nothing on a timer at all and
+/// no window finds it.
+const WATCH_LEASES: u64 = 20;
+
 /// how many runs `runs` shows unless `--limit` says otherwise.
 const RUNS_PAGE: u32 = 20;
 
@@ -166,7 +177,10 @@ impl From<Error> for Fail {
             // what the caller asked for cannot be done with what is stored,
             // and the message says what to pass instead: a usage answer, like
             // every other refusal that is about the request
-            | Error::RedactedParams { .. } => Exit::Usage,
+            | Error::RedactedParams { .. }
+            // asking hestan to copy a postgres run log is the command line
+            // being wrong rather than the work going wrong
+            | Error::NoBackup(_) => Exit::Usage,
             Error::Sqlite(_) | Error::Io(_) | Error::UnsupportedDb(_) | Error::SchemaTooNew(_) => {
                 Exit::Unreachable
             }
@@ -272,6 +286,10 @@ enum Command {
     Owner(OwnerArgs),
     /// one command that answers "why is nothing running"
     Doctor,
+    /// take a consistent copy of a sqlite run log while it is being written to
+    Backup(BackupArgs),
+    /// hand back the claims and the deciding lease a restored run log carries
+    Resettle(ResettleArgs),
     /// the plan a run would follow, without running it
     Explain(ExplainArgs),
     /// a completion script for your shell
@@ -301,6 +319,20 @@ struct AssetsArgs {
 struct OwnerArgs {
     /// the job or the asset to ask about
     name: String,
+}
+
+#[derive(Args)]
+struct BackupArgs {
+    /// where to write the copy; it must not already exist
+    dest: String,
+}
+
+#[derive(Args)]
+struct ResettleArgs {
+    /// watch the leases for this many seconds first, to catch a deployment
+    /// still writing to this database. 0 skips the watch
+    #[arg(long, value_name = "SECS", default_value_t = WATCH_LEASES)]
+    watch: u64,
 }
 
 #[derive(Args)]
@@ -1022,6 +1054,10 @@ async fn dispatch(reach: Reach, command: Command, out: &Out) -> Result<(), Fail>
         Command::Owner(args) => owner(reach, args, out).await,
 
         Command::Doctor => doctor(reach, out).await,
+
+        Command::Backup(args) => backup(reach, &args.dest, out),
+
+        Command::Resettle(args) => resettle(reach, &args, out).await,
 
         Command::Explain(args) => explain(
             reach,
@@ -2508,6 +2544,109 @@ fn who_owns(owner: &Value) -> String {
     }
 }
 
+// ------------------------------------------------------------------ backup and restore
+
+/// take a copy of the run log, consistently, while it is being written to.
+///
+/// there is no server-mode form of this and there is not going to be one: the
+/// copy has to land on a filesystem, and the filesystem that matters is the
+/// one the database is on rather than the one the person typing is on.
+fn backup(reach: Reach, dest: &str, out: &Out) -> Result<(), Fail> {
+    let store = match reach {
+        Reach::Server(_) => {
+            return Err(Fail::new(
+                Exit::Unsupported,
+                "a backup writes a file next to the database, so it is taken where the \
+                 database is: run this with --db on that host, or take the copy with \
+                 whatever already copies that server",
+            ));
+        }
+        reach => reach.store()?,
+    };
+    store.backup_to(dest)?;
+    out.said(
+        &json!({ "backup": dest }),
+        &format!(
+            "copied to {dest}. it is marked as a copy, so a deployment refuses to come \
+             up on it until `hestan resettle` has handed back its claims. what an io \
+             manager wrote is not in it: copy that directory from the same instant"
+        ),
+    );
+    Ok(())
+}
+
+/// hand back what a restored run log claims, once nothing looks alive in it.
+///
+/// **the watch is the part worth reading.** the one way to make a recovery
+/// worse is to restore an old copy while workers are still running against the
+/// live store, and by the time this command runs the restore has already
+/// happened: the file is in place or the dump is loaded, and nothing hestan
+/// can do reaches back before that. what it can do is refuse to *resettle* a
+/// database something is still writing to, which is the state where a restore
+/// went wrong and is the last point at which somebody is still watching.
+///
+/// so it reads every lease, waits, and reads them again. a lease a live
+/// process holds moves, because holding one is renewing it; a lease that came
+/// out of a copy sits exactly where the copy has it. if anything moved,
+/// something is up, and the answer is to go and stop it rather than to carry
+/// on.
+///
+/// **what the watch does not see**, said plainly here because it is the shape
+/// of the hole: a process that is up but holds no run and runs no election
+/// renews nothing, writes nothing on a timer, and looks exactly like a process
+/// that is not there. an idle worker is invisible to this. so is anything else
+/// that has the database open, including another copy of hestan on a second
+/// host that happens to be quiet. stopping every process first is still the
+/// operator's job, and this is a second pair of eyes rather than a lock.
+async fn resettle(reach: Reach, args: &ResettleArgs, out: &Out) -> Result<(), Fail> {
+    let store = match reach {
+        Reach::Server(_) => {
+            return Err(Fail::new(
+                Exit::Unsupported,
+                "resettling a restored run log means writing to it while nothing else \
+                 does, which a running server is the opposite of. stop it, then run \
+                 this with --db",
+            ));
+        }
+        reach => reach.store()?,
+    };
+    let watch = Duration::from_secs(args.watch);
+    if !watch.is_zero() {
+        let before = store.leases()?;
+        if !out.json && !out.quiet {
+            println!(
+                "watching the leases for {}s: a process still executing a run or still \
+                 running an election moves one, and a lease that came out of a copy \
+                 does not",
+                args.watch
+            );
+        }
+        tokio::time::sleep(watch).await;
+        if store.leases()? != before {
+            return Err(Fail::new(
+                Exit::Failed,
+                "a lease moved while this was watching, so something is running against \
+                 this database right now. resettling it now would take runs away from a \
+                 process that is executing them. stop every hestan process on this store \
+                 and run this again",
+            ));
+        }
+    }
+    let done = store.resettle()?;
+    let (failed, requeued) = (done.failed(), done.requeued());
+    out.said(
+        &json!({ "failed": failed, "requeued": requeued }),
+        &format!(
+            "resettled: {failed} runs that were executing when the copy was taken \
+             recorded as failed, {requeued} claimed runs back on the queue, the deciding \
+             lease handed back. nothing was requeued for the {failed}: they may have \
+             finished in the original after the copy was taken, so resume or replay the \
+             ones you want run again"
+        ),
+    );
+    Ok(())
+}
+
 /// one command that answers "why is nothing running".
 ///
 /// **every check here looks at something.** a check that cannot see what it is
@@ -2544,6 +2683,7 @@ async fn doctor(reach: Reach, out: &Out) -> Result<(), Fail> {
         ),
     ));
     findings.push(check_store_writes(store));
+    findings.extend(check_restored(store)?);
     findings.extend(check_schedules(store)?);
     findings.extend(check_sensors(store)?);
     findings.extend(check_leases(store, Utc::now())?);
@@ -2715,6 +2855,40 @@ fn check_leases(store: &Store, now: DateTime<Utc>) -> Result<Vec<Finding>, Fail>
         "any hestan process runs the lease loop that reclaims these: start one, \
          and they are failed or requeued as `reclaim` says",
     )])
+}
+
+/// whether this run log came out of a copy, and whether anybody resettled it.
+///
+/// nothing at all on an ordinary database, which is nearly every database this
+/// runs against: the row only exists on a copy `hestan backup` took or one
+/// `hestan resettle` has been run on. that is also the limit worth knowing,
+/// and the finding says it rather than leaving a green line to be read as
+/// "this is not a copy".
+fn check_restored(store: &Store) -> Result<Vec<Finding>, Fail> {
+    let Some(copy) = store.restored()? else {
+        return Ok(Vec::new());
+    };
+    match copy.settled_at() {
+        Some(at) => Ok(vec![Finding::note(
+            "restored",
+            format!(
+                "this run log is a copy ({}), resettled at {at}",
+                copy.describe()
+            ),
+            "what an io manager wrote lives outside the store and no copy of the store \
+             contains it, so a materialization here can hold a handle to a file that is \
+             gone. `values` above counts the runs still holding one",
+        )]),
+        None => Ok(vec![Finding::wrong(
+            "restored",
+            format!(
+                "this run log is a copy ({}) and nothing has resettled it",
+                copy.describe()
+            ),
+            "a deployment refuses to come up on it. stop everything still writing to \
+             the store it was copied from, then `hestan resettle --db <this>`",
+        )]),
+    }
 }
 
 /// who is doing the deciding, which is the answer to "why is nothing running

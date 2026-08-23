@@ -1478,6 +1478,18 @@ impl Hestan {
 
         let store = Store::at(&self.db_path)?;
         logs::set_caps(Some(self.log_bytes), Some(self.log_line_cap));
+        // before boot recovery, and that order is the whole of it. a restored
+        // store's claims and leases describe another machine, and
+        // `fail_interrupted` believes leases on purpose: run against a copy it
+        // would leave every claim whose lease has not run out exactly as the
+        // copy has it, and this process would come up beside runs it thinks
+        // somebody else is executing. so the copy is refused here instead, and
+        // `hestan resettle` is what makes it startable
+        if let Some(copy) = store.restored()?
+            && copy.unsettled()
+        {
+            return Err(Error::NotResettled(copy.describe()));
+        }
         store.fail_interrupted()?;
         store.sync_schedules(&schedules)?;
         // seeded, not synced: the launchpad's presets share the table, so
@@ -1645,6 +1657,52 @@ mod tests {
             .op(Op::new("render", |_| async { Ok(json!(null)) }).params::<Window>())
             .build()
             .unwrap()
+    }
+
+    // the half of a restore that has to be a refusal rather than a warning. a
+    // copy's claims and leases describe processes on another machine, and a
+    // deployment that came up beside them would wait out leases nobody holds
+    // and leave runs marked as executing where nothing is
+    #[tokio::test]
+    async fn a_deployment_refuses_to_come_up_on_a_copy_nothing_has_resettled() {
+        let dir = tempfile::tempdir().unwrap();
+        let live = dir.path().join("hestan.db").display().to_string();
+        let copy = dir.path().join("copy.db").display().to_string();
+        Hestan::new()
+            .job(windowed("report"))
+            .db(live.clone())
+            .run_once("report", json!({"days": 1}))
+            .await
+            .unwrap();
+        Store::open(&live).unwrap().backup_to(&copy).unwrap();
+
+        let refused = Hestan::new()
+            .job(windowed("report"))
+            .db(copy.clone())
+            .run_once("report", json!({"days": 1}))
+            .await
+            .err()
+            .unwrap();
+        assert!(matches!(refused, Error::NotResettled(_)), "{refused}");
+        assert!(refused.to_string().contains("hestan resettle"), "{refused}");
+
+        // reading it is still fine, and has to be: pointing a report or an
+        // export at a copy is the ordinary reason to have one
+        let store = Store::open(&copy).unwrap();
+        assert_eq!(
+            store.runs(None, None, None, None, None, 10).unwrap().len(),
+            1
+        );
+
+        // and once it has been resettled the same deployment comes up on it
+        store.resettle().unwrap();
+        drop(store);
+        Hestan::new()
+            .job(windowed("report"))
+            .db(copy)
+            .run_once("report", json!({"days": 2}))
+            .await
+            .unwrap();
     }
 
     fn pooled(job: &str) -> Job {

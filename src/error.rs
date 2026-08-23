@@ -185,6 +185,35 @@ pub enum Error {
     /// the `postgres` feature compiled in.
     #[error("unsupported database: {0}")]
     UnsupportedDb(String),
+    /// hestan was asked to copy a run log it does not copy.
+    ///
+    /// [`Store::backup_to`](crate::Store::backup_to) is sqlite's online backup
+    /// and nothing else. a postgres run log is copied by whatever already
+    /// copies that server, and hestan pretending otherwise would be a wrapper
+    /// around `pg_dump` with fewer options and worse errors.
+    #[error(
+        "hestan copies a sqlite run log and not {0}: a postgres copy is your own \
+         tooling's, and pg_dump of this database or a base backup of the server is \
+         what to take. see docs/backup.md for what one must not leave out"
+    )]
+    NoBackup(String),
+    /// the run log is a copy that nothing has resettled, so a deployment
+    /// refuses to come up on it.
+    ///
+    /// every claim in a restored database is held by an instance that is not
+    /// executing against it, and the deciding lease names a holder that cannot
+    /// renew it. coming up regardless would mean waiting out a lease nobody
+    /// holds, and leaving runs marked as executing somewhere that no longer
+    /// exists. see [`Store::resettle`](crate::Store::resettle) and
+    /// `docs/backup.md`.
+    #[error(
+        "this run log is a copy ({0}) and nothing has resettled it. the claims in it \
+         are held by processes that are not executing against this database and its \
+         deciding lease names a holder that cannot renew it. stop everything still \
+         writing to the store this was copied from, then run `hestan resettle`. see \
+         docs/backup.md"
+    )]
+    NotResettled(String),
     /// a dbt manifest that cannot become assets: it could not be read, it is
     /// not the json a manifest is, its schema version is not one this build
     /// [reads](crate::dbt), or two of its nodes would be one asset. every one
