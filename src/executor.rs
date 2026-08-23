@@ -154,7 +154,13 @@ impl Limits {
 }
 
 /// why a queued run is not starting right now.
+///
+/// **not a closed set** (`#[non_exhaustive]`).
+/// [`Undefined`](Blocked::Undefined) already names the variant after this
+/// one, and a queue view has [`reason`](Blocked::reason) for a block it
+/// does not recognise.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Blocked {
     /// the deployment-wide cap is full.
     Global(usize),
@@ -294,6 +300,10 @@ pub(crate) struct Pool {
 pub(crate) type Pools = Arc<HashMap<String, Pool>>;
 
 /// what [`Runner::cancel`] did.
+///
+/// **a closed set**, and it stays one: a cancel took, arrived too late, or
+/// named nothing, and a caller branching on it has covered the outcome when
+/// it has covered these three.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CancelOutcome {
     /// the signal was sent; the run will finish canceled shortly.

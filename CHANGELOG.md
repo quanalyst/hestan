@@ -2,6 +2,85 @@
 
 ## unreleased
 
+**BREAKING: eleven public enums are now `#[non_exhaustive]`.** a `match` on
+one of them from outside this crate needs a `_` arm, and that is the whole of
+the break: no variant was added, renamed or removed, every variant is still
+constructible by name, `matches!` and `if let` are untouched, and the stored
+words, the json and every api response are byte for byte what they were.
+
+the eleven are **`Error`, `Meta`, `InputError`, `Auth`, `Trigger`,
+`SubjectKind`, `EventKind`, `TickOutcome`, `When`, `Reclaim` and `Blocked`**.
+what a caller adds is one arm:
+
+```rust
+let label = match run.trigger {
+    Trigger::Schedule => "on a schedule",
+    Trigger::Sensor => "a sensor",
+    _ => "somebody asked",
+};
+```
+
+three of these had already grown, and each time it was a source break somebody
+met at `cargo build`: `Meta` gained `Series` and `Saved`, `Trigger` gained
+`Replay`, and `EventKind` gained `RunReleased` one entry below this one, where
+this file said it was "breaking at compile time only" because the enum was not
+`#[non_exhaustive]`. it is now, and this is the last time any of the eleven
+does that to anyone.
+
+| now open | because |
+| --- | --- |
+| `Error` | a new refusal is a new variant, and which variants exist already depends on the features compiled in |
+| `Meta` | it grows whenever the ui learns to draw something, and a match on it is picking a rendering |
+| `InputError` | the typed accessors gain ways to come up empty as the accessors grow |
+| `Auth` | another way of checking who is asking is a variant here; it is configured, not read back |
+| `Trigger` | whatever causes a run next is a variant here |
+| `SubjectKind` | a new thing hestan keeps rows about is a new kind |
+| `EventKind` | a new kind arrives with every subsystem that learns to record something |
+| `TickOutcome` | it gained `Deferred` with overlap queueing and gains another with the next thing a schedule can do |
+| `When` | three trigger rules are not the whole space of them |
+| `Reclaim` | hestan knows how to resume a run, so a third answer to an expired claim is one it may grow |
+| `Blocked` | its own `Undefined` docs already name the variant after it |
+
+**seventeen public enums were left closed, and that is the other half of the
+decision.** an enum a caller can still match with no `_` arm is one hestan has
+promised not to grow, and each of these is worth more as that promise than as
+room to extend:
+
+| still closed | because |
+| --- | --- |
+| `Exit` | `docs/cli.md` publishes the nine exit codes as fixed and a cron line is a `case` over them |
+| `RunStatus`, `OpStatus`, `BackfillStatus`, `DeliveryState` | a state machine, where a new state changes what the existing ones mean and a `_` arm would hide that rather than absorb it |
+| `Access`, `EventLevel`, `Severity` | ordered scales, where a value inserted into the order changes the comparisons already written against it |
+| `Overlap`, `Catchup`, `Role`, `Freshness`, `CancelOutcome`, `SensorOutcome` | the answers cover their question, and a further choice would be a field on a variant rather than a variant beside it |
+| `LateKind`, `LogStream`, `CheckStatus` | two of a thing that comes in two: job or asset, stdout or stderr, satisfied or not |
+
+each of the twenty-eight now carries the reasoning in its own rustdoc, in one
+sentence saying whether hestan will add a variant there and what a caller loses
+if it cannot match exhaustively.
+
+- **the public structs were looked at and deliberately left alone.** thirty-one
+  of them have public fields, so adding a field to one is a source break for
+  anybody writing a struct literal. twenty-seven are things hestan hands you
+  (`Run`, `Event`, `OpRun`, `Materialization`, the hook payloads, the rest of
+  the store's rows) and a caller only reads them; `IoKey` is handed to an
+  `IoManager` rather than built by one. the three a caller does build are
+  `EventQuery`, `RunRequest` and `Identity`, and each already has a way in that
+  a new field does not break: `EventQuery` derives `Default`, so
+  `EventQuery { level: Some(EventLevel::Error), ..Default::default() }`, and
+  the other two have constructors. `#[non_exhaustive]` on a struct blocks the
+  struct literal outright,
+  functional update syntax included, so putting it on the row types would leave
+  anybody with a legitimate reason to build one, a test fixture or a fake
+  store, with no way to build it at all. that wants constructors first and it
+  is not this phase.
+- **`tests/stability.rs`** matches every one of the seventeen closed sets with
+  no `_` arm. it is an integration test on purpose: `#[non_exhaustive]` does
+  not restrict the crate that defines the type, so the same matches inside
+  `src/` would compile either way and prove nothing.
+- **`Trigger`'s rustdoc carries a `compile_fail` doc example**, the exhaustive
+  match that no longer builds, beside the one that does. `cargo test` runs
+  both.
+
 a process asked to stop stops, and hands back what it was holding.
 
 phase 43 measured the problem and could not fix it: hestan installed no signal

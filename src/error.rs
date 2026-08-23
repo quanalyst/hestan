@@ -6,7 +6,13 @@
 /// `NothingToResume`, `ResumeChain`) say why a run cannot be resumed,
 /// `NothingToReplay` and `ReplayInput` say why one cannot be replayed, and
 /// `Conflict` is something already under way that this would collide with.
+///
+/// **not a closed set** (`#[non_exhaustive]`). hestan gains a variant here
+/// every time it learns a new refusal, and which variants exist already
+/// depends on the features compiled in, so all a caller gives up is the
+/// fallback arm a new failure was going to land in anyway.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum Error {
     /// a declaration that does not describe anything executable: a cycle, a
     /// dep on a name nothing produces, two ops under one name, a fan-out with

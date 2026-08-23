@@ -88,6 +88,11 @@ const QUEUE_PAGE: u32 = 200;
 /// | 6 | this mode cannot serve this command, and the message says why |
 /// | 7 | `doctor` found something actionable |
 /// | 8 | the server refused this identity: no token, a token it does not accept, or a role that may not |
+///
+/// **a closed set**, and it stays one: `docs/cli.md` publishes these as
+/// fixed and a cron line is a `case` over them, so the freedom to add a
+/// code is worth less than the promise that the ones here keep meaning what
+/// they mean.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum Exit {

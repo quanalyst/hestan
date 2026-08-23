@@ -37,6 +37,11 @@ macro_rules! str_enum {
 /// the last three are **terminal**: a run in one of them never moves again,
 /// which is what [retention](crate::Retention), the queue and
 /// [`RunStatusSensor`](crate::RunStatusSensor) all key off.
+///
+/// **a closed set**, and it stays one: these five are the state machine,
+/// and a sixth would change what terminal means for retention, the queue
+/// and [`RunStatusSensor`](crate::RunStatusSensor), which a `_` arm would
+/// hide rather than absorb.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum RunStatus {
@@ -68,6 +73,10 @@ str_enum!(RunStatus {
 /// are the plan as much as the record: an op nothing ever reached is
 /// [`Pending`](OpStatus::Pending) forever, which is how a failed run shows what
 /// it did not get to.
+///
+/// **a closed set**, and it stays one: an op is waiting, running, or done
+/// in one of four ways, and anything counting op rows wants the compile
+/// error if that stops being true.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum OpStatus {
@@ -99,8 +108,42 @@ str_enum!(OpStatus {
 ///
 /// it says *what* asked, never *who*: [`Run::actor`] is who, and the two are
 /// separate because most runs have a cause and no person behind them.
+///
+/// **not a closed set** (`#[non_exhaustive]`). it gained `Replay` and gains
+/// whatever causes a run next, and a caller grouping runs by cause folds an
+/// unfamiliar one into its own bucket without being wrong about the runs it
+/// does recognise. so this no longer compiles outside the crate:
+///
+/// ```compile_fail
+/// # use hestan::Trigger;
+/// # fn label(t: Trigger) -> &'static str {
+/// match t {
+///     Trigger::Manual => "by hand",
+///     Trigger::Schedule => "on a schedule",
+///     Trigger::Retry => "a retry",
+///     Trigger::Resume => "a resume",
+///     Trigger::Replay => "a replay",
+///     Trigger::Build => "a build",
+///     Trigger::Sensor => "a sensor",
+/// }
+/// # }
+/// ```
+///
+/// and this does, and goes on doing so through every variant added after it:
+///
+/// ```
+/// # use hestan::Trigger;
+/// # fn label(t: Trigger) -> &'static str {
+/// match t {
+///     Trigger::Schedule => "on a schedule",
+///     Trigger::Sensor => "a sensor",
+///     _ => "somebody asked",
+/// }
+/// # }
+/// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
+#[non_exhaustive]
 pub enum Trigger {
     /// somebody launched it: the ui, the cli, the api, or a call to
     /// [`Runner::launch`](crate::Runner::launch) in your own code.
@@ -139,6 +182,10 @@ str_enum!(Trigger {
 /// three levels rather than the five a logging crate has, because this is a
 /// filter an operator uses rather than a knob a developer tunes: the question
 /// a run page is asked is "show me the errors".
+///
+/// **a closed set**, and it stays one: three levels is the decision this
+/// type is, so a fourth would be re-deciding it rather than extending it,
+/// and a filter over three is complete.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum EventLevel {
@@ -173,7 +220,12 @@ pub const EVENT_SCHEMA: u32 = 1;
 /// the log described runs and nothing else until v17, so every event written
 /// before it reads as [`Run`](SubjectKind::Run), which is what those events
 /// were.
+///
+/// **not a closed set** (`#[non_exhaustive]`). a new thing hestan keeps
+/// rows about is a new kind here, the way four of these arrived in v17, and
+/// a reader that cannot match exhaustively still has the stored word.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum SubjectKind {
     /// one run, named by [`Event::run_id`] rather than by `subject`.
     Run,
@@ -207,7 +259,13 @@ pub enum SubjectKind {
 /// alternative (a parse error) is one row from a newer writer breaking every
 /// query that would have read the rows around it. the same reason
 /// [`Meta::from_tagged`](crate::Meta::from_tagged) tolerates an unknown tag.
+///
+/// `#[non_exhaustive]` says that to the compiler too: hestan writes a new
+/// kind whenever a subsystem learns to record something, and a consumer
+/// loses only the compile error, since a payload it does not know is one it
+/// was going to skip.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum EventKind {
     /// a run was created. it exists from here, whether or not anything is free
     /// to execute it.
@@ -402,8 +460,15 @@ open_enum!(EventKind {
 /// every occurrence the scheduler passes gets one of these, including the ones
 /// it decided not to fire: a schedule that launched nothing last night is a
 /// question the [tick log](Tick) has to be able to answer.
+///
+/// **not a closed set** (`#[non_exhaustive]`). it gained
+/// [`Deferred`](TickOutcome::Deferred) when overlap queueing arrived and
+/// gains another the next time a schedule can do something new about an
+/// occurrence, and a report counting outcomes puts one it does not know in
+/// a row of its own.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
+#[non_exhaustive]
 pub enum TickOutcome {
     /// a run was launched, and `run_id` on the tick names it.
     Fired,
@@ -427,8 +492,13 @@ str_enum!(TickOutcome {
 /// an op's trigger rule: what its deps have to have done for it to run, from
 /// [`Op::when`](crate::Op::when). readiness is the same either way (every dep
 /// terminal), and this decides run vs skip once they are.
+///
+/// **not a closed set** (`#[non_exhaustive]`). three rules are not the
+/// whole space of them, since `any_succeeded` and `none_failed` are both
+/// askable, and this is declared far more often than it is matched on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum When {
     /// every dep succeeded. the default, and the only rule there was before
     /// trigger rules existed.
@@ -450,6 +520,10 @@ str_enum!(When {
 /// [`Asset::fresh_within`](crate::Asset::fresh_within) or
 /// [`JobBuilder::fresh_within`](crate::JobBuilder::fresh_within) read against
 /// the latest success. computed at read time; nothing caches it.
+///
+/// **a closed set**, and it stays one: a policy caps how old a success may
+/// get, and inside the window, past it, and nothing to measure are the only
+/// three answers to that.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Freshness {
     /// a success inside the window the policy allows.
@@ -524,6 +598,10 @@ pub struct FreshnessRow {
 }
 
 /// what a schedule does when it fires while the job still has an active run.
+///
+/// **a closed set**, and it stays one: an occurrence arriving while the job
+/// is busy can fire, not fire, or wait, and there is no fourth thing to do
+/// with it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum Overlap {
@@ -547,6 +625,10 @@ str_enum!(Overlap { Allow => "allow", Skip => "skip", Queue => "queue" });
 /// running to fire them: a restart, a crash, a deploy. the scheduler's
 /// [cursor](crate::Schedule::catchup) is what makes the missed set knowable at
 /// all; this decides what to do with it.
+///
+/// **a closed set**, and it stays one: fire none, fire the last, or fire
+/// all of them capped, and a further choice about catching up is a field on
+/// [`All`](Catchup::All) rather than a variant beside it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Catchup {
     /// advance the cursor over them and fire nothing. the default, and what
@@ -697,8 +779,14 @@ pub struct Run {
 /// would do them again, quietly; failing it puts a stall in front of whoever
 /// is on call. [`Requeue`](Reclaim::Requeue) is right when the work is
 /// idempotent and available beats exact.
+///
+/// **not a closed set** (`#[non_exhaustive]`). hestan already knows how to
+/// resume a run from what it recorded, so a third answer to an expired
+/// claim is one it may grow, and this is a policy a deployment sets rather
+/// than one it reads back.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
+#[non_exhaustive]
 pub enum Reclaim {
     /// mark it failed and leave it for a person. the default.
     #[default]
@@ -729,6 +817,10 @@ str_enum!(Reclaim { Fail => "fail", Requeue => "requeue" });
 /// that also spawns processes: an op subprocess runs one op and exits, and a
 /// queue worker is a long-lived process that claims whole runs. a queue worker
 /// spawns op subprocesses like any other hestan process does.
+///
+/// **a closed set**, and it stays one: this is the two halves of the queue
+/// plus the process that is both, so another variant would mean a third
+/// thing a process can do about a queue, and there is not one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum Role {
@@ -792,6 +884,10 @@ impl Role {
 
 /// where one [durable notification](crate::Hestan::durable_notifications) has
 /// got to.
+///
+/// **a closed set**, and it stays one: a queued notification is waiting,
+/// delivered, or given up on, and anything auditing delivery wants the
+/// compile error if a fourth state is ever invented.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum DeliveryState {
@@ -945,6 +1041,9 @@ impl Event {
 
 /// which pipe of an [isolated op](crate::Op::isolated)'s process a captured
 /// line came out of.
+///
+/// **a closed set**, and it stays one: a child has two pipes, so a match
+/// over them is complete for good.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum LogStream {
@@ -1134,6 +1233,9 @@ pub struct HistoryEntry {
 /// what a failing [`AssetCheck`](crate::AssetCheck) costs. `Error` (the
 /// default) fails the check's op, and so the run that produced the asset;
 /// `Warn` records the failure and lets the run carry on.
+///
+/// **a closed set**, and it stays one: a failing check costs the run or it
+/// costs nothing, and a third cost would change what these two mean.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum Severity {
@@ -1147,6 +1249,9 @@ pub enum Severity {
 str_enum!(Severity { Warn => "warn", Error => "error" });
 
 /// what a check said about the value it was handed.
+///
+/// **a closed set**, and it stays one: a check was satisfied or it was not,
+/// and everything else about it is [`Severity`] or the message.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum CheckStatus {
@@ -1191,6 +1296,9 @@ pub struct AssetCheckRow {
 
 /// how a [backfill](crate::Hestan) ended, derived from the runs it launched.
 /// `running` covers a chunk in flight and the pause between chunks.
+///
+/// **a closed set**, and it stays one: it is derived from the runs the
+/// backfill launched, and those give these four answers and no other.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum BackfillStatus {
@@ -1276,6 +1384,10 @@ pub struct SensorRow {
 /// how a sensor evaluation ended: `fired` means the closure returned and every
 /// requested run launched, possibly zero of them. `skipped` is a turn the loop
 /// did not evaluate at all, because the previous evaluation was still going.
+///
+/// **a closed set**, and it stays one: an evaluation either did not happen
+/// or it did, and if it did it either returned or it did not, so there is
+/// no fourth ending to record.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum SensorOutcome {

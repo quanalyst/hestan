@@ -18,6 +18,11 @@ const CHECK_EVERY: Duration = Duration::from_secs(60);
 
 /// which side of the api a [`LateEvent`] is about. jobs are late against their
 /// last successful run, assets against their last materialization.
+///
+/// **a closed set**, and it stays one: a policy is declared on a job or on
+/// an asset and there is nowhere else to declare one, so a hook holding
+/// this looks the name up in one of two places and a `_` arm would be a
+/// lookup in neither.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum LateKind {

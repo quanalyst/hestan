@@ -61,6 +61,12 @@ use crate::error::Error;
 /// what someone may do, in the order the roles contain each other: an operator
 /// may everything a viewer may, and the whole of every decision in the server
 /// is `identity.role >= needed`.
+///
+/// **a closed set**, and it stays one: the roles contain each other and
+/// every decision in the server is `identity.role >= needed`, so a fourth
+/// role changes what these three mean rather than adding to them, and a
+/// build error is the right way to make a custom authenticator's mapping be
+/// read again.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Access {
@@ -239,7 +245,13 @@ impl std::fmt::Debug for Token {
 ///
 /// there is no default variant: a deployment either configures one of these or
 /// serves loopback only. see the [module docs](crate::auth).
+///
+/// **not a closed set** (`#[non_exhaustive]`). another way of checking who
+/// is asking is a variant here, and nothing is lost by that: this is
+/// configured rather than read back, and the two variants carrying anything
+/// carry values only this crate builds.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub enum Auth {
     /// nothing in hestan checks identity, deliberately.
     ///

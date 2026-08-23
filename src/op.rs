@@ -227,7 +227,13 @@ fn sample_across(points: Vec<(DateTime<Utc>, f64)>) -> Vec<(DateTime<Utc>, f64)>
 /// not convert, since narrowing them is a lie waiting to happen; cast them
 /// yourself, or say which kind of number you meant with
 /// [`count`](Meta::count) or [`bytes`](Meta::bytes).
+///
+/// **not a closed set** (`#[non_exhaustive]`). it gained `Series` and
+/// `Saved` in one phase and gains another whenever the ui learns to draw
+/// something, and a caller matching on it is picking a rendering, which is
+/// a thing a `_` arm can do for a type it has never seen.
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub enum Meta {
     /// a whole number that is not a count of anything: a year, an id, a
     /// difference that may be negative.
@@ -756,7 +762,13 @@ impl Retry {
 }
 
 /// why a typed accessor on [`OpCtx`] came up empty.
+///
+/// **not a closed set** (`#[non_exhaustive]`). the typed accessors gain
+/// ways to come up empty as the accessors themselves grow, and a caller
+/// that cannot match exhaustively still has the message, which is what it
+/// reports.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum InputError {
     /// no dep of that name produced anything this op can see: usually a
     /// typo, or a dep the job wires under a different name than the body
