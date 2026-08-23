@@ -395,6 +395,13 @@ standalone binary for those two. [docs/cli.md](docs/cli.md).
   building by invoking `dbt run --select <model>` with its output captured on
   the run page. your dbt and your profile, invoked; see
   [docs/dbt.md](docs/dbt.md)
+- **`GET /metrics` is prometheus**, in every build and behind no feature:
+  queue depth and the age of the oldest queued run, claim latency, schedule
+  lateness, reclaims, retries, store errors and run outcomes. no metric carries
+  a job name, an asset name or a partition key, and the type of a label is what
+  enforces that rather than a note. it sits **inside** the auth guard, because
+  prometheus can hold a token where a kubelet cannot; see
+  [docs/metrics.md](docs/metrics.md), which also says what to alert on
 - **an address anyone can reach needs an authenticator, and `serve` refuses to
   start without one**: `Auth::bearer(token)` for one shared secret, or
   `Auth::custom(|req| …)` to compose the identities you already have. three
@@ -450,7 +457,8 @@ the details live in [docs/](docs/README.md):
 [the web ui](docs/web-ui.md),
 [the command line](docs/cli.md),
 [authentication](docs/auth.md),
-[the http api](docs/http-api.md), [storage](docs/storage.md),
+[the http api](docs/http-api.md), [metrics](docs/metrics.md),
+[storage](docs/storage.md),
 [scaling](docs/scaling.md), [containers](docs/containers.md),
 [embedding](docs/embedding.md), [stability](docs/stability.md), and
 [development](docs/development.md).

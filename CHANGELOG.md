@@ -2,6 +2,127 @@
 
 ## unreleased
 
+"is orchestration healthy" is now a question a scrape can answer.
+
+hestan had traces behind the `otel` feature and an `/api/health` about one
+process. it had no counters, so the state of a deployment could only be read by
+opening the ui or querying the run log yourself. **`GET /metrics` is prometheus
+text exposition**, in every build.
+
+**what an existing deployment sees change:**
+
+- **one new route, and nothing else moved.** no public signature changed, no
+  schema version, no dependency, no behaviour, no existing response shape.
+  `/api/health` is byte for byte what it was.
+- **it is on, and there is no switch.** it is not behind a feature, because
+  unlike `otel` it adds no dependency, and a feature in this crate is a
+  dependency somebody gets to decline. hestan has nine feature configurations
+  in its gate already and a tenth for a text formatter would be a cost with
+  nothing on the other side of it.
+- **it is inside the [auth guard](docs/auth.md) and needs a viewer.** a
+  deployment with a token refuses an unauthenticated scrape with a 401, and
+  prometheus carries one in `authorization` (a `ServiceMonitor` and a
+  `PodMonitor` too). that is the difference from `/api/whoami`, which is open
+  because a kubelet's `httpGet` probe has nowhere to put a token at all. a
+  deployment with no authenticator serves `/metrics` to anyone who can reach
+  the port, exactly as it serves everything else, and `serve` already refuses
+  to bind a reachable address without one unless you asked for `Auth::None`.
+- **there is no opt-out beyond that.** a deployment that does not want the
+  endpoint blocks the path at whatever is in front of it. adding a flag for it
+  would be a second way to configure something the guard already covers.
+
+**twenty-one metrics, and the two halves do not mean the same thing.**
+
+- **eight gauges are read off the run log when the scrape arrives**: queue
+  depth, how long the oldest queued run has waited, runs active, runs stalled
+  past their lease, paused schedules, paused sensors, how long the decision
+  lease has left, and whether this process is the one holding it. every process
+  answers with the same figure for the first seven, so they aggregate with
+  `max` and never with `sum`; the eighth is how you find *which* target is
+  deciding.
+- **three more gauges are about the process**: whether it can read the store,
+  whether its last write landed, and how many runs it gave up on.
+- **eight counters and two histograms belong to the process that was scraped**
+  and **read zero after a restart**: run outcomes by status, claims, reclaims
+  by outcome, op retries, schedule fires by outcome, three store-write
+  counters, and histograms for claim latency (queued to claimed) and schedule
+  lateness (due to fired).
+
+**the counters are in-process on purpose and it is worth saying why.** every
+table hestan keeps is prunable by retention, so a `_total` read off a
+`COUNT(*)` would fall the first time a prune ran, and prometheus reads a
+counter that fell as a restart and invents the rate to match. each counter is
+instead moved at the store call that has just committed the same fact, so a
+write that was refused and retried moves it once, a write that never landed
+does not move it at all, and the counter and the run log agree or neither says
+anything. a restart zeroes them, which is the one thing prometheus already
+knows how to handle.
+
+**no metric carries a job name, an asset name, an op name, a partition key or
+a run id, and that is enforced by a type rather than by a note.** a label value
+in `src/metrics.rs` is a `&'static str`, and a name read out of a database row
+borrows from the row, so it does not typecheck as one. what is left is the
+words hestan spells in its own source, which is why every label comes from a
+**closed** enum (`RunStatus`, `Reclaim`, `TickOutcome`, whose `as_str` returns
+`&'static str`) while an open enum's borrows from `self` and cannot be written
+there at all. the cost is stated rather than hidden: **you cannot ask this
+endpoint which job is failing.** it says runs are failing; `/api/runs?job=…`,
+the ui and the run log say which.
+
+**what was left out, and why:**
+
+- **op outcomes by status.** an op's terminal row is written by whichever
+  process ran the op, and an isolated op writes its own from a child process
+  that exits immediately after, taking any counter with it. a per-process op
+  counter would undercount exactly the deployments that use isolation, and
+  silently. runs have no such split, because a run is executed by the one
+  process that claimed it.
+- anything per job, per asset or per partition; run duration, whose useful cut
+  is per job; sensor tick counts, which `/api/sensors` already answers; asset
+  freshness, which `on_late` already alerts on without prometheus; and a build
+  info metric, because nobody pages on a version string.
+
+**six of the gauges are facts `hestan doctor` already reports**, off the same
+rows, and neither reads the other. doctor is a person asking once and getting a
+sentence and a fix; a metric is a scrape asking every fifteen seconds and
+getting a number you can put a threshold on. what stays in doctor and cannot be
+a metric is everything that needs the registry rather than the store
+(`policies`, `rates`, `groups`, `colours`, `retention`), because each is per
+asset or per declaration and would need the labels this endpoint rules out.
+
+- **`docs/metrics.md`** is the whole of it: every metric with its type and
+  labels, the promql for what to alert on, the argument about which side of the
+  guard it sits, what may be a label, the doctor overlap, and what is
+  deliberately not there.
+- **`deploy/k8s/podmonitor.yaml`**, a PodMonitor rather than a ServiceMonitor
+  because the counters are per process and no service fronts every hestan pod;
+  both pod templates also gain the `prometheus.io/*` annotations, which do
+  nothing without something relabelling on them. **still not applied to a
+  cluster**, and it now also assumes a prometheus operator, which is a second
+  thing nobody here has run.
+- **`docs/containers.md`** has the scrape against the running compose stack,
+  including why the workers are scraped by container name rather than through
+  `worker:4000`: a target that reaches a different replica each scrape reports
+  counters that jump around.
+- **`Health` gains a third counter**, writes the store refused that hestan
+  tried again, which is the leading indicator the other two do not give.
+  internal: it is on `/metrics` and `/api/health` is unchanged.
+- **run on the compose stack**, which is where the first version of this was
+  wrong: a fired occurrence writes its tick in the transaction that created the
+  run rather than through `record_tick`, so `hestan_schedule_fires_total` read
+  zero on a scheduler that had fired six. the first occurrence after a fixed
+  stack came up read `fires_total{outcome="fired"} 1` and a lateness of 9ms on
+  the scheduler, and `run_claims_total 1` with a claim delay of 79ms on the
+  worker that took the run, with the other two workers at zero. the numbers are
+  in `docs/containers.md`.
+- **cases**: the counters against the writes that record the same facts, on
+  both backends; the exposition parsed the way a scrape parses it, with a type
+  and a help for every family and the suffix conventions checked; a counter
+  moving when the thing it counts happens and a gauge following the store; a
+  restart keeping the gauges and starting the counters over; and a store filled
+  with two hundred job names, two hundred partition keys, two hundred schedules
+  and two hundred sensor names rendering exactly the series an empty one does.
+
 **BREAKING: eleven public enums are now `#[non_exhaustive]`.** a `match` on
 one of them from outside this crate needs a `_` arm, and that is the whole of
 the break: no variant was added, renamed or removed, every variant is still

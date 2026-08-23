@@ -27,6 +27,7 @@
 - [scaling](scaling.md): the run queue, concurrency limits, priority, claims and leases, scheduler and worker roles, the compose example, and what several hosts needs.
 - [containers](containers.md): the image and what is in it, the compose stack of one scheduler and three workers, what a stop is worth next to a kill, what happened when the deciding process was cut off the network, and the kubernetes manifests nobody has applied to a cluster.
 - [http api](http-api.md): every endpoint, parameter, response shape, and error code.
+- [metrics](metrics.md): the prometheus endpoint, every metric with its type and labels, what to alert on, which side of the auth guard it sits and why, what may be a label and what may not, and what is deliberately not there.
 - [storage](storage.md): the two backends and how to choose, the schema, migrations, and crash recovery.
 - [embedding](embedding.md): `serve` vs `run_once` vs `Runner`, testing, consuming from another repo.
 - [stability](stability.md): what a caller may rely on while hestan is 0.x, the five surfaces and what each holds still, which types are a closed set and which will grow, the extension points that are contracts, and what is deliberately not a surface at all.

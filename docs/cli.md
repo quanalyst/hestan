@@ -333,6 +333,17 @@ be, which is what makes the other two believable.
 `--json` gives `{"ok": bool, "findings": [...], "unchecked": [...]}` with a
 `fix` on everything actionable.
 
+six of these checks are the same facts `GET /metrics` now publishes, off the
+same rows: `schedules`/`sensors` paused, `leases`, `deciding`, half of `queue`,
+and `writes`. neither reads the other; both read the store. the difference is
+that doctor is a person asking once and getting a sentence and a fix, and a
+metric is a scrape asking every fifteen seconds and getting a number you can
+put a threshold on. what stays here and cannot be a metric is everything that
+needs the registry rather than the store (`policies`, `rates`, `groups`,
+`colours`, `retention`), because each of those is per asset or per declaration
+and a metric carrying one would need a label per asset; see
+[metrics](metrics.md#what-may-be-a-label).
+
 over `--server` doctor answers the four questions http can, and says plainly
 that it saw nothing else. whether the deployment [checks who is
 asking](auth.md), and (with a token) who it makes you; with that same token,

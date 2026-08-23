@@ -124,6 +124,56 @@ connection, builds the same registry and evaluates nothing until the deciding
 lease runs out. the fault checks need it, because a handover wants somewhere
 to hand to.
 
+### Scraping the stack
+
+every container serves `GET /metrics` on the same port as the ui and behind the
+same token. the scheduler publishes 4000, so from the host:
+
+```
+curl -s -H "Authorization: Bearer demo-token-change-me" localhost:4000/metrics
+```
+
+the workers publish no host port, so they are reached over the compose network
+the same way the health check above is:
+
+```
+docker run --rm --network hestan_default busybox:1.36 \
+  wget -qO- --header="Authorization: Bearer demo-token-change-me" \
+  "http://hestan-worker-3:4000/metrics"
+```
+
+the first occurrence of the demo's `*/2` schedule after the stack came up, read
+off two of the five containers:
+
+| | scheduler | worker-3 |
+| --- | --- | --- |
+| `hestan_decider_held` | 1 | 0 |
+| `hestan_schedule_fires_total{outcome="fired"}` | 1 | 0 |
+| `hestan_schedule_lateness_seconds_sum` | 0.009085 | 0 |
+| `hestan_run_claims_total` | 0 | 1 |
+| `hestan_run_claim_delay_seconds_sum` | 0 | 0.078624 |
+| `hestan_runs_total{status="success"}` | 0 | 1 |
+
+that is the [role split](scaling.md#roles) as numbers. the scheduler fired the
+occurrence nine milliseconds after it came due and executed nothing; worker-3
+claimed the run it produced seventy-nine milliseconds after it was written down
+and took it to success; workers 1 and 2 claimed nothing and finished nothing.
+the two gauges read off the shared run log (`hestan_queue_depth` and
+`hestan_decider_lease_seconds`) were the same figure on every container asked.
+
+**by container name, not by service name.** `worker:4000` resolves to whichever
+of the three replicas dns hands back, and the counters above are per process: a
+target that reaches a different worker each scrape reports numbers that jump
+around. the gauges would survive it, because they are read off the shared run
+log rather than out of the process, which is the split
+[metrics](metrics.md#deployment-wide-or-per-process) is about.
+
+without the token it is a 401, like every other read.
+
+there is no prometheus in this compose file, deliberately. it would be a
+container nobody here has pointed at a dashboard, in a stack whose whole value
+is that it was actually run.
+
 ### The honest limit
 
 **this is five containers on one host.** each is its own pid and network
@@ -313,7 +363,8 @@ not recorded as failed, so nothing pages about it.
 ## Kubernetes, written and not run
 
 [`deploy/k8s/`](../deploy/k8s) has a ConfigMap, a Secret, a Deployment for the
-schedulers, a Deployment for the workers, a Service, and a kustomization.
+schedulers, a Deployment for the workers, a Service, a PodMonitor, and a
+kustomization.
 
 **none of it has been applied to a cluster.** no kubernetes runs on the machine
 this was written on, so nothing there has been scheduled by a kubelet or probed
@@ -344,6 +395,15 @@ and it answers 200 either way on purpose, because the endpoint answering is the
 news. readiness here means serving, not healthy, and something that can hold a
 token has to watch `/api/health`'s body for the rest.
 
+**`podmonitor.yaml` is a prometheus operator resource, which is a second thing
+nobody here has run.** it selects every hestan pod (both deployments: a worker
+is where the run outcomes and the claim latency are counted) and carries the
+token in `authorization.credentials`, because `/metrics` is inside the guard
+while `/api/whoami` is not. both pod templates also carry the
+`prometheus.io/*` annotations, which do nothing on their own: something has to
+relabel on them, and that something is also where the credential goes.
+[metrics](metrics.md#kubernetes) has the reasoning.
+
 there is no helm chart, deliberately. what changes between deployments here is
 the image, two replica counts and a secret, all three of which kustomize
 already does with a tool that ships inside kubectl. a chart nobody has rendered
@@ -366,5 +426,6 @@ new execution paths.
   occurrence.
 - [authentication](auth.md): the token these files set, and where a real one
   comes from.
+- [metrics](metrics.md): what a scrape of one of these containers reads.
 - [development](development.md): the gates, and the ui build loop the image
   depends on.
