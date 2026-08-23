@@ -122,8 +122,8 @@ changelog line rather than quietly.
 ## Not a surface
 
 - **module paths inside the crate.** everything but `auth`, `capture`, `cli`,
-  `dbt`, `notify`, `otel` and `prelude` is a private module, so a type's path
-  is its re-export at the crate root. `hestan::model::Run` was never
+  `dbt`, `notify`, `otel`, `secret` and `prelude` is a private module, so a
+  type's path is its re-export at the crate root. `hestan::model::Run` was never
   something you could write.
 - **the wording of an error.** the `Error` variant is the contract and its
   `Display` string is for a person to read. same for a log line and an event's

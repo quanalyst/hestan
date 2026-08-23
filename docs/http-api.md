@@ -84,19 +84,37 @@ $ curl -H 'Authorization: Bearer '"$HESTAN_TOKEN" https://hestan.internal/api/ru
   `WWW-Authenticate: Bearer` with it.
 - **403**: an identity that may not do this. the message says what it
   would have taken: `{"error": "this needs operator, and vic is a viewer"}`.
+  a [scoped](auth.md#the-scopes) token reaching outside its scope is the same
+  status, and the message names the scope and what the request was about:
+  `{"error": "ci is scoped to job deploy, and this changes job billing"}`.
 
 what each role may is the [roles table](auth.md#the-roles): every `GET` is a
 viewer's, launching and cancelling and building are an operator's, and pausing,
 priority and presets are an admin's. anything not in that table needs an
 operator if it is not a `GET`.
 
+a **scope** narrows which job or asset a token may change, and does nothing to
+what it may read. it applies to every method but `GET` and `HEAD`, it is
+decided before the handler, and a mutation that names no job or asset in its
+path (`POST /api/assets/build`, `POST /api/schedules/state`) is refused for any
+scoped token. an unscoped token is unaffected.
+
 `GET /api/whoami` needs nothing, because it is what the ui and `hestan doctor`
 ask *before* they hold anything to present:
 
 ```json
-{ "auth": true, "identity": { "name": "ada", "role": "admin" } }
+{
+  "auth": true,
+  "identity": {
+    "name": "ada",
+    "role": "admin",
+    "scope": { "everything": true, "jobs": [], "assets": [] }
+  }
+}
 ```
 
+`scope.everything` is an unscoped token, which is every token a deployment had
+before scopes existed; anything else lists what it may change.
 `auth` is whether this deployment checks at all; `identity` is `null` when it
 does and does not recognize you, a 200, not a 401. the ui's own files
 (`/`, `/assets/…`) need no credential either, or the page that asks for one
@@ -356,7 +374,10 @@ now it means it precisely: with no limits declared the run starts in the same
 instant, and with limits declared it starts when there is room. a body that isn't `{"params": ...}`-shaped is a
 400 (`invalid body: ...`), params rejected by an op's `.params::<P>()` are a
 400 (`invalid params for op fetch: ...`) with nothing written, and an unknown
-job is a 404.
+job is a 404. a param the job declares [secret](secrets.md) is stored as
+`"[hestan:redacted]"` and reaches the ops all the same; passing that marker
+*as* a value is a 409, because it is what a stored run's params read back as
+and not a credential.
 
 `{"preset": "nightly"}` launches with a stored [preset](#presets)'s params
 instead, which is an alternative to `params` rather than a base for it:
@@ -391,6 +412,9 @@ job, `{"presets": []}` when it has none:
     "created_at": "2026-08-07T12:00:00+00:00" }
 ] }
 ```
+
+a preset's params go through the same [redaction](secrets.md) a run's do, so a
+preset cannot become a place a credential lives.
 
 `PUT /api/jobs/{name}/presets/{preset}` with `{"params": {...}}` stores one,
 replacing whatever was under that name: `200 {"ok": true}`. the params run
@@ -746,7 +770,10 @@ when the run is still queued or running, since retrying a live run would only
 double it, and a manual launch is the ungated escape hatch when an
 overlapping run is really wanted; 409
 (`job no longer defined: ...`) when the run exists but its job is no longer
-registered (a 404 would lie, the run is right there); 400 when the recorded
+registered (a 404 would lie, the run is right there); 409 (`param ... is
+declared secret and not stored`) when the run carried a
+[secret param](secrets.md), whose value was deliberately never written down and
+so cannot be re-read; 400 when the recorded
 params no longer pass a `.params::<P>()` check the job has since grown. the
 checks apply in that order.
 
@@ -770,7 +797,9 @@ that succeeded.
 (`run did not fail: ...`) for a plain resume of a successful run (a
 targeted `from` on the same run is fine); 409 (`job no longer defined: ...`)
 when the run exists but its job is no longer registered (a 404 would lie,
-the run is right there); 400 for a body that isn't `{"from": [...]}`-shaped,
+the run is right there); 409 (`param ... is declared secret and not stored`)
+when the run carried a [secret param](secrets.md); 400 for a body that isn't
+`{"from": [...]}`-shaped,
 for `from` naming ops the job does not have, when the ops recorded across the
 resume chain are no longer exactly the job's ops, when an ancestor run has
 been pruned out of the history, when nothing is left to re-run, when a
@@ -812,7 +841,9 @@ today's clock, and today's answer from anything the op fetches itself) is
 202 with the new `run_id`; 404 when the run id is unknown; 409
 (`run still active: ...`) when the run is still queued or running; 409
 (`job no longer defined: ...`) when the run exists but its job is no longer
-registered; 400 for a body that isn't `{"ops": [...]}`-shaped, for `ops`
+registered; 409 (`param ... is declared secret and not stored`) when the run
+carried a [secret param](secrets.md); 400 for a body that isn't
+`{"ops": [...]}`-shaped, for `ops`
 naming ops the job does not have or ops this run never ran, when nothing the
 run recorded failed and no `ops` were named
 (`nothing to replay: no op of run ... failed`), when a replayed op's dep

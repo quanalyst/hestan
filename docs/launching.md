@@ -112,6 +112,16 @@ pointed at, never refused, since the schema does not decide what launches.
 it is deliberately a legend and not a form builder. json is what the api takes
 and what a preset stores, so the editor stays the thing you edit.
 
+## Secret params
+
+`Op::secret_params(["token"])` names params that are credentials. the ops still
+read them; the store writes `"[hestan:redacted]"` in their place, so they are
+not on the run page, not in `GET /api/runs`, not in a preset and not in the
+database. the cost is that a run launched with one cannot be replayed, resumed
+or retried, because the value was never written down.
+[secrets in params](secrets.md) is where that decision, its limits and what it
+does not cover are set out; read it before declaring one.
+
 ## Run tags
 
 a tag is a flat `{"k": "v"}` mark on a run. `trigger` already says *what kind

@@ -407,7 +407,18 @@ standalone binary for those two. [docs/cli.md](docs/cli.md).
   `Auth::custom(|req| …)` to compose the identities you already have. three
   roles (viewer reads, operator drives runs, admin changes how the deployment
   behaves), and a control a role may not use is not rendered in the ui rather
-  than rendered and answering 403. see [docs/auth.md](docs/auth.md)
+  than rendered and answering 403. `Identity::operator("ci").scoped_to(
+  Scope::jobs(["deploy"]))` narrows it further: a token that may launch one job
+  and is a stranger everywhere else, enforced in one place so a route added
+  later is covered by the rule rather than by a list. see
+  [docs/auth.md](docs/auth.md)
+- **a param an op declares secret does not reach the store**:
+  `Op::secret_params(["token"])` puts `[hestan:redacted]` in `runs.params`,
+  `schedules.params` and `presets.params` while the ops still read the value,
+  so it is not on the run page, not on the api and not in the database. the
+  redaction is in the store rather than in any renderer, which is what makes it
+  something a new reader cannot walk around. it costs the run its replay, on
+  purpose: see [docs/secrets.md](docs/secrets.md)
 
 ## More than one process
 

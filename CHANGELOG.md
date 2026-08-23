@@ -2,6 +2,181 @@
 
 ## unreleased
 
+a deploy token passed as a param used to be written to `runs.params`, shown on
+the run page, returned by `GET /api/runs` and kept until retention pruned it.
+and a token that could launch a deploy could also cancel production runs,
+because the roles say how much somebody may do and nothing about what to. two
+things, both about a credential being wider than it needed to be.
+
+**a param a caller declares secret does not reach the store.**
+
+```rust
+Op::new("push", body).secret_params(["token"])
+```
+
+the op still reads the value. what changes is that nothing writes it down:
+`runs.params`, `schedules.params` and `presets.params` all get
+`"[hestan:redacted]"` where it was.
+
+**the redaction is in the store, not in any renderer.** `Store` holds what each
+job declared and applies it to every params column it writes, before the
+insert. so the ui, the api, the event log, the cli, `hestan doctor`, a `psql`
+prompt and a route added next month are all reading a row that never held the
+value, and none of them had to be taught anything. a value scrubbed in a
+renderer is still in the database and still on every other renderer, and the
+next reader somebody adds gets it for free.
+
+the ops get it because the process that took the launch keeps it in memory,
+keyed by run id, and puts it back into the params of the run it is about to
+execute. it goes to no disk on the way.
+
+**BREAKING, in behaviour: a run launched with a secret param cannot be
+replayed, resumed or retried.** this is the sharp edge and it is deliberate.
+those three read a finished run's stored params back, the store holds the
+marker, and re-launching from that row would run the deploy with the literal
+string `[hestan:redacted]` as its credential: a run that fails confusingly at
+best and authenticates as something unintended at worst. so the marker is
+refused as a param value at `Runner::enqueue`, the one funnel every run goes
+through, which means the four paths that read params back land on it without
+any of them checking:
+
+```
+job deploy: param token is declared secret and not stored, so what came back is
+the marker and not the value. a retry, a resume or a replay cannot re-read one:
+launch again and pass it
+```
+
+`409` on the api, exit 2 on the cli, and the resume and replay *previews*
+refuse identically so the ui never offers a button that cannot work. re-running
+means launching again and passing the value. if that is not acceptable for a
+job, do not declare the param: put the credential in a resource, which is
+process configuration, is built where the op runs, and is rebuilt on a replay
+like anything else.
+
+**what is covered, and by what.** run params, schedule params and preset params
+by the declaration; the event log, the ui, `GET /api/runs`, `hestan runs show`
+and `hestan doctor` because they read the row; `hestan run --dry-run` by
+applying the declaration itself, since it never touches the store; and the
+refusal a `.params::<P>()` check gives, which is the classic leak, because
+serde quotes back what it was handed and `Job::params_error` is the one
+function that produces that sentence for the launch, for `validate_params` and
+for `--dry-run`.
+
+**a second line, said to be second.** an op holds the value and can log it or
+put it in metadata, and a declaration cannot stop that. so while a run holding
+secret values is executing in this process, every string bound to every
+statement the store issues is scanned for those values and any that appears is
+replaced. it sits at the store's parameter binding, so it covers op output,
+metadata, log lines, op errors and every event including ones a future table
+carries. it finds a copy and not a transformation, it skips values under
+sixteen characters (a shorter needle matches inside run ids and timestamps and
+rewriting those would corrupt the run log), and it is not applied to reads.
+
+**nothing guesses.** hestan does not match param names against
+`token|secret|password`. a pattern misses the credential somebody called `key2`
+and redacts the innocent column named `password_column`, and a redaction that
+is sometimes wrong is one nobody can reason about. a param nobody declared is
+stored.
+
+**the limits, plainly.** top-level keys only, so `{"db": {"password": …}}` is
+not covered. one process: the value is in the memory of whatever took the
+launch, so a worker in another process finds the marker, refuses to execute on
+it and fails the run naming the param. secret params therefore work on a
+single-process deployment and on a multi-process one only when whatever
+launched also executes; a `Role::Scheduler` enqueuing for `Role::Worker`
+processes is exactly the shape they do not work in, and a resource is the
+answer there. and it encrypts nothing: the marker is a marker.
+
+**a token scoped to the jobs it may touch.**
+
+```rust
+Identity::operator("ci").scoped_to(Scope::jobs(["deploy"]))
+```
+
+an operator on `deploy`, a stranger everywhere else. a scope is a list of jobs,
+a list of assets or both, and the list is the whole of what may be touched.
+
+```json
+{"error": "ci is scoped to job deploy, and this changes job billing"}
+```
+
+**enforced in the guard, before any handler, and derived from the path rather
+than from a list of routes.** the first `{placeholder}` in the matched route
+names the subject and the literal before it says what kind: a job, an asset, a
+run (resolved to its job off the row) or a backfill (resolved to its asset).
+**anything with no placeholder at all is the deployment, and a scoped token may
+not touch the deployment.** so `POST /api/assets/build`,
+`POST /api/schedules/state` and `POST /api/sensors/state` are refused by the
+rule, and so is a mutation added next month that names no job or asset in its
+path. a case scrapes every route out of the router and asserts a token scoped
+elsewhere is refused at all of them, so a route added tomorrow is covered the
+moment it is written.
+
+**a scope does nothing to a read, and that is a decision.** a write names in
+its path what it is about, so one check rules on every write there will ever
+be. a read is mostly a list, and narrowing those means a filter inside each
+handler that builds one, which is a check that has to be remembered at every
+list and will be forgotten at one. a confidentiality promise that holds nine
+times in ten is worse than none, because people plan around it. so: **a scope
+is not a confidentiality boundary**, a token that can read reads the whole
+deployment, and a deployment that needs the read half narrowed does it in
+`Auth::custom` or in front of hestan, where it can be exact.
+
+a scope cannot be widened by whoever holds the token: an `Identity` is built by
+an authenticator in the deployment's own process, and nothing in a header, a
+query or a body reaches the scope on it. it is an api limit and not a
+capability check inside the library: code holding a `Runner` launches whatever
+it likes, exactly as it always could.
+
+**BREAKING, source only: `Identity` gains a public `scope` field.** an
+`Identity { name, role }` literal no longer compiles; `Identity::new`,
+`viewer`, `operator` and `admin` are unchanged and are what the docs have
+always shown. `GET /api/whoami` gains `identity.scope`, which is
+`{"everything": true, "jobs": [], "assets": []}` for every token that existed
+before this.
+
+**what an existing deployment sees change:**
+
+- **no schema version, no migration, no new column, no new route.** the store
+  is at v21 exactly as it was, and nothing currently stored becomes unreadable:
+  a param already in `runs.params` is still there, still plain text, still on
+  the api and the ui, and still replayable. the redaction is applied at the
+  write, so it only ever affects rows written after a job declares a param.
+- **a job that declares no secret param writes params byte for byte as it
+  did.** the redaction, the second-line scan and the marker refusal are all no
+  ops when nothing is declared, and the scan costs one atomic load per write in
+  that case.
+- **an unscoped token is decided by the role ladder alone**, as it was, and a
+  case asserts that against every row of the roles table rather than assuming
+  it. `Auth::bearer` is unscoped, so the one-token deployment and the ui are
+  untouched.
+- **one source break**, the `Identity` literal above.
+- **the ui shows a scope and does not act on one.** the header reads
+  `ci · operator · jobs deploy`; the controls are not hidden, so a scoped token
+  still sees another job's launch button and the api answers 403 naming the
+  scope. hiding them would mean a scope check at every list, tile, palette
+  entry and detail page, which is the per-call-site check the api rule exists to
+  avoid. the disagreement is deliberate and `docs/auth.md` says so rather than
+  leaving it to be found.
+
+- **`docs/secrets.md`** is the whole of the first half: where the redaction is
+  and why it is there, the replay consequence, what is covered by what, the
+  second line and that it is second, and the limits.
+- **`docs/auth.md`** gains the scopes, the read decision with its reasoning,
+  the deny-by-default rule and the ui exception; its "there are no per-job or
+  per-asset permissions" bullet was true and is not any more.
+- **cases**: the op reading the credential while the whole database is scanned
+  for it and does not have it; each of the three params columns written through
+  the declaration and a job that declared nothing written unchanged; the four
+  re-run paths and both previews refusing with the param named; a second
+  process failing the run rather than executing on the marker; a params check
+  quoting the marker instead of the value; the api and the launchpad prefill
+  showing the marker and the prefill refusing to be launched back as it stands;
+  the cli dry run redacting what it never stored; a scoped token driving what it
+  owns and refused the rest with the reason; reads unnarrowed; an unscoped token
+  unaffected across the whole roles table; the widening attempts; and every
+  route in the router refused for a token scoped elsewhere.
+
 "is orchestration healthy" is now a question a scrape can answer.
 
 hestan had traces behind the `otel` feature and an `/api/health` about one

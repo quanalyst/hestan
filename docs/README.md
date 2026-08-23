@@ -20,6 +20,7 @@
 - [http sources](http-sources.md): declarative REST pulls, the full `HttpSource` builder, fan-out, retry policy.
 - [notifications](notifications.md): hooks, `on_run_finished`/`RunEvent`, `on_op_finished`/`OpEvent`, per-job scoping, `on_failure`/`RunFailure`, `on_late`/`LateEvent`, the webhook and slack helpers, and durable at-least-once delivery.
 - [replay](replay.md): re-running ops of a finished run on the inputs it gave them, what it is for, what it reproduces, the four things it does not, the retention horizon, and the three ways in.
+- [secrets in params](secrets.md): `Op::secret_params`, where the redaction is and why it is in the store rather than in a renderer, what a secret does to a replay, what the second line catches and what it does not, and the limits.
 - [launching](launching.md): presets, params schemas, run tags, subset launches, and cloning a past run.
 - [the command line](cli.md): `hestan::cli::run` in your own binary, the mount, the three ways to reach a deployment, every command, the exit codes a cron line reads, the output contract, `doctor`, `explain` and dynamic completion.
 - [web ui](web-ui.md): a page-by-page tour of the embedded ui and how it draws status.

@@ -125,8 +125,10 @@ for.
 ## The roles
 
 three roles, and they contain each other: an operator may everything a viewer
-may, an admin everything an operator may. every decision the server makes is
-one comparison: `identity.role >= what this endpoint needs`.
+may, an admin everything an operator may. how much of the api a request needs
+is one comparison: `identity.role >= what this endpoint needs`. *what* it may
+be done to is [the other question](#the-scopes), and the roles say nothing
+about it.
 
 | role | may |
 | --- | --- |
@@ -178,12 +180,142 @@ not load. neither does `GET /api/whoami`, which answers "does this deployment
 check who is asking, and who does it make you":
 
 ```json
-{ "auth": true, "identity": { "name": "ada", "role": "admin" } }
+{
+  "auth": true,
+  "identity": {
+    "name": "ada",
+    "role": "admin",
+    "scope": { "everything": true, "jobs": [], "assets": [] }
+  }
+}
 ```
 
 with no credentials that is `{"auth": true, "identity": null}`, a 200, not a
 401, because it is the endpoint asked *before* there is anything to present.
 an open deployment answers `{"auth": false, "identity": null}`.
+
+## The scopes
+
+the ladder is the right shape and it is too coarse for one case: **a token that
+may launch one job and nothing else.** a ci pipeline triggering a deploy needs
+an operator's `POST /api/jobs/deploy/runs`, and an operator may also cancel
+production runs, retry anything and start a backfill. those are the same role.
+
+a **scope** narrows what a role may touch without changing what the role is:
+
+```rust
+Hestan::new()
+    .job(deploy)
+    .job(billing)
+    .auth(Auth::custom(|req| match req.bearer()? {
+        t if secret_eq(t, &ci_token) => {
+            Some(Identity::operator("ci").scoped_to(Scope::jobs(["deploy"])))
+        }
+        t if secret_eq(t, &ops_token) => Some(Identity::admin("ops")),
+        _ => None,
+    }))
+    .serve(([0, 0, 0, 0], 4000))
+    .await
+```
+
+`ci` is an operator on `deploy` and a stranger everywhere else:
+
+```
+$ curl -XPOST -H "authorization: Bearer $CI" .../api/jobs/deploy/runs
+{"run_id":"019..."}
+
+$ curl -XPOST -H "authorization: Bearer $CI" .../api/jobs/billing/runs
+{"error":"ci is scoped to job deploy, and this changes job billing"}
+
+$ curl -XPOST -H "authorization: Bearer $CI" .../api/runs/019.../cancel
+{"error":"ci is scoped to job deploy, and this changes run 019..., which is a
+run of job billing"}
+```
+
+a scope is a list of jobs, a list of assets, or both, and **the list is the
+whole of what may be touched**: `Scope::jobs(["deploy"])` may touch no asset,
+`Scope::assets(["orders"])` may launch no job, and
+`Scope::jobs(["etl"]).and_assets(["orders"])` may touch exactly those two. a
+scope naming something nothing matches may change nothing at all, which is the
+right way round for a thing whose job is to say no.
+
+### An unscoped token is unaffected
+
+`Scope::everything()` is what every identity is unless something said
+otherwise, and it is what `Identity::new`, `viewer`, `operator` and `admin`
+build. an unscoped identity skips the scope check entirely: its requests are
+decided by the ladder alone, byte for byte as they were before scopes existed,
+and a case asserts that against every row of the table above rather than
+assuming it. `Auth::bearer` is unscoped, so the one-token deployment and the ui
+are untouched.
+
+### What a scope does to a read
+
+**nothing.** a scope limits what a token may change. a token that can read
+reads the whole deployment: every run of every job, every param, every log
+line, the event log, the queue.
+
+that is a decision, not an omission, and here is the reasoning. a write names
+in its path what it is about, so one check in one place can rule on every write
+there will ever be. a read is mostly a *list*: `/api/runs`, `/api/events`,
+`/api/queue`, `/api/assets`, the sse stream, `/metrics`. narrowing those means
+a filter inside each handler that builds one, which is a check that has to be
+remembered at every list, and phase 33's lesson is that a check which must be
+remembered at each call site is one that will be forgotten at one. a
+confidentiality promise that holds in nine places out of ten is worse than no
+promise, because people plan around it and the tenth is where the leak is.
+
+so hestan makes the small exact promise instead. **a scope is not a
+confidentiality boundary.** if a ci token must not *see* production run params,
+a scope is the wrong tool: put a proxy in front that refuses the reads, or use
+`Auth::custom` and return `None` for the paths that token has no business
+reading, which is a decision the deployment can make exactly and hestan cannot.
+
+### Deny by default, and why a route added later is covered
+
+the check is in the guard, before any handler, and it reads what a request is
+about off the route it matched rather than off a list of endpoints:
+
+| the matched route | what it is about |
+| --- | --- |
+| `/api/jobs/{name}/…` | that job |
+| `/api/assets/{name}/…` | that asset |
+| `/api/runs/{id}/…` | whichever job that run is a run of, read off the row |
+| `/api/backfills/{id}/…` | whichever asset that backfill is filling in |
+| anything with no `{placeholder}` at all | **the deployment** |
+| a `{placeholder}` under a noun this does not know | **the deployment** |
+
+**the deployment is what a scoped token may not touch.** so
+`POST /api/assets/build`, `POST /api/schedules/state` and
+`POST /api/sensors/state` are refused for a scoped token by the rule rather
+than by a list, and so is a mutation added next month that does not name a job
+or an asset in its path. a run id or a backfill id this deployment cannot
+resolve is refused for the same reason: an id nobody can resolve to a subject
+is not a subject in the scope.
+
+a case scrapes every route out of the router and asserts that a token scoped to
+something else is refused at all of them. a route added tomorrow is in that
+scrape the moment it is written, and there is no list to update.
+
+### A scope cannot be widened by the holder
+
+an [`Identity`] is built by an authenticator, in the deployment's own process,
+and nothing in a header, a query or a body reaches the scope on it. there is no
+input for a holder of a token to widen it through, and a case sends the obvious
+attempts (`x-hestan-scope`, `x-scope`, a second `authorization`, a `scope` in
+the body) and gets the same refusal.
+
+what a scope *is* worth is bounded by what `Auth::custom` does, exactly as a
+role is: hestan checks the scope it was given, not where it came from.
+
+### Where a scope is not
+
+a scope is an **api** limit. it is not a capability check inside the library:
+code holding a `Runner` launches whatever it likes, exactly as it always could,
+because that code is the deployment rather than a caller of it. and the ui
+shows a scope without acting on one; see below.
+
+[`Identity`]: https://docs.rs/hestan/latest/hestan/struct.Identity.html
 
 ## The ui
 
@@ -197,6 +329,17 @@ re-run, resume, replay, build, backfill, pause, preset and queue-order
 controls are absent the same way. a button that is there and answers 403 teaches people that
 the ui lies about what they can do, and the ones who learn that stop reading
 the rest of it.
+
+**a scope is shown and not acted on, and that is the one exception to the line
+above.** the header reads `ci · operator · jobs deploy`, so somebody whose
+launch is about to be refused can see why before they press it. the controls
+themselves are not hidden: a token scoped to one job still sees another job's
+launch button, and the api answers 403 naming the scope. hiding them would mean
+a scope check at every list, tile, palette entry and detail page, which is
+exactly the per-call-site check the api rule was built to avoid, and getting it
+wrong at one of them would hide a control somebody may in fact use. so the
+disagreement is deliberate, it is here rather than left to be discovered, and
+the api is where the rule is.
 
 ### Where the token lives, and what that does not protect against
 
@@ -332,10 +475,12 @@ deliberately, and none of these are coming later by accident:
 - **there is no oauth, oidc, saml or ldap.** a deployment that needs any of
   them already runs something that speaks them, and `Auth::custom` is how that
   thing's answer becomes hestan's.
-- **there are no per-job or per-asset permissions.** the roles are about kinds
-  of action, not about which pipeline. "ada may launch `orders_etl` but not
-  `payments_reconcile`" is not expressible, and pretending otherwise with a
-  half-built rule engine would be worse than saying so.
+- **a scope is not a rule engine, and reads are not in it.** "ci may launch
+  `deploy`" is expressible; "ada may launch `orders_etl` between nine and five
+  if the last run failed" is not, and neither is "ci may not see
+  `payments_reconcile`". what a scope narrows is which job or asset a *change*
+  may name. the read half is [not a promise hestan
+  makes](#what-a-scope-does-to-a-read).
 - **there is no rate limiting and no lockout.** a token that leaks can be
   guessed at as fast as your network allows; the comparison is constant-time,
   which closes the timing oracle and nothing else. put something in front of
@@ -351,8 +496,8 @@ deliberately, and none of these are coming later by accident:
 
 | | |
 | --- | --- |
-| the refusal, the loopback rule, the constant-time comparison | `src/auth.rs` |
-| the guard, the roles table, `whoami` | `src/server.rs` |
+| the refusal, the loopback rule, the constant-time comparison, `Scope` | `src/auth.rs` |
+| the guard, the roles table, what a request is about, `whoami` | `src/server.rs` |
 | who did what, in the store | `src/store.rs` (schema v18: `runs.actor`, `events.actor`) |
 | the token, the prompt, and what it does not protect against | `ui/src/identity.ts` |
 | the token leaving no trace | `tests/auth.rs` |

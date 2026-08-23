@@ -125,7 +125,16 @@ params are stored on the run row and served by the api and the ui, which is
 right for `{"day": "2026-08-11"}` and wrong for a password: it would be in the
 run log, in every launch that copied that run, and in whatever your log
 aggregator keeps. a run's params are a thing anyone who can read the run can
-read, and hestan does not redact them.
+read.
+
+**this is still the advice**, and it is not softened by
+[`Op::secret_params`](secrets.md), which is for the case a resource cannot
+cover: a credential that belongs to *one launch* rather than to the process, a
+deploy token a ci pipeline hands over per run. that keeps the value out of the
+store and costs the run its replay: a run launched with one cannot be replayed,
+resumed or retried, because the value was never written down. a resource costs
+nothing and is rebuilt on every replay, so it is the answer whenever the
+credential is the deployment's rather than the launch's.
 
 a constructor that returns `Err` aborts startup with `Error::Resource` before
 the store is opened, so a deployment with a missing `WAREHOUSE_URL` fails at

@@ -55,6 +55,27 @@ does not say the original run would have worked with this fix, and it is not a
 reconstruction of an incident. if the difference matters for what you are
 about to conclude, the honest reading is the narrow one.
 
+## A run that carried a secret param cannot be replayed at all
+
+a param an op declared [secret](secrets.md) is not in the run log: the store
+holds `[hestan:redacted]` where the value was, on purpose, and nothing anywhere
+can turn that back into the credential. so there is nothing for a replay to
+re-run it with.
+
+that is a refusal rather than a run:
+
+```
+job deploy: param token is declared secret and not stored, so what came back is
+the marker and not the value. a retry, a resume or a replay cannot re-read one:
+launch again and pass it
+```
+
+the same refusal covers a resume, a retry and both previews, because it is
+raised where params become a launch rather than in each of the four. **launch
+again and pass the value** is the way to re-run such a run, and if that is not
+acceptable for a job, the credential belongs in a [resource](resources.md)
+rather than in its params: a resource is rebuilt on a replay like any other.
+
 ## The retention horizon
 
 [retention](storage.md#retention) prunes old runs, and pruning a run asks
