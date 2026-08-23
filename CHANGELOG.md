@@ -2,6 +2,171 @@
 
 ## unreleased
 
+a store is one file or one database, and nothing said how to take a copy of it.
+that half is small. the half worth building is what a **restored** copy means,
+because every claim in one is held by a process that is somewhere else. and a
+plain launch had nothing to stop a retried request becoming two runs, while a
+sensor and a schedule have had exactly that for phases.
+
+**a consistent copy, and a copy that says it is one.**
+
+```
+hestan backup /backups/hestan-2026-08-24.db
+```
+
+sqlite's online backup rather than a `cp`: the database is in WAL mode, so the
+file on its own is missing whatever is still in the `-wal` beside it and gives
+no sign of it. `Store::backup_to` runs `VACUUM INTO`, which takes a read
+transaction and writes a whole database out of it while runs go on being
+recorded. it writes to `<dest>.part` and renames, so a file under the name you
+asked for is a finished copy, and it refuses a destination that already exists
+rather than writing over last night's.
+
+**postgres is your own tooling's and hestan says so** rather than shipping a
+worse `pg_dump`. what it does say is what such a dump must not leave out:
+every table (the consistency here is across tables, so `pg_dump -t runs` is not
+a backup of a run log), `schema_version`, and the schema itself if hestan is
+not in `public`.
+
+**a restored store is a lie about the present, and a deployment refuses to come
+up on one.** `hestan backup` marks the copy; `Hestan::serve` and `run_once`
+refuse a marked one with `Error::NotResettled`, naming the command that fixes
+it. reads still work, because pointing a report or `hestan runs --db copy.db`
+at a copy is the ordinary reason to have one and none of that acts on a claim.
+
+```
+hestan resettle --db /var/lib/hestan/hestan.db
+```
+
+**it does not consult the leases, and that is the whole difference from boot
+recovery.** hestan already fails runs whose claimer stopped renewing, and that
+believes leases on purpose: on a live database a claim with thirty seconds left
+on it is a run some other process is executing right now. on a restored
+database there is no such process whatever the lease says. so `Store::resettle`
+fails every run that was `running`, puts every claimed-but-unstarted run back
+on the queue with its claim cleared, leaves the unclaimed queue alone, and
+hands back the deciding lease. **nothing is requeued for a run that was
+`running`**: it may well have finished in the original after the copy was
+taken, and re-running a deploy or a payment run on hestan's own initiative is
+not a small thing. those are failed with a reason and left for a resume or a
+replay.
+
+**the sharp edge, and it is a plain statement rather than a feature.**
+restoring an old copy while workers are still running against the live store is
+how a recovery makes things worse, and **nothing in hestan prevents it, because
+nothing in hestan can**: by the time any hestan code runs against the restored
+store, the file is already in place or the dump is already loaded. what
+`hestan resettle` adds is a second pair of eyes at the last moment somebody is
+still watching. it reads every lease, waits twenty seconds, reads them again,
+and refuses if any moved, because a lease that moves is a process renewing it.
+what that does not see is written down beside it: a process holding no run and
+running no election renews nothing, so an idle worker is invisible to it.
+`docs/backup.md` has the order an operator has to work in, including what
+`mv copy.db hestan.db` means to a worker that has the old inode open.
+
+**what a backup does not contain, asserted rather than mentioned.** an
+[io manager](docs/io-managers.md) writes op outputs to files outside the
+database, and no copy of the store contains them. a case builds a value through
+`FileIo`, records the materialization, takes a backup, removes the directory,
+and asserts both halves: the restored materialization still holds the handle
+and still says the asset is built, and the value it names is gone. that is a
+likely case rather than a theoretical one, and `hestan doctor` counts the runs
+holding one under `values`.
+
+**a launch key makes a retry harmless.**
+
+```
+POST /api/jobs/deploy/runs  {"params": {"env": "prod"}, "key": "ci-build-4182"}
+hestan run deploy --key ci-build-4182
+runner.launch_once("deploy", params, Trigger::Manual, "ci-build-4182", tags, None)
+```
+
+same key, same job, same params: **one run**, and the second call is answered
+with the first one's id rather than with a conflict, because "make sure this
+ran once" is what the caller meant. `202` for the call that launched and
+`200 {"repeat": true}` for one that did not.
+
+**the store refuses the second one, not a check.** `launch_key` is the primary
+key of the new table and the insert that takes it is in the same transaction as
+the run row, so two api processes racing one key produce one run because the
+database said no to the second. that is phase 41's lesson applied where it was
+still missing: a read-then-write is two callers away from a race, and a
+uniqueness constraint holds where a lock does not. a case starts four threads
+on four connections, releases them together, and asserts one `Yes`, three
+`Held` naming that same run, one run row, one op row and one queued event.
+
+**keyed on the key alone, not on `(job, key)`.** a key is the caller's name for
+one request. keyed per job, one key would mean two things on two jobs and hand
+somebody a second run without either caller seeing it; keyed on the key, that
+is a collision hestan can report, and it does: **the same key with different
+params, or on a different job, is `Error::LaunchKeyReused`**, naming the run the
+key already has. a `409` over http, exit 2 on the command line, nothing
+launched.
+
+**what "the same params" compares is the params as stored.** so key order in an
+object does not matter, and **two launches differing only in a param the job
+declared secret are the same launch**, because the stored params are identical
+and that is what the digest is of. hashing what is in the database rather than
+what was passed is the right way round, and the cost is a case rather than a
+sentence.
+
+**how long a key is honoured**: until retention's age cutoff passes it, which
+is the same knob and the same cutoff `sensor_run_keys` rides rather than a
+second lifetime to reason about. with no retention policy configured nothing
+prunes either. a key is also dropped **with the run it names**, through a new
+`launch_keys_run` index, so it can never hand a retrying caller an id nothing
+can be looked up under.
+
+**what an existing deployment sees change:**
+
+- **two migrations, v22 and v23, and both are one `CREATE TABLE`.** `store_copy`
+  is empty on every database that is not a copy; `launch_keys` is empty until
+  something passes a key. nothing is read, nothing is rewritten, and the upgrade
+  costs the same on both backends. a deployment that takes no backup through
+  hestan and passes no key notices neither.
+- **`db schema v23`**, so a database opened by this build cannot then be opened
+  by an older one. that has been true of every migration.
+- **`POST /api/jobs/{name}/runs` can now answer `200`.** only when the request
+  carries `key` and that key already named a run; a request without `key`
+  answers exactly what it always did. `key` alongside `ops` is a `400`: a subset
+  launch has no keyed form, and honouring one of the two silently would be
+  worse than saying so.
+- **`Error` gains `NotResettled`, `NoBackup` and `LaunchKeyReused`**, which is
+  what `#[non_exhaustive]` on it is for.
+- **`Launch`, `Restored` and `Resettled` are new public types with private
+  fields and accessors**, the pattern `docs/stability.md` set with `Owner`.
+  none of them is an enum, so nothing new has to be matched.
+- **`hestan doctor` reports a restored run log**, `wrong` and therefore exit 7
+  until it has been resettled and a `note` afterwards. a deploy pipeline that
+  runs `doctor` catches a restored database before it serves anything.
+- **a restored deployment may do work twice, and nothing can stop it.**
+  occurrences fired and run keys claimed after the copy was taken left their
+  trace in the copy's source and nowhere else, so a schedule with catch-up will
+  re-fire them and a keyed sensor will re-launch them. `docs/backup.md` says to
+  pause both before starting a restored deployment if that is expensive.
+- **the deciding term goes backwards on a restore**, so a process still holding
+  a term from before the copy could be accepted by a store about to issue it
+  again. nothing detects that; stopping every process first is what prevents it,
+  and it is one more reason the order in `docs/backup.md` is the order.
+
+- **`docs/backup.md`** is the new page: taking a copy of each backend, what is
+  not in one, what a restored store says about claims and leases, coming up on
+  one, the hazard, and what to check afterwards. `docs/launching.md` gains
+  "launching once", `docs/http-api.md` the `key` parameter and the `200`,
+  `docs/cli.md` `--key`, `backup` and `resettle`, and `docs/storage.md` the two
+  tables and the two migration steps.
+- **cases**: a copy taken while a second connection writes flat out, opening and
+  reading whole; the copy marked and the original not; a deployment refusing to
+  come up on it and starting once it is resettled; boot recovery leaving a
+  copy's live-looking claims exactly as it finds them and a resettle taking them
+  anyway; the leases reading the same twice until something renews one; a
+  materialization whose file is gone; one key answered with one run three times
+  over; a different key making a second run; one key with different params and
+  one key on another job both refused by name; a secret param flattening two
+  launches into one; four threads on four connections racing one key; a key
+  pruned by the cutoff and a key going with its run; both migrations from a
+  populated database on both backends; and the command line for all of it.
+
 a run failed at 3am and the log said which job, not whose. and two teams in one
 deployment shared one flat list of jobs, so a token that should reach one
 team's work had to name every job in it. two rows, and they belong together

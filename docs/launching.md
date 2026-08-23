@@ -177,6 +177,89 @@ muted `key:value` chips. from a terminal it is the same filter:
 --tag kind=smoke` is this whole page as one line ([the command
 line](cli.md)).
 
+## Launching once
+
+a launch is a request, and a request can be made twice. an http client whose
+call timed out retries it; a ci step re-runs; a queue consumer with
+at-least-once delivery hands you the same message again. none of those callers
+wants two runs, and until now every one of them got two.
+
+a **launch key** is the caller's name for one request:
+
+```
+POST /api/jobs/deploy/runs  {"params": {"env": "prod"}, "key": "ci-build-4182"}
+```
+
+```
+hestan run deploy --params '{"env":"prod"}' --key ci-build-4182
+```
+
+```rust
+let launch = runner.launch_once(
+    "deploy", params, Trigger::Manual, "ci-build-4182", RunTags::new(), None,
+)?;
+```
+
+same key, same job, same params: **one run**, and the second call is answered
+with the first one's run id rather than with a conflict, because what the
+caller asked for is "make sure this ran once" and it has. the api answers `202`
+for the call that launched and `200 {"repeat": true}` for one that did not; the
+command line prints the same id either way and says which happened;
+[`Launch::repeat`] is the rust half.
+
+### the store refuses it, not a check
+
+the key is the primary key of a table, and the insert that takes it is in the
+same transaction as the run row. so two callers arriving at the same instant on
+two connections produce one run because the **database** said no to the second,
+not because either of them looked first. that is the same mechanism a keyed
+[sensor](sensors.md#run-keys) and a [cron
+occurrence](scheduling.md#one-fire-per-occurrence) already rest on, and it is
+deliberate: a read-then-write is two callers away from a race, and no amount of
+locking in front of it changes that.
+
+### the same key with a different request
+
+is a caller bug, and hestan says so rather than handing back a run that did
+something else:
+
+```
+$ hestan run deploy --key ci-build-4182 --params '{"env":"staging"}'
+error: launch key ci-build-4182 already launched run 019ff1b7-8df6 of job
+deploy, and this call names job deploy with different params. a key stands for
+one launch: send what the first call sent, or use a key of its own
+```
+
+that is a `409` over http and exit 2 on the command line, with nothing
+launched. the same key naming a **different job** is refused the same way: a
+key is the caller's name for a request, so it is unique across the deployment
+rather than per job, and one key meaning two things on two jobs would hand
+somebody a second run without either caller seeing it.
+
+what "the same params" means is worth one sentence: the comparison is over the
+params **as stored**, so key order in an object does not matter, and two
+launches differing only in a param the job declared [secret](secrets.md) are
+the same launch as far as this is concerned, because the stored params are
+identical. that is the price of hashing what is in the database rather than
+what was passed, and it is the right way round.
+
+### how long a key is honoured
+
+until [retention](storage.md#retention)'s age cutoff passes it. keys ride the
+same knob and the same cutoff as a sensor's run keys, on purpose: two lifetimes
+for two kinds of key would be two things to reason about. **with no retention
+policy configured nothing prunes either**, and a key is honoured for as long as
+the database lives.
+
+a key is also dropped with the run it names, so it can never hand back an id
+nothing can be looked up under.
+
+### what it does not cover
+
+a key and a [subset launch](#launching-a-subset-of-ops) are alternatives:
+`{"key": ..., "ops": [...]}` is a `400`. a subset launch has no keyed form, and
+honouring one of the two silently would be worse than saying so.
+
 ## Launching a subset of ops
 
 hestan has always been able to run part of a job: it is how an asset build and

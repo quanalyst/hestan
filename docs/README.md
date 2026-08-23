@@ -31,6 +31,7 @@
 - [http api](http-api.md): every endpoint, parameter, response shape, and error code.
 - [metrics](metrics.md): the prometheus endpoint, every metric with its type and labels, what to alert on, which side of the auth guard it sits and why, what may be a label and what may not, and what is deliberately not there.
 - [storage](storage.md): the two backends and how to choose, the schema, migrations, and crash recovery.
+- [backup and recovery](backup.md): taking a consistent copy of each backend, what a restored store says about claims, leases and running runs, the io manager files a copy does not contain, and the hazard of restoring one while workers are still up.
 - [embedding](embedding.md): `serve` vs `run_once` vs `Runner`, testing, consuming from another repo.
 - [stability](stability.md): what a caller may rely on while hestan is 0.x, the five surfaces and what each holds still, which types are a closed set and which will grow, the extension points that are contracts, and what is deliberately not a surface at all.
 - [development](development.md): repo layout, quality gates, the ui build loop, adding a migration.

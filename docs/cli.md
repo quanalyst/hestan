@@ -186,13 +186,34 @@ default build of the library compiles no binary and no argument parser at all.
 
 ```
 run <job> [--params JSON | --preset NAME] [--tag K=V]... [--priority N]
-          [--wait [--timeout SECS]] [--dry-run]
+          [--key KEY] [--wait [--timeout SECS]] [--dry-run]
 ```
 
 launches a run. **without `--wait` this enqueues and returns**: the run goes on
 the queue for whatever is serving that database, and this process does not
 start executing something it is about to exit out from under. **with `--wait`
 this process executes it**, streams it, and exits with what it did.
+
+`--key` makes the launch [idempotent](launching.md#launching-once): the same
+key again is answered with the run the first call made, and nothing new is
+created. that is what a ci step that may run twice wants, and what a cron line
+wrapped in a retry wants:
+
+```
+$ hestan run deploy --key ci-build-4182 --quiet
+019ff1b7-8df6-7c3e-9b21-2f5a0c8e41d7
+$ hestan run deploy --key ci-build-4182 --quiet     # the retry
+019ff1b7-8df6-7c3e-9b21-2f5a0c8e41d7
+```
+
+without `--quiet` the second one says so (`... already launched under this key;
+nothing new was created`), and under `--json` it is
+`{"run_id": ..., "job": ..., "repeat": true}`. there is no `status` key on that
+object, unlike a launch: the run it names may have finished an hour ago, and
+saying `queued` about it would be a guess. `--key` with `--wait` waits for
+whichever run the key names.
+
+the same key for a different request is exit 2, naming the run it already has.
 
 ```
 retry <run>                     the same job again, with the same params
@@ -297,6 +318,31 @@ explain <job> [--params JSON]   the plan, without running it
 completions <bash|zsh|fish>
 serve [--addr HOST:PORT]
 ```
+
+### Backing up and coming back
+
+```
+backup <dest>                   a consistent copy of a sqlite run log
+resettle [--watch SECS]         hand back what a restored copy claims
+```
+
+`backup` runs sqlite's online backup, which is not a `cp`: a hestan database
+is in WAL mode, so the file on its own is missing whatever is still in the
+`-wal` beside it. against a postgres run log it says so and names `pg_dump`
+rather than doing something that looks like a backup and is not one. it refuses
+a destination that already exists.
+
+`resettle` is what makes a **restored** run log startable. every claim in a
+copy is held by a process that is not executing against this database and its
+deciding lease names a holder that cannot renew it, so a deployment refuses to
+come up on one until this has handed them back. it watches the leases for
+twenty seconds first and refuses if any of them moves, because a lease that
+moves is a process that is still running against this database; `--watch 0`
+skips that. both are [backup and recovery](backup.md), which is also where the
+hazard is written down.
+
+both need the database, so they are `--db` or embedded-mode commands: over
+`--server` they exit 6 and say which mode would serve them.
 
 ## doctor
 
@@ -504,6 +550,19 @@ and against a deployment that is already running somewhere:
     hestan --server https://hestan.internal run warehouse_load --wait --timeout 3600
 ```
 
+a ci step is the place `--key` earns itself, because a re-run of a job is one
+click away and a re-run of a **deploy** is not what anybody meant by it:
+
+```yaml
+- name: deploy, at most once per build
+  run: |
+    hestan --server https://hestan.internal \
+      run deploy --key "ci-$GITHUB_RUN_ID" --wait --timeout 900
+```
+
+re-running that step waits on the run the first attempt made rather than
+launching a second one, and exits with what it did.
+
 ## What it does not do
 
 - **`--server` cannot `explain`, and can only half `doctor`.** both read things
@@ -518,3 +577,8 @@ and against a deployment that is already running somewhere:
 - **`runs` has no status filter.** the store's query does not take one, and
   filtering a page after it was fetched would silently show you fewer rows than
   `--limit` asked for. `--json` and `jq` is the honest workaround for now.
+- **`backup` copies sqlite only, and `--server` serves neither it nor
+  `resettle`.** a copy has to land on the filesystem the database is on, and a
+  resettle has to write to a database nothing else is writing to, which a
+  running server is the opposite of. both exit 6 with the mode that would serve
+  them.

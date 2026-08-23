@@ -421,6 +421,22 @@ standalone binary for those two. [docs/cli.md](docs/cli.md).
   group: a group labels the graph and hestan draws it, a namespace divides the
   deployment and hestan enforces it. see
   [docs/namespaces.md](docs/namespaces.md)
+- **a launch key makes a retried request harmless**: `hestan run deploy --key
+  ci-build-4182`, or `{"key": "ci-build-4182"}` on the launch endpoint. same
+  key, same job, same params, and there is one run: the second call is answered
+  with the first one's id rather than launching beside it. the uniqueness is a
+  database constraint taken in the same transaction as the run row, so two api
+  processes racing one key still produce one run, and the same key with a
+  different request is refused by name. see
+  [docs/launching.md](docs/launching.md#launching-once)
+- **a copy of the run log says it is a copy**: `hestan backup out.db` takes a
+  consistent one while runs are being recorded (sqlite's online backup, not a
+  `cp` of a WAL database), and a deployment refuses to come up on a restored
+  one until `hestan resettle` has handed back the claims and the deciding lease
+  it carries, because every one of them names a process that is somewhere else.
+  what a copy does not contain, and the hazard of restoring one while workers
+  are still up, are written down rather than implied. see
+  [docs/backup.md](docs/backup.md)
 - **a param an op declares secret does not reach the store**:
   `Op::secret_params(["token"])` puts `[hestan:redacted]` in `runs.params`,
   `schedules.params` and `presets.params` while the ops still read the value,
@@ -479,7 +495,7 @@ the details live in [docs/](docs/README.md):
 [namespaces and owners](docs/namespaces.md),
 [authentication](docs/auth.md),
 [the http api](docs/http-api.md), [metrics](docs/metrics.md),
-[storage](docs/storage.md),
+[storage](docs/storage.md), [backup and recovery](docs/backup.md),
 [scaling](docs/scaling.md), [containers](docs/containers.md),
 [embedding](docs/embedding.md), [stability](docs/stability.md), and
 [development](docs/development.md).

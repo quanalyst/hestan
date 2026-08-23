@@ -276,6 +276,11 @@ duplicate decision impossible is the store:
   written in one transaction so a refused tick launches nothing.
 - one run per `(sensor, run_key)`, on the `sensor_run_keys` primary key, the
   same way and since [run keys](sensors.md#run-keys) existed.
+- one run per [launch key](launching.md#launching-once), on the `launch_keys`
+  primary key, again in the transaction that writes the run. that one is not a
+  decision a scheduler makes; it is two api processes behind a load balancer
+  taking the same retried request, which the lease has nothing to say about at
+  all.
 
 a distributed lock fails exactly when a process pauses, a disk stalls or a
 network splits, which is to say it fails at the moment its holder is most

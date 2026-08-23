@@ -79,6 +79,10 @@ for work that is naturally idempotent.
 pick a key that names the *work*, not the moment: the partition, the day, the
 upstream run id, the file's mtime. `"2026-08-09"` is a key; `Utc::now()` is not.
 
+a [launch key](launching.md#launching-once) is the same idea aimed at a
+caller rather than at a sensor, and the two do not meet: a run key is scoped to
+its sensor and a launch key is the caller's name for one request.
+
 **keys are never collected on their own.** a daily-keyed sensor writes a row a
 day for as long as the database exists.
 [retention](storage.md#retention) prunes them on the same age cutoff it prunes

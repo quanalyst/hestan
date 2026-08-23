@@ -272,6 +272,22 @@ CREATE TABLE sensor_run_keys (         -- added in v11
     PRIMARY KEY (sensor, run_key)
 );
 
+CREATE TABLE launch_keys (             -- added in v23
+    launch_key TEXT NOT NULL PRIMARY KEY,
+    job TEXT NOT NULL,
+    params_hash TEXT NOT NULL, -- sha-256 of the params as stored
+    run_id TEXT NOT NULL,
+    launched_at TEXT NOT NULL
+);
+CREATE INDEX launch_keys_run ON launch_keys(run_id);
+
+CREATE TABLE store_copy (              -- added in v22
+    only_row INTEGER PRIMARY KEY CHECK (only_row = 1),
+    taken_at TEXT,             -- when hestan took the copy; null if it did not
+    taken_from TEXT,           -- the store it was copied from
+    settled_at TEXT            -- when `hestan resettle` handed its claims back
+);
+
 CREATE TABLE presets (                  -- added in v12
     job TEXT NOT NULL,
     name TEXT NOT NULL,
@@ -354,6 +370,25 @@ silently, which is worse than the duplicate the key exists to prevent. the
 primary key is the claim, so two evaluations racing the same key still launch
 one run. `run_id` is a record of which run took the key rather than a foreign
 key: retention deletes runs and leaves keys, which is the right way round.
+
+`launch_keys` is what makes a plain launch
+[idempotent](launching.md#launching-once), and it is the same mechanism
+`sensor_run_keys` is, aimed at a caller rather than at a sensor. the row is
+inserted in the same transaction that creates the run it names, and the primary
+key on `launch_key` alone is what refuses a second launch: keyed per job
+instead, one key would mean two things on two jobs and hand somebody a second
+run without either caller seeing it. `params_hash` is a sha-256 of the params
+**as stored**, so two launches differing only in a [secret](secrets.md) param
+hash the same and the second is answered with the first one's run. unlike
+`sensor_run_keys`, these go **with** the run they name, through
+`launch_keys_run`: a key that outlived its run would hand a retrying caller an
+id nothing can be looked up under.
+
+`store_copy` is empty on every database but a copy. `Store::backup_to` writes
+the row into the copy it takes, which is what lets a deployment refuse to come
+up on a restored run log before it acts on claims that describe another
+machine; `Store::resettle` sets `settled_at`. only a copy hestan took carries
+it, and [backup and recovery](backup.md) is the whole of what that means.
 
 `runs.error` is the run's own failure summary: the first op that terminally
 failed, as `op {name} failed: {message}`, written in the same statement as
@@ -452,7 +487,13 @@ because a resume continues a run and a replay re-runs one; version 20 adds the
 [one fire per occurrence](#one-fire-per-occurrence) and is the only unique
 constraint in this schema that was not already a primary key; version 21 adds
 the `decider` table, one row holding the
-[deciding lease](scaling.md#the-deciding-lease) and the term it is on.
+[deciding lease](scaling.md#the-deciding-lease) and the term it is on; version
+22 adds the `store_copy` table, empty on every database that is not a
+[copy](backup.md) and one row on one that is; version 23 adds the
+`launch_keys` table and its `launch_keys_run` index, which is
+[one run per launch key](launching.md#launching-once). both are new tables and
+neither reads or rewrites a row, so the upgrade is two `CREATE TABLE`s on
+either backend and a deployment that uses neither notices nothing.
 
 an older file at any version opens straight into the current one, rows
 intact: the v8 rebuild copies every keyed materialization across, where it becomes
@@ -461,7 +502,7 @@ existing row with a null partition, which is exactly what an unpartitioned
 asset is. every pending step and the version stamp run in one transaction
 (sqlite DDL is transactional), so a crash or failure mid-migration leaves the
 file exactly as it was found, never half-migrated. a database stamped
-with a version newer than the build refuses to open (`db schema v21 is newer
+with a version newer than the build refuses to open (`db schema v24 is newer
 than this build`) instead of quietly writing an older stamp over it.
 
 ### One fire per occurrence
@@ -552,6 +593,13 @@ started. one that dies while everything is up is caught by the same test on a
 loop: every process renews the leases it holds every 15 seconds and takes back
 anything nobody has renewed for 60, failing it or requeueing it per
 [`Reclaim`](scaling.md#claims-and-leases).
+
+**a restored database is the one case this gets wrong on purpose.** believing
+leases is right on a live store and wrong on a copy, where a claim with time
+left on it names a process that is not executing anything here. so a copy is
+handled by [`hestan resettle`](backup.md#resettle) instead, and a deployment
+refuses to come up on a copy that has not had it. see
+[backup and recovery](backup.md).
 
 ## When the database will not take a write
 
@@ -701,10 +749,16 @@ matters here, since a failure is what anybody replays: `Retention::days(30)
 .failed_days(180)` keeps six months of the runs worth re-running and a month
 of the ones that worked.
 
-the sweep also takes [sensor run keys](sensors.md) older than the age cutoff
-(nothing else collects them, and a sensor keyed by the day would keep a row
-per day forever) and delivered [notifications](notifications.md) older than
-it.
+the sweep also takes both kinds of key older than the age cutoff, on one
+cutoff rather than two: [sensor run keys](sensors.md) and
+[launch keys](launching.md#launching-once). nothing else collects either, and a
+sensor keyed by the day or an api called a thousand times an hour would keep a
+row per request forever. **with no retention policy configured neither is
+pruned**, so a key is honoured for as long as the database lives, which is what
+"how long is a launch key honoured" comes to. a launch key also goes with the
+run it names, whenever that run is pruned, so it can never hand a retrying
+caller an id nothing can be looked up under. delivered
+[notifications](notifications.md) older than the cutoff go the same way.
 undelivered notifications stay at any age: one that never got through is not
 history, it is something outstanding.
 

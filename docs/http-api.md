@@ -429,6 +429,19 @@ object. `Hestan::run_tags` defaults merge underneath it, per-launch winning.
 the process default; higher goes first, ties by creation time, negatives are
 legal. it combines with everything else here.
 
+`{"key": "ci-build-4182"}` makes the launch [idempotent](launching.md#launching-once):
+one run per key, ever. the first call is `202 {"run_id": "..."}` exactly as
+before; a second call with the same key, the same job and the same params is
+`200 {"run_id": "...", "repeat": true}` naming that first run, and launches
+nothing. the same key with different params, or on a different job, is a `409`
+naming the run it already has (`launch key ci-build-4182 already launched run
+019... of job deploy, and this call names ...`); a key is the caller's name for
+one request, so it is unique across the deployment rather than per job. the
+uniqueness is a database constraint taken in the same transaction as the run,
+so two api processes racing one key still produce one run. `key` and `ops` are
+alternatives: naming both is a `400`. how long a key is honoured, and what
+prunes it, is [retention](launching.md#how-long-a-key-is-honoured).
+
 `{"ops": ["clean", "publish"]}` runs only those ops and everything downstream
 of them, [seeding nothing](launching.md#launching-a-subset-of-ops). their own
 upstreams must therefore be in the set, or the request is a 400 naming what is

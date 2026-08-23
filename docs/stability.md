@@ -97,6 +97,14 @@ constructors and accessors**. it is a thing callers build (`Owner::team("x")
 expected to grow, so a literal of it was never offered. it is not counted in
 the thirty-one, and adding a field to it will not break anybody.
 
+`Launch`, `Restored` and `Resettled` are built the same way and for the same
+reason. each answers a question that is expected to gain a second half:
+[`Launch`](launching.md#launching-once) is what a keyed launch came to,
+[`Restored`](backup.md) is what a run log says about having come out of a copy,
+and [`Resettled`](backup.md#resettle) is what a resettle handed back. none of
+them is a thing you build, so accessors cost a caller nothing and a new field
+costs them nothing either.
+
 ## The extension points
 
 a trait somebody implements is a contract whether or not it was meant as one,

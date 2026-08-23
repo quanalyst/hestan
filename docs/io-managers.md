@@ -302,6 +302,20 @@ the op run is `failed` with no output, its downstream is skipped, and the run
 fails. recording success for a value that was never stored would strand the
 next resume, which would seed a handle to nothing.
 
+## What a backup does not contain
+
+the counterpart to the section below, and the one nobody expects. a manager
+puts op outputs **outside** the store, so a copy of the store holds the handles
+and none of what they point at. restore a run log without the directory beside
+it and you have materializations that say an asset is built, with a fingerprint
+and a row count, pointing at parquet that is not on this machine. nothing in
+the store can tell you, and nothing checks until a build, a resume or a replay
+tries to read one.
+
+so the directory is part of the backup, from the same instant.
+[backup and recovery](backup.md#what-a-copy-does-not-contain) is the whole of
+it.
+
 ## What retention takes
 
 a run's rows are the only record that the run existed. so when
