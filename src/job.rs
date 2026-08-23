@@ -9,7 +9,7 @@ use crate::hooks::{Hooks, OpEvent, RunEvent};
 use crate::model::Overlap;
 use crate::op::Op;
 use crate::retention::Retention;
-use crate::whose::check_namespace;
+use crate::whose::{Owner, check_namespace};
 
 /// a validated dag of ops, built via [`Job::builder`].
 ///
@@ -41,6 +41,7 @@ pub struct Job {
     name: String,
     description: Option<String>,
     namespace: Option<String>,
+    owner: Option<Owner>,
     ops: Vec<Op>,
     order: Vec<String>,
     max_parallel: Option<usize>,
@@ -68,6 +69,7 @@ impl Job {
             name: name.into(),
             description: None,
             namespace: None,
+            owner: None,
             ops: Vec::new(),
             instances: Vec::new(),
             max_parallel: None,
@@ -98,6 +100,13 @@ impl Job {
     /// existed.
     pub fn namespace(&self) -> Option<&str> {
         self.namespace.as_deref()
+    }
+
+    /// who to wake when a run of this job fails, from
+    /// [`JobBuilder::owner`]. `None` for a job nobody claimed, which is every
+    /// job in a deployment that declares no owners.
+    pub fn owner(&self) -> Option<&Owner> {
+        self.owner.as_ref()
     }
 
     /// every op, including the ones a [`Graph`] instance flattened into the
@@ -259,6 +268,7 @@ impl Job {
             name,
             description,
             namespace: None,
+            owner: None,
             ops,
             order,
             max_parallel: None,
@@ -879,6 +889,7 @@ pub struct JobBuilder {
     name: String,
     description: Option<String>,
     namespace: Option<String>,
+    owner: Option<Owner>,
     ops: Vec<Op>,
     instances: Vec<Instance>,
     max_parallel: Option<usize>,
@@ -924,6 +935,34 @@ impl JobBuilder {
     /// [`build`](Self::build).
     pub fn namespace(mut self, name: impl Into<String>) -> Self {
         self.namespace = Some(name.into());
+        self
+    }
+
+    /// who to wake when a run of this job fails.
+    ///
+    /// ```no_run
+    /// # use hestan::{Job, Owner};
+    /// Job::builder("orders_etl").owner(
+    ///     Owner::team("data-platform")
+    ///         .contact("#data-alerts")
+    ///         .escalates_to("ops@example.com"),
+    /// )
+    /// # ;
+    /// ```
+    ///
+    /// **it reaches the alert on its own.** the terminal event of every run of
+    /// this job carries it as [`RunEvent::owner`](crate::RunEvent), so
+    /// [`on_failure`](crate::Hestan::on_failure), a run hook and the built-in
+    /// [notifiers][n] all see it without the caller threading it through, and
+    /// `hestan owner <name>` answers it from the command line.
+    ///
+    /// what an [`Owner`] is and what it deliberately is not (a rota, a timer,
+    /// an acknowledgement) is on the type.
+    ///
+    #[cfg_attr(feature = "http", doc = "[n]: crate::notify")]
+    #[cfg_attr(not(feature = "http"), doc = "[n]: crate")]
+    pub fn owner(mut self, owner: Owner) -> Self {
+        self.owner = Some(owner);
         self
     }
 
@@ -1070,6 +1109,7 @@ impl JobBuilder {
             name: self.name,
             description: self.description,
             namespace: self.namespace,
+            owner: self.owner,
             ops,
             order,
             max_parallel: self.max_parallel,

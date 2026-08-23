@@ -9,6 +9,7 @@ import "./lineage.test";
 import "./log.test";
 import "./markdown.test";
 import "./metalist.test";
+import "./owner.test";
 import "./rate.test";
 import "./replay.test";
 import "./role.test";

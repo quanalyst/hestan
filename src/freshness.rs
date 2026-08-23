@@ -10,6 +10,7 @@ use crate::error::Error;
 use crate::executor::Runner;
 use crate::hooks::fire_hooks;
 use crate::model::Freshness;
+use crate::whose::Owner;
 
 /// how often the checker re-evaluates every declared policy. a policy is a
 /// claim about hours or days, so a minute of lag on noticing one broke is
@@ -52,6 +53,16 @@ pub struct LateEvent {
     pub kind: LateKind,
     /// the job or the asset, by name.
     pub name: String,
+    /// who to wake about it, from
+    /// [`JobBuilder::owner`](crate::JobBuilder::owner) or
+    /// [`Asset::owner`](crate::Asset::owner); `None` for one nobody claimed.
+    ///
+    /// **this is the path an asset's owner reaches an alert by.** a run event
+    /// carries the owner of the job the run was of, and an asset build runs
+    /// under the internal `assets` job; a freshness crossing is about the asset
+    /// itself, so this is its own owner.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub owner: Option<Owner>,
     /// how far past the policy's deadline it is, the moment it crossed.
     #[serde(rename = "late_by_secs", serialize_with = "as_secs")]
     pub late_by: Duration,
@@ -72,6 +83,7 @@ pub type LateHook = Arc<dyn Fn(LateEvent) + Send + Sync>;
 pub(crate) struct Verdict {
     pub kind: LateKind,
     pub name: String,
+    pub owner: Option<Owner>,
     pub freshness: Freshness,
     pub last_success: Option<DateTime<Utc>>,
 }
@@ -82,6 +94,7 @@ impl Verdict {
         Some(LateEvent {
             kind: self.kind,
             name: self.name.clone(),
+            owner: self.owner.clone(),
             late_by: self.freshness.late_by()?,
             last_success: self.last_success,
         })
@@ -134,6 +147,7 @@ pub(crate) fn verdicts(
         out.push(Verdict {
             kind: LateKind::Job,
             name: name.clone(),
+            owner: runner.jobs()[name].owner().cloned(),
             freshness: Freshness::of(last, within, now),
             last_success: last,
         });
@@ -149,6 +163,7 @@ pub(crate) fn verdicts(
                 out.push(Verdict {
                     kind: LateKind::Asset,
                     name: meta.name.clone(),
+                    owner: meta.owner.clone(),
                     freshness,
                     last_success: last,
                 });
@@ -429,6 +444,51 @@ mod tests {
         let fired = check_once(&runner, &reg, later);
         assert_eq!(fired.len(), 1, "a relapse is news again");
         assert_eq!(fired[0].late_by.as_secs(), 7200);
+    }
+
+    // the path an asset's owner reaches an alert by. a run event carries the
+    // owner of the job the run was of, and an asset build runs under the
+    // internal `assets` job; a crossing into late is about the asset itself,
+    // so it carries the asset's own owner
+    #[test]
+    fn a_crossing_says_who_owns_the_thing_that_went_late() {
+        let store = Store::open(":memory:").unwrap();
+        let owned = Job::builder("etl")
+            .fresh_within(HOUR)
+            .owner(crate::Owner::team("data-platform").contact("#data-alerts"))
+            .op(Op::new("noop", |_| async { Ok(json!(null)) }))
+            .build()
+            .unwrap();
+        let runner = Runner::new([owned], store.clone()).unwrap();
+        let reg = registry(vec![
+            Asset::new("orders", |_| async { Ok(json!(null)) })
+                .fresh_within(HOUR)
+                .owner(crate::Owner::team("finance").person("ada")),
+            // and one nobody claimed, beside it
+            Asset::new("scratch", |_| async { Ok(json!(null)) }).fresh_within(HOUR),
+        ]);
+        let now = Utc::now();
+        let old = now - chrono::Duration::hours(2);
+        plant_success(&store, "etl", old);
+        plant_materialization(&store, "orders", None, old);
+        plant_materialization(&store, "scratch", None, old);
+
+        let fired = check_once(&runner, &reg, now);
+        let owner_of = |name: &str| {
+            fired
+                .iter()
+                .find(|e| e.name == name)
+                .unwrap_or_else(|| panic!("nothing late called {name}"))
+                .owner
+                .clone()
+        };
+        assert_eq!(
+            owner_of("etl").unwrap().to_string(),
+            "data-platform (#data-alerts)"
+        );
+        assert_eq!(owner_of("orders").unwrap().who(), "ada of finance");
+        // an absence, rather than an owner with nothing in it
+        assert_eq!(owner_of("scratch"), None);
     }
 
     #[test]

@@ -2999,6 +2999,18 @@ impl Store {
         Ok(())
     }
 
+    /// overwrite one notification's payload. tests only, and for one thing:
+    /// standing in for a row an older hestan wrote, which is not something a
+    /// current one can produce.
+    #[cfg(test)]
+    pub(crate) fn repayload(&self, id: i64, payload: &serde_json::Value) -> Result<(), Error> {
+        self.conn().execute(
+            "UPDATE notifications SET payload = ?1 WHERE id = ?2",
+            args![payload.to_string(), id],
+        )?;
+        Ok(())
+    }
+
     /// put a delivered notification back where a crash between the hook
     /// returning and the mark landing would have left it. tests only: this is
     /// the one thing a process cannot do to itself honestly.

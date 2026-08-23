@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::executor::{Runner, panic_payload};
 use crate::model::{OpStatus, RunStatus, Trigger};
+use crate::whose::Owner;
 
 /// what an [`on_run_finished`](crate::Hestan::on_run_finished) hook receives:
 /// a run reached a terminal status, whichever one.
@@ -22,6 +23,20 @@ pub struct RunEvent {
     pub run_id: String,
     /// which job it was of.
     pub job: String,
+    /// who owns that job, from [`JobBuilder::owner`](crate::JobBuilder::owner);
+    /// `None` for a job nobody claimed.
+    ///
+    /// **this is how an owner reaches an alert.** it is filled in from the
+    /// job's declaration when the event is built, so a failure hook asks the
+    /// event who to wake rather than being handed a recipient by whoever
+    /// registered it.
+    ///
+    /// a run of the internal `assets` job carries that job's owner and not the
+    /// owner of whichever asset was being built: see
+    /// [`Asset::owner`](crate::Asset::owner) for why, and what does carry an
+    /// asset's owner.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner: Option<Owner>,
     /// what caused the run, worth filtering on: a failed retry and a failed
     /// nightly are usually not the same page.
     pub trigger: Trigger,
@@ -97,6 +112,10 @@ pub struct RunFailure {
     pub run_id: String,
     /// which job it was of.
     pub job: String,
+    /// who owns that job; `None` for a job nobody claimed. see
+    /// [`RunEvent::owner`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub owner: Option<Owner>,
     /// what caused the run.
     pub trigger: Trigger,
     /// the first op that terminally failed this run.
@@ -150,6 +169,7 @@ pub(crate) fn as_run_hook(hook: FailureHook) -> RunHook {
         hook(RunFailure {
             run_id: e.run_id,
             job: e.job,
+            owner: e.owner,
             trigger: e.trigger,
             failed_op: e.failed_op,
             error: e.error,
@@ -410,6 +430,7 @@ mod tests {
         let payload = serde_json::to_value(RunEvent {
             run_id: run_id.to_string(),
             job: "etl".into(),
+            owner: Some(Owner::team("data").contact("#alerts")),
             trigger: Trigger::Schedule,
             status: RunStatus::Failed,
             failed_op: Some("load".into()),
@@ -457,6 +478,13 @@ mod tests {
         let seen = seen.lock().unwrap();
         assert_eq!(seen.len(), 1);
         assert_eq!(seen[0].run_id, "r1");
+        // and it still says who to wake: the owner is written into the row
+        // with the rest of the event, so the process that finally delivers
+        // does not have to hold the registry the run was launched from
+        assert_eq!(
+            seen[0].owner.as_ref().and_then(Owner::team_name),
+            Some("data")
+        );
         assert_eq!(seen[0].status, RunStatus::Failed);
         assert_eq!(seen[0].failed_op.as_deref(), Some("load"));
         assert_eq!(seen[0].error.as_deref(), Some("no good"));
@@ -554,10 +582,34 @@ mod tests {
         );
     }
 
+    // a row an older hestan wrote has no owner key at all, and the loop reads
+    // it as an event with no owner rather than failing to parse the payload
+    // and giving up on the alert
+    #[tokio::test]
+    async fn a_notification_written_before_owners_existed_still_delivers() {
+        let store = Store::open(":memory:").unwrap();
+        plant(&store, "r1");
+        // the payload as it was written before this phase: every key it had,
+        // and not one it did not
+        let id = store.notifications(None, 10).unwrap()[0].id;
+        let mut payload = store.notifications(None, 10).unwrap()[0].payload.clone();
+        payload.as_object_mut().unwrap().remove("owner");
+        assert!(payload.get("owner").is_none());
+        store.repayload(id, &payload).unwrap();
+
+        let (seen, hook) = collector();
+        let runner = runner(store, hook);
+        assert_eq!(deliver_once(&runner, Utc::now()).await, 1);
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 1, "the old row was given up on");
+        assert_eq!(seen[0].owner, None);
+    }
+
     fn event(status: RunStatus) -> RunEvent {
         RunEvent {
             run_id: "r1".into(),
             job: "etl".into(),
+            owner: Some(Owner::team("data")),
             trigger: Trigger::Schedule,
             status,
             failed_op: Some("load".into()),

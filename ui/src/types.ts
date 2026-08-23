@@ -169,12 +169,26 @@ export interface LateEntry {
   last_success: string | null;
 }
 
+// who to wake about a job or an asset, as the api sends it: the halves nobody
+// declared are absent keys rather than empty strings, so an owner that named
+// only a team is exactly that
+export interface Owner {
+  team?: string;
+  person?: string;
+  contact?: string;
+  // a second contact and nothing more: hestan carries it, waits on nothing,
+  // and never notices that the first one did not answer
+  escalates_to?: string;
+}
+
 export interface JobSummary {
   name: string;
   description: string | null;
   // which slice of the deployment it is in; null in one that declares no
   // namespaces. not a group: see AssetSummary below
   namespace: string | null;
+  // who to wake when a run of it fails; null for a job nobody claimed
+  owner: Owner | null;
   ops: OpSummary[];
   // every op's schema merged into one; null when no op declared any
   params_schema: ParamsSchema | null;
@@ -520,6 +534,8 @@ export interface AssetSummary {
   // whose it is: what it declared, else null. a boundary the api and a token
   // scope are narrowed by, and never derived from the group below
   namespace: string | null;
+  // who to wake about it; null for one nobody claimed
+  owner: Owner | null;
   // what it is labeled with on the graph: what it declared, else the part of
   // the name before the first "/", else null for an asset in no group at all
   group: string | null;

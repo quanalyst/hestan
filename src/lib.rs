@@ -207,6 +207,7 @@ pub use schedule::Schedule;
 pub use secret::REDACTED;
 pub use sensor::{RunRequest, RunStatusSensor, RunSummary, Sensor, SensorCtx};
 pub use store::{EventQuery, Settled, Store};
+pub use whose::Owner;
 
 /// what a file that defines jobs, ops and assets needs, in one import.
 ///

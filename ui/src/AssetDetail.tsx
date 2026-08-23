@@ -14,7 +14,7 @@ import type {
   PartitionEntry,
   Trends,
 } from "./types";
-import { assetPath, numericMetaKeys, relTime, shortId } from "./util";
+import { assetPath, numericMetaKeys, ownerLine, relTime, shortId } from "./util";
 
 // enough hex to tell fingerprints apart at a glance; the title carries the rest
 const shortHash = (fp: string) => fp.slice(0, 12);
@@ -142,6 +142,27 @@ export default function AssetDetail({
           <span className="op-line-label">state</span>
           <span className="mono">{asset.stale ? "stale" : "fresh"}</span>
         </div>
+        {/* who to wake about this one. the line is absent for an asset nobody
+            claimed, rather than a label with nothing after it */}
+        {ownerLine(asset.owner) !== null && (
+          <div className="op-line">
+            <span className="op-line-label">owner</span>
+            <span>
+              {ownerLine(asset.owner)}
+              {asset.owner?.escalates_to && (
+                <span className="muted"> · then {asset.owner.escalates_to}</span>
+              )}
+            </span>
+          </div>
+        )}
+        {/* and whose slice of the deployment it is in, which is not the group
+            it is drawn under */}
+        {asset.namespace !== null && (
+          <div className="op-line">
+            <span className="op-line-label">namespace</span>
+            <span className="mono">{asset.namespace}</span>
+          </div>
+        )}
         {asset.partitions && (
           <div className="op-line">
             <span className="op-line-label">partitions</span>

@@ -17,7 +17,7 @@ import {
 } from "../src/catalog";
 import { collapseGroups, neighbourhood } from "../src/dag";
 import type { DagNode } from "../src/DagView";
-import type { AssetPolicy, AssetSummary, Origin, PartitionCounts } from "../src/types";
+import type { AssetPolicy, AssetSummary, Origin, Owner, PartitionCounts } from "../src/types";
 
 interface Over {
   stale?: boolean;
@@ -28,6 +28,7 @@ interface Over {
   last_success?: string | null;
   group?: string | null;
   namespace?: string | null;
+  owner?: Owner | null;
   provenance?: Origin[];
 }
 
@@ -43,6 +44,7 @@ const prefixGroup = (name: string): string | null => {
 export const asset = (name: string, over: Over = {}): AssetSummary => ({
   name,
   namespace: over.namespace ?? null,
+  owner: over.owner ?? null,
   group: over.group === undefined ? prefixGroup(name) : over.group,
   group_hue: 200,
   provenance: over.provenance ?? [],

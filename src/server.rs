@@ -582,6 +582,9 @@ pub(crate) fn job_summary(
         // which slice of the deployment it is in; null in a deployment that
         // declares no namespaces, which is every one built before they existed
         "namespace": job.namespace(),
+        // who to wake when a run of it fails; null for a job nobody claimed,
+        // and absent keys inside it for the halves nobody said
+        "owner": job.owner(),
         "ops": ops,
         "params_schema": job.params_schema(),
         "schedules": schedules,
@@ -1338,6 +1341,8 @@ pub(crate) fn assets_json(registry: &AssetRegistry, store: &Store) -> Result<Val
                 // declares no namespaces. not the group below, which is a
                 // label on the graph and falls back to the name
                 "namespace": meta.namespace,
+                // who to wake about it; null for one nobody claimed
+                "owner": meta.owner,
                 // what it is labeled with: what it declared, else the part of
                 // the name before the first "/", else null
                 "group": meta.group(),
@@ -2054,6 +2059,7 @@ async fn list_late(State(st): State<AppState>) -> Result<Json<Value>, ApiError> 
             json!({
                 "kind": v.kind.as_str(),
                 "name": v.name,
+                "owner": v.owner,
                 "late_by_secs": v.freshness.late_by().map(|d| d.as_secs()),
                 "last_success": v.last_success,
             })
@@ -7503,6 +7509,60 @@ mod tests {
         };
         assert_eq!(of("etl"), json!("finance"));
         assert_eq!(of("cron_sweep"), Value::Null);
+    }
+
+    // the two pages a person opens when something is wrong: the job behind a
+    // run, and the asset itself. an owner nobody declared is absent from the
+    // payload rather than a blank string the ui would draw as a name
+    #[tokio::test]
+    async fn the_job_and_the_asset_payloads_say_who_owns_them() {
+        let owned = Job::builder("etl")
+            .owner(
+                crate::Owner::team("data-platform")
+                    .person("ada")
+                    .contact("#data-alerts")
+                    .escalates_to("ops@example.invalid"),
+            )
+            .op(Op::new("echo", |_| async { Ok(json!(null)) }))
+            .build()
+            .unwrap();
+        let assets = AssetRegistry::new(
+            vec![
+                crate::Asset::source("orders").owner(crate::Owner::team("finance")),
+                crate::Asset::source("scratch"),
+            ],
+            Vec::new(),
+            Vec::new(),
+        )
+        .unwrap();
+        let st = state(vec![owned]);
+        let st = AppState {
+            assets: Arc::new(assets),
+            ..st
+        };
+
+        let Json(job) = get_job(State(st.clone()), Path("etl".into()))
+            .await
+            .unwrap();
+        assert_eq!(job["owner"]["team"], "data-platform");
+        assert_eq!(job["owner"]["person"], "ada");
+        assert_eq!(job["owner"]["contact"], "#data-alerts");
+        assert_eq!(job["owner"]["escalates_to"], "ops@example.invalid");
+
+        let Json(listed) = list_assets(State(st), everything()).await.unwrap();
+        let of = |name: &str| {
+            listed["assets"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|a| a["name"] == name)
+                .unwrap()["owner"]
+                .clone()
+        };
+        assert_eq!(of("orders"), json!({ "team": "finance" }));
+        // nobody claimed it, so there is nothing there: null, and not an
+        // object of empty strings
+        assert_eq!(of("scratch"), Value::Null);
     }
 
     // declared rather than parsed out of the name, and this is what that buys:

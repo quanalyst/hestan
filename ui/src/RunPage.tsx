@@ -33,6 +33,7 @@ import {
   lineage,
   opBadge,
   outputLine,
+  ownerLine,
   relTime,
   replayLine,
   resumeLine,
@@ -398,6 +399,15 @@ function RunView({ id }: { id: string }) {
               </>
             )}
           </p>
+          {/* who to wake, read off the job this run is of. absent for a job
+              nobody claimed, which reads as an absence rather than as a name
+              that came back blank */}
+          {job && ownerLine(job.owner) !== null && (
+            <p className="muted">
+              owned by {ownerLine(job.owner)}
+              {job.owner?.escalates_to && <> · then {job.owner.escalates_to}</>}
+            </p>
+          )}
           {run.error && <p className="mono muted op-err">{run.error}</p>}
         </div>
         <div className="run-actions">

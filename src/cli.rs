@@ -268,6 +268,8 @@ enum Command {
     Priority(PriorityArgs),
     /// what happened, across every subsystem
     Events(EventsArgs),
+    /// who owns a job or an asset
+    Owner(OwnerArgs),
     /// one command that answers "why is nothing running"
     Doctor,
     /// the plan a run would follow, without running it
@@ -293,6 +295,12 @@ struct AssetsArgs {
     /// deployment one team declared
     #[arg(long, value_name = "NAME")]
     namespace: Option<String>,
+}
+
+#[derive(Args)]
+struct OwnerArgs {
+    /// the job or the asset to ask about
+    name: String,
 }
 
 #[derive(Args)]
@@ -1010,6 +1018,8 @@ async fn dispatch(reach: Reach, command: Command, out: &Out) -> Result<(), Fail>
         }
 
         Command::Events(args) => events(reach, args, out).await,
+
+        Command::Owner(args) => owner(reach, args, out).await,
 
         Command::Doctor => doctor(reach, out).await,
 
@@ -2053,8 +2063,8 @@ fn render_assets(answer: &Value, out: &Out) {
         };
         table.row([
             Cell::plain(s(asset, "name")),
-            // written out rather than coloured: the group is the answer to
-            // "whose is this", and a column of names is what a pipe carries
+            // written out rather than coloured: a column of names is what a
+            // pipe carries, and the hue is for the graph
             Cell::plain(asset["group"].as_str().unwrap_or("-")),
             Cell::plain(origin_of(asset)),
             state,
@@ -2406,6 +2416,95 @@ impl Finding {
             "says": self.says,
             "fix": self.fix,
         })
+    }
+}
+
+/// who owns a job or an asset, by name.
+///
+/// both, where a job and an asset share one: they are two different things
+/// under one word and picking one would be a guess about which was meant.
+///
+/// **an owner nobody declared is an absence.** the row is still there, saying
+/// the thing exists and nobody claimed it, which is a different answer from
+/// "no such job", and neither of them is a blank line.
+async fn owner(reach: Reach, args: OwnerArgs, out: &Out) -> Result<(), Fail> {
+    let name = args.name;
+    let mut found: Vec<Value> = Vec::new();
+    match reach {
+        Reach::Server(api) => {
+            // a 404 here is "no job by that name", which is half an answer
+            // rather than a failure: the asset half is still to come
+            if let Ok(job) = api.get(&format!("/api/jobs/{}", escape(&name))).await {
+                found.push(json!({
+                    "kind": "job", "name": name, "owner": job["owner"],
+                }));
+            }
+            let assets = api.get("/api/assets").await?;
+            if let Some(asset) = list(&assets, "assets")
+                .iter()
+                .find(|a| a["name"] == json!(name))
+            {
+                found.push(json!({
+                    "kind": "asset", "name": name, "owner": asset["owner"],
+                }));
+            }
+        }
+        Reach::Local(app) => {
+            let app = app.inspect()?;
+            if let Some(job) = app.jobs.iter().find(|j| j.name() == name) {
+                found.push(json!({
+                    "kind": "job", "name": name, "owner": job.owner(),
+                }));
+            }
+            if let Some(meta) = app.registry.get(&name) {
+                found.push(json!({
+                    "kind": "asset", "name": name, "owner": meta.owner,
+                }));
+            }
+        }
+        Reach::Store { target, .. } => {
+            return Err(no_registry(&target, "asking who owns something"));
+        }
+    }
+    if found.is_empty() {
+        return Err(Fail::usage(format!("no job or asset called {name}")));
+    }
+    if out.json {
+        out.object(&json!({ "owners": found }));
+        return Ok(());
+    }
+    if out.quiet {
+        for row in &found {
+            println!("{}", who_owns(&row["owner"]));
+        }
+        return Ok(());
+    }
+    let mut table = Table::new(["WHAT", "NAME", "OWNER", "CONTACT", "ESCALATES TO"]);
+    for row in &found {
+        let owner = &row["owner"];
+        table.row([
+            Cell::plain(s(row, "kind")),
+            Cell::plain(s(row, "name")),
+            Cell::plain(who_owns(owner)),
+            Cell::plain(owner["contact"].as_str().unwrap_or("-")),
+            Cell::plain(owner["escalates_to"].as_str().unwrap_or("-")),
+        ]);
+    }
+    table.print(out, "nobody");
+    Ok(())
+}
+
+/// the owner half of a row in words: `ada of data-platform`, `data-platform`,
+/// or `-` for a thing nobody claimed.
+///
+/// `-` rather than an empty cell, so a column of them reads as "nobody
+/// declared one" and not as a rendering that went wrong.
+fn who_owns(owner: &Value) -> String {
+    match (owner["person"].as_str(), owner["team"].as_str()) {
+        (Some(person), Some(team)) => format!("{person} of {team}"),
+        (Some(person), None) => person.to_string(),
+        (None, Some(team)) => team.to_string(),
+        (None, None) => "-".to_string(),
     }
 }
 
@@ -3486,6 +3585,8 @@ enum Names {
     Schedules,
     Sensors,
     Runs,
+    /// jobs and assets together, for the one command that takes either.
+    Owned,
 }
 
 /// the name this process was invoked as, which is what a completion script
@@ -3530,6 +3631,14 @@ fn complete(reach: Result<Reach, Fail>, what: Names, out: &Out) -> Result<(), Fa
             .topo()
             .map(|meta| meta.name.clone())
             .collect(),
+        // both, because `owner` takes either and a completion that offered
+        // only half of them would read as the other half not existing
+        Names::Owned => {
+            let app = reach?.inspect()?;
+            let mut names: Vec<String> = app.jobs.iter().map(|j| j.name().to_string()).collect();
+            names.extend(app.registry.topo().map(|meta| meta.name.clone()));
+            names
+        }
         // out of the table rather than the registry: a schedule can be paused
         // and a sensor can be one a probe added, and either way the row is the
         // thing the commands take
@@ -3600,6 +3709,7 @@ _{ident}_complete() {{
     case "$prev" in
         run|explain) what=jobs ;;
         build|backfill) what=assets ;;
+        owner) what=owned ;;
         show|logs|cancel|retry|resume|priority) what=runs ;;
         sensor) what=sensors ;;
         schedule) what=schedules ;;
@@ -3619,6 +3729,7 @@ _{ident}() {{
     case "${{words[CURRENT-1]}}" in
         run|explain) what=jobs ;;
         build|backfill) what=assets ;;
+        owner) what=owned ;;
         show|logs|cancel|retry|resume|priority) what=runs ;;
         sensor) what=sensors ;;
         schedule) what=schedules ;;
@@ -3642,6 +3753,8 @@ function __{ident}_complete
                 set what jobs
             case build backfill
                 set what assets
+            case owner
+                set what owned
             case show logs cancel retry resume priority
                 set what runs
             case sensor

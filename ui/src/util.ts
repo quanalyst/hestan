@@ -1,4 +1,12 @@
-import type { Metadata, OpSummary, ReplayPreview, ResumePreview, RunStatus, When } from "./types";
+import type {
+  Metadata,
+  OpSummary,
+  Owner,
+  ReplayPreview,
+  ResumePreview,
+  RunStatus,
+  When,
+} from "./types";
 
 const OUTPUT_CAP = 160;
 
@@ -184,4 +192,20 @@ export function stamp(iso: string, seconds = false): string {
 
 export function clockTime(iso: string): string {
   return new Date(iso).toLocaleTimeString([], { hour12: false });
+}
+
+// who owns something, in one line: "ada of data-platform (#data-alerts)".
+//
+// null for a thing nobody claimed, so a caller renders an absence rather than
+// an empty string: the difference between "nobody declared an owner" and "the
+// owner's name is blank" is the whole reason this returns null and not "".
+export function ownerLine(owner: Owner | null): string | null {
+  if (owner === null) return null;
+  const who =
+    owner.person && owner.team
+      ? `${owner.person} of ${owner.team}`
+      : (owner.person ?? owner.team ?? null);
+  if (who === null && !owner.contact) return null;
+  const named = who ?? "nobody named";
+  return owner.contact ? `${named} (${owner.contact})` : named;
 }

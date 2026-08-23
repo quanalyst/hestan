@@ -23,6 +23,7 @@ use serde_json::json;
 use crate::freshness::LateEvent;
 use crate::hooks::{OpEvent, RunEvent, RunFailure};
 use crate::model::{OpStatus, RunStatus};
+use crate::whose::Owner;
 
 fn client() -> &'static reqwest::Client {
     static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
@@ -65,12 +66,25 @@ pub trait Alert: Serialize {
 impl Alert for RunFailure {
     fn summary(&self) -> String {
         format!(
-            "job {} failed at {}: {} ({})",
+            "job {} failed at {}: {} ({}){}",
             self.job,
             self.failed_op.as_deref().unwrap_or("unknown op"),
             self.error.as_deref().unwrap_or("unknown error"),
-            self.run_id
+            self.run_id,
+            owned_by(self.owner.as_ref())
         )
+    }
+}
+
+/// `, owned by ada of data-platform (#data-alerts)`, or nothing at all.
+///
+/// nothing, rather than "owned by nobody": an alert about a job nobody claimed
+/// reads exactly as it did before owners existed, and a line that says who
+/// owns it says so because somebody declared it.
+fn owned_by(owner: Option<&Owner>) -> String {
+    match owner {
+        Some(owner) => format!(", owned by {owner}"),
+        None => String::new(),
     }
 }
 
@@ -89,10 +103,14 @@ impl Alert for RunEvent {
             _ => "succeeded".to_string(),
         };
         format!(
-            "job {} {what}{} ({})",
+            "job {} {what}{} ({}){}",
             self.job,
             took(self.duration),
-            self.run_id
+            self.run_id,
+            // on every terminal status, not only a failure: a success line
+            // that named nobody and a failure line that did would read as if
+            // the owner were part of the alarm
+            owned_by(self.owner.as_ref())
         )
     }
 }
@@ -130,14 +148,19 @@ fn took(d: Option<Duration>) -> String {
 impl Alert for LateEvent {
     fn summary(&self) -> String {
         let mins = self.late_by.as_secs() / 60;
+        let owner = owned_by(self.owner.as_ref());
         match self.last_success {
             Some(t) => format!(
-                "{} {} is {mins}m late (last success {})",
+                "{} {} is {mins}m late (last success {}){owner}",
                 self.kind.as_str(),
                 self.name,
                 t.to_rfc3339()
             ),
-            None => format!("{} {} is {mins}m late", self.kind.as_str(), self.name),
+            None => format!(
+                "{} {} is {mins}m late{owner}",
+                self.kind.as_str(),
+                self.name
+            ),
         }
     }
 }
@@ -166,6 +189,11 @@ pub fn webhook<A: Alert>(url: impl Into<String>) -> impl Fn(A) + Send + Sync {
 /// run that worked, `op {op} of job {job} failed on attempt {n}: {error}
 /// ({run_id})` for an op, and `{kind} {name} is {n}m late (last success {t})`
 /// for a late one.
+///
+/// a run or a late alert about something with a declared
+/// [`Owner`] ends `, owned by ada of data-platform
+/// (#data-alerts)`. one about something nobody claimed ends where it always
+/// did.
 pub fn slack<A: Alert>(url: impl Into<String>) -> impl Fn(A) + Send + Sync {
     let url = url.into();
     move |a: A| {
@@ -183,6 +211,7 @@ mod tests {
         RunEvent {
             run_id: "0192-abc".into(),
             job: "orders_etl".into(),
+            owner: None,
             trigger: Trigger::Schedule,
             status,
             failed_op: Some("load".into()),

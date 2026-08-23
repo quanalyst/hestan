@@ -18,7 +18,7 @@ use crate::partition::{KeySet, PartitionMapping, Partitions, Reads};
 use crate::policy::AutoPolicy;
 use crate::schedule::Cron;
 use crate::store::{Built, Store};
-use crate::whose::check_namespace;
+use crate::whose::{Owner, check_namespace};
 
 /// the internal job every asset build runs under.
 pub(crate) const ASSETS_JOB: &str = "assets";
@@ -129,6 +129,7 @@ pub struct Asset {
     source: bool,
     group: Option<String>,
     namespace: Option<String>,
+    owner: Option<Owner>,
     hue: Option<u16>,
     deps: Vec<String>,
     maps: BTreeMap<String, PartitionMapping>,
@@ -153,6 +154,7 @@ impl Asset {
             source: true,
             group: None,
             namespace: None,
+            owner: None,
             hue: None,
             deps: Vec::new(),
             maps: BTreeMap::new(),
@@ -183,6 +185,7 @@ impl Asset {
             source: false,
             group: None,
             namespace: None,
+            owner: None,
             hue: None,
             deps: Vec::new(),
             maps: BTreeMap::new(),
@@ -214,6 +217,7 @@ impl Asset {
             source: false,
             group: None,
             namespace: None,
+            owner: None,
             hue: None,
             deps: Vec::new(),
             maps: BTreeMap::new(),
@@ -379,6 +383,31 @@ impl Asset {
         self
     }
 
+    /// who to wake when this asset is stale, late, or failed to build.
+    ///
+    /// ```
+    /// # use hestan::{Asset, Owner};
+    /// let orders = Asset::source("orders").owner(Owner::team("finance").contact("#fin-data"));
+    /// # let _ = orders;
+    /// ```
+    ///
+    /// it is on `GET /api/assets`, on the asset's page, and on the
+    /// [`LateEvent`](crate::LateEvent) a declared
+    /// [`fresh_within`](Asset::fresh_within) fires, so an
+    /// [`on_late`](crate::Hestan::on_late) hook knows who to tell. `hestan
+    /// owner <name>` answers it from the command line.
+    ///
+    /// **the limit, plainly**: an asset build runs under the internal `assets`
+    /// job, so the [`RunEvent`](crate::RunEvent) for a failed build carries
+    /// that job's owner and not the asset's. one run can build several assets
+    /// with several owners, and picking one of them would be a guess. an
+    /// asset's own owner reaches a hook through `on_late`, and reaches a person
+    /// through the api, the ui and the command line.
+    pub fn owner(mut self, owner: Owner) -> Asset {
+        self.owner = Some(owner);
+        self
+    }
+
     /// pin the [hue](crate::hue) this asset's label is drawn in, 0..=359
     /// degrees; outside that range fails the build.
     ///
@@ -538,6 +567,7 @@ pub struct MultiAsset {
     name: String,
     produces: Vec<String>,
     namespace: Option<String>,
+    owner: Option<Owner>,
     deps: Vec<String>,
     op: Op,
     io: Option<String>,
@@ -560,6 +590,7 @@ impl MultiAsset {
             name,
             produces: Vec::new(),
             namespace: None,
+            owner: None,
             deps: Vec::new(),
             io: None,
             policy: None,
@@ -578,6 +609,13 @@ impl MultiAsset {
     /// fallback.
     pub fn namespace(mut self, name: impl Into<String>) -> MultiAsset {
         self.namespace = Some(name.into());
+        self
+    }
+
+    /// who to wake about everything this produces, declared once here for the
+    /// same reason the namespace is.
+    pub fn owner(mut self, owner: Owner) -> MultiAsset {
+        self.owner = Some(owner);
         self
     }
 
@@ -769,6 +807,9 @@ pub(crate) struct AssetMeta {
     /// [`Asset::namespace`] or from the [`MultiAsset`] that produces it.
     /// `None` in a deployment that declares no namespaces.
     pub namespace: Option<String>,
+    /// who to wake about this asset, from [`Asset::owner`] or from the
+    /// [`MultiAsset`] that produces it. `None` for one nobody claimed.
+    pub owner: Option<Owner>,
     /// the hue [`Asset::hue`] pinned on this asset's label; `None` when
     /// nothing was pinned, in which case [`hue`] answers from the label.
     pub declared_hue: Option<u16>,
@@ -961,6 +1002,7 @@ impl AssetRegistry {
                 source: a.source,
                 declared_group: a.group,
                 namespace: a.namespace,
+                owner: a.owner,
                 declared_hue: a.hue,
                 deps: a.deps,
                 maps: a.maps,
@@ -996,6 +1038,7 @@ impl AssetRegistry {
                     // a namespace has no fallback to be had from the name, so
                     // a multi-asset declares one for everything it produces
                     namespace: m.namespace.clone(),
+                    owner: m.owner.clone(),
                     declared_hue: None,
                     deps: m.deps.clone(),
                     maps: BTreeMap::new(),

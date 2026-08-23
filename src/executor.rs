@@ -24,6 +24,7 @@ use crate::op::{self, Cancel, MetaBuf, Op, OpCtx};
 use crate::rate::{Rate, RateStatus, Rates, Ticket};
 use crate::resource::{self, Resources, RunResource, RunResources};
 use crate::store::{Built, Claimed, Fenced, Fire, Landed, RunKey, Store, note};
+use crate::whose::Owner;
 
 /// how far back a resume follows `resumed_from` links. resuming a resume is
 /// normal; a chain this long is a bug, and the walk says so instead of looping.
@@ -676,6 +677,13 @@ impl Runner {
             hooks: Arc::new(hooks),
             ..self
         }
+    }
+
+    /// who to wake about `job`, from the registry this process was built with.
+    /// `None` for a job nobody claimed, and for one this process does not
+    /// define.
+    pub(crate) fn job_owner(&self, job: &str) -> Option<Owner> {
+        self.jobs.get(job).and_then(Job::owner).cloned()
     }
 
     /// every run hook one run's terminal event goes to: this process's, then
@@ -1586,7 +1594,10 @@ impl Runner {
         }
         let durable = self.durable;
         let taken = match self.store.reclaim_expired(self.reclaim, |run| {
-            durable.then(|| serde_json::to_value(reclaimed(run)).expect("a run event is json"))
+            durable.then(|| {
+                serde_json::to_value(reclaimed(run, self.job_owner(&run.job)))
+                    .expect("a run event is json")
+            })
         }) {
             Ok(taken) => taken,
             Err(e) => {
@@ -1612,7 +1623,11 @@ impl Runner {
             // repeating half its side effects in silence. durable, the row the
             // reclaim wrote is what carries it, and the delivery loop sends it
             if self.reclaim == Reclaim::Fail && !durable {
-                fire_hooks(&self.run_hooks(&run.job), reclaimed(run), "run");
+                fire_hooks(
+                    &self.run_hooks(&run.job),
+                    reclaimed(run, self.job_owner(&run.job)),
+                    "run",
+                );
             }
         }
         self.settled.notify_waiters();
@@ -2534,11 +2549,12 @@ fn fold_instances(
 /// no `failed_op`: nothing this run did failed. the process holding it stopped
 /// saying it was there, which is not any op's doing and should not be reported
 /// as one.
-fn reclaimed(run: &Run) -> RunEvent {
+fn reclaimed(run: &Run, owner: Option<Owner>) -> RunEvent {
     let finished_at = run.finished_at.unwrap_or_else(Utc::now);
     RunEvent {
         run_id: run.id.clone(),
         job: run.job.clone(),
+        owner,
         trigger: run.trigger,
         status: RunStatus::Failed,
         failed_op: None,
@@ -3552,6 +3568,9 @@ async fn execute_in_span(
     let event = RunEvent {
         run_id: run_id.clone(),
         job: job.name().to_string(),
+        // read off the declaration here, at the one place a terminal event is
+        // built, so nothing downstream of this has to be handed a recipient
+        owner: job.owner().cloned(),
         trigger,
         status,
         failed_op,

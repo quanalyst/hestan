@@ -16,7 +16,7 @@ use std::process::{Command, Output};
 use std::time::{Duration, Instant};
 
 use hestan::prelude::*;
-use hestan::{Auth, EventQuery, Limits, Runner, Store, Trigger};
+use hestan::{Auth, EventQuery, Limits, Owner, Runner, Store, Trigger};
 
 /// where the process under test finds its run log. absent means "run the
 /// cases", which is how one binary is both halves of this.
@@ -91,7 +91,13 @@ fn assets() -> Vec<Asset> {
     let margin = Asset::new("margin", |_| async { Ok(json!({ "margin": 1 })) })
         .from(&orders)
         .from(&fx)
-        .group("finance");
+        .group("finance")
+        .owner(
+            Owner::team("finance-data")
+                .person("ada")
+                .contact("#fin-alerts")
+                .escalates_to("ops@example.invalid"),
+        );
     // and one whose group is the prefix in its name, with nothing declared
     let netted = Asset::new("finance/netted", |_| async { Ok(json!(null)) }).from(&returns);
     vec![orders, returns, fx, margin, netted]
@@ -101,6 +107,7 @@ fn jobs() -> Vec<Job> {
     vec![
         Job::builder("quick")
             .description("finishes before anything can attach to it")
+            .owner(Owner::team("data-platform").contact("#data-alerts"))
             .op(Op::new("greet", |ctx: OpCtx| async move {
                 ctx.info("hello from quick");
                 Ok(json!({ "ok": true }))
@@ -184,6 +191,7 @@ async fn cases(dir: &Path) {
     )
     .await;
     case("doctor_answers_why_nothing_is_running", diagnosed(dir)).await;
+    case("the_command_line_says_who_owns_something", owned(dir)).await;
     case("a_dry_run_checks_the_params_and_creates_nothing", dry(dir)).await;
     case(
         "completion_comes_from_the_registry_in_this_binary",
@@ -241,6 +249,48 @@ async fn isolated_child(dir: &Path) {
          other than run it: {:?}",
         ran.stderr
     );
+}
+
+/// "who owns X", the question a log line at 3am does not answer.
+///
+/// three answers, and the difference between them is the point: something
+/// with an owner, something without one, and no such thing at all.
+async fn owned(dir: &Path) {
+    let db = db(dir, "owned");
+
+    let ran = cli(&db, &["owner", "quick"]);
+    ran.assert(0);
+    assert!(
+        ran.stdout.contains("data-platform") && ran.stdout.contains("#data-alerts"),
+        "the job's owner and how to reach them: {:?}",
+        ran.stdout
+    );
+
+    // an asset, with both halves and a second contact hestan carries and does
+    // nothing else with
+    let ran = cli(&db, &["owner", "margin"]);
+    ran.assert(0);
+    assert!(
+        ran.stdout.contains("ada of finance-data"),
+        "the asset's owner: {:?}",
+        ran.stdout
+    );
+    assert!(
+        ran.stdout.contains("ops@example.invalid"),
+        "the escalation contact never reached the answer: {:?}",
+        ran.stdout
+    );
+
+    // something nobody claimed exists and says so, which is a different
+    // answer from "no such job" and is not a blank line
+    let ran = cli(&db, &["--json", "owner", "boom"]);
+    ran.assert(0);
+    let answer: Value = serde_json::from_str(&ran.stdout).expect("json");
+    assert_eq!(answer["owners"][0]["kind"], "job");
+    assert_eq!(answer["owners"][0]["owner"], Value::Null);
+
+    // and a name nothing is registered under is a usage mistake
+    cli(&db, &["owner", "nothing_by_that_name"]).assert(2);
 }
 
 async fn fails(dir: &Path) {
@@ -872,6 +922,14 @@ async fn completing(dir: &Path) {
     let listed: Vec<&str> = names.stdout.lines().collect();
     assert!(listed.contains(&"quick"), "{listed:?}");
     assert!(listed.contains(&"diamond"), "{listed:?}");
+
+    // `owner` takes either a job or an asset, so it completes both: half the
+    // list would read as the other half not existing
+    let owned = cli(&db, &["__complete", "owned"]);
+    owned.assert(0);
+    let listed: Vec<&str> = owned.stdout.lines().collect();
+    assert!(listed.contains(&"quick"), "{listed:?}");
+    assert!(listed.contains(&"margin"), "{listed:?}");
 
     // and the subcommands, which a shell has to be able to ask for before it
     // has been told where any deployment is
