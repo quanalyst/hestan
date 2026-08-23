@@ -178,9 +178,11 @@ impl From<Error> for Fail {
             // and the message says what to pass instead: a usage answer, like
             // every other refusal that is about the request
             | Error::RedactedParams { .. }
-            // asking hestan to copy a postgres run log is the command line
+            // asking hestan to copy a postgres run log, and presenting one
+            // launch key for two different requests: both are the command line
             // being wrong rather than the work going wrong
-            | Error::NoBackup(_) => Exit::Usage,
+            | Error::NoBackup(_)
+            | Error::LaunchKeyReused { .. } => Exit::Usage,
             Error::Sqlite(_) | Error::Io(_) | Error::UnsupportedDb(_) | Error::SchemaTooNew(_) => {
                 Exit::Unreachable
             }
@@ -399,6 +401,10 @@ struct RunArgs {
     /// nothing at all
     #[arg(long = "dry-run", conflicts_with = "wait")]
     dry_run: bool,
+    /// launch at most once under this key: the same key again is answered with
+    /// the run the first call made
+    #[arg(long, value_name = "KEY")]
+    key: Option<String>,
 }
 
 #[derive(Args)]
@@ -1126,7 +1132,7 @@ async fn launch(reach: Reach, args: RunArgs, out: &Out) -> Result<(), Fail> {
         );
     }
     let timeout = args.timeout.map(Duration::from_secs);
-    let (id, watched) = match reach {
+    let (answer, watched) = match reach {
         Reach::Server(api) => {
             let mut body = json!({ "tags": tags, "priority": args.priority });
             match (&args.params, &args.preset) {
@@ -1134,10 +1140,16 @@ async fn launch(reach: Reach, args: RunArgs, out: &Out) -> Result<(), Fail> {
                 (None, Some(preset)) => body["preset"] = json!(preset),
                 (None, None) => {}
             }
+            if let Some(key) = &args.key {
+                body["key"] = json!(key);
+            }
             let answer = api
                 .post(&format!("/api/jobs/{}/runs", args.job), body)
                 .await?;
-            (s(&answer, "run_id"), Watched::There(api))
+            // `repeat` on the answer is the api saying this key already named a
+            // run, which is a `200` where a launch is a `202`
+            let repeat = answer["repeat"] == json!(true);
+            ((s(&answer, "run_id"), repeat), Watched::There(api))
         }
         reach => {
             let built = reach.built(args.wait).await?;
@@ -1155,16 +1167,28 @@ async fn launch(reach: Reach, args: RunArgs, out: &Out) -> Result<(), Fail> {
                 }
                 (None, None) => json!({}),
             };
-            let id = runner
-                .launch_prioritized(&args.job, params, Trigger::Manual, tags, args.priority)
-                .map_err(Fail::from)?;
-            (id, Watched::Here(Box::new(runner)))
+            let launched = match &args.key {
+                None => runner
+                    .launch_prioritized(&args.job, params, Trigger::Manual, tags, args.priority)
+                    .map(|id| (id, false)),
+                Some(key) => runner
+                    .launch_once(&args.job, params, Trigger::Manual, key, tags, args.priority)
+                    .map(|launch| {
+                        let repeat = launch.repeat();
+                        (launch.into_run_id(), repeat)
+                    }),
+            }
+            .map_err(Fail::from)?;
+            (launched, Watched::Here(Box::new(runner)))
         }
     };
+    let (id, repeat) = answer;
     if !args.wait {
-        out.launched(&id, &args.job);
+        out.launched_once(&id, &args.job, repeat);
         return Ok(());
     }
+    // a `--wait` on a key that already named a run waits for **that** run,
+    // which is what "make sure this ran once, and tell me how it went" means
     settle(&watched, &id, timeout, out).await
 }
 
@@ -4050,6 +4074,25 @@ impl Out {
             println!("{id}");
         } else {
             println!("{id}  {job} queued");
+        }
+    }
+
+    /// a run a launch key already named, so this call created nothing.
+    ///
+    /// no `status` key, unlike [`launched`](Self::launched): that run may have
+    /// finished an hour ago and saying `queued` about it would be a guess. what
+    /// is certain is the id and that this call made nothing, and that is what
+    /// this says.
+    fn launched_once(&self, id: &str, job: &str, repeat: bool) {
+        if !repeat {
+            return self.launched(id, job);
+        }
+        if self.json {
+            self.object(&json!({ "run_id": id, "job": job, "repeat": true }));
+        } else if self.quiet {
+            println!("{id}");
+        } else {
+            println!("{id}  {job} already launched under this key; nothing new was created");
         }
     }
 

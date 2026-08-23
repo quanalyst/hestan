@@ -41,7 +41,7 @@ use crate::store::{AnyRow, SCHEMA_VERSION, Val, args};
 
 /// the whole schema at [`SCHEMA_VERSION`], created in one statement batch.
 ///
-/// the same eighteen tables the sqlite chain arrives at, with the same columns
+/// the same nineteen tables the sqlite chain arrives at, with the same columns
 /// and the same indexes; what each one is for is written on the migration that
 /// added it. the differences are `BIGSERIAL` where sqlite writes `INTEGER
 /// PRIMARY KEY AUTOINCREMENT`, `BIGINT` where it writes `INTEGER`, and the
@@ -253,6 +253,14 @@ CREATE TABLE store_copy (
     taken_from TEXT COLLATE "C",
     settled_at TEXT COLLATE "C"
 );
+CREATE TABLE launch_keys (
+    launch_key TEXT COLLATE "C" NOT NULL PRIMARY KEY,
+    job TEXT COLLATE "C" NOT NULL,
+    params_hash TEXT COLLATE "C" NOT NULL,
+    run_id TEXT COLLATE "C" NOT NULL,
+    launched_at TEXT COLLATE "C" NOT NULL
+);
+CREATE INDEX launch_keys_run ON launch_keys(run_id);
 "#;
 
 /// the lock two processes booting against the same empty database take turns
@@ -499,6 +507,22 @@ CREATE TABLE store_copy (
 );
 "#;
 
+/// one run per launch key. the postgres half of `SCHEMA_V23`, the same table
+/// and the same primary key, and this is the backend where it counts most: two
+/// api processes behind one load balancer are what a retried request reaches,
+/// and the primary key is what puts the second one on the first one's run
+/// rather than beside it.
+const MIGRATE_V23: &str = r#"
+CREATE TABLE launch_keys (
+    launch_key TEXT COLLATE "C" NOT NULL PRIMARY KEY,
+    job TEXT COLLATE "C" NOT NULL,
+    params_hash TEXT COLLATE "C" NOT NULL,
+    run_id TEXT COLLATE "C" NOT NULL,
+    launched_at TEXT COLLATE "C" NOT NULL
+);
+CREATE INDEX launch_keys_run ON launch_keys(run_id);
+"#;
+
 const MIGRATE_V17: &str = r#"
 ALTER TABLE events ALTER COLUMN run_id DROP NOT NULL;
 ALTER TABLE events ADD COLUMN subject_kind TEXT COLLATE "C" NOT NULL DEFAULT 'run';
@@ -555,6 +579,9 @@ fn migrate(client: &mut Client) -> Result<(), Error> {
             }
             if version < 22 {
                 tx.batch(MIGRATE_V22)?;
+            }
+            if version < 23 {
+                tx.batch(MIGRATE_V23)?;
             }
             if version != SCHEMA_VERSION {
                 tx.execute(

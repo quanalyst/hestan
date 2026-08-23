@@ -198,6 +198,7 @@ async fn cases(dir: &Path) {
     .await;
     case("the_command_line_says_who_owns_something", owned(dir)).await;
     case("a_dry_run_checks_the_params_and_creates_nothing", dry(dir)).await;
+    case("a_launch_key_makes_a_retried_launch_harmless", keyed(dir)).await;
     case(
         "completion_comes_from_the_registry_in_this_binary",
         completing(dir),
@@ -987,6 +988,71 @@ fn cli(db: &Path, args: &[&str]) -> Ran {
             .output()
             .expect("the command starts"),
     )
+}
+
+/// the command line's half of a launch key: the shape a cron line or a ci step
+/// actually uses, which is `--key` and `--quiet` and nothing else.
+async fn keyed(dir: &Path) {
+    let db = db(dir, "keyed");
+    let first = cli(&db, &["--quiet", "run", "quick", "--key", "ci-4182"]);
+    first.assert(0);
+    let id = first.stdout.trim().to_string();
+    assert!(!id.is_empty(), "nothing was printed: {first:?}");
+
+    // the retry: the same id, exit 0, and no second run
+    let again = cli(&db, &["--quiet", "run", "quick", "--key", "ci-4182"]);
+    again.assert(0);
+    assert_eq!(
+        again.stdout.trim(),
+        id,
+        "a retry under one key printed another run"
+    );
+
+    // and it says so where a person is reading rather than a script
+    let said = cli(&db, &["run", "quick", "--key", "ci-4182"]);
+    said.assert(0);
+    assert!(
+        said.stdout.contains("already launched under this key"),
+        "the repeat was reported as a launch: {:?}",
+        said.stdout
+    );
+    let json = cli(&db, &["--json", "run", "quick", "--key", "ci-4182"]);
+    json.assert(0);
+    let answer: Value = serde_json::from_str(json.stdout.trim()).expect("one json object");
+    assert_eq!(answer["run_id"].as_str().unwrap(), id);
+    assert_eq!(answer["repeat"], json!(true));
+
+    // a key of its own is a run of its own
+    let other = cli(&db, &["--quiet", "run", "quick", "--key", "ci-4183"]);
+    other.assert(0);
+    assert_ne!(other.stdout.trim(), id);
+
+    // the same key for a different request is the command line being wrong,
+    // which is exit 2, and it names the run the key already has
+    let refused = cli(
+        &db,
+        &[
+            "run",
+            "quick",
+            "--key",
+            "ci-4182",
+            "--params",
+            r#"{"loud": true}"#,
+        ],
+    );
+    refused.assert(2);
+    assert!(
+        refused.stderr.contains(&id) && refused.stderr.contains("different params"),
+        "the refusal did not say what was wrong: {:?}",
+        refused.stderr
+    );
+
+    // and only two runs exist across the lot
+    let store = Store::open(db.to_str().unwrap()).unwrap();
+    let runs = store
+        .runs(Some("quick"), None, None, None, None, 50)
+        .unwrap();
+    assert_eq!(runs.len(), 2, "one key made more than one run: {runs:?}");
 }
 
 /// a backup, and the whole of what a restored run log does to a deployment

@@ -577,8 +577,11 @@ fn note_tick(
     caught_up: bool,
 ) {
     let tick = match runner.fire_scheduled(job, expr, due, params.clone(), caught_up) {
-        // the fire and its tick landed together; nothing more to record
-        Ok(Launched::Queued(_)) => Ok(()),
+        // the fire and its tick landed together; nothing more to record. a
+        // fire carries a cron occurrence and never a launch key, so the keyed
+        // answer is grouped here rather than panicked over: a run exists
+        // either way and there is nothing more for a tick to say
+        Ok(Launched::Queued(_) | Launched::Repeat(_)) => Ok(()),
         Ok(Launched::Taken) => {
             tracing::info!(job = %job, expr = %expr, "fire refused: {ALREADY_FIRED}");
             runner.store().record_tick(

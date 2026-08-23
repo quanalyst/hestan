@@ -481,6 +481,10 @@ pub(crate) enum Launched {
     /// store. the work is *not* done, and the process that holds the lease now
     /// will decide it on its next pass, of fresher data. nothing was written.
     Stale,
+    /// a [launch key](Runner::launch_once) that already named a run, by id.
+    /// the work is done or under way, and this is the answer rather than a
+    /// refusal. nothing was written.
+    Repeat(String),
 }
 
 impl Launched {
@@ -495,8 +499,59 @@ impl Launched {
         match self {
             Launched::Queued(id) => Ok(id),
             Launched::Stale => Err(Error::NotDeciding),
-            Launched::Taken => unreachable!("a launch with nothing to claim cannot lose it"),
+            Launched::Taken | Launched::Repeat(_) => {
+                unreachable!("a launch with nothing to claim cannot lose it")
+            }
         }
+    }
+}
+
+/// what a [keyed launch](Runner::launch_once) came to: the run, and whether
+/// this call is the one that made it.
+///
+/// both, because a caller retrying a request it never got an answer to wants
+/// both. the id is what it asked for; whether the run is new is what tells a
+/// retry from a first attempt, and the http api answers `202` for one and
+/// `200` for the other. a ci step that only wants the id can ignore the
+/// difference entirely.
+///
+/// private fields, so that a keyed launch with more to report later can say so
+/// without breaking a caller; see `docs/stability.md`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Launch {
+    id: String,
+    repeat: bool,
+}
+
+impl Launch {
+    /// a launch this call made.
+    pub(crate) fn first(id: String) -> Launch {
+        Launch { id, repeat: false }
+    }
+
+    pub(crate) fn repeated(id: String) -> Launch {
+        Launch { id, repeat: true }
+    }
+
+    /// the run the key names, whether or not this call created it.
+    pub fn run_id(&self) -> &str {
+        &self.id
+    }
+
+    /// the same, owned, for a caller that is going to keep it.
+    pub fn into_run_id(self) -> String {
+        self.id
+    }
+
+    /// whether an earlier call under this key already created the run, so this
+    /// call created nothing at all.
+    ///
+    /// `false` is a run this call made. the id is good either way: what this
+    /// separates is "your request was accepted" from "your request had already
+    /// been accepted", and only the caller knows which of those it wants to
+    /// log, count or report.
+    pub fn repeat(&self) -> bool {
+        self.repeat
     }
 }
 
@@ -1290,6 +1345,90 @@ impl Runner {
             tags,
             None,
         )
+    }
+
+    /// [`Runner::launch_prioritized`] with an idempotency key: one run per
+    /// key, ever, and a second call under the same key is answered with the
+    /// first one's run.
+    ///
+    /// ```no_run
+    /// # use hestan::{Runner, RunTags, Trigger};
+    /// # fn f(runner: &Runner) -> Result<(), hestan::Error> {
+    /// # let params = serde_json::json!({});
+    /// let launch = runner.launch_once(
+    ///     "deploy", params, Trigger::Manual, "ci-build-4182", RunTags::new(), None,
+    /// )?;
+    /// println!("{} (already launched: {})", launch.run_id(), launch.repeat());
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// this is for the caller whose request timed out and who does not know
+    /// whether it landed: an http client that retried, a ci step that ran
+    /// twice, a queue consumer with at-least-once delivery. what it wants is
+    /// "make sure this ran once", so the second call is answered rather than
+    /// refused: same key, same run id, and [`Launch::repeat`] saying which
+    /// call made it.
+    ///
+    /// **the store refuses the second one, not a check.** the key is the
+    /// primary key of a table and the insert that takes it is in the same
+    /// transaction as the run row, so two callers arriving at the same instant
+    /// on two connections produce one run because the *database* said no to
+    /// the second, not because either of them looked first. a read-then-write
+    /// would be two callers away from two runs.
+    ///
+    /// **the same key with a different request is [`Error::LaunchKeyReused`]**,
+    /// naming the run the key already has. a key means one launch; answering a
+    /// call for job `report` with a run of job `deploy` because they shared a
+    /// key would be hestan agreeing with a caller bug.
+    ///
+    /// **how long a key is honoured**: until
+    /// [retention](crate::Retention)'s age cutoff passes it, which is the same
+    /// knob and the same cutoff a keyed [sensor](crate::RunRequest)'s run keys
+    /// ride. with no retention policy set, nothing prunes either and a key is
+    /// honoured for as long as the database lives. a key is also dropped with
+    /// the run it names, so it can never hand back an id nothing can be looked
+    /// up under.
+    ///
+    /// **one limit worth knowing**: what a repeat is compared against is the
+    /// params *as stored*, so two launches under one key differing only in a
+    /// param the job declared [secret](crate::secret) are the same launch as
+    /// far as this is concerned, and the second is answered with the first
+    /// one's run.
+    pub fn launch_once(
+        &self,
+        job: &str,
+        params: Value,
+        trigger: Trigger,
+        key: &str,
+        tags: RunTags,
+        priority: Option<i64>,
+    ) -> Result<Launch, Error> {
+        let launched = self.enqueue(
+            job,
+            None,
+            params,
+            trigger,
+            Lineage::None,
+            None,
+            Claimed::Launch(key),
+            tags,
+            priority,
+        )?;
+        match launched {
+            Launched::Queued(id) => Ok(Launch::first(id)),
+            Launched::Repeat(id) => Ok(Launch::repeated(id)),
+            Launched::Stale => Err(Error::NotDeciding),
+            // the key was taken and then collected between the insert that was
+            // refused and the read that would have said by what, which needs a
+            // retention sweep to land on this key in that window. nothing was
+            // written, so asking again is the whole of the fix
+            Launched::Taken => Err(Error::Conflict(format!(
+                "launch key {key} was claimed and then collected between one statement \
+                 and the next, so nothing was launched and nothing can be named. \
+                 launch again"
+            ))),
+        }
     }
 
     /// like [`Runner::launch`] but awaits completion, including the time the
@@ -2294,6 +2433,13 @@ impl Runner {
             Landed::Stale => {
                 secrets.release(&run.id);
                 return Ok(Launched::Stale);
+            }
+            // a launch key that already named a run: nothing was written, so
+            // nothing is going to execute under the id this call generated and
+            // nothing should still be holding a credential for it
+            Landed::Held(id) => {
+                secrets.release(&run.id);
+                return Ok(Launched::Repeat(id));
             }
         }
         // enqueued and on disk; whether it starts now is the dispatcher's
@@ -6265,5 +6411,67 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
         panic!("the queue never moved again");
+    }
+
+    // the api a caller actually holds: one key, one run, and the answer says
+    // which call made it
+    #[tokio::test]
+    async fn launching_once_answers_a_second_call_with_the_first_call_s_run() {
+        let store = Store::open(":memory:").unwrap();
+        // scheduler-only, so a launch stays on the queue and this case is about
+        // the launch rather than about what executed
+        let runner = Runner::new(
+            vec![sleepy_job("deploy", 0), sleepy_job("report", 0)],
+            store.clone(),
+        )
+        .unwrap()
+        .with_role(Role::Scheduler, 1);
+
+        let launch = |job: &'static str, key: &'static str, params: Value| {
+            let runner = runner.clone();
+            move || {
+                runner.launch_once(
+                    job,
+                    params.clone(),
+                    Trigger::Manual,
+                    key,
+                    RunTags::new(),
+                    None,
+                )
+            }
+        };
+
+        let first = launch("deploy", "ci-4182", json!({}))().unwrap();
+        assert!(!first.repeat(), "a first launch said it was a repeat");
+        let id = first.run_id().to_string();
+
+        let again = launch("deploy", "ci-4182", json!({}))().unwrap();
+        assert!(again.repeat(), "a second call under one key launched again");
+        assert_eq!(again.run_id(), id);
+        assert_eq!(
+            store.runs(None, None, None, None, None, 50).unwrap().len(),
+            1
+        );
+
+        // a different key is a different launch
+        let other = launch("deploy", "ci-4183", json!({}))().unwrap();
+        assert!(!other.repeat());
+        assert_ne!(other.run_id(), id);
+        assert_eq!(
+            store.runs(None, None, None, None, None, 50).unwrap().len(),
+            2
+        );
+
+        // and the same key on another job is refused rather than answered with
+        // a run of something else
+        let crossed = launch("report", "ci-4182", json!({}))().unwrap_err();
+        assert!(
+            matches!(crossed, Error::LaunchKeyReused { .. }),
+            "{crossed}"
+        );
+        assert_eq!(
+            store.runs(None, None, None, None, None, 50).unwrap().len(),
+            2
+        );
     }
 }

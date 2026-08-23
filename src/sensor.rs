@@ -888,7 +888,9 @@ fn launch_request(sensor: &str, req: RunRequest, runner: &Runner) -> Result<Fire
         RunKey { sensor, key },
         sensor_tag(sensor),
     ) {
-        Ok(Launched::Queued(run_id)) => {
+        // a sensor request carries a run key and never a launch key, so the
+        // keyed answer is grouped here: a run exists either way
+        Ok(Launched::Queued(run_id) | Launched::Repeat(run_id)) => {
             tracing::info!(sensor = %sensor, job = %job, key = %key, run = %run_id, "sensor fired");
             Ok(Fired::Launched(run_id))
         }

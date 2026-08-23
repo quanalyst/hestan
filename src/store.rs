@@ -554,7 +554,44 @@ CREATE TABLE store_copy (
 );
 "#;
 
-pub(crate) const SCHEMA_VERSION: u32 = 22;
+/// **one run per launch key, refused by the database.**
+///
+/// a sensor request already carries a [run key](RunKey) and a cron fire
+/// already carries an [occurrence](Fire); a plain launch carried nothing, so a
+/// caller whose http request timed out and retried got two runs and a ci
+/// pipeline that fired twice got two deploys. this is the table that says no
+/// to the second one.
+///
+/// `launch_key` is the whole primary key, not `(job, launch_key)`. an
+/// idempotency key is the *caller's* name for one request, and a key that
+/// meant one thing on `deploy` and another on `report` would hand a caller a
+/// second run under the same key without either of them ever seeing it. keyed
+/// on the key alone, the same key on another job is a collision the store can
+/// report, which is what it is.
+///
+/// `params_hash` is a sha-256 of the params **as they are stored**, which is
+/// the same text `runs.params` gets: [secret](crate::secret) params redacted.
+/// a digest rather than the params so the column is one size whatever a caller
+/// sends, and of the stored text rather than of the given text so that it is a
+/// digest of something this database already holds. what that costs is written
+/// down and is real: two launches under one key that differ only in a param
+/// the job declared secret hash the same, and the second is answered with the
+/// first one's run.
+///
+/// `launch_keys_run` is what [`Store::delete_runs`] deletes through, so a key
+/// never outlives the run it names.
+const SCHEMA_V23: &str = r#"
+CREATE TABLE launch_keys (
+    launch_key TEXT NOT NULL PRIMARY KEY,
+    job TEXT NOT NULL,
+    params_hash TEXT NOT NULL,
+    run_id TEXT NOT NULL,
+    launched_at TEXT NOT NULL
+);
+CREATE INDEX launch_keys_run ON launch_keys(run_id);
+"#;
+
+pub(crate) const SCHEMA_VERSION: u32 = 23;
 
 // one transaction around every pending step and the version stamp (sqlite DDL
 // is transactional), so a crash mid-migration leaves the db exactly as found
@@ -639,6 +676,9 @@ fn migrate(conn: &mut Connection) -> Result<(), Error> {
     if version < 22 {
         tx.execute_batch(SCHEMA_V22)?;
     }
+    if version < 23 {
+        tx.execute_batch(SCHEMA_V23)?;
+    }
     if version != SCHEMA_VERSION {
         tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     }
@@ -701,13 +741,20 @@ pub(crate) enum Fenced<'a> {
 }
 
 /// what came of a write that had something to claim or a term to name.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// not `Copy` since [`Held`](Landed::Held) carries the id it is handing back,
+/// which is the point of that variant.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Landed {
     /// on disk, claim and all.
     Yes,
     /// somebody already made this decision: the occurrence has a fire against
     /// it, or the run key is claimed. nothing was written.
     Taken,
+    /// the [launch key](Claimed::Launch) already named this run, and that is
+    /// the answer rather than a refusal: the caller asked for the job to have
+    /// been launched once, and it has been. nothing was written.
+    Held(String),
     /// the deciding lease moved on before this reached the store. nothing was
     /// written.
     Stale,
@@ -730,6 +777,15 @@ pub(crate) enum Claimed<'a> {
     Key(RunKey<'a>),
     /// a [cron occurrence](Fire).
     Fire(Fire<'a>),
+    /// a launch carrying an idempotency key: at most one run per key, ever, by
+    /// [`SCHEMA_V23`].
+    ///
+    /// the odd one out, because it is the only claim whose loser wants an
+    /// answer back. a fire that loses is an occurrence somebody else fired and
+    /// there is nothing to hand over; a launch key that loses is a caller
+    /// asking "did this run", and the run it is asking about is right there,
+    /// so [`Landed::Held`] carries the id.
+    Launch(&'a str),
 }
 
 /// every column [`event_from_row`] reads, in the order it reads them.
@@ -1930,6 +1986,59 @@ impl Store {
                     return Ok(Landed::Taken);
                 }
             }
+            // **the insert is the check.** nothing reads this table first: the
+            // primary key on `launch_key` is what decides, and the read below
+            // happens only once it has already said no. a select-then-insert
+            // here would be two callers away from two runs under one key,
+            // which is the whole thing a key exists to stop
+            Claimed::Launch(key) => {
+                let digest = params_digest(&self.params_col(&run.job, &run.params));
+                let took = tx.execute(
+                    &format!(
+                        "{insert} launch_keys (launch_key, job, params_hash, run_id, launched_at)
+                         VALUES (?1, ?2, ?3, ?4, ?5) {ignore}"
+                    ),
+                    args![key, &run.job, &digest, &run.id, at.to_rfc3339()],
+                )?;
+                if took == 0 {
+                    // by the time an insert is told the key is taken, the
+                    // transaction that took it has committed: sqlite serialises
+                    // writers, and postgres makes `ON CONFLICT DO NOTHING` wait
+                    // on the other transaction before answering. so this reads
+                    // what won, and it is a read *about* a decision already
+                    // made rather than a check that gates one
+                    let held = tx.query_opt(
+                        "SELECT run_id, job, params_hash FROM launch_keys WHERE launch_key = ?1",
+                        args![key],
+                        |r| Ok((r.text(0)?, r.text(1)?, r.text(2)?)),
+                    )?;
+                    // gone between the two statements, which needs a retention
+                    // sweep to land on this exact key in that window. nothing
+                    // was written, and the caller may simply ask again
+                    let Some((held_run, held_job, held_hash)) = held else {
+                        return Ok(Landed::Taken);
+                    };
+                    // the same key for a different request is a caller bug, and
+                    // handing back a run that did something else would be
+                    // hestan going along with it
+                    let named = match held_job == run.job {
+                        false => Some(format!("job {}", run.job)),
+                        true if held_hash != digest => {
+                            Some(format!("job {} with different params", run.job))
+                        }
+                        true => None,
+                    };
+                    if let Some(named) = named {
+                        return Err(Error::LaunchKeyReused {
+                            key: key.to_string(),
+                            run: held_run,
+                            job: held_job,
+                            named,
+                        });
+                    }
+                    return Ok(Landed::Held(held_run));
+                }
+            }
             // written after the run below rather than here, so a single
             // scheduler's event log reads in exactly the order it always did:
             // the run queued, then the schedule fired. inside one transaction
@@ -2016,6 +2125,36 @@ impl Store {
         self.conn().execute(
             "DELETE FROM sensor_run_keys WHERE launched_at < ?1",
             args![older_than.to_rfc3339()],
+        )
+    }
+
+    /// drop launch keys claimed before `older_than`, which is what says how
+    /// long a key is honoured.
+    ///
+    /// the same knob and the same cutoff as [run
+    /// keys](Self::prune_sensor_run_keys), deliberately: two lifetimes for two
+    /// kinds of key would be two things to reason about and one of them would
+    /// be wrong. with no retention policy set, nothing prunes either, and a
+    /// key is honoured for as long as the database lives.
+    pub(crate) fn prune_launch_keys(&self, older_than: DateTime<Utc>) -> Result<usize, Error> {
+        self.conn().execute(
+            "DELETE FROM launch_keys WHERE launched_at < ?1",
+            args![older_than.to_rfc3339()],
+        )
+    }
+
+    /// which run a launch key names, or none.
+    ///
+    /// tests only. nothing in hestan reads a key outside the transaction that
+    /// takes it, on purpose: the answer to "is this key taken" is the insert,
+    /// and a method that answered it beforehand would be the read-then-write
+    /// this table exists to make unnecessary.
+    #[cfg(test)]
+    pub(crate) fn launch_key(&self, key: &str) -> Result<Option<String>, Error> {
+        self.conn().query_opt(
+            "SELECT run_id FROM launch_keys WHERE launch_key = ?1",
+            args![key],
+            |r| r.text(0),
         )
     }
 
@@ -3913,8 +4052,12 @@ impl Store {
         for batch in runs.chunks(BATCH) {
             let list = placeholders(batch.len());
             let mut binds: Vec<Val<'_>> = batch.iter().map(Val::from).collect();
-            // children first: the transaction should make it moot, the order makes it true anyway
-            for table in ["op_runs", "events", "op_logs"] {
+            // children first: the transaction should make it moot, the order
+            // makes it true anyway. `launch_keys` is here rather than left to
+            // its own cutoff so that a key can never name a run this deleted:
+            // a caller retrying under that key would otherwise be handed an id
+            // nothing can be looked up under
+            for table in ["op_runs", "events", "op_logs", "launch_keys"] {
                 tx.execute(
                     &format!("DELETE FROM {table} WHERE run_id IN ({list})"),
                     &binds,
@@ -5729,6 +5872,28 @@ fn trace_event(ev: &NewEvent<'_>) {
             tracing::error!(target: crate::logs::TRACE_TARGET, kind, subject, "{message}");
         }
     }
+}
+
+/// what a [launch key](Claimed::Launch) records about the params it was
+/// presented with: a sha-256 of the stored json, hex.
+///
+/// of the **stored** params, which is the text `runs.params` holds, so this is
+/// a digest of something the database already has rather than of anything a
+/// [secret param](crate::secret) kept out of it. what that costs is on the
+/// [table](SCHEMA_V23): two launches differing only in a secret param are one
+/// digest, and the second is answered with the first one's run.
+///
+/// serde_json orders an object's keys, at every depth, so the same params
+/// written in two orders are the same text and the same digest.
+fn params_digest(params: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(params.as_bytes());
+    hasher
+        .finalize()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
 }
 
 /// the one [copy mark](Restored) row, replacing whatever is there.
@@ -8279,6 +8444,7 @@ mod tests {
                          DROP INDEX schedule_ticks_fire;
                          DROP TABLE decider;
                          DROP TABLE store_copy;
+                         DROP TABLE launch_keys;
                          UPDATE schema_version SET version = 16;"
                     ))
                     .unwrap();
@@ -8379,6 +8545,7 @@ mod tests {
                          DROP INDEX schedule_ticks_fire;
                          DROP TABLE decider;
                          DROP TABLE store_copy;
+                         DROP TABLE launch_keys;
                          UPDATE schema_version SET version = 17;",
                     )
                     .unwrap();
@@ -8475,6 +8642,7 @@ mod tests {
                          DROP INDEX schedule_ticks_fire;
                          DROP TABLE decider;
                          DROP TABLE store_copy;
+                         DROP TABLE launch_keys;
                          UPDATE schema_version SET version = 18;",
                     )
                     .unwrap();
@@ -8591,6 +8759,7 @@ mod tests {
                         "DROP INDEX schedule_ticks_fire;
                          DROP TABLE decider;
                          DROP TABLE store_copy;
+                         DROP TABLE launch_keys;
                          {ticks}
                          UPDATE schema_version SET version = 19;"
                     ))
@@ -11235,13 +11404,14 @@ mod tests {
     /// every table the sqlite chain arrives at. a fresh postgres database has
     /// all of them from its first statement.
     #[cfg(feature = "postgres")]
-    const TABLES: [&str; 19] = [
+    const TABLES: [&str; 20] = [
         "asset_checks",
         "asset_materializations",
         "backfills",
         "decider",
         "events",
         "freshness_state",
+        "launch_keys",
         "notifications",
         "op_logs",
         "op_runs",
@@ -12132,6 +12302,7 @@ mod tests {
                     .conn()
                     .batch(
                         "DROP TABLE store_copy;
+                         DROP TABLE launch_keys;
                          UPDATE schema_version SET version = 21;",
                     )
                     .unwrap();
@@ -12159,6 +12330,395 @@ mod tests {
             let store = db.store();
             assert_eq!(store.restored().unwrap(), None);
             assert!(store.run("after").unwrap().is_some());
+        });
+    }
+
+    // ----------------------------------------------------------------- launch keys
+    // one run per key, refused by the primary key rather than by anybody
+    // looking first. the racing case at the end is the one that proves it.
+
+    /// launch `job` with `params` under `key`, as `Runner::launch_once` does.
+    fn once(store: &Store, id: &str, job: &str, key: &str, params: Value) -> Result<Landed, Error> {
+        let mut run = mk_run(id, job, Utc::now());
+        run.params = params;
+        store.create_run_keyed(
+            &run,
+            &["a".into()],
+            Claimed::Launch(key),
+            None,
+            Fenced::Never,
+        )
+    }
+
+    // the whole promise, in four launches: one key is one run, and asking again
+    // hands back the run rather than making another
+    #[test]
+    fn one_launch_key_is_one_run_and_the_second_call_is_answered_with_it() {
+        both(|db| {
+            let store = db.store();
+            let params = json!({ "env": "prod" });
+
+            assert_eq!(
+                once(&store, "first", "deploy", "ci-4182", params.clone()).unwrap(),
+                Landed::Yes
+            );
+            // the same key again, same job, same params: the first run's id,
+            // and nothing new written anywhere
+            assert_eq!(
+                once(&store, "second", "deploy", "ci-4182", params.clone()).unwrap(),
+                Landed::Held("first".to_string())
+            );
+            assert!(
+                store.run("second").unwrap().is_none(),
+                "a second run was created"
+            );
+            assert_eq!(
+                store.launch_key("ci-4182").unwrap().as_deref(),
+                Some("first")
+            );
+
+            // a third time, because a retry that retries is the ordinary case
+            assert_eq!(
+                once(&store, "third", "deploy", "ci-4182", params.clone()).unwrap(),
+                Landed::Held("first".to_string())
+            );
+
+            // and a key of its own is a run of its own
+            assert_eq!(
+                once(&store, "other", "deploy", "ci-4183", params).unwrap(),
+                Landed::Yes
+            );
+            let runs = store
+                .runs(Some("deploy"), None, None, None, None, 50)
+                .unwrap();
+            assert_eq!(runs.len(), 2, "one key per run: {runs:?}");
+        });
+    }
+
+    // the caller bug the key must not paper over: one name, two requests
+    #[test]
+    fn one_key_with_different_params_is_refused_and_says_which_run_it_already_has() {
+        both(|db| {
+            let store = db.store();
+            once(
+                &store,
+                "first",
+                "deploy",
+                "ci-4182",
+                json!({ "env": "prod" }),
+            )
+            .unwrap();
+
+            let refused = once(
+                &store,
+                "second",
+                "deploy",
+                "ci-4182",
+                json!({ "env": "staging" }),
+            )
+            .unwrap_err();
+            let Error::LaunchKeyReused {
+                key,
+                run,
+                job,
+                named,
+            } = &refused
+            else {
+                panic!("{refused}");
+            };
+            assert_eq!(
+                (key.as_str(), run.as_str(), job.as_str()),
+                ("ci-4182", "first", "deploy")
+            );
+            assert!(named.contains("different params"), "{named}");
+            assert!(refused.to_string().contains("run first"), "{refused}");
+            assert!(store.run("second").unwrap().is_none());
+
+            // the same key on another job is the same mistake with a different
+            // shape, and is named as one rather than as a params mismatch
+            let crossed = once(
+                &store,
+                "third",
+                "report",
+                "ci-4182",
+                json!({ "env": "prod" }),
+            )
+            .unwrap_err();
+            let Error::LaunchKeyReused { named, .. } = &crossed else {
+                panic!("{crossed}");
+            };
+            assert_eq!(named, "job report");
+            assert!(store.run("third").unwrap().is_none());
+
+            // and the key still names what it always named
+            assert_eq!(
+                store.launch_key("ci-4182").unwrap().as_deref(),
+                Some("first")
+            );
+        });
+    }
+
+    // params reach the store through one redaction, so what a key compares is
+    // what the store holds. the cost is a limit and is asserted rather than
+    // described: two launches differing only in a secret param are one launch
+    #[test]
+    fn a_key_compares_the_params_as_stored_which_a_secret_param_flattens() {
+        both(|db| {
+            let store = db.store();
+            store
+                .secrets()
+                .declare("deploy", BTreeSet::from(["token".to_string()]));
+
+            once(
+                &store,
+                "first",
+                "deploy",
+                "k",
+                json!({ "token": "one", "env": "prod" }),
+            )
+            .unwrap();
+            // a different secret, everything else the same: both are stored as
+            // the marker, so this is the same launch as far as the key is
+            // concerned and it is answered rather than refused
+            assert_eq!(
+                once(
+                    &store,
+                    "second",
+                    "deploy",
+                    "k",
+                    json!({ "token": "two", "env": "prod" })
+                )
+                .unwrap(),
+                Landed::Held("first".to_string())
+            );
+            // and a param that *is* stored still tells them apart
+            assert!(matches!(
+                once(
+                    &store,
+                    "third",
+                    "deploy",
+                    "k",
+                    json!({ "token": "one", "env": "dev" })
+                ),
+                Err(Error::LaunchKeyReused { .. })
+            ));
+        });
+    }
+
+    // the same key written two ways is the same key: object order is not part
+    // of what a caller asked for
+    #[test]
+    fn the_same_params_in_another_order_are_the_same_launch() {
+        both(|db| {
+            let store = db.store();
+            once(
+                &store,
+                "first",
+                "deploy",
+                "k",
+                json!({ "a": 1, "b": { "x": 1, "y": 2 } }),
+            )
+            .unwrap();
+            assert_eq!(
+                once(
+                    &store,
+                    "second",
+                    "deploy",
+                    "k",
+                    json!({ "b": { "y": 2, "x": 1 }, "a": 1 })
+                )
+                .unwrap(),
+                Landed::Held("first".to_string())
+            );
+        });
+    }
+
+    // how long a key is honoured, and what ends it
+    #[test]
+    fn a_launch_key_is_honoured_until_retention_passes_it() {
+        both(|db| {
+            let store = db.store();
+            once(&store, "first", "deploy", "k", json!({})).unwrap();
+            let day = chrono::Duration::days(1);
+
+            // nothing prunes a key that is younger than the cutoff
+            assert_eq!(store.prune_launch_keys(Utc::now() - day).unwrap(), 0);
+            assert_eq!(store.launch_key("k").unwrap().as_deref(), Some("first"));
+
+            assert_eq!(store.prune_launch_keys(Utc::now() + day).unwrap(), 1);
+            assert_eq!(store.launch_key("k").unwrap(), None);
+            // and the key is free again, which is what a lifetime means
+            assert_eq!(
+                once(&store, "later", "deploy", "k", json!({})).unwrap(),
+                Landed::Yes
+            );
+        });
+    }
+
+    // a key that named a run retention took would hand back an id nothing can
+    // be looked up under, so it goes with the run
+    #[test]
+    fn a_launch_key_goes_when_the_run_it_names_does() {
+        both(|db| {
+            let store = db.store();
+            once(&store, "first", "deploy", "k", json!({})).unwrap();
+
+            assert_eq!(
+                store
+                    .delete_runs("deploy", &["first".to_string()], Utc::now())
+                    .unwrap(),
+                1
+            );
+            assert_eq!(store.launch_key("k").unwrap(), None);
+            assert_eq!(
+                once(&store, "again", "deploy", "k", json!({})).unwrap(),
+                Landed::Yes
+            );
+        });
+    }
+
+    /// `hands` callers presenting one launch key at the same instant, each on a
+    /// connection of its own, released together. returns what each came away
+    /// with.
+    fn race_one_key(db: &Backend, hands: usize) -> Vec<Landed> {
+        let gate = std::sync::Arc::new(std::sync::Barrier::new(hands));
+        let callers: Vec<_> = (0..hands)
+            .map(|i| {
+                let (store, gate) = (db.store(), gate.clone());
+                std::thread::spawn(move || {
+                    let id = format!("run-{i}");
+                    gate.wait();
+                    once(&store, &id, "deploy", "ci-4182", json!({ "env": "prod" })).unwrap()
+                })
+            })
+            .collect();
+        callers.into_iter().map(|c| c.join().unwrap()).collect()
+    }
+
+    // **the case the whole design is for.** four callers, four connections, one
+    // key, released together: the primary key is what decides, and a
+    // read-then-write would have produced two runs here rather than one
+    #[test]
+    fn several_callers_present_one_launch_key_at_once_and_exactly_one_run_is_made() {
+        both(|db| {
+            let store = db.store();
+            let came_away = race_one_key(db, 4);
+
+            let made: Vec<&Landed> = came_away.iter().filter(|l| **l == Landed::Yes).collect();
+            assert_eq!(made.len(), 1, "one key made several runs: {came_away:?}");
+
+            // and every other caller was handed the run that was made, rather
+            // than a refusal or a run of its own
+            let held: Vec<&String> = came_away
+                .iter()
+                .filter_map(|l| match l {
+                    Landed::Held(id) => Some(id),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                held.len(),
+                3,
+                "a caller came away with neither: {came_away:?}"
+            );
+            let winner = store
+                .launch_key("ci-4182")
+                .unwrap()
+                .expect("the key names a run");
+            for id in held {
+                assert_eq!(
+                    id, &winner,
+                    "a caller was handed a run the key does not name"
+                );
+            }
+
+            let runs = store
+                .runs(Some("deploy"), None, None, None, None, 50)
+                .unwrap();
+            assert_eq!(runs.len(), 1, "four callers, one key, {} runs", runs.len());
+            assert_eq!(runs[0].id, winner);
+            // and only the run that was made has op rows and a queued event:
+            // the losers rolled back whole
+            assert_eq!(store.op_runs(&winner).unwrap().len(), 1);
+            assert_eq!(
+                store.event_log(&EventQuery::default(), 50).unwrap().len(),
+                1
+            );
+        });
+    }
+
+    /// a database at v22: everything but the launch keys.
+    fn at_v22(db: &Backend) {
+        match db {
+            Backend::Sqlite(dir) => {
+                let conn = Connection::open(dir.path().join("hestan.db")).unwrap();
+                for batch in [
+                    PHASE1_SCHEMA,
+                    SCHEMA_V2,
+                    SCHEMA_V3,
+                    SCHEMA_V4,
+                    SCHEMA_V5,
+                    SCHEMA_V6,
+                    SCHEMA_V7,
+                    SCHEMA_V8,
+                    SCHEMA_V9,
+                    SCHEMA_V10,
+                    SCHEMA_V11,
+                    SCHEMA_V12,
+                    SCHEMA_V13,
+                    SCHEMA_V14,
+                    SCHEMA_V15,
+                    SCHEMA_V16,
+                    SCHEMA_V17,
+                    SCHEMA_V18,
+                    SCHEMA_V19,
+                    SCHEMA_V20,
+                    SCHEMA_V21,
+                    SCHEMA_V22,
+                ] {
+                    conn.execute_batch(batch).unwrap();
+                }
+                conn.pragma_update(None, "user_version", 22).unwrap();
+            }
+            #[cfg(feature = "postgres")]
+            Backend::Postgres(pg) => {
+                pg.store()
+                    .conn()
+                    .batch(
+                        "DROP TABLE launch_keys;
+                         UPDATE schema_version SET version = 22;",
+                    )
+                    .unwrap();
+            }
+        }
+    }
+
+    // the migration an existing deployment sees: one empty table, nothing read
+    // and nothing rewritten, and every launch it was already making goes on
+    // working with no key at all
+    #[test]
+    fn a_v22_db_migrates_to_v23_and_keeps_launching_without_a_key() {
+        both(|db| {
+            at_v22(db);
+            let store = db.store();
+            assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
+
+            store
+                .create_run(&mk_run("plain", "deploy", Utc::now()), &["a".into()])
+                .unwrap();
+            assert!(store.run("plain").unwrap().is_some());
+            assert_eq!(store.launch_key("anything").unwrap(), None);
+
+            // and from here a launch can carry one
+            assert_eq!(
+                once(&store, "keyed", "deploy", "k", json!({})).unwrap(),
+                Landed::Yes
+            );
+
+            // reopening does not migrate a second time
+            drop(store);
+            let store = db.store();
+            assert_eq!(store.launch_key("k").unwrap().as_deref(), Some("keyed"));
         });
     }
 }

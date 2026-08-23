@@ -21,7 +21,7 @@ use crate::asset::{ASSETS_JOB, AssetRegistry, launch_plan, mapped_reads, mats_ma
 use crate::auth::{self, Access, Auth, Identity};
 use crate::backfill;
 use crate::error::Error;
-use crate::executor::{self, CancelOutcome, Lineage, Runner};
+use crate::executor::{self, CancelOutcome, Launch, Lineage, Runner};
 use crate::freshness::{self, asset_freshness};
 use crate::graph;
 use crate::job::Job;
@@ -844,6 +844,11 @@ struct LaunchBody {
     /// where in the queue this run goes: higher starts first. absent is
     /// whatever `Hestan::priority` set.
     priority: Option<i64>,
+    /// an idempotency key: one run per key, ever. a second request carrying
+    /// the same key is answered `200` with the first one's run rather than
+    /// launching a second, which is what a client that retried a request it
+    /// never got an answer to is asking for.
+    key: Option<String>,
 }
 
 /// a body that carries nothing but `params`: validation and preset writes.
@@ -906,12 +911,44 @@ async fn launch_run(
     // `Trigger::Manual` with no actor means a person asked and nothing was
     // checking who
     let runner = st.runner.as_actor(actor(&who));
-    let launched = match body.ops {
-        None => runner.launch_prioritized(&name, params, Trigger::Manual, tags, body.priority),
-        Some(ops) => launch_subset(&st, &runner, &name, ops, params, tags, body.priority)?,
+    let launched = match (body.ops, body.key) {
+        // a subset launch has no keyed form, and saying so is better than
+        // honouring one of the two: `Runner::launch_subset` takes no claim, so
+        // a key alongside `ops` would be silently ignored
+        (Some(_), Some(_)) => {
+            return Err(err(
+                StatusCode::BAD_REQUEST,
+                "key and ops are alternatives: a launch key names one launch of a job, \
+                 and a subset launch has no keyed form",
+            ));
+        }
+        (None, None) => runner
+            .launch_prioritized(&name, params, Trigger::Manual, tags, body.priority)
+            .map(Launch::first),
+        (None, Some(key)) => {
+            runner.launch_once(&name, params, Trigger::Manual, &key, tags, body.priority)
+        }
+        (Some(ops), None) => {
+            launch_subset(&st, &runner, &name, ops, params, tags, body.priority)?.map(Launch::first)
+        }
     };
     match launched {
-        Ok(run_id) => Ok((StatusCode::ACCEPTED, Json(json!({ "run_id": run_id })))),
+        // a repeat is `200` and carries `repeat`, because "your request was
+        // accepted" and "your request had already been accepted" are different
+        // answers and a caller counting deploys needs to tell them apart. a
+        // plain launch answers exactly what it always did
+        Ok(launch) if launch.repeat() => Ok((
+            StatusCode::OK,
+            Json(json!({ "run_id": launch.run_id(), "repeat": true })),
+        )),
+        Ok(launch) => Ok((
+            StatusCode::ACCEPTED,
+            Json(json!({ "run_id": launch.into_run_id() })),
+        )),
+        // the same key presented for a different job or different params: the
+        // caller has two requests and one name for them, and the message says
+        // which run the name already has
+        Err(e @ Error::LaunchKeyReused { .. }) => Err(err(StatusCode::CONFLICT, e.to_string())),
         Err(e @ Error::UnknownJob(_)) => Err(err(StatusCode::NOT_FOUND, e.to_string())),
         // a subset the job cannot satisfy is Error::Graph, raised by the same
         // check asset builds and resumes go through, and it names what is
@@ -8283,5 +8320,81 @@ mod tests {
                 );
             }
         }
+    }
+
+    // the http half of a launch key: what a client that retried a request it
+    // never got an answer to sees
+    #[tokio::test]
+    async fn a_launch_key_answers_a_retry_with_the_run_it_already_made() {
+        let st = state(vec![windowed_job("report")]);
+        let post = |body: &'static str| {
+            let st = st.clone();
+            async move { launch_run(State(st), Path("report".into()), None, raw(body)).await }
+        };
+
+        let (status, Json(first)) = post(r#"{"params": {"days": 7}, "key": "ci-4182"}"#)
+            .await
+            .unwrap();
+        assert_eq!(status, StatusCode::ACCEPTED);
+        assert_eq!(
+            first["repeat"],
+            json!(null),
+            "a first launch claimed to be a repeat"
+        );
+        let id = first["run_id"].as_str().unwrap().to_string();
+
+        // the retry: 200 rather than 202, because nothing was accepted this
+        // time, and the same run id, because that is what was asked about
+        let (status, Json(again)) = post(r#"{"params": {"days": 7}, "key": "ci-4182"}"#)
+            .await
+            .unwrap();
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(again["run_id"].as_str().unwrap(), id);
+        assert_eq!(again["repeat"], json!(true));
+        assert_eq!(
+            st.runner
+                .store()
+                .runs(None, None, None, None, None, 50)
+                .unwrap()
+                .len(),
+            1,
+            "a retry launched a second run"
+        );
+
+        // a key of its own is a run of its own
+        let (status, Json(other)) = post(r#"{"params": {"days": 7}, "key": "ci-4183"}"#)
+            .await
+            .unwrap();
+        assert_eq!(status, StatusCode::ACCEPTED);
+        assert_ne!(other["run_id"].as_str().unwrap(), id);
+
+        // and the same key for a different request is the caller's mistake,
+        // named as one
+        let (status, Json(body)) = post(r#"{"params": {"days": 1}, "key": "ci-4182"}"#)
+            .await
+            .unwrap_err();
+        assert_eq!(status, StatusCode::CONFLICT);
+        let said = body["error"].as_str().unwrap();
+        assert!(said.contains("ci-4182") && said.contains(&id), "{said}");
+        assert!(said.contains("different params"), "{said}");
+        assert_eq!(
+            st.runner
+                .store()
+                .runs(None, None, None, None, None, 50)
+                .unwrap()
+                .len(),
+            2
+        );
+
+        // a key alongside a subset launch is refused rather than ignored
+        let (status, Json(body)) =
+            post(r#"{"params": {"days": 7}, "key": "k", "ops": ["render"]}"#)
+                .await
+                .unwrap_err();
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(
+            body["error"].as_str().unwrap().contains("alternatives"),
+            "{body}"
+        );
     }
 }

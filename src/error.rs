@@ -214,6 +214,30 @@ pub enum Error {
          docs/backup.md"
     )]
     NotResettled(String),
+    /// the same [launch key](crate::Runner::launch_once) presented twice for
+    /// two different launches.
+    ///
+    /// a key means "make sure this ran once", so a second call carrying one is
+    /// answered with the run the first call made. that answer is only true
+    /// while the two calls are asking for the same thing: the same job, and
+    /// the same params. when they are not, one of the two callers is about to
+    /// be handed a run that did something else, and hestan says so instead.
+    #[error(
+        "launch key {key} already launched run {run} of job {job}, and this call names \
+         {named}. a key stands for one launch: send what the first call sent, or use a \
+         key of its own"
+    )]
+    LaunchKeyReused {
+        /// the key, as it was presented.
+        key: String,
+        /// the run the key already names.
+        run: String,
+        /// the job that run is of.
+        job: String,
+        /// what this call named instead: another job, or the same job with
+        /// params that are not the stored ones.
+        named: String,
+    },
     /// a dbt manifest that cannot become assets: it could not be read, it is
     /// not the json a manifest is, its schema version is not one this build
     /// [reads](crate::dbt), or two of its nodes would be one asset. every one

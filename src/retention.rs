@@ -212,12 +212,19 @@ pub(crate) fn sweep(runner: &Runner, policy: &Retention, now: DateTime<Utc>) {
     if removed > 0 {
         tracing::info!("retention: removed {removed} runs");
     }
-    // sensor run keys are never collected on their own: a sensor keyed by the
-    // day would keep a row per day for as long as the file lives
+    // keys are never collected on their own: a sensor keyed by the day would
+    // keep a row per day for as long as the file lives, and a launch key is a
+    // row per request. both ride this one cutoff rather than each having a
+    // lifetime of its own, so "how long is a key honoured" has one answer
     if let Some(cutoff) = policy.cutoffs(now).success {
         match store.prune_sensor_run_keys(cutoff) {
             Ok(n) if n > 0 => tracing::info!("retention: removed {n} sensor run keys"),
             Err(e) => tracing::warn!("retention: sensor run keys: {e}"),
+            Ok(_) => {}
+        }
+        match store.prune_launch_keys(cutoff) {
+            Ok(n) if n > 0 => tracing::info!("retention: removed {n} launch keys"),
+            Err(e) => tracing::warn!("retention: launch keys: {e}"),
             Ok(_) => {}
         }
         // delivered notifications only. one that never got through is not
