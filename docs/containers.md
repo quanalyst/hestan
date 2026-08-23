@@ -148,13 +148,14 @@ easier thing to be right about.
 the scripts are in [`deploy/checks/`](../deploy/checks) and run like this:
 
 ```
-bash deploy/checks/run.sh                     # all of them, about six minutes
+bash deploy/checks/run.sh                     # all of them, about ten minutes
 bash deploy/checks/partition.sh               # one of them
+bash deploy/checks/stop.sh                    # the stop, and the kill
 PARTITION_SECS=120 bash deploy/checks/partition.sh
 ```
 
 they are not `cargo test` cases and will not become them. a partition takes a
-minute of wall clock to be a partition, and a test binary that takes six
+minute of wall clock to be a partition, and a test binary that takes ten
 minutes is a test binary nobody runs. they want a docker daemon, the compose
 plugin, psql, python3, and host ports 4000, 4001 and 55432.
 
@@ -260,30 +261,54 @@ expiry by a stop signal or a long gc pause. the last of those is the case the
 fence's doc comment is written about and it is still reasoning rather than a
 measurement.
 
-## Signals, and why a container takes ten seconds to stop
+## Signals, and what a stop is worth
 
-**hestan installs no signal handler**, and the kernel drops an unhandled signal
-sent to pid 1 of a container rather than applying its default action. so
-SIGTERM does nothing to a hestan container:
+`serve` and `work` listen for SIGTERM and SIGINT. they did not before, and the
+kernel drops an unhandled signal sent to pid 1 of a container rather than
+applying its default action, so a stopped hestan container was a killed one.
+the same measurement, on the same image and the same machine, before and after:
 
-| | |
+| `docker stop`, hestan as pid 1, no `--init` | then | now |
+| --- | --- | --- |
+| how it ended | waited its full 10s timeout, exit 137 (SIGKILL) | exited on the signal after 39ms, exit 0 |
+| the deciding lease | left to expire | handed back before the process finished leaving |
+| a run it was executing | killed mid-op, claimed until its 60s lease ran out | finished, or put back on the queue |
+
+for reference and unchanged: the same image behind `docker run --init` exited
+on the signal in 196ms with 143, which is an init shim forwarding a signal to a
+process that had no handler. `deploy/checks/stop.sh` runs the case **without**
+one, because that is the case that was broken and a check behind an init shim
+would pass without touching it.
+
+### The handover, stopped and killed
+
+the pair is the point, and both halves were measured on one stack, from one
+machine, polling the `decider` row the same way:
+
+| | until another process held the term |
 | --- | --- |
-| `docker stop` on this image | waited its full 10s timeout, exit 137 (SIGKILL) |
-| the same image behind `docker run --init` | exited on the signal in 196ms, exit 143 (SIGTERM) |
+| after `docker kill` | 8286ms, 8954ms, 9934ms, 10425ms over four kills, and 10033ms on this one |
+| after `docker stop` | **1448ms** |
 
-three things follow, and none of them is hypothetical.
+the kill number is the one that does not move: it is whatever was left of the
+ten second lease plus up to one two second renewal, and it is what the expiry
+is for. the stop number is a handback, so the lease is free the instant the
+leader goes and what is left is the next process's renewal interval. a stop is
+not instant and is not meant to be read as instant.
 
-- `docker compose down` takes about ten seconds per hestan container. `init:
-  true` on the service, or a signal handler in your own binary, is how to make
-  that quick.
-- a container being stopped goes on working normally until SIGKILL arrives. a
-  worker keeps claiming runs the whole way through its grace period.
-- **the deciding lease is never handed back on a stop.** `serve` hands it back
-  when `serve` returns, and a signal is not what makes `serve` return.
-  [scaling](scaling.md#the-deciding-lease) says a clean stop hands the lease
-  back; in a container there is no clean stop, so a restart inside the lease
-  waits up to ten seconds before it decides anything. that is the same ten
-  seconds a kill costs, which is the case the expiry exists for.
+### What it costs
+
+**a hestan process now takes longer to exit than it used to.** it is finishing
+work rather than dying. an idle scheduler is gone in milliseconds; a worker
+holding a run waits for the run, up to `Hestan::stop_within`, eight seconds by
+default. `docker compose down` on a stack with nothing running is quick now
+where it took ten seconds a container; on a stack that is busy it takes as long
+as the work has left.
+
+a run the deadline did not cover goes back on the queue and is executed again
+from the beginning by whoever claims it, which is
+[the same trade `Reclaim::Requeue` makes](scaling.md#claims-and-leases). it is
+not recorded as failed, so nothing pages about it.
 
 ## Kubernetes, written and not run
 
@@ -302,10 +327,12 @@ two fields are worth the comment they carry.
 **the scheduler runs two replicas.** one process at a time decides, and which
 one is settled by [a lease in the store](scaling.md#the-deciding-lease) rather
 than by a replica count, so two is safe rather than forbidden. the second one
-buys no throughput; it buys that a pod going away is a gap of about one lease
-instead of an outage lasting however long a replacement pod takes to schedule,
-pull and boot. one replica is also correct if you would rather the deployment
-simply stop deciding.
+buys no throughput; it buys that a pod going away is a gap rather than an
+outage lasting however long a replacement pod takes to schedule, pull and boot.
+how long a gap depends on how the pod went: one **deleted** is sent SIGTERM and
+hands the lease back, so the gap is the other pod's renewal interval, while one
+whose node vanished costs a whole lease. one replica is also correct if you
+would rather the deployment simply stop deciding.
 
 **the probes point at `/api/whoami`.** that is the one endpoint outside the
 [auth guard](auth.md), because the ui has to be able to ask whether there is a

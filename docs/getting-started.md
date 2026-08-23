@@ -93,8 +93,10 @@ readable three months later.
 `Hestan::new()` collects everything, and `serve` is what starts: it opens the
 database, recovers whatever a previous process left half-done, runs the
 scheduler, and serves the ui and json api on the address given. it does not
-return until the process stops. for one headless run and no server, swap it for
-`run_once("etl", json!({})).await`; see [embedding](embedding.md).
+return until the process is
+[asked to stop](scaling.md#stopping-a-process-on-purpose). for one headless run
+and no server, swap it for `run_once("etl", json!({})).await`; see
+[embedding](embedding.md).
 
 ## Where the state lives
 

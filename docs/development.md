@@ -21,6 +21,7 @@ src/
   store.rs      the store: schema, migrations, all reads and writes
   pg.rs         the postgres half of it (behind the postgres feature)
   server.rs     axum router, api handlers, embedded ui fallback
+  stop.rs       what a long-lived process does between the signal and the exit
   model.rs      Run/OpRun/Event/Tick/Materialization rows and the status enums
   http.rs       HttpSource (behind the http feature)
   notify.rs     webhook/slack failure hooks (behind the http feature)
@@ -38,8 +39,8 @@ ui/             react + vite app; ui/dist is committed and embedded
 examples/       demo.rs and assets.rs (both mount the cli, so both need
                 --features cli), http_source.rs (needs --features http)
 tests/          pipeline.rs, assets.rs, isolation.rs, queue.rs, auth.rs,
-                docs.rs; http_source.rs and notify.rs (need the http
-                feature); capture.rs (needs capture); otel.rs (needs otel);
+                stopping.rs, docs.rs; http_source.rs and notify.rs (need the
+                http feature); capture.rs (needs capture); otel.rs (needs otel);
                 cli.rs (needs cli); parquet.rs (needs parquet); dbt.rs
                 (needs dbt), over the fixture manifest in
                 tests/fixtures/dbt/

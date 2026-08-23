@@ -2,6 +2,95 @@
 
 ## unreleased
 
+a process asked to stop stops, and hands back what it was holding.
+
+phase 43 measured the problem and could not fix it: hestan installed no signal
+handler in its server process, and the kernel drops an unhandled signal sent to
+pid 1 of a container, so `docker stop` on a hestan container waited its full ten
+seconds and killed it. `Hestan::serve` and `Hestan::work` now listen for SIGTERM
+and SIGINT. `run_once` and `build_asset` deliberately do not: a headless
+one-shot exists to execute the run it was asked for, and a handler that made it
+wait for a drain, or swallowed the signal that would have ended it, would be a
+worse bug than the one being fixed.
+
+**what an existing deployment sees change**, cost first:
+
+- **a process takes longer to exit than it used to.** it is finishing work
+  rather than dying. an idle one is gone in milliseconds; one holding a run
+  waits for the run, up to `Hestan::stop_within`, **eight seconds by default**.
+  a rolling restart timed around a process that died the instant it was
+  signalled is timed around a different number now. eight because `docker stop`
+  gives ten and the handback and the exit go in what is left; kubernetes gives
+  thirty, and a deployment whose ops need longer can say so
+- **the deciding lease comes back on a stop**, so the next process takes the
+  term without waiting out the expiry. measured by `deploy/checks/stop.sh` on
+  one compose stack, with hestan as **pid 1 and no `--init`**, polling the
+  `decider` row the same way for both:
+
+  | | until another process held the term |
+  | --- | --- |
+  | after `docker kill` | 10033ms, inside the 8286 to 10425ms phase 43 recorded over four kills |
+  | after `docker stop` | **1448ms** |
+
+  and the container itself exited **0** within 39ms of the signal,
+  where before it waited out the whole ten second grace period and reported
+  137. a stop is not instant and should not be read as instant: the lease is
+  free the moment the leader goes, and what is left is the next process's two
+  second renewal interval rather than the ten second expiry
+- **a run a stopping process cannot finish goes back on the queue** rather than
+  sitting claimed until its sixty second lease runs out, and it is **not**
+  recorded as failed: no failure hook fires, no alert is sent, and its ops go
+  back to `pending`. it did not fail, the process left. whoever claims it next
+  runs it **from the beginning**, so an op that already ran runs again, which
+  is the same trade `Reclaim::Requeue` has always made
+- **an open event stream ends when the process serving it is stopped.** it is
+  the one response with no natural end, so a stream that went on polling would
+  be the connection holding a stopping process open. reconnect with the
+  `Last-Event-ID` you already have and nothing is missed
+- **`EventKind` gains `RunReleased`** (`run_released`, warn, payload
+  `{"claimer": ...}`). `EVENT_SCHEMA` does not move: it says in as many words
+  that a kind may be added without it. **breaking at compile time only**: the
+  enum is not `#[non_exhaustive]`, so an exhaustive `match` on it needs one
+  more arm, and it has an `Unknown` arm precisely so that nothing has to
+- **`Hestan::stop_within(Duration)`** is the only new public method
+
+**what an isolated op's child process gets** is nothing, and it is worth saying
+plainly because it is the one process in a hestan deployment that hestan did
+not start. it is not signalled and it is not asked to stop, because the op is
+being given time to finish. if it finishes inside the deadline the run finishes
+with it; if it does not, the parent drops it on the way out, and dropping an op
+subprocess kills it, so a released run is never still being executed by the
+process that gave it up. what the container runtime does with the signal is a
+separate thing and `docs/isolation.md` says which: `docker stop` and a kubelet
+signal pid 1 alone, while a ctrl-c at a terminal signals the whole foreground
+process group and the child dies of that instead, which the parent then records
+as a failed attempt.
+
+- **`tests/stopping.rs`**, nine cases over real processes signalled from
+  outside: a served process exits on the signal rather than being killed, a
+  one-shot is untouched and still dies on SIGTERM, a second signal
+  short-circuits the wait, the lease is handed back and the term moves, a run
+  that fits inside the deadline finishes, one that does not is released rather
+  than failed, another worker picks a released run up without waiting for the
+  lease, the deadline is honoured, and an isolated op's child does not outlive
+  the stop. the store's half of it runs on both backends
+- **`deploy/checks/stop.sh`**: the stop and the kill on one stack, measured the
+  same way, plus a worker stopped with a run in flight. it asserts the shape it
+  is testing before it tests anything (`HostConfig.Init` unset, the hestan
+  binary at pid 1), because a check behind an init shim would pass without
+  going near the case that was broken
+- **`deploy/k8s`**: `terminationGracePeriodSeconds` stays 10 on the scheduler
+  and 30 on the worker, and the comments now say what the number is a ceiling
+  on rather than a timer the pod runs out, and that hestan's own deadline is
+  what decides. still not applied to a cluster
+- and one thing that is not this phase's work, called out rather than folded
+  in: the deciding-lease case in the store suite took a **twenty millisecond**
+  lease and then asserted, one round trip later, that it was still live. on
+  postgres, with the rest of the suite running beside it, twenty milliseconds
+  is not reliably longer than a round trip, and it failed on this machine on
+  `b544cfa` with none of the above in the tree. the lease is half a second now
+  and nothing the case asserts changed
+
 a hestan deployment in containers, and the first test of the term fence
 against a network that was actually taken away.
 

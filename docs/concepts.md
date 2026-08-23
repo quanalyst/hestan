@@ -33,10 +33,11 @@ all in the same log the run kinds are, and "what happened last night" is one
 query.
 
 a run's own kinds are `run_queued`, `run_started`, `run_success`, `run_failed`,
-`run_canceled`, `run_reclaimed`, `op_started`, `op_expanded`, `op_retry`,
-`op_success`, `op_failed`, `op_skipped`, `op_canceled`, `type_check_failed`,
-and `log`; the last is what `ctx.info/warn/error` emit. [events](events.md)
-has every kind, what each payload carries, where each one is written and which
+`run_canceled`, `run_reclaimed`, `run_released`, `op_started`, `op_expanded`,
+`op_retry`, `op_success`, `op_failed`, `op_skipped`, `op_canceled`,
+`type_check_failed`, and `log`; the last is what `ctx.info/warn/error` emit.
+[events](events.md) has every kind, what each payload carries, where each one
+is written and which
 of them cannot be atomic, how to query and follow the log, and how a run maps
 onto a distributed trace.
 

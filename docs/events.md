@@ -71,6 +71,7 @@ rule phase 21 applied to a run's terminal notification.
 | `run_queued` | the `runs` insert | yes |
 | `run_success` / `run_failed` / `run_canceled` | none | **no**, see below |
 | `run_reclaimed` | the reclaim's status change | yes |
+| `run_released` | the release's status change | yes |
 | `op_*`, `type_check_failed`, `log` | none | **no**, see below |
 | `asset_materialized` | the `asset_materializations` insert, which for a build is the op's terminal write | yes |
 | `policy_launched` | none | **no**, see below |
@@ -134,10 +135,20 @@ be `null` or absent.
 | `run_failed` | error | `job`, `status`, `error`, `failed_op`, `duration_secs` |
 | `run_canceled` | warn | `job`, `status`, `error` (optional), `failed_op` (optional), `duration_secs` |
 | `run_reclaimed` | warn | `claimer` (the instance that stopped renewing) and `policy`, `fail` or `requeue` |
+| `run_released` | warn | `claimer` (the instance that was stopping) |
 
 a reclaimed run under `fail` gets `run_reclaimed` **and then** `run_failed`:
 the first says why, the second says what the run did. under `requeue` it gets
 only the first, because the run has not ended.
+
+`run_released` is the same shape as a requeue and a different cause: the
+process holding the run was [asked to stop](scaling.md#stopping-a-process-on-purpose)
+and handed it back rather than leaving it claimed until the lease ran out. it
+is warn rather than info because the run starts over, so whatever its ops
+already did they do again. unlike a `fail` reclaim it is not followed by a
+terminal status: the run did not end, and it is queued again in the same
+transaction that wrote this line. what it does after that it does under
+whichever process claims it next.
 
 ### Ops
 
@@ -332,6 +343,12 @@ GET /api/events/stream?after=4182&subject_kind=asset
 each message is one event, with the event's `seq` as the SSE `id`, so a
 reconnecting consumer that sends `Last-Event-ID` (or passes `after=`) picks up
 exactly where it stopped and the gap is delivered before the live tail.
+
+**a stream ends when the process serving it is
+[asked to stop](scaling.md#stopping-a-process-on-purpose).** it is a response
+with no natural end, so a stream that went on polling would be the one
+connection keeping a stopping process alive. reconnect with the
+`Last-Event-ID` you already have and nothing is missed.
 
 ### `seq` is allocated on insert, not on commit
 

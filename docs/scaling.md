@@ -170,6 +170,56 @@ lease has expired, or if it is `running` with no claim at all (which can only
 be a row written before the queue existed). a **queued run nobody has claimed
 is left where it is**: that row is not a casualty, it is the queue.
 
+### Stopping a process on purpose
+
+`serve` and `work` listen for SIGTERM and SIGINT. a headless one-shot
+(`run_once`, `build_asset`) does not, and dies on a signal exactly as any
+program with no handler does: it exists to execute the run it was asked for,
+and a handler that made it wait would be a worse bug than no handler at all.
+
+what a stop does, in order:
+
+1. the http server stops accepting and finishes the requests it has. the
+   [event stream](events.md#following-the-log) ends here rather than holding a
+   connection open, because it is the one response with no natural end.
+2. this process claims nothing more. a run claimed now is a run it would hand
+   straight back.
+3. the loops that decide stop, and the
+   [deciding lease](#the-deciding-lease) goes back, so the next process takes
+   the term without waiting out the expiry.
+4. what is already in flight gets until `Hestan::stop_within` to finish.
+   **eight seconds by default**, which fits inside the ten `docker stop` gives
+   with room for the rest of this.
+5. whatever did not finish is **released**: back on the queue, claim cleared,
+   ops back to `pending`, and a `run_released` line in the log saying so.
+
+```rust
+Hestan::new().stop_within(Duration::from_secs(25)).work(None).await
+```
+
+a **second signal** skips step 4. ctrl-c twice is somebody saying something,
+and the second one is not swallowed.
+
+three things follow, and the first of them is a cost:
+
+- **a process takes longer to exit than it used to**, because it is finishing
+  work instead of dying. an idle one is gone in milliseconds; one holding a run
+  waits for the run, up to the deadline. a rolling restart timed around a
+  process that died instantly is timed around a different number now.
+- **released is not resumed.** whoever claims the run next runs it from the
+  beginning, so an op that already ran runs again. that is the same trade
+  [`Reclaim::Requeue`](#claims-and-leases) makes and it wants the same thought:
+  side effects happen twice.
+- **a released run is not a failed one.** nothing about it went wrong and
+  nothing records an outcome for it, so no failure hook fires and no alert is
+  sent. it is a queued run again.
+
+what a stop deliberately does not do is cancel anything. an
+[isolated](isolation.md#when-the-orchestrator-itself-is-stopped) op's child is
+not signalled by hestan: it is being given time to finish. if the deadline runs
+out first the parent drops it, and dropping it kills it, so a released run is
+never being executed by a process that has left.
+
 ## Roles
 
 ```rust
@@ -253,18 +303,19 @@ in its own memory, and disagrees with the row.
 database finds the row free, takes it before `serve` binds its socket, and never
 contends with anybody. the exception is worth stating: a process **killed**
 without handing the lease back leaves it held until it expires, so a restart
-inside that window waits up to ten seconds before it decides anything. a clean
-stop hands it back and a first boot finds it free. ten seconds of nobody
-deciding is ten more seconds of downtime, and
+inside that window waits up to ten seconds before it decides anything. ten
+seconds of nobody deciding is ten more seconds of downtime, and
 [catch-up](scheduling.md#missed-fire-catch-up) already has an answer for
 downtime.
 
-**in a container there is no clean stop**, so the handback is not the case to
-plan around. hestan installs no signal handler and the kernel drops an
-unhandled signal sent to pid 1 of a container, which makes a stopped container
-a killed one:
-[containers](containers.md#signals-and-why-a-container-takes-ten-seconds-to-stop)
-has the measurement.
+**a stop is the other case, and a deploy is a stop.** a process
+[asked to stop](#stopping-a-process-on-purpose) hands the lease back, so the
+row is free before it has finished leaving and what is left is how long the
+next process takes to look: one two-second renewal rather than the rest of a
+ten-second lease. measured in containers, with hestan as pid 1 and no init shim
+in front of it:
+[containers](containers.md#signals-and-what-a-stop-is-worth) has the stop and
+the kill side by side.
 
 ### What the term fences, and what it does not
 

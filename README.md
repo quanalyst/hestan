@@ -423,6 +423,14 @@ the database while it keeps running, and its next decision comes back refused
 by the store on the term it named. [docs/containers.md](docs/containers.md)
 has the image, the stack and what the fault injection measured.
 
+**a process stops when it is told to.** SIGTERM or SIGINT stops `serve` and
+`work` accepting, finishes what they are already doing up to
+`Hestan::stop_within`, hands the deciding lease back so the next process takes
+over without waiting out the expiry, and puts anything that did not finish back
+on the queue rather than leaving it claimed. the cost is that a process now
+takes longer to exit than one that simply died, because it is finishing the
+work; `deploy/checks/stop.sh` has the stop and the kill side by side.
+
 ## Docs
 
 the details live in [docs/](docs/README.md):

@@ -41,6 +41,13 @@ started. it is the **bound** address that is checked against the
 anyone can reach with nothing configured. when serve returns, every loop is
 aborted with it.
 
+**and `serve` returns when the process is signalled.** SIGTERM or SIGINT stops
+it accepting, finishes what it is holding up to `Hestan::stop_within`, hands
+the deciding lease back and puts what it could not finish back on the queue;
+[scaling](scaling.md#stopping-a-process-on-purpose) has the order. `run_once`
+and `build_asset` install no handler at all, and a signal ends them where it
+finds them: they exist to execute the run they were asked for.
+
 `Hestan::new()...run_once(job, params)` builds the same way (including the
 crash sweep, the schedule/sensor sync and one retention sweep) but runs a
 single manual run to completion and returns the final `Run`. no server, no

@@ -193,6 +193,31 @@ for `isolated()` on anything blocking.
 a timeout is still a failed attempt rather than a canceled run, so it retries
 like any other failure.
 
+### When the orchestrator itself is stopped
+
+a [stop](scaling.md#stopping-a-process-on-purpose) is not a cancel, and hestan
+does not signal an isolated op on one. the op is being given time to finish, so
+the child goes on running exactly as it would have, and if it finishes inside
+`Hestan::stop_within` the run finishes with it.
+
+if it does not, the parent drops the task holding the child on its way out, and
+dropping the child kills it: SIGKILL, no grace, no `ctx.is_cancelled()`. that
+is deliberate. the run is going back on the queue, and a subprocess outliving
+the process that spawned it would be a second copy of the op running against
+whichever worker picks the run up next.
+
+what the *runtime* does with the signal is a separate thing and is worth
+knowing, because it is the difference between a server and a laptop:
+
+- `docker stop`, and a kubelet deleting a pod, signal **pid 1 alone**. the
+  child never sees the signal at all, which is the case above.
+- ctrl-c at a terminal signals the whole **foreground process group**. the
+  child gets that SIGINT too, and it handles SIGTERM and not SIGINT, so it dies
+  of it. the parent then finds a subprocess that exited on a signal without
+  recording a result and records that attempt as failed. so a run interrupted
+  with ctrl-c can fail where the same run in a container would have been
+  released.
+
 ## Limits
 
 a child can be capped, which an in-process op cannot be:
