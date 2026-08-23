@@ -1,6 +1,7 @@
 import { useState } from "react";
-import { useNavigate } from "react-router-dom";
+import { useNavigate, useSearchParams } from "react-router-dom";
 import { get, usePoll } from "./api";
+import { namespacesOf, onlyNamespace } from "./catalog";
 import MicroBars from "./MicroBars";
 import type { MicroBar } from "./MicroBars";
 import StatusDot from "./StatusDot";
@@ -20,6 +21,19 @@ const runBars = (runs: Run[]): MicroBar[] =>
 
 export default function JobsPage() {
   const nav = useNavigate();
+  // which slice of the deployment this page is showing, in the url like the
+  // assets page's filters, so one team's view is a link
+  const [params, setParams] = useSearchParams();
+  const namespace = params.get("namespace");
+  const setNamespace = (want: string | null) =>
+    setParams(
+      (prev) => {
+        if (want === null) prev.delete("namespace");
+        else prev.set("namespace", want);
+        return prev;
+      },
+      { replace: true },
+    );
   const [jobs, setJobs] = useState<JobSummary[] | null>(null);
   const [runs, setRuns] = useState<Run[] | null>(null);
   const [upcoming, setUpcoming] = useState<UpcomingSchedule[]>([]);
@@ -63,6 +77,8 @@ export default function JobsPage() {
 
   if (!jobs) return <p className="muted">loading…</p>;
 
+  const namespaces = namespacesOf(jobs);
+  const shown = onlyNamespace(jobs, namespace);
   const winStart = Date.now() - windowSecs * 1000;
   const winRuns = (runs ?? []).filter((r) => new Date(r.created_at).getTime() >= winStart);
   // canceled excluded: its duration measures when someone hit stop
@@ -119,16 +135,47 @@ export default function JobsPage() {
       </div>
 
       <TimelinePlot
-        jobs={jobs.map((j) => j.name)}
+        jobs={shown.map((j) => j.name)}
         runs={winRuns}
         upcoming={upcoming}
         windowSecs={windowSecs}
         onWindow={setWindowSecs}
       />
 
+      {namespaces.length > 0 && (
+        <div className="filter-row">
+          <span className="filter-group">
+            <span className="filter-label">namespace</span>
+            <button
+              className={namespace === null ? "text-btn active" : "text-btn"}
+              onClick={() => setNamespace(null)}
+            >
+              all
+            </button>
+            {namespaces.map((ns) => (
+              <button
+                key={ns}
+                className={namespace === ns ? "text-btn active" : "text-btn"}
+                onClick={() => setNamespace(namespace === ns ? null : ns)}
+              >
+                {ns}
+              </button>
+            ))}
+          </span>
+        </div>
+      )}
+
       {jobs.length > 0 && (
         <>
-          <h2>jobs</h2>
+          <h2>
+            jobs
+            {shown.length !== jobs.length && (
+              <span className="secondary">
+                {" "}
+                · {shown.length} of {jobs.length}
+              </span>
+            )}
+          </h2>
           <table>
             <thead>
               <tr>
@@ -141,7 +188,7 @@ export default function JobsPage() {
               </tr>
             </thead>
             <tbody>
-              {jobs.map((job) => {
+              {shown.map((job) => {
                 const run = job.last_run;
                 return (
                   <tr key={job.name} onClick={() => nav(`/jobs/${encodeURIComponent(job.name)}`)}>

@@ -9,6 +9,7 @@ use crate::hooks::{Hooks, OpEvent, RunEvent};
 use crate::model::Overlap;
 use crate::op::Op;
 use crate::retention::Retention;
+use crate::whose::check_namespace;
 
 /// a validated dag of ops, built via [`Job::builder`].
 ///
@@ -39,6 +40,7 @@ use crate::retention::Retention;
 pub struct Job {
     name: String,
     description: Option<String>,
+    namespace: Option<String>,
     ops: Vec<Op>,
     order: Vec<String>,
     max_parallel: Option<usize>,
@@ -65,6 +67,7 @@ impl Job {
         JobBuilder {
             name: name.into(),
             description: None,
+            namespace: None,
             ops: Vec::new(),
             instances: Vec::new(),
             max_parallel: None,
@@ -87,6 +90,14 @@ impl Job {
     /// [`JobBuilder::description`].
     pub fn description(&self) -> Option<&str> {
         self.description.as_deref()
+    }
+
+    /// which slice of the deployment this job is in, from
+    /// [`JobBuilder::namespace`]. `None` is every job in a deployment that
+    /// declares no namespaces, which is what one looked like before they
+    /// existed.
+    pub fn namespace(&self) -> Option<&str> {
+        self.namespace.as_deref()
     }
 
     /// every op, including the ones a [`Graph`] instance flattened into the
@@ -247,6 +258,7 @@ impl Job {
         Ok(Job {
             name,
             description,
+            namespace: None,
             ops,
             order,
             max_parallel: None,
@@ -607,7 +619,7 @@ impl GraphBuilder {
         if let Some(e) = self.error {
             return Err(Error::Graph(format!("{g}: {e}")));
         }
-        // ops and nested instances share one namespace: both are things an
+        // ops and nested instances share one set of names: both are things an
         // inner op can name
         let mut names: Vec<&str> = Vec::new();
         for name in self
@@ -866,6 +878,7 @@ fn flatten(job: &str, ops: Vec<Op>, instances: Vec<Instance>) -> Result<Vec<Op>,
 pub struct JobBuilder {
     name: String,
     description: Option<String>,
+    namespace: Option<String>,
     ops: Vec<Op>,
     instances: Vec<Instance>,
     max_parallel: Option<usize>,
@@ -881,6 +894,36 @@ impl JobBuilder {
     /// a line about what this job is for, shown beside its name in the ui.
     pub fn description(mut self, d: impl Into<String>) -> Self {
         self.description = Some(d.into());
+        self
+    }
+
+    /// which slice of the deployment this job belongs to.
+    ///
+    /// ```
+    /// # use hestan::Job;
+    /// # fn main() -> Result<(), hestan::Error> {
+    /// let job = Job::builder("orders_etl").namespace("finance").build()?;
+    /// assert_eq!(job.namespace(), Some("finance"));
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// a namespace is what a [scope](crate::Scope) names to admit a whole
+    /// team's jobs and assets at once, and what `?namespace=` narrows the api
+    /// and the ui to. **it is not an asset [`group`](crate::Asset::group)**: a
+    /// group labels the asset graph and hestan draws it, a namespace divides
+    /// the deployment and hestan enforces it, and neither is derived from the
+    /// other. `docs/namespaces.md` is the whole of it.
+    ///
+    /// declared here rather than parsed out of the job's name, because the
+    /// name is the key every run row, schedule and api path refers to a job
+    /// by: renaming a job to regroup it orphans its history, and this leaves
+    /// the name where it is.
+    ///
+    /// a namespace that is empty, or that starts or ends with a space, fails
+    /// [`build`](Self::build).
+    pub fn namespace(mut self, name: impl Into<String>) -> Self {
+        self.namespace = Some(name.into());
         self
     }
 
@@ -1012,6 +1055,7 @@ impl JobBuilder {
         if let Some(e) = self.error {
             return Err(Error::Graph(format!("job {}: {e}", self.name)));
         }
+        check_namespace("job", &self.name, self.namespace.as_deref())?;
         let ops = flatten(&self.name, self.ops, self.instances)?;
         let pairs: Vec<_> = ops
             .iter()
@@ -1025,6 +1069,7 @@ impl JobBuilder {
         Ok(Job {
             name: self.name,
             description: self.description,
+            namespace: self.namespace,
             ops,
             order,
             max_parallel: self.max_parallel,
@@ -1072,6 +1117,35 @@ mod tests {
             Err(e) => e.to_string(),
             Ok(_) => panic!("expected a build error"),
         }
+    }
+
+    // a namespace nobody could type again in a url is not a namespace, and
+    // the build says so rather than serving a slice nothing can name
+    #[test]
+    fn a_namespace_that_cannot_be_named_fails_the_build() {
+        let said = build_err(Job::builder("etl").op(op("run")).namespace("  "));
+        assert!(said.contains("job etl"), "{said}");
+        assert!(said.contains("no name in it"), "{said}");
+
+        let said = build_err(Job::builder("etl").op(op("run")).namespace("finance "));
+        assert!(said.contains("declare \"finance\""), "{said}");
+
+        // and one that reads back as what was declared, which is every job
+        // that was ever built before namespaces existed when it declares none
+        let job = Job::builder("etl")
+            .op(op("run"))
+            .namespace("finance")
+            .build()
+            .unwrap();
+        assert_eq!(job.namespace(), Some("finance"));
+        assert_eq!(
+            Job::builder("etl")
+                .op(op("run"))
+                .build()
+                .unwrap()
+                .namespace(),
+            None
+        );
     }
 
     // a limit caps a process. in-process that process is the orchestrator, so

@@ -18,6 +18,7 @@ use crate::partition::{KeySet, PartitionMapping, Partitions, Reads};
 use crate::policy::AutoPolicy;
 use crate::schedule::Cron;
 use crate::store::{Built, Store};
+use crate::whose::check_namespace;
 
 /// the internal job every asset build runs under.
 pub(crate) const ASSETS_JOB: &str = "assets";
@@ -127,6 +128,7 @@ pub struct Asset {
     name: String,
     source: bool,
     group: Option<String>,
+    namespace: Option<String>,
     hue: Option<u16>,
     deps: Vec<String>,
     maps: BTreeMap<String, PartitionMapping>,
@@ -150,6 +152,7 @@ impl Asset {
             name: name.into(),
             source: true,
             group: None,
+            namespace: None,
             hue: None,
             deps: Vec::new(),
             maps: BTreeMap::new(),
@@ -179,6 +182,7 @@ impl Asset {
             name,
             source: false,
             group: None,
+            namespace: None,
             hue: None,
             deps: Vec::new(),
             maps: BTreeMap::new(),
@@ -209,6 +213,7 @@ impl Asset {
             name,
             source: false,
             group: None,
+            namespace: None,
             hue: None,
             deps: Vec::new(),
             maps: BTreeMap::new(),
@@ -312,8 +317,14 @@ impl Asset {
         &self.deps
     }
 
-    /// the group this asset belongs to: one flat name, with nothing nested
-    /// inside it and no separator parsed out of it.
+    /// what this asset is labeled with on the graph: one flat name, with
+    /// nothing nested inside it and no separator parsed out of it.
+    ///
+    /// **a group is a label, not a boundary.** it clusters the graph, colours
+    /// it and names a source's origin, and nothing reads it to decide who may
+    /// touch what. the boundary is a [`namespace`](Asset::namespace), it is
+    /// declared, and neither is derived from the other. `docs/namespaces.md`
+    /// says which to reach for.
     ///
     /// **the resolution order is the declared group, else the part of the name
     /// before the first `/`, else no group at all**, so a graph that never
@@ -341,6 +352,30 @@ impl Asset {
     /// falling back to a bare source name and the two would be one entry.
     pub fn group(mut self, name: impl Into<String>) -> Asset {
         self.group = Some(name.into());
+        self
+    }
+
+    /// which slice of the deployment this asset belongs to.
+    ///
+    /// ```
+    /// # use hestan::Asset;
+    /// let orders = Asset::source("orders").group("warehouse").namespace("finance");
+    /// # let _ = orders;
+    /// ```
+    ///
+    /// a namespace is what a [scope](crate::Scope) names to admit a whole
+    /// team's jobs and assets at once, and what `?namespace=` narrows the api
+    /// and the ui to. **it is not a [`group`](Asset::group)**: the two answer
+    /// different questions and the example above is an asset that came from
+    /// the warehouse and belongs to finance. a group has a fallback (the part
+    /// of the name before the first `/`) because it only has to label a
+    /// picture; a namespace has none, because nothing should end up inside a
+    /// boundary by being named a certain way.
+    ///
+    /// the build refuses one that is empty, and one that starts or ends with
+    /// a space.
+    pub fn namespace(mut self, name: impl Into<String>) -> Asset {
+        self.namespace = Some(name.into());
         self
     }
 
@@ -502,6 +537,7 @@ impl Asset {
 pub struct MultiAsset {
     name: String,
     produces: Vec<String>,
+    namespace: Option<String>,
     deps: Vec<String>,
     op: Op,
     io: Option<String>,
@@ -523,12 +559,26 @@ impl MultiAsset {
             op: Op::new(name.clone(), f),
             name,
             produces: Vec::new(),
+            namespace: None,
             deps: Vec::new(),
             io: None,
             policy: None,
             retries: 0,
             retry_delay: None,
         }
+    }
+
+    /// which slice of the deployment everything this produces belongs to.
+    ///
+    /// declared here because a multi-asset produces *names* rather than
+    /// [`Asset`] values, so there is nowhere else to hang one, and one op
+    /// producing two teams' assets is not a thing worth expressing. a
+    /// [`group`](Asset::group) needs no equivalent: it falls back to the part
+    /// of each name before the first `/`, and a namespace deliberately has no
+    /// fallback.
+    pub fn namespace(mut self, name: impl Into<String>) -> MultiAsset {
+        self.namespace = Some(name.into());
+        self
     }
 
     /// the assets this op produces, one per key of the object it returns.
@@ -715,6 +765,10 @@ pub(crate) struct AssetMeta {
     /// in which case the name prefix answers instead. kept as declared rather
     /// than resolved so `doctor` can see the two disagree.
     pub declared_group: Option<String>,
+    /// which slice of the deployment this asset is in, from
+    /// [`Asset::namespace`] or from the [`MultiAsset`] that produces it.
+    /// `None` in a deployment that declares no namespaces.
+    pub namespace: Option<String>,
     /// the hue [`Asset::hue`] pinned on this asset's label; `None` when
     /// nothing was pinned, in which case [`hue`] answers from the label.
     pub declared_hue: Option<u16>,
@@ -906,6 +960,7 @@ impl AssetRegistry {
                 name: a.name.clone(),
                 source: a.source,
                 declared_group: a.group,
+                namespace: a.namespace,
                 declared_hue: a.hue,
                 deps: a.deps,
                 maps: a.maps,
@@ -938,6 +993,9 @@ impl AssetRegistry {
                     // so there is nowhere to declare a group on one of them;
                     // the name prefix is what answers for them
                     declared_group: None,
+                    // a namespace has no fallback to be had from the name, so
+                    // a multi-asset declares one for everything it produces
+                    namespace: m.namespace.clone(),
                     declared_hue: None,
                     deps: m.deps.clone(),
                     maps: BTreeMap::new(),
@@ -974,9 +1032,10 @@ impl AssetRegistry {
         let order = graph::topo_order(&pairs).map_err(|e| Error::Graph(format!("assets: {e}")))?;
         check_partition_deps(&metas)?;
         check_groups(&metas)?;
+        check_namespaces(&metas)?;
         let mut seen_ops: HashSet<&str> = HashSet::new();
         for o in &ops {
-            // ops and assets share one namespace inside the job, so a
+            // ops and assets share one set of names inside the job, so a
             // multi-asset named after an asset it does not produce collides
             // there, said before the duplicate check below, which would
             // otherwise report the collision as two multi-assets
@@ -1301,6 +1360,18 @@ fn check_groups(metas: &[AssetMeta]) -> Result<(), Error> {
                 meta.name
             )));
         }
+    }
+    Ok(())
+}
+
+/// what a declared namespace is allowed to be, over every asset at once.
+///
+/// the same two refusals every other declaration gets, from the one function
+/// that decides: a namespace nobody could name again in a url is not a
+/// namespace.
+fn check_namespaces(metas: &[AssetMeta]) -> Result<(), Error> {
+    for meta in metas {
+        check_namespace("asset", &meta.name, meta.namespace.as_deref())?;
     }
     Ok(())
 }
@@ -2754,6 +2825,66 @@ mod tests {
             Vec::new(),
         )
         .expect("no collision left");
+    }
+
+    // the decision, asserted: they are two different questions about one
+    // asset, neither is derived from the other, and an asset answers both
+    #[test]
+    fn a_namespace_is_not_a_group_and_neither_is_read_off_the_other() {
+        let reg = AssetRegistry::new(
+            vec![
+                echo("sales/orders").namespace("finance"),
+                Asset::source("fx_rates")
+                    .group("vendor")
+                    .namespace("finance"),
+                echo("heartbeat"),
+            ],
+            Vec::new(),
+            Vec::new(),
+        )
+        .unwrap();
+
+        // labeled `sales` on the graph by the prefix in its name, declared in
+        // `finance`: the name says nothing about the namespace
+        let orders = reg.get("sales/orders").unwrap();
+        assert_eq!(orders.group(), Some("sales"));
+        assert_eq!(orders.namespace.as_deref(), Some("finance"));
+
+        // and the case a nesting rule would have got wrong: a source's group
+        // names the system the data came from, which is not a team. two teams
+        // reading one vendor is ordinary, so nothing here refuses it
+        let fx = reg.get("fx_rates").unwrap();
+        assert_eq!(fx.group(), Some("vendor"));
+        assert_eq!(fx.namespace.as_deref(), Some("finance"));
+
+        // a group falls back to the name; a namespace never does
+        let beat = reg.get("heartbeat").unwrap();
+        assert_eq!(beat.group(), None);
+        assert_eq!(beat.namespace, None);
+    }
+
+    #[test]
+    fn a_namespace_that_cannot_be_named_fails_the_asset_build() {
+        let said = reg_err(vec![echo("daily").namespace("")]).to_string();
+        assert!(
+            said.contains("asset daily") && said.contains("no name in it"),
+            "{said}"
+        );
+        let said = reg_err(vec![echo("daily").namespace("finance ")]).to_string();
+        assert!(said.contains("declare \"finance\""), "{said}");
+    }
+
+    // a multi-asset produces names rather than `Asset` values, so its
+    // namespace is declared once for everything it produces
+    #[test]
+    fn a_multi_asset_puts_everything_it_produces_in_one_namespace() {
+        let multi = MultiAsset::new("split", |_| async { Ok(json!({"a": 1, "b": 2})) })
+            .produces(["a", "b"])
+            .namespace("finance");
+        let reg = AssetRegistry::new(Vec::new(), vec![multi], Vec::new()).unwrap();
+        for name in ["a", "b"] {
+            assert_eq!(reg.get(name).unwrap().namespace.as_deref(), Some("finance"));
+        }
     }
 
     // ------------------------------------------------------------- hues

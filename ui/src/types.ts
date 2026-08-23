@@ -172,6 +172,9 @@ export interface LateEntry {
 export interface JobSummary {
   name: string;
   description: string | null;
+  // which slice of the deployment it is in; null in one that declares no
+  // namespaces. not a group: see AssetSummary below
+  namespace: string | null;
   ops: OpSummary[];
   // every op's schema merged into one; null when no op declared any
   params_schema: ParamsSchema | null;
@@ -514,8 +517,11 @@ export interface PolicyWait {
 
 export interface AssetSummary {
   name: string;
-  // where it belongs: what it declared, else the part of the name before the
-  // first "/", else null for an asset in no group at all
+  // whose it is: what it declared, else null. a boundary the api and a token
+  // scope are narrowed by, and never derived from the group below
+  namespace: string | null;
+  // what it is labeled with on the graph: what it declared, else the part of
+  // the name before the first "/", else null for an asset in no group at all
   group: string | null;
   // and the angle that group is drawn at; null wherever the group is
   group_hue: number | null;
@@ -659,6 +665,7 @@ export interface SensorFilter {
 
 export interface SensorSummary {
   name: string;
+  namespace: string | null;
   every_secs: number;
   paused: boolean;
   cursor: unknown;

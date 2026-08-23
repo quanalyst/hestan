@@ -286,9 +286,13 @@ enum Command {
 
 #[derive(Args)]
 struct AssetsArgs {
-    /// only the assets in this group, which is what one team owns
+    /// only the assets labeled with this group on the graph
     #[arg(long, value_name = "NAME")]
     group: Option<String>,
+    /// only the assets in this namespace, which is the slice of the
+    /// deployment one team declared
+    #[arg(long, value_name = "NAME")]
+    namespace: Option<String>,
 }
 
 #[derive(Args)]
@@ -887,7 +891,9 @@ async fn dispatch(reach: Reach, command: Command, out: &Out) -> Result<(), Fail>
                     json!({ "assets": built })
                 }
             };
-            render_assets(&in_group(answer, args.group.as_deref()), out);
+            let answer = only_where(answer, "group", args.group.as_deref());
+            let answer = only_where(answer, "namespace", args.namespace.as_deref());
+            render_assets(&answer, out);
             Ok(())
         }
 
@@ -932,7 +938,20 @@ async fn dispatch(reach: Reach, command: Command, out: &Out) -> Result<(), Fail>
         Command::Schedules => {
             let answer = match reach {
                 Reach::Server(api) => api.get("/api/schedules").await?,
-                reach => crate::server::schedules_json(&reach.store()?)?,
+                // a schedule's namespace is its job's, so answering it needs
+                // the definitions. a binary with them compiled in resolves it;
+                // `--db` opens a run log, which holds no job definitions, and
+                // reports null rather than guessing
+                Reach::Local(app) => {
+                    let app = app.inspect()?;
+                    let jobs = app.jobs;
+                    crate::server::schedules_json(&app.store, |job| {
+                        jobs.iter()
+                            .find(|j| j.name() == job)
+                            .and_then(crate::Job::namespace)
+                    })?
+                }
+                Reach::Store { store, .. } => crate::server::schedules_json(&store, |_| None)?,
             };
             render_schedules(&answer, out);
             Ok(())
@@ -1607,8 +1626,10 @@ async fn paused(reach: Reach, what: What, paused: bool, out: &Out) -> Result<(),
         (What::Schedule { job, expr }, reach) => {
             let matched = match &reach {
                 Reach::Server(api) => list(&api.get("/api/schedules").await?, "schedules"),
+                // the namespace is not read here: this matches on job and
+                // expression and prints neither
                 _ => list(
-                    &crate::server::schedules_json(&stored(&reach)?)?,
+                    &crate::server::schedules_json(&stored(&reach)?, |_| None)?,
                     "schedules",
                 ),
             };
@@ -1961,21 +1982,21 @@ fn render_jobs(answer: &Value, out: &Out) {
     table.print(out, "no jobs");
 }
 
-/// the assets in one group, `--group` having named one.
+/// the assets whose `key` is `want`, for `--group` and `--namespace`.
 ///
 /// filtered here rather than asked for over the wire, because the three ways
 /// of reaching a deployment answer this list differently and only one of them
-/// could take a query. a run log opened directly carries no registry and so no
-/// groups, and a `--group` against one is empty rather than unfiltered: saying
-/// "no assets" is right, and showing every asset because the filter could not
-/// be applied would not be.
-fn in_group(answer: Value, group: Option<&str>) -> Value {
-    let Some(group) = group else {
+/// could take a query. a run log opened directly carries no registry and so
+/// neither label, and a filter against one is empty rather than unfiltered:
+/// saying "no assets" is right, and showing every asset because the filter
+/// could not be applied would not be.
+fn only_where(answer: Value, key: &str, want: Option<&str>) -> Value {
+    let Some(want) = want else {
         return answer;
     };
     let kept: Vec<Value> = list(&answer, "assets")
         .into_iter()
-        .filter(|a| a["group"] == json!(group))
+        .filter(|a| a[key] == json!(want))
         .collect();
     json!({ "assets": kept })
 }
@@ -4217,24 +4238,33 @@ mod tests {
     }
 
     #[test]
-    fn the_asset_list_can_be_cut_down_to_one_group() {
+    fn the_asset_list_can_be_cut_down_to_one_group_or_one_namespace() {
         let answer = json!({"assets": [
-            {"name": "sales/orders", "group": "sales"},
-            {"name": "returns", "group": "warehouse"},
-            {"name": "heartbeat", "group": Value::Null},
+            {"name": "sales/orders", "group": "sales", "namespace": "finance"},
+            {"name": "returns", "group": "warehouse", "namespace": Value::Null},
+            {"name": "heartbeat", "group": Value::Null, "namespace": Value::Null},
         ]});
-        let named = |group| {
-            list(&in_group(answer.clone(), group), "assets")
+        let named = |key, want| {
+            list(&only_where(answer.clone(), key, want), "assets")
                 .iter()
                 .map(|a| s(a, "name"))
                 .collect::<Vec<_>>()
         };
-        assert_eq!(named(None), ["sales/orders", "returns", "heartbeat"]);
-        assert_eq!(named(Some("warehouse")), ["returns"]);
+        assert_eq!(
+            named("group", None),
+            ["sales/orders", "returns", "heartbeat"]
+        );
+        assert_eq!(named("group", Some("warehouse")), ["returns"]);
         // a group nothing is in is an empty list, not everything
-        assert!(named(Some("finance")).is_empty());
+        assert!(named("group", Some("finance")).is_empty());
         // and an ungrouped asset is in no group, so nothing names it
-        assert!(named(Some("")).is_empty());
+        assert!(named("group", Some("")).is_empty());
+
+        // the namespace is the other question, and the same asset answers the
+        // two differently: labeled `sales` on the graph, declared in `finance`
+        assert_eq!(named("namespace", Some("finance")), ["sales/orders"]);
+        assert!(named("namespace", Some("sales")).is_empty());
+        assert!(named("namespace", Some("warehouse")).is_empty());
     }
 
     #[test]

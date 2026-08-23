@@ -8,6 +8,7 @@ import type { AssetSummary, InputFingerprint, MaterializationEntry } from "../sr
 
 const asset = (name: string, deps: string[]): AssetSummary => ({
   name,
+  namespace: null,
   group: null,
   group_hue: null,
   provenance: [],

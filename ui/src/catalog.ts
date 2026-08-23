@@ -60,21 +60,47 @@ export function matchesState(a: AssetSummary, filter: StateFilter): boolean {
   }
 }
 
+// whether one thing is in the namespace asked for. null and "" are no filter
+// at all, which is what a blank field in the url means; nothing is ever in the
+// namespace "", so reading a blank as a request for that would show an empty
+// page every time somebody cleared the box
+export function inNamespace(thing: { namespace: string | null }, want: string | null): boolean {
+  return want === null || want === "" || thing.namespace === want;
+}
+
+// the same, over a list, for the pages that hold one
+export function onlyNamespace<T extends { namespace: string | null }>(
+  things: T[],
+  want: string | null,
+): T[] {
+  return things.filter((t) => inNamespace(t, want));
+}
+
+// every namespace anything in the list declares, sorted, for the picker. the
+// ones in no namespace contribute nothing: "" is not a namespace
+export function namespacesOf(things: { namespace: string | null }[]): string[] {
+  const seen = new Set<string>();
+  for (const t of things) if (t.namespace !== null && t.namespace !== "") seen.add(t.namespace);
+  return [...seen].sort((a, b) => a.localeCompare(b));
+}
+
 // substring on the name, case-insensitively, as you type. no fuzzy matching:
-// the names are a namespace, and `sales` should not find `stale_orders`.
-// `group` is exact and is a different question from the search: it is which
-// group, not which letters
+// the names are a catalog, and `sales` should not find `stale_orders`.
+// `group` and `namespace` are exact and are different questions from the
+// search: which label, and whose, rather than which letters
 export function filterAssets(
   assets: AssetSummary[],
   query: string,
   filter: StateFilter,
   group: string | null = null,
+  namespace: string | null = null,
 ): AssetSummary[] {
   const needle = query.trim().toLowerCase();
   return assets.filter(
     (a) =>
       matchesState(a, filter) &&
       (group === null || a.group === group) &&
+      inNamespace(a, namespace) &&
       (needle === "" || a.name.toLowerCase().includes(needle)),
   );
 }

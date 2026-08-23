@@ -51,6 +51,9 @@ const LOG_DOWNLOAD: u32 = 100_000;
 pub(crate) struct SensorInfo {
     pub name: String,
     pub every: std::time::Duration,
+    /// which slice of the deployment it is in; `None` in one that declares no
+    /// namespaces.
+    pub namespace: Option<String>,
     /// what a [run-status sensor](crate::RunStatusSensor) watches; `None` for
     /// a user sensor or a probe, which watch whatever their closure looks at.
     pub filter: Option<Value>,
@@ -254,26 +257,37 @@ fn out_of_scope(st: &AppState, who: &Identity, subject: Subject<'_>) -> Option<S
             who.name, who.scope
         ))
     };
+    // which namespace the thing named is declared in, from the registry rather
+    // than from anything in the request: a scope that read a namespace off a
+    // header would be a scope its holder could widen. a name nothing is
+    // registered under is in no namespace, so a namespace-scoped token is
+    // refused it, which is the same answer it gets for a job that does exist
+    // somewhere else
+    let job_ns = |name: &str| st.jobs.get(name).and_then(Job::namespace);
+    let asset_ns = |name: &str| {
+        st.assets
+            .get(name)
+            .and_then(|meta| meta.namespace.as_deref())
+    };
     match subject {
         Subject::Job(job) => {
-            (!who.scope.may_touch_job(job)).then(|| refuse(format!("job {job}")))?
+            (!who.scope.may_touch_job(job, job_ns(job))).then(|| refuse(format!("job {job}")))?
         }
-        Subject::Asset(asset) => {
-            (!who.scope.may_touch_asset(asset)).then(|| refuse(format!("asset {asset}")))?
-        }
+        Subject::Asset(asset) => (!who.scope.may_touch_asset(asset, asset_ns(asset)))
+            .then(|| refuse(format!("asset {asset}")))?,
         // a run is whatever job it is a run of, read off the row. a run this
         // store does not have is refused rather than looked past: a scope that
         // let an unknown id through would be a scope an id nobody can resolve
         // walks around
         Subject::Run(id) => match st.runner.store().run(id) {
-            Ok(Some(run)) if who.scope.may_touch_job(&run.job) => None,
+            Ok(Some(run)) if who.scope.may_touch_job(&run.job, job_ns(&run.job)) => None,
             Ok(Some(run)) => refuse(format!("run {id}, which is a run of job {}", run.job)),
             _ => refuse(format!(
                 "run {id}, which this deployment cannot resolve to a job"
             )),
         },
         Subject::Backfill(id) => match id.parse().map(|id: i64| st.runner.store().backfill(id)) {
-            Ok(Ok(Some(bf))) if who.scope.may_touch_asset(&bf.asset) => None,
+            Ok(Ok(Some(bf))) if who.scope.may_touch_asset(&bf.asset, asset_ns(&bf.asset)) => None,
             Ok(Ok(Some(bf))) => refuse(format!(
                 "backfill {id}, which is a backfill of asset {}",
                 bf.asset
@@ -565,6 +579,9 @@ pub(crate) fn job_summary(
     Ok(json!({
         "name": job.name(),
         "description": job.description(),
+        // which slice of the deployment it is in; null in a deployment that
+        // declares no namespaces, which is every one built before they existed
+        "namespace": job.namespace(),
         "ops": ops,
         "params_schema": job.params_schema(),
         "schedules": schedules,
@@ -735,7 +752,44 @@ async fn list_resources(State(st): State<AppState>) -> Json<Value> {
     Json(json!({ "resources": resources }))
 }
 
-async fn list_jobs(State(st): State<AppState>) -> Result<Json<Value>, ApiError> {
+/// `?namespace=finance` on a list endpoint: only the things declared in that
+/// [namespace](crate::JobBuilder::namespace).
+///
+/// **one filter, applied to the array the handler already built**, rather than
+/// a `where` clause in four places: the namespace is on the row each of them
+/// emits, so narrowing is the same operation whichever list it is and there is
+/// no per-handler filter to get wrong.
+///
+/// an absent parameter is every row, which is what every request that existed
+/// before this made. an empty one is the same, since nothing is ever in the
+/// namespace `""`: a form that posts a blank field asks for everything rather
+/// than for nothing.
+///
+/// **it narrows a list and it is not a permission.** a token that may read
+/// reads the whole deployment, exactly as `docs/auth.md` says: this is the ui
+/// asking a smaller question, not the api answering a narrower one.
+#[derive(Deserialize, Default)]
+struct NamespaceQuery {
+    namespace: Option<String>,
+}
+
+impl NamespaceQuery {
+    /// keep only the rows under `key` whose `namespace` is the one asked for.
+    fn narrow(&self, listed: &mut Value, key: &str) {
+        let Some(want) = self.namespace.as_deref().filter(|ns| !ns.is_empty()) else {
+            return;
+        };
+        if let Some(rows) = listed[key].as_array_mut() {
+            rows.retain(|row| row["namespace"].as_str() == Some(want));
+        }
+    }
+}
+
+async fn list_jobs(
+    State(st): State<AppState>,
+    q: Result<Query<NamespaceQuery>, QueryRejection>,
+) -> Result<Json<Value>, ApiError> {
+    let Query(q) = q.map_err(bad_query)?;
     let mut jobs: Vec<&Job> = st.jobs.values().collect();
     jobs.sort_by(|a, b| a.name().cmp(b.name()));
     let jobs: Vec<Value> = jobs
@@ -750,7 +804,9 @@ async fn list_jobs(State(st): State<AppState>) -> Result<Json<Value>, ApiError> 
         })
         .collect::<Result<_, _>>()
         .map_err(internal)?;
-    Ok(Json(json!({ "jobs": jobs })))
+    let mut listed = json!({ "jobs": jobs });
+    q.narrow(&mut listed, "jobs");
+    Ok(Json(listed))
 }
 
 async fn get_job(
@@ -1207,10 +1263,14 @@ async fn set_run_priority(
     }
 }
 
-async fn list_assets(State(st): State<AppState>) -> Result<Json<Value>, ApiError> {
-    assets_json(&st.assets, st.runner.store())
-        .map(Json)
-        .map_err(internal)
+async fn list_assets(
+    State(st): State<AppState>,
+    q: Result<Query<NamespaceQuery>, QueryRejection>,
+) -> Result<Json<Value>, ApiError> {
+    let Query(q) = q.map_err(bad_query)?;
+    let mut listed = assets_json(&st.assets, st.runner.store()).map_err(internal)?;
+    q.narrow(&mut listed, "assets");
+    Ok(Json(listed))
 }
 
 /// everything `GET /api/assets` says, for the same reason
@@ -1274,8 +1334,12 @@ pub(crate) fn assets_json(registry: &AssetRegistry, store: &Store) -> Result<Val
                 .collect();
             json!({
                 "name": meta.name,
-                // where it belongs: what it declared, else the part of the
-                // name before the first "/", else null
+                // whose it is: what it declared, and null in a deployment that
+                // declares no namespaces. not the group below, which is a
+                // label on the graph and falls back to the name
+                "namespace": meta.namespace,
+                // what it is labeled with: what it declared, else the part of
+                // the name before the first "/", else null
                 "group": meta.group(),
                 // an angle on the colour wheel rather than a colour, because
                 // what lightness is legible depends on the reader's theme and
@@ -1753,7 +1817,11 @@ async fn build_all_assets(
     }
 }
 
-async fn list_sensors(State(st): State<AppState>) -> Result<Json<Value>, ApiError> {
+async fn list_sensors(
+    State(st): State<AppState>,
+    q: Result<Query<NamespaceQuery>, QueryRejection>,
+) -> Result<Json<Value>, ApiError> {
+    let Query(q) = q.map_err(bad_query)?;
     let store = st.runner.store();
     let rows = store.sensors().map_err(internal)?;
     let sensors: Vec<Value> = st
@@ -1768,6 +1836,7 @@ async fn list_sensors(State(st): State<AppState>) -> Result<Json<Value>, ApiErro
             let (next_eval, failures) = info.state.snapshot();
             Ok(json!({
                 "name": info.name,
+                "namespace": info.namespace,
                 "every_secs": info.every.as_secs(),
                 "paused": row.is_some_and(|r| r.paused),
                 "cursor": row.and_then(|r| r.cursor.clone()),
@@ -1778,7 +1847,9 @@ async fn list_sensors(State(st): State<AppState>) -> Result<Json<Value>, ApiErro
             }))
         })
         .collect::<Result<_, ApiError>>()?;
-    Ok(Json(json!({ "sensors": sensors })))
+    let mut listed = json!({ "sensors": sensors });
+    q.narrow(&mut listed, "sensors");
+    Ok(Json(listed))
 }
 
 #[derive(Deserialize)]
@@ -1827,21 +1898,37 @@ async fn sensor_ticks(
     Ok(Json(json!({ "ticks": ticks })))
 }
 
-async fn list_schedules(State(st): State<AppState>) -> Result<Json<Value>, ApiError> {
-    schedules_json(st.runner.store())
-        .map(Json)
-        .map_err(internal)
+async fn list_schedules(
+    State(st): State<AppState>,
+    q: Result<Query<NamespaceQuery>, QueryRejection>,
+) -> Result<Json<Value>, ApiError> {
+    let Query(q) = q.map_err(bad_query)?;
+    let mut listed = schedules_json(st.runner.store(), |job| {
+        st.jobs.get(job).and_then(Job::namespace)
+    })
+    .map_err(internal)?;
+    q.narrow(&mut listed, "schedules");
+    Ok(Json(listed))
 }
 
 /// everything `GET /api/schedules` says. shared with the command line for the
 /// same reason [`job_summary`] is.
-pub(crate) fn schedules_json(store: &Store) -> Result<Value, Error> {
+///
+/// **a schedule's namespace is its job's**, which is why this is handed a
+/// lookup rather than reading one off the row: a schedule is a firing rule for
+/// exactly one job, so there is nothing for it to declare and no way for the
+/// two to disagree.
+pub(crate) fn schedules_json<'a>(
+    store: &Store,
+    namespace: impl Fn(&str) -> Option<&'a str>,
+) -> Result<Value, Error> {
     let schedules: Vec<Value> = store
         .schedules()?
         .iter()
         .map(|s| {
             json!({
                 "job": s.job,
+                "namespace": namespace(&s.job),
                 "expr": s.expr,
                 "tz": s.tz,
                 "paused": s.paused,
@@ -2620,6 +2707,20 @@ mod tests {
     use crate::schedule::Schedule;
     use crate::store::Store;
 
+    /// a list request that narrows nothing, which is every request that was
+    /// ever made before `?namespace=` existed.
+    fn everything() -> Result<Query<NamespaceQuery>, QueryRejection> {
+        Ok(Query(NamespaceQuery::default()))
+    }
+
+    /// a list request narrowed to one namespace, as `?namespace=finance`
+    /// arrives.
+    fn only(namespace: &str) -> Result<Query<NamespaceQuery>, QueryRejection> {
+        Ok(Query(NamespaceQuery {
+            namespace: Some(namespace.to_string()),
+        }))
+    }
+
     fn echo_job(name: &str) -> Job {
         Job::builder(name)
             .op(Op::new(
@@ -2631,7 +2732,11 @@ mod tests {
     }
 
     fn state(jobs: Vec<Job>) -> AppState {
-        let runner = Runner::new(jobs, Store::open(":memory:").unwrap()).unwrap();
+        state_over(jobs, Store::open(":memory:").unwrap())
+    }
+
+    fn state_over(jobs: Vec<Job>, store: Store) -> AppState {
+        let runner = Runner::new(jobs, store).unwrap();
         AppState {
             jobs: Arc::new(runner.jobs().clone()),
             runner,
@@ -4383,7 +4488,9 @@ mod tests {
             .sync_schedules(&[Schedule::new("etl", "0 * * * *").params(json!({"region": "eu"}))])
             .unwrap();
 
-        let Json(body) = list_schedules(State(st.clone())).await.unwrap();
+        let Json(body) = list_schedules(State(st.clone()), everything())
+            .await
+            .unwrap();
         assert_eq!(body["schedules"][0]["params"], json!({"region": "eu"}));
 
         let Json(body) = get_job(State(st), Path("etl".into())).await.unwrap();
@@ -5555,7 +5662,7 @@ mod tests {
     #[tokio::test]
     async fn assets_endpoint_lists_topo_with_staleness() {
         let st = asset_state();
-        let Json(body) = list_assets(State(st.clone())).await.unwrap();
+        let Json(body) = list_assets(State(st.clone()), everything()).await.unwrap();
         let assets = body["assets"].as_array().unwrap();
         let names: Vec<&str> = assets.iter().map(|a| a["name"].as_str().unwrap()).collect();
         assert_eq!(names, ["docs", "stats", "totals"]);
@@ -5579,7 +5686,7 @@ mod tests {
         let run_id = body["run_ids"][0].as_str().unwrap();
         wait_success(&st, run_id).await;
 
-        let Json(body) = list_assets(State(st.clone())).await.unwrap();
+        let Json(body) = list_assets(State(st.clone()), everything()).await.unwrap();
         let assets = body["assets"].as_array().unwrap();
         assert!(assets.iter().all(|a| a["stale"] == json!(false)));
         assert_eq!(assets[1]["run_id"].as_str().unwrap(), run_id);
@@ -5591,7 +5698,7 @@ mod tests {
             .store()
             .record_materialization("docs", None, "d2", &json!({}), None, None, None)
             .unwrap();
-        let Json(body) = list_assets(State(st)).await.unwrap();
+        let Json(body) = list_assets(State(st), everything()).await.unwrap();
         let stats = &body["assets"].as_array().unwrap()[1];
         assert_eq!(stats["stale"], json!(true));
         assert_eq!(stats["reasons"][0]["dep"], "docs");
@@ -5604,7 +5711,7 @@ mod tests {
     #[tokio::test]
     async fn the_assets_endpoint_says_what_a_policy_is_and_what_it_waits_for() {
         let st = asset_state();
-        let Json(body) = list_assets(State(st.clone())).await.unwrap();
+        let Json(body) = list_assets(State(st.clone()), everything()).await.unwrap();
         let assets = body["assets"].as_array().unwrap();
         assert_eq!(assets[1]["policy"], json!(null), "nothing was declared");
         let policy = &assets[2]["policy"];
@@ -5623,7 +5730,7 @@ mod tests {
             .store()
             .record_materialization("docs", None, "d1", &json!({}), None, None, None)
             .unwrap();
-        let Json(body) = list_assets(State(st)).await.unwrap();
+        let Json(body) = list_assets(State(st), everything()).await.unwrap();
         let assets = body["assets"].as_array().unwrap();
         assert_eq!(assets[2]["policy"]["waiting"], json!(null));
     }
@@ -5796,7 +5903,7 @@ mod tests {
         assert_eq!(status, StatusCode::ACCEPTED);
         wait_success(&st, body["run_ids"][0].as_str().unwrap()).await;
 
-        let Json(body) = list_assets(State(st.clone())).await.unwrap();
+        let Json(body) = list_assets(State(st.clone()), everything()).await.unwrap();
         let assets = body["assets"].as_array().unwrap();
         let stats = assets.iter().find(|a| a["name"] == "stats").unwrap();
         assert_eq!(stats["checks"]["passed"], json!(1));
@@ -6022,7 +6129,7 @@ mod tests {
             .count();
         assert_eq!(done, 24, "the hours the day covers");
 
-        let Json(body) = list_assets(State(st.clone())).await.unwrap();
+        let Json(body) = list_assets(State(st.clone()), everything()).await.unwrap();
         let rollup = body["assets"]
             .as_array()
             .unwrap()
@@ -6090,7 +6197,7 @@ mod tests {
                 .record_materialization("a", Some(key), "moved", &json!({}), None, None, None)
                 .unwrap();
         }
-        let Json(body) = list_assets(State(st.clone())).await.unwrap();
+        let Json(body) = list_assets(State(st.clone()), everything()).await.unwrap();
         let flat = body["assets"]
             .as_array()
             .unwrap()
@@ -6190,7 +6297,7 @@ mod tests {
     async fn a_partitioned_asset_reports_its_key_set_and_builds_one_key() {
         let st = partitioned_state();
         // nothing built: three keys, all missing
-        let Json(body) = list_assets(State(st.clone())).await.unwrap();
+        let Json(body) = list_assets(State(st.clone()), everything()).await.unwrap();
         let asset = &body["assets"][0];
         assert_eq!(
             asset["fingerprint"],
@@ -6238,7 +6345,7 @@ mod tests {
         assert_eq!(status, StatusCode::ACCEPTED);
         wait_success(&st, body["run_id"].as_str().unwrap()).await;
 
-        let Json(body) = list_assets(State(st.clone())).await.unwrap();
+        let Json(body) = list_assets(State(st.clone()), everything()).await.unwrap();
         assert_eq!(
             body["assets"][0]["partitions"],
             json!({"total": 3, "materialized": 1, "stale": 0, "missing": 2})
@@ -6403,18 +6510,21 @@ mod tests {
                 SensorInfo {
                     name: "watch".into(),
                     every: std::time::Duration::from_secs(30),
+                    namespace: None,
                     filter: None,
                     state: SensorState::new(),
                 },
                 SensorInfo {
                     name: "probe:docs".into(),
                     every: std::time::Duration::from_secs(60),
+                    namespace: None,
                     filter: None,
                     state: SensorState::new(),
                 },
                 SensorInfo {
                     name: "run:chain".into(),
                     every: std::time::Duration::from_secs(15),
+                    namespace: None,
                     filter: Some(json!({"job": "etl", "statuses": ["success"]})),
                     state: SensorState::new(),
                 },
@@ -6426,7 +6536,7 @@ mod tests {
             .sync_sensors(&["watch".into(), "probe:docs".into(), "run:chain".into()])
             .unwrap();
 
-        let Json(body) = list_sensors(State(st.clone())).await.unwrap();
+        let Json(body) = list_sensors(State(st.clone()), everything()).await.unwrap();
         let sensors = body["sensors"].as_array().unwrap();
         assert_eq!(sensors.len(), 3);
         assert_eq!(sensors[0]["name"], "watch");
@@ -6488,7 +6598,7 @@ mod tests {
                 Some("no such dir"),
             )
             .unwrap();
-        let Json(body) = list_sensors(State(st.clone())).await.unwrap();
+        let Json(body) = list_sensors(State(st.clone()), everything()).await.unwrap();
         let sensors = body["sensors"].as_array().unwrap();
         assert_eq!(sensors[0]["paused"], json!(true));
         assert_eq!(sensors[0]["cursor"], json!({"mtime": 5}));
@@ -7261,6 +7371,257 @@ mod tests {
         );
     }
 
+    /// a deployment split in two, plus a job and an asset in no namespace at
+    /// all: what an existing deployment is entirely made of.
+    fn divided() -> AppState {
+        let orders = crate::Asset::source("orders").namespace("finance");
+        let payroll = crate::Asset::source("payroll").namespace("people");
+        let legacy = crate::Asset::source("legacy");
+        let registry = Arc::new(
+            AssetRegistry::new(vec![orders, payroll, legacy], Vec::new(), Vec::new()).unwrap(),
+        );
+        let jobs = vec![
+            Job::builder("etl")
+                .namespace("finance")
+                .op(Op::new("echo", |_| async { Ok(json!(null)) }))
+                .build()
+                .unwrap(),
+            Job::builder("payslips")
+                .namespace("people")
+                .op(Op::new("echo", |_| async { Ok(json!(null)) }))
+                .build()
+                .unwrap(),
+            echo_job("cron_sweep"),
+            registry.lower_job().unwrap(),
+        ];
+        let runner = Runner::new(jobs, Store::open(":memory:").unwrap()).unwrap();
+        let st = AppState {
+            jobs: Arc::new(runner.jobs().clone()),
+            runner,
+            assets: registry,
+            sensors: Arc::new(vec![
+                SensorInfo {
+                    name: "watch_drops".into(),
+                    every: std::time::Duration::from_secs(30),
+                    namespace: Some("finance".into()),
+                    filter: None,
+                    state: SensorState::new(),
+                },
+                SensorInfo {
+                    name: "probe:payroll".into(),
+                    every: std::time::Duration::from_secs(60),
+                    namespace: Some("people".into()),
+                    filter: None,
+                    state: SensorState::new(),
+                },
+            ]),
+            auth: Some(Auth::custom(|req| match req.header("x-user")? {
+                // an admin scoped to one namespace, so nothing below is a role
+                // refusal wearing a scope's clothes
+                "fin" => Some(Identity::admin("fin").scoped_to(Scope::namespaces(["finance"]))),
+                "ada" => Some(Identity::admin("ada")),
+                _ => None,
+            })),
+        };
+        st.runner
+            .store()
+            .sync_schedules(&[
+                Schedule::new("etl", "0 3 * * *"),
+                Schedule::new("payslips", "0 4 * * *"),
+                Schedule::new("cron_sweep", "0 5 * * *"),
+            ])
+            .unwrap();
+        insert_run(&st, "r1", "etl", RunStatus::Success, json!({}));
+        insert_run(&st, "r2", "payslips", RunStatus::Success, json!({}));
+        st
+    }
+
+    // the row this exists for: one declaration reaches all four kinds, and a
+    // schedule takes its job's rather than declaring one of its own
+    #[tokio::test]
+    async fn a_namespace_groups_jobs_schedules_sensors_and_assets() {
+        let st = divided();
+        let Json(jobs) = list_jobs(State(st.clone()), only("finance")).await.unwrap();
+        let named: Vec<&str> = jobs["jobs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|j| j["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(named, ["etl"]);
+
+        let Json(assets) = list_assets(State(st.clone()), only("finance"))
+            .await
+            .unwrap();
+        assert_eq!(assets["assets"][0]["name"], "orders");
+        assert_eq!(assets["assets"].as_array().unwrap().len(), 1);
+
+        let Json(schedules) = list_schedules(State(st.clone()), only("finance"))
+            .await
+            .unwrap();
+        assert_eq!(schedules["schedules"][0]["job"], "etl");
+        assert_eq!(schedules["schedules"].as_array().unwrap().len(), 1);
+
+        let Json(sensors) = list_sensors(State(st.clone()), only("finance"))
+            .await
+            .unwrap();
+        assert_eq!(sensors["sensors"][0]["name"], "watch_drops");
+        assert_eq!(sensors["sensors"].as_array().unwrap().len(), 1);
+    }
+
+    // the url is the whole of the filter, and an absent one is every request
+    // that was ever made before it existed
+    #[tokio::test]
+    async fn no_namespace_in_the_url_is_the_whole_deployment() {
+        let st = divided();
+        let all = |v: &Value, key: &str| v[key].as_array().unwrap().len();
+        let Json(jobs) = list_jobs(State(st.clone()), everything()).await.unwrap();
+        // etl, payslips, cron_sweep and the internal assets job
+        assert_eq!(all(&jobs, "jobs"), 4);
+        let Json(assets) = list_assets(State(st.clone()), everything()).await.unwrap();
+        assert_eq!(all(&assets, "assets"), 3);
+
+        // an empty value is a blank form field rather than a request for the
+        // things in the namespace called "", which nothing is ever in
+        let Json(jobs) = list_jobs(State(st.clone()), only("")).await.unwrap();
+        assert_eq!(all(&jobs, "jobs"), 4);
+
+        // a namespace nothing is declared in is empty rather than everything
+        let Json(jobs) = list_jobs(State(st.clone()), only("nobody")).await.unwrap();
+        assert_eq!(all(&jobs, "jobs"), 0);
+
+        // and the field is on the row whether or not anything was declared
+        let Json(jobs) = list_jobs(State(st), everything()).await.unwrap();
+        let of = |name: &str| {
+            jobs["jobs"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|j| j["name"] == name)
+                .unwrap()["namespace"]
+                .clone()
+        };
+        assert_eq!(of("etl"), json!("finance"));
+        assert_eq!(of("cron_sweep"), Value::Null);
+    }
+
+    // declared rather than parsed out of the name, and this is what that buys:
+    // the name is the key every run row and every materialization is under, so
+    // putting a job in a namespace leaves its history exactly where it was.
+    // renaming it to regroup would not
+    #[tokio::test]
+    async fn adding_a_namespace_to_a_job_leaves_its_history_where_it_is() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hestan.db");
+        let path = path.to_str().unwrap();
+
+        let plain = |ns: Option<&str>| {
+            let mut b = Job::builder("etl").op(Op::new("echo", |_| async { Ok(json!(null)) }));
+            if let Some(ns) = ns {
+                b = b.namespace(ns);
+            }
+            b.build().unwrap()
+        };
+
+        // one process, no namespaces anywhere, one run recorded
+        let before = state_over(vec![plain(None)], Store::open(path).unwrap());
+        insert_run(&before, "r1", "etl", RunStatus::Success, json!({}));
+        let Json(was) = get_job(State(before), Path("etl".into())).await.unwrap();
+        assert_eq!(was["namespace"], Value::Null);
+        assert_eq!(was["last_run"]["id"], "r1");
+
+        // the next one declares a namespace, and finds the same history under
+        // the same name
+        let after = state_over(vec![plain(Some("finance"))], Store::open(path).unwrap());
+        let Json(now) = get_job(State(after.clone()), Path("etl".into()))
+            .await
+            .unwrap();
+        assert_eq!(now["namespace"], "finance");
+        assert_eq!(now["last_run"]["id"], "r1", "the run went missing");
+        assert_eq!(
+            after
+                .runner
+                .store()
+                .runs(Some("etl"), None, None, None, None, 10)
+                .unwrap()
+                .len(),
+            1
+        );
+        // and the run row still says which job it was of, unqualified: nothing
+        // about a namespace reaches the key
+        assert_eq!(after.runner.store().run("r1").unwrap().unwrap().job, "etl");
+    }
+
+    // a token scoped to a namespace admits its jobs and its assets without
+    // naming either, and refuses another team's
+    #[tokio::test]
+    async fn a_scope_naming_a_namespace_admits_what_is_declared_in_it() {
+        let st = divided();
+        for (method, path) in [
+            ("POST", "/api/jobs/etl/runs"),
+            ("PUT", "/api/jobs/etl/presets/nightly"),
+            ("POST", "/api/runs/r1/cancel"),
+            ("POST", "/api/assets/orders/build"),
+        ] {
+            let status = status_of(&st, method, path, Some(("x-user", "fin"))).await;
+            assert!(
+                !refused(status),
+                "fin was refused {method} {path}: {status}"
+            );
+        }
+
+        for (method, path, what) in [
+            ("POST", "/api/jobs/payslips/runs", "job payslips"),
+            ("POST", "/api/assets/payroll/build", "asset payroll"),
+            // a job in no namespace is in nobody's, so a namespace scope does
+            // not reach it either
+            ("POST", "/api/jobs/cron_sweep/runs", "job cron_sweep"),
+            ("POST", "/api/assets/legacy/build", "asset legacy"),
+            // and the run of another namespace's job, named as that job
+            ("POST", "/api/runs/r2/cancel", "run of job payslips"),
+            // the deployment itself is still nobody scoped's to touch
+            ("POST", "/api/schedules/state", "the deployment"),
+        ] {
+            let (status, body) = asked(&st, method, path, Some(("x-user", "fin"))).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{method} {path}");
+            let said = body["error"].as_str().unwrap_or_default();
+            assert!(
+                said.contains("fin is scoped to namespace finance"),
+                "{method} {path}: {said}"
+            );
+            assert!(said.contains(what), "{method} {path}: {said}");
+        }
+    }
+
+    // the promise an existing deployment is owed, asserted rather than
+    // assumed: nothing declares a namespace, so nothing changes
+    #[tokio::test]
+    async fn a_deployment_that_declares_no_namespace_is_what_it_always_was() {
+        let st = guarded(scoped_people());
+        let Json(jobs) = list_jobs(State(st.clone()), everything()).await.unwrap();
+        assert_eq!(jobs["jobs"][0]["namespace"], Value::Null);
+        // an unscoped token still may everything, and a job-scoped one is
+        // decided by its list exactly as it was: a namespace nobody declared
+        // adds nothing to either side
+        for (method, path) in [
+            ("POST", "/api/jobs/etl/runs"),
+            ("POST", "/api/runs/r1/retry"),
+        ] {
+            for who in ["ada", "ci"] {
+                let status = status_of(&st, method, path, Some(("x-user", who))).await;
+                assert!(!refused(status), "{who}: {method} {path}: {status}");
+            }
+        }
+        let (status, _) = asked(
+            &st,
+            "POST",
+            "/api/jobs/billing/runs",
+            Some(("x-user", "ci")),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+    }
+
     // the decision, asserted rather than described: a scope narrows what a
     // token may change and does nothing at all to what it may read
     #[tokio::test]
@@ -7322,8 +7683,8 @@ mod tests {
         // and the identity type itself: a scope replaces a scope, and the only
         // way to one is a constructor in this process
         let ci = Identity::operator("ci").scoped_to(Scope::jobs(["deploy"]));
-        assert!(!ci.scope.may_touch_job("billing"));
-        assert!(ci.scope.may_touch_job("deploy"));
+        assert!(!ci.scope.may_touch_job("billing", None));
+        assert!(ci.scope.may_touch_job("deploy", None));
     }
 
     // **the structural half.** every route this file declares, including the

@@ -14,6 +14,7 @@ import {
   filterAssets,
   groupAssets,
   groupOf,
+  namespacesOf,
   policySays,
   sortAssets,
 } from "./catalog";
@@ -198,6 +199,10 @@ export default function AssetsPage() {
   // every other view state, so a coloured view is a link
   const colour = hueMode(params.get("colour"));
   const groupFilter = params.get("group");
+  // whose assets these are, and the coarser of the two filters: a group is a
+  // label on this graph, a namespace is the slice of the deployment a team
+  // declared. in the url like everything else here, so a team's view is a link
+  const namespaceFilter = params.get("namespace");
   // one hop is what feeds it and what it feeds, which is the question that
   // brought you to a focused graph; two is already most of a wide graph
   const depth = Number(params.get("depth") ?? 1);
@@ -303,7 +308,7 @@ export default function AssetsPage() {
   const anyStale = assets.some((a) => a.stale);
   const selected = assets.find((a) => a.name === sel) ?? null;
   const shown = sortAssets(
-    filterAssets(assets, query, stateFilter, groupFilter),
+    filterAssets(assets, query, stateFilter, groupFilter, namespaceFilter),
     sortKey,
     dir,
   );
@@ -311,6 +316,7 @@ export default function AssetsPage() {
   // the fold chips are about the registry, not about what survived a filter:
   // a group filtered down to nothing still has a name and still folds
   const allGroups = groupAssets(assets).filter((g) => g.name !== "");
+  const allNamespaces = namespacesOf(assets);
   // a column only earns its width where something fills it
   const anyFreshness = assets.some((a) => a.freshness !== null);
   const anyPartitioned = assets.some((a) => a.partitions !== null);
@@ -461,6 +467,26 @@ export default function AssetsPage() {
                 </button>
               ))}
             </span>
+            {allNamespaces.length > 0 && (
+              <span className="filter-group">
+                <span className="filter-label">namespace</span>
+                <button
+                  className={namespaceFilter === null ? "text-btn active" : "text-btn"}
+                  onClick={() => set({ namespace: null })}
+                >
+                  all
+                </button>
+                {allNamespaces.map((ns) => (
+                  <button
+                    key={ns}
+                    className={namespaceFilter === ns ? "text-btn active" : "text-btn"}
+                    onClick={() => set({ namespace: namespaceFilter === ns ? null : ns })}
+                  >
+                    {ns}
+                  </button>
+                ))}
+              </span>
+            )}
             {allGroups.length > 0 && (
               <span className="filter-group">
                 <span className="filter-label">group</span>

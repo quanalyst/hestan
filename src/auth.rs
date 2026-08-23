@@ -75,6 +75,12 @@
 //! # }
 //! ```
 //!
+//! a scope names jobs, assets, or the [namespaces](Scope::namespaces) they
+//! are declared in. naming the namespace is the coarse form and the one worth
+//! reaching for: `Scope::namespaces(["finance"])` admits every job and every
+//! asset finance declared, including the one somebody adds next week, without
+//! the token listing any of them.
+//!
 //! **a scope limits what a token may change, and does nothing to what it may
 //! read.** that is a decision rather than an omission, and the reasoning is in
 //! `docs/auth.md`: a write names in its path what it is about, so one check in
@@ -139,8 +145,8 @@ impl std::fmt::Display for Access {
     }
 }
 
-/// which jobs and assets a token may change, for the token that should be able
-/// to do one thing.
+/// which namespaces, jobs and assets a token may change, for the token that
+/// should be able to do one thing.
 ///
 /// [`Scope::everything()`] is the default and is every identity that existed
 /// before scopes did: unlimited, and exactly as it was. anything else is a
@@ -153,21 +159,36 @@ impl std::fmt::Display for Access {
 /// # use hestan::Scope;
 /// // an operator on `deploy`, a stranger everywhere else
 /// let ci = Scope::jobs(["deploy"]);
-/// assert!(ci.may_touch_job("deploy"));
-/// assert!(!ci.may_touch_job("billing"));
-/// assert!(!ci.may_touch_asset("deploy"));
+/// assert!(ci.may_touch_job("deploy", None));
+/// assert!(!ci.may_touch_job("billing", None));
+/// assert!(!ci.may_touch_asset("deploy", None));
 ///
 /// // and both halves, for the token that owns one pipeline end to end
-/// let owner = Scope::jobs(["etl"]).and_assets(["orders"]);
-/// assert!(owner.may_touch_asset("orders"));
+/// let pipeline = Scope::jobs(["etl"]).and_assets(["orders"]);
+/// assert!(pipeline.may_touch_asset("orders", None));
+/// ```
+///
+/// **a [namespace](Scope::namespaces) is the coarse half**, and the reason to
+/// have one: it admits everything declared in it, of either kind, without the
+/// scope having to list what that is today.
+///
+/// ```
+/// # use hestan::Scope;
+/// let team = Scope::namespaces(["finance"]);
+/// assert!(team.may_touch_job("orders_etl", Some("finance")));
+/// assert!(team.may_touch_asset("orders", Some("finance")));
+/// assert!(!team.may_touch_job("payroll", Some("people")));
+/// // and a job in no namespace is in nobody's, so it is not in this one
+/// assert!(!team.may_touch_job("legacy", None));
 /// ```
 ///
 /// **reads are not scoped.** see the [module docs](crate::auth) for why, and
 /// `docs/auth.md` for the whole of it. a scope says what a token may change.
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
 pub struct Scope {
-    /// nothing is narrowed: the jobs and assets lists are not consulted.
+    /// nothing is narrowed: the three lists are not consulted.
     everything: bool,
+    namespaces: BTreeSet<String>,
     jobs: BTreeSet<String>,
     assets: BTreeSet<String>,
 }
@@ -182,10 +203,36 @@ impl Scope {
         }
     }
 
+    /// everything declared in these [namespaces](crate::JobBuilder::namespace),
+    /// jobs and assets alike, and nothing outside them.
+    ///
+    /// this is the point of a namespace: a token for one team names the team,
+    /// not the eleven jobs the team happens to own this week, and a job added
+    /// to that namespace tomorrow is in the token's reach without anybody
+    /// editing the token.
+    ///
+    /// ```no_run
+    /// # use hestan::{Identity, Scope};
+    /// Identity::operator("finance-ci").scoped_to(Scope::namespaces(["finance"]));
+    /// ```
+    ///
+    /// a namespace nothing is declared in reaches nothing, and a thing in no
+    /// namespace at all is reached by no namespace: `None` is not a namespace,
+    /// it is the absence of one.
+    pub fn namespaces<S: Into<String>>(names: impl IntoIterator<Item = S>) -> Scope {
+        Scope {
+            everything: false,
+            namespaces: names.into_iter().map(Into::into).collect(),
+            jobs: BTreeSet::new(),
+            assets: BTreeSet::new(),
+        }
+    }
+
     /// these jobs and no assets.
     pub fn jobs<S: Into<String>>(names: impl IntoIterator<Item = S>) -> Scope {
         Scope {
             everything: false,
+            namespaces: BTreeSet::new(),
             jobs: names.into_iter().map(Into::into).collect(),
             assets: BTreeSet::new(),
         }
@@ -195,9 +242,17 @@ impl Scope {
     pub fn assets<S: Into<String>>(names: impl IntoIterator<Item = S>) -> Scope {
         Scope {
             everything: false,
+            namespaces: BTreeSet::new(),
             jobs: BTreeSet::new(),
             assets: names.into_iter().map(Into::into).collect(),
         }
+    }
+
+    /// these namespaces as well.
+    pub fn and_namespaces<S: Into<String>>(mut self, names: impl IntoIterator<Item = S>) -> Scope {
+        self.everything = false;
+        self.namespaces.extend(names.into_iter().map(Into::into));
+        self
     }
 
     /// these jobs as well.
@@ -221,26 +276,38 @@ impl Scope {
         self.everything
     }
 
-    /// whether a request that changes job `name` is in this scope.
-    pub fn may_touch_job(&self, name: &str) -> bool {
-        self.everything || self.jobs.contains(name)
+    /// whether a request that changes job `name`, declared in `namespace`, is
+    /// in this scope.
+    pub fn may_touch_job(&self, name: &str, namespace: Option<&str>) -> bool {
+        self.everything || self.jobs.contains(name) || self.covers(namespace)
     }
 
-    /// whether a request that changes asset `name` is in this scope.
-    pub fn may_touch_asset(&self, name: &str) -> bool {
-        self.everything || self.assets.contains(name)
+    /// whether a request that changes asset `name`, declared in `namespace`,
+    /// is in this scope.
+    pub fn may_touch_asset(&self, name: &str, namespace: Option<&str>) -> bool {
+        self.everything || self.assets.contains(name) || self.covers(namespace)
+    }
+
+    /// whether this scope names the namespace something is in. `None` is a
+    /// thing in no namespace, which no namespace covers.
+    fn covers(&self, namespace: Option<&str>) -> bool {
+        namespace.is_some_and(|ns| self.namespaces.contains(ns))
     }
 }
 
 impl std::fmt::Display for Scope {
     /// what a refusal says the token was limited to: `job deploy`,
-    /// `assets a and b`, `jobs etl, load and asset orders`, or `nothing`.
+    /// `assets a and b`, `namespace finance and job etl`, or `nothing`.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         if self.everything {
             return f.write_str("everything");
         }
         let mut parts: Vec<String> = Vec::new();
-        for (what, names) in [("job", &self.jobs), ("asset", &self.assets)] {
+        for (what, names) in [
+            ("namespace", &self.namespaces),
+            ("job", &self.jobs),
+            ("asset", &self.assets),
+        ] {
             if names.is_empty() {
                 continue;
             }

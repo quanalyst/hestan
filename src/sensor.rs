@@ -123,6 +123,7 @@ pub struct Sensor {
     name: String,
     every: Duration,
     timeout: Duration,
+    namespace: Option<String>,
     f: Arc<SensorFn>,
 }
 
@@ -159,6 +160,7 @@ impl Sensor {
             name: name.into(),
             every,
             timeout: DEFAULT_SENSOR_TIMEOUT,
+            namespace: None,
             f: Arc::new(move |ctx| Box::pin(f(ctx))),
         }
     }
@@ -177,6 +179,17 @@ impl Sensor {
     /// cooperative half.
     pub fn timeout(mut self, timeout: Duration) -> Sensor {
         self.timeout = timeout;
+        self
+    }
+
+    /// which slice of the deployment this sensor belongs to.
+    ///
+    /// declared rather than inherited, because a sensor names no job until it
+    /// fires and may name several: there is nothing to inherit from. a
+    /// [`Schedule`](crate::Schedule) is the other way round and takes its
+    /// job's. see `docs/namespaces.md`.
+    pub fn namespace(mut self, name: impl Into<String>) -> Sensor {
+        self.namespace = Some(name.into());
         self
     }
 
@@ -284,6 +297,7 @@ pub struct RunStatusSensor {
     timeout: Duration,
     statuses: Vec<RunStatus>,
     job: Option<String>,
+    namespace: Option<String>,
     f: Arc<RunSensorFn>,
 }
 
@@ -304,6 +318,7 @@ impl RunStatusSensor {
             timeout: DEFAULT_SENSOR_TIMEOUT,
             statuses: vec![RunStatus::Success],
             job: None,
+            namespace: None,
             f: Arc::new(move |ctx, run| Box::pin(f(ctx, run))),
         }
     }
@@ -321,6 +336,16 @@ impl RunStatusSensor {
     /// watch one job only; without it, every job in the process.
     pub fn for_job(mut self, job: impl Into<String>) -> RunStatusSensor {
         self.job = Some(job.into());
+        self
+    }
+
+    /// which slice of the deployment this sensor belongs to.
+    ///
+    /// declared rather than taken from [`for_job`](Self::for_job), because
+    /// the sensor exists whether or not a job was named and what it launches
+    /// is whatever its closure asks for.
+    pub fn namespace(mut self, name: impl Into<String>) -> RunStatusSensor {
+        self.namespace = Some(name.into());
         self
     }
 
@@ -435,6 +460,9 @@ pub(crate) struct SensorEntry {
     pub name: String,
     pub every: Duration,
     pub timeout: Duration,
+    /// which slice of the deployment it is in: what a user sensor or a run
+    /// sensor declared, and for a probe whatever its asset is in.
+    pub namespace: Option<String>,
     pub eval: SensorEval,
     /// when it is next due and whether an evaluation of it is still going.
     /// shared, because evaluations run on tasks of their own now.
@@ -447,6 +475,7 @@ impl SensorEntry {
             name: sensor.name,
             every: sensor.every,
             timeout: sensor.timeout,
+            namespace: sensor.namespace,
             eval: SensorEval::User(sensor.f),
             state: SensorState::new(),
         }
@@ -457,6 +486,7 @@ impl SensorEntry {
             name: sensor.sensor_name(),
             every: sensor.every,
             timeout: sensor.timeout,
+            namespace: sensor.namespace,
             eval: SensorEval::Runs {
                 statuses: sensor.statuses,
                 job: sensor.job,
@@ -468,11 +498,19 @@ impl SensorEntry {
 
     /// the entry a probed source asset becomes. probes carry the default
     /// timeout: there is no declaration to hang another one on.
-    pub(crate) fn probe(asset: &str, probe: Arc<ProbeFn>, every: Duration) -> SensorEntry {
+    pub(crate) fn probe(
+        asset: &str,
+        namespace: Option<&str>,
+        probe: Arc<ProbeFn>,
+        every: Duration,
+    ) -> SensorEntry {
         SensorEntry {
             name: format!("probe:{asset}"),
             every,
             timeout: DEFAULT_SENSOR_TIMEOUT,
+            // a probe is not declared, so there is nothing to declare a
+            // namespace on: it is in whatever its asset is in
+            namespace: namespace.map(str::to_string),
             eval: SensorEval::Probe {
                 asset: asset.to_string(),
                 probe,
@@ -1376,7 +1414,7 @@ mod tests {
 
     fn probe_entry(reg: &AssetRegistry, asset: &str) -> SensorEntry {
         let probe = reg.get(asset).unwrap().probe.clone().unwrap();
-        SensorEntry::probe(asset, probe, Duration::from_secs(3600))
+        SensorEntry::probe(asset, None, probe, Duration::from_secs(3600))
     }
 
     #[tokio::test]

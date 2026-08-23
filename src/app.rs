@@ -1073,6 +1073,7 @@ impl Hestan {
             .map(|e| SensorInfo {
                 name: e.name.clone(),
                 every: e.every,
+                namespace: e.namespace.clone(),
                 filter: e.filter(),
                 state: e.state.clone(),
             })
@@ -1456,6 +1457,7 @@ impl Hestan {
             if let Some(probe) = &meta.probe {
                 sensor_entries.push(SensorEntry::probe(
                     &meta.name,
+                    meta.namespace.as_deref(),
                     probe.clone(),
                     meta.probe_every,
                 ));
@@ -1463,6 +1465,7 @@ impl Hestan {
         }
         let mut sensor_names = HashSet::new();
         for e in &sensor_entries {
+            crate::whose::check_namespace("sensor", &e.name, e.namespace.as_deref())?;
             if !sensor_names.insert(e.name.clone()) {
                 return Err(Error::Graph(format!("duplicate sensor {}", e.name)));
             }

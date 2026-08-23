@@ -8,7 +8,10 @@ import {
   filterAssets,
   groupAssets,
   groupOf,
+  inNamespace,
+  namespacesOf,
   neverBuilt,
+  onlyNamespace,
   policySays,
   sortAssets,
 } from "../src/catalog";
@@ -24,6 +27,7 @@ interface Over {
   within_secs?: number;
   last_success?: string | null;
   group?: string | null;
+  namespace?: string | null;
   provenance?: Origin[];
 }
 
@@ -38,6 +42,7 @@ const prefixGroup = (name: string): string | null => {
 
 export const asset = (name: string, over: Over = {}): AssetSummary => ({
   name,
+  namespace: over.namespace ?? null,
   group: over.group === undefined ? prefixGroup(name) : over.group,
   group_hue: 200,
   provenance: over.provenance ?? [],
@@ -154,6 +159,35 @@ test("the group filter is exact, and it composes with the other two", () => {
   assert.deepEqual(names(filterAssets(catalog, "cust", "all", "sales")), ["sales/customers"]);
   // no group named is every group, which is not the same as the ungrouped ones
   assert.equal(filterAssets(catalog, "", "all", null).length, 5);
+});
+
+// the decision the page rests on: which team's slice, which is not which
+// label on the graph. one asset answers the two differently
+test("the namespace filter is the other question, and a blank one is no filter", () => {
+  const divided = [
+    asset("sales/orders", { namespace: "finance" }),
+    asset("sales/returns", { namespace: "people" }),
+    asset("heartbeat"),
+  ];
+  assert.deepEqual(names(onlyNamespace(divided, "finance")), ["sales/orders"]);
+  // labeled `sales` on the graph and split across two namespaces: the group is
+  // not the boundary and nothing here pretends it is
+  assert.deepEqual(names(filterAssets(divided, "", "all", "sales")).length, 2);
+  assert.deepEqual(names(filterAssets(divided, "", "all", "sales", "finance")), [
+    "sales/orders",
+  ]);
+
+  // an asset in no namespace is in nobody's, so no namespace names it
+  assert.equal(inNamespace(divided[2], "finance"), false);
+  // and a blank is a cleared filter rather than a request for the namespace
+  // called "", which nothing is ever in
+  assert.equal(names(onlyNamespace(divided, null)).length, 3);
+  assert.equal(names(onlyNamespace(divided, "")).length, 3);
+
+  // the picker offers what was declared, sorted, and nothing for a deployment
+  // that declared none
+  assert.deepEqual(namespacesOf(divided), ["finance", "people"]);
+  assert.deepEqual(namespacesOf(catalog), []);
 });
 
 test("every column sorts both ways and leaves equal rows where they were", () => {

@@ -160,6 +160,10 @@ mod server;
 // and `work` reach it: a one-shot installs no handler at all
 mod stop;
 mod store;
+// whose work this is: the namespace that divides a deployment, and the owner
+// a failure hook is handed. private, because the only public type in it is
+// re-exported at the root like every other row type
+mod whose;
 
 pub use app::Hestan;
 pub use asset::{Asset, AssetCheck, CheckOutcome, CheckResult, MultiAsset, hue};
