@@ -31,6 +31,13 @@ spec:
       labels:
         app.kubernetes.io/name: hestan
         app.kubernetes.io/component: worker
+      annotations:
+        # inert on their own: something has to relabel on them, and that
+        # something is also where the token goes, because an annotation cannot
+        # carry one. `podmonitor.yaml` is the version that can
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "4000"
+        prometheus.io/path: /metrics
     spec:
       securityContext:
         runAsNonRoot: true

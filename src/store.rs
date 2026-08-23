@@ -1490,6 +1490,13 @@ impl Health {
     pub(crate) fn unrecorded_writes(&self) -> u64 {
         self.unrecorded.load(Ordering::Relaxed)
     }
+
+    /// how many writes this store refused and hestan then tried again. a write
+    /// that took on its fourth attempt is one run recorded and three counted
+    /// here.
+    pub(crate) fn write_retries(&self) -> u64 {
+        self.retried.load(Ordering::Relaxed)
+    }
 }
 
 /// run history on sqlite or postgres. cheap to clone; safe to share across
@@ -1594,6 +1601,12 @@ impl Store {
     /// could not record at all, and whether it is taking writes now.
     pub(crate) fn health(&self) -> &Health {
         &self.health
+    }
+
+    /// what this process has counted itself doing to this store: the counters
+    /// and histograms `/metrics` renders, shared by every clone.
+    pub(crate) fn meters(&self) -> &Meters {
+        &self.meters
     }
 
     /// a write that records authoritative state: what a run did, what an op
@@ -2172,6 +2185,93 @@ impl Store {
             |r| r.size(0),
         )?;
         Ok(n.unwrap_or_default())
+    }
+
+    /// everything `/metrics` reads off the run log, in one pass.
+    ///
+    /// **these describe the deployment, not this process.** the run log is
+    /// shared, so three workers scraped separately each report the same queue
+    /// depth, and a dashboard that added them up would report three times the
+    /// queue there is.
+    ///
+    /// six counts and one lease read, none of them scanning further than an
+    /// index: this runs on every scrape of every process, so a query here that
+    /// walked the runs table would be a scrape interval hestan chose for
+    /// somebody's database.
+    pub(crate) fn counts(&self, now: DateTime<Utc>) -> Result<Counts, Error> {
+        let at = now.to_rfc3339();
+        let (queued, oldest, active, stalled, schedules_paused, sensors_paused) = {
+            let mut conn = self.conn();
+            // the depth and the age of the oldest in one query: they answer
+            // the same question and a queue that changed between two reads
+            // would have them disagreeing about which run is at the front
+            let (queued, oldest) = conn
+                .query_opt(
+                    "SELECT COUNT(*), MIN(created_at) FROM runs
+                     WHERE status = 'queued' AND claimed_by IS NULL",
+                    args![],
+                    |r| Ok((r.int(0)?, r.opt_ts(1)?)),
+                )?
+                .unwrap_or_default();
+            let active = conn
+                .query_opt(
+                    "SELECT COUNT(*) FROM runs
+                     WHERE claimed_by IS NOT NULL AND status IN ('queued', 'running')",
+                    args![],
+                    |r| r.int(0),
+                )?
+                .unwrap_or_default();
+            // the same set `reclaim_expired` takes, asked without taking it: a
+            // count here that is not zero for long is a deployment whose lease
+            // loop is behind or absent
+            let stalled = conn
+                .query_opt(
+                    "SELECT COUNT(*) FROM runs
+                     WHERE claimed_by IS NOT NULL AND status IN ('queued', 'running')
+                       AND (lease_until IS NULL OR lease_until < ?1)",
+                    args![&at],
+                    |r| r.int(0),
+                )?
+                .unwrap_or_default();
+            // `paused` is a 0/1 column on both backends, which is what lets
+            // this be one statement rather than a bound boolean per dialect
+            let schedules_paused = conn
+                .query_opt(
+                    "SELECT COUNT(*) FROM schedules WHERE paused <> 0",
+                    args![],
+                    |r| r.int(0),
+                )?
+                .unwrap_or_default();
+            let sensors_paused = conn
+                .query_opt(
+                    "SELECT COUNT(*) FROM sensors WHERE paused <> 0",
+                    args![],
+                    |r| r.int(0),
+                )?
+                .unwrap_or_default();
+            (
+                queued,
+                oldest,
+                active,
+                stalled,
+                schedules_paused,
+                sensors_paused,
+            )
+        };
+        // outside the block above because it takes the connection itself, and
+        // the mutex behind it does not nest
+        let decider = self.decider()?;
+        Ok(Counts {
+            queued: queued.max(0) as u64,
+            oldest_queued: oldest.map_or(0.0, |at| {
+                (now - at).num_milliseconds().max(0) as f64 / 1000.0
+            }),
+            active: active.max(0) as u64,
+            stalled: stalled.max(0) as u64,
+            schedules_paused: schedules_paused.max(0) as u64,
+            sensors_paused: sensors_paused.max(0) as u64,
+            decider,
+        })
     }
 
     /// move a run up or down the queue. false when there is no such run, and
@@ -4938,6 +5038,28 @@ fn backfill_over(
     }))
 }
 
+/// what one pass over the run log says about the whole deployment, for the
+/// gauges on `/metrics`.
+///
+/// seconds rather than instants, because that is what a scrape reads and
+/// converting in two places is how the two stop agreeing.
+pub(crate) struct Counts {
+    /// runs written down and claimed by nobody.
+    pub queued: u64,
+    /// how long the oldest of those has waited; 0 when there are none.
+    pub oldest_queued: f64,
+    /// runs claimed by some process and not yet terminal.
+    pub active: u64,
+    /// claimed runs past the lease they were claimed under.
+    pub stalled: u64,
+    /// declared schedules that are paused.
+    pub schedules_paused: u64,
+    /// declared sensors that are paused.
+    pub sensors_paused: u64,
+    /// who is deciding, so a scrape can say whether anybody is.
+    pub decider: Decider,
+}
+
 /// how far a follower may read, from [`Store::settled_after`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Settled {
@@ -5689,6 +5811,38 @@ mod tests {
         }
     }
 
+    /// the counter that arrives before anything is lost: a write the database
+    /// refused, which hestan then tried again and which took.
+    ///
+    /// the last assertion is the one that matters. `landed` calls the write
+    /// again, and the write records the run again; the counter moves **once**,
+    /// because it moves after the commit rather than inside the call.
+    #[tokio::test]
+    async fn a_write_the_store_refused_and_took_on_the_retry_is_counted() {
+        let store = Store::open(":memory:").unwrap();
+        store
+            .create_run(&mk_run("r1", "etl", Utc::now()), &["a".into()])
+            .unwrap();
+        store.fail_writes(1);
+        assert!(
+            store
+                .landed("run_finished", || store.run_finished(
+                    "r1",
+                    RunStatus::Success,
+                    None,
+                    Utc::now(),
+                    None
+                ))
+                .await
+        );
+        assert_eq!(store.health().write_retries(), 1);
+        // and nothing was lost, because the second attempt took
+        assert_eq!(store.health().unrecorded_writes(), 0);
+        assert_eq!(store.health().dropped_writes(), 0);
+        assert!(!store.health().failing());
+        assert_eq!(store.meters().counted()["runs:success"], 1);
+    }
+
     /// every counter and histogram this store keeps for `/metrics`, against
     /// the write that records the same fact.
     ///
@@ -5706,12 +5860,12 @@ mod tests {
             let defined = HashSet::from(["etl".to_string()]);
             let none = |store: &Store| {
                 assert!(
-                    store.meters.counted().values().all(|n| *n == 0),
+                    store.meters().counted().values().all(|n| *n == 0),
                     "{:?}",
-                    store.meters.counted()
+                    store.meters().counted()
                 );
             };
-            let count = |store: &Store, key: &str| store.meters.counted()[key];
+            let count = |store: &Store, key: &str| store.meters().counted()[key];
             none(&store);
 
             // a claim, and how long the run had been waiting for it
@@ -5888,7 +6042,7 @@ mod tests {
 
             // the whole map, so a counter that moved twice or moved for the
             // wrong reason fails here rather than passing quietly
-            let counted = store.meters.counted();
+            let counted = store.meters().counted();
             assert_eq!(counted["runs:success"], 1);
             assert_eq!(counted["runs:failed"], 2);
             assert_eq!(counted["runs:canceled"], 1);

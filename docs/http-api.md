@@ -1,7 +1,9 @@
 # Http api
 
 everything lives under `/api`, speaks json, and is what the ui itself runs
-on: there is no privileged path. errors are always
+on: there is no privileged path. the one exception is `/metrics`, which is
+prometheus text rather than json and is not under `/api` because a scrape
+looks for it where every other exporter puts it. errors are always
 `{"error": "<message>"}` with an appropriate status: 400 for bad input
 (malformed query parameters included), 404 for unknown names, 409 for a
 request that conflicts with reality (a retry or resume of a run still active
@@ -16,6 +18,7 @@ page is for writing something that is not hestan.
 | method | path | purpose |
 | --- | --- | --- |
 | GET | `/api/health` | liveness, this process's instance id, what it is holding, whether it is the deciding process, and whether its store is taking writes |
+| GET | `/metrics` | prometheus text: queue depth and age, claim latency, schedule lateness, reclaims, retries, store errors and run outcomes |
 | GET | `/api/resources` | registered resources: names and types |
 | GET | `/api/jobs` | all job summaries, sorted by name |
 | GET | `/api/jobs/{name}` | one job summary |
@@ -295,6 +298,41 @@ what each one is doing, sorted by name:
 queued for a token **in this process**, which is the only place the bucket
 exists. point this at each worker in turn and add them up: the far side is
 seeing the sum. see [a rate is per process](scaling.md#a-rate-is-per-process).
+
+## Metrics
+
+`GET /metrics` is prometheus text exposition and the only endpoint here that is
+not json. it is in every build and behind no feature.
+
+```
+$ curl -s -H "Authorization: Bearer $HESTAN_TOKEN" localhost:4000/metrics
+# HELP hestan_queue_depth runs written down and claimed by nobody
+# TYPE hestan_queue_depth gauge
+hestan_queue_depth 3
+# HELP hestan_runs_total runs this process took to a terminal status, by which one
+# TYPE hestan_runs_total counter
+hestan_runs_total{status="success"} 412
+hestan_runs_total{status="failed"} 7
+hestan_runs_total{status="canceled"} 1
+```
+
+**it is inside the [auth guard](auth.md) and needs a viewer**, unlike
+`/api/whoami`. a kubelet probe has nowhere to put a bearer token, which is why
+that one is open; prometheus has `authorization` in every scrape config, so the
+constraint is not present here, and what this publishes is the shape of a
+deployment. an unauthenticated deployment serves it to anyone who can reach the
+port, exactly as it serves everything else.
+
+it always answers 200. a process that cannot read its run log renders
+`hestan_store_up 0` and the rest of what it knows, because a 500 would take the
+metric that says why with it.
+
+the gauges are read off the run log and so describe the whole deployment: every
+process answers with the same figure, and they aggregate with `max`, never
+`sum`. the counters and histograms belong to the process that was scraped and
+read zero after a restart. no metric carries a job name, an asset name, an op
+name, a partition key or a run id. [metrics](metrics.md) is the whole of it:
+every name, its type, its labels, what to alert on, and why.
 
 ## Resources
 

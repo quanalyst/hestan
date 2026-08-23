@@ -87,6 +87,9 @@ services:
       <<: *hestan-env
       HESTAN_ROLE: scheduler
     ports:
+      # the ui, the api and `GET /metrics`, which is one port because it is one
+      # server. docs/containers.md has the scrape, including why the workers
+      # are scraped by container name rather than through `worker:4000`
       - "4000:4000"
 
   worker:

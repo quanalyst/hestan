@@ -18,6 +18,7 @@ resources:
   - scheduler.yaml
   - worker.yaml
   - service.yaml
+  - podmonitor.yaml
 
 # the two edits a deployment actually makes:
 #

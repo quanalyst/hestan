@@ -74,6 +74,9 @@ pub(crate) fn router(state: AppState) -> Router {
     let auth = state.auth.clone();
     Router::new()
         .route("/api/health", get(health))
+        // the one endpoint that is neither json nor under `/api`, and it is
+        // inside the guard on purpose: the handler says why
+        .route("/metrics", get(metrics))
         .route("/api/resources", get(list_resources))
         .route("/api/jobs", get(list_jobs))
         .route("/api/jobs/{name}", get(get_job))
@@ -479,6 +482,38 @@ async fn health(State(st): State<AppState>) -> Json<Value> {
             "given_up": st.runner.given_up(),
         },
     }))
+}
+
+/// every number a scrape can read off this process, as prometheus text.
+///
+/// **inside the auth guard, and that is the decision on this endpoint worth
+/// arguing with.** a scrape often cannot carry a credential, which is exactly
+/// why [`whoami`] is outside the guard and why the kubelet probes in
+/// `deploy/k8s` point at it rather than at anything more useful. prometheus is
+/// not a kubelet: every scrape config has an `authorization` block and so does
+/// a `ServiceMonitor`, so the constraint that forced that one open is not
+/// present here. and what this renders is the shape of a deployment (how much
+/// work it has, how much of it fails, whether anything is deciding), which is
+/// the same class of thing `/api/jobs` and `/api/runs` return. serving it to
+/// anybody who can reach the port would be a hole in exactly the deployments
+/// that asked for a guard.
+///
+/// a deployment with no authenticator serves it to anyone, like everything
+/// else, and [`serve`](crate::Hestan::serve) already refuses to bind a
+/// reachable address without one.
+///
+/// **always 200.** a process that cannot read its store renders
+/// `hestan_store_up 0` and everything else it knows, because a 500 here would
+/// take the metric that says why down with it.
+async fn metrics(State(st): State<AppState>) -> Response {
+    (
+        [(
+            header::CONTENT_TYPE,
+            "text/plain; version=0.0.4; charset=utf-8",
+        )],
+        crate::metrics::render(&st.runner),
+    )
+        .into_response()
 }
 
 /// who is doing the deciding in this deployment, and whether it is this
@@ -2455,6 +2490,19 @@ mod tests {
 
     fn state(jobs: Vec<Job>) -> AppState {
         let runner = Runner::new(jobs, Store::open(":memory:").unwrap()).unwrap();
+        AppState {
+            jobs: Arc::new(runner.jobs().clone()),
+            runner,
+            assets: Arc::new(AssetRegistry::empty()),
+            sensors: Arc::new(Vec::new()),
+            auth: None,
+        }
+    }
+
+    /// the same over a database on disk, which is what a second process on
+    /// one is: `":memory:"` is private per connection and cannot be reopened.
+    fn state_on(store: Store) -> AppState {
+        let runner = Runner::new(vec![echo_job("etl")], store).unwrap();
         AppState {
             jobs: Arc::new(runner.jobs().clone()),
             runner,
@@ -6711,8 +6759,9 @@ mod tests {
     /// a route nobody asserted the access of, so the two lists below are
     /// checked against the router itself in
     /// [`the_table_covers_every_endpoint_the_router_serves`].
-    const READS: [&str; 34] = [
+    const READS: [&str; 35] = [
         "/api/health",
+        "/metrics",
         "/api/rates",
         "/api/resources",
         "/api/jobs",
@@ -6939,7 +6988,7 @@ mod tests {
         );
         // and the count, so that a scraper that quietly stopped finding
         // anything cannot pass this by covering nothing
-        assert_eq!(declared_routes().len(), 49);
+        assert_eq!(declared_routes().len(), 50);
     }
 
     /// every `| METHOD | \`/api/path\` |` row of the table at the top of
@@ -7004,8 +7053,8 @@ mod tests {
         assert!(stale.is_empty(), "documented but not served: {stale:?}");
         // and neither list is empty, so a scraper that stopped finding
         // anything cannot pass by comparing nothing with nothing
-        assert_eq!(declared.len(), 50);
-        assert_eq!(documented.len(), 50);
+        assert_eq!(declared.len(), 51);
+        assert_eq!(documented.len(), 51);
     }
 
     // a role that may not is 403 and says what it would take; nobody at all is
@@ -7152,6 +7201,231 @@ mod tests {
                 .iter()
                 .all(|e| e.actor.is_none())
         );
+    }
+
+    // ---- what a scrape reads ----
+
+    /// one scrape: the body, with the two things a scrape checks before it
+    /// parses anything.
+    async fn scrape(st: &AppState) -> String {
+        let (status, body, content_type) =
+            request_text(router(st.clone()), Method::GET, "/metrics").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            content_type.starts_with("text/plain; version=0.0.4"),
+            "{content_type}"
+        );
+        body
+    }
+
+    /// the exposition parsed the way a scrape parses it: every sample by its
+    /// full series name, and the type each family was declared under.
+    ///
+    /// it panics on the malformed rather than skipping it, which is what makes
+    /// this a parser and not a grep.
+    fn scraped(
+        text: &str,
+    ) -> (
+        std::collections::BTreeMap<String, f64>,
+        std::collections::BTreeMap<String, String>,
+    ) {
+        let mut samples = std::collections::BTreeMap::new();
+        let mut types = std::collections::BTreeMap::new();
+        let mut helped = std::collections::BTreeSet::new();
+        for line in text.lines() {
+            if let Some(rest) = line.strip_prefix("# HELP ") {
+                let (name, help) = rest.split_once(' ').expect("a help line says something");
+                assert!(!help.trim().is_empty(), "{name} has an empty help");
+                assert!(helped.insert(name.to_string()), "{name} documented twice");
+                continue;
+            }
+            if let Some(rest) = line.strip_prefix("# TYPE ") {
+                let (name, kind) = rest.split_once(' ').expect("a type line names a type");
+                assert!(
+                    types.insert(name.to_string(), kind.to_string()).is_none(),
+                    "{name} declared twice"
+                );
+                continue;
+            }
+            let (series, value) = line
+                .rsplit_once(' ')
+                .expect("a sample line ends in a value");
+            let value: f64 = value
+                .parse()
+                .unwrap_or_else(|_| panic!("not a number: {line}"));
+            assert!(
+                samples.insert(series.to_string(), value).is_none(),
+                "{series} appears twice"
+            );
+        }
+        // a family with a type and no help is a metric a dashboard cannot
+        // explain, and one with a help and no type is one a scrape guesses at
+        let named: std::collections::BTreeSet<String> = types.keys().cloned().collect();
+        assert_eq!(named, helped, "every family gets both lines or neither");
+        (samples, types)
+    }
+
+    // the format, against what a scrape does with it: one family per name,
+    // a type and a help for each, values that are numbers, and the suffix
+    // conventions a reader relies on
+    #[tokio::test]
+    async fn the_endpoint_renders_valid_exposition_format() {
+        let st = state(vec![echo_job("etl")]);
+        insert_run(&st, "r1", "etl", RunStatus::Queued, json!({}));
+        let (samples, types) = scraped(&scrape(&st).await);
+        assert!(samples.len() > 20, "only {} samples", samples.len());
+
+        for series in samples.keys() {
+            let name = series.split('{').next().unwrap();
+            // a histogram's samples carry a suffix its family name does not
+            let family = ["_bucket", "_sum", "_count"]
+                .iter()
+                .find_map(|suffix| name.strip_suffix(*suffix))
+                .filter(|f| types.get(*f).is_some_and(|kind| kind == "histogram"))
+                .unwrap_or(name);
+            assert!(types.contains_key(family), "{series} has no TYPE line");
+            assert!(family.starts_with("hestan_"), "{series} is not ours");
+        }
+        for (name, kind) in &types {
+            match kind.as_str() {
+                "counter" => assert!(name.ends_with("_total"), "counter {name}"),
+                "histogram" => assert!(name.ends_with("_seconds"), "histogram {name}"),
+                "gauge" => assert!(!name.ends_with("_total"), "gauge {name}"),
+                other => panic!("{name} is a {other}"),
+            }
+        }
+        // the two shapes have to both be there, or the loops above passed by
+        // finding one of them
+        assert!(types.values().any(|k| k == "histogram"));
+        assert!(types.values().any(|k| k == "counter"));
+    }
+
+    // a counter that does not move when the thing it counts happens is a
+    // counter nobody can alert on, and so is one that moves on its own
+    #[tokio::test]
+    async fn a_counter_moves_when_the_thing_it_counts_happens() {
+        let st = state(vec![echo_job("etl")]);
+        let before = scraped(&scrape(&st).await).0;
+        assert_eq!(before["hestan_queue_depth"], 0.0);
+        assert_eq!(before["hestan_runs_total{status=\"success\"}"], 0.0);
+
+        // a run nobody has claimed is a gauge, read off the run log
+        insert_run(&st, "waiting", "etl", RunStatus::Queued, json!({}));
+        let queued = scraped(&scrape(&st).await).0;
+        assert_eq!(queued["hestan_queue_depth"], 1.0);
+        // and nothing has ended, so nothing counted one
+        assert_eq!(queued["hestan_runs_total{status=\"success\"}"], 0.0);
+
+        // a run that ended is a counter, in the process that ended it
+        insert_run(&st, "done", "etl", RunStatus::Queued, json!({}));
+        st.runner
+            .store()
+            .run_finished("done", RunStatus::Success, None, Utc::now(), None)
+            .unwrap();
+        let after = scraped(&scrape(&st).await).0;
+        assert_eq!(after["hestan_runs_total{status=\"success\"}"], 1.0);
+        assert_eq!(after["hestan_runs_total{status=\"failed\"}"], 0.0);
+        // and the gauge followed the store back down to the one still waiting
+        assert_eq!(after["hestan_queue_depth"], 1.0);
+    }
+
+    // what a restart does, which is what a reader has to know before they
+    // trust a `_total` here: the run log is where it was and the counters are
+    // not
+    #[tokio::test]
+    async fn a_restart_keeps_the_gauges_and_starts_the_counters_over() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hestan.db");
+        let path = path.to_str().unwrap();
+
+        let before = state_on(Store::open(path).unwrap());
+        insert_run(&before, "waiting", "etl", RunStatus::Queued, json!({}));
+        insert_run(&before, "done", "etl", RunStatus::Queued, json!({}));
+        before
+            .runner
+            .store()
+            .run_finished("done", RunStatus::Success, None, Utc::now(), None)
+            .unwrap();
+        let first = scraped(&scrape(&before).await).0;
+        assert_eq!(first["hestan_queue_depth"], 1.0);
+        assert_eq!(first["hestan_runs_total{status=\"success\"}"], 1.0);
+
+        // a second process on the same database, which is what a restart is
+        let after = state_on(Store::open(path).unwrap());
+        let restarted = scraped(&scrape(&after).await).0;
+        assert_eq!(
+            restarted["hestan_queue_depth"], 1.0,
+            "a gauge is read off the store, so a restart does not touch it"
+        );
+        assert_eq!(
+            restarted["hestan_runs_total{status=\"success\"}"], 0.0,
+            "a counter belongs to the process that counted it"
+        );
+        assert_eq!(restarted["hestan_run_claim_delay_seconds_count"], 0.0);
+    }
+
+    // the cardinality rule, asserted rather than asked for: a store full of
+    // job names, partition keys and sensor names renders exactly the series
+    // an empty one does
+    #[tokio::test]
+    async fn neither_a_job_name_nor_a_partition_key_can_add_a_series() {
+        let empty = state(vec![]);
+        let bare: Vec<String> = scraped(&scrape(&empty).await).0.into_keys().collect();
+
+        let st = state(vec![echo_job("etl")]);
+        let store = st.runner.store();
+        let mut schedules = Vec::new();
+        for n in 0..200 {
+            insert_run(
+                &st,
+                &format!("r{n}"),
+                &format!("job-{n}"),
+                RunStatus::Queued,
+                json!({}),
+            );
+            let key = format!("2026-01-{n:03}");
+            store
+                .record_materialization(
+                    "sales/orders",
+                    Some(&key),
+                    "fp",
+                    &json!({}),
+                    None,
+                    None,
+                    None,
+                )
+                .unwrap();
+            schedules.push(Schedule::new(format!("job-{n}"), "0 * * * *"));
+        }
+        store.sync_schedules(&schedules).unwrap();
+        let sensors: Vec<String> = (0..200).map(|n| format!("watch-{n}")).collect();
+        store.sync_sensors(&sensors).unwrap();
+
+        let stuffed: Vec<String> = scraped(&scrape(&st).await).0.into_keys().collect();
+        assert_eq!(bare, stuffed);
+        // and it is not two empty lists agreeing
+        assert!(bare.len() > 20, "only {} series", bare.len());
+    }
+
+    // the scrape endpoint is inside the guard. the argument is on the handler;
+    // this is the part of it that is checkable
+    #[tokio::test]
+    async fn a_scrape_of_a_guarded_deployment_needs_a_credential() {
+        let st = guarded(Auth::bearer("s3cret"));
+        assert_eq!(
+            status_of(&st, "GET", "/metrics", None).await,
+            StatusCode::UNAUTHORIZED
+        );
+        let token = Some(("authorization", "Bearer s3cret"));
+        assert_eq!(
+            status_of(&st, "GET", "/metrics", token).await,
+            StatusCode::OK
+        );
+        // and it is a read, so a viewer may have it
+        let st = guarded(people());
+        assert!(!refused(
+            status_of(&st, "GET", "/metrics", Some(("x-user", "vic"))).await
+        ));
     }
 
     // nothing configured serves exactly as it did before any of this existed

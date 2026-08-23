@@ -1,0 +1,46 @@
+# NOT RUN AGAINST A CLUSTER. nothing in deploy/k8s has been applied to a
+# cluster, scheduled by a kubelet or scraped by anything. this file assumes a
+# prometheus operator on top of that, which is a second thing nobody here has
+# run: without one, `kind: PodMonitor` is a resource the api server does not
+# know and `kubectl apply` refuses it.
+#
+# **a PodMonitor rather than a ServiceMonitor, and the reason is the metrics
+# themselves.** the counters and histograms on `/metrics` are per process:
+# every hestan process counts what it did, and a scrape has to reach each one
+# as its own target or a `rate()` over them is nonsense. there is no service in
+# front of every hestan pod (`service.yaml` deliberately selects only the
+# schedulers, so that the ui and `/api/health` answer for a known small set),
+# so a ServiceMonitor would need a second service that exists only to be
+# scraped. a PodMonitor selects the pods, which is what is being measured.
+#
+# it selects **both** deployments. a worker publishes no service and is still
+# the process that executes runs, so a deployment scraping only its schedulers
+# would have no claim latency, no run outcomes and no reclaims at all.
+apiVersion: monitoring.coreos.com/v1
+kind: PodMonitor
+metadata:
+  name: hestan
+  labels:
+    app.kubernetes.io/name: hestan
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: hestan
+  podMetricsEndpoints:
+    - port: http
+      path: /metrics
+      interval: 30s
+      # **`/metrics` is inside the auth guard**, unlike the `/api/whoami` the
+      # kubelet probes point at. a kubelet has nowhere to put a bearer token
+      # and prometheus does, which is the whole of why the two endpoints sit on
+      # different sides of it; docs/metrics.md has the argument.
+      #
+      # this reads the same key the pods read, out of a secret that has to
+      # exist **in the prometheus operator's namespace** rather than in the
+      # application's: a PodMonitor's credentials are resolved where prometheus
+      # runs. that is a real piece of setup and not a copy of secret.yaml.
+      authorization:
+        type: Bearer
+        credentials:
+          name: hestan
+          key: HESTAN_TOKEN
