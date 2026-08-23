@@ -29,4 +29,5 @@
 - [http api](http-api.md): every endpoint, parameter, response shape, and error code.
 - [storage](storage.md): the two backends and how to choose, the schema, migrations, and crash recovery.
 - [embedding](embedding.md): `serve` vs `run_once` vs `Runner`, testing, consuming from another repo.
+- [stability](stability.md): what a caller may rely on while hestan is 0.x, the five surfaces and what each holds still, which types are a closed set and which will grow, the extension points that are contracts, and what is deliberately not a surface at all.
 - [development](development.md): repo layout, quality gates, the ui build loop, adding a migration.

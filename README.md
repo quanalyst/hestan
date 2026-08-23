@@ -452,7 +452,7 @@ the details live in [docs/](docs/README.md):
 [authentication](docs/auth.md),
 [the http api](docs/http-api.md), [storage](docs/storage.md),
 [scaling](docs/scaling.md), [containers](docs/containers.md),
-[embedding](docs/embedding.md), and
+[embedding](docs/embedding.md), [stability](docs/stability.md), and
 [development](docs/development.md).
 release notes are in [CHANGELOG.md](CHANGELOG.md).
 
@@ -481,3 +481,9 @@ should get to decline:
 | `http` | `HttpSource` and the [notification](docs/notifications.md) helpers ([http sources](docs/http-sources.md)) |
 | `parquet` | `ParquetIo`, op outputs stored as parquet files ([io managers](docs/io-managers.md)) |
 | `dbt` | `hestan::dbt`, a dbt project's models as assets ([dbt](docs/dbt.md)) |
+
+it is a `0.1.0-beta`, so a break is possible and arrives announced: the first
+line of a changelog entry names every type that moved and what to write
+instead. [stability](docs/stability.md) is which types are a closed set,
+which will grow and want a `_` arm, and which of the traits here are
+contracts because somebody implements them.

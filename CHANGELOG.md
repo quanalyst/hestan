@@ -60,19 +60,18 @@ if it cannot match exhaustively.
 
 - **the public structs were looked at and deliberately left alone.** thirty-one
   of them have public fields, so adding a field to one is a source break for
-  anybody writing a struct literal. twenty-seven are things hestan hands you
+  anybody writing a struct literal. twenty-eight are things hestan hands you
   (`Run`, `Event`, `OpRun`, `Materialization`, the hook payloads, the rest of
-  the store's rows) and a caller only reads them; `IoKey` is handed to an
-  `IoManager` rather than built by one. the three a caller does build are
+  the store's rows, and `IoKey`, which an `IoManager` receives rather than
+  builds) and a caller only reads them. the three a caller does build are
   `EventQuery`, `RunRequest` and `Identity`, and each already has a way in that
   a new field does not break: `EventQuery` derives `Default`, so
   `EventQuery { level: Some(EventLevel::Error), ..Default::default() }`, and
   the other two have constructors. `#[non_exhaustive]` on a struct blocks the
-  struct literal outright,
-  functional update syntax included, so putting it on the row types would leave
-  anybody with a legitimate reason to build one, a test fixture or a fake
-  store, with no way to build it at all. that wants constructors first and it
-  is not this phase.
+  struct literal outright, functional update syntax included, so putting it on
+  the row types would leave anybody with a legitimate reason to build one, a
+  test fixture or a fake store, with no way to build it at all. that wants
+  constructors first, and it is not this phase.
 - **`tests/stability.rs`** matches every one of the seventeen closed sets with
   no `_` arm. it is an integration test on purpose: `#[non_exhaustive]` does
   not restrict the crate that defines the type, so the same matches inside
@@ -80,6 +79,19 @@ if it cannot match exhaustively.
 - **`Trigger`'s rustdoc carries a `compile_fail` doc example**, the exhaustive
   match that no longer builds, beside the one that does. `cargo test` runs
   both.
+- **`docs/stability.md`** is the rest of the answer, and the part that was
+  missing rather than wrong: the five surfaces and what each holds still,
+  the closed sets beside the ones that will grow, the structs that are read
+  rather than built, the extension points that are contracts because
+  somebody implements them (`IoManager` first, with `drop_run` as the worked
+  case), and the list of things that are deliberately not a surface at all:
+  the module paths inside the crate, the wording of an error, the ui's html
+  and urls, the sql, and every tuning number. linked from the readme, the
+  docs index and `lib.rs`.
+- **two more cases in `tests/stability.rs`**, because a stability claim
+  nothing checks is a comment: `src/` is read back so a public enum cannot
+  land with nothing recorded about it, and the nine exit codes are read out
+  of `docs/cli.md` and asserted against the `Exit` variants.
 
 a process asked to stop stops, and hands back what it was holding.
 

@@ -298,6 +298,13 @@ as `EventKind::Unknown("…")` carrying the stored word, rather than failing the
 query and taking the rest of the page with it. the same is true of
 `subject_kind`.
 
+`EventKind` and `SubjectKind` are also `#[non_exhaustive]`, which is the
+same promise made to the compiler: a build against a newer hestan needs a
+`_` arm rather than one new arm per kind. the two mechanisms cover
+different halves of one problem, `Unknown` for a row this build reads and
+the attribute for a build against a hestan that has grown, and
+[stability](stability.md) says which is which.
+
 ## Asking
 
 `GET /api/events` is the whole log, newest first.

@@ -64,6 +64,13 @@ somebody stopped is not a run that broke), so a cron line that pages on 1 and
 each code has a case of its own in `tests/cli.rs`, which runs the real binary
 and reads what it exited with.
 
+`Exit` is deliberately **not** `#[non_exhaustive]`, unlike most of the enums
+hestan exposes: the table above is what a cron line matches on, so the type
+stays matchable with no `_` arm and a tenth code would owe you a compile
+error rather than appearing quietly. `tests/stability.rs` reads these nine
+numbers back out of this file and asserts them against the variants, so the
+table and the type cannot drift apart. see [stability](stability.md).
+
 ## The output contract
 
 **stdout belongs to the answer.** under `--json` or `--quiet` nothing else may

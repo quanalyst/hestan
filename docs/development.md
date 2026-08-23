@@ -39,10 +39,10 @@ ui/             react + vite app; ui/dist is committed and embedded
 examples/       demo.rs and assets.rs (both mount the cli, so both need
                 --features cli), http_source.rs (needs --features http)
 tests/          pipeline.rs, assets.rs, isolation.rs, queue.rs, auth.rs,
-                stopping.rs, docs.rs; http_source.rs and notify.rs (need the
-                http feature); capture.rs (needs capture); otel.rs (needs otel);
-                cli.rs (needs cli); parquet.rs (needs parquet); dbt.rs
-                (needs dbt), over the fixture manifest in
+                stopping.rs, docs.rs, stability.rs; http_source.rs and
+                notify.rs (need the http feature); capture.rs (needs capture);
+                otel.rs (needs otel); cli.rs (needs cli); parquet.rs (needs
+                parquet); dbt.rs (needs dbt), over the fixture manifest in
                 tests/fixtures/dbt/
 ```
 
@@ -219,6 +219,14 @@ streams and reads what it exited with, so each documented exit code is asserted
 against a real process rather than against a return value. the conditions
 `doctor` reports are constructed and asserted in `src/cli.rs` instead, where a
 bad timezone or a claim past its lease can be written straight into a store.
+
+`tests/stability.rs` is the [stability](stability.md) page's claims as cases,
+and it is an integration test for the reason that is the whole point of it:
+`#[non_exhaustive]` does not restrict the crate that defines the type, so the
+same matches written in `src/` would compile either way and prove nothing.
+out here the seventeen closed sets are matched with no `_` arm, `src/` is
+read back so a public enum cannot land with no decision recorded about it,
+and `cli.md`'s nine exit codes are asserted against the `Exit` variants.
 
 `tests/capture.rs` is the [capture layer](logs.md) against a real subscriber,
 and it is a binary of its own for a reason worth knowing: `tracing` caches a

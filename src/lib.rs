@@ -42,6 +42,16 @@
 //! - [`Store`] is the run log, readable on its own: a report, an export, a
 //!   test that asserts what a run did.
 //!
+//! # What you may rely on
+//!
+//! `docs/stability.md` is the whole of it: which surfaces are versioned,
+//! which types are a closed set and which will grow, and which of the
+//! traits here are contracts because somebody implements them. the line a
+//! caller meets first is that an enum carrying `#[non_exhaustive]` will
+//! gain variants and wants a `_` arm, while one without it, [`RunStatus`]
+//! and the cli's exit codes being the two that hold most still, has been
+//! promised not to.
+//!
 //! # Features
 //!
 //! everything below is off by default, and each one is a dependency somebody

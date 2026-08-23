@@ -42,6 +42,11 @@ without anything reading the value having to guess.
 | `AssetRef(String)` | `{"asset": "orders"}` | a link to that asset |
 | `Saved(Sample)` | `{"saved": {…}}` | whatever it wraps, marked as a sample |
 
+that table grows: it gained `Series` and `Saved` already. `Meta` is
+`#[non_exhaustive]` for that reason, so a `match` on it from outside hestan
+wants a `_` arm, and rendering whatever the value holds as text is the right
+thing for that arm to do. see [stability](stability.md).
+
 the obvious rust types convert on their own: `i64`, `i32`, `u32`, `f64`,
 `String`, `&str`, `std::time::Duration`, and `serde_json::Value` (which
 becomes `Meta::Json`). the rest are named outright, either as a variant or
