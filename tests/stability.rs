@@ -248,15 +248,26 @@ fn every_public_enum_is_either_marked_or_listed_here() {
     let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
     let mut found = 0usize;
     let mut undecided: Vec<String> = Vec::new();
-    for entry in std::fs::read_dir(&src).expect("src/") {
-        let path = entry.expect("a directory entry").path();
-        if path.extension().and_then(|e| e.to_str()) != Some("rs") {
-            continue;
+    // every `.rs` under `src/`, at any depth, because a scan of the top level
+    // only would let an enum in a subdirectory added later go undecided, and
+    // this test passing is the whole record that a decision was made
+    let mut queue = vec![src.clone()];
+    let mut files: Vec<std::path::PathBuf> = Vec::new();
+    while let Some(dir) = queue.pop() {
+        for entry in std::fs::read_dir(&dir).expect("a directory under src/") {
+            let path = entry.expect("a directory entry").path();
+            if path.is_dir() {
+                queue.push(path);
+            } else if path.extension().and_then(|e| e.to_str()) == Some("rs") {
+                files.push(path);
+            }
         }
+    }
+    for path in files {
         let text = std::fs::read_to_string(&path).expect("a source file");
         let lines: Vec<&str> = text.lines().collect();
         for (i, line) in lines.iter().enumerate() {
-            let Some(rest) = line.strip_prefix("pub enum ") else {
+            let Some(rest) = line.trim_start().strip_prefix("pub enum ") else {
                 continue;
             };
             let name = rest.split([' ', '<']).next().unwrap_or(rest);
@@ -264,8 +275,8 @@ fn every_public_enum_is_either_marked_or_listed_here() {
             let marked = lines[..i]
                 .iter()
                 .rev()
-                .take_while(|l| l.starts_with("#["))
-                .any(|l| *l == "#[non_exhaustive]");
+                .take_while(|l| l.trim_start().starts_with("#["))
+                .any(|l| l.trim() == "#[non_exhaustive]");
             if !marked && !CLOSED.contains(&name) {
                 undecided.push(format!("{}: {name}", path.display()));
             }
