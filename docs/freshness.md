@@ -89,8 +89,16 @@ Hestan::new()
 | --- | --- |
 | `kind` | `job` or `asset` |
 | `name` | the job or asset name |
+| `owner` | who to wake, from `JobBuilder::owner` or `Asset::owner`; `None` for one nobody claimed |
 | `late_by` | how far past the deadline, at the crossing |
 | `last_success` | the success the deadline was measured from |
+
+`owner` is what makes this an alert somebody can act on rather than a line
+naming an asset: it is filled in from the declaration when the crossing is
+recorded, so a hook reads it off the event. it is also **the only path an
+asset's owner reaches a hook by**, since an asset build runs under the internal
+`assets` job and a run event carries that job's owner. see
+[namespaces and owners](namespaces.md#it-reaches-the-alert).
 
 it fires **once per crossing**, not once per poll: a job late for a week pages
 once, not every minute. the last-notified state lives in the database
@@ -122,6 +130,8 @@ reads.
 - `GET /api/jobs` and `GET /api/assets`: `freshness: {status, late_by_secs,
   last_success}`, `null` when nothing was declared.
 - `GET /api/late`: everything currently late, in the same shape `on_late`
-  hands its hooks (jobs first, then assets, each by name).
+  hands its hooks (jobs first, then assets, each by name), each with the
+  [`owner`](namespaces.md#an-owner) of whatever went late and `null` where
+  nobody claimed it.
 - the ui tags late jobs and late assets with `late` (beside `overdue`, which
   is a different claim), and the jobs overview statline counts them.

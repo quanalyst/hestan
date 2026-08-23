@@ -24,6 +24,7 @@
 - [launching](launching.md): presets, params schemas, run tags, subset launches, and cloning a past run.
 - [the command line](cli.md): `hestan::cli::run` in your own binary, the mount, the three ways to reach a deployment, every command, the exit codes a cron line reads, the output contract, `doctor`, `explain` and dynamic completion.
 - [web ui](web-ui.md): a page-by-page tour of the embedded ui and how it draws status.
+- [namespaces and owners](namespaces.md): dividing one deployment between teams, how a namespace differs from an asset group, a token scoped to one, who owns a job or an asset, how that owner reaches a failure hook, and where the line is drawn on escalation.
 - [authentication](auth.md): the refusal that keeps an unguarded deployment off a public address, the two authenticators, the three roles endpoint by endpoint, where the ui keeps a token and what that does not protect against, the audit trail, and what this deliberately is not.
 - [scaling](scaling.md): the run queue, concurrency limits, priority, claims and leases, scheduler and worker roles, the compose example, and what several hosts needs.
 - [containers](containers.md): the image and what is in it, the compose stack of one scheduler and three workers, what a stop is worth next to a kill, what happened when the deciding process was cut off the network, and the kubernetes manifests nobody has applied to a cluster.

@@ -232,12 +232,44 @@ $ curl -XPOST -H "authorization: Bearer $CI" .../api/runs/019.../cancel
 run of job billing"}
 ```
 
-a scope is a list of jobs, a list of assets, or both, and **the list is the
+a scope is a list of jobs, a list of assets, a list of
+[namespaces](namespaces.md), or any of them together, and **the list is the
 whole of what may be touched**: `Scope::jobs(["deploy"])` may touch no asset,
 `Scope::assets(["orders"])` may launch no job, and
 `Scope::jobs(["etl"]).and_assets(["orders"])` may touch exactly those two. a
 scope naming something nothing matches may change nothing at all, which is the
 right way round for a thing whose job is to say no.
+
+### A namespace is the coarse half
+
+naming jobs one at a time is right for a ci token that launches one deploy and
+wrong for a token that stands for a team: eleven jobs today, twelve next week,
+and the token has to be edited for the twelfth. a
+[namespace](namespaces.md) is the coarser thing to name:
+
+```rust
+Identity::operator("finance-ci").scoped_to(Scope::namespaces(["finance"]))
+```
+
+that admits **every job and every asset declared in `finance`**, of either
+kind, including the one somebody adds next week. the refusal names the
+namespace the same way it names a job:
+
+```
+$ curl -XPOST -H "authorization: Bearer $FIN" .../api/jobs/payslips/runs
+{"error":"fin is scoped to namespace finance, and this changes job payslips"}
+```
+
+**a thing in no namespace is in nobody's.** an unnamespaced job is refused to a
+namespace-scoped token exactly as another team's job is: `None` is the absence
+of a namespace and not a namespace that everything falls into. and the
+namespace is read off the registry inside the same check, never off anything in
+the request, so it is no more widenable than the rest of a scope.
+
+the check itself did not move: it is the same function, called from the same
+guard, reading the same subject off the same matched route. what it gained is
+the namespace the subject is declared in, so the rule below covers a namespace
+without a second path to remember.
 
 ### An unscoped token is unaffected
 
@@ -476,11 +508,16 @@ deliberately, and none of these are coming later by accident:
   them already runs something that speaks them, and `Auth::custom` is how that
   thing's answer becomes hestan's.
 - **a scope is not a rule engine, and reads are not in it.** "ci may launch
-  `deploy`" is expressible; "ada may launch `orders_etl` between nine and five
-  if the last run failed" is not, and neither is "ci may not see
-  `payments_reconcile`". what a scope narrows is which job or asset a *change*
-  may name. the read half is [not a promise hestan
-  makes](#what-a-scope-does-to-a-read).
+  `deploy`" and "finance may drive its own namespace" are expressible; "ada may
+  launch `orders_etl` between nine and five if the last run failed" is not, and
+  neither is "ci may not see `payments_reconcile`". what a scope narrows is
+  which job, asset or namespace a *change* may name. the read half is [not a
+  promise hestan makes](#what-a-scope-does-to-a-read), and
+  `?namespace=` is a filter on a list rather than a second answer to it.
+- **a namespace is not a tenant.** it divides one deployment's declarations so
+  a token and a page can name a team's half of them. it is not a separate
+  database, a separate process, a separate queue or a confidentiality boundary,
+  and [namespaces and owners](namespaces.md) says so in the same words.
 - **there is no rate limiting and no lockout.** a token that leaks can be
   guessed at as fast as your network allows; the comparison is constant-time,
   which closes the timing oracle and nothing else. put something in front of
@@ -497,6 +534,7 @@ deliberately, and none of these are coming later by accident:
 | | |
 | --- | --- |
 | the refusal, the loopback rule, the constant-time comparison, `Scope` | `src/auth.rs` |
+| what a namespace is and what declares one | `src/whose.rs`, and [namespaces and owners](namespaces.md) |
 | the guard, the roles table, what a request is about, `whoami` | `src/server.rs` |
 | who did what, in the store | `src/store.rs` (schema v18: `runs.actor`, `events.actor`) |
 | the token, the prompt, and what it does not protect against | `ui/src/identity.ts` |

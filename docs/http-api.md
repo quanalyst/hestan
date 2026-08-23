@@ -108,27 +108,58 @@ ask *before* they hold anything to present:
   "identity": {
     "name": "ada",
     "role": "admin",
-    "scope": { "everything": true, "jobs": [], "assets": [] }
+    "scope": { "everything": true, "namespaces": [], "jobs": [], "assets": [] }
   }
 }
 ```
 
 `scope.everything` is an unscoped token, which is every token a deployment had
-before scopes existed; anything else lists what it may change.
+before scopes existed; anything else lists what it may change, by
+[namespace](namespaces.md), by job and by asset.
 `auth` is whether this deployment checks at all; `identity` is `null` when it
 does and does not recognize you, a 200, not a 401. the ui's own files
 (`/`, `/assets/…`) need no credential either, or the page that asks for one
 could not load.
 
+## Namespaces
+
+`?namespace=finance` narrows four list endpoints to one
+[namespace](namespaces.md):
+
+```
+GET /api/jobs?namespace=finance
+GET /api/assets?namespace=finance
+GET /api/schedules?namespace=finance
+GET /api/sensors?namespace=finance
+```
+
+one rule, applied to the array each handler already built, so narrowing means
+the same thing on all four. an **absent** parameter is every row, which is what
+every request made before this existed; an **empty** one is the same, since
+nothing is ever in the namespace `""` and a form posting a blank field is
+asking for everything rather than for nothing. a namespace nothing is declared
+in is an empty list rather than an unfiltered one.
+
+**this narrows a list and is not a permission.** a token that may read reads
+whatever it asks for, exactly as [auth.md](auth.md#what-a-scope-does-to-a-read)
+says. what a namespace *does* limit is a scoped token's writes, and that is
+`Scope::namespaces`, not this.
+
+every row of those four carries `namespace`, `null` where nothing was declared.
+
 ## Job summaries
 
 `GET /api/jobs` returns `{"jobs": [...]}`; `GET /api/jobs/{name}` returns one
-summary or a 404. the shape:
+summary or a 404. `?namespace=` on the list narrows it to one
+[namespace](namespaces.md); see [namespaces](#namespaces). the shape:
 
 ```json
 {
   "name": "orders_etl",
   "description": "pull orders, clean them, publish aggregates",
+  "namespace": "finance",
+  "owner": { "team": "data-platform", "person": "ada",
+             "contact": "#data-alerts", "escalates_to": "ops@example.com" },
   "ops": [
     {
       "name": "fetch_orders",
@@ -167,6 +198,12 @@ summary or a 404. the shape:
                  "last_success": "2026-08-07T12:30:02+00:00" }
 }
 ```
+
+`namespace` is which slice of the deployment this job was declared in, null in
+a deployment that declares none. `owner` is who to wake when a run of it fails,
+and every half of it is optional: a key nobody declared is **absent** rather
+than null or empty, and the whole object is null for a job nobody claimed. see
+[namespaces and owners](namespaces.md).
 
 `max_parallel` caps ops of this job (null for uncapped). `pools` lists the
 [concurrency pools](concepts.md#concurrency-pools) this job's ops draw from,
@@ -896,6 +933,7 @@ startup's sweep marks failed.
                 "upstream_ready": true, "says": "when stale, once upstream is ready",
                 "waiting": { "key": "2026-08-08", "for": "hourly_traffic[2026-08-08T23]",
                              "keys": 1 } },
+    "namespace": "finance", "owner": { "team": "finance", "contact": "#fin" },
     "op": "doc_stats", "partitions": null, "mappings": [],
     "fingerprint": "3bffef12...", "built_at": "2026-08-08T11:01:36Z",
     "run_id": "019fe109-...", "stale": true,
@@ -907,10 +945,18 @@ startup's sweep marks failed.
 ] }
 ```
 
-`group` is where the asset [belongs](assets.md#where-an-asset-belongs-and-where-it-came-from):
+`namespace` is whose slice of the deployment this asset is in, and `owner` is
+who to wake about it, on the same terms as a job's: declared, never derived,
+null where nothing was declared. `?namespace=` narrows the list; see
+[namespaces](#namespaces).
+
+`group` is what the asset is [labeled with](assets.md#group) on the graph:
 what it declared, else the part of its name before the first `/`, else null
-for an asset in no group at all. the fallback is applied here, so nothing
-reading this has to know the rule. `provenance` is where it came from: the
+for an asset in no group at all. **it is not the namespace**: a group clusters
+and colours a picture and falls back to the name, a namespace is a boundary and
+has no fallback. [namespaces and owners](namespaces.md) is the whole of that.
+the group fallback is applied here, so nothing reading this has to know the
+rule. `provenance` is where it came from: the
 source groups it descends from transitively, ordered by name, each with the
 hue that label is drawn in. a source's own origin is itself, an ungrouped
 source contributes its own name, and `[]` is a real answer meaning no source
@@ -1122,7 +1168,8 @@ sensors, then probes in asset topo order:
 
 ```json
 { "sensors": [
-  { "name": "marker_file", "every_secs": 5, "paused": false,
+  { "name": "marker_file", "namespace": "finance", "every_secs": 5,
+    "paused": false,
     "cursor": 1786186914014, "filter": null,
     "next_eval": "2026-08-08T11:02:11Z", "consecutive_failures": 0,
     "last_tick": { "id": 7, "sensor": "marker_file",
@@ -1135,6 +1182,9 @@ sensors, then probes in asset topo order:
     "last_tick": null }
 ] }
 ```
+
+`namespace` is what the sensor declared, and for a probe whatever its asset is
+in; null where nothing was declared. `?namespace=` narrows the list.
 
 `cursor` is whatever the sensor last committed (null before the first
 commit); for a run sensor it is the last terminal run it read, as
@@ -1173,12 +1223,18 @@ expression:
 
 ```json
 { "schedules": [
-  { "job": "orders_etl", "expr": "*/2 * * * *", "tz": "UTC",
+  { "job": "orders_etl", "namespace": "finance",
+    "expr": "*/2 * * * *", "tz": "UTC",
     "paused": false, "params": {"region": "eu"},
     "catchup": "all:24", "cursor": "2026-08-07T12:32:00Z",
     "next_fire": "2026-08-07T12:34:00+00:00" }
 ] }
 ```
+
+`namespace` is the **job's**: a schedule is a firing rule for exactly one job,
+so there is nothing for it to declare and no way for the two to disagree. it is
+null over `--db`, which opens a run log and holds no job definitions.
+`?namespace=` narrows the list.
 
 `params` is what every fire of that schedule launches with: `{}` unless the
 declaration set it with `schedule_with` / `schedule_tz_with`, and validated
@@ -1232,12 +1288,16 @@ group by name:
 
 ```json
 { "late": [
-  { "kind": "job", "name": "orders_etl", "late_by_secs": 1800,
-    "last_success": "2026-08-07T11:00:04Z" },
-  { "kind": "asset", "name": "report", "late_by_secs": 7200,
-    "last_success": "2026-08-07T09:31:00Z" }
+  { "kind": "job", "name": "orders_etl",
+    "owner": { "team": "data-platform", "contact": "#data-alerts" },
+    "late_by_secs": 1800, "last_success": "2026-08-07T11:00:04Z" },
+  { "kind": "asset", "name": "report", "owner": null,
+    "late_by_secs": 7200, "last_success": "2026-08-07T09:31:00Z" }
 ] }
 ```
+
+`owner` is who to wake about whatever went late, and null for one nobody
+claimed.
 
 this is the same shape an `on_late` hook receives, computed the same way at
 the same moment, so the alert and the list cannot disagree. something that has

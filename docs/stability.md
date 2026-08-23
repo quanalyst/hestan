@@ -88,7 +88,14 @@ none of the thirty-one is `#[non_exhaustive]`, on purpose. on a struct that
 attribute blocks the literal outright, functional update syntax included, so
 putting it on the row types would leave anybody with a good reason to build one
 (a test fixture, a fake store) with no way to do it. that wants constructors
-first, and they do not exist yet.
+first.
+
+[`Owner`](namespaces.md#an-owner) is the first one built that way, and it is
+the pattern for the ones after it: **public struct, private fields,
+constructors and accessors**. it is a thing callers build (`Owner::team("x")
+.contact("#y")`) and a thing hestan hands back on a hook payload, and it is
+expected to grow, so a literal of it was never offered. it is not counted in
+the thirty-one, and adding a field to it will not break anybody.
 
 ## The extension points
 
@@ -99,7 +106,7 @@ because adding a required method to it breaks every implementation that exists.
 | --- | --- | --- |
 | [`IoManager`](io-managers.md) | yes | a new required method is a break, taken deliberately or not at all |
 | [`Sensor`](sensors.md)'s closure, and the `RunRequest` it returns | yes | the closure signature and the request's shape hold still |
-| the [notification hooks](notifications.md): `on_run_finished`, `on_op_finished`, `on_failure`, `on_late` | yes | the callback shapes hold; the payload structs gain fields |
+| the [notification hooks](notifications.md): `on_run_finished`, `on_op_finished`, `on_failure`, `on_late` | yes | the callback shapes hold; the payload structs gain fields (`owner` was one) |
 | [`notify::Alert`](notifications.md) | yes | `Serialize` plus a one-line `summary`, and it stays that |
 | `Auth::custom`, and the `Request` it is handed | yes | the accessors hold; `Auth` itself will gain variants |
 | a [resource](resources.md), by its concrete type | yes | `ctx.resource::<T>()` finds what was declared under `T` and nothing else |

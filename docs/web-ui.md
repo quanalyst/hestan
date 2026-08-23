@@ -75,6 +75,13 @@ opens the run under the cursor) to brush a time range: a selection panel
 lists every run that overlaps it. escape, clicking elsewhere, or "clear"
 dismisses it.
 
+where anything declares a [namespace](namespaces.md) a `namespace` filter
+appears above the table: `all` plus one chip per namespace, in the url like
+every other filter, so one team's view of the overview is a link. it narrows
+the table and the timeline lanes together, and a count beside the heading says
+how much of the deployment is on screen. a deployment that declares no
+namespace gets no filter at all rather than a row of one useless chip.
+
 the jobs table shows each job's description, op count, schedule expressions
 (paused ones muted and tagged), a duration sparkline of its recent finished
 runs in the window (hatched bars are failures), and the last run's status
@@ -178,7 +185,7 @@ ways of drawing fewer:
   directions, out to 1, 2 or 3 hops. capped at 40 nodes, because a source with
   sixty dependents has a neighbourhood the size of the graph; past the cap the
   caption says to fold a group instead.
-- **fold.** the `fold` chips collapse a [group](assets.md#where-an-asset-belongs-and-where-it-came-from)
+- **fold.** the `fold` chips collapse a [group](assets.md#group)
   to a single node carrying its count, with the edges that crossed the group's
   boundary rewired to it and the ones inside it gone. the same chips fold the
   table's groups: one set of folded groups, two views of it.
@@ -200,7 +207,7 @@ separates four questions the engine answers with one word: `fresh`, `stale`,
 `never built` (which is the same verdict as stale, and a different thing to
 look at), and `failed check`, which cuts across the other three.
 
-rows are sectioned by the [group](assets.md#where-an-asset-belongs-and-where-it-came-from)
+rows are sectioned by the [group](assets.md#group)
 the api resolved: what the asset declared, else the part of its name before
 the first `/`, else none. `sales/orders` and `sales/returns` are one
 collapsible `sales` group, and where the name repeats the group as a prefix it
@@ -211,6 +218,12 @@ anywhere there is no grouping**; assets in none sort last under their own
 heading, or the first of them reads as the last row of the group above. a
 `group` filter beside the search narrows to one, exactly, and lives in the url
 with everything else.
+
+beside it, where anything declares one, a `namespace` filter. it is the other
+question, and one asset can answer the two differently: a group is what it is
+labeled with on this graph, a namespace is whose slice of the deployment it is
+in, and neither is derived from the other. [namespaces and
+owners](namespaces.md) says which to reach for.
 
 the columns are state (with the reason beside it), when it was last built, the
 run that built it, freshness where a policy is declared, partition coverage
@@ -238,7 +251,7 @@ whole sentence ("when stale, once upstream is ready · 2026-08-14 waiting for
 **everywhere else in this ui the palette is grey and shape carries state.**
 that is exactly what leaves colour free, and it stays free only while it means
 one thing: a hue here is where an asset [belongs or where it came
-from](assets.md#where-an-asset-belongs-and-where-it-came-from), and never how
+from](assets.md#group), and never how
 it is doing. the moment a hue meant "failed" the channel would be carrying two
 answers and neither reliably.
 
@@ -294,7 +307,11 @@ they appear in its dag and gantt as `check:{asset}:{check}` nodes.
 `/assets/sales/orders` rather than as an escape sequence. the header carries
 the kind, when it was last built (or how many of its partitions are fresh),
 the run that produced the current value as a link, the state glyph, and a
-build button.
+build button. where somebody declared one it also carries an `owner` line
+(`ada of finance (#fin-alerts)`, with the escalation contact after it) and a
+`namespace` line. **an asset nobody claimed has no owner line at all**, rather
+than a label with nothing after it: the difference between "nobody declared
+one" and "the name came back blank" is worth being able to see.
 
 ### Why it is stale
 
@@ -505,7 +522,10 @@ now": it is over, just not finished.
 ## Run page
 
 the header names the job (linked), the short run id, trigger, creation time,
-and duration. on a run that came from another there is also a link back to
+and duration, and under it, where the job declares one, who owns it: `owned by
+ada of data-platform (#data-alerts)`, with the escalation contact after it.
+that is the [job's](namespaces.md#an-owner) owner, read off the job this run is
+of; a job nobody claimed shows no line. on a run that came from another there is also a link back to
 it: "continues" on a resumed run and "replay of" on a
 [replayed](replay.md) one, which are opposite things and say so.
 next to the status sit the actions: clone at any point, cancel while the run is

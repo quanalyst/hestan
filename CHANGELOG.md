@@ -2,6 +2,185 @@
 
 ## unreleased
 
+a run failed at 3am and the log said which job, not whose. and two teams in one
+deployment shared one flat list of jobs, so a token that should reach one
+team's work had to name every job in it. two rows, and they belong together
+because both answer "whose is this".
+
+**a namespace divides a deployment.**
+
+```rust
+Job::builder("orders_etl").namespace("finance")
+Asset::source("orders").namespace("finance")
+Sensor::new("new_files", every, body).namespace("finance")
+```
+
+**the decision that had to be made first, in one sentence: a group labels the
+asset graph and hestan draws it; a namespace divides the deployment and hestan
+enforces it, and neither is derived from the other.** `docs/namespaces.md` is
+the whole of it and `docs/assets.md` agrees with it: the group section is
+retitled and its opening narrowed to what a group does, which is cluster the
+graph, colour it and name a source's origin. nothing about the group changed in
+code, and nothing about an existing graph changed.
+
+they were not merged, and two cases say why. **a source's group names the
+external system**, so `Asset::source("fx_rates").group("vendor")` is a vendor
+feed and not a team, and two teams reading one vendor is ordinary. and **a
+group falls back to the part of the name before the first `/`**, which is right
+for a colour and wrong for a boundary: what a token may touch would then be
+decided by a naming convention.
+
+**a schedule declares nothing: its namespace is its job's.** a schedule is a
+firing rule for exactly one job, named in its constructor, so there is nothing
+for it to decide and no way for the two to disagree. a sensor names no job
+until it fires and may name several, so it declares one; a probe sensor is in
+whatever namespace its asset is. all four kinds are in a namespace and two of
+the four are told rather than asked.
+
+**declared, never parsed out of a name**, for the reason phase 40 established:
+the name is the key in `runs.job`, in every materialization and in every api
+path, so renaming a job to regroup it starts its history over. a case registers
+a job, records a run, re-registers it with a namespace, and asserts the run is
+still there under the same key.
+
+**a token scoped to a namespace is the point of having one.**
+
+```rust
+Identity::operator("finance-ci").scoped_to(Scope::namespaces(["finance"]))
+```
+
+every job and every asset declared in `finance`, including the one somebody
+adds next week, without the token naming any of them.
+
+```json
+{"error": "fin is scoped to namespace finance, and this changes job payslips"}
+```
+
+**it extends phase 47's one enforcement point rather than adding a second.**
+`out_of_scope` is still the only place a scope is ruled on, still called from
+`guard` before any handler, and still reads the subject off the matched route.
+what changed is that `may_touch_job` and `may_touch_asset` take the namespace
+the thing is declared in, resolved from the registry inside that same function.
+a mutation added tomorrow lands on the namespace rule the way it already lands
+on the job rule. **a thing in no namespace is in nobody's**: a namespace-scoped
+token is refused an unnamespaced job exactly as it is refused another team's.
+
+`?namespace=finance` narrows `GET /api/jobs`, `/api/assets`, `/api/schedules`
+and `/api/sensors`. an absent parameter is every row; an empty one is the same,
+since nothing is ever in the namespace `""`. **it narrows a list and is not a
+permission**: reads are still not scoped, exactly as `docs/auth.md` says. the
+ui keeps it in the url like every other filter, and `hestan assets --namespace`
+sits beside the `--group` that was already there.
+
+**a job and an asset say who owns them.**
+
+```rust
+Job::builder("orders_etl").owner(
+    Owner::team("data-platform")
+        .person("ada")
+        .contact("#data-alerts")
+        .escalates_to("ops@example.com"),
+)
+```
+
+a team, a person, or both, plus how to reach them. that is the whole shape:
+**hestan carries this and hands it to a hook. it is not a directory service**
+and it never parses, resolves or dials one of these strings.
+
+**it reaches the alert without the caller threading it through**, which is the
+difference between this and a field on a struct. the executor reads the owner
+off the declaration at the one place a run's terminal event is built, so
+`RunEvent::owner` and `RunFailure::owner` are already there when a hook is
+called:
+
+```rust
+Hestan::new().on_failure(|f: RunFailure| {
+    page(f.owner.and_then(|o| o.contact_at().map(str::to_string)))
+})
+```
+
+a case registers a plain closure over the event, before the job is looked at,
+and asserts it is handed the team, the person, the contact and the escalation
+contact. the built-in slack line ends `, owned by data-platform
+(#data-alerts)`; one about something nobody claimed ends where it always did,
+and a case asserts the webhook body has no `owner` key at all then. durable
+delivery carries it in the notification row, and a row written by an older
+hestan reads back as an event with no owner rather than a payload that will not
+parse.
+
+`LateEvent::owner` is the other half, and it is how an **asset's** owner
+reaches a hook. **the limit, plainly: an asset build's run event carries the
+internal `assets` job's owner and not the asset's.** one run can build several
+assets with several owners and picking one would be a guess. an asset's own
+owner reaches a hook through `on_late` and a person through the api, the ui and
+the command line.
+
+**escalation is a second contact and hestan does nothing with it.** it does not
+wait, time anything, ask whether the first contact answered, take an
+acknowledgement, repeat, or know about a rotation or a shift. that line is
+drawn on purpose and written down rather than implied: an escalation *policy*
+with timers and acknowledgement is a paging product, and half of one inside an
+orchestrator would be the worst thing to ship, something that looks like it
+will keep trying and does not. the promise is exactly that the second contact
+reaches your hook beside the first.
+
+**an owner nobody declared is an absence everywhere**: `null` in the api, no
+line on the page, `-` in the cli column, and no key in a webhook body. never an
+empty string dressed as a name, and there is a case on each surface.
+
+```
+$ orders owner margin
+WHAT   NAME    OWNER           CONTACT      ESCALATES TO
+asset  margin  ada of finance  #fin-alerts  ops@example.com
+```
+
+**what an existing deployment sees change:**
+
+- **nothing behaves differently until something declares one.** no schema
+  version, no migration, no new column, no new route, and a deployment that
+  declares no namespace and no owner answers every request the way it did.
+  there are cases on both halves asserting that rather than assuming it.
+- **the responses are not byte for byte.** `namespace` and `owner` are new keys
+  on `GET /api/jobs` and `GET /api/assets`, `namespace` on `/api/schedules` and
+  `/api/sensors`, `owner` on `/api/late`, each `null` where nothing was
+  declared. a client reading keys by name is unaffected; one comparing whole
+  documents is not.
+- **BREAKING, source only: `Scope::may_touch_job` and `Scope::may_touch_asset`
+  take a second argument**, the namespace the thing is declared in. it is a
+  compile error rather than a behaviour change, and `None` is exactly what
+  those calls meant before. the whole scope surface otherwise stands.
+- **BREAKING, source only: `RunEvent`, `RunFailure` and `LateEvent` gain an
+  `owner` field**, which breaks a struct literal of one. `docs/stability.md`
+  has always said these are things hestan hands you and that they gain fields.
+- **`Owner` has private fields and constructors**, unlike the row types, which
+  is the pattern `docs/stability.md` said it wanted for a struct a caller
+  builds and did not have an example of until now.
+- **a schedule's namespace over `--db` is null.** a run log holds no job
+  definitions and a schedule's namespace is its job's, so the mode that cannot
+  see the registry reports it as unknown rather than guessing. every other mode
+  answers it.
+- **the ui shows what was declared and hides what was not**: a namespace filter
+  only where something declared one, an owner line only where somebody is
+  named. it does not act on a namespace any more than it acts on a scope.
+
+- **`docs/namespaces.md`** is the new page: the one-sentence rule, why a group
+  and a namespace were not merged, how a scope composes with one, what reaches
+  a hook, and where the escalation line is. `docs/auth.md` gains
+  `Scope::namespaces`, `docs/notifications.md` and `docs/freshness.md` gain the
+  owner on each payload, `docs/assets.md` narrows the group paragraph,
+  `docs/http-api.md` gains the field and the parameter, `docs/cli.md` gains
+  `owner`, and `docs/stability.md` records the `Owner` decision.
+- **cases**: a namespace over all four kinds; a scope naming one admitting its
+  jobs and assets and refusing another's, an unnamespaced job's, and the
+  deployment's; a job's history surviving the declaration; the filter in the
+  url on the api and in the ui; a build refusing a namespace nothing could name
+  again; a group and a namespace disagreeing on one asset on purpose; a failure
+  hook handed the owner it was never given; the slack line with an owner and
+  without; a late crossing carrying the asset's own owner; an old notification
+  row delivering; the job and asset payloads; and `hestan owner` answering for
+  a job, an asset, something nobody claimed, and a name nothing is registered
+  under.
+
 a deploy token passed as a param used to be written to `runs.params`, shown on
 the run page, returned by `GET /api/runs` and kept until retention pruned it.
 and a token that could launch a deploy could also cancel production runs,

@@ -124,14 +124,23 @@ stage one of its own. plain `ctx.meta` describes the computation, so it lands
 on the op run; for an op producing one asset it lands on the materialization
 too, exactly as it always has.
 
-names live in one namespace inside the lowered job, so a multi-asset called
-after an existing asset is a build error, as are two multi-assets with one
-name, one that produces nothing, and two claiming the same output.
+ops and assets share one set of names inside the lowered job, so a multi-asset
+called after an existing asset is a build error, as are two multi-assets with
+one name, one that produces nothing, and two claiming the same output.
 
-## Where an asset belongs, and where it came from
+## Group, origin and namespace
 
-two questions about one asset, and they are not the same question. **group**
-is where it belongs. **origin** is where it came from.
+three questions about one asset, and they are three questions rather than one
+worded three ways. **group** is what it is labeled with on the graph.
+**origin** is where its data came from. **namespace** is whose slice of the
+deployment it is in.
+
+**a group labels the asset graph and hestan draws it; a namespace divides the
+deployment and hestan enforces it, and neither is derived from the other.**
+that is the whole of the relationship: if you are dividing a picture, reach for
+a group; if you are dividing a deployment, reach for a namespace.
+[namespaces and owners](namespaces.md) is the page for the second one, and
+everything below is the first.
 
 ### Group
 
@@ -167,6 +176,13 @@ asset and the group:
 
 a source's group names the **external system** the data stands for, which is
 what makes `orders` and `returns` above one thing downstream rather than two.
+
+that is also the clearest reason a group is not a tenancy boundary: `vendor` is
+a feed, not a team, and two teams reading one vendor is ordinary. neither is
+the fallback: an asset called `finance/orders` is in group `finance` without
+anybody declaring anything, which is right for a colour and wrong for anything
+that decides who may touch what. a [namespace](namespaces.md) is declared, has
+no fallback, and is the thing an api filter and a token's scope read.
 
 ### Origin
 
@@ -220,6 +236,27 @@ and shape carries state, which is exactly what leaves colour free; the moment
 a hue meant "failed" the channel would be carrying two things. and colour is
 never the only carrier: every group and origin name is written on the same
 screen as the hue that stands for it. `docs/web-ui.md` is where that is drawn.
+
+### Namespace, and who owns it
+
+```rust
+Asset::source("orders")
+    .group("warehouse")
+    .namespace("finance")
+    .owner(Owner::team("finance-data").contact("#fin-alerts"))
+```
+
+an asset that came from the warehouse, belongs to finance, and wakes
+`#fin-alerts`. the namespace is what an api filter and a token's
+[scope](auth.md#a-namespace-is-the-coarse-half) narrow by, and the owner is on
+`GET /api/assets`, on the asset's page, on `hestan owner <name>`, and on the
+[`LateEvent`](freshness.md) a declared `fresh_within` fires. a
+[`MultiAsset`](#one-op-several-assets) declares both once for everything it
+produces, since it produces names rather than `Asset` values.
+
+**neither is a group, and no group is either of them.** the whole of that
+decision, why they were not merged, how an owner reaches a hook and where the
+line is drawn on escalation is [namespaces and owners](namespaces.md).
 
 ## Fingerprints
 

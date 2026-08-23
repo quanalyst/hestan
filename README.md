@@ -412,6 +412,15 @@ standalone binary for those two. [docs/cli.md](docs/cli.md).
   and is a stranger everywhere else, enforced in one place so a route added
   later is covered by the rule rather than by a list. see
   [docs/auth.md](docs/auth.md)
+- **a namespace divides one deployment between teams, and a job or an asset
+  says who owns it**: `Job::builder("etl").namespace("finance").owner(
+  Owner::team("data-platform").contact("#data-alerts"))`, and a token scoped to
+  `finance` reaches every job and asset in it without naming any of them. the
+  owner is on the event a failure hook is handed, so an alert says who to wake
+  without the caller threading a recipient through. a namespace is not an asset
+  group: a group labels the graph and hestan draws it, a namespace divides the
+  deployment and hestan enforces it. see
+  [docs/namespaces.md](docs/namespaces.md)
 - **a param an op declares secret does not reach the store**:
   `Op::secret_params(["token"])` puts `[hestan:redacted]` in `runs.params`,
   `schedules.params` and `presets.params` while the ops still read the value,
@@ -467,6 +476,7 @@ the details live in [docs/](docs/README.md):
 [launching](docs/launching.md),
 [the web ui](docs/web-ui.md),
 [the command line](docs/cli.md),
+[namespaces and owners](docs/namespaces.md),
 [authentication](docs/auth.md),
 [the http api](docs/http-api.md), [metrics](docs/metrics.md),
 [storage](docs/storage.md),

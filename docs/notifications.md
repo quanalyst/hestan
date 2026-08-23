@@ -26,6 +26,7 @@ one is caught and logged as a warning without touching the others. driving
 | --- | --- |
 | `run_id` | the run |
 | `job` | its job name |
+| `owner` | who to wake about that job, from `JobBuilder::owner`; `None` for a job nobody claimed |
 | `status` | `success`, `failed` or `canceled` |
 | `trigger` | why the run existed: `manual`, `schedule`, `retry`, `resume`, `replay`, `build`, or `sensor` |
 | `failed_op` | the first op that exhausted its attempts; `None` unless one did |
@@ -42,6 +43,40 @@ the run row itself carries the same thing: `run.error` is
 `op {failed_op} failed: {error}`, so an alert that only ever sees a run
 (from `GET /api/runs/{id}`, or straight out of the store) is not left
 guessing why it failed.
+
+### The owner reaches the hook
+
+`owner` is the field that answers "who do I wake", and it is on the event
+rather than something the caller passes in:
+
+```rust
+Hestan::new()
+    .job(Job::builder("orders_etl")
+        .owner(Owner::team("data-platform").contact("#data-alerts"))
+        .op(pull)
+        .build()?)
+    // nothing threaded an owner through this closure: it is on what it is handed
+    .on_failure(|f: RunFailure| page(f.owner.as_ref().and_then(Owner::contact_at)))
+```
+
+the executor reads it off the job's declaration at the one place a terminal
+event is built, so every hook, the durable delivery loop and the built-in
+notifiers get the same answer without any of them looking anything up. a job
+nobody claimed is `None`, and `None` renders as an absence rather than as an
+empty name.
+
+durable delivery writes the owner into the notification row with the rest of
+the event, so the process that finally delivers does not need to be holding the
+registry the run was launched from. a row written by an older hestan has no
+`owner` key and reads back as an event with no owner.
+
+**the limit, plainly**: an asset build runs under one internal `assets` job, so
+its run event carries that job's owner and not the asset's. one run can build
+several assets with several owners and picking one would be a guess. an asset's
+own owner reaches a hook through `on_late`, below.
+
+what an `Owner` is, and what escalation deliberately is not, is on
+[namespaces and owners](namespaces.md#an-owner).
 
 ## OpEvent
 
@@ -100,8 +135,8 @@ is not going anywhere:
 Hestan::new().on_failure(|f: RunFailure| eprintln!("{} failed at {:?}", f.job, f.failed_op))
 ```
 
-it receives a `RunFailure` (`run_id`, `job`, `trigger`, `failed_op`, `error`,
-`finished_at`), which is what it always received. it is the same dispatch with
+it receives a `RunFailure` (`run_id`, `job`, `owner`, `trigger`, `failed_op`,
+`error`, `finished_at`), which is what it always received plus the owner. it is the same dispatch with
 a filter on it rather than a mechanism beside it, so there is one place an
 event can go missing from rather than two.
 
@@ -134,8 +169,14 @@ Hestan::new()
 | --- | --- |
 | `kind` | `job` or `asset` |
 | `name` | the job or asset name |
+| `owner` | who to wake about it, from `JobBuilder::owner` or `Asset::owner`; `None` for one nobody claimed |
 | `late_by` | how far past the policy's deadline, at the crossing |
 | `last_success` | the success the deadline was measured from |
+
+**this is the path an asset's owner reaches a hook by.** a run event carries
+the owner of the job the run was of, and an asset build runs under the internal
+`assets` job; a crossing into late is about the asset itself, so it carries the
+asset's own owner.
 
 the dispatch is the same one the others use (one blocking task per hook,
 panics caught and logged), and the difference that matters is *when*: a run
@@ -170,6 +211,11 @@ incoming-webhook shape `{"text": <one-line summary>}`:
 a run that succeeded does not read like an alarm, which is deliberate: a
 channel where the good news looks like the bad news is a channel people stop
 reading.
+
+a run line or a late line about something with a declared owner ends
+`, owned by ada of data-platform (#data-alerts)`; one about something nobody
+claimed ends where it always did, with nothing appended. the `webhook` body
+gains an `owner` object, and omits the key entirely when there is none.
 
 which event a helper is built for is inferred from the hook it is handed to;
 the trait behind that is `notify::Alert`, and implementing it on your own type
