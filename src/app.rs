@@ -11,6 +11,7 @@ use crate::asset::{
 };
 use crate::auth::{self, Auth};
 use crate::decider;
+use crate::deployment::Deployment;
 use crate::error::Error;
 use crate::executor::{self, Limits, Runner};
 use crate::freshness::{self, LateEvent, LateHook};
@@ -71,6 +72,9 @@ pub struct Hestan {
     io_default: Option<Arc<dyn IoManager>>,
     io_named: HashMap<String, Arc<dyn IoManager>>,
     db_path: String,
+    /// which installation this is and which build of the embedding application
+    /// it runs. declared or absent: hestan knows neither on its own.
+    deployment: Deployment,
     /// `None` is not "no authentication": it is nothing configured, which is
     /// what [`up`](Hestan::up) refuses to serve on a reachable address.
     auth: Option<Auth>,
@@ -121,6 +125,7 @@ impl Default for Hestan {
             io_default: None,
             io_named: HashMap::new(),
             db_path: "hestan.db".into(),
+            deployment: Deployment::default(),
             auth: None,
             hooks: Vec::new(),
             run_hooks: Vec::new(),
@@ -710,6 +715,34 @@ impl Hestan {
     #[cfg_attr(not(feature = "postgres"), doc = "[pg]: crate::Store")]
     pub fn db(mut self, target: impl Into<String>) -> Self {
         self.db_path = target.into();
+        self
+    }
+
+    /// which installation this is, and which build of your application it
+    /// runs.
+    ///
+    /// ```no_run
+    /// # use hestan::{Deployment, Hestan};
+    /// # fn f(app: Hestan) -> Hestan {
+    /// app.db("postgres://hestan@db/hestan").deployment(
+    ///     Deployment::new()
+    ///         .name("prod-eu")
+    ///         .build(std::env::var("APP_BUILD").unwrap_or_default()),
+    /// )
+    /// # }
+    /// ```
+    ///
+    /// beside [`db`](Self::db) because it is the same sort of statement: where
+    /// the run log is, and whose run log it is. both halves are optional and a
+    /// deployment that declares neither reads exactly as it always did.
+    ///
+    /// where it surfaces: `GET /api/health`, `hestan doctor` and the ui's
+    /// activity page, beside the compile-time facts hestan has without being
+    /// told: its own version, the schema version, the features compiled and
+    /// the platform. [`Deployment`] is where the difference between those and
+    /// your build is written down.
+    pub fn deployment(mut self, deployment: Deployment) -> Self {
+        self.deployment = deployment;
         self
     }
 
@@ -1401,6 +1434,7 @@ impl Hestan {
             role: self.role,
             auth: self.auth,
             db: self.db_path,
+            deployment: self.deployment,
         })
     }
 
@@ -1517,6 +1551,7 @@ impl Hestan {
         .with_rates(self.rates)?
         .with_hooks(self.run_hooks, self.op_hooks)
         .with_run_tags(self.run_tags)
+        .with_deployment(self.deployment)
         .with_limits(self.limits, self.priority)
         .with_reclaim(self.reclaim)
         .with_role(self.role, self.slots)
@@ -1581,6 +1616,9 @@ pub(crate) struct Inspected {
     pub(crate) auth: Option<Auth>,
     /// the path or url the store was opened at.
     pub(crate) db: String,
+    /// what this deployment says it is. `doctor` reports it beside the
+    /// compile-time facts, which is where the difference between the two shows.
+    pub(crate) deployment: Deployment,
 }
 
 pub(crate) struct Built {

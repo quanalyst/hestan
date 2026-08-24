@@ -66,6 +66,43 @@ spec:
           env:
             - name: HESTAN_ROLE
               value: scheduler
+            # which installation this is: from the namespace, a name the
+            # cluster already has and keeps in step with itself, so `prod` and
+            # `staging` tell themselves apart with nothing to maintain. a
+            # literal in the configmap is the alternative, and is what
+            # `docker-compose.yml` does
+            - name: HESTAN_DEPLOYMENT
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            # **which build of the application this pod runs, and the two ways
+            # it can get here.** UNVERIFIED like everything in this directory.
+            #
+            # hestan is a library compiled into your binary. it reads its own
+            # version, its schema version and the features it compiled, and it
+            # cannot read your git sha: something outside has to say it.
+            #
+            # 1. **baked into the image at build time**, which is what the
+            #    `Dockerfile` at the repository root does with `--build-arg
+            #    HESTAN_BUILD`, and what this file assumes: there is no
+            #    `HESTAN_BUILD` in this env list because the image already
+            #    carries it. the image and the answer cannot come apart, which
+            #    is the reason to prefer it.
+            # 2. **from the pod, through the downward api**, for an image that
+            #    is not yours to rebuild. uncomment the three lines below and
+            #    have kustomize or your release tool set the annotation on the
+            #    pod template per release. this says what the *deployment*
+            #    claims the build is, which is a weaker claim than the image's
+            #    own.
+            #
+            # **do not do both.** an env var here overrides the image's, so an
+            # unset annotation would replace a perfectly good baked-in sha with
+            # an empty string, which hestan reads as "nobody said".
+            #
+            # - name: HESTAN_BUILD
+            #   valueFrom:
+            #     fieldRef:
+            #       fieldPath: metadata.annotations['app.kubernetes.io/version']
           envFrom:
             - configMapRef:
                 name: hestan

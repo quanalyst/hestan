@@ -42,6 +42,7 @@ use serde_json::{Value, json};
 
 use crate::app::{Built, Hestan, Inspected};
 use crate::auth::Auth;
+use crate::deployment::Deployment;
 use crate::error::Error;
 use crate::executor::Runner;
 use crate::job::Job;
@@ -2698,6 +2699,17 @@ async fn doctor(reach: Reach, out: &Out) -> Result<(), Fail> {
 
     let mut findings = Vec::new();
     let mut unchecked: Vec<&str> = Vec::new();
+    // what it is, before what it is doing: the rest of this report is only
+    // ever about one deployment, and this is the line that says which
+    match &app {
+        Some(app) => findings.push(check_deployment(&app.deployment)),
+        None => unchecked.push(
+            "which deployment this is and which build it runs, which is declared in \
+             the deployment's own binary and is not in the database at all: the runs \
+             below carry the build that launched each of them",
+        ),
+    }
+    findings.push(check_hestan(app.is_some()));
     findings.push(Finding::ok(
         "store",
         format!(
@@ -3244,6 +3256,64 @@ fn check_retention(app: &Inspected) -> Vec<Finding> {
     )]
 }
 
+/// what this deployment says it is: a name and a build, or neither.
+///
+/// **the build is the half with the operational value**, because it is the one
+/// that joins "this started failing on Tuesday" to "we deployed on Tuesday",
+/// and it is also the one hestan cannot work out: it is a library compiled into
+/// somebody else's binary. so a deployment that declares none gets a note
+/// rather than a clean line, and one that declares one gets it quoted back.
+fn check_deployment(deployment: &Deployment) -> Finding {
+    match (deployment.called(), deployment.build_id()) {
+        (name, Some(build)) => Finding::ok(
+            "deployment",
+            match name {
+                Some(name) => format!("{name}, running build {build}"),
+                None => format!("unnamed, running build {build}"),
+            },
+        ),
+        (Some(name), None) => Finding::note(
+            "deployment",
+            format!("{name}, and it does not say which build it runs"),
+            "Hestan::deployment(Deployment::new().name(…).build(…)) with your git sha or \
+             image digest, and every run launched after it records that build",
+        ),
+        (None, None) => Finding::note(
+            "deployment",
+            "declares no name and no build, so its runs record no build either",
+            "Hestan::deployment(Deployment::new().name(…).build(…)) with your git sha or \
+             image digest. one process on one machine has nothing to tell apart and can \
+             leave this alone",
+        ),
+    }
+}
+
+/// the hestan compiled into whichever binary is running this command.
+///
+/// every part of it is a compile-time fact and none of it says anything about
+/// *your* application: `hestan doctor` run from the operator binary against
+/// somebody else's database reports the operator binary's hestan, which is why
+/// this line says which binary it is about.
+fn check_hestan(own: bool) -> Finding {
+    let whose = match own {
+        true => "this deployment's binary",
+        false => "this command's binary, which is not the deployment's",
+    };
+    let debug = match Deployment::debug_assertions() {
+        true => ", debug assertions on",
+        false => "",
+    };
+    Finding::ok(
+        "hestan",
+        format!(
+            "{} in {whose}, {}{debug}, features: {}",
+            Deployment::hestan_version(),
+            Deployment::platform(),
+            Deployment::features().join(" "),
+        ),
+    )
+}
+
 /// whether anything checks who is asking.
 ///
 /// not an error either way: a deployment on loopback is a deployment on one
@@ -3316,6 +3386,7 @@ async fn remote_doctor(api: &Api, out: &Out) -> Result<(), Fail> {
     }
     match api.get("/api/health").await {
         Ok(health) => {
+            findings.push(check_remote_deployment(&health));
             findings.push(check_remote_deciding(&health));
             findings.push(check_remote_store(&health));
         }
@@ -3356,6 +3427,33 @@ async fn remote_doctor(api: &Api, out: &Out) -> Result<(), Fail> {
     match wrong {
         true => Err(Fail::new(Exit::Actionable, "something above is actionable")),
         false => Ok(()),
+    }
+}
+
+/// what the process on the other end says it is.
+///
+/// the one finding here that is about somebody else's binary rather than about
+/// this one, which is exactly what makes it worth reading: `hestan` and
+/// `platform` describe the deployment being asked, not the command asking.
+fn check_remote_deployment(health: &Value) -> Finding {
+    let d = &health["deployment"];
+    let hestan = d["hestan"]["version"].as_str().unwrap_or("?");
+    let platform = d["hestan"]["platform"].as_str().unwrap_or("?");
+    let is = match (d["name"].as_str(), d["build"].as_str()) {
+        (Some(name), Some(build)) => format!("{name}, running build {build}"),
+        (Some(name), None) => format!("{name}, and it does not say which build it runs"),
+        (None, Some(build)) => format!("unnamed, running build {build}"),
+        (None, None) => "declares no name and no build".to_string(),
+    };
+    let says = format!("{is}; hestan {hestan} on {platform}");
+    match d["build"].as_str() {
+        Some(_) => Finding::ok("deployment", says),
+        None => Finding::note(
+            "deployment",
+            says,
+            "Hestan::deployment(Deployment::new().name(…).build(…)) in that deployment's \
+             own binary, and every run it launches after that records the build",
+        ),
     }
 }
 
@@ -4422,6 +4520,7 @@ mod tests {
             role: Role::All,
             auth: None,
             db: ":memory:".into(),
+            deployment: Deployment::default(),
         }
     }
 
@@ -4880,6 +4979,74 @@ mod tests {
         let held = check_held_values(&store).unwrap();
         assert_eq!(held.level, Level::Note);
         assert!(held.says.starts_with("1 run(s)"), "{}", held.says);
+    }
+
+    // the three identities, kept apart on the one report an operator reads
+    // when they are standing in front of a deployment
+    #[test]
+    fn doctor_says_which_deployment_this_is_and_which_build_it_runs() {
+        let declared = check_deployment(&Deployment::new().name("prod-eu").build("9f2c1ab"));
+        assert_eq!(declared.level, Level::Ok);
+        assert!(declared.says.contains("prod-eu"), "{}", declared.says);
+        assert!(declared.says.contains("9f2c1ab"), "{}", declared.says);
+
+        // the build is the half with the operational value, so a deployment
+        // that names itself and not its build still gets told
+        let unnamed = check_deployment(&Deployment::new().name("prod-eu"));
+        assert_eq!(unnamed.level, Level::Note);
+        assert!(unnamed.fix.unwrap().contains("Hestan::deployment"));
+
+        let nothing = check_deployment(&Deployment::new());
+        assert_eq!(nothing.level, Level::Note);
+        assert!(nothing.says.contains("no build"), "{}", nothing.says);
+        // and hestan's own version is never offered in its place
+        assert!(
+            !nothing.says.contains(Deployment::hestan_version()),
+            "{}",
+            nothing.says
+        );
+
+        // the compile-time half is a separate line, and it says whose binary
+        // it is about: `hestan doctor --db other.db` reports the operator
+        // binary's hestan and not the deployment's
+        let own = check_hestan(true);
+        assert_eq!(own.level, Level::Ok);
+        assert!(own.says.contains(Deployment::hestan_version()));
+        assert!(own.says.contains("deployment's binary"), "{}", own.says);
+        assert!(
+            check_hestan(false).says.contains("not the deployment's"),
+            "{}",
+            check_hestan(false).says
+        );
+    }
+
+    // what a doctor across the network reads off the health endpoint: the one
+    // finding on that report that is about somebody else's binary
+    #[test]
+    fn a_remote_doctor_says_which_build_the_process_it_asked_is_running() {
+        let health = |name: Value, build: Value| {
+            json!({
+                "deployment": {
+                    "name": name,
+                    "build": build,
+                    "hestan": { "version": "0.1.0-beta.3", "platform": "linux/aarch64" },
+                }
+            })
+        };
+        let declared = check_remote_deployment(&health(json!("prod-eu"), json!("9f2c1ab")));
+        assert_eq!(declared.level, Level::Ok);
+        assert!(declared.says.contains("prod-eu"), "{}", declared.says);
+        assert!(declared.says.contains("9f2c1ab"), "{}", declared.says);
+        // the remote's hestan, not this command's
+        assert!(declared.says.contains("0.1.0-beta.3"), "{}", declared.says);
+
+        let silent = check_remote_deployment(&health(Value::Null, Value::Null));
+        assert_eq!(silent.level, Level::Note);
+        assert!(
+            silent.says.contains("no name and no build"),
+            "{}",
+            silent.says
+        );
     }
 
     // the question to ask before giving a deployment an address: is anything

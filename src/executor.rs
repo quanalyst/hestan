@@ -11,6 +11,7 @@ use tokio::task::{Id, JoinHandle, JoinSet};
 use tracing::Instrument;
 
 use crate::decider::Deciding;
+use crate::deployment::Deployment;
 use crate::error::Error;
 use crate::graph;
 use crate::hooks::{FailureHook, Hooks, OpEvent, OpHook, RunEvent, RunHook, fire_hooks};
@@ -592,6 +593,12 @@ pub struct Runner {
     // tags every run this runner launches carries, under whatever the launch
     // itself said
     run_tags: Arc<RunTags>,
+    // which installation this is and which build of the embedding application
+    // it runs. the build is stamped on every run this handle launches, which is
+    // the whole reason it is here rather than only on the server's state: a run
+    // records the build in force when it was launched, and looking it up later
+    // would answer with whatever is deployed by then
+    deployment: Arc<Deployment>,
     // what this process claims runs as
     claimer: &'static str,
     // read at the top of every dispatch pass, so raising a limit takes effect
@@ -700,6 +707,7 @@ impl Runner {
             run_resources: Arc::new(Vec::new()),
             io: Io::default(),
             run_tags: Arc::new(RunTags::new()),
+            deployment: Arc::new(Deployment::default()),
             claimer: instance_id(),
             limits: Arc::new(Mutex::new(Limits::new())),
             priority: 0,
@@ -765,6 +773,25 @@ impl Runner {
             run_tags: Arc::new(tags),
             ..self
         }
+    }
+
+    /// what this deployment says it is: a name, and the build of the
+    /// application hestan is compiled into. `Hestan::deployment` is the way
+    /// in.
+    ///
+    /// every run launched through this runner from here on **records** the
+    /// build, so the run log answers "which code produced this" for itself
+    /// rather than by joining to whatever process happens to be reading it.
+    pub fn with_deployment(self, deployment: Deployment) -> Runner {
+        Runner {
+            deployment: Arc::new(deployment),
+            ..self
+        }
+    }
+
+    /// what this deployment says it is, for the endpoints that report it.
+    pub(crate) fn deployment(&self) -> &Deployment {
+        &self.deployment
     }
 
     /// what the dispatcher will not start past, and the queue position a launch

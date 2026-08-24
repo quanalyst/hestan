@@ -606,6 +606,13 @@ pub(crate) fn job_summary(
 /// tell which of three workers is executing the run you are looking at, and,
 /// pointed at each of them in turn, which one has gone quiet.
 ///
+/// **`deployment` is the answer to "what is this".** it has two halves and they
+/// are not the same kind of fact: `name` and `build` are what the deployment
+/// declared through [`Hestan::deployment`](crate::Hestan::deployment) and are
+/// null until it does, while everything under `hestan` is a compile-time fact
+/// about the library in this binary. hestan cannot see your build and says
+/// null rather than guessing.
+///
 /// **`ok` is false while the store is refusing writes**, because a control
 /// plane that reports health while run outcomes are going missing is the
 /// specific failure this endpoint exists to catch. a process in that state has
@@ -619,6 +626,7 @@ async fn health(State(st): State<AppState>) -> Json<Value> {
         "instance": st.runner.instance(),
         "holding": holding,
         "deciding": deciding(&st.runner),
+        "deployment": st.runner.deployment().describe(),
         "store": {
             // what the last write did, which is what decides whether this
             // process is claiming anything
@@ -2745,6 +2753,7 @@ async fn static_ui(method: Method, uri: Uri) -> Response {
 mod tests {
     use super::*;
     use crate::auth::Scope;
+    use crate::deployment::Deployment;
     use crate::model::{Run, RunStatus};
     use crate::op::{Meta, Op, OpCtx};
     use crate::schedule::Schedule;
@@ -7103,6 +7112,48 @@ mod tests {
         assert_eq!(body["ok"], false);
         assert_eq!(body["store"]["writing"], false);
         assert_eq!(body["store"]["unrecorded_writes"], 1);
+    }
+
+    // what a deployment that has declared nothing reports: the compile-time
+    // facts, and nulls where somebody would have had to tell hestan
+    #[tokio::test]
+    async fn health_reports_what_hestan_knows_and_no_more_until_it_is_told() {
+        let st = state(vec![]);
+        let (_, body, _) = request(router(st), Method::GET, "/api/health").await;
+        let d = body.unwrap()["deployment"].clone();
+        assert!(d["name"].is_null());
+        // and specifically not hestan's own version standing in for it, which
+        // would be a confident answer to a different question
+        assert!(d["build"].is_null());
+        assert_eq!(d["hestan"]["version"], env!("CARGO_PKG_VERSION"));
+        assert_eq!(d["hestan"]["schema"], crate::store::SCHEMA_VERSION);
+        assert_eq!(d["hestan"]["debug_assertions"], cfg!(debug_assertions));
+        assert_eq!(
+            d["hestan"]["platform"],
+            format!("{}/{}", std::env::consts::OS, std::env::consts::ARCH)
+        );
+        // the features this build actually compiled, and nothing it did not
+        let features = d["hestan"]["features"].as_array().unwrap().clone();
+        let has = |name: &str| features.iter().any(|f| f == name);
+        assert_eq!(has("postgres"), cfg!(feature = "postgres"));
+        assert_eq!(has("cli"), cfg!(feature = "cli"));
+        assert_eq!(has("parquet"), cfg!(feature = "parquet"));
+        assert_eq!(has("bundled"), cfg!(feature = "bundled"));
+    }
+
+    #[tokio::test]
+    async fn a_declared_name_and_build_reach_health() {
+        let mut st = state(vec![]);
+        st.runner = st
+            .runner
+            .with_deployment(Deployment::new().name("prod-eu").build("9f2c1ab"));
+        let (_, body, _) = request(router(st), Method::GET, "/api/health").await;
+        let d = body.unwrap()["deployment"].clone();
+        assert_eq!(d["name"], "prod-eu");
+        assert_eq!(d["build"], "9f2c1ab");
+        // still separate from hestan's own, which is the whole point of the
+        // two halves
+        assert_eq!(d["hestan"]["version"], env!("CARGO_PKG_VERSION"));
     }
 
     // ------------------------------------------------------------- the guard    // ------------------------------------------------------------- the guard

@@ -14,7 +14,13 @@
 
 services:
   spare:
-    build: .
+    # the same build arguments as the stack beside it: both definitions produce
+    # the image under one name, so a spare built without the sha would replace
+    # the one built with it
+    build:
+      context: .
+      args:
+        HESTAN_BUILD: ${HESTAN_BUILD:-}
     image: hestan-demo
     depends_on:
       db:
@@ -23,6 +29,7 @@ services:
     environment:
       HESTAN_DB: postgres://hestan:hestan@db:5432/hestan
       HESTAN_ADDR: 0.0.0.0:4000
+      HESTAN_DEPLOYMENT: compose-local
       HESTAN_TOKEN: demo-token-change-me
       HESTAN_MAX_CONCURRENT_RUNS: "4"
       HESTAN_WAREHOUSE: /var/lib/hestan/warehouse.db

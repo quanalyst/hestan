@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
 use hestan::prelude::*;
-use hestan::{Auth, Role};
+use hestan::{Auth, Deployment, Role};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -243,7 +243,19 @@ async fn main() -> Result<(), hestan::Error> {
         .schedule("warehouse_healthcheck", "*/5 * * * *")
         .max_concurrent_runs(env_num("HESTAN_MAX_CONCURRENT_RUNS").unwrap_or(4))
         .slots(env_num("HESTAN_SLOTS").unwrap_or(2))
-        .db(env("HESTAN_DB").unwrap_or_else(|| "demo.db".into()));
+        .db(env("HESTAN_DB").unwrap_or_else(|| "demo.db".into()))
+        // which installation this is and which build of *this binary* is in
+        // it. both from the environment, because both are facts the thing that
+        // built and deployed this container knows and the source does not: the
+        // compose file passes the build through as a build argument and the
+        // image carries it as an env var from then on. see
+        // docs/deployment.md. a laptop sets neither and gets nulls, which is
+        // the honest answer rather than a made-up one
+        .deployment(
+            Deployment::new()
+                .name(env("HESTAN_DEPLOYMENT").unwrap_or_default())
+                .build(env("HESTAN_BUILD").unwrap_or_default()),
+        );
 
     // the compose file binds 0.0.0.0 and publishes the port, which `serve`
     // refuses to do unguarded, so it sets a token, and this is where a

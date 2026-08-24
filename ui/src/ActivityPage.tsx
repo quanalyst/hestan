@@ -3,7 +3,7 @@ import { Link } from "react-router-dom";
 import { get } from "./api";
 import { token } from "./identity";
 import type { Dropped, FeedRow, Filters } from "./activity";
-import { decidingLine, kindLabel, linkFor, matches, merge, subjectOf } from "./activity";
+import { decidingLine, deploymentLine, kindLabel, linkFor, matches, merge, subjectOf } from "./activity";
 import type { EventLevel, Health, RunEvent } from "./types";
 import { clockTime, relTime, shortId } from "./util";
 
@@ -103,17 +103,20 @@ function GapRow({ gap }: { gap: Dropped }) {
   );
 }
 
-// who is deciding, said once, on the page somebody asking "why has nothing
-// fired" is already reading. a deployment may serve this ui from several
-// processes and exactly one of them decides, so which one is not a pedantic
-// distinction: it is the whole answer.
-function Deciding() {
-  const [says, setSays] = useState<string | null>(null);
+// what this deployment is and who is deciding, said once, on the page somebody
+// asking "why has nothing fired" is already reading.
+//
+// **once, and here.** which build is running is a fact about the deployment,
+// and a fact about the deployment repeated on a page about one run is noise on
+// that page. this is the log of what the deployment did, so it is where both
+// lines belong. one fetch serves both.
+function Whose() {
+  const [health, setHealth] = useState<Health | null>(null);
   useEffect(() => {
     let stopped = false;
     get<Health>("/api/health")
       .then((h) => {
-        if (!stopped) setSays(decidingLine(h));
+        if (!stopped) setHealth(h);
       })
       // a health endpoint that cannot be read says nothing here: every page
       // below reports a deployment that is not there, one failed fetch at a
@@ -123,8 +126,14 @@ function Deciding() {
       stopped = true;
     };
   }, []);
-  if (says === null) return null;
-  return <p className="act-deciding muted">deciding · {says}</p>;
+  if (health === null) return null;
+  const deciding = decidingLine(health);
+  return (
+    <>
+      <p className="act-deciding muted">{deploymentLine(health)}</p>
+      {deciding !== null && <p className="act-deciding muted">deciding · {deciding}</p>}
+    </>
+  );
 }
 
 export default function ActivityPage() {
@@ -222,7 +231,7 @@ export default function ActivityPage() {
         Activity
         <span className="secondary"> · {live ? "live" : "not following"}</span>
       </h1>
-      <Deciding />
+      <Whose />
       {feed.length === 0 ? (
         // a database nothing has happened in yet. no fake rows, and no bare
         // "no data": what to do about it is the useful half

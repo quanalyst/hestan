@@ -731,10 +731,35 @@ export interface Deciding {
   decides: boolean;
 }
 
+// what a deployment says it is, and what hestan knows about itself without
+// being told, off `GET /api/health`.
+//
+// the two halves are not the same kind of fact and are kept apart here for the
+// same reason they are kept apart on the wire. `name` and `build` are declared
+// by the deployment and are null until it declares them; everything under
+// `hestan` is a compile-time fact about the library, and none of it says
+// anything about the application hestan is compiled into.
+export interface DeploymentInfo {
+  // what this installation is called; null until somebody says
+  name: string | null;
+  // which build of the embedding application this is: a git sha, a tag, an
+  // image digest. null means hestan was not told, never "no build": hestan is
+  // a library inside somebody else's binary and cannot see it
+  build: string | null;
+  hestan: {
+    version: string;
+    schema: number;
+    features: string[];
+    platform: string;
+    debug_assertions: boolean;
+  };
+}
+
 export interface Health {
   ok: boolean;
   instance: string;
   holding: string[];
   // null when the process could not read its own lease
   deciding: Deciding | null;
+  deployment: DeploymentInfo;
 }

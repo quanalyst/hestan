@@ -89,6 +89,10 @@ pub mod auth;
 mod backfill;
 mod backoff;
 mod decider;
+// which installation this is and which build of the embedding application it
+// runs. private, because the only public type in it is re-exported at the root
+// like every other type hestan hands back
+mod deployment;
 // the tracing layer a host composes into its own subscriber. optional because
 // hestan installs no subscriber and will not make anyone depend on one. public
 // so that what it deliberately does not capture is written somewhere a reader
@@ -174,6 +178,7 @@ pub use capture::{CaptureLayer, capture_layer};
 #[cfg(feature = "dbt")]
 #[cfg_attr(docsrs, doc(cfg(feature = "dbt")))]
 pub use dbt::Dbt;
+pub use deployment::Deployment;
 pub use error::Error;
 pub use executor::{
     Blocked, CancelOutcome, Launch, Limits, Queued, ReplayPlan, ResumePlan, Runner,

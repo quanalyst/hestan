@@ -100,3 +100,58 @@ fn the_readme_lists_exactly_the_features_the_manifest_has() {
     );
     assert!(!declared.is_empty(), "no features found in Cargo.toml");
 }
+
+/// whether this build compiled `name`, decided here rather than read off the
+/// library, so that the two lists have to agree rather than one of them being
+/// both the claim and the check.
+///
+/// `None` is a feature this test has never heard of, which is what a feature
+/// added to `Cargo.toml` and nowhere else looks like from in here.
+fn compiled(name: &str) -> Option<bool> {
+    Some(match name {
+        "bundled" => cfg!(feature = "bundled"),
+        "capture" => cfg!(feature = "capture"),
+        "cli" => cfg!(feature = "cli"),
+        "dbt" => cfg!(feature = "dbt"),
+        "http" => cfg!(feature = "http"),
+        "otel" => cfg!(feature = "otel"),
+        "parquet" => cfg!(feature = "parquet"),
+        "postgres" => cfg!(feature = "postgres"),
+        _ => return None,
+    })
+}
+
+// `GET /api/health` and `hestan doctor` report which features a deployment
+// compiled, and a report that had drifted from the build would be worse than
+// no report: it is read by somebody asking why a deployment does not have a
+// thing it does have. so the manifest, the library and this file all have to
+// say the same words.
+#[test]
+fn the_feature_set_reported_is_the_feature_set_compiled() {
+    let declared = declared_features();
+    assert!(!declared.is_empty(), "no features found in Cargo.toml");
+    let reported: BTreeSet<String> = hestan::Deployment::features()
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+
+    // nothing is reported that is not a feature this crate has
+    let invented: Vec<&String> = reported.difference(&declared).collect();
+    assert!(
+        invented.is_empty(),
+        "reported but not declared: {invented:?}"
+    );
+
+    // and every declared feature is reported exactly when it was compiled,
+    // which is what makes this a check on the build rather than on a list
+    for name in &declared {
+        let on = compiled(name)
+            .unwrap_or_else(|| panic!("{name} is in Cargo.toml and unknown to this test"));
+        assert_eq!(
+            reported.contains(name),
+            on,
+            "{name}: compiled {on}, reported {}",
+            reported.contains(name)
+        );
+    }
+}

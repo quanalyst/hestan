@@ -4,7 +4,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import type { FeedRow } from "../src/activity";
-import { decidingLine, kindLabel, linkFor, matches, merge, subjectOf } from "../src/activity";
+import { decidingLine, deploymentLine, kindLabel, linkFor, matches, merge, subjectOf } from "../src/activity";
 import type { EventKind, EventLevel, Health, RunEvent, SubjectKind } from "../src/types";
 
 const ev = (
@@ -105,11 +105,23 @@ test("a kind reads without saying its subject twice", () => {
 
 // several processes may serve this ui and exactly one of them decides, so the
 // line has to say which one this is rather than only what is happening
-const health = (deciding: Health["deciding"]): Health => ({
+const hestan = {
+  version: "0.1.0-beta.3",
+  schema: 24,
+  features: ["bundled", "cli", "postgres"],
+  platform: "linux/aarch64",
+  debug_assertions: false,
+};
+
+const health = (
+  deciding: Health["deciding"],
+  deployment: Health["deployment"] = { name: null, build: null, hestan },
+): Health => ({
   ok: true,
   instance: "a1b2c3d4",
   holding: [],
   deciding,
+  deployment,
 });
 
 test("the deciding line says whether this is the process that decides", () => {
@@ -141,4 +153,21 @@ test("the deciding line says whether this is the process that decides", () => {
   // a process that could not read its own lease says nothing rather than
   // guessing
   assert.equal(decidingLine(health(null)), null);
+});
+
+test("the deployment line separates what was declared from what hestan knows", () => {
+  assert.equal(
+    deploymentLine(health(null, { name: "prod-eu", build: "9f2c1ab", hestan })),
+    "prod-eu · build 9f2c1ab · hestan 0.1.0-beta.3 on linux/aarch64",
+  );
+  // hestan's own version is never offered in place of the application's build:
+  // a deployment that declared none is told it declared none
+  const undeclared = deploymentLine(health(null));
+  assert.match(undeclared, /build not declared/);
+  assert.doesNotMatch(undeclared, /build 0\.1\.0/);
+  // and a build with no name still says the half that matters
+  assert.equal(
+    deploymentLine(health(null, { name: null, build: "9f2c1ab", hestan })),
+    "build 9f2c1ab · hestan 0.1.0-beta.3 on linux/aarch64",
+  );
 });

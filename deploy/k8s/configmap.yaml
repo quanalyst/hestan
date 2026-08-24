@@ -27,3 +27,7 @@ data:
   # is not shared and is not meant to be
   HESTAN_WAREHOUSE: "/var/lib/hestan/warehouse.db"
   RUST_LOG: "info"
+  # nothing here names the deployment or its build. the name comes from the
+  # namespace through the downward api (see `scheduler.yaml`), and the build is
+  # baked into the image by the Dockerfile, because a configmap shared by every
+  # release is the wrong place for a value that changes with each of them

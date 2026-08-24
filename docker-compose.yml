@@ -28,6 +28,10 @@ x-hestan-env: &hestan-env
   # `db` is the service name, which is a dns name on the compose network
   HESTAN_DB: postgres://hestan:hestan@db:5432/hestan
   HESTAN_ADDR: 0.0.0.0:4000
+  # what this installation is called, as opposed to staging or to the copy on
+  # somebody's laptop. runtime, unlike the build above: the same image is this
+  # deployment or another one depending on where it is started
+  HESTAN_DEPLOYMENT: compose-local
   # 0.0.0.0 is a reachable address and `serve` refuses one with nothing
   # checking who is asking. so: a token, which the ui asks for once and keeps
   # for the tab. a real deployment reads this out of a secret rather than out
@@ -48,7 +52,18 @@ x-hestan-env: &hestan-env
   RUST_LOG: ${RUST_LOG:-info}
 
 x-hestan: &hestan
-  build: .
+  build:
+    context: .
+    args:
+      # which build this is, from the shell that ran `docker compose build`:
+      #
+      #     HESTAN_BUILD=$(git rev-parse --short HEAD) docker compose up -d --build
+      #
+      # hestan cannot see it: it is a library inside the demo binary, and the
+      # sha belongs to the repository the image was built from. unset, this is
+      # empty, hestan reads that as an absence, and the run log says so rather
+      # than inventing one
+      HESTAN_BUILD: ${HESTAN_BUILD:-}
   # named, so compose builds it once and every hestan container runs the same
   # bytes
   image: hestan-demo

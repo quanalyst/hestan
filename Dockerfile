@@ -115,5 +115,25 @@ VOLUME ["/var/lib/hestan"]
 USER hestan
 WORKDIR /var/lib/hestan
 ENV HESTAN_DB=/var/lib/hestan/hestan.db
+
+# which build of the application this image is, baked in at build time.
+#
+#     docker build --build-arg HESTAN_BUILD=$(git rev-parse --short HEAD) .
+#
+# hestan is a library compiled into the binary above and cannot see the
+# repository it came from, so somebody has to tell it, and the moment somebody
+# knows is this one: the sha is a fact about the build, and an image is the
+# thing a build produces. the demo reads the variable and passes it to
+# `Deployment::build`, and from there every run it launches records it.
+#
+# the default is deliberately not a plausible-looking string. an unset build
+# argument becomes an empty value, hestan reads an empty value as an absence,
+# and a run log that says "no build declared" is a better answer than one that
+# says every run came from `unknown`.
+#
+# **last, and after the layers that do work.** this argument changes on every
+# commit, and a build layer under it would be rebuilt every time.
+ARG HESTAN_BUILD=""
+ENV HESTAN_BUILD=$HESTAN_BUILD
 EXPOSE 4000
 CMD ["hestan-demo"]

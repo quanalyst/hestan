@@ -99,6 +99,22 @@ export function kindLabel(kind: EventKind): string {
   return rest.replace(/_/g, " ");
 }
 
+// what this deployment is, in one line: the name it declared, the build of the
+// application it runs, and the hestan compiled into it.
+//
+// said once, here, rather than in a corner of every page. the build is the half
+// worth reading, because it is what joins "this started failing on Tuesday" to
+// "we deployed on Tuesday", and it is the half hestan has to be told: a
+// deployment that never declared one gets said so rather than getting hestan's
+// own version in its place, which would be a confident answer to a different
+// question.
+export function deploymentLine(health: Health): string {
+  const d = health.deployment;
+  const hestan = `hestan ${d.hestan.version} on ${d.hestan.platform}`;
+  const build = d.build === null ? "build not declared" : `build ${d.build}`;
+  return d.name === null ? `${build} · ${hestan}` : `${d.name} · ${build} · ${hestan}`;
+}
+
 // what to say about who is deciding, in one line, or null when there is
 // nothing worth a line.
 //
