@@ -1,7 +1,12 @@
-# the gates ci runs
+# the gates ci runs. `--no-default-features` is the tenth and the odd one out:
+# it is the only configuration a consumer can reach that is not a subset of
+# --all-features, and it is linted rather than tested because with `bundled`
+# off the link wants a system sqlite, which is a package on the machine rather
+# than anything this repository can promise
 check:
     cargo fmt --check
     cargo clippy --all-targets -- -D warnings
+    cargo clippy --all-targets --no-default-features -- -D warnings
     cargo clippy --all-targets --features http -- -D warnings
     cargo clippy --all-targets --features capture -- -D warnings
     cargo clippy --all-targets --features postgres -- -D warnings
@@ -23,6 +28,13 @@ check:
 # the same, with the postgres half of the store suite actually running
 check-pg url="postgres://hestan:hestan@localhost/hestan_test":
     HESTAN_TEST_PG={{url}} cargo test --features postgres
+
+# the page docs.rs will build: nightly, every feature, `--cfg docsrs` and
+# warnings denied. docs.rs builds it exactly like this and with no network, and
+# `deny(missing_docs)` is live, so a failure there is a release whose
+# documentation page is an error message
+docs:
+    RUSTDOCFLAGS="--cfg docsrs -D warnings" cargo +nightly doc --all-features --no-deps
 
 # the container checks: the image builds and serves, the compose stack splits
 # the roles, what happens to the deciding process when its network is taken
@@ -47,7 +59,6 @@ release-check:
     cd "$scratch/hestan-$version"
     cargo build --offline --all-features --all-targets
     echo "built hestan-$version from $crate in $scratch"
-
 
 demo:
     cargo run --example demo --features cli

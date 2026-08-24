@@ -109,7 +109,8 @@ libc = "0.2"
 
 [features]
 default = ["bundled"]
-# compiles sqlite from source; disable to link the system library
+# compiles sqlite from source; disable to link the system library instead,
+# which then has to be installed where the linker can find it
 bundled = ["rusqlite/bundled"]
 http = ["dep:reqwest"]
 # a command line in your own binary: `hestan::cli::run`, and the standalone

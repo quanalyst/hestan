@@ -66,7 +66,7 @@
 //! | `http` | `hestan::HttpSource`, pulling a rest api on a schedule, and `hestan::notify` |
 //! | `parquet` | `hestan::ParquetIo`, op outputs stored as parquet files |
 //! | `dbt` | `hestan::dbt`, a dbt project's models as assets |
-//! | `bundled` | **on** by default: compiles sqlite from source rather than linking the system one |
+//! | `bundled` | **on** by default: compiles sqlite from source. off, it links the system one, which then has to be installed where the linker can find it |
 
 // `doc(cfg(..))` puts "available on crate feature x" on the items that need
 // one. it is a nightly attribute, so it is behind a cfg only docs.rs sets,

@@ -30,6 +30,9 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --check
       - run: cargo clippy --all-targets -- -D warnings
+      # `bundled` off is the one configuration that is not a subset of
+      # --all-features; see the justfile
+      - run: cargo clippy --all-targets --no-default-features -- -D warnings
       - run: cargo clippy --all-targets --features http -- -D warnings
       - run: cargo clippy --all-targets --features capture -- -D warnings
       - run: cargo clippy --all-targets --features postgres -- -D warnings
@@ -61,6 +64,17 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.88
       - uses: Swatinem/rust-cache@v2
       - run: cargo check --all-targets --all-features
+
+  # the page docs.rs will build, built the way docs.rs builds it
+  docs:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo doc --all-features --no-deps
+        env:
+          RUSTDOCFLAGS: --cfg docsrs -D warnings
 
   ui:
     runs-on: ubuntu-latest

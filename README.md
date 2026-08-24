@@ -519,7 +519,7 @@ should get to decline:
 
 | feature | what it adds |
 | --- | --- |
-| `bundled` | **on by default**: compiles sqlite from source instead of linking the system library |
+| `bundled` | **on by default**: compiles sqlite from source. turned off, it links the system library instead, which then has to be installed where the linker can find it |
 | `postgres` | `Store::connect`, for a run log several processes share ([storage](docs/storage.md)) |
 | `cli` | `hestan::cli::run`, and the standalone `hestan` binary ([the command line](docs/cli.md)) |
 | `capture` | `hestan::capture_layer`, storing the `tracing` events ops emit ([logs](docs/logs.md)) |
