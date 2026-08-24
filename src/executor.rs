@@ -2426,6 +2426,11 @@ impl Runner {
             claimed_at: None,
             lease_until: None,
             actor: self.actor.as_deref().map(str::to_string),
+            // read here, once, and written into the row below. every launch in
+            // the crate comes through this function, so this is the whole of
+            // where a run's build comes from, and it is the build this process
+            // was told about rather than one looked up later
+            build: self.deployment.build_id().map(str::to_string),
         };
         // a mapped op is never a row of its own: its instances are the record,
         // and how many there are is not known until its dep has produced
@@ -4854,6 +4859,75 @@ mod tests {
         assert!(said.contains("resource"), "{said}");
     }
 
+    // **the whole reason the build is a column and not a join.**
+    //
+    // two runners on two connections to one database, on different builds,
+    // which is what a deployment mid-rollout is: a scheduler still on last
+    // week's image queues a run, a worker already on this week's claims it and
+    // executes it to the end. the run says which build *launched* it, and the
+    // worker's writes, every one of them, leave that alone. read off the
+    // process asking, this run would answer with whichever was asked.
+    //
+    // **two runners in one process**, which is the shape of it and not the
+    // whole claim: `tests/queue.rs` makes the same assertion across two real
+    // os processes on both backends, and that is the one to believe.
+    #[tokio::test]
+    async fn a_worker_on_another_build_does_not_rewrite_the_one_that_launched() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hestan.db");
+        let path = path.to_str().unwrap();
+
+        let enqueuer = Runner::new([sleepy_job("etl", 1)], Store::open(path).unwrap())
+            .unwrap()
+            .with_deployment(crate::Deployment::new().name("prod").build("last-week"))
+            .with_role(Role::Scheduler, 1);
+        let id = enqueuer.launch("etl", json!({}), Trigger::Manual).unwrap();
+        let queued = enqueuer.store().run(&id).unwrap().unwrap();
+        assert_eq!(queued.build.as_deref(), Some("last-week"));
+        assert_eq!(queued.status, RunStatus::Queued);
+
+        let worker_store = Store::open(path).unwrap();
+        let worker = Runner::new([sleepy_job("etl", 1)], worker_store.clone())
+            .unwrap()
+            .with_deployment(crate::Deployment::new().name("prod").build("this-week"));
+        worker.dispatch();
+        assert_eq!(wait_terminal(&worker, &id).await, RunStatus::Success);
+
+        // claimed, started, heartbeaten and settled by a process on
+        // `this-week`, and still recorded against the build that launched it
+        let done = worker_store.run(&id).unwrap().unwrap();
+        assert_eq!(done.build.as_deref(), Some("last-week"));
+        assert!(done.claimed_by.is_some());
+        assert!(done.finished_at.is_some());
+
+        // and a run the worker launches itself is the worker's build: this is
+        // about the launching process, not about the older row
+        let mine = worker.launch("etl", json!({}), Trigger::Manual).unwrap();
+        assert_eq!(wait_terminal(&worker, &mine).await, RunStatus::Success);
+        assert_eq!(
+            worker_store.run(&mine).unwrap().unwrap().build.as_deref(),
+            Some("this-week")
+        );
+    }
+
+    // a deployment that declares nothing goes on writing what it always wrote,
+    // which is nothing at all in that column
+    #[tokio::test]
+    async fn a_deployment_that_declares_no_build_records_an_absence() {
+        let store = Store::open(":memory:").unwrap();
+        let runner = Runner::new([sleepy_job("etl", 1)], store.clone()).unwrap();
+        let id = runner.launch("etl", json!({}), Trigger::Manual).unwrap();
+        assert_eq!(wait_terminal(&runner, &id).await, RunStatus::Success);
+        assert_eq!(store.run(&id).unwrap().unwrap().build, None);
+
+        // and a deployment that declared a name and no build is the same
+        // absence: the name is not a build
+        let named = runner.with_deployment(crate::Deployment::new().name("prod-eu"));
+        let id = named.launch("etl", json!({}), Trigger::Manual).unwrap();
+        assert_eq!(wait_terminal(&named, &id).await, RunStatus::Success);
+        assert_eq!(store.run(&id).unwrap().unwrap().build, None);
+    }
+
     // the classic leak: a launch is refused and the refusal prints what it was
     // given
     #[tokio::test]
@@ -4877,7 +4951,7 @@ mod tests {
         // and nothing was written, so there is no run row carrying it either
         assert!(
             store
-                .runs(None, None, None, None, None, 10)
+                .runs(None, None, None, None, None, None, 10)
                 .unwrap()
                 .is_empty()
         );
@@ -4974,7 +5048,7 @@ mod tests {
         assert!(
             runner
                 .store()
-                .runs(None, None, None, None, None, 10)
+                .runs(None, None, None, None, None, None, 10)
                 .unwrap()
                 .is_empty()
         );
@@ -5086,7 +5160,7 @@ mod tests {
         assert!(
             runner
                 .store()
-                .runs(None, None, None, None, None, 10)
+                .runs(None, None, None, None, None, None, 10)
                 .unwrap()
                 .is_empty()
         );
@@ -5410,7 +5484,7 @@ mod tests {
                 .run(
                     &runner
                         .store()
-                        .runs(None, None, None, None, None, 10)
+                        .runs(None, None, None, None, None, None, 10)
                         .unwrap()[1]
                         .id
                 )
@@ -5478,6 +5552,7 @@ mod tests {
             claimed_at: None,
             lease_until: None,
             actor: None,
+            build: None,
         };
         store.create_run(&run, &["work".to_string()]).unwrap();
     }
@@ -6476,7 +6551,10 @@ mod tests {
         assert!(again.repeat(), "a second call under one key launched again");
         assert_eq!(again.run_id(), id);
         assert_eq!(
-            store.runs(None, None, None, None, None, 50).unwrap().len(),
+            store
+                .runs(None, None, None, None, None, None, 50)
+                .unwrap()
+                .len(),
             1
         );
 
@@ -6485,7 +6563,10 @@ mod tests {
         assert!(!other.repeat());
         assert_ne!(other.run_id(), id);
         assert_eq!(
-            store.runs(None, None, None, None, None, 50).unwrap().len(),
+            store
+                .runs(None, None, None, None, None, None, 50)
+                .unwrap()
+                .len(),
             2
         );
 
@@ -6497,7 +6578,10 @@ mod tests {
             "{crossed}"
         );
         assert_eq!(
-            store.runs(None, None, None, None, None, 50).unwrap().len(),
+            store
+                .runs(None, None, None, None, None, None, 50)
+                .unwrap()
+                .len(),
             2
         );
     }

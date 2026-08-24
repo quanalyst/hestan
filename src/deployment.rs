@@ -61,8 +61,11 @@ const FEATURES: &[(&str, bool)] = &[
 /// absence. what it does know without being told is on the associated
 /// functions below, and every one of them is a compile-time fact.
 ///
-/// where it surfaces: `GET /api/health`, `hestan doctor` and the ui's activity
-/// page.
+/// where it surfaces: `GET /api/health`, `hestan doctor`, the ui's activity
+/// page, and, for the build, the `build` column of every run launched while it
+/// was declared. that last one is [recorded, not joined](crate::Run::build): a
+/// run log read six months from now still says which build produced each run,
+/// rather than answering with whatever is deployed on the day it is read.
 ///
 /// **fields are private and there are accessors**, the pattern
 /// [`Owner`](crate::Owner) set: this is a struct callers build, and a struct

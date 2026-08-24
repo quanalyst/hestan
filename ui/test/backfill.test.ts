@@ -132,6 +132,7 @@ const run = (id: string, status: Run["status"]): Run => ({
   claimed_at: null,
   lease_until: null,
   actor: null,
+  build: null,
 });
 
 test("which run built which key is arithmetic on the chunk size", () => {

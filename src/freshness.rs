@@ -306,6 +306,7 @@ mod tests {
             claimed_at: None,
             lease_until: None,
             actor: None,
+            build: None,
         };
         store.create_run(&run, &[]).unwrap();
         store

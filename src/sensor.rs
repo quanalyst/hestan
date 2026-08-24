@@ -1243,13 +1243,13 @@ mod tests {
         evaluate(&entry, &runner, &AssetRegistry::empty()).await;
 
         let runs = store
-            .runs(None, None, None, None, Some(("sensor", "watch")), 10)
+            .runs(None, None, None, None, Some(("sensor", "watch")), None, 10)
             .unwrap();
         assert_eq!(runs.len(), 2);
         assert!(runs.iter().all(|r| r.trigger == Trigger::Sensor));
         assert!(
             store
-                .runs(None, None, None, None, Some(("sensor", "other")), 10)
+                .runs(None, None, None, None, Some(("sensor", "other")), None, 10)
                 .unwrap()
                 .is_empty()
         );
@@ -1277,7 +1277,7 @@ mod tests {
         let ticks = store.sensor_ticks(Some("watch"), 10).unwrap();
         assert_eq!(ticks[0].outcome, SensorOutcome::Fired);
         assert_eq!(ticks[0].launched, 2);
-        let runs = store.runs(None, None, None, None, None, 10).unwrap();
+        let runs = store.runs(None, None, None, None, None, None, 10).unwrap();
         assert_eq!(runs.len(), 2);
         assert!(runs.iter().all(|r| r.trigger == Trigger::Sensor));
         for run in &runs {
@@ -1344,7 +1344,7 @@ mod tests {
         assert_eq!(ticks[2].error.as_deref(), Some("flaky"));
         assert!(
             store
-                .runs(None, None, None, None, None, 10)
+                .runs(None, None, None, None, None, None, 10)
                 .unwrap()
                 .is_empty()
         );
@@ -1365,7 +1365,7 @@ mod tests {
         ));
         evaluate(&entry, &runner, &AssetRegistry::empty()).await;
 
-        let runs = store.runs(None, None, None, None, None, 10).unwrap();
+        let runs = store.runs(None, None, None, None, None, None, 10).unwrap();
         assert_eq!(runs.len(), 1);
         assert_eq!(runs[0].trigger, Trigger::Sensor);
         assert_eq!(runs[0].params, json!({"n": 4}));
@@ -1433,7 +1433,7 @@ mod tests {
         assert_eq!(docs.fingerprint, "one");
         assert_eq!(docs.value, None);
         assert_eq!(docs.run_id, None);
-        let runs = store.runs(None, None, None, None, None, 10).unwrap();
+        let runs = store.runs(None, None, None, None, None, None, 10).unwrap();
         assert_eq!(runs.len(), 1);
         assert_eq!(runs[0].trigger, Trigger::Build);
         assert_eq!(
@@ -1449,7 +1449,10 @@ mod tests {
 
         evaluate(&entry, &runner, &reg).await;
         assert_eq!(
-            store.runs(None, None, None, None, None, 10).unwrap().len(),
+            store
+                .runs(None, None, None, None, None, None, 10)
+                .unwrap()
+                .len(),
             1
         );
         let docs_again = store.materialization("docs", None).unwrap().unwrap();
@@ -1469,7 +1472,7 @@ mod tests {
                 .fingerprint,
             "two"
         );
-        let runs = store.runs(None, None, None, None, None, 10).unwrap();
+        let runs = store.runs(None, None, None, None, None, None, 10).unwrap();
         assert_eq!(runs.len(), 2);
         assert_eq!(
             wait_terminal(&runner, &runs[0].id).await,
@@ -1513,7 +1516,7 @@ mod tests {
         let entry = probe_entry(&reg, "s");
 
         evaluate(&entry, &runner, &reg).await;
-        let runs = store.runs(None, None, None, None, None, 10).unwrap();
+        let runs = store.runs(None, None, None, None, None, None, 10).unwrap();
         assert_eq!(runs.len(), 1);
         let ops = store.op_runs(&runs[0].id).unwrap();
         let names: Vec<&str> = ops.iter().map(|o| o.op.as_str()).collect();
@@ -1559,6 +1562,7 @@ mod tests {
             claimed_at: None,
             lease_until: None,
             actor: None,
+            build: None,
         };
         store.create_run(&active, &[]).unwrap();
         evaluate(&entry, &runner, &reg).await;
@@ -1574,7 +1578,10 @@ mod tests {
         assert_eq!(ticks[0].outcome, SensorOutcome::Fired);
         assert_eq!(ticks[0].launched, 0);
         assert_eq!(
-            store.runs(None, None, None, None, None, 10).unwrap().len(),
+            store
+                .runs(None, None, None, None, None, None, 10)
+                .unwrap()
+                .len(),
             1
         );
 
@@ -1586,7 +1593,7 @@ mod tests {
         let ticks = store.sensor_ticks(Some("probe:docs"), 10).unwrap();
         assert_eq!(ticks[0].outcome, SensorOutcome::Fired);
         assert_eq!(ticks[0].launched, 1);
-        let runs = store.runs(None, None, None, None, None, 10).unwrap();
+        let runs = store.runs(None, None, None, None, None, None, 10).unwrap();
         assert_eq!(runs.len(), 2);
         let build = runs.iter().find(|r| r.id != "active").unwrap();
         assert_eq!(wait_terminal(&runner, &build.id).await, RunStatus::Success);
@@ -1624,7 +1631,7 @@ mod tests {
         );
         assert!(
             store
-                .runs(None, None, None, None, None, 10)
+                .runs(None, None, None, None, None, None, 10)
                 .unwrap()
                 .is_empty()
         );
@@ -1634,7 +1641,7 @@ mod tests {
         let ticks = store.sensor_ticks(Some("probe:docs"), 10).unwrap();
         assert_eq!(ticks[0].outcome, SensorOutcome::Fired);
         assert_eq!(ticks[0].launched, 1);
-        let runs = store.runs(None, None, None, None, None, 10).unwrap();
+        let runs = store.runs(None, None, None, None, None, None, 10).unwrap();
         assert_eq!(runs.len(), 1);
         assert_eq!(
             wait_terminal(&runner, &runs[0].id).await,
@@ -1739,7 +1746,7 @@ mod tests {
     /// manual `publish` planted by a test is not mistaken for a chained one.
     fn published(store: &Store) -> Vec<Value> {
         let mut runs = store
-            .runs(Some("publish"), None, None, None, None, 20)
+            .runs(Some("publish"), None, None, None, None, None, 20)
             .unwrap();
         runs.retain(|r| r.trigger == Trigger::Sensor);
         runs.sort_by_key(|r| r.created_at);
@@ -1865,7 +1872,7 @@ mod tests {
         for _ in 0..4 {
             evaluate(&entry, &runner, &reg).await;
             for run in store
-                .runs(Some("publish"), None, None, None, None, 20)
+                .runs(Some("publish"), None, None, None, None, None, 20)
                 .unwrap()
             {
                 wait_terminal(&runner, &run.id).await;
@@ -1988,7 +1995,7 @@ mod tests {
     }
 
     fn launched_kinds(store: &Store) -> Vec<String> {
-        let mut runs = store.runs(None, None, None, None, None, 20).unwrap();
+        let mut runs = store.runs(None, None, None, None, None, None, 20).unwrap();
         runs.sort_by_key(|r| r.created_at);
         runs.iter()
             .map(|r| r.params["kind"].as_str().unwrap_or("?").to_string())
@@ -2047,7 +2054,7 @@ mod tests {
         assert_eq!((ticks[0].launched, ticks[0].skipped), (0, 0));
         assert!(
             store
-                .runs(None, None, None, None, None, 10)
+                .runs(None, None, None, None, None, None, 10)
                 .unwrap()
                 .is_empty()
         );
@@ -2285,7 +2292,7 @@ mod tests {
         assert_eq!(cursor_of(&store, "stuck"), None);
         assert!(
             store
-                .runs(None, None, None, None, None, 10)
+                .runs(None, None, None, None, None, None, 10)
                 .unwrap()
                 .is_empty()
         );
@@ -2456,7 +2463,7 @@ mod tests {
         );
         assert!(
             store
-                .runs(None, None, None, None, None, 10)
+                .runs(None, None, None, None, None, None, 10)
                 .unwrap()
                 .is_empty()
         );

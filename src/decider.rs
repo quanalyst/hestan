@@ -530,7 +530,7 @@ mod tests {
         );
         let built = || {
             !store
-                .runs(None, None, None, None, None, 10)
+                .runs(None, None, None, None, None, None, 10)
                 .unwrap()
                 .is_empty()
         };
@@ -668,7 +668,10 @@ mod tests {
             "a stale decider left a tick behind"
         );
         assert_eq!(
-            store.runs(None, None, None, None, None, 50).unwrap().len(),
+            store
+                .runs(None, None, None, None, None, None, 50)
+                .unwrap()
+                .len(),
             1
         );
 
@@ -679,7 +682,10 @@ mod tests {
             .launch("etl", json!({}), Trigger::Manual)
             .expect("a manual launch is nobody's decision to lose");
         assert_eq!(
-            store.runs(None, None, None, None, None, 50).unwrap().len(),
+            store
+                .runs(None, None, None, None, None, None, 50)
+                .unwrap()
+                .len(),
             2
         );
     }
@@ -758,7 +764,7 @@ mod tests {
         );
         assert!(
             store
-                .runs(None, None, None, None, None, 10)
+                .runs(None, None, None, None, None, None, 10)
                 .unwrap()
                 .is_empty()
         );
@@ -780,7 +786,7 @@ mod tests {
         // the occurrence it stands for is the missed one, not the wall clock
         // it was fired at
         let run = store
-            .runs(None, None, None, None, None, 10)
+            .runs(None, None, None, None, None, None, 10)
             .unwrap()
             .pop()
             .unwrap();
@@ -928,6 +934,7 @@ mod tests {
             claimed_at: None,
             lease_until: None,
             actor: None,
+            build: None,
         }
     }
 }

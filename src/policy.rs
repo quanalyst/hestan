@@ -1069,7 +1069,7 @@ mod tests {
             "one build, not two"
         );
         assert_eq!(tick(&runner, &reg, now).unwrap(), None);
-        let runs = store.runs(None, None, None, None, None, 10).unwrap();
+        let runs = store.runs(None, None, None, None, None, None, 10).unwrap();
         assert_eq!(runs.len(), 1);
         assert_eq!(events(&store).len(), 1, "one launch is one event");
 
@@ -1103,7 +1103,7 @@ mod tests {
         }
         assert!(
             store
-                .runs(None, None, None, None, None, 10)
+                .runs(None, None, None, None, None, None, 10)
                 .unwrap()
                 .is_empty()
         );
@@ -1218,7 +1218,7 @@ mod tests {
         assert_eq!(tick(&runner, &reg, Utc::now()).unwrap(), None);
         assert!(
             store
-                .runs(None, None, None, None, None, 10)
+                .runs(None, None, None, None, None, None, 10)
                 .unwrap()
                 .is_empty()
         );

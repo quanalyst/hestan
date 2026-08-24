@@ -423,6 +423,7 @@ mod tests {
                     claimed_at: None,
                     lease_until: None,
                     actor: None,
+                    build: None,
                 },
                 &["load".to_string()],
             )

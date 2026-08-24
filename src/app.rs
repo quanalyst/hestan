@@ -736,7 +736,12 @@ impl Hestan {
     /// the run log is, and whose run log it is. both halves are optional and a
     /// deployment that declares neither reads exactly as it always did.
     ///
-    /// where it surfaces: `GET /api/health`, `hestan doctor` and the ui's
+    /// **the build reaches the run log.** every run launched through this
+    /// process from here on records it, so a run read back next year says
+    /// which build produced it rather than which build is deployed on the day
+    /// somebody asks. see [`Run::build`](crate::Run::build).
+    ///
+    /// it also reaches `GET /api/health`, `hestan doctor` and the ui's
     /// activity page, beside the compile-time facts hestan has without being
     /// told: its own version, the schema version, the features compiled and
     /// the platform. [`Deployment`] is where the difference between those and
@@ -1728,7 +1733,10 @@ mod tests {
         // export at a copy is the ordinary reason to have one
         let store = Store::open(&copy).unwrap();
         assert_eq!(
-            store.runs(None, None, None, None, None, 10).unwrap().len(),
+            store
+                .runs(None, None, None, None, None, None, 10)
+                .unwrap()
+                .len(),
             1
         );
 
@@ -2110,7 +2118,7 @@ mod tests {
             .unwrap();
 
         let store = Store::open(&path).unwrap();
-        let run = &store.runs(None, None, None, None, None, 10).unwrap()[0];
+        let run = &store.runs(None, None, None, None, None, None, 10).unwrap()[0];
         // stackable, last wins within the defaults themselves
         assert_eq!(run.tags["env"], "prod");
         assert_eq!(run.tags["cluster"], "eu-2");
@@ -2176,6 +2184,7 @@ mod tests {
             claimed_at: None,
             lease_until: None,
             actor: None,
+            build: None,
         };
         store
             .create_run(&planted("mine"), &["quick".to_string()])

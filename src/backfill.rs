@@ -270,6 +270,7 @@ mod tests {
                 None,
                 None,
                 tag.as_ref().map(|(k, v)| (*k, v.as_str())),
+                None,
                 10,
             )
             .unwrap();

@@ -16,7 +16,7 @@ use std::process::{Command, Output};
 use std::time::{Duration, Instant};
 
 use hestan::prelude::*;
-use hestan::{Auth, EventQuery, Limits, Owner, Runner, Store, Trigger};
+use hestan::{Auth, Deployment, EventQuery, Limits, Owner, Runner, Store, Trigger};
 
 /// where the process under test finds its run log. absent means "run the
 /// cases", which is how one binary is both halves of this.
@@ -28,6 +28,10 @@ const ADDR: &str = "HESTAN_CLI_ADDR";
 /// an authenticated one. absent means an open deployment, which is what every
 /// other case here serves.
 const TOKEN: &str = "HESTAN_CLI_TOKEN";
+/// which build the deployment under test declares, where a case wants one.
+/// absent means a deployment that declares no build, which is every other case
+/// here and is what the runs it launches record.
+const BUILD: &str = "HESTAN_CLI_BUILD";
 const SECRET: &str = "tk-cli-4d1f7a-not-in-any-output";
 
 fn main() {
@@ -63,6 +67,10 @@ fn app(db: &str) -> Hestan {
         // run queue up behind it
         .max_concurrent_runs(1)
         .db(db);
+    let app = match std::env::var(BUILD) {
+        Ok(build) => app.deployment(Deployment::new().name("cli-case").build(build)),
+        Err(_) => app,
+    };
     match std::env::var(TOKEN) {
         Ok(token) => app.auth(Auth::bearer(token)),
         Err(_) => app,
@@ -205,6 +213,7 @@ async fn cases(dir: &Path) {
     )
     .await;
     case("a_hue_is_the_same_number_in_another_process", coloured(dir)).await;
+    case("a_run_is_listed_by_the_build_that_launched_it", built(dir)).await;
     #[cfg(unix)]
     case(
         "an_isolated_op_is_served_its_op_and_not_a_socket",
@@ -364,7 +373,7 @@ async fn canceled(dir: &Path) {
     let queued = wait_for("the child's run to queue", || {
         runner
             .store()
-            .runs(Some("quick"), None, None, None, None, 5)
+            .runs(Some("quick"), None, None, None, None, None, 5)
             .unwrap()
             .pop()
     })
@@ -387,7 +396,9 @@ async fn timed_out(dir: &Path) {
     assert!(ran.stderr.contains("stops with this process"), "{ran:?}");
     // the run is still going, which is what the message said
     let store = Store::open(db.to_str().unwrap()).unwrap();
-    let run = store.runs(Some("slow"), None, None, None, None, 1).unwrap();
+    let run = store
+        .runs(Some("slow"), None, None, None, None, None, 1)
+        .unwrap();
     assert_eq!(run[0].status, RunStatus::Running);
 }
 
@@ -409,7 +420,9 @@ async fn replays(dir: &Path) {
 
     // a run that failed, which is the case somebody actually has
     cli(&db, &["run", "boom", "--wait"]).assert(1);
-    let failed = store.runs(Some("boom"), None, None, None, None, 1).unwrap();
+    let failed = store
+        .runs(Some("boom"), None, None, None, None, None, 1)
+        .unwrap();
     let failed = failed[0].id.clone();
 
     let ran = cli(&db, &["--quiet", "replay", &failed]);
@@ -430,7 +443,7 @@ async fn replays(dir: &Path) {
     // a run that worked has no failed op to replay, and saying so is exit 2
     cli(&db, &["run", "quick", "--wait"]).assert(0);
     let won = store
-        .runs(Some("quick"), None, None, None, None, 1)
+        .runs(Some("quick"), None, None, None, None, None, 1)
         .unwrap();
     let ran = cli(&db, &["replay", &won[0].id]);
     ran.assert(2);
@@ -990,6 +1003,79 @@ fn cli(db: &Path, args: &[&str]) -> Ran {
     )
 }
 
+/// the same, from a process whose deployment declares `build`.
+fn cli_from(db: &Path, build: &str, args: &[&str]) -> Ran {
+    Ran::of(
+        Command::new(exe())
+            .env(DB, db)
+            .env(BUILD, build)
+            .args(args)
+            .output()
+            .expect("the command starts"),
+    )
+}
+
+/// two builds against one run log, which is a deployment across a rollout, and
+/// the question the column exists to answer asked from a terminal.
+///
+/// **every command here is its own process**, so "the build in force when the
+/// run was launched" is a real fact about a real process rather than a field
+/// set in a test. the third process declares neither build and still lists
+/// each run under the one that made it.
+async fn built(dir: &Path) {
+    let db = db(dir, "built");
+    let first = cli_from(&db, "9f2c1ab", &["--quiet", "run", "quick", "--wait"]);
+    first.assert(0);
+    let old = first.stdout.trim().to_string();
+    let second = cli_from(&db, "aa11bb2", &["--quiet", "run", "quick", "--wait"]);
+    second.assert(0);
+    let new = second.stdout.trim().to_string();
+    assert_ne!(old, new);
+
+    // a third process, declaring no build at all, reads back what each of the
+    // other two recorded rather than anything about itself
+    let ids = |args: &[&str]| -> Vec<String> {
+        let listed = cli(&db, args);
+        listed.assert(0);
+        let value: Value = serde_json::from_str(&listed.stdout).expect("one json object");
+        value["runs"]
+            .as_array()
+            .expect("runs")
+            .iter()
+            .map(|r| r["id"].as_str().unwrap().to_string())
+            .collect()
+    };
+    assert_eq!(
+        ids(&["--json", "runs", "--build", "9f2c1ab"]),
+        [old.as_str()]
+    );
+    assert_eq!(
+        ids(&["--json", "runs", "--build", "aa11bb2"]),
+        [new.as_str()]
+    );
+    assert_eq!(
+        ids(&["--json", "runs", "--build", "never-shipped"]).len(),
+        0
+    );
+    assert_eq!(ids(&["--json", "runs"]).len(), 2);
+
+    // and one run, shown, says which build made it
+    let shown = cli(&db, &["--json", "show", &old]);
+    shown.assert(0);
+    let value: Value = serde_json::from_str(&shown.stdout).expect("one json object");
+    assert_eq!(value["run"]["build"], "9f2c1ab");
+
+    // a run this deployment launches now, declaring nothing, records nothing,
+    // and is not swept up by either build's filter
+    let plain = cli(&db, &["--quiet", "run", "quick", "--wait"]);
+    plain.assert(0);
+    assert_eq!(ids(&["--json", "runs"]).len(), 3);
+    assert_eq!(
+        ids(&["--json", "runs", "--build", "9f2c1ab"]),
+        [old.as_str()]
+    );
+}
+
 /// the command line's half of a launch key: the shape a cron line or a ci step
 /// actually uses, which is `--key` and `--quiet` and nothing else.
 async fn keyed(dir: &Path) {
@@ -1050,7 +1136,7 @@ async fn keyed(dir: &Path) {
     // and only two runs exist across the lot
     let store = Store::open(db.to_str().unwrap()).unwrap();
     let runs = store
-        .runs(Some("quick"), None, None, None, None, 50)
+        .runs(Some("quick"), None, None, None, None, None, 50)
         .unwrap();
     assert_eq!(runs.len(), 2, "one key made more than one run: {runs:?}");
 }

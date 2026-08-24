@@ -293,7 +293,7 @@ async fn a_one_shot_is_unchanged(db: &str) {
     // nothing it was doing reached a terminal status, since nothing recorded
     // one: the point is that the process was gone, not what it left behind
     let running = store
-        .runs(None, None, None, None, None, 200)
+        .runs(None, None, None, None, None, None, 200)
         .unwrap()
         .into_iter()
         .filter(|r| r.status == RunStatus::Running)
@@ -752,7 +752,7 @@ fn mark(line: &str) {
 fn tidy(db: &str) {
     let store = Store::open(db).unwrap();
     let runner = enqueuer(db);
-    for run in store.runs(None, None, None, None, None, 500).unwrap() {
+    for run in store.runs(None, None, None, None, None, None, 500).unwrap() {
         if run.status == RunStatus::Queued {
             let _ = runner.cancel(&run.id);
         }

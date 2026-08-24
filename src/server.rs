@@ -574,7 +574,7 @@ pub(crate) fn job_summary(
         _ => false,
     };
     let last_run = store
-        .runs(Some(job.name()), None, None, None, None, 1)?
+        .runs(Some(job.name()), None, None, None, None, None, 1)?
         .pop();
     Ok(json!({
         "name": job.name(),
@@ -2121,6 +2121,9 @@ struct RunsQuery {
     before_id: Option<String>,
     /// one `k:v` pair, matched exactly against the run's tags.
     tag: Option<String>,
+    /// the build that launched the run, matched exactly. this is what "show me
+    /// the runs from the build before last" asks with.
+    build: Option<String>,
     limit: Option<u32>,
 }
 
@@ -2161,13 +2164,17 @@ async fn list_runs(
     // before_id only refines `before`; alone it means nothing and is dropped
     let before_id = before.and(q.before_id.as_deref().filter(|s| !s.is_empty()));
     let tag = tag_param(q.tag.as_deref())?;
+    // an empty build is no filter rather than "runs with an empty build":
+    // nothing in the column is ever the empty string, so the other reading
+    // would answer every request with nothing
+    let build = q.build.as_deref().filter(|b| !b.is_empty());
     // windowed fetches page through whole days of runs, hence the wider cap
     let max = if since.is_some() { 2000 } else { 500 };
     let limit = q.limit.unwrap_or(50).clamp(1, max);
     let runs = st
         .runner
         .store()
-        .runs(job, since, before, before_id, tag, limit)
+        .runs(job, since, before, before_id, tag, build, limit)
         .map_err(internal)?;
     Ok(Json(json!({ "runs": runs })))
 }
@@ -2831,6 +2838,7 @@ mod tests {
             claimed_at: None,
             lease_until: None,
             actor: None,
+            build: None,
         };
         st.runner.store().create_run(&run, &[]).unwrap();
         run
@@ -2860,6 +2868,7 @@ mod tests {
                 claimed_at: None,
                 lease_until: None,
                 actor: None,
+                build: None,
             };
             st.runner.store().create_run(&run, &[]).unwrap();
         }
@@ -2870,6 +2879,7 @@ mod tests {
             before: None,
             before_id: None,
             tag: None,
+            build: None,
             limit: None,
         };
         let Json(body) = list_runs(State(st.clone()), Ok(Query(q(Some(&t0.to_rfc3339())))))
@@ -2918,6 +2928,7 @@ mod tests {
                 claimed_at: None,
                 lease_until: None,
                 actor: None,
+                build: None,
             };
             st.runner.store().create_run(&run, &[]).unwrap();
         }
@@ -2928,6 +2939,7 @@ mod tests {
             before,
             before_id: None,
             tag: None,
+            build: None,
             limit: None,
         };
         let ids = |body: &Value| -> Vec<String> {
@@ -2987,6 +2999,7 @@ mod tests {
                 claimed_at: None,
                 lease_until: None,
                 actor: None,
+                build: None,
             };
             st.runner.store().create_run(&run, &[]).unwrap();
         }
@@ -3004,6 +3017,7 @@ mod tests {
                 before,
                 before_id,
                 tag: None,
+                build: None,
                 limit: Some(1),
             };
             let Json(body) = list_runs(State(st.clone()), Ok(Query(q))).await.unwrap();
@@ -3091,6 +3105,7 @@ mod tests {
                 claimed_at: None,
                 lease_until: None,
                 actor: None,
+                build: None,
             };
             store.create_run(&run, &["a".into(), "b".into()]).unwrap();
             store.op_started(&run.id, "a", 1).unwrap();
@@ -3211,6 +3226,7 @@ mod tests {
             claimed_at: None,
             lease_until: None,
             actor: None,
+            build: None,
         };
         store.create_run(&run, &ops).unwrap();
         for op in &ops {
@@ -3309,6 +3325,7 @@ mod tests {
             claimed_at: None,
             lease_until: None,
             actor: None,
+            build: None,
         };
         store.create_run(&run, &ops).unwrap();
         for op in &ops {
@@ -3845,7 +3862,7 @@ mod tests {
         assert_eq!(
             st.runner
                 .store()
-                .runs(None, None, None, None, None, 10)
+                .runs(None, None, None, None, None, None, 10)
                 .unwrap()
                 .len(),
             1
@@ -3895,6 +3912,7 @@ mod tests {
                 before: None,
                 before_id: None,
                 tag: tag.map(String::from),
+                build: None,
                 limit: None,
             };
             list_runs(State(st.clone()), Ok(Query(q)))
@@ -4026,7 +4044,7 @@ mod tests {
         assert!(
             st.runner
                 .store()
-                .runs(None, None, None, None, None, 10)
+                .runs(None, None, None, None, None, None, 10)
                 .unwrap()
                 .is_empty(),
             "a refused subset left a run behind"
@@ -4111,7 +4129,7 @@ mod tests {
         assert_eq!(
             st.runner
                 .store()
-                .runs(None, None, None, None, None, 10)
+                .runs(None, None, None, None, None, None, 10)
                 .unwrap()
                 .len(),
             2
@@ -4179,7 +4197,7 @@ mod tests {
         assert!(
             st.runner
                 .store()
-                .runs(None, None, None, None, None, 10)
+                .runs(None, None, None, None, None, None, 10)
                 .unwrap()
                 .is_empty()
         );
@@ -4644,7 +4662,7 @@ mod tests {
         let running = st
             .runner
             .store()
-            .runs(None, None, None, None, None, 10)
+            .runs(None, None, None, None, None, None, 10)
             .unwrap()
             .into_iter()
             .find(|r| r.claimed_by.is_some())
@@ -4877,6 +4895,7 @@ mod tests {
             claimed_at: None,
             lease_until: None,
             actor: None,
+            build: None,
         };
         let ops: Vec<String> = ops.iter().map(|o| o.to_string()).collect();
         st.runner.store().create_run(&run, &ops).unwrap();
@@ -5295,6 +5314,7 @@ mod tests {
             claimed_at: None,
             lease_until: None,
             actor: None,
+            build: None,
         };
         st.runner.store().create_run(&stale, &[]).unwrap();
         let s = job_summary(
@@ -5401,7 +5421,7 @@ mod tests {
         let id = st
             .runner
             .store()
-            .runs(Some("etl"), None, None, None, None, 1)
+            .runs(Some("etl"), None, None, None, None, None, 1)
             .unwrap()[0]
             .id
             .clone();
@@ -6531,7 +6551,7 @@ mod tests {
         assert_eq!(
             st.runner
                 .store()
-                .runs(None, None, None, None, None, 10)
+                .runs(None, None, None, None, None, None, 10)
                 .unwrap()
                 .len(),
             1
@@ -7114,6 +7134,81 @@ mod tests {
         assert_eq!(body["store"]["unrecorded_writes"], 1);
     }
 
+    // "show me the runs from the build before last", over http, which is what
+    // makes the column something an operator can use rather than a line on a
+    // page
+    #[tokio::test]
+    async fn the_runs_list_filters_by_the_build_that_launched_them() {
+        let st = state(vec![echo_job("etl")]);
+        // written with the build already on the row, which is the only way one
+        // ever gets there: nothing sets it afterwards
+        let planted = |id: &str, build: Option<&str>| {
+            let mut run = Run {
+                id: id.into(),
+                job: "etl".into(),
+                status: RunStatus::Success,
+                trigger: Trigger::Manual,
+                params: json!({}),
+                created_at: Utc::now(),
+                started_at: None,
+                finished_at: None,
+                error: None,
+                resumed_from: None,
+                replay_of: None,
+                scheduled_for: None,
+                tags: Default::default(),
+                priority: 0,
+                claimed_by: None,
+                claimed_at: None,
+                lease_until: None,
+                actor: None,
+                build: None,
+            };
+            run.build = build.map(str::to_string);
+            st.runner.store().create_run(&run, &[]).unwrap();
+        };
+        planted("b1", Some("9f2c1ab"));
+        planted("b2", Some("9f2c1ab"));
+        planted("b3", Some("aa11bb2"));
+        planted("b4", None);
+
+        let ids = |build: Option<&str>| {
+            let q = RunsQuery {
+                job: None,
+                since: None,
+                before: None,
+                before_id: None,
+                tag: None,
+                build: build.map(String::from),
+                limit: None,
+            };
+            list_runs(State(st.clone()), Ok(Query(q)))
+        };
+        let Json(body) = ids(Some("9f2c1ab")).await.unwrap();
+        let listed = body["runs"].as_array().unwrap();
+        assert_eq!(listed.len(), 2);
+        assert!(listed.iter().all(|r| r["build"] == "9f2c1ab"));
+
+        // and the run rows carry it whether or not anything filtered on it
+        let Json(body) = ids(None).await.unwrap();
+        let all = body["runs"].as_array().unwrap();
+        assert_eq!(all.len(), 4);
+        assert_eq!(
+            all.iter().filter(|r| r["build"].is_null()).count(),
+            1,
+            "a run with no build reports null rather than a string"
+        );
+
+        // an empty build is no filter rather than a filter matching nothing,
+        // which is what a cleared input box sends
+        let Json(body) = ids(Some("")).await.unwrap();
+        assert_eq!(body["runs"].as_array().unwrap().len(), 4);
+
+        // a build nothing ran under is an empty page
+        let Json(body) = ids(Some("never")).await.unwrap();
+        assert!(body["runs"].as_array().unwrap().is_empty());
+    }
+
     // what a deployment that has declared nothing reports: the compile-time
     // facts, and nulls where somebody would have had to tell hestan
     #[tokio::test]
@@ -7690,7 +7785,7 @@ mod tests {
             after
                 .runner
                 .store()
-                .runs(Some("etl"), None, None, None, None, 10)
+                .runs(Some("etl"), None, None, None, None, None, 10)
                 .unwrap()
                 .len(),
             1
@@ -8405,7 +8500,7 @@ mod tests {
         assert_eq!(
             st.runner
                 .store()
-                .runs(None, None, None, None, None, 50)
+                .runs(None, None, None, None, None, None, 50)
                 .unwrap()
                 .len(),
             1,
@@ -8431,7 +8526,7 @@ mod tests {
         assert_eq!(
             st.runner
                 .store()
-                .runs(None, None, None, None, None, 50)
+                .runs(None, None, None, None, None, None, 50)
                 .unwrap()
                 .len(),
             2

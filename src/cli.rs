@@ -416,6 +416,9 @@ struct RunsArgs {
     /// only runs carrying this tag
     #[arg(long, value_name = "KEY=VALUE")]
     tag: Option<String>,
+    /// only runs launched by this build of the application
+    #[arg(long, value_name = "BUILD")]
+    build: Option<String>,
     /// only runs created since then: `2h`, `30m`, `7d`, or an rfc3339 instant
     #[arg(long, value_name = "WHEN")]
     since: Option<String>,
@@ -763,6 +766,7 @@ async fn dispatch(reach: Reach, command: Command, out: &Out) -> Result<(), Fail>
                             None,
                             None,
                             tag.as_ref().map(|(k, v)| (k.as_str(), v.as_str())),
+                            args.build.as_deref(),
                             args.limit.clamp(1, 2000),
                         )?,
                     })
@@ -1993,6 +1997,12 @@ fn render_show(answer: &Value, out: &Out) {
         let tags: Vec<String> = tags.iter().map(|(k, v)| format!("{k}={v}")).collect();
         println!("tags     {}", tags.join(" "));
     }
+    // which build produced this run, as the row has it. absent on a run
+    // launched by a deployment that declared none and on one older than the
+    // column, and a blank line for either would read as a build with no name
+    if let Some(build) = run["build"].as_str() {
+        println!("build    {build}");
+    }
     if let Some(error) = run["error"].as_str() {
         println!("error    {}", out.paint(error, RED));
     }
@@ -2293,6 +2303,9 @@ fn runs_query(args: &RunsArgs) -> Result<String, Fail> {
     if let Some(tag) = &args.tag {
         split_pair(tag)?;
         query.push(format!("tag={}", escape(tag)));
+    }
+    if let Some(build) = &args.build {
+        query.push(format!("build={}", escape(build)));
     }
     if let Some(since) = &args.since {
         query.push(format!("since={}", escape(&instant(since)?.to_rfc3339())));
@@ -3956,7 +3969,7 @@ fn complete(reach: Result<Reach, Fail>, what: Names, out: &Out) -> Result<(), Fa
             .collect(),
         Names::Runs => reach?
             .store()?
-            .runs(None, None, None, None, None, 50)?
+            .runs(None, None, None, None, None, None, 50)?
             .into_iter()
             .map(|r| r.id)
             .collect(),
@@ -4460,6 +4473,7 @@ mod tests {
         let query = runs_query(&RunsArgs {
             job: Some("etl".into()),
             tag: Some("env=prod".into()),
+            build: Some("9f2c1ab".into()),
             since: None,
             limit: 5,
         })
@@ -4467,10 +4481,12 @@ mod tests {
         assert!(query.contains("limit=5"), "{query}");
         assert!(query.contains("job=etl"), "{query}");
         assert!(query.contains("tag=env%3Dprod"), "{query}");
+        assert!(query.contains("build=9f2c1ab"), "{query}");
 
         let bad = runs_query(&RunsArgs {
             job: None,
             tag: Some("prod".into()),
+            build: None,
             since: None,
             limit: 5,
         })

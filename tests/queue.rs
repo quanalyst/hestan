@@ -23,7 +23,7 @@ use std::process::{Child, Command};
 use std::time::{Duration, Instant};
 
 use hestan::prelude::*;
-use hestan::{Overlap, Role, RunStatus, Runner, Store, TickOutcome, Trigger};
+use hestan::{Deployment, Overlap, Role, RunStatus, Runner, Store, TickOutcome, Trigger};
 
 /// where every process in this test finds the run log. a deployment reads this
 /// out of its own config; a test has to hand it to its children somehow, and
@@ -34,6 +34,15 @@ const ROLE: &str = "HESTAN_QUEUE_ROLE";
 /// where every op appends a line saying which run it was and which process ran
 /// it: the double-run detector.
 const MARKS: &str = "HESTAN_QUEUE_MARKS";
+/// which build a child process declares, so a worker can be on a different one
+/// from the process that enqueued the run it claims. absent in the parent,
+/// which declares its own; see [`another_process_executes`].
+const BUILD: &str = "HESTAN_QUEUE_BUILD";
+
+/// what the parent enqueues under, and what a worker child is started under.
+/// two different strings on one database, which is a deployment mid-rollout.
+const ENQUEUED_BY: &str = "build-that-enqueued";
+const EXECUTED_BY: &str = "build-that-executed";
 
 fn main() {
     let rt = tokio::runtime::Builder::new_multi_thread()
@@ -174,6 +183,15 @@ fn app(db: &str) -> Hestan {
         // and a schedule, so the same holds for the tick log
         .schedule("chunk", "* * * * *")
         .db(db)
+        // a child declares whichever build it was started with. the parent
+        // declares another one on the runner it enqueues through, so a run
+        // this deployment executes was launched by one build and finished by
+        // a different one
+        .deployment(
+            Deployment::new()
+                .name("queue-case")
+                .build(std::env::var(BUILD).unwrap_or_default()),
+        )
 }
 
 /// the deployment the double-fire cases run: one job on a one-second cron,
@@ -203,7 +221,7 @@ fn beat_app(db: &str) -> Hestan {
 /// which process launched each `beat` run so far, oldest first.
 fn deciders(store: &Store) -> Vec<String> {
     let mut runs: Vec<hestan::Run> = store
-        .runs(None, None, None, None, None, 500)
+        .runs(None, None, None, None, None, None, 500)
         .unwrap()
         .into_iter()
         .filter(|r| r.job == BEAT && r.trigger == Trigger::Schedule)
@@ -298,6 +316,7 @@ fn rate_marks() -> PathBuf {
 fn enqueuer(db: &str) -> Runner {
     Runner::new(jobs(), open(db))
         .unwrap()
+        .with_deployment(Deployment::new().name("queue-case").build(ENQUEUED_BY))
         .with_role(Role::Scheduler, 1)
 }
 
@@ -365,6 +384,14 @@ async fn another_process_executes(db: &str) {
         u64::from(std::process::id()),
         "the run executed in the process that enqueued it"
     );
+
+    // **and it is still recorded against the build that launched it.** the
+    // process that claimed, started, heartbeat and settled this run is a
+    // different os process on a different declared build, which is what a
+    // deployment mid-rollout is. asked of the reader rather than of the row,
+    // this run would answer with whichever process was asked
+    assert_eq!(queued.build.as_deref(), Some(ENQUEUED_BY));
+    assert_eq!(run.build.as_deref(), Some(ENQUEUED_BY));
     stop(&mut worker);
 }
 
@@ -414,14 +441,20 @@ async fn two_workers_split_it(db: &str) {
 
 async fn a_worker_decides_nothing(db: &str) {
     let store = open(db);
-    let before = store.runs(None, None, None, None, None, 500).unwrap().len();
+    let before = store
+        .runs(None, None, None, None, None, None, 500)
+        .unwrap()
+        .len();
     let ticks_before = store.ticks(None, 500).unwrap().len();
 
     // a worker, alone, for long enough that a sensor due every 100ms would have
     // fired twenty times
     let mut worker = spawn("worker");
     tokio::time::sleep(Duration::from_secs(2)).await;
-    let after = store.runs(None, None, None, None, None, 500).unwrap().len();
+    let after = store
+        .runs(None, None, None, None, None, None, 500)
+        .unwrap()
+        .len();
     assert_eq!(
         after, before,
         "a worker launched something: it is supposed to decide nothing"
@@ -442,7 +475,7 @@ async fn a_worker_decides_nothing(db: &str) {
     let mut scheduler = spawn("scheduler");
     let fired = wait_for("a sensor fire", || {
         store
-            .runs(None, None, None, None, None, 500)
+            .runs(None, None, None, None, None, None, 500)
             .unwrap()
             .into_iter()
             .find(|r| r.trigger == Trigger::Sensor)
@@ -575,7 +608,7 @@ async fn two_schedulers_fire_each_occurrence_once(db: &str) {
     // tick would have been a second run of the job
     let launched: Vec<String> = fires.iter().filter_map(|t| t.run_id.clone()).collect();
     let mut stood_for: Vec<String> = store
-        .runs(None, None, None, None, None, 500)
+        .runs(None, None, None, None, None, None, 500)
         .unwrap()
         .into_iter()
         .filter(|r| launched.contains(&r.id))
@@ -660,6 +693,10 @@ fn spawn(role: &str) -> Child {
     let exe = std::env::current_exe().expect("this binary");
     Command::new(exe)
         .env(ROLE, role)
+        // a child is on the *other* build, so what a run row says about its
+        // build is a claim about which process wrote it rather than about
+        // which process is reading it
+        .env(BUILD, EXECUTED_BY)
         .spawn()
         .unwrap_or_else(|e| panic!("could not start a {role}: {e}"))
 }

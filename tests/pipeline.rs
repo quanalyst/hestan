@@ -294,7 +294,7 @@ async fn invalid_params_rejected_before_launch() {
     assert!(
         runner
             .store()
-            .runs(None, None, None, None, None, 10)
+            .runs(None, None, None, None, None, None, 10)
             .unwrap()
             .is_empty()
     );
@@ -1589,7 +1589,10 @@ async fn resume_refuses_a_changed_graph() {
 
     // no half-built run survives a refusal
     assert_eq!(
-        store.runs(None, None, None, None, None, 10).unwrap().len(),
+        store
+            .runs(None, None, None, None, None, None, 10)
+            .unwrap()
+            .len(),
         1
     );
 }
@@ -1787,7 +1790,7 @@ async fn a_replay_whose_inputs_are_gone_refuses_and_names_them() {
     assert_eq!(
         runner
             .store()
-            .runs(None, None, None, None, None, 10)
+            .runs(None, None, None, None, None, None, 10)
             .unwrap()
             .len(),
         1
@@ -2661,7 +2664,7 @@ async fn a_failed_run_names_the_failing_op_in_its_error() {
     // and it reads the same back out of the list endpoint's query
     let listed = runner
         .store()
-        .runs(None, None, None, None, None, 10)
+        .runs(None, None, None, None, None, None, 10)
         .unwrap();
     assert_eq!(listed[0].error.as_deref(), Some(error));
 

@@ -132,6 +132,11 @@ export default function RunsPage() {
   const [tag, setTag] = useState("");
   const [tagQ, setTagQ] = useState("");
   const [tagErr, setTagErr] = useState<string | null>(null);
+  // and so is this one, for the same reason: a page holds fifty runs and "the
+  // build before last" is a question about all of them. seeded from the url so
+  // the build chip on a run page lands here with the filter already applied
+  const [build, setBuild] = useState(search.get("build") ?? "");
+  const [buildQ, setBuildQ] = useState(search.get("build") ?? "");
   const [queue, setQueue] = useState<QueueView | null>(null);
   const [rates, setRates] = useState<RateView[]>([]);
   const [undelivered, setUndelivered] = useState<Notification[]>([]);
@@ -140,17 +145,18 @@ export default function RunsPage() {
   const [now, setNow] = useState(() => Date.now());
   const jobQ = job ? `&job=${encodeURIComponent(job)}` : "";
   const tagParam = tagQ ? `&tag=${encodeURIComponent(tagQ)}` : "";
+  const buildParam = buildQ ? `&build=${encodeURIComponent(buildQ)}` : "";
 
   useEffect(() => {
     headRef.current = null;
     setHead(null);
     setTail([]);
     setExhausted(false);
-  }, [job, tagQ]);
+  }, [job, tagQ, buildQ]);
 
   usePoll(
     () => {
-      get<{ runs: Run[] }>(`/api/runs?limit=${PAGE}${jobQ}${tagParam}`)
+      get<{ runs: Run[] }>(`/api/runs?limit=${PAGE}${jobQ}${tagParam}${buildParam}`)
         .then((r) => {
           // rows new runs push off the head page fall into the gap before the tail
           const prev = headRef.current;
@@ -175,7 +181,7 @@ export default function RunsPage() {
         });
     },
     5000,
-    [job, tagParam],
+    [job, tagParam, buildParam],
   );
 
   usePoll(
@@ -256,7 +262,7 @@ export default function RunsPage() {
       // before_id breaks created_at ties so simultaneous runs never drop out
       const r = await get<{ runs: Run[] }>(
         `/api/runs?limit=${PAGE}&before=${encodeURIComponent(oldest.created_at)}` +
-          `&before_id=${encodeURIComponent(oldest.id)}${jobQ}${tagParam}`,
+          `&before_id=${encodeURIComponent(oldest.id)}${jobQ}${tagParam}${buildParam}`,
       );
       setTail((t) => [...t, ...r.runs]);
       if (r.runs.length < PAGE) setExhausted(true);
@@ -317,7 +323,11 @@ export default function RunsPage() {
       <Undelivered rows={undelivered} />
       {runs.length === 0 ? (
         <p className="muted">
-          {tagQ ? `no runs tagged ${tagQ}` : "no runs yet: launch one from a job page"}
+          {tagQ
+            ? `no runs tagged ${tagQ}`
+            : buildQ
+              ? `no runs from build ${buildQ}`
+              : "no runs yet: launch one from a job page"}
         </p>
       ) : (
         <>
@@ -443,6 +453,24 @@ export default function RunsPage() {
               />
             </span>
             <span className="filter-group">
+              <span className="filter-label">build</span>
+              <input
+                className="filter-input"
+                value={build}
+                placeholder="git sha"
+                onChange={(e) => setBuild(e.target.value)}
+                onKeyDown={(e) => {
+                  // the server owns this one too, so it applies on enter
+                  if (e.key === "Enter") setBuildQ(build.trim());
+                  if (e.key === "Escape") {
+                    setBuild("");
+                    setBuildQ("");
+                  }
+                }}
+                onBlur={() => setBuildQ(build.trim())}
+              />
+            </span>
+            <span className="filter-group">
               <span className="filter-label">find</span>
               <input
                 className="filter-input"
@@ -456,7 +484,9 @@ export default function RunsPage() {
             </span>
           </div>
           {shown.length === 0 ? (
-            <p className="muted">no runs match the filter</p>
+            <p className="muted">
+              {buildQ ? `no runs from build ${buildQ}` : "no runs match the filter"}
+            </p>
           ) : (
             <table>
               <thead>

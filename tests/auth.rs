@@ -193,7 +193,7 @@ fn a_credential_reaches_no_stream_no_row_and_no_response(dir: &Path) {
             assert!(!row.contains(secret), "a credential is on an event: {row}");
         }
     }
-    for run in store.runs(None, None, None, None, None, 100).unwrap() {
+    for run in store.runs(None, None, None, None, None, None, 100).unwrap() {
         let row = format!("{run:?}");
         for secret in [TOKEN, WRONG] {
             assert!(!row.contains(secret), "a credential is on a run: {row}");

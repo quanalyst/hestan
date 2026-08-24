@@ -591,7 +591,31 @@ CREATE TABLE launch_keys (
 CREATE INDEX launch_keys_run ON launch_keys(run_id);
 "#;
 
-pub(crate) const SCHEMA_VERSION: u32 = 23;
+/// which build of the application launched a run.
+///
+/// **recorded on the row, and never looked up.** the alternative was to join a
+/// run to whatever build the process reading the log happens to be running,
+/// which would answer every run there has ever been with today's build: a
+/// confidently wrong answer, and the exact question this column exists for is
+/// "which build produced the runs that started failing on Tuesday". so it is
+/// written once, by the process that created the run, and no later write
+/// touches it: a claim, a start, a heartbeat and a terminal write all name the
+/// columns they change and this is not one of them.
+///
+/// one nullable column, no rewrite and no index, on both backends. **null on
+/// every row written before this**, which is an absence and not an empty
+/// string: a deployment that never declared a build and a run that predates
+/// the column read the same, because they are the same thing, which is nobody
+/// having told hestan.
+///
+/// **no index over it.** the filter is a scan, exactly as the tag filter has
+/// been since v12, and an index on the largest table in the database is more
+/// than "a string per run row" costs. `docs/storage.md` has the measurement.
+const SCHEMA_V24: &str = r#"
+ALTER TABLE runs ADD COLUMN build TEXT;
+"#;
+
+pub(crate) const SCHEMA_VERSION: u32 = 24;
 
 // one transaction around every pending step and the version stamp (sqlite DDL
 // is transactional), so a crash mid-migration leaves the db exactly as found
@@ -678,6 +702,9 @@ fn migrate(conn: &mut Connection) -> Result<(), Error> {
     }
     if version < 23 {
         tx.execute_batch(SCHEMA_V23)?;
+    }
+    if version < 24 {
+        tx.execute_batch(SCHEMA_V24)?;
     }
     if version != SCHEMA_VERSION {
         tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
@@ -797,7 +824,16 @@ const EVENT_COLS: &str =
 /// two of them drifting apart is a real way to spend an afternoon.
 const RUN_COLS: &str = r#"id, job, status, "trigger", params, created_at, started_at, finished_at,
     resumed_from, error, scheduled_for, tags, priority, claimed_by, claimed_at, lease_until,
-    actor, replay_of"#;
+    actor, replay_of, build"#;
+
+/// how many columns [`RUN_COLS`] names, which is the index of the first column
+/// after it in a query that selects both.
+///
+/// a constant with a case behind it rather than a number written twice: the one
+/// query that reads a column beside a run reads it by index, and a column added
+/// to `RUN_COLS` without moving that index reads the run's last column as the
+/// other one. that failure is quiet, because both are nullable text.
+const RUN_COL_COUNT: usize = 19;
 
 /// every column [`notification_from_row`] reads, in the order it reads them.
 const NOTIFICATION_COLS: &str =
@@ -1649,7 +1685,7 @@ impl Health {
 /// # use hestan::Store;
 /// # fn f() -> Result<(), hestan::Error> {
 /// let store = Store::open("hestan.db")?;
-/// for run in store.runs(Some("nightly"), None, None, None, None, 20)? {
+/// for run in store.runs(Some("nightly"), None, None, None, None, None, 20)? {
 ///     println!("{} {} {}", run.id, run.status, run.created_at);
 /// }
 /// # Ok(())
@@ -2049,8 +2085,9 @@ impl Store {
         tx.execute(
             r#"INSERT INTO runs (id, job, status, "trigger", params, created_at, started_at,
                                  finished_at, error, resumed_from, scheduled_for, tags,
-                                 priority, plan, actor, replay_of)
-               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)"#,
+                                 priority, plan, actor, replay_of, build)
+               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16,
+                       ?17)"#,
             args![
                 &run.id,
                 &run.job,
@@ -2068,6 +2105,10 @@ impl Store {
                 plan.map(|v| v.to_string()),
                 run.actor.as_deref(),
                 run.replay_of.as_deref(),
+                // the only statement in the crate that writes this column. it
+                // is what the launching process was told, at the moment it
+                // wrote the row, and nothing later has an `UPDATE` for it
+                run.build.as_deref(),
             ],
         )?;
         for op in ops {
@@ -4206,6 +4247,16 @@ impl Store {
     /// "older than this timestamp" would skip the rest of that instant. pass
     /// the last row of the previous page as both, and no run is seen twice or
     /// missed. `since` is a window rather than a cursor.
+    ///
+    /// `build` matches [`Run::build`](crate::Run::build) exactly, which is what
+    /// answers "show me the runs from the build before last". it is a scan,
+    /// like `tag`: there is no index over either, on purpose, because an index
+    /// on the largest table in the database costs more than the column does.
+    ///
+    /// **seven filters is as many as a positional signature carries.** three of
+    /// them are `Option<&str>` and two calls that swapped a pair would both
+    /// compile, so the next one wants a named-field query the way
+    /// [`EventQuery`] already is, rather than an eighth argument here.
     // created_at is always rfc3339 utc, so the comparisons below are plain string
     // ordering; `before_id` only refines `before`, never stands alone
     #[allow(clippy::too_many_arguments)]
@@ -4216,6 +4267,7 @@ impl Store {
         before: Option<DateTime<Utc>>,
         before_id: Option<&str>,
         tag: Option<(&str, &str)>,
+        build: Option<&str>,
         limit: u32,
     ) -> Result<Vec<Run>, Error> {
         let mut conn = self.conn();
@@ -4232,9 +4284,10 @@ impl Store {
                      AND (?3{opt} IS NULL OR created_at < ?3
                           OR (?4{opt} IS NOT NULL AND created_at = ?3 AND id < ?4))
                      AND (?5{opt} IS NULL OR {tagged})
-                   ORDER BY created_at DESC, id DESC LIMIT ?7"#
+                     AND (?7{opt} IS NULL OR build = ?7)
+                   ORDER BY created_at DESC, id DESC LIMIT ?8"#
             ),
-            args![job, since, before, before_id, key, value, limit],
+            args![job, since, before, before_id, key, value, build, limit],
             run_from_row,
         )
     }
@@ -5505,7 +5558,9 @@ fn queued(db: &mut impl Exec, limit: u32) -> Result<Vec<(Run, Option<Value>)>, E
              ORDER BY priority DESC, created_at, id LIMIT ?1"
         ),
         args![limit],
-        |r| Ok((run_from_row(r)?, r.opt_json(18)?)),
+        // `plan` is the column after the run's own, so its index is the number
+        // of columns in RUN_COLS: a column added there moves this one along
+        |r| Ok((run_from_row(r)?, r.opt_json(RUN_COL_COUNT)?)),
     )
 }
 
@@ -5529,6 +5584,7 @@ fn run_from_row(row: &AnyRow<'_>) -> Result<Run, Error> {
         lease_until: row.opt_ts(15)?,
         actor: row.opt_text(16)?,
         replay_of: row.opt_text(17)?,
+        build: row.opt_text(18)?,
     })
 }
 
@@ -6302,7 +6358,18 @@ mod tests {
             claimed_at: None,
             lease_until: None,
             actor: None,
+            build: None,
         }
+    }
+
+    // the constant and the list have to agree, and the one query that reads a
+    // column beside a run is why: it takes `plan` by index, so a column added
+    // to `RUN_COLS` without the count moving reads a run's last column as its
+    // plan. both are nullable text, so nothing complains and the plan is
+    // simply wrong.
+    #[test]
+    fn the_run_column_count_is_the_number_of_columns_the_list_names() {
+        assert_eq!(RUN_COLS.split(',').count(), RUN_COL_COUNT);
     }
 
     // params reach the database through three columns and one function, so
@@ -7490,18 +7557,23 @@ mod tests {
                 store.create_run(&run, &[]).unwrap();
             }
 
-            let etl = store.runs(Some("etl"), None, None, None, None, 10).unwrap();
+            let etl = store
+                .runs(Some("etl"), None, None, None, None, None, 10)
+                .unwrap();
             assert_eq!(
                 etl.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(),
                 ["r3", "r1", "r0"]
             );
             assert_eq!(
-                store.runs(None, None, None, None, None, 2).unwrap().len(),
+                store
+                    .runs(None, None, None, None, None, None, 2)
+                    .unwrap()
+                    .len(),
                 2
             );
             assert!(
                 store
-                    .runs(Some("nope"), None, None, None, None, 10)
+                    .runs(Some("nope"), None, None, None, None, None, 10)
                     .unwrap()
                     .is_empty()
             );
@@ -7519,14 +7591,16 @@ mod tests {
             }
 
             let since = t0 + chrono::Duration::minutes(2);
-            let recent = store.runs(None, Some(since), None, None, None, 10).unwrap();
+            let recent = store
+                .runs(None, Some(since), None, None, None, None, 10)
+                .unwrap();
             assert_eq!(
                 recent.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(),
                 ["r3", "r2"]
             );
 
             let etl = store
-                .runs(Some("etl"), Some(since), None, None, None, 10)
+                .runs(Some("etl"), Some(since), None, None, None, None, 10)
                 .unwrap();
             assert_eq!(
                 etl.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(),
@@ -7536,7 +7610,7 @@ mod tests {
             let future = t0 + chrono::Duration::hours(1);
             assert!(
                 store
-                    .runs(None, Some(future), None, None, None, 10)
+                    .runs(None, Some(future), None, None, None, None, 10)
                     .unwrap()
                     .is_empty()
             );
@@ -7555,7 +7629,7 @@ mod tests {
 
             let before = t0 + chrono::Duration::minutes(2);
             let older = store
-                .runs(None, None, Some(before), None, None, 10)
+                .runs(None, None, Some(before), None, None, None, 10)
                 .unwrap();
             assert_eq!(
                 older.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(),
@@ -7564,20 +7638,20 @@ mod tests {
 
             let since = t0 + chrono::Duration::minutes(1);
             let etl = store
-                .runs(Some("etl"), Some(since), Some(before), None, None, 10)
+                .runs(Some("etl"), Some(since), Some(before), None, None, None, 10)
                 .unwrap();
             assert_eq!(
                 etl.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(),
                 ["r1"]
             );
 
-            let page = store.runs(None, None, None, None, None, 2).unwrap();
+            let page = store.runs(None, None, None, None, None, None, 2).unwrap();
             assert_eq!(
                 page.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(),
                 ["r3", "r2"]
             );
             let next = store
-                .runs(None, None, Some(page[1].created_at), None, None, 2)
+                .runs(None, None, Some(page[1].created_at), None, None, None, 2)
                 .unwrap();
             assert_eq!(
                 next.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(),
@@ -7602,9 +7676,9 @@ mod tests {
             loop {
                 let page = match &cursor {
                     Some((ts, id)) => store
-                        .runs(None, None, Some(*ts), Some(id.as_str()), None, 1)
+                        .runs(None, None, Some(*ts), Some(id.as_str()), None, None, 1)
                         .unwrap(),
-                    None => store.runs(None, None, None, None, None, 1).unwrap(),
+                    None => store.runs(None, None, None, None, None, None, 1).unwrap(),
                 };
                 let Some(run) = page.into_iter().next() else {
                     break;
@@ -7750,7 +7824,10 @@ mod tests {
             // to hold anything back from, it deletes nothing at all
             assert_eq!(prune(&store, &Retention::default().keep_last(1)), 0);
             assert_eq!(
-                store.runs(None, None, None, None, None, 10).unwrap().len(),
+                store
+                    .runs(None, None, None, None, None, None, 10)
+                    .unwrap()
+                    .len(),
                 2
             );
         });
@@ -8445,6 +8522,7 @@ mod tests {
                          DROP TABLE decider;
                          DROP TABLE store_copy;
                          DROP TABLE launch_keys;
+                         ALTER TABLE runs DROP COLUMN build;
                          UPDATE schema_version SET version = 16;"
                     ))
                     .unwrap();
@@ -8546,6 +8624,7 @@ mod tests {
                          DROP TABLE decider;
                          DROP TABLE store_copy;
                          DROP TABLE launch_keys;
+                         ALTER TABLE runs DROP COLUMN build;
                          UPDATE schema_version SET version = 17;",
                     )
                     .unwrap();
@@ -8643,6 +8722,7 @@ mod tests {
                          DROP TABLE decider;
                          DROP TABLE store_copy;
                          DROP TABLE launch_keys;
+                         ALTER TABLE runs DROP COLUMN build;
                          UPDATE schema_version SET version = 18;",
                     )
                     .unwrap();
@@ -8660,7 +8740,7 @@ mod tests {
             // null column honestly says. the sqlite fixture's r1 comes from
             // the phase-1 schema and the postgres one is written above, so
             // only what both have is asserted
-            for run in store.runs(None, None, None, None, None, 10).unwrap() {
+            for run in store.runs(None, None, None, None, None, None, 10).unwrap() {
                 assert_eq!(run.replay_of, None, "{}", run.id);
             }
 
@@ -8760,6 +8840,7 @@ mod tests {
                          DROP TABLE decider;
                          DROP TABLE store_copy;
                          DROP TABLE launch_keys;
+                         ALTER TABLE runs DROP COLUMN build;
                          {ticks}
                          UPDATE schema_version SET version = 19;"
                     ))
@@ -9357,7 +9438,7 @@ mod tests {
 
             let ids = |tag: Option<(&str, &str)>| -> Vec<String> {
                 store
-                    .runs(None, None, None, None, tag, 10)
+                    .runs(None, None, None, None, tag, None, 10)
                     .unwrap()
                     .into_iter()
                     .map(|r| r.id)
@@ -9379,7 +9460,15 @@ mod tests {
             store.create_run(&run, &[]).unwrap();
             assert_eq!(
                 store
-                    .runs(Some("etl"), None, None, None, Some(("kind", "smoke")), 10)
+                    .runs(
+                        Some("etl"),
+                        None,
+                        None,
+                        None,
+                        Some(("kind", "smoke")),
+                        None,
+                        10
+                    )
                     .unwrap()
                     .len(),
                 1
@@ -9499,7 +9588,7 @@ mod tests {
             assert_eq!(row("r3").resumed_from, None);
             assert_eq!(row("r3").trigger, Trigger::Replay);
             // and the listing reads the same columns the single row does
-            let listed = store.runs(None, None, None, None, None, 10).unwrap();
+            let listed = store.runs(None, None, None, None, None, None, 10).unwrap();
             let of = |id: &str| listed.iter().find(|r| r.id == id).unwrap();
             assert_eq!(of("r3").replay_of.as_deref(), Some("r1"));
             assert_eq!(of("r2").replay_of, None);
@@ -9694,7 +9783,7 @@ mod tests {
             Some("r1".to_string())
         );
         assert_eq!(
-            store.runs(None, None, None, None, None, 10).unwrap()[0].resumed_from,
+            store.runs(None, None, None, None, None, None, 10).unwrap()[0].resumed_from,
             Some("r1".to_string())
         );
     }
@@ -9739,7 +9828,7 @@ mod tests {
             Some("op a failed: boom")
         );
         assert_eq!(
-            store.runs(None, None, None, None, None, 10).unwrap()[0]
+            store.runs(None, None, None, None, None, None, 10).unwrap()[0]
                 .error
                 .as_deref(),
             Some("op a failed: boom")
@@ -11938,7 +12027,9 @@ mod tests {
         assert_eq!(copy.events("r1", 0).unwrap().len(), 1);
         // and every run the copy caught out of the writer's stream is whole,
         // which is what "consistent" is being claimed to mean here
-        let caught = copy.runs(None, None, None, None, None, 10_000).unwrap();
+        let caught = copy
+            .runs(None, None, None, None, None, None, 10_000)
+            .unwrap();
         assert!(caught.len() <= wrote as usize + 1);
         for run in &caught {
             assert_eq!(
@@ -12303,6 +12394,7 @@ mod tests {
                     .batch(
                         "DROP TABLE store_copy;
                          DROP TABLE launch_keys;
+                         ALTER TABLE runs DROP COLUMN build;
                          UPDATE schema_version SET version = 21;",
                     )
                     .unwrap();
@@ -12389,7 +12481,7 @@ mod tests {
                 Landed::Yes
             );
             let runs = store
-                .runs(Some("deploy"), None, None, None, None, 50)
+                .runs(Some("deploy"), None, None, None, None, None, 50)
                 .unwrap();
             assert_eq!(runs.len(), 2, "one key per run: {runs:?}");
         });
@@ -12633,7 +12725,7 @@ mod tests {
             }
 
             let runs = store
-                .runs(Some("deploy"), None, None, None, None, 50)
+                .runs(Some("deploy"), None, None, None, None, None, 50)
                 .unwrap();
             assert_eq!(runs.len(), 1, "four callers, one key, {} runs", runs.len());
             assert_eq!(runs[0].id, winner);
@@ -12686,6 +12778,7 @@ mod tests {
                     .conn()
                     .batch(
                         "DROP TABLE launch_keys;
+                         ALTER TABLE runs DROP COLUMN build;
                          UPDATE schema_version SET version = 22;",
                     )
                     .unwrap();
@@ -12720,5 +12813,162 @@ mod tests {
             let store = db.store();
             assert_eq!(store.launch_key("k").unwrap().as_deref(), Some("keyed"));
         });
+    }
+
+    /// a database at v23: everything but the build column.
+    fn at_v23(db: &Backend) {
+        match db {
+            Backend::Sqlite(dir) => {
+                let conn = Connection::open(dir.path().join("hestan.db")).unwrap();
+                // sqlite grew `DROP COLUMN` in 3.35, and the bundled build is
+                // well past it. the column is the whole of v24, so removing it
+                // is the whole of the reversal
+                conn.execute_batch("ALTER TABLE runs DROP COLUMN build;")
+                    .unwrap();
+                conn.pragma_update(None, "user_version", 23).unwrap();
+            }
+            #[cfg(feature = "postgres")]
+            Backend::Postgres(pg) => {
+                pg.store()
+                    .conn()
+                    .batch(
+                        "ALTER TABLE runs DROP COLUMN build;
+                         UPDATE schema_version SET version = 23;",
+                    )
+                    .unwrap();
+            }
+        }
+    }
+
+    // what an existing deployment sees: one column, and every row it already
+    // had reading as an absence rather than as this build's
+    #[test]
+    fn a_v23_db_migrates_to_v24_and_its_old_runs_have_no_build() {
+        both(|db| {
+            let store = db.store();
+            store
+                .create_run(&mk_run("before", "etl", Utc::now()), &["a".into()])
+                .unwrap();
+            at_v23(db);
+
+            let store = db.store();
+            assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
+            // the row that predates the column reads as nobody having said,
+            // which is what it is, and not as an empty string and not as
+            // whatever this process is running
+            assert_eq!(store.run("before").unwrap().unwrap().build, None);
+
+            // and from here a launch can carry one
+            let mut run = mk_run("after", "etl", Utc::now());
+            run.build = Some("9f2c1ab".into());
+            store.create_run(&run, &["a".into()]).unwrap();
+            assert_eq!(
+                store.run("after").unwrap().unwrap().build.as_deref(),
+                Some("9f2c1ab")
+            );
+
+            // reopening does not migrate a second time
+            drop(store);
+            let store = db.store();
+            assert_eq!(
+                store.run("after").unwrap().unwrap().build.as_deref(),
+                Some("9f2c1ab")
+            );
+        });
+    }
+
+    // "show me the runs from the build before last", which is the question the
+    // column exists to answer and the reason it is a filter rather than a line
+    // on a page
+    #[test]
+    fn the_build_filter_returns_the_runs_that_build_launched_and_no_others() {
+        both(|db| {
+            let store = db.store();
+            let at = Utc.with_ymd_and_hms(2026, 8, 24, 9, 0, 0).unwrap();
+            let planted = |id: &str, job: &str, build: Option<&str>, mins: i64| {
+                let mut run = mk_run(id, job, at + chrono::Duration::minutes(mins));
+                run.build = build.map(str::to_string);
+                store.create_run(&run, &["a".into()]).unwrap();
+            };
+            planted("old1", "etl", Some("before-last"), 0);
+            planted("old2", "report", Some("before-last"), 1);
+            planted("new1", "etl", Some("last"), 2);
+            planted("none", "etl", None, 3);
+
+            let ids = |build: Option<&str>, job: Option<&str>| -> Vec<String> {
+                store
+                    .runs(job, None, None, None, None, build, 50)
+                    .unwrap()
+                    .into_iter()
+                    .map(|r| r.id)
+                    .collect()
+            };
+            assert_eq!(ids(Some("before-last"), None), ["old2", "old1"]);
+            assert_eq!(ids(Some("last"), None), ["new1"]);
+            // and it composes with the filters beside it rather than replacing
+            // them
+            assert_eq!(ids(Some("before-last"), Some("etl")), ["old1"]);
+            // a build nothing ran under is an empty page, not every run
+            assert!(ids(Some("never-deployed"), None).is_empty());
+            // and no filter is still every run, the ones with no build
+            // included: a run that records none is not hidden by a filter
+            // nobody asked for
+            assert_eq!(ids(None, None).len(), 4);
+        });
+    }
+
+    // **what the column costs, measured rather than estimated.**
+    //
+    // one nullable text column on the largest table in the database, so the
+    // number worth having is bytes per run row on disk with a realistic value
+    // in it. two databases, the same rows in each, one with a forty-character
+    // sha and one without, vacuumed so neither is carrying free pages, and the
+    // difference divided by the rows.
+    //
+    // sqlite only. the file is the measurement, and postgres's is a directory
+    // of segments a session cannot see the fsync state of.
+    #[test]
+    fn a_build_costs_about_a_sha_per_run_row() {
+        const ROWS: usize = 2_000;
+        const SHA: &str = "9f2c1ab4d5e6f708192a3b4c5d6e7f8091a2b3c4";
+
+        let sized = |build: Option<&str>| -> u64 {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("hestan.db");
+            let store = Store::open(path.to_str().unwrap()).unwrap();
+            let at = Utc.with_ymd_and_hms(2026, 8, 24, 9, 0, 0).unwrap();
+            for i in 0..ROWS {
+                let mut run = mk_run(
+                    &format!("01a0314f-fb8b-74f2-9bd2-e806f0f7{i:04}"),
+                    "nightly",
+                    at + chrono::Duration::seconds(i as i64),
+                );
+                run.build = build.map(str::to_string);
+                // no op rows: they are identical in both databases and the
+                // question is what the runs table costs
+                store.create_run(&run, &[]).unwrap();
+            }
+            drop(store);
+            // the whole file, with the wal folded in and free pages given
+            // back, which is what an operator would see
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch("VACUUM").unwrap();
+            drop(conn);
+            std::fs::metadata(&path).unwrap().len()
+        };
+
+        let with = sized(Some(SHA));
+        let without = sized(None);
+        let per_row = (with - without) as f64 / ROWS as f64;
+        // forty bytes of sha plus a byte of serial type, and the assertion is
+        // a range rather than a number so that page granularity over 2,000
+        // rows cannot make it flap. it is also the guard: a change that put an
+        // index over the column would land well outside it
+        assert!(
+            (38.0..46.0).contains(&per_row),
+            "a {}-character build costs {per_row:.1} bytes per run row \
+             ({with} bytes against {without} over {ROWS} rows)",
+            SHA.len()
+        );
     }
 }

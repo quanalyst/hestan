@@ -327,6 +327,7 @@ mod tests {
                     claimed_at: None,
                     lease_until: None,
                     actor: None,
+                    build: None,
                 },
                 &["noop".to_string()],
             )
@@ -338,7 +339,7 @@ mod tests {
 
     fn ids(store: &Store) -> Vec<String> {
         store
-            .runs(None, None, None, None, None, 100)
+            .runs(None, None, None, None, None, None, 100)
             .unwrap()
             .into_iter()
             .map(|r| r.id)

@@ -253,6 +253,11 @@ export interface Run {
   // were. null on everything a schedule, a sensor or a backfill launched, and
   // on every launch through a deployment with no authentication
   actor: string | null;
+  // which build of the application launched this run, as recorded on the row
+  // at the moment it was created. null on a run older than the column and on
+  // one launched by a deployment that declares no build: the same absence, and
+  // never today's build standing in for it
+  build: string | null;
 }
 
 // why a queued run is not executing: which limit, and the sentence to show

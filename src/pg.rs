@@ -75,7 +75,8 @@ CREATE TABLE runs (
     lease_until TEXT COLLATE "C",
     plan TEXT COLLATE "C",
     actor TEXT COLLATE "C",
-    replay_of TEXT COLLATE "C"
+    replay_of TEXT COLLATE "C",
+    build TEXT COLLATE "C"
 );
 CREATE INDEX runs_job_created ON runs(job, created_at DESC);
 CREATE INDEX runs_queue ON runs(status, claimed_by, priority DESC, created_at);
@@ -523,6 +524,18 @@ CREATE TABLE launch_keys (
 CREATE INDEX launch_keys_run ON launch_keys(run_id);
 "#;
 
+/// which build of the application launched a run. the postgres half of
+/// `SCHEMA_V24`: one nullable column, catalog-only on both backends, no index
+/// and no rewrite.
+///
+/// this is the backend where the column earns its keep, because it is the one
+/// several processes share: a run created by a scheduler on last week's build
+/// and executed by a worker on this week's records the *launching* build, and
+/// no later write from either process touches it.
+const MIGRATE_V24: &str = r#"
+ALTER TABLE runs ADD COLUMN build TEXT COLLATE "C";
+"#;
+
 const MIGRATE_V17: &str = r#"
 ALTER TABLE events ALTER COLUMN run_id DROP NOT NULL;
 ALTER TABLE events ADD COLUMN subject_kind TEXT COLLATE "C" NOT NULL DEFAULT 'run';
@@ -582,6 +595,9 @@ fn migrate(client: &mut Client) -> Result<(), Error> {
             }
             if version < 23 {
                 tx.batch(MIGRATE_V23)?;
+            }
+            if version < 24 {
+                tx.batch(MIGRATE_V24)?;
             }
             if version != SCHEMA_VERSION {
                 tx.execute(

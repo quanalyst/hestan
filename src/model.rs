@@ -770,6 +770,23 @@ pub struct Run {
     /// not "system": `Trigger::Manual` with no actor means a person asked and
     /// nothing was checking who.
     pub actor: Option<String>,
+    /// which build of the application launched this run: whatever
+    /// [`Deployment::build`](crate::Deployment::build) was set to in the
+    /// process that wrote the row.
+    ///
+    /// **recorded, not joined.** this is the build in force at the moment the
+    /// run was created, and nothing rewrites it afterwards: a worker in
+    /// another process claims and executes the run without touching it, and a
+    /// deploy the next day does not change what it says. reading it off the
+    /// process doing the *asking* instead would answer every run in the log
+    /// with today's build, which is what makes this a column rather than a
+    /// join.
+    ///
+    /// `None` on every run written before the column existed, on every run
+    /// launched by a deployment that declares no build, and on one launched
+    /// through a [`Runner`](crate::Runner) that was never told one. the three
+    /// are one absence and hestan cannot tell them apart.
+    pub build: Option<String>,
 }
 
 /// what happens to a run whose claimer stopped renewing its lease.

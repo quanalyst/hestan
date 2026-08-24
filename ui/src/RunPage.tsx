@@ -383,6 +383,18 @@ function RunView({ id }: { id: string }) {
             {/* "manual, by whom": absent on everything a loop launched, and on
                 every launch through a deployment that checks nobody */}
             {run.actor && <> by {run.actor}</>} · created {relTime(run.created_at)}
+            {/* which build produced this run, as the row recorded it at launch.
+                absent on a run whose deployment declared no build and on one
+                older than the column, and never the build running now */}
+            {run.build && (
+              <>
+                {" "}
+                ·{" "}
+                <Link className="head-link mono" to={`/runs?build=${encodeURIComponent(run.build)}`}>
+                  build {run.build}
+                </Link>
+              </>
+            )}
             {/* the hour this run stands for, which is not when it started once
                 a schedule is catching up or a held fire drains */}
             {run.scheduled_for && (
