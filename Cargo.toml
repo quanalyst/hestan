@@ -9,6 +9,31 @@ readme = "README.md"
 keywords = ["orchestration", "scheduler", "dag", "pipeline", "cron"]
 categories = ["asynchronous", "development-tools", "web-programming::http-server"]
 repository = "https://github.com/quanalyst/hestan"
+# an allowlist, the way `.dockerignore` is one, because the default is
+# everything and the default put the ui's typescript sources, its npm lockfile,
+# the container checks and the kubernetes manifests into the published crate.
+# the rule: what compiling, testing and reading the library needs ships, and
+# what builds or checks *the repository* stays in the repository, one clone
+# away at the `repository` url above.
+#
+# `ui/dist` is here because `include_dir!` reads it at compile time and a crate
+# without it does not build. `ui/src` and `ui/test` are the sources it was
+# built from and nothing in a `cargo build` opens them. `docs/` is here because
+# `src/` and `tests/docs.rs` read pages out of it with `include_str!` and
+# `read_dir`, so a crate without it fails `cargo test`
+include = [
+    "/CHANGELOG.md",
+    "/Cargo.lock",
+    "/Cargo.toml",
+    "/LICENSE",
+    "/README.md",
+    "/SECURITY.md",
+    "/docs",
+    "/examples",
+    "/src",
+    "/tests",
+    "/ui/dist",
+]
 
 # docs.rs builds with every feature on, so the postgres store, the cli, the
 # capture layer, the otel bridge and the http source are all on the page,

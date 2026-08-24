@@ -31,6 +31,24 @@ check-pg url="postgres://hestan:hestan@localhost/hestan_test":
 checks:
     bash deploy/checks/run.sh
 
+# the packaging half of a release: what would ship, then a build of exactly
+# that file, offline and outside this directory, because a crate missing
+# something it compiles against builds here and for nobody else. see
+# RELEASING.md
+release-check:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cargo package --list
+    cargo package
+    version=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -1)
+    crate=$PWD/target/package/hestan-$version.crate
+    scratch=$(mktemp -d)
+    tar xzf "$crate" -C "$scratch"
+    cd "$scratch/hestan-$version"
+    cargo build --offline --all-features --all-targets
+    echo "built hestan-$version from $crate in $scratch"
+
+
 demo:
     cargo run --example demo --features cli
 
