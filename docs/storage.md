@@ -134,7 +134,9 @@ CREATE TABLE runs (
     claimed_at TEXT,                    -- added in v14
     lease_until TEXT,                   -- added in v14
     plan TEXT,                          -- added in v14
-    actor TEXT                          -- added in v18
+    actor TEXT,                         -- added in v18
+    replay_of TEXT,                     -- added in v19
+    build TEXT                          -- added in v24
 );
 CREATE INDEX runs_job_created ON runs(job, created_at DESC);
 CREATE INDEX runs_queue ON runs(status, claimed_by, priority DESC, created_at);
@@ -493,7 +495,13 @@ the `decider` table, one row holding the
 `launch_keys` table and its `launch_keys_run` index, which is
 [one run per launch key](launching.md#launching-once). both are new tables and
 neither reads or rewrites a row, so the upgrade is two `CREATE TABLE`s on
-either backend and a deployment that uses neither notices nothing.
+either backend and a deployment that uses neither notices nothing; version 24
+adds `runs.build`, which build of your application launched the run
+([deployment and build identity](deployment.md)). one nullable column, no
+index, and no rewrite on either backend: null on every row written before it,
+which is an absence and not an empty string, because a run that predates the
+column and a deployment that declares no build are the same thing, which is
+nobody having told hestan.
 
 an older file at any version opens straight into the current one, rows
 intact: the v8 rebuild copies every keyed materialization across, where it becomes
@@ -502,7 +510,7 @@ existing row with a null partition, which is exactly what an unpartitioned
 asset is. every pending step and the version stamp run in one transaction
 (sqlite DDL is transactional), so a crash or failure mid-migration leaves the
 file exactly as it was found, never half-migrated. a database stamped
-with a version newer than the build refuses to open (`db schema v24 is newer
+with a version newer than the build refuses to open (`db schema v25 is newer
 than this build`) instead of quietly writing an older stamp over it.
 
 ### One fire per occurrence
@@ -775,6 +783,22 @@ would otherwise ever collect.
 newest row of either is never trimmed at any `n`: an asset's latest
 materialization is its current state and a check's latest result is what the
 asset summary counts ([assets](assets.md)).
+
+### What the build column costs
+
+`runs.build` is one nullable text column on the largest table in the database,
+so it is the one addition of phase 50 with a size to it. it is **measured**
+rather than estimated, in a case in `store.rs`: 2,000 runs written into two
+databases, identical but for a forty-character git sha, both vacuumed, the
+files compared.
+
+**43 bytes per run row**, which is the forty characters plus sqlite's
+per-value overhead and page rounding. a million runs is about 41 MiB, and a ci
+build number or a short tag costs proportionally less. the case asserts a range
+rather than the number, so it cannot drift quietly, and an index over the column
+would land well outside it, which is the other thing the range guards: there is
+no index, and the filter is a scan, exactly as the tag filter has been since
+v12.
 
 ## What's stored and what stays in memory
 

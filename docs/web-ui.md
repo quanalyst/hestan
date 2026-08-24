@@ -493,10 +493,15 @@ if anything is queued or running, a "running now" section lists it with a
 live elapsed clock (ticking every second; the ticker only runs while
 something is active). below that, filters: status, trigger (manual,
 schedule, retry, resume, replay, build, sensor), a time window
-(all/1h/6h/24h), and
+(all/1h/6h/24h), a `build` box, and
 a quick find box matching substrings of the job name or run id (escape
 clears it).
-filters apply client-side to the loaded set.
+filters apply client-side to the loaded set, with two exceptions: the tag box
+and the `build` box are **served**, because a page holds fifty runs and "the
+runs from the build before last" is a question about all of them. both apply on
+enter or on leaving the box rather than on every keystroke, and escape clears
+them. the `build` box is seeded from the url, which is what the build chip on a
+[run page](#run-page) links to.
 
 one exception: the tag box is **served**. it takes `key:value` and applies on
 enter or blur, refetching from `/api/runs?tag=`, because a
@@ -522,7 +527,11 @@ now": it is over, just not finished.
 ## Run page
 
 the header names the job (linked), the short run id, trigger, creation time,
-and duration, and under it, where the job declares one, who owns it: `owned by
+duration, and, where the run recorded one, the build that launched it, linked
+to the runs page filtered to that build. that is the build in force when the
+run was created and not the one running now, and a run that recorded none shows
+no chip: a blank one would read as a build with no name. under it, where the
+job declares one, who owns it: `owned by
 ada of data-platform (#data-alerts)`, with the escalation contact after it.
 that is the [job's](namespaces.md#an-owner) owner, read off the job this run is
 of; a job nobody claimed shows no line. on a run that came from another there is also a link back to
@@ -671,7 +680,17 @@ merged into the same list so there is no seam between the two. the header says
 `live` or `not following`, because a feed that quietly stopped updating is
 worse than one that says it has. `load older` walks back a page at a time.
 
-under the heading, one line saying **who is deciding**: whether the process
+under the heading, two lines saying **what this deployment is**. the first is
+its declared name, the build of your application it runs, and the hestan
+version and platform compiled into it: `prod-eu · build 9f2c1ab · hestan
+0.1.0-beta.3 on linux/aarch64`. a deployment that declared no build says `build
+not declared` rather than putting hestan's own version where yours would go,
+which would be a confident answer to a different question. **said once, and
+here**, for the reason the deciding line below is: which build is running is a
+fact about the deployment, and repeating it on a page about one run is noise on
+that page. see [deployment and build identity](deployment.md).
+
+the second is **who is deciding**: whether the process
 serving this page is the one firing schedules and evaluating sensors, or which
 one is. schedules, sensors and [automation policies](assets.md#automation-policies)
 run on exactly one process at a time (see

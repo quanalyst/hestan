@@ -318,8 +318,31 @@ stuck, and the two histograms, which are about a trend rather than a moment.
 - **asset freshness and staleness.** per asset, so barred, and
   [`on_late`](notifications.md) already alerts on the one that matters without
   going through prometheus at all.
-- **a build info metric.** nobody pages on a version string. `/api/health`
-  carries the instance id when you need to tell two pods apart.
+- **a build info metric.** phase 46 left it out because nobody pages on a
+  version string, and phase 50, which gave hestan a build identity to publish,
+  agrees and left it out again. two reasons, and the second is the one that
+  settles it.
+
+  a `hestan_build_info{build="9f2c1ab"} 1` gauge is the standard prometheus
+  shape for this, and its cardinality is defensible: one series per process per
+  build, and the old series go stale at the next deploy rather than
+  accumulating without bound. so the cardinality argument alone would not
+  refuse it.
+
+  what refuses it is the rule at the top of this page: **every label hestan
+  emits is a `&'static str`, and that is both the rule and the whole of its
+  enforcement.** a build identity is a string read out of the environment at
+  start, which does not typecheck as one. publishing it would mean either
+  giving that rule up, or leaking the string to get a `'static` out of it,
+  which is the rule kept in letter and abandoned in spirit. neither is worth a
+  series nothing alerts on.
+
+  and there is somewhere better. `/api/health` carries the whole deployment
+  identity, including hestan's own version, the schema version and the compiled
+  features, which no metric was ever going to carry; `hestan doctor` says it in
+  a sentence; and **the run rows carry the build that launched each of them**,
+  which is the join a version string on a metric could not make. see
+  [deployment and build identity](deployment.md).
 
 ## Scraping it
 

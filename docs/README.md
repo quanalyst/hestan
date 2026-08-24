@@ -27,6 +27,7 @@
 - [namespaces and owners](namespaces.md): dividing one deployment between teams, how a namespace differs from an asset group, a token scoped to one, who owns a job or an asset, how that owner reaches a failure hook, and where the line is drawn on escalation.
 - [authentication](auth.md): the refusal that keeps an unguarded deployment off a public address, the two authenticators, the three roles endpoint by endpoint, where the ui keeps a token and what that does not protect against, the audit trail, and what this deliberately is not.
 - [scaling](scaling.md): the run queue, concurrency limits, priority, claims and leases, scheduler and worker roles, the compose example, and what several hosts needs.
+- [deployment and build identity](deployment.md): declaring which installation this is and which build of your application it runs, what hestan knows about itself without being told, the build a run records at launch, filtering a run list by it, and what the column costs.
 - [containers](containers.md): the image and what is in it, the compose stack of one scheduler and three workers, what a stop is worth next to a kill, what happened when the deciding process was cut off the network, and the kubernetes manifests nobody has applied to a cluster.
 - [http api](http-api.md): every endpoint, parameter, response shape, and error code.
 - [metrics](metrics.md): the prometheus endpoint, every metric with its type and labels, what to alert on, which side of the auth guard it sits and why, what may be a label and what may not, and what is deliberately not there.

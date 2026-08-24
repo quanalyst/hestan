@@ -158,6 +158,16 @@ schema as well. to add the next one (call it vN, one past whatever
 4. add tests like the existing ones: build a fixture database at the old
    version (see `phase1_db`), open it, assert old rows survive and new
    tables/columns work, then reopen to prove the migration doesn't run twice.
+5. the postgres fixtures rewind rather than replay: each `at_vN` drops
+   everything added *after* its version off a database created whole. so a new
+   step means adding its drop to **every** earlier `at_vN`, not only the one
+   for N-1, or the older cases fail on a column that is already there.
+
+a column added to `runs` also wants `RUN_COLS`, `run_from_row`, the insert and
+`RUN_COL_COUNT`, which is what the one query selecting a column *beside* a run
+reads that column by. get the count wrong and the run's last column is read as
+the other one, quietly, because both are nullable text; there is a case
+asserting the two agree.
 
 keep the v0 quirk in mind: version 0 plus an existing `runs` table means a
 pre-versioning database and is stamped v1 before migrating. don't reuse

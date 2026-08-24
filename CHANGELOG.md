@@ -2,6 +2,132 @@
 
 ## unreleased
 
+a run log said what ran and when. it did not say **which build of your code ran
+it**, so "this started failing on Tuesday" could not be joined to "we deployed
+on Tuesday" without going outside hestan and lining two timelines up by eye.
+
+**three identities, kept apart, because only one of them is hestan's to know.**
+
+- **hestan's own version**, which it reads at compile time, along with the
+  schema version, the features compiled and the platform.
+- **your application's build**: a git sha, a tag, an image digest. hestan is a
+  library compiled into your binary and cannot see it. **it is told or it is
+  absent**, and a version it invented would be worse than the absence.
+- **the deployment's name**: this installation as opposed to staging. also told.
+
+the one an operator cares about at 3am is the second, and hestan can only carry
+what it is given. `docs/deployment.md` is the whole of it.
+
+```rust
+Hestan::new()
+    .db("postgres://hestan@db/hestan")
+    .deployment(
+        Deployment::new()
+            .name("prod-eu")
+            .build(std::env::var("APP_BUILD").unwrap_or_default()),
+    )
+```
+
+beside `db` because it is the same sort of statement: where the run log is, and
+whose run log it is. **both halves are optional and declaring neither is the
+ordinary case**: one process on a laptop has nothing to tell itself apart from
+and should not have to fill anything in. an empty string is an absence, because
+`unwrap_or_default()` on an unset variable is how you get here and a build
+called `""` on every run row would read as an answer.
+
+**what is knowable without being told is not asked for.** `GET /api/health` and
+`hestan doctor` report hestan's version, the schema version, the compiled
+feature set, the platform as `os/arch` and whether debug assertions are on, all
+compile-time facts, in a half of the object separate from the two declared
+fields. hestan's own version is never offered in place of yours. a case reads
+`[features]` out of `Cargo.toml` and asserts the reported set is exactly it,
+with its own `cfg!` table, so a feature added tomorrow cannot go unreported.
+
+**a run remembers the build that launched it.**
+
+```
+GET /api/runs?build=9f2c1ab
+hestan runs --build 9f2c1ab
+```
+
+**recorded, not joined**, and that is the decision the phase turns on. looking
+the build up from the process doing the *reading* would answer every run there
+has ever been with today's build: a confidently wrong answer, and wrong about
+exactly the runs somebody is looking at. so it is a column on `runs`, written
+once by the process that created the row, and nothing rewrites it. a scheduler
+on last week's image queues a run and a worker already on this week's claims
+and executes it: the row says `last-week`. there is a case that runs two
+processes on two builds against one database and asserts it, and the command
+line suite does the same thing with three real processes.
+
+**filterable, or it would be decoration.** `build=` on `GET /api/runs`,
+`--build` on `hestan runs`, a `build` box on the runs page beside the tag one,
+and a build chip on a run page that links to it. the store's existing run filter
+gained a parameter rather than growing a second path; it now carries seven, and
+that is as many as a positional signature should: three of them are
+`Option<&str>` and two swapped arguments would still compile, so the next
+filter wants a named-field query like `EventQuery`, which is said on the method
+rather than left to be found.
+
+**what it costs, measured rather than estimated.** one nullable text column on
+the largest table in the database: 2,000 runs written into two databases
+identical but for a forty-character git sha, both vacuumed, the files compared.
+**43 bytes per run row**, so about 41 MiB per million runs. the case asserts a
+range so the number cannot drift, and an index over the column would land well
+outside it, which is the other thing the range guards: there is no index, and
+the filter is a scan exactly as the tag filter has been since v12.
+
+**the build stays off the metrics endpoint, deliberately.** phase 46 left it
+out because nobody pages on a version string; this phase, which finally has one
+to publish, agrees. the cardinality of a `hestan_build_info` gauge would be
+defensible, but every label hestan emits is a `&'static str` and that is both
+the rule and the whole of its enforcement, while a build read out of the
+environment is not one. publishing it would mean giving up the rule or leaking
+a string to get around it. `/api/health` is where "what is this" is answered,
+and the run rows carry the join a label never could.
+
+**what an existing deployment sees change:**
+
+- **one migration, v24, and it is one nullable column** (`runs.build`). no
+  index, no rewrite, and a catalog change on postgres. **every row written
+  before it reads as an absence**, not as an empty string and not as this
+  build: a run that predates the column and a deployment that declares no build
+  are the same thing, which is nobody having told hestan.
+- **`db schema v24`**, so a database opened by this build cannot then be opened
+  by an older one. that has been true of every migration.
+- **`GET /api/health` gains `deployment`**, and every run object gains
+  `build`, which is `null` on everything launched before this or by a
+  deployment that declares none.
+- **`Run` gains a `build` field**, which breaks a struct literal of it, as
+  `docs/stability.md` says a row type may. `Store::runs` gains a `build`
+  parameter before `limit`.
+- **`Deployment` is a new public type** with private fields and a builder, the
+  pattern `Owner` set. it is not an enum, so nothing new has to be matched.
+- **`hestan doctor` gains two lines**, `deployment` and `hestan`. a deployment
+  that declares no build gets a `note`, which does not affect the exit code; a
+  `doctor --db` run from the operator binary says plainly that the `hestan`
+  line is about *its* binary and not the deployment's.
+- **the ui says it once**, at the top of the activity page beside the deciding
+  line, and nowhere else.
+- **the container image takes `--build-arg HESTAN_BUILD`**, the compose stack
+  passes it through and names itself `compose-local`, and `deploy/k8s` shows
+  the downward-api alternative with the warning that doing both replaces a good
+  baked-in sha with an empty one. everything under `deploy/` is still
+  **unverified**: no cluster has seen it.
+- **cases**: a deployment that declares nothing reporting only what hestan
+  knows; a declared name and build reaching health, doctor, a remote doctor and
+  the ui line; the reported feature set against `Cargo.toml`; a run recording
+  the build that launched it; a worker on a different build claiming, executing
+  and settling that run without touching it, and the same claim again in the
+  queue suite across two real os processes on both backends, where the worker
+  child is started on a different declared build from the parent that
+  enqueued; a run launched by a deployment that names itself and declares no
+  build recording an absence; a
+  v23 database migrating on both backends with its old rows reading as an
+  absence; the filter alone and composed with `job`; an empty `build=`
+  being no filter rather than one matching nothing; the column count that the
+  one index-based read of a run row depends on; and the storage measurement.
+
 a store is one file or one database, and nothing said how to take a copy of it.
 that half is small. the half worth building is what a **restored** copy means,
 because every claim in one is held by a process that is somewhere else. and a

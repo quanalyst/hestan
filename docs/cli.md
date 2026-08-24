@@ -257,7 +257,7 @@ process can stop it. reach it with --server, or use the ui it is serving
 ### Looking at things
 
 ```
-runs [--job NAME] [--tag K=V] [--since 2h] [--limit N]
+runs [--job NAME] [--tag K=V] [--build SHA] [--since 2h] [--limit N]
 show <run>                      the run and every op of it
 logs <run> [--op NAME] [--follow]
 events [--kind K] [--subject S] [--level L] [--since 2h] [--follow [--after SEQ]]
@@ -290,6 +290,13 @@ one. `escalates_to` is a second contact hestan carries and nothing else: no
 timer, no acknowledgement, no second page. `--db` opens a run log and holds no
 definitions, so this needs the binary the jobs are compiled into or a
 `--server` pointed at one.
+
+`--build` is "show me the runs from the build before last": it matches the
+build the run recorded when it was **launched**, so it answers about the code
+that ran, not about the code running now. `show` prints a `build` line for a
+run that has one and nothing for a run that does not, because a blank line
+would read as a build with no name. see [deployment and build
+identity](deployment.md).
 
 `--since` takes `30m`, `2h`, `7d` or an rfc3339 instant, because one of those
 is what you type and the other is what a program has.
@@ -353,7 +360,10 @@ thing it is about is worse than no check at all.
 
 ```
 $ orders doctor
-ok    store      sqlite at /var/lib/hestan.db, schema v21
+ok    deployment prod-eu, running build 9f2c1ab
+ok    hestan     0.1.0-beta.3 in this deployment's binary, linux/aarch64,
+                 features: bundled cli postgres
+ok    store      sqlite at /var/lib/hestan.db, schema v24
 ok    writes     the store took a write lock and gave it back
 ok    schedules  2 of 2 parse
 note  schedules  paused, so they will not fire: warehouse_healthcheck
@@ -380,6 +390,8 @@ what it checks, and what each one can actually see:
 
 | check | it finds | needs |
 | ----- | -------- | ----- |
+| deployment | which installation this is and which build of your application it runs, or that it declares neither, which is a `note`: a run log that records no build cannot say which code produced anything in it. see [deployment and build identity](deployment.md) | the declaration, so the deployment's own binary |
+| hestan | the hestan version, platform, features and debug assertions of **whichever binary is running this command**, and says which binary that is: `--db` pointed at somebody else's database reports the operator binary's, not theirs | nothing |
 | store | that the database opened, which backend it is, and what schema version | a store |
 | writes | that the database would take a write: a file whose permissions changed, a disk mounted read-only, another writer holding the lock. nothing is recorded about any run while this is wrong | a store |
 | schedules | a cron expression or a timezone that no longer resolves, so the schedule silently never fires again | a store |
@@ -414,13 +426,16 @@ needs the registry rather than the store (`policies`, `rates`, `groups`,
 and a metric carrying one would need a label per asset; see
 [metrics](metrics.md#what-may-be-a-label).
 
-over `--server` doctor answers the four questions http can, and says plainly
+over `--server` doctor answers the five questions http can, and says plainly
 that it saw nothing else. whether the deployment [checks who is
 asking](auth.md), and (with a token) who it makes you; with that same token,
-whether its store is taking the writes it makes, what is queued behind each
-of its [rates](concepts.md#rates), and whether the process on the other end is
+which deployment and build it says it is, whether its store is taking the
+writes it makes, what is queued behind each of its
+[rates](concepts.md#rates), and whether the process on the other end is
 the one doing the [deciding](scaling.md#running-more-than-one-scheduler), the
-three things only the running process knows. that last one is the answer to
+things only the running process knows. the deployment line there is about the
+**other** binary, which is the one useful thing a remote doctor can say that a
+local one cannot. that last one is the answer to
 "this schedule has not fired and this process looks fine", which is a question
 about a different process. that second one is `wrong` when run outcomes are going unrecorded (the
 process has stopped claiming and is leaving what it holds for a reclaimer), and

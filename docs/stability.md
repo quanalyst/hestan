@@ -105,6 +105,11 @@ and [`Resettled`](backup.md#resettle) is what a resettle handed back. none of
 them is a thing you build, so accessors cost a caller nothing and a new field
 costs them nothing either.
 
+[`Deployment`](deployment.md) is the same pattern on the other side of the
+line: a thing callers *do* build, with private fields and a builder, for the
+reason `Owner` has one. it names what an installation is and it is exactly the
+sort of thing that grows a third half.
+
 ## The extension points
 
 a trait somebody implements is a contract whether or not it was meant as one,

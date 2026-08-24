@@ -17,7 +17,7 @@ page is for writing something that is not hestan.
 
 | method | path | purpose |
 | --- | --- | --- |
-| GET | `/api/health` | liveness, this process's instance id, what it is holding, whether it is the deciding process, and whether its store is taking writes |
+| GET | `/api/health` | liveness, this process's instance id, what it is holding, which deployment and build it is, whether it is the deciding process, and whether its store is taking writes |
 | GET | `/metrics` | prometheus text: queue depth and age, claim latency, schedule lateness, reclaims, retries, store errors and run outcomes |
 | GET | `/api/resources` | registered resources: names and types |
 | GET | `/api/jobs` | all job summaries, sorted by name |
@@ -30,7 +30,7 @@ page is for writing something that is not hestan.
 | GET | `/api/jobs/{name}/op_stats` | per-op aggregates over recent runs |
 | GET | `/api/jobs/{name}/ops/{op}/metadata/{key}` | one numeric metadata key over recent runs |
 | GET | `/api/jobs/{name}/state` | the job's committed op state |
-| GET | `/api/runs` | run list with filters and paging |
+| GET | `/api/runs` | run list with filters (job, time, tag, build) and paging |
 | GET | `/api/runs/{id}` | one run plus its op runs |
 | GET | `/api/runs/{id}/events` | the run's event log, cursored |
 | GET | `/api/events` | the whole log, newest first, filtered and cursored |
@@ -251,6 +251,17 @@ my run" and "which one has gone quiet".
   "ok": true,
   "instance": "3f2a91cc",
   "holding": ["0192...", "0192..."],
+  "deployment": {
+    "name": "prod-eu",
+    "build": "9f2c1ab",
+    "hestan": {
+      "version": "0.1.0-beta.3",
+      "schema": 24,
+      "features": ["bundled", "cli", "postgres"],
+      "platform": "linux/aarch64",
+      "debug_assertions": false
+    }
+  },
   "deciding": {
     "leader": true,
     "holder": "3f2a91cc",
@@ -266,6 +277,16 @@ my run" and "which one has gone quiet".
   }
 }
 ```
+
+`deployment` is the answer to "what **is** this", and its two halves are two
+different kinds of fact. `name` and `build` are what the deployment declared
+through `Hestan::deployment`, and are `null` until it does: hestan is a library
+compiled into your binary and cannot see which build of it this is, so it says
+so rather than guessing. everything under `hestan` is a compile-time fact about
+the library itself and is never asked for. **hestan's own `version` is not your
+build**, which is why the two are not in the same half.
+[deployment and build identity](deployment.md) is the whole of it, and
+`build` here is the same string every run this process launches records.
 
 `deciding` is the answer to "why is nothing running **here**". schedules fire,
 sensors evaluate and [automation policies](assets.md#automation-policies) build
@@ -554,7 +575,7 @@ skips `set_state` on empty pulls.
 
 ## Runs
 
-`GET /api/runs?job=&since=&before=&before_id=&tag=&limit=` returns
+`GET /api/runs?job=&since=&before=&before_id=&tag=&build=&limit=` returns
 `{"runs": [...]}`, newest first, ordered by `created_at` then `id`, both
 descending (ids are uuid v7, so the tiebreak follows creation order). `job`
 filters exactly; `since` (inclusive) and `before` (exclusive) are rfc3339
@@ -568,7 +589,11 @@ stays a plain exclusive timestamp compare (back-compat), and `before_id`
 without `before` is ignored. `tag=key:value` keeps runs carrying that exact
 [tag](launching.md#run-tags) (exact, not a prefix), split at the first colon
 so a value may hold one; anything that is not a `key:value` pair is a 400
-(`invalid tag: ...`) rather than a filter that quietly does nothing. a run:
+(`invalid tag: ...`) rather than a filter that quietly does nothing.
+`build=9f2c1ab` keeps runs [that build launched](deployment.md), matched
+exactly; an empty value is no filter rather than a filter matching nothing,
+since nothing in the column is ever an empty string. every filter composes with
+every other. a run:
 
 ```json
 {
@@ -589,7 +614,8 @@ so a value may hold one; anything that is not a `key:value` pair is a 400
   "claimed_by": "3f2a91cc",
   "claimed_at": "2026-08-07T12:00:00Z",
   "lease_until": null,
-  "actor": "ada"
+  "actor": "ada",
+  "build": "9f2c1ab"
 }
 ```
 
@@ -599,6 +625,16 @@ credential. it is null on everything a schedule, a sensor, a backfill or a
 freshness policy launched, and on every launch through a deployment with no
 authenticator: `"trigger": "manual"` with no actor means a person asked and
 nothing was checking who.
+
+`build` is which build of your application launched this run, recorded on the
+row at the moment it was created and never rewritten: a worker on a newer build
+claims and executes it without touching it. so a run read back next year still
+names the code that produced it, rather than whatever is deployed on the day
+somebody asks. `null` means hestan was not told, which covers a run written
+before the column existed, one launched by a deployment that declares no build,
+and one launched through a `Runner` that was never given one. hestan is a
+library inside your binary and cannot see your build:
+[deployment and build identity](deployment.md) is where it comes from.
 
 a failed run's `error` names the first op that terminally failed, as
 `"op publish failed: warehouse connection reset"`, the same pair an

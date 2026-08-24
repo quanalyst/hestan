@@ -87,6 +87,63 @@ compiler, which the rust image has. tokio-postgres speaks the wire protocol in
 rust, so there is no libpq. reqwest is rustls over ring, so there is no openssl
 and no pkg-config.
 
+### Which build an image is
+
+hestan is a library compiled into the binary above. it can read its own
+version, its schema version and the features it compiled, and it cannot read
+your git sha: the repository the image was built from is not one it is in. so
+the sha goes in at the one moment somebody knows it, which is the build:
+
+```
+docker build --build-arg HESTAN_BUILD=$(git rev-parse --short HEAD) -t hestan-demo .
+```
+
+the `Dockerfile` turns that argument into an `ENV`, the demo reads it and hands
+it to `Deployment::build`, and from there **every run this image launches
+records it**. `docker-compose.yml` passes the same value through:
+
+```
+HESTAN_BUILD=$(git rev-parse --short HEAD) docker compose up -d --build
+```
+
+the argument is last in the `Dockerfile`, after the layers that do work,
+because it changes on every commit and a build layer under it would be rebuilt
+every time.
+
+**unset is an absence, not a build called `unknown`.** the default is the empty
+string, hestan reads an empty string as nobody having said, and a run log that
+says nothing about the build is a better answer than one where every run since
+the beginning of time came from `unknown`.
+
+what the running stack then says:
+
+```
+$ curl -s -H "Authorization: Bearer demo-token-change-me" \
+    localhost:4000/api/health | jq .deployment
+{
+  "name": "compose-local",
+  "build": "9f2c1ab",
+  "hestan": {
+    "version": "0.1.0-beta.3",
+    "schema": 24,
+    "features": ["bundled", "cli", "postgres"],
+    "platform": "linux/aarch64",
+    "debug_assertions": false
+  }
+}
+```
+
+`name` is `HESTAN_DEPLOYMENT`, set in the compose file rather than in the
+image: the same image is this deployment or another one depending on where it
+is started, and the build is a fact about the image itself. everything under
+`hestan` was never asked for. [deployment and build
+identity](deployment.md) is the whole of the distinction, and the run column is
+the half worth having:
+
+```
+$ docker compose exec scheduler hestan-demo runs --build 9f2c1ab
+```
+
 ## The compose stack
 
 ```
@@ -373,7 +430,7 @@ by one. every file says so on its first line. what has been done to it is
 --dry-run=client` cannot validate it offline, because that downloads a schema
 from a cluster.
 
-two fields are worth the comment they carry.
+three fields are worth the comment they carry.
 
 **the scheduler runs two replicas.** one process at a time decides, and which
 one is settled by [a lease in the store](scaling.md#the-deciding-lease) rather
@@ -394,6 +451,21 @@ store is reachable: `GET /api/health` is where that lives, in an `ok` field,
 and it answers 200 either way on purpose, because the endpoint answering is the
 news. readiness here means serving, not healthy, and something that can hold a
 token has to watch `/api/health`'s body for the rest.
+
+**the build identity has two ways in, and the manifests take the first.**
+nothing in `deploy/k8s` sets `HESTAN_BUILD`, because the image already carries
+it from `--build-arg`, and the image saying which build it is cannot come apart
+from the image. the second way is the downward api: an
+`app.kubernetes.io/version` annotation on the pod template, set per release by
+whatever cuts your releases, read back with a `fieldRef`. `scheduler.yaml` has
+those three lines commented out with the reason, which is that **doing both is
+worse than either**: a pod env var overrides the image's, so an unset
+annotation would replace a perfectly good baked-in sha with an empty string.
+
+`HESTAN_DEPLOYMENT` does come from the downward api, off `metadata.namespace`,
+because a namespace is a name the cluster already has and keeps in step with
+itself. the configmap sets neither: it is shared by every release, and the
+build changes with each of them.
 
 **`podmonitor.yaml` is a prometheus operator resource, which is a second thing
 nobody here has run.** it selects every hestan pod (both deployments: a worker
@@ -427,5 +499,7 @@ new execution paths.
 - [authentication](auth.md): the token these files set, and where a real one
   comes from.
 - [metrics](metrics.md): what a scrape of one of these containers reads.
+- [deployment and build identity](deployment.md): the declaration the build
+  argument above feeds, and the run column it lands in.
 - [development](development.md): the gates, and the ui build loop the image
   depends on.

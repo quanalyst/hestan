@@ -497,6 +497,7 @@ the details live in [docs/](docs/README.md):
 [the http api](docs/http-api.md), [metrics](docs/metrics.md),
 [storage](docs/storage.md), [backup and recovery](docs/backup.md),
 [scaling](docs/scaling.md), [containers](docs/containers.md),
+[deployment and build identity](docs/deployment.md),
 [embedding](docs/embedding.md), [stability](docs/stability.md), and
 [development](docs/development.md).
 release notes are in [CHANGELOG.md](CHANGELOG.md).
