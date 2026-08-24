@@ -44,7 +44,18 @@ tests/          pipeline.rs, assets.rs, isolation.rs, queue.rs, auth.rs,
                 otel.rs (needs otel); cli.rs (needs cli); parquet.rs (needs
                 parquet); dbt.rs (needs dbt), over the fixture manifest in
                 tests/fixtures/dbt/
+deploy/         the container checks as scripts, and the kubernetes manifests
+                nobody has applied to a cluster
+docs/           these pages; src/ and tests/ read some of them back
 ```
+
+`Cargo.toml`'s `include` is an allowlist of what a published `.crate` holds,
+and a good deal of the tree is not in it: `src`, `tests`, `examples`, `docs`,
+`ui/dist` and five files at the root are. what builds or checks the repository
+rather than the library stays here, which is `ui/src`, `deploy/`, the
+`Dockerfile`, the compose files, this justfile and the ci workflow.
+[RELEASING.md](../RELEASING.md) is what a person does with all of it, in order,
+and `tests/docs.rs` is what holds the list to the rule in both directions.
 
 ## Gates
 
@@ -52,12 +63,13 @@ tests/          pipeline.rs, assets.rs, isolation.rs, queue.rs, auth.rs,
 `cli`, `parquet` and `dbt` each compile real extra code, and all but
 `postgres` gate a test target of their own via `required-features`;
 postgres's extra coverage is the second half of the store suite instead. the
-crate has to be clean without any of them as well as with them, so nine
+crate has to be clean without any of them as well as with them, so ten
 configurations are checked rather than one:
 
 ```
 cargo fmt --check
 cargo clippy --all-targets -- -D warnings
+cargo clippy --all-targets --no-default-features -- -D warnings
 cargo clippy --all-targets --features http -- -D warnings
 cargo clippy --all-targets --features capture -- -D warnings
 cargo clippy --all-targets --features postgres -- -D warnings
@@ -77,19 +89,36 @@ cargo test --features dbt
 cargo test --all-features
 ```
 
+**`--no-default-features` is the tenth, and the odd one out.** every other
+configuration is a subset of `--all-features`, so the last clippy and the last
+test cover them all over again; turning `bundled` off is the one a consumer can
+reach that is not. it is linted rather than tested because with `bundled` off
+the link wants a system sqlite, and whether one is installed is a fact about
+the machine rather than anything this repository can promise.
+
+**`just docs` is the page docs.rs will build**, on nightly with every feature,
+`--cfg docsrs` and warnings denied. it is not part of `just check` because it
+wants a nightly toolchain, so ci runs it as a job of its own. it matters
+because `deny(missing_docs)` and `deny(rustdoc::broken_intra_doc_links)` are
+both live: a doc build that fails on docs.rs is a release whose documentation
+page is an error message.
+
 ci additionally runs the ui's own gates (`npm run lint`, `npm test` and
 `npm run build`) and fails on a `ui/dist` diff, so a stale committed bundle
 can't ship. two things it does that `just check` cannot: it sets
 `HESTAN_TEST_PG`, so the postgres half of the store suite actually runs
-(`just check-pg` is the local equivalent), and it compiles the whole thing on
-the msrv toolchain, so a newer language feature slipping in is caught here
-rather than by whoever is pinned.
+(`just check-pg` is the local equivalent), and it type-checks every target
+under every feature on the msrv toolchain (`cargo check`, on 1.88), so a newer
+language feature slipping in is caught here rather than by whoever is pinned.
+running the *suite* on that toolchain rather than type-checking it is a release
+step; [RELEASING.md](../RELEASING.md) has it.
 
 the other justfile recipes: `just check-pg` (the store suite with a real
 postgres behind it), `just demo` (the demo on :4000), `just assets` (the
 assets example on :4002), `just http-source`, `just ui-dev` (vite dev server),
 `just ui-test` (the ui suites), `just ui-build` (rebuild `ui/dist` and touch
-`src/server.rs`), `just build`.
+`src/server.rs`), `just docs` (the docs.rs page), `just release-check` (package
+the crate and build that file offline somewhere else), `just build`.
 
 ## The ui loop
 

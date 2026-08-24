@@ -1,6 +1,86 @@
 # changelog
 
-## unreleased
+## 0.1.0 (2026-08-24)
+
+the first release that is not a pre-release. the surfaces in
+[stability](docs/stability.md) are now held by a version number rather than by
+a tag: cargo reads `hestan = "0.1.0"` as `>=0.1.0, <0.2.0`, so a break has to
+wait for a `0.2.0` that nothing updates a deployment onto by itself.
+
+**upgrading from `0.1.0-beta.3`: every source break is in the table below, one
+behaviour break follows it, and `cargo update` brings a deployment here without
+being asked.** a requirement written `hestan = "0.1.0-beta.3"` has the same
+`<0.2.0` ceiling a released one does, so the pre-release tag held nobody back
+from this. each source break is a compile error rather than a change of
+meaning, and each has something to write instead:
+
+| what moved | what to write instead |
+| --- | --- |
+| eleven enums are `#[non_exhaustive]`: `Error`, `Meta`, `InputError`, `Auth`, `Trigger`, `SubjectKind`, `EventKind`, `TickOutcome`, `When`, `Reclaim`, `Blocked` | a `_` arm on a `match` over one. no variant was added, renamed or removed, and `matches!`, `if let` and naming a variant to construct it are all untouched |
+| `Meta` gained `Series` and `Saved`; `EventKind` gained `RunReleased` | the same `_` arm, which is what those two being open is for from here on |
+| `Identity` gained a public `scope` field | `Identity::new(name, access)`, or `viewer`, `operator`, `admin`, which is what the docs have always shown |
+| `RunEvent`, `RunFailure` and `LateEvent` gained an `owner` field | nothing, unless you built one: a hook is handed a payload rather than building one |
+| `Run` gained a `build` field | the same. `Store::runs` hands them back |
+| `Store::runs` gained a `build` parameter, before `limit` | `None`, which is what the call meant before |
+| `Scope::may_touch_job` and `Scope::may_touch_asset` take the namespace as a second argument | `None`, likewise |
+
+the behaviour break is one, and it is the sharp edge of secret params:
+**a run launched with a param declared through `Op::secret_params` cannot be
+replayed, resumed or retried.** the store holds a marker rather than the value,
+and re-launching off that row would run the job with the literal
+`[hestan:redacted]` as its credential. launch again and pass it, or move the
+credential to a resource. [secrets](docs/secrets.md).
+
+**the store goes from schema v19 to v24**, five migrations applied on first
+open, on both backends. **rolling one back is not supported.** hestan writes no
+down migrations, and a build refuses a database written by a newer hestan
+rather than guessing at it, which is the correct half of that. an operator who
+has to go back to a beta binary restores the copy taken before the upgrade:
+that is what `hestan backup` is for and [backup and recovery](docs/backup.md)
+is the order to work in. there is no in-place downgrade and none is planned.
+
+**what 0.1.0 is.** a library compiled into your own binary: ops wired into
+jobs, cron schedules, sensors, assets with fingerprints and provable staleness,
+a run log on sqlite or postgres, notification hooks, an embedded web ui, a json
+api, a command line over the same registry, and a run queue several processes
+on one host share. nothing is deployed beside it and there is no daemon. the
+five surfaces in [stability](docs/stability.md) are what a caller may build on
+and they move together on the one version number.
+
+**what 0.1.0 is not.** each of these is written where it belongs in the docs.
+they are gathered here because somebody deciding whether to depend on hestan
+should not have to find them one at a time.
+
+- **the kubernetes manifests have never been applied to a cluster.**
+  `deploy/k8s` is written from what the compose stack does, and every file in
+  it says so on its own first line. it is a starting point somebody has to try,
+  not a deployment anybody has run.
+- **the operating envelope was measured on one machine and is not a load
+  qualification.** the image sizes, the 3.2-to-44.5-second window a partitioned
+  process takes to notice the network came back, and every other number in
+  [containers](docs/containers.md) are measurements of the runs named, on one
+  box, and none of them is a guarantee. nobody has run hestan under sustained
+  load, and nobody has run its workers on more than one *host*: that a process
+  on another host differs only in which socket it opens is an argument rather
+  than a run, and [scaling](docs/scaling.md) keeps the difference.
+- **secret params are single-process.** the value lives in the memory of
+  whatever took the launch, so they work on a one-process deployment, and on a
+  multi-process one only when whatever launched also executes. a scheduler
+  enqueuing for separate workers is exactly the shape they do not work in; that
+  shape wants a resource. they cover top-level keys only and they encrypt
+  nothing.
+- **a scope is an authority boundary and not a confidentiality one.** it
+  narrows what a token may do and it does not narrow what a token may see:
+  reads are not filtered by it, and the ui shows a scoped token controls that
+  the api will then refuse. keeping data from a caller wants a proxy in front or
+  `Auth::custom`, and [authentication](docs/auth.md) says why the small exact
+  promise was preferred to a large approximate one.
+- **sqlite is one host.** several processes on one host share the file; workers
+  on more than one host need postgres. that is a property of sqlite and not
+  something hestan can lift.
+
+what changed since `0.1.0-beta.3`, in the order it landed, is the rest of this
+entry.
 
 a run log said what ran and when. it did not say **which build of your code ran
 it**, so "this started failing on Tuesday" could not be joined to "we deployed

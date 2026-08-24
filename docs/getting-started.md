@@ -11,20 +11,22 @@ binary.
 cargo new orders && cd orders
 cargo add hestan
 cargo add tokio --features full
-cargo add serde_json
 ```
 
-tokio because everything hestan runs is async and something has to drive it;
-`serde_json` because an op hands its result back as json. that is the whole of
-the setup. to track the repository instead of the release, with a tag
+tokio because everything hestan runs is async and something has to drive it,
+and that is the whole of the setup. an op hands its result back as json, and
+`json!` and `Value` come out of `hestan::prelude`, so nothing on this page
+needs a `serde_json` of its own; add that, and `serde` with `derive`, at the
+point your ops start taking [typed params](typed-io.md) or returning types you
+declared. to track the repository instead of the release, with a tag
 or a sibling checkout for hacking on both at once:
 
 ```toml
-hestan = { git = "https://github.com/quanalyst/hestan", tag = "v0.1.0-beta.3" }
+hestan = { git = "https://github.com/quanalyst/hestan", tag = "v0.1.0" }
 hestan = { path = "../hestan" }
 ```
 
-this is alpha: under 0.x the api changes without a deprecation cycle, so read
+this is a 0.x: the api changes without a deprecation cycle, so read
 [the changelog](../CHANGELOG.md) before bumping. everything on this page works
 with no cargo features turned on; the optional ones are listed in
 [the readme](../README.md#using-it-from-your-project).

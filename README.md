@@ -13,13 +13,14 @@ anything but loopback under that default. an address anyone can reach needs an
 [authenticator](docs/auth.md): one token, or your own check. see
 [SECURITY.md](SECURITY.md).
 
-pin an exact version: under 0.x the api changes without a deprecation cycle.
+under 0.x the api changes without a deprecation cycle, and the minor number is
+where a break lands.
 
 ## Quickstart
 
 ```toml
 [dependencies]
-hestan = "0.1.0-beta.3"
+hestan = "0.1.0"
 tokio = { version = "1", features = ["full"] }
 ```
 
@@ -71,7 +72,7 @@ Hestan::new()
 ```
 
 ```toml
-hestan = { version = "0.1.0-beta.3", features = ["http"] }
+hestan = { version = "0.1.0", features = ["http"] }
 ```
 
 transport errors, 429s, and 5xx responses are retried with capped exponential
@@ -506,7 +507,7 @@ release notes are in [CHANGELOG.md](CHANGELOG.md).
 
 ```toml
 [dependencies]
-hestan = "0.1.0-beta.3"
+hestan = "0.1.0"
 ```
 
 the binary is yours: define jobs, then `Hestan::new()...serve(addr)`, or
@@ -528,8 +529,9 @@ should get to decline:
 | `parquet` | `ParquetIo`, op outputs stored as parquet files ([io managers](docs/io-managers.md)) |
 | `dbt` | `hestan::dbt`, a dbt project's models as assets ([dbt](docs/dbt.md)) |
 
-it is a `0.1.0-beta`, so a break is possible and arrives announced: the first
-line of a changelog entry names every type that moved and what to write
+it is a 0.x, so a break is possible and arrives announced: it lands on a new
+minor version, which `hestan = "0.1"` does not take on its own, and the first
+line of that changelog entry names every type that moved and what to write
 instead. [stability](docs/stability.md) is which types are a closed set,
 which will grow and want a `_` arm, and which of the traits here are
 contracts because somebody implements them.

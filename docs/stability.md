@@ -1,8 +1,8 @@
 # Stability
 
-hestan is `0.1.0-beta.3`, which is a version that says out loud that it will
-move. this page is what it will not move, so that something can be built on it
-in the meantime.
+hestan is `0.1.0`, which is a 0.x version and therefore one that says out loud
+that it will move. this page is what it will not move, so that something can be
+built on it in the meantime.
 
 it is not a promise about 1.0. it is a description of how 0.x is run, and the
 whole of it is one sentence: **the things a caller reads, and the traits a
@@ -11,20 +11,29 @@ what moved and what to write instead.**
 
 ## The version
 
-the version carries a pre-release tag, so `cargo update` moves a deployment
-from `beta.3` to `beta.4` without anybody asking. a break therefore has to be
-the **first line** of its changelog entry rather than a paragraph inside it,
-because the first line is the only part somebody reads before finding out the
-hard way.
+cargo reads `hestan = "0.1.0"` as `>=0.1.0, <0.2.0`, so under 0.x the **minor
+number is the compatibility number**. a `0.1.1` is additions and fixes and
+`cargo update` takes it; a break lands on `0.2.0`, which the same requirement
+refuses until somebody edits the manifest.
 
-what may land without breaking a build: a new method, a new variant on one of
-the enums marked `#[non_exhaustive]` below, a new endpoint, a new column behind
-a migration, a better sentence in an error.
+that much is new as of 0.1.0, and it is the one thing the release changed about
+this page. up to `0.1.0-beta.3` the version carried a pre-release tag, whose
+requirement has the same `<0.2.0` ceiling: `cargo update` moved a deployment
+from `beta.3` to `beta.4`, and then onto `0.1.0` itself, without anybody
+asking. so a break has to be the **first line** of its changelog entry rather
+than a paragraph inside it, and it stays there: the first line is the only part
+somebody reads before finding out the hard way, and a requirement written
+`hestan = "0"` still takes a `0.2.0` on its own.
 
-what may not, and is therefore called out: a variant on any other enum, a
-**field on a public struct** (that is a source break for a struct literal, and
-hestan counts it as one), a required method on a trait somebody implements, a
-rename, a removal, a default that changes what an unchanged deployment does.
+what may land in a `0.1.x` without breaking a build: a new method, a new
+variant on one of the enums marked `#[non_exhaustive]` below, a new endpoint, a
+new column behind a migration, a better sentence in an error.
+
+what may not, and is therefore what a `0.2.0` is for: a variant on any other
+enum, a **field on a public struct** (that is a source break for a struct
+literal, and hestan counts it as one), a required method on a trait somebody
+implements, a rename, a removal, a default that changes what an unchanged
+deployment does.
 
 ## The surfaces
 

@@ -124,11 +124,11 @@ hestan = { path = "../hestan" }
 cargo resolves the git dependency to your working copy while the manifest
 keeps the tag; delete the file and you're back on the pin.
 
-either way you are pinning a `0.1.0-beta`, and the version carries a
-pre-release tag, so `cargo update` moves you between betas without asking.
-[stability](stability.md) is what that costs and what it does not: which
-surfaces hold still, which types are a closed set, and which of the traits
-you implement are contracts.
+either way you are pinning a 0.x, where the minor number is the compatibility
+number: `cargo update` moves you within `0.1.x` without asking and stops at
+`0.2.0`. [stability](stability.md) is what that costs and what it does not:
+which surfaces hold still, which types are a closed set, and which of the
+traits you implement are contracts.
 
 ## Where the database lives
 
