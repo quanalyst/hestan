@@ -906,6 +906,7 @@ async fn dispatch(reach: Reach, command: Command, out: &Out) -> Result<(), Fail>
                                 &app.store,
                                 |p| pools.get(p).copied(),
                                 |r| rates.get(r).copied(),
+                                |l| app.registry.hue_of(l),
                             )
                         })
                         .collect::<Result<_, _>>()?;
@@ -3136,8 +3137,10 @@ const HUE_APART: u16 = 8;
 /// prevent that, so this reports it instead: a limit found with a tool rather
 /// than by squinting at a screen.
 fn check_colours(app: &Inspected) -> Finding {
-    // both channels at once: a group is a colour and so is an origin, and a
-    // pair that collides collides in whichever view is showing
+    // every channel at once: a group is a colour and so is an origin, and a
+    // pair that collides collides in whichever view is showing. a job's group
+    // is in here for the same reason it shares the hue with an asset's, which
+    // is that it is the same label
     let mut labels: BTreeSet<&str> = BTreeSet::new();
     for meta in app.registry.topo() {
         if let Some(group) = meta.group() {
@@ -3145,6 +3148,7 @@ fn check_colours(app: &Inspected) -> Finding {
         }
         labels.extend(meta.provenance.iter().map(String::as_str));
     }
+    labels.extend(app.jobs.iter().filter_map(Job::group));
     if labels.len() < 2 {
         return Finding::ok(
             "colours",

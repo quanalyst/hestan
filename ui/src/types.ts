@@ -185,8 +185,14 @@ export interface JobSummary {
   name: string;
   description: string | null;
   // which slice of the deployment it is in; null in one that declares no
-  // namespaces. not a group: see AssetSummary below
+  // namespaces. not a group: see below
   namespace: string | null;
+  // what it is labeled with on the timeline; null wherever nothing declared
+  // one, which for a job has no fallback out of it
+  group: string | null;
+  // and the angle that group is drawn at; null wherever the group is. the same
+  // angle an asset group of the same name gets: one label, one colour
+  group_hue: number | null;
   // who to wake when a run of it fails; null for a job nobody claimed
   owner: Owner | null;
   ops: OpSummary[];

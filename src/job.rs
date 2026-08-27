@@ -3,6 +3,7 @@ use std::time::Duration;
 
 use serde_json::{Value, json};
 
+use crate::asset::check_group;
 use crate::error::Error;
 use crate::graph;
 use crate::hooks::{Hooks, OpEvent, RunEvent};
@@ -41,6 +42,7 @@ pub struct Job {
     name: String,
     description: Option<String>,
     namespace: Option<String>,
+    group: Option<String>,
     owner: Option<Owner>,
     ops: Vec<Op>,
     order: Vec<String>,
@@ -69,6 +71,7 @@ impl Job {
             name: name.into(),
             description: None,
             namespace: None,
+            group: None,
             owner: None,
             ops: Vec::new(),
             instances: Vec::new(),
@@ -100,6 +103,14 @@ impl Job {
     /// existed.
     pub fn namespace(&self) -> Option<&str> {
         self.namespace.as_deref()
+    }
+
+    /// what this job is labeled with on the timeline, from
+    /// [`JobBuilder::group`]. `None` is every job in a deployment that
+    /// declares no groups, which is what one looked like before they existed,
+    /// and there is no fallback: a job's group is declared or it is absent.
+    pub fn group(&self) -> Option<&str> {
+        self.group.as_deref()
     }
 
     /// who to wake when a run of this job fails, from
@@ -268,6 +279,7 @@ impl Job {
             name,
             description,
             namespace: None,
+            group: None,
             owner: None,
             ops,
             order,
@@ -889,6 +901,7 @@ pub struct JobBuilder {
     name: String,
     description: Option<String>,
     namespace: Option<String>,
+    group: Option<String>,
     owner: Option<Owner>,
     ops: Vec<Op>,
     instances: Vec<Instance>,
@@ -921,10 +934,10 @@ impl JobBuilder {
     ///
     /// a namespace is what a [scope](crate::Scope) names to admit a whole
     /// team's jobs and assets at once, and what `?namespace=` narrows the api
-    /// and the ui to. **it is not an asset [`group`](crate::Asset::group)**: a
-    /// group labels the asset graph and hestan draws it, a namespace divides
-    /// the deployment and hestan enforces it, and neither is derived from the
-    /// other. `docs/namespaces.md` is the whole of it.
+    /// and the ui to. **it is not a [`group`](Self::group)**: a group labels a
+    /// picture and hestan draws it, a namespace divides the deployment and
+    /// hestan enforces it, and neither is derived from the other.
+    /// `docs/namespaces.md` is the whole of it.
     ///
     /// declared here rather than parsed out of the job's name, because the
     /// name is the key every run row, schedule and api path refers to a job
@@ -935,6 +948,53 @@ impl JobBuilder {
     /// [`build`](Self::build).
     pub fn namespace(mut self, name: impl Into<String>) -> Self {
         self.namespace = Some(name.into());
+        self
+    }
+
+    /// what this job is labeled with on the timeline: one flat name, with
+    /// nothing nested inside it.
+    ///
+    /// ```
+    /// # use hestan::Job;
+    /// # fn main() -> Result<(), hestan::Error> {
+    /// let job = Job::builder("weather_pull").group("weather").build()?;
+    /// assert_eq!(job.group(), Some("weather"));
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// **a group is a label, not a boundary.** it clusters the timeline and
+    /// colours it, and nothing reads it to decide who may touch what. the
+    /// boundary is a [`namespace`](Self::namespace), it is declared, and
+    /// neither is derived from the other. `docs/namespaces.md` says which to
+    /// reach for.
+    ///
+    /// **it is the same label an [asset](crate::Asset::group) declares**, so a
+    /// job in group `weather` and the assets in group `weather` are drawn in
+    /// one colour, and pinning that colour with
+    /// [`Asset::hue`](crate::Asset::hue) moves both. one name, one hue, in the
+    /// timeline, the graph, the api and the command line.
+    ///
+    /// declaring it is what makes regrouping cheap, for the reason a
+    /// [`namespace`](Self::namespace) is declared: the name is the key every
+    /// run row, schedule and api path refers to a job by, so regrouping by
+    /// renaming starts the job's history over and regrouping with this leaves
+    /// it where it is.
+    ///
+    /// **there is no fallback, and that is the one place this differs from an
+    /// asset's group.** an asset's falls back to the part of its name before
+    /// the first `/`, because that is how the asset graph grouped before
+    /// `Asset::group` existed and the fallback keeps an existing graph looking
+    /// the way it looked. no timeline has ever grouped by anything, so the
+    /// same rule here means the same thing and produces the opposite
+    /// mechanics: a job's group is declared or it is absent, and a deployment
+    /// that declares none folds nothing.
+    ///
+    /// a group that is empty or only spaces, or that contains `/`, fails
+    /// [`build`](Self::build), which are the two refusals an asset's group
+    /// gets from the same function.
+    pub fn group(mut self, name: impl Into<String>) -> Self {
+        self.group = Some(name.into());
         self
     }
 
@@ -1095,6 +1155,9 @@ impl JobBuilder {
             return Err(Error::Graph(format!("job {}: {e}", self.name)));
         }
         check_namespace("job", &self.name, self.namespace.as_deref())?;
+        if let Some(group) = self.group.as_deref() {
+            check_group("job", &self.name, group)?;
+        }
         let ops = flatten(&self.name, self.ops, self.instances)?;
         let pairs: Vec<_> = ops
             .iter()
@@ -1109,6 +1172,7 @@ impl JobBuilder {
             name: self.name,
             description: self.description,
             namespace: self.namespace,
+            group: self.group,
             owner: self.owner,
             ops,
             order,
@@ -1186,6 +1250,55 @@ mod tests {
                 .namespace(),
             None
         );
+    }
+
+    // a group carries through the builder and reads back as what was
+    // declared, and a job that declares none reads as an absence rather than
+    // as a group called something
+    #[test]
+    fn a_job_carries_the_group_it_declared_and_none_where_it_declared_none() {
+        let job = Job::builder("weather_pull")
+            .op(op("run"))
+            .group("weather")
+            .build()
+            .unwrap();
+        assert_eq!(job.group(), Some("weather"));
+
+        assert_eq!(
+            Job::builder("weather_pull")
+                .op(op("run"))
+                .build()
+                .unwrap()
+                .group(),
+            None
+        );
+    }
+
+    // **no fallback.** an asset's group falls back to the part of its name
+    // before the first "/" because that is how the asset graph grouped before
+    // anybody could declare one. no timeline ever grouped by anything, so a
+    // slash in a job's name is a slash in a job's name
+    #[test]
+    fn a_slash_in_a_jobs_name_does_not_make_a_group_out_of_the_prefix() {
+        let job = Job::builder("finance/etl").op(op("run")).build().unwrap();
+        assert_eq!(job.group(), None);
+        assert_eq!(job.name(), "finance/etl");
+    }
+
+    // the same two refusals an asset's group gets, from the same function:
+    // a name with nothing in it, and a name with the separator in it
+    #[test]
+    fn a_group_that_could_not_be_drawn_fails_the_build_naming_the_job() {
+        let said = build_err(Job::builder("etl").op(op("run")).group(""));
+        assert!(said.contains("job etl"), "{said}");
+        assert!(said.contains("no name in it"), "{said}");
+
+        let said = build_err(Job::builder("etl").op(op("run")).group("   "));
+        assert!(said.contains("no name in it"), "{said}");
+
+        let said = build_err(Job::builder("etl").op(op("run")).group("a/b"));
+        assert!(said.contains("job etl") && said.contains("a/b"), "{said}");
+        assert!(said.contains("a group is flat"), "{said}");
     }
 
     // a limit caps a process. in-process that process is the orchestrator, so

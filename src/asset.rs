@@ -1361,12 +1361,41 @@ fn walk_provenance(metas: &mut [AssetMeta], by_name: &HashMap<String, usize>) {
     }
 }
 
+/// the two refusals a declared group gets wherever it was declared: on an
+/// asset, and on a [job](crate::JobBuilder::group). a name with nothing in it,
+/// and a name with the separator in it that a folded node would draw as
+/// nesting.
+///
+/// one function for both because a job group and an asset group of the same
+/// name are one label with one hue. a name one of them may carry and the other
+/// may not would be a label that exists in half the deployment, and the two
+/// wordings would drift apart the first time one of them was edited.
+///
+/// `what` and `which` name the thing declaring it, so the build error says
+/// which line to go and look at.
+pub(crate) fn check_group(what: &str, which: &str, group: &str) -> Result<(), Error> {
+    if group.trim().is_empty() {
+        return Err(Error::Graph(format!(
+            "{what} {which}: declared group {group:?} has no name in it, and a group with no name \
+             is no group"
+        )));
+    }
+    if group.contains(GROUP_SEPARATOR) {
+        return Err(Error::Graph(format!(
+            "{what} {which}: declared group {group:?} contains {GROUP_SEPARATOR:?}, which is the \
+             character a name uses to say which group it is in, so {group:?} reads as nesting \
+             that is not there. a group is flat"
+        )));
+    }
+    Ok(())
+}
+
 /// what a declared group is allowed to be.
 ///
 /// three refusals, and each is about something the group would otherwise be
 /// drawn as: a name with nothing in it, a name with a separator in it that a
 /// folded node would draw as nesting, and a name a legend entry could not
-/// point at unambiguously.
+/// point at unambiguously. the first two are the ones a job's group gets too.
 fn check_groups(metas: &[AssetMeta]) -> Result<(), Error> {
     // the sources whose bare names an origin label falls back to, which is the
     // set a declared group must not walk into
@@ -1379,21 +1408,7 @@ fn check_groups(metas: &[AssetMeta]) -> Result<(), Error> {
         let Some(group) = meta.declared_group.as_deref() else {
             continue;
         };
-        if group.trim().is_empty() {
-            return Err(Error::Graph(format!(
-                "asset {}: declared group {group:?} has no name in it, and an asset in a group \
-                 with no name is an asset in no group",
-                meta.name
-            )));
-        }
-        if group.contains(GROUP_SEPARATOR) {
-            return Err(Error::Graph(format!(
-                "asset {}: declared group {group:?} contains {GROUP_SEPARATOR:?}, and a folded \
-                 group is drawn as {group}{GROUP_SEPARATOR}, which reads as nesting that is not \
-                 there. a group is flat",
-                meta.name
-            )));
-        }
+        check_group("asset", &meta.name, group)?;
         if bare.contains(group) {
             return Err(Error::Graph(format!(
                 "asset {}: declared group {group} is also the name of the ungrouped source \

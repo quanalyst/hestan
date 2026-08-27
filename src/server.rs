@@ -464,11 +464,17 @@ fn freshness_json(
 /// `store` and `pool_limit` rather than the whole server state, because the
 /// command line answers `jobs` with this same function and has no router
 /// around it: one description of a job, however it is asked for.
+///
+/// `hue` is [`AssetRegistry::hue_of`] at both call sites, and that is the
+/// point of it being passed rather than computed here: a group is a label, a
+/// label has one angle, and a job group and an asset group of the same name
+/// are the same label.
 pub(crate) fn job_summary(
     job: &Job,
     store: &Store,
     pool_limit: impl Fn(&str) -> Option<usize>,
     rate_limit: impl Fn(&str) -> Option<(usize, StdDuration)>,
+    hue: impl Fn(&str) -> u16,
 ) -> Result<Value, Error> {
     let ops: Vec<Value> = job
         .ops()
@@ -582,6 +588,15 @@ pub(crate) fn job_summary(
         // which slice of the deployment it is in; null in a deployment that
         // declares no namespaces, which is every one built before they existed
         "namespace": job.namespace(),
+        // what it is labeled with on the timeline; null wherever nothing
+        // declared one, which a job's group has no fallback out of
+        "group": job.group(),
+        // an angle on the colour wheel rather than a colour, for the reason
+        // an asset's group carries one: what lightness is legible depends on
+        // the reader's theme and this end does not know it. resolved through
+        // the same function, so this group and an asset group of the same
+        // name are one colour
+        "group_hue": job.group().map(&hue),
         // who to wake when a run of it fails; null for a job nobody claimed,
         // and absent keys inside it for the halves nobody said
         "owner": job.owner(),
@@ -811,6 +826,7 @@ async fn list_jobs(
                 st.runner.store(),
                 |p| st.runner.pool_limit(p),
                 |r| st.runner.rate_limit(r),
+                |l| st.assets.hue_of(l),
             )
         })
         .collect::<Result<_, _>>()
@@ -834,6 +850,7 @@ async fn get_job(
             st.runner.store(),
             |p| st.runner.pool_limit(p),
             |r| st.runner.rate_limit(r),
+            |l| st.assets.hue_of(l),
         )
         .map_err(internal)?,
     ))
@@ -5274,6 +5291,7 @@ mod tests {
             st.runner.store(),
             |p| st.runner.pool_limit(p),
             |r| st.runner.rate_limit(r),
+            |l| st.assets.hue_of(l),
         )
         .unwrap();
         assert_eq!(s["interval_secs"], json!(null));
@@ -5290,6 +5308,7 @@ mod tests {
             st.runner.store(),
             |p| st.runner.pool_limit(p),
             |r| st.runner.rate_limit(r),
+            |l| st.assets.hue_of(l),
         )
         .unwrap();
         assert_eq!(s["interval_secs"], json!(60));
@@ -5322,6 +5341,7 @@ mod tests {
             st.runner.store(),
             |p| st.runner.pool_limit(p),
             |r| st.runner.rate_limit(r),
+            |l| st.assets.hue_of(l),
         )
         .unwrap();
         assert_eq!(s["overdue"], json!(true));
@@ -5335,6 +5355,7 @@ mod tests {
             st.runner.store(),
             |p| st.runner.pool_limit(p),
             |r| st.runner.rate_limit(r),
+            |l| st.assets.hue_of(l),
         )
         .unwrap();
         assert_eq!(s["overdue"], json!(false));
@@ -5348,6 +5369,7 @@ mod tests {
             st.runner.store(),
             |p| st.runner.pool_limit(p),
             |r| st.runner.rate_limit(r),
+            |l| st.assets.hue_of(l),
         )
         .unwrap();
         assert_eq!(s["interval_secs"], json!(null));
@@ -5376,6 +5398,7 @@ mod tests {
             st.runner.store(),
             |p| st.runner.pool_limit(p),
             |r| st.runner.rate_limit(r),
+            |l| st.assets.hue_of(l),
         )
         .unwrap();
         assert_eq!(plain["overdue"], json!(true));
@@ -5388,6 +5411,7 @@ mod tests {
             st.runner.store(),
             |p| st.runner.pool_limit(p),
             |r| st.runner.rate_limit(r),
+            |l| st.assets.hue_of(l),
         )
         .unwrap();
         assert_eq!(etl["overdue"], json!(false), "the policy is the answer now");
@@ -5403,6 +5427,7 @@ mod tests {
             st.runner.store(),
             |p| st.runner.pool_limit(p),
             |r| st.runner.rate_limit(r),
+            |l| st.assets.hue_of(l),
         )
         .unwrap();
         assert_eq!(etl["freshness"]["status"], json!("fresh"));
@@ -5434,6 +5459,7 @@ mod tests {
             st.runner.store(),
             |p| st.runner.pool_limit(p),
             |r| st.runner.rate_limit(r),
+            |l| st.assets.hue_of(l),
         )
         .unwrap();
         assert_eq!(etl["freshness"]["status"], json!("late"));
@@ -7793,6 +7819,155 @@ mod tests {
         // and the run row still says which job it was of, unqualified: nothing
         // about a namespace reaches the key
         assert_eq!(after.runner.store().run("r1").unwrap().unwrap().job, "etl");
+    }
+
+    // ------------------------------------------------------------ groups
+
+    /// a deployment where a job and an asset are in one group, which is the
+    /// arrangement the colour question is actually about.
+    fn grouped() -> AppState {
+        let registry = Arc::new(
+            AssetRegistry::new(
+                vec![
+                    crate::Asset::source("station_readings").group("weather"),
+                    crate::Asset::source("prices").group("market"),
+                ],
+                Vec::new(),
+                Vec::new(),
+            )
+            .unwrap(),
+        );
+        let grouped_job = |name: &str, group: &str| {
+            Job::builder(name)
+                .group(group)
+                .op(Op::new("echo", |_| async { Ok(json!(null)) }))
+                .build()
+                .unwrap()
+        };
+        let jobs = vec![
+            grouped_job("weather_pull", "weather"),
+            grouped_job("weather_clean", "weather"),
+            echo_job("cron_sweep"),
+        ];
+        let runner = Runner::new(jobs, Store::open(":memory:").unwrap()).unwrap();
+        AppState {
+            jobs: Arc::new(runner.jobs().clone()),
+            runner,
+            assets: registry,
+            sensors: Arc::new(Vec::new()),
+            auth: None,
+        }
+    }
+
+    /// one job out of a `/api/jobs` body, by name.
+    fn listed(jobs: &Value, name: &str) -> Value {
+        jobs["jobs"]
+            .as_array()
+            .expect("jobs")
+            .iter()
+            .find(|j| j["name"] == name)
+            .unwrap_or_else(|| panic!("no job {name} in {jobs}"))
+            .clone()
+    }
+
+    // the group reaches the api on the job, beside the namespace, on both the
+    // list and the one-job endpoint
+    #[tokio::test]
+    async fn a_jobs_group_reaches_the_api_where_its_namespace_already_did() {
+        let st = grouped();
+        let Json(jobs) = list_jobs(State(st.clone()), everything()).await.unwrap();
+        assert_eq!(listed(&jobs, "weather_pull")["group"], "weather");
+        assert_eq!(listed(&jobs, "weather_clean")["group"], "weather");
+
+        let Json(one) = get_job(State(st), Path("weather_pull".into()))
+            .await
+            .unwrap();
+        assert_eq!(one["group"], "weather");
+        assert_eq!(one["group_hue"], json!(crate::hue("weather")));
+    }
+
+    // a job nobody grouped reads as an absence, and there is no fallback out
+    // of it: a job's group is declared or it is not there
+    #[tokio::test]
+    async fn an_ungrouped_job_carries_null_for_the_group_and_null_for_the_hue() {
+        let st = grouped();
+        let Json(jobs) = list_jobs(State(st), everything()).await.unwrap();
+        let sweep = listed(&jobs, "cron_sweep");
+        assert_eq!(sweep["group"], Value::Null);
+        assert_eq!(sweep["group_hue"], Value::Null);
+
+        // and a deployment where nothing declares one says that about every
+        // job it has, which is what every deployment built before this said
+        let plain = state(vec![echo_job("etl"), echo_job("billing")]);
+        let Json(jobs) = list_jobs(State(plain), everything()).await.unwrap();
+        for job in jobs["jobs"].as_array().unwrap() {
+            assert_eq!(job["group"], Value::Null, "{job}");
+            assert_eq!(job["group_hue"], Value::Null, "{job}");
+        }
+    }
+
+    // the decision, asserted rather than described: a job group and an asset
+    // group of one name are one label and are drawn at one angle. `hue` is a
+    // pure function of the name, so neither end has to be told about the other
+    #[tokio::test]
+    async fn a_job_group_and_an_asset_group_of_one_name_are_drawn_at_one_angle() {
+        let st = grouped();
+        let Json(jobs) = list_jobs(State(st.clone()), everything()).await.unwrap();
+        let Json(assets) = list_assets(State(st), everything()).await.unwrap();
+        let asset = assets["assets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|a| a["name"] == "station_readings")
+            .expect("station_readings")
+            .clone();
+        assert_eq!(asset["group"], "weather");
+        assert_eq!(
+            listed(&jobs, "weather_pull")["group_hue"],
+            asset["group_hue"]
+        );
+        assert_eq!(
+            listed(&jobs, "weather_pull")["group_hue"],
+            json!(crate::hue("weather"))
+        );
+    }
+
+    // and the other half of one label, one answer: `Asset::hue` pins a label
+    // rather than an asset, so a job in that group moves with it instead of
+    // sitting at the hash while the graph sits at the pin
+    #[tokio::test]
+    async fn a_pinned_label_moves_the_job_group_of_that_name_with_it() {
+        let pinned = (crate::hue("weather") + 40) % 360;
+        assert_ne!(pinned, crate::hue("weather"), "the pin moved nothing");
+        let registry = Arc::new(
+            AssetRegistry::new(
+                vec![
+                    crate::Asset::source("station_readings")
+                        .group("weather")
+                        .hue(pinned),
+                ],
+                Vec::new(),
+                Vec::new(),
+            )
+            .unwrap(),
+        );
+        let jobs = vec![
+            Job::builder("weather_pull")
+                .group("weather")
+                .op(Op::new("echo", |_| async { Ok(json!(null)) }))
+                .build()
+                .unwrap(),
+        ];
+        let runner = Runner::new(jobs, Store::open(":memory:").unwrap()).unwrap();
+        let st = AppState {
+            jobs: Arc::new(runner.jobs().clone()),
+            runner,
+            assets: registry,
+            sensors: Arc::new(Vec::new()),
+            auth: None,
+        };
+        let Json(jobs) = list_jobs(State(st), everything()).await.unwrap();
+        assert_eq!(listed(&jobs, "weather_pull")["group_hue"], json!(pinned));
     }
 
     // a token scoped to a namespace admits its jobs and its assets without
