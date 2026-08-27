@@ -15,3 +15,4 @@ import "./replay.test";
 import "./role.test";
 import "./saved.test";
 import "./swatch.test";
+import "./timeline.test";

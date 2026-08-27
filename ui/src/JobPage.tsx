@@ -600,8 +600,10 @@ function JobView({ name }: { name: string }) {
         </>
       )}
 
+      {/* one job, so nothing to fold: no chips, and the row is drawn in the
+          ink every other row is */}
       <TimelinePlot
-        jobs={[job.name]}
+        jobs={[job]}
         runs={tlRuns}
         upcoming={upcoming}
         windowSecs={windowSecs}

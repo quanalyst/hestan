@@ -6,6 +6,7 @@ import MicroBars from "./MicroBars";
 import type { MicroBar } from "./MicroBars";
 import StatusDot from "./StatusDot";
 import TimelinePlot, { futureWindowSecs } from "./TimelinePlot";
+import { foldParam, foldedFrom, toggleFold as toggle } from "./timeline";
 import type { JobSummary, LateEntry, Run, UpcomingSchedule } from "./types";
 import { durationMs, fmtDuration, relTime } from "./util";
 
@@ -30,6 +31,19 @@ export default function JobsPage() {
       (prev) => {
         if (want === null) prev.delete("namespace");
         else prev.set("namespace", want);
+        return prev;
+      },
+      { replace: true },
+    );
+  // which groups the timeline draws as one row, beside the namespace filter
+  // and for the same reason: a folded view is a link somebody can send
+  const folded = foldedFrom(params.get("folded"));
+  const toggleFold = (group: string) =>
+    setParams(
+      (prev) => {
+        const next = foldParam(toggle(folded, group));
+        if (next === "") prev.delete("folded");
+        else prev.set("folded", next);
         return prev;
       },
       { replace: true },
@@ -135,11 +149,13 @@ export default function JobsPage() {
       </div>
 
       <TimelinePlot
-        jobs={shown.map((j) => j.name)}
+        jobs={shown}
         runs={winRuns}
         upcoming={upcoming}
         windowSecs={windowSecs}
         onWindow={setWindowSecs}
+        folded={folded}
+        onFold={toggleFold}
       />
 
       {namespaces.length > 0 && (

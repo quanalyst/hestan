@@ -756,6 +756,12 @@ button.text-btn.active {
   padding-bottom: 7px;
 }
 
+/* a bar on a folded row, in the group's own hue. the group is written in the
+   gutter beside it, so the colour says which group faster and never alone */
+.tl-hued {
+  fill: hsl(var(--h) var(--hue-sat) var(--hue-light));
+}
+
 .tl-running {
   animation: bar-pulse 1.4s ease-in-out infinite;
 }

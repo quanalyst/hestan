@@ -5,15 +5,24 @@ import { get } from "./api";
 import { clampTipX, DIM, HatchPattern } from "./chart";
 import { GlyphShape } from "./StatusGlyph";
 import StatusDot from "./StatusDot";
+import { at } from "./Swatch";
+import {
+  BAR_H,
+  NONE,
+  TOP,
+  failuresIn,
+  groupsOf,
+  hueOf,
+  laneLabel,
+  lanesOf,
+  place,
+  rowsOf,
+} from "./timeline";
+import type { Bar, TimelineJob } from "./timeline";
 import type { OpRun, Run, RunStatus, UpcomingSchedule } from "./types";
 import { clockTime, durationMs, fmtDuration, shortId } from "./util";
 
 const GUTTER = 168;
-const BAR_H = 12;
-const LANE_GAP = 3;
-const ROW_PAD = 8;
-const MIN_ROW_H = 34;
-const TOP = 8;
 const AXIS_H = 24;
 const MIN_BAR_W = 4;
 const FUTURE = 0.15; // fraction of the axis right of the now line
@@ -60,33 +69,25 @@ function legendSwatch(status: RunStatus, hatch: string) {
   }
 }
 
-interface Bar {
-  run: Run;
-  start: number;
-  end: number;
-  lane: number;
-}
-
-interface Row {
-  job: string;
-  y: number;
-  h: number;
-  bars: Bar[];
-  laneCount: number;
-}
-
 export default function TimelinePlot({
   jobs,
   runs,
   upcoming,
   windowSecs,
   onWindow,
+  folded = NONE,
+  onFold,
 }: {
-  jobs: string[];
+  jobs: TimelineJob[];
   runs: Run[];
   upcoming: UpcomingSchedule[];
   windowSecs: number;
   onWindow: (secs: number) => void;
+  // which groups are drawn as one row, and how to turn one of them around.
+  // both absent is a plot that offers no folding, which is what a page
+  // showing one job wants
+  folded?: ReadonlySet<string>;
+  onFold?: (group: string) => void;
 }) {
   const nav = useNavigate();
   const hatch = useId();
@@ -100,9 +101,17 @@ export default function TimelinePlot({
   const viewRef = useRef({ t0: 0, t1: 1, plotW: 1, width: 0 }); // scale on screen, read by stale drag closures
   const failCache = useRef(new Map<string, string | null>());
 
-  const lanes = [...jobs];
-  for (const r of runs) if (!lanes.includes(r.job)) lanes.push(r.job);
+  // a run of a job that has since left the code still gets a row, in no group:
+  // there is nothing left to declare one on
+  const all: TimelineJob[] = [...jobs];
+  for (const r of runs) {
+    if (!all.some((j) => j.name === r.job)) all.push({ name: r.job, group: null, group_hue: null });
+  }
+  const lanes = lanesOf(all, folded);
   const hasLanes = lanes.length > 0;
+  // the groups on this plot, which is what the chips fold. a group whose every
+  // job was filtered out has no row here to fold, so it gets no chip either
+  const groups = groupsOf(all);
 
   useEffect(() => {
     const el = wrapRef.current;
@@ -154,6 +163,24 @@ export default function TimelinePlot({
     </h2>
   );
 
+  // the same chips the catalog folds a group with. nothing declares a group in
+  // most deployments, and that case gets no row of chips at all rather than
+  // the word "fold" with nothing after it
+  const chips = onFold && groups.length > 0 && (
+    <div className="group-chips">
+      <span className="filter-label">fold</span>
+      {groups.map((g) => (
+        <button
+          key={g}
+          className={folded.has(g) ? "text-btn active" : "text-btn"}
+          onClick={() => onFold(g)}
+        >
+          {g}
+        </button>
+      ))}
+    </div>
+  );
+
   if (!hasLanes)
     return (
       <>
@@ -166,6 +193,7 @@ export default function TimelinePlot({
     return (
       <>
         {header}
+        {chips}
         <div className="tl" ref={wrapRef} />
       </>
     );
@@ -185,28 +213,11 @@ export default function TimelinePlot({
     else byJob.set(run.job, [bar]);
   }
 
-  const rows: Row[] = [];
-  let yCur = TOP;
-  for (const job of lanes) {
-    const bars = (byJob.get(job) ?? []).sort((a, b) => a.start - b.start);
-    const laneEnds: number[] = [];
-    for (const b of bars) {
-      let lane = laneEnds.findIndex((e) => e <= b.start);
-      if (lane === -1) {
-        lane = laneEnds.length;
-        laneEnds.push(b.end);
-      } else {
-        laneEnds[lane] = b.end;
-      }
-      b.lane = lane;
-    }
-    const n = Math.max(1, laneEnds.length);
-    const block = n * BAR_H + (n - 1) * LANE_GAP;
-    const h = Math.max(MIN_ROW_H, ROW_PAD * 2 + block);
-    rows.push({ job, y: yCur, h, bars, laneCount: n });
-    yCur += h;
-  }
-  const plotBottom = yCur;
+  // a folded row's bars are every member's, packed by the same rule one job's
+  // row has always used, so the fold changes how many rows there are and never
+  // how many bars
+  const rows = rowsOf(lanes, byJob);
+  const plotBottom = rows.reduce((y, row) => y + row.h, TOP);
 
   const plotW = width - GUTTER;
   const x = (t: number) => GUTTER + ((t - t0) / (t1 - t0)) * plotW;
@@ -220,18 +231,13 @@ export default function TimelinePlot({
   const ticks: number[] = [];
   for (let t = midnight.getTime(); t <= t1; t += step) if (t >= t0) ticks.push(t);
 
-  const placed = rows.flatMap((row) => {
-    const block = row.laneCount * BAR_H + (row.laneCount - 1) * LANE_GAP;
-    const blockTop = row.y + (row.h - block) / 2;
-    return row.bars.map((b) => {
-      const bx = Math.max(x(b.start), GUTTER);
-      const bw = Math.max(MIN_BAR_W, Math.min(x(b.end), nowX) - bx);
-      const by = blockTop + b.lane * (BAR_H + LANE_GAP);
-      return { ...b, bx, bw, by };
-    });
-  });
+  // one entry per run, and one rect below per entry: nothing between here and
+  // the svg drops a bar, which is what a fold has to leave true
+  const placed = place(rows, { x, nowX, gutter: GUTTER, minBarW: MIN_BAR_W });
 
-  const rowByJob = new Map(rows.map((r) => [r.job, r]));
+  // a ghost lands on whatever row its job's runs land on, which for a member
+  // of a folded group is the group's
+  const rowByJob = new Map(rows.flatMap((r) => r.lane.jobs.map((job) => [job, r] as const)));
   const ghosts = upcoming.flatMap((u) => {
     const row = rowByJob.get(u.job);
     if (!row) return [];
@@ -249,7 +255,7 @@ export default function TimelinePlot({
 
   // below this the strip's x-clamp bounds invert and glyphs land left of the gutter
   const stripFits = width >= GUTTER + 8;
-  const failures = stripFits ? placed.filter((b) => b.run.status === "failed") : [];
+  const failures = stripFits ? failuresIn(placed) : [];
   const stripH = failures.length ? STRIP_H : 0;
   const height = plotBottom + stripH + AXIS_H;
 
@@ -353,6 +359,7 @@ export default function TimelinePlot({
   return (
     <>
       {header}
+      {chips}
       <div className="tl" ref={wrapRef}>
         <svg width={width} height={height} onMouseDown={startBrush}>
           <HatchPattern id={hatch} />
@@ -377,7 +384,7 @@ export default function TimelinePlot({
           ))}
 
           {rows.map((row, i) => (
-            <g key={row.job}>
+            <g key={row.lane.key}>
               {i > 0 && <line className="tl-row" x1={GUTTER} y1={px(row.y)} x2={width} y2={px(row.y)} />}
               <text
                 className="tl-label"
@@ -386,7 +393,10 @@ export default function TimelinePlot({
                 textAnchor="end"
                 dominantBaseline="central"
               >
-                {truncate(row.job)}
+                {truncate(laneLabel(row.lane))}
+                {/* a folded row says which jobs it swallowed, since the label
+                    itself only has room for the count */}
+                {row.lane.group !== null && <title>{row.lane.jobs.join(", ")}</title>}
               </text>
             </g>
           ))}
@@ -454,16 +464,24 @@ export default function TimelinePlot({
                   fillOpacity={DIM}
                 />
               );
+            // a folded row's bars carry the group's hue, and a failed one
+            // carries none: `hueOf` says why. the group is named in the gutter
+            // beside the row either way, so the colour is never the only thing
+            // carrying it
+            const hue = hueOf(b);
             return (
               <rect
                 key={b.run.id}
-                className={`${hot ? "bar bar-hot" : "bar"}${b.run.status === "running" ? " tl-running" : ""}`}
+                className={`${hot ? "bar bar-hot" : "bar"}${b.run.status === "running" ? " tl-running" : ""}${
+                  hue === null ? "" : " tl-hued"
+                }`}
+                style={hue === null ? undefined : at(hue)}
                 x={b.bx}
                 y={b.by}
                 width={b.bw}
                 height={BAR_H}
                 rx={1}
-                fill={b.run.status === "failed" ? `url(#${hatch})` : "var(--mark)"}
+                fill={b.run.status === "failed" ? `url(#${hatch})` : hue === null ? "var(--mark)" : undefined}
               />
             );
           })}
