@@ -418,10 +418,11 @@ standalone binary for those two. [docs/cli.md](docs/cli.md).
   Owner::team("data-platform").contact("#data-alerts"))`, and a token scoped to
   `finance` reaches every job and asset in it without naming any of them. the
   owner is on the event a failure hook is handed, so an alert says who to wake
-  without the caller threading a recipient through. a namespace is not an asset
-  group: a group labels the graph and hestan draws it, a namespace divides the
-  deployment and hestan enforces it. see
-  [docs/namespaces.md](docs/namespaces.md)
+  without the caller threading a recipient through. a namespace is not a group:
+  a group labels a picture and hestan draws it, a namespace divides the
+  deployment and hestan enforces it. `.group("weather")` on a job labels the run
+  timeline the way it labels the asset graph, and the jobs overview folds a
+  group's lanes into one row. see [docs/namespaces.md](docs/namespaces.md)
 - **a launch key makes a retried request harmless**: `hestan run deploy --key
   ci-build-4182`, or `{"key": "ci-build-4182"}` on the launch endpoint. same
   key, same job, same params, and there is one run: the second call is answered

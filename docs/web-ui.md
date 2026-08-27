@@ -61,14 +61,15 @@ with no runs it says so ("no runs in the last 6 hours") rather than showing
 zeros.
 
 under it, the timeline: one lane per registered job (runs of a job that has
-since left the code still get a lane), a 1h/6h/24h window switch, and about
-15% of the axis reserved right of the "now" line for the future. runs draw as
-bars; overlapping runs within a job pack greedily into stacked sub-lanes
-rather than drawing over each other. projected schedule fires render as
-hollow ghost slivers in the future zone. hover names the schedule and time,
-click goes to the job. failed runs additionally get an × in a strip under
-the plot; hovering one fetches the run and names the first op that failed,
-so you can often diagnose without leaving the overview.
+since left the code still get a lane, and a group of lanes can be
+[folded](#folding-a-group-of-lanes) into one), a 1h/6h/24h window switch, and
+about 15% of the axis reserved right of the "now" line for the future. runs
+draw as bars; overlapping runs within a job pack greedily into stacked
+sub-lanes rather than drawing over each other. projected schedule fires
+render as hollow ghost slivers in the future zone. hover names the schedule
+and time, click goes to the job. failed runs additionally get an × in a strip
+under the plot; hovering one fetches the run and names the first op that
+failed, so you can often diagnose without leaving the overview.
 
 drag horizontally on the plot (more than a few pixels; a plain click still
 opens the run under the cursor) to brush a time range: a selection panel
@@ -93,6 +94,34 @@ job or asset past its declared [freshness policy](freshness.md) carries a
 apply), and the statline counts everything currently late.
 rows click through to the job page. the page polls jobs every 5s, window
 runs every 10s, and upcoming fires every 30s.
+
+### Folding a group of lanes
+
+twenty jobs is twenty lanes, and a namespace is too coarse to cut that down:
+two chips over one bucket of fourteen is not a fold anybody wants. so where a
+job declares a [group](namespaces.md#a-job-has-one-too), `fold` chips above the
+plot collapse that group's lanes onto one row, with the group's name and how
+many jobs it stands for in the gutter and the jobs themselves on the hover.
+
+**a folded row draws every run its members have.** the same greedy sub-lane
+packing one job's lane already uses, run over all the members' runs at once, so
+three runs live at one moment is a row three sub-lanes tall whether or not it
+is folded. a fold makes the plot shorter and never quieter: drawing the first
+run and hiding the rest would make a busy period look like a quiet one, which
+is a worse lie than not folding at all.
+
+the bars on a folded row carry the group's [hue](assets.md#colour), except
+where the outcome already has a mark of its own: a failure keeps its hatch and
+its × in the strip under the plot, a queued run its hollow outline, a canceled
+one its dimmed grey. shape carries state here, and a colour where an outcome
+already is would be a colour meaning two things. the group is written in the
+gutter beside the row, so the hue is never the only thing carrying it.
+
+the fold is in the url like every other view state
+(`/jobs?folded=weather,eia`), so a folded view is a link somebody can send.
+**a deployment where nothing declares a group gets no chips and the plot it
+always had**: there is nothing to fold, a job in no group is never folded into
+anything, and inventing a fold out of a naming convention would be a guess.
 
 ## Job page
 
@@ -159,9 +188,9 @@ still waiting), when the fire was scheduled for, a link to the launched run,
 and the error message when the launch failed.
 
 then a single-lane timeline (same windows, ghosts, and brushing as the
-overview), a bar chart of the last finished runs' durations, and a table of
-the ten most recent runs, with an "all runs" link into the runs page
-pre-filtered to this job.
+overview, and no fold chips: one lane is nothing to fold), a bar chart of the
+last finished runs' durations, and a table of the ten most recent runs, with
+an "all runs" link into the runs page pre-filtered to this job.
 
 ## The catalog
 

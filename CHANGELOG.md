@@ -1,5 +1,94 @@
 # changelog
 
+## unreleased
+
+a job says which group it belongs to, and the run timeline folds a group of
+lanes into one.
+
+0.1.0 shipped `Asset::group` and nothing equivalent for a job, so the asset
+graph knew about weather, eia and forecast while the timeline showing the jobs
+that feed those same assets knew only the namespace. folding on the namespace
+instead turns twenty lanes into two buckets, one of them holding fourteen,
+which is not a fold anybody wants.
+
+```rust
+Job::builder("weather_pull").group("weather")
+Asset::source("station_readings").group("weather")
+```
+
+**a group labels a picture and hestan draws it; a namespace divides the
+deployment and hestan enforces it, and neither is derived from the other.**
+that is the sentence `docs/namespaces.md` already used for an asset's group,
+reused rather than reworded: the picture is the asset graph for an asset and
+the run timeline for a job. two concepts explained differently in two places
+become three concepts, so the wording moved to cover both rather than a second
+one being written beside it.
+
+**one label, one colour.** `hestan::hue` is a pure function of a name, so a job
+in group `weather` and the assets in group `weather` land on the same angle
+without either end being told about the other, and `Asset::hue(n)` pins that
+angle for both. deliberate rather than incidental: they are the same word on
+one screen, and two colours for one word is a reader's problem. the api
+resolves a job's hue through the same function the asset graph uses, so a pin
+cannot leave the two disagreeing, and `hestan doctor` counts a job's group
+among the labels it checks for hues too close to tell apart.
+
+**there is no fallback, and that is the one place a job's group differs from an
+asset's.** an asset's falls back to the part of its name before the first `/`,
+because that is how the asset graph grouped before `Asset::group` existed and
+the fallback is what keeps an existing graph looking the way it looked. no
+timeline has ever grouped by anything, so the same rule produces the opposite
+mechanics here: a job's group is declared or it is absent, and a job called
+`finance/etl` is in no group.
+
+### The fold
+
+`fold` chips over the jobs overview collapse a group's lanes onto one row, in
+the group's hue, with the group and how many jobs it stands for in the gutter.
+
+- **a folded row draws every run its members have.** the same greedy sub-lane
+  packing one job's lane already uses, run over all the members' runs at once,
+  so three runs live at one moment is a row three sub-lanes tall. a fold makes
+  the plot shorter and never quieter. drawing the first run and hiding the rest
+  would make a busy period look like a quiet one, which is a worse lie than not
+  folding at all and would look right on a screen. there is a case that folds a
+  group and asserts the drawn bar count and the run ids did not move, that no
+  two overlapping runs share a sub-lane, and that the row grew by exactly the
+  height three sub-lanes need.
+- **a failure survives the fold**: the strip under the plot is fed from the
+  same placed bars, so a failed run inside a folded group keeps its glyph. it
+  is drawn in no hue at all, because shape carries state in this ui and a
+  colour where an outcome already is would mean two things. a queued run keeps
+  its outline and a canceled one its dimmed grey for the same reason.
+- **the fold state is in the url** (`/jobs?folded=weather,eia`), beside the
+  namespace filter and for the same reason: a folded view is a link somebody
+  can send.
+- **nothing folds where nothing declares a group.** no chip row, no "no group"
+  bucket, and a job in no group is never folded into anything. inventing a fold
+  out of a naming convention would be a guess.
+
+the decisions moved out of `TimelinePlot.tsx` into `ui/src/timeline.ts` so the
+claim about density can be asserted rather than described: `lanesOf`, `pack`,
+`rowsOf` and `place` are what turn a job list and a run list into the rects the
+svg draws, and none of them drops a bar.
+
+### What an existing deployment sees change
+
+- **nothing, until a job declares a group.** no schema version, no migration,
+  no new route, no new query parameter. a deployment that declares none has one
+  lane per job on the timeline, no fold chips, and `null` for both new keys.
+  there are cases asserting that rather than assuming it.
+- **the responses are not byte for byte**: `group` and `group_hue` are new keys
+  on `GET /api/jobs` and `GET /api/jobs/{name}`, `null` where nothing was
+  declared. a client that reads keys by name is unaffected; one that compares
+  whole documents is not.
+- **no source break.** `JobBuilder::group` is a new method and `Job::group` a
+  new accessor.
+- **two error messages are worded differently.** an asset declaring a group
+  with no name in it, or with `/` in it, is refused by the same function that
+  now refuses a job's, so the two say one thing. both were and remain
+  `Error::Graph` from the build, naming the asset and the group.
+
 ## 0.1.0 (2026-08-24)
 
 the first release that is not a pre-release. the surfaces in

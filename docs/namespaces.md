@@ -13,12 +13,18 @@ every job in it by hand.
 
 ## The rule, in one sentence
 
-**a group labels the asset graph and hestan draws it; a namespace divides the
+**a group labels a picture and hestan draws it; a namespace divides the
 deployment and hestan enforces it, and neither is derived from the other.**
 
 that is the whole of the relationship, and everything below is it worked out.
 if you are dividing a picture, that is a [group](assets.md#group). if you are
 dividing a deployment, that is a namespace.
+
+the picture is the asset graph for an asset and the [run
+timeline](web-ui.md#jobs-overview) for a job. one sentence covers both because
+it is one concept: `Asset::group` and `JobBuilder::group` declare the same
+label in two places, and [a job has one too](#a-job-has-one-too) below is what
+follows from that.
 
 ## A namespace
 
@@ -82,6 +88,7 @@ because they are two questions rather than one.
 | the question | the answer |
 | --- | --- |
 | what is this asset near, on the graph | its [group](assets.md#group) |
+| what is this job near, on the timeline | its [group](#a-job-has-one-too) |
 | where did this data come from | its [origin](assets.md#origin) |
 | whose slice of the deployment is this | its namespace |
 
@@ -101,6 +108,38 @@ admits would then be decided by a naming convention.
 
 so `group` was left as phase 40 shipped it and its documentation narrowed to
 what it does. nothing about an existing graph changed.
+
+### A job has one too
+
+```rust
+Job::builder("weather_pull").group("weather")
+```
+
+the same label, said the same way, and the [jobs
+overview](web-ui.md#jobs-overview) folds a group's lanes into one row with it.
+a group is still a label and not a boundary: nothing reads it to decide who may
+touch what, and the boundary is still the namespace beside it.
+
+**a job group and an asset group of the same name are one label and are drawn
+in one colour.** `hestan::hue` is a pure function of a name, so the timeline and
+the graph agree without either being told about the other, and
+[`Asset::hue(n)`](assets.md#colour) pins the angle for both. that is deliberate
+rather than incidental: they are the same word on one screen, and two colours
+for one word is a reader's problem rather than a designer's. `hestan doctor`
+counts a job's group among the labels it checks for hues too close to tell
+apart, for the same reason.
+
+**a job's group has no fallback, and that is the one place it differs from an
+asset's.** an asset's falls back to the part of its name before the first `/`,
+because that is how the asset graph grouped before `Asset::group` existed and
+the fallback is what keeps an existing graph looking the way it looked. no
+timeline has ever grouped by anything, so the same rule produces the opposite
+mechanics here: a job's group is declared or it is absent, a job called
+`finance/etl` is in no group, and a deployment that declares none folds nothing.
+
+both are refused at build by the one function, so a name one of them may carry
+is a name the other may carry: an empty or whitespace-only group, and a group
+containing `/`, which reads as nesting that is not there.
 
 ## It composes with a scope
 
@@ -247,7 +286,8 @@ reaches a hook through `on_late`, and reaches a person through
 - the **asset page** and the assets drawer have an `owner` line, and a
   `namespace` line beside it.
 - `GET /api/jobs`, `GET /api/jobs/{name}`, `GET /api/assets` and `GET /api/late`
-  carry `owner`.
+  carry `owner`, and the two job endpoints carry `group` and `group_hue` beside
+  `namespace`, both `null` where nothing declared one.
 - `hestan owner <name>` answers it from a terminal, for a job, an asset, or
   both where a name is used for one of each:
 

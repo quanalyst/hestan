@@ -135,12 +135,17 @@ worded three ways. **group** is what it is labeled with on the graph.
 **origin** is where its data came from. **namespace** is whose slice of the
 deployment it is in.
 
-**a group labels the asset graph and hestan draws it; a namespace divides the
+**a group labels a picture and hestan draws it; a namespace divides the
 deployment and hestan enforces it, and neither is derived from the other.**
 that is the whole of the relationship: if you are dividing a picture, reach for
 a group; if you are dividing a deployment, reach for a namespace.
 [namespaces and owners](namespaces.md) is the page for the second one, and
 everything below is the first.
+
+the picture here is this graph. a [job declares the same
+label](namespaces.md#a-job-has-one-too) and its picture is the run timeline:
+one sentence and one concept rather than two, and a group of one name on both
+is one label drawn in one colour.
 
 ### Group
 
@@ -166,13 +171,17 @@ a group is flat. there is no nesting inside one, and nothing is parsed out of
 the name you give it. three groups are refused at build, each naming both the
 asset and the group:
 
-- an empty or whitespace-only name, since an asset in a group with no name is
-  an asset in no group;
-- a name containing `/`, since a folded group draws as `sales/` and a group
-  called `a/b` would draw as `a/b/`, which reads as nesting that is not there;
+- an empty or whitespace-only name, since a group with no name is no group;
+- a name containing `/`, since `/` is the character a name uses to say which
+  group it is in, so `a/b` reads as nesting that is not there;
 - a name that is also the name of an ungrouped source, since an origin label
   is a group name falling back to a bare source name and one legend entry
   would then point at two things.
+
+the first two come from the one function a [job's
+group](namespaces.md#a-job-has-one-too) is refused by, so a name one of them
+may carry is a name the other may carry. the third is about origins and is an
+asset's alone.
 
 a source's group names the **external system** the data stands for, which is
 what makes `orders` and `returns` above one thing downstream rather than two.
@@ -221,6 +230,11 @@ the number is a hue and not a colour. what lightness is legible depends on the
 ground it is drawn on, so the reader picks saturation and lightness and hestan
 picks the angle: the web ui does that in css per theme, and anything painting
 a terminal gets the same angle to work from.
+
+**a job's group is in the same space.** `hue` reads a name and nothing else, so
+a job in group `weather` and the assets in group `weather` land on the same
+angle without either end being told about the other, and a pin moves both. one
+name, one colour, on the graph and on the [timeline](web-ui.md#jobs-overview).
 
 **the limit, stated plainly**: two names can hash close enough together to be
 hard to tell apart, and no pure function of a single name can prevent that,
