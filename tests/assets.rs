@@ -542,3 +542,54 @@ async fn an_asset_op_that_skips_writes_no_materialization_and_stays_stale() {
     assert_eq!(mat.value, Some(json!({"files": 3})));
     assert_eq!(mat.run_id.as_deref(), Some(run.id.as_str()));
 }
+
+// a schedule that could never do what it says is a startup error, not a tick
+// that fails at 6am forever. the same three checks a build of the asset would
+// make, made before the process comes up
+#[tokio::test]
+async fn an_asset_schedule_that_could_never_fire_is_refused_at_startup() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("hestan.db");
+    let db = db.to_str().unwrap();
+    let refused = |s: Schedule| async move {
+        Hestan::new()
+            .assets(doc_assets())
+            .add_schedule(s)
+            .db(db)
+            .build_asset("totals")
+            .await
+            .err()
+            .expect("the schedule was accepted")
+            .to_string()
+    };
+
+    // no such asset, said with the name in it
+    let err = refused(Schedule::asset("nope", "0 6 * * *")).await;
+    assert!(err.contains("unknown asset: nope"), "{err}");
+
+    // a source is probed, never built, so a cron that builds one is a cron
+    // that can only ever fail
+    let err = refused(Schedule::asset("docs", "0 6 * * *")).await;
+    assert!(err.contains("docs"), "{err}");
+    assert!(err.contains("sources are probed, never built"), "{err}");
+
+    // three missed occurrences are not three builds: the first makes the asset
+    // fresh, so the message says what to write instead
+    let err =
+        refused(Schedule::asset("totals", "0 6 * * *").catchup(Catchup::All { limit: 3 })).await;
+    assert!(err.contains("totals"), "{err}");
+    assert!(err.contains("Catchup::One"), "{err}");
+
+    // a build's params are {}, so params on one of these would be dropped
+    let err = refused(Schedule::asset("totals", "0 6 * * *").params(json!({"region": "eu"}))).await;
+    assert!(err.contains("a build takes no params"), "{err}");
+
+    // and the good one comes up
+    Hestan::new()
+        .assets(doc_assets())
+        .add_schedule(Schedule::asset("totals", "0 6 * * *"))
+        .db(db)
+        .build_asset("totals")
+        .await
+        .unwrap();
+}

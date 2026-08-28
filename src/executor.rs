@@ -1338,28 +1338,58 @@ impl Runner {
     /// when the pass began and was not by the time the write landed. nobody
     /// fired the occurrence, and the new decider's catch-up is what will
     /// account for it.
+    ///
+    /// `fire` names the occurrence, and its `job` field is what the schedule is
+    /// keyed under rather than what the run is of: an
+    /// [asset schedule](crate::Schedule::asset) is keyed on the asset and
+    /// launches a run of the internal assets job, which is why the two are
+    /// separate arguments.
+    ///
+    /// `Ok(None)` is a fire that found nothing to do, which only an asset
+    /// schedule can report; a job schedule always has a run to launch.
     pub(crate) fn fire_scheduled(
         &self,
         job: &str,
-        expr: &str,
-        at: DateTime<Utc>,
+        fire: Fire<'_>,
         params: Value,
-        caught_up: bool,
-    ) -> Result<Launched, Error> {
+    ) -> Result<Option<Launched>, Error> {
         self.enqueue(
             job,
             None,
             params,
             Trigger::Schedule,
             Lineage::None,
-            Some(at),
-            Claimed::Fire(Fire {
-                job,
-                expr,
-                scheduled_for: at,
-                caught_up,
-            }),
+            Some(fire.scheduled_for),
+            Claimed::Fire(fire),
             RunTags::new(),
+            None,
+        )
+        .map(Some)
+    }
+
+    /// [`launch_subset`](Self::launch_subset) for a subset run that stands for
+    /// a cron occurrence: the tick is claimed in the same transaction as the
+    /// run, exactly as [`fire_scheduled`](Self::fire_scheduled) claims it for a
+    /// whole job. this is what an [asset schedule](crate::Schedule::asset)
+    /// launches its plan through.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn fire_subset(
+        &self,
+        job: &str,
+        ops: HashSet<String>,
+        seeded: HashMap<String, Value>,
+        fire: Fire<'_>,
+        tags: RunTags,
+    ) -> Result<Launched, Error> {
+        self.enqueue(
+            job,
+            Some((ops, seeded)),
+            json!({}),
+            Trigger::Schedule,
+            Lineage::None,
+            Some(fire.scheduled_for),
+            Claimed::Fire(fire),
+            tags,
             None,
         )
     }

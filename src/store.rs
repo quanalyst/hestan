@@ -3761,22 +3761,29 @@ impl Store {
         )
     }
 
-    /// make the schedules table mirror the code: insert new (job, expr) pairs,
-    /// refresh tz and params on existing ones (pause state survives), drop the
-    /// rest.
+    /// make the schedules table mirror the code: insert new (target, expr)
+    /// pairs, refresh tz and params on existing ones (pause state survives),
+    /// drop the rest.
+    ///
+    /// the `job` column holds what the schedule fires, which for an
+    /// [asset schedule](crate::Schedule::asset) is the asset behind its
+    /// prefix rather than the job the build runs as. one column for both kinds
+    /// keeps one row per schedule, one pause flag, one cursor and one
+    /// one-fire-per-occurrence index.
     pub(crate) fn sync_schedules(&self, defined: &[Schedule]) -> Result<(), Error> {
         let mut conn = self.conn();
         let (insert, ignore) = conn.dialect().insert_or_ignore();
         let mut tx = conn.begin()?;
-        for s in defined {
-            let declared = self.params_col(&s.job, &s.params);
+        let ids: Vec<String> = defined.iter().map(Schedule::id).collect();
+        for (s, id) in defined.iter().zip(&ids) {
+            let declared = self.params_col(id, &s.params);
             let catchup = s.catchup.to_string();
             tx.execute(
                 &format!(
                     "{insert} schedules (job, expr, tz, params, catchup)
                      VALUES (?1, ?2, ?3, ?4, ?5) {ignore}"
                 ),
-                args![&s.job, &s.expr, &s.tz, &declared, &catchup],
+                args![id, &s.expr, &s.tz, &declared, &catchup],
             )?;
             // the cursor is deliberately not touched: it is what the scheduler
             // knows about this pair, and a restart that rewrote it would be a
@@ -3784,7 +3791,7 @@ impl Store {
             tx.execute(
                 "UPDATE schedules SET tz = ?3, params = ?4, catchup = ?5
                  WHERE job = ?1 AND expr = ?2",
-                args![&s.job, &s.expr, &s.tz, &declared, &catchup],
+                args![id, &s.expr, &s.tz, &declared, &catchup],
             )?;
         }
         let existing: Vec<(String, String)> =
@@ -3793,7 +3800,8 @@ impl Store {
             })?;
         let keep: HashSet<(&str, &str)> = defined
             .iter()
-            .map(|s| (s.job.as_str(), s.expr.as_str()))
+            .zip(&ids)
+            .map(|(s, id)| (id.as_str(), s.expr.as_str()))
             .collect();
         for (job, expr) in &existing {
             if !keep.contains(&(job.as_str(), expr.as_str())) {

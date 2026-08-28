@@ -2515,21 +2515,25 @@ pub(crate) fn launch_plan(
     )
 }
 
-/// launch a build of one asset: it, plus whatever upstream of it is stale, as
-/// one run.
+/// what a build of one asset would run: it, plus whatever upstream of it is
+/// stale, as one plan.
 ///
 /// `Ok(None)` is an asset that is already up to date and had nothing to do,
-/// not a refusal and not a run. named `keys` are a rebuild of exactly those
+/// not a refusal and not a plan. named `keys` are a rebuild of exactly those
 /// partitions whatever staleness says, which is the point of naming them.
 ///
-/// the api handler and the command line both come through here, so "build this
-/// asset" cannot come to mean two things depending on which one asked.
-pub(crate) fn build_one(
+/// **every caller that means "build this asset" plans it here.** the api
+/// handler, the command line and an
+/// [asset schedule](crate::Schedule::asset) all come through this function, so
+/// "build this asset" cannot come to mean different things depending on which
+/// one asked. what differs between them is one launch below, which is the
+/// trigger it records and the occurrence it claims, and never the plan.
+pub(crate) fn plan_one(
     runner: &crate::executor::Runner,
     reg: &AssetRegistry,
     name: &str,
     keys: &[String],
-) -> Result<Option<String>, Error> {
+) -> Result<Option<BuildPlan>, Error> {
     let Some(meta) = reg.get(name) else {
         return Err(Error::UnknownAsset(name.to_string()));
     };
@@ -2555,8 +2559,51 @@ pub(crate) fn build_one(
     if named.is_empty() && !staleness(reg, &mats)[name].stale {
         return Ok(None);
     }
-    let plan = plan_partitions(reg, &mats, std::slice::from_ref(&name.to_string()), &named)?;
+    plan_partitions(reg, &mats, std::slice::from_ref(&name.to_string()), &named).map(Some)
+}
+
+/// launch a build of one asset: [`plan_one`], launched as `Trigger::Build`.
+pub(crate) fn build_one(
+    runner: &crate::executor::Runner,
+    reg: &AssetRegistry,
+    name: &str,
+    keys: &[String],
+) -> Result<Option<String>, Error> {
+    let Some(plan) = plan_one(runner, reg, name, keys)? else {
+        return Ok(None);
+    };
     launch_plan(runner, plan, Trigger::Build, asset_tag(name)).map(Some)
+}
+
+/// [`plan_one`] fired by a [schedule on the asset](crate::Schedule::asset):
+/// the same plan, launched as `Trigger::Schedule` with the occurrence claimed
+/// in the same transaction as the run row.
+///
+/// `Trigger::Schedule` rather than `Trigger::Build` because the trigger says
+/// *what asked*, and a cron asked. the run is still tagged with the asset, so
+/// everything that finds a build by that tag (the asset page, the run filter,
+/// the policy log) finds this one too without being taught the combination.
+///
+/// `Ok(None)` is nothing owed: the asset and its upstream are already fresh,
+/// so there is no run and the caller records the occurrence as skipped.
+pub(crate) fn fire_build(
+    runner: &crate::executor::Runner,
+    reg: &AssetRegistry,
+    name: &str,
+    fire: crate::store::Fire<'_>,
+) -> Result<Option<crate::executor::Launched>, Error> {
+    let Some(plan) = plan_one(runner, reg, name, &[])? else {
+        return Ok(None);
+    };
+    runner
+        .fire_subset(
+            ASSETS_JOB,
+            plan.ops.into_iter().collect(),
+            plan.seeds,
+            fire,
+            asset_tag(name),
+        )
+        .map(Some)
 }
 
 /// what one key of a partitioned asset reads of one mapped dep.

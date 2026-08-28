@@ -1970,9 +1970,16 @@ async fn list_schedules(
     q: Result<Query<NamespaceQuery>, QueryRejection>,
 ) -> Result<Json<Value>, ApiError> {
     let Query(q) = q.map_err(bad_query)?;
-    let mut listed = schedules_json(st.runner.store(), |job| {
-        st.jobs.get(job).and_then(Job::namespace)
-    })
+    // the id names a job or an asset, and the namespace comes from whichever
+    // it is: an asset schedule filtered into the wrong namespace would be an
+    // asset schedule nobody with the right filter can see
+    let mut listed = schedules_json(
+        st.runner.store(),
+        |id| match crate::schedule::Target::from_id(id).asset() {
+            Some(asset) => st.assets.get(asset).and_then(|m| m.namespace.as_deref()),
+            None => st.jobs.get(id).and_then(Job::namespace),
+        },
+    )
     .map_err(internal)?;
     q.narrow(&mut listed, "schedules");
     Ok(Json(listed))
@@ -1981,10 +1988,15 @@ async fn list_schedules(
 /// everything `GET /api/schedules` says. shared with the command line for the
 /// same reason [`job_summary`] is.
 ///
-/// **a schedule's namespace is its job's**, which is why this is handed a
+/// **a schedule's namespace is its target's**, which is why this is handed a
 /// lookup rather than reading one off the row: a schedule is a firing rule for
-/// exactly one job, so there is nothing for it to declare and no way for the
-/// two to disagree.
+/// exactly one job or one asset, so there is nothing for it to declare and no
+/// way for the two to disagree. the lookup is given the stored id, so it is
+/// the caller that knows whether that names a job or an asset.
+///
+/// `job` is the stored id and stays what it always was for a job schedule. an
+/// [asset schedule](crate::Schedule::asset) reads `kind: "asset"` with the
+/// asset on `asset`, so a reader tells the two apart without parsing a prefix.
 pub(crate) fn schedules_json<'a>(
     store: &Store,
     namespace: impl Fn(&str) -> Option<&'a str>,
@@ -1993,8 +2005,13 @@ pub(crate) fn schedules_json<'a>(
         .schedules()?
         .iter()
         .map(|s| {
+            let asset = crate::schedule::Target::from_id(&s.job)
+                .asset()
+                .map(str::to_string);
             json!({
                 "job": s.job,
+                "kind": if asset.is_some() { "asset" } else { "job" },
+                "asset": asset,
                 "namespace": namespace(&s.job),
                 "expr": s.expr,
                 "tz": s.tz,

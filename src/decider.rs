@@ -424,7 +424,11 @@ mod tests {
         let entries = vec![crate::schedule::parse("etl", "* * * * * *", "UTC").unwrap()];
         let fired = || !store.ticks(None, 10).unwrap().is_empty();
 
-        let task = tokio::spawn(crate::schedule::run_scheduler(entries, runner.clone()));
+        let task = tokio::spawn(crate::schedule::run_scheduler(
+            entries,
+            runner.clone(),
+            None,
+        ));
         did_nothing("the scheduler wrote a tick", fired).await;
         elect(&runner);
         then_does("a tick", task, fired).await;
@@ -629,9 +633,18 @@ mod tests {
         // while it holds the lease, a fire lands exactly as it always did
         assert!(matches!(
             decides
-                .fire_scheduled("etl", "0 * * * *", hour(9), json!({}), false)
+                .fire_scheduled(
+                    "etl",
+                    crate::store::Fire {
+                        job: "etl",
+                        expr: "0 * * * *",
+                        scheduled_for: hour(9),
+                        caught_up: false,
+                    },
+                    json!({}),
+                )
                 .unwrap(),
-            Launched::Queued(_)
+            Some(Launched::Queued(_))
         ));
 
         // the lease moves on. this handle still believes it holds term 1: the
@@ -655,9 +668,18 @@ mod tests {
 
         assert_eq!(
             decides
-                .fire_scheduled("etl", "0 * * * *", hour(10), json!({}), false)
+                .fire_scheduled(
+                    "etl",
+                    crate::store::Fire {
+                        job: "etl",
+                        expr: "0 * * * *",
+                        scheduled_for: hour(10),
+                        caught_up: false,
+                    },
+                    json!({}),
+                )
                 .unwrap(),
-            Launched::Stale
+            Some(Launched::Stale)
         );
         assert!(
             store
@@ -745,7 +767,11 @@ mod tests {
     #[tokio::test]
     async fn an_occurrence_due_during_a_handover_is_skipped_under_the_default_policy() {
         let (store, runner, entries) = after_a_gap(Catchup::Skip, 3);
-        let task = tokio::spawn(crate::schedule::run_scheduler(entries, runner.clone()));
+        let task = tokio::spawn(crate::schedule::run_scheduler(
+            entries,
+            runner.clone(),
+            None,
+        ));
         did_nothing("the scheduler caught up", || !accounted(&store).is_empty()).await;
 
         elect(&runner);
@@ -775,7 +801,11 @@ mod tests {
     #[tokio::test]
     async fn an_occurrence_due_during_a_handover_is_fired_late_under_catchup_one() {
         let (store, runner, entries) = after_a_gap(Catchup::One, 3);
-        let task = tokio::spawn(crate::schedule::run_scheduler(entries, runner.clone()));
+        let task = tokio::spawn(crate::schedule::run_scheduler(
+            entries,
+            runner.clone(),
+            None,
+        ));
         did_nothing("the scheduler caught up", || !accounted(&store).is_empty()).await;
 
         elect(&runner);
@@ -800,7 +830,11 @@ mod tests {
     #[tokio::test]
     async fn every_occurrence_due_during_a_handover_is_accounted_for_under_catchup_all() {
         let (store, runner, entries) = after_a_gap(Catchup::All { limit: 10 }, 3);
-        let task = tokio::spawn(crate::schedule::run_scheduler(entries, runner.clone()));
+        let task = tokio::spawn(crate::schedule::run_scheduler(
+            entries,
+            runner.clone(),
+            None,
+        ));
         did_nothing("the scheduler caught up", || !accounted(&store).is_empty()).await;
 
         elect(&runner);
@@ -864,7 +898,11 @@ mod tests {
                 })
             };
 
-        let task = tokio::spawn(crate::schedule::run_scheduler(entries, runner.clone()));
+        let task = tokio::spawn(crate::schedule::run_scheduler(
+            entries,
+            runner.clone(),
+            None,
+        ));
         did_nothing("the held fire was drained", drained).await;
         assert!(
             !store.pending_fires().unwrap().is_empty(),

@@ -19,7 +19,7 @@ use crate::hooks::{self, FailureHook, OpEvent, OpHook, RunEvent, RunFailure, Run
 use crate::io::{Io, IoManager};
 use crate::job::Job;
 use crate::logs;
-use crate::model::{Reclaim, Role, Run, RunTags, Trigger};
+use crate::model::{Catchup, Reclaim, Role, Run, RunTags, Trigger};
 use crate::resource::{self, Resource, ResourceCtx, ResourceFn, RunResource, RunResourceFn};
 use crate::retention::{self, Retention};
 use crate::schedule::{self, Schedule, ScheduleEntry};
@@ -1127,6 +1127,7 @@ impl Hestan {
             loops.push(tokio::spawn(schedule::run_scheduler(
                 built.entries,
                 decides.clone(),
+                Some(built.registry.clone()),
             )));
             loops.push(tokio::spawn(run_sensors(
                 built.sensor_entries,
@@ -1451,30 +1452,58 @@ impl Hestan {
         let (jobs, registry) = self.lower()?;
         let schedules = std::mem::take(&mut self.schedules);
         let mut entries = Vec::new();
+        let ids: Vec<String> = schedules.iter().map(Schedule::id).collect();
         let mut pairs: HashSet<(&str, &str)> = HashSet::new();
-        for s in &schedules {
-            let (job, expr) = (&s.job, &s.expr);
-            let Some(defined) = jobs.iter().find(|j| j.name() == job) else {
-                return Err(Error::UnknownJob(job.clone()));
-            };
+        // a job whose name is where an asset schedule is stored would share a
+        // row, a pause flag, a cursor and a fire index with it. the prefix is
+        // only reserved once something uses it, so a deployment that declares
+        // no asset schedule is unaffected by this existing at all
+        if schedules.iter().any(|s| s.target.asset().is_some())
+            && let Some(clash) = jobs
+                .iter()
+                .find(|j| j.name().starts_with(schedule::ASSET_PREFIX))
+        {
+            return Err(Error::Graph(format!(
+                "job {}: {:?} names where an asset schedule is stored, and this \
+                 deployment declares one. rename the job",
+                clash.name(),
+                schedule::ASSET_PREFIX
+            )));
+        }
+        for (s, id) in schedules.iter().zip(&ids) {
+            let expr = &s.expr;
             // the store keys a schedule on the pair, so a second declaration of
             // one is not a second schedule: it is that row with whichever
             // timezone and params came last on it, and both entries firing
-            if !pairs.insert((job.as_str(), expr.as_str())) {
+            if !pairs.insert((id.as_str(), expr.as_str())) {
                 return Err(Error::Graph(format!(
-                    "schedule {expr} on job {job} is declared twice"
+                    "schedule {expr} on {} is declared twice",
+                    s.target.label()
                 )));
             }
-            // the same validators a launch runs, at startup: a schedule whose
-            // params no op accepts is a build error, not a 3am tick that fails
-            if let Some((op, reason)) = defined.params_error(&s.params) {
-                return Err(Error::InvalidParams {
-                    op,
-                    reason: format!("schedule {expr} on job {job}: {reason}"),
-                });
+            match s.target.asset() {
+                // the same validators a launch runs, at startup: a schedule
+                // whose params no op accepts is a build error, not a 3am tick
+                // that fails
+                None => {
+                    let job = id;
+                    let Some(defined) = jobs.iter().find(|j| j.name() == job) else {
+                        return Err(Error::UnknownJob(job.clone()));
+                    };
+                    if let Some((op, reason)) = defined.params_error(&s.params) {
+                        return Err(Error::InvalidParams {
+                            op,
+                            reason: format!("schedule {expr} on job {job}: {reason}"),
+                        });
+                    }
+                }
+                // and the same three checks a build of that asset would make,
+                // at startup rather than at 3am: a schedule that could never
+                // fire is a declaration that is wrong now
+                Some(asset) => check_asset_schedule(&registry, s, asset, expr)?,
             }
             entries.push(
-                schedule::parse(job, expr, &s.tz)?
+                schedule::parse(id, expr, &s.tz)?
                     .with_params(s.params.clone())
                     .with_catchup(s.catchup),
             );
@@ -1628,6 +1657,57 @@ pub(crate) struct Inspected {
     /// what this deployment says it is. `doctor` reports it beside the
     /// compile-time facts, which is where the difference between the two shows.
     pub(crate) deployment: Deployment,
+}
+
+/// the checks an [asset schedule](Schedule::asset) has to pass before a
+/// deployment comes up, run from `serve` and from `run_once` the way a job
+/// schedule's params are checked against the job's ops.
+///
+/// all three refuse a schedule that could never do what it says. an unknown
+/// asset and a source ("sources are probed, never built") would fail on every
+/// tick forever, and a tick log full of the same error at 6am is a worse way
+/// to learn about a typo than a process that will not start.
+///
+/// [`Catchup::All`] is refused because it is not wrong so much as meaningless
+/// here. catching up fires each missed occurrence for its own logical time,
+/// and a build has no logical time to be for: the first of three missed
+/// builds makes the asset fresh, so the other two plan nothing and land as
+/// skipped ticks. the message says what to write instead rather than leaving
+/// somebody to work out why their backlog did nothing.
+///
+/// params are refused for the same reason: a build's params are `{}`, so a
+/// schedule that set some would have them dropped on the floor. said here
+/// rather than ignored.
+fn check_asset_schedule(
+    registry: &AssetRegistry,
+    s: &Schedule,
+    asset: &str,
+    expr: &str,
+) -> Result<(), Error> {
+    let Some(meta) = registry.get(asset) else {
+        return Err(Error::UnknownAsset(asset.to_string()));
+    };
+    if meta.source {
+        return Err(Error::Graph(format!(
+            "schedule {expr} on asset {asset}: {asset} is a source; sources are \
+             probed, never built"
+        )));
+    }
+    if let Catchup::All { .. } = s.catchup {
+        return Err(Error::Graph(format!(
+            "schedule {expr} on asset {asset}: catchup all builds an asset once per \
+             missed occurrence, and the first of them makes it fresh, so the rest \
+             build nothing. write Catchup::One to build once on the way back up, or \
+             leave the default Catchup::Skip"
+        )));
+    }
+    if !matches!(&s.params, Value::Object(o) if o.is_empty()) {
+        return Err(Error::Graph(format!(
+            "schedule {expr} on asset {asset}: a build takes no params, so these \
+             would be dropped. params belong to a job schedule"
+        )));
+    }
+    Ok(())
 }
 
 pub(crate) struct Built {
