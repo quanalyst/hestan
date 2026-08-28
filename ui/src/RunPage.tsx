@@ -499,6 +499,17 @@ function RunView({ id }: { id: string }) {
         </p>
       )}
 
+      {/* what the op row itself says: the reason a skipped op gives for not
+          running, and the message a failed one ended with. the run's own error
+          names the first failure only, so an op selected anywhere else on the
+          graph has nowhere else to say why */}
+      {selectedOp?.error && (
+        <p className="muted dag-action">
+          {selectedOp.status === "skipped" ? "skipped" : "error"}{" "}
+          <span className="mono">{selectedOp.error}</span>
+        </p>
+      )}
+
       {opSel && selectedOutput !== null && (
         <p className="muted dag-action">
           output <span className="mono">{selectedOutput}</span>

@@ -1367,6 +1367,10 @@ impl Hestan {
         let code = match self.ran_op_subprocess(req).await {
             Ok(crate::isolate::Worked::Success) => 0,
             Ok(crate::isolate::Worked::Failed) => 1,
+            // the row the child wrote is what the parent reads, and a skip
+            // recorded one: this exit code says the child got that far, not
+            // what the row says
+            Ok(crate::isolate::Worked::Skipped) => 0,
             // the op ran; nothing recorded it. said here for the same reason
             // the arm below prints rather than traces: the parent captures
             // this stream as the attempt's output, and its own read of the op

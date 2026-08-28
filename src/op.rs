@@ -18,6 +18,40 @@ use crate::store::{Built, Store, note};
 /// what an op body returns: json output on success, any error on failure.
 pub type OpResult = Result<Value, Box<dyn std::error::Error + Send + Sync>>;
 
+/// the error [`OpCtx::skip`] hands back, recognised by the run loop and by
+/// nothing else.
+///
+/// it travels as an ordinary boxed error because that is the only channel out
+/// of an op body that is not a success, and being an error is what makes the
+/// compiler insist the body stop. the run loop downcasts it back before it
+/// treats an error as a failure, so a skip never reaches a failure hook, an
+/// `on_failure` notification or the run's own error.
+///
+/// **a wrapped one is a failure**, deliberately. a body that catches this and
+/// re-raises it inside its own error type has turned it into something else,
+/// and hestan guessing that the something else was still meant as a skip
+/// would be hestan reading through a conversion the author wrote on purpose.
+#[derive(Debug)]
+pub(crate) struct Skip {
+    reason: String,
+}
+
+impl fmt::Display for Skip {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.reason)
+    }
+}
+
+impl std::error::Error for Skip {}
+
+/// the reason on a boxed error that is a skip, and `None` for every error that
+/// is a failure.
+pub(crate) fn skip_reason<'a>(
+    e: &'a (dyn std::error::Error + Send + Sync + 'static),
+) -> Option<&'a str> {
+    e.downcast_ref::<Skip>().map(|s| s.reason.as_str())
+}
+
 /// how many rows a [`Meta::table`] keeps, applied at construction. a metadata
 /// table is a sample you read at a glance (the top regions, the columns that
 /// changed type), not a result set, and a pipeline that reports its whole
@@ -1966,6 +2000,85 @@ impl OpCtx {
     /// body reached the end of the work.
     pub(crate) fn stage_build(&self, built: Built) {
         self.built.lock().unwrap().push(built);
+    }
+
+    /// end this op as [`Skipped`](crate::OpStatus::Skipped): there was nothing
+    /// for it to do, and that is neither a success nor a failure.
+    ///
+    /// ```no_run
+    /// # use hestan::{Op, OpCtx};
+    /// # use serde_json::json;
+    /// # fn vendor_file_is_there() -> bool { true }
+    /// Op::new("load", |ctx: OpCtx| async move {
+    ///     if !vendor_file_is_there() {
+    ///         return Err(ctx.skip("no drop from the vendor yet"));
+    ///     }
+    ///     Ok(json!({"loaded": true}))
+    /// });
+    /// ```
+    ///
+    /// the two things an op could say before this both said something untrue.
+    /// `Ok(..)` records a success, so freshness, any materialization and every
+    /// success hook take a build that did not happen as one that did.
+    /// `Err(..)` fails the run, which wakes whoever owns it for a non-event.
+    ///
+    /// **it returns the error rather than setting a flag, so the body stops.**
+    /// a `skip` that only marked something and let the body carry on is wrong
+    /// the first time it is written inside an `if` with the `return`
+    /// forgotten, and it would be wrong silently. going out through the error
+    /// channel is the one shape the compiler enforces: the op either returns
+    /// this or returns a value, because those are the two arms of one
+    /// `Result`, so skipping and also succeeding is not a state that exists.
+    /// the return is the boxed error and not an `OpResult` because
+    /// [`Op::typed`] bodies return their own output type, and only the error
+    /// half of the two is common to both.
+    ///
+    /// **the reason is not optional.** it goes into the [event
+    /// log](crate::EventKind::OpSkipped) at warn level, the way
+    /// [`warn`](Self::warn) does, and onto the op run row, so the run page
+    /// says why without anybody opening the log.
+    ///
+    /// **downstream sees exactly what a [rule](When) skip leaves.** the row is
+    /// `Skipped` either way, and the run propagates from it through the same
+    /// function, so an op with [`When::AllSucceeded`] on a skipped dep is
+    /// skipped naming this one, and one with [`When::Always`] runs and reads
+    /// [`dep_status`](Self::dep_status) as `Skipped`. there is nothing to seed
+    /// it with, so [`input`](Self::input) for this op is `None`: a skip
+    /// produced no output, and a downstream op that needs one wants
+    /// `AllSucceeded`, which is the default.
+    ///
+    /// **it never retries.** a skip is a decision the body reached, not a
+    /// failure it might reach differently next time, so
+    /// [`retries`](Op::retries) does not apply to it.
+    ///
+    /// **an asset op that skips materializes nothing.** what
+    /// [an asset op stages](crate::Asset) is written in the transaction that
+    /// records the op as having *succeeded*, and this is not that, so
+    /// staleness still says the asset is stale and the next real build still
+    /// happens. a skip that wrote a materialization would suppress it.
+    ///
+    /// **what it staged is kept, except the state.** [`meta`](Self::meta) and
+    /// [`saved`](Self::saved) survive, because a skip is a finished op rather
+    /// than a discarded attempt: the numbers the body read on the way to
+    /// deciding there was nothing to do are the evidence for the decision, and
+    /// a run page saying "skipped: no drop from the vendor yet" is better for
+    /// having them. a failed attempt drops its metadata because a retry is
+    /// about to replace it, and a skip has no retry to be replaced by.
+    /// [`set_state`](Self::set_state) is the exception and is dropped:
+    /// a watermark is a promise about work that was done, and moving it
+    /// without doing the work is how the next run skips real input.
+    /// [`set_fingerprint`](Self::set_fingerprint) goes with the
+    /// materialization that is not being written.
+    ///
+    /// **the whole run's status is unchanged by a skip**, so a run whose ops
+    /// all skipped is [`Success`](crate::RunStatus::Success). that is already
+    /// what an all-rule-skipped run is: the run did nothing and failed
+    /// nothing, and two ways of doing nothing must not end in two statuses.
+    #[must_use = "a skip only happens when the body returns it: `return Err(ctx.skip(..))`"]
+    pub fn skip(&self, reason: impl Into<String>) -> Box<dyn std::error::Error + Send + Sync> {
+        Box::new(Skip {
+            reason: reason.into(),
+        })
     }
 
     /// say something in the run log, attributed to this op.

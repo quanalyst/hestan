@@ -7,7 +7,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { renderToStaticMarkup } from "react-dom/server";
-import Markdown from "../src/Markdown";
+import Markdown from "../src/MarkdownView";
 import { linkHref, parseInline, parseMarkdown } from "../src/markdown";
 import type { Inline } from "../src/markdown";
 

@@ -469,3 +469,76 @@ async fn a_materialization_written_before_any_of_this_still_seeds_a_build() {
     let path = new.value.unwrap()["path"].as_str().unwrap().to_string();
     assert_eq!(std::fs::read_to_string(path).unwrap(), r#"{"doubled":6}"#);
 }
+
+// a skip is not a build. if a skipping asset op wrote a materialization,
+// staleness would take the asset as refreshed and suppress the next real
+// build, which is the one that would have done the work
+#[tokio::test]
+async fn an_asset_op_that_skips_writes_no_materialization_and_stays_stale() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("hestan.db");
+    let db = db.to_str().unwrap();
+
+    let ready = Arc::new(Mutex::new(false));
+    let assets = |ready: Arc<Mutex<bool>>| {
+        let docs = Asset::source("docs");
+        let stats = Asset::new("stats", move |ctx: OpCtx| {
+            let ready = ready.clone();
+            async move {
+                let go = *ready.lock().unwrap();
+                match go {
+                    false => Err(ctx.skip("upstream file has not landed")),
+                    true => Ok(json!({"files": 3})),
+                }
+            }
+        })
+        .from(&docs);
+        vec![docs, stats]
+    };
+
+    // the probe row a source would have written, planted by hand: the write
+    // api is crate-internal
+    drop(Store::open(db).unwrap());
+    rusqlite::Connection::open(db)
+        .unwrap()
+        .execute(
+            "INSERT INTO asset_materializations (asset, fingerprint, inputs, built_at)
+             VALUES ('docs', 'd1', '{}', ?1)",
+            [chrono::Utc::now().to_rfc3339()],
+        )
+        .unwrap();
+
+    let run = Hestan::new()
+        .assets(assets(ready.clone()))
+        .db(db)
+        .build_asset("stats")
+        .await
+        .unwrap();
+    // the run did nothing and failed nothing
+    assert_eq!(run.status, RunStatus::Success);
+
+    let store = Store::open(db).unwrap();
+    let row = store.op_run(&run.id, "stats").unwrap().unwrap();
+    assert_eq!(row.status, hestan::OpStatus::Skipped);
+    assert_eq!(row.error.as_deref(), Some("upstream file has not landed"));
+    assert!(
+        store.materialization("stats", None).unwrap().is_none(),
+        "a skip wrote a materialization"
+    );
+
+    // so the asset is still stale, and the next build is not suppressed
+    *ready.lock().unwrap() = true;
+    let run = Hestan::new()
+        .assets(assets(ready.clone()))
+        .db(db)
+        .build_asset("stats")
+        .await
+        .unwrap();
+    assert_eq!(run.status, RunStatus::Success);
+    let ops = store.op_runs(&run.id).unwrap();
+    let names: Vec<&str> = ops.iter().map(|o| o.op.as_str()).collect();
+    assert_eq!(names, ["stats"], "the second build had nothing to do");
+    let mat = store.materialization("stats", None).unwrap().unwrap();
+    assert_eq!(mat.value, Some(json!({"files": 3})));
+    assert_eq!(mat.run_id.as_deref(), Some(run.id.as_str()));
+}

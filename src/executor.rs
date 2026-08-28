@@ -389,6 +389,10 @@ pub(crate) enum Ended {
     Handle(Value),
     /// the attempt failed, with the message the run records.
     Failed(String),
+    /// the body said there was nothing to do: [`OpCtx::skip`](crate::OpCtx::skip)
+    /// with the reason it gave. terminal on the first attempt, since a
+    /// decision is not something a retry reaches differently.
+    Skipped(String),
     /// an isolated child was stopped for real: signalled, then killed, and
     /// watched to die.
     Killed(String),
@@ -410,6 +414,18 @@ enum Outcome {
     Recorded(Value),
     /// terminally failed, after any retries.
     Failed(String),
+    /// the body [skipped itself](crate::OpCtx::skip), with the reason and
+    /// whatever it staged on the way to deciding. the run records it exactly as
+    /// it records a skip a [trigger rule](When) decided, down to the same
+    /// function: two ways of not running an op must not be two things
+    /// downstream has to know apart.
+    Skipped {
+        reason: String,
+        /// what [`OpCtx::meta`](crate::OpCtx::meta) staged, kept because a
+        /// skip is a finished op rather than a discarded attempt. the state
+        /// and the asset builds are not kept; see [`OpCtx::skip`](crate::OpCtx::skip).
+        meta: Option<Value>,
+    },
     /// an isolated op the run's cancellation killed. unlike the cooperative
     /// path this one gets a real finish time, because for once hestan watched
     /// the work stop.
@@ -2886,7 +2902,7 @@ async fn execute_in_span(
             // and every row says why
             let reason = format!("skipped: {e}");
             for name in pending.drain(..) {
-                unrecorded |= !op_skipped(&store, &run_id, &name, &reason, None).await;
+                unrecorded |= !op_skipped(&store, &run_id, &name, &reason, None, None).await;
             }
             failed = true;
             run_error = Some(e.to_string());
@@ -2910,7 +2926,7 @@ async fn execute_in_span(
         );
         let reason = format!("skipped: {e}");
         for name in pending.drain(..) {
-            unrecorded |= !op_skipped(&store, &run_id, &name, &reason, None).await;
+            unrecorded |= !op_skipped(&store, &run_id, &name, &reason, None, None).await;
         }
         failed = true;
         run_error = Some(e);
@@ -2947,6 +2963,9 @@ async fn execute_in_span(
                         reason,
                         Some(&json!({ "reason": reason, "when": op.runs_when() })),
                     ));
+                    // the reason on the row as well as in the log, exactly as
+                    // `op_skipped` writes every other skip: a run page must
+                    // say why an op is grey whichever kind of skip it was
                     if !store
                         .landed("op_finished", || {
                             store.op_finished(
@@ -2955,7 +2974,7 @@ async fn execute_in_span(
                                 OpStatus::Skipped,
                                 None,
                                 None,
-                                None,
+                                Some(reason),
                                 &[],
                             )
                         })
@@ -3378,6 +3397,40 @@ async fn execute_in_span(
                         }
                         Err(msg)
                     }
+                    // the body said there was nothing to do. recorded through
+                    // the same function every other skip goes through, and
+                    // propagated by the same one a rule skip propagates by, so
+                    // downstream cannot tell a self-skip from a rule skip and
+                    // does not have to. nothing is persisted and nothing is
+                    // collected: a skip produced no output, so there is no
+                    // handle for `outputs` and no value for a fan-out slot.
+                    // `failed` is untouched, which is what leaves a run whose
+                    // ops all skipped a success
+                    Outcome::Skipped { reason, meta } => {
+                        if !op_skipped(&store, &run_id, &name, &reason, None, meta.as_ref()).await {
+                            unrecorded = true;
+                            break 'run;
+                        }
+                        if !stop_here(
+                            &name,
+                            OpStatus::Skipped,
+                            "was skipped",
+                            &instances,
+                            &mut fanouts,
+                            &job,
+                            &pairs,
+                            &mut pending,
+                            &mut statuses,
+                            &run_id,
+                            &store,
+                        )
+                        .await
+                        {
+                            unrecorded = true;
+                            break 'run;
+                        }
+                        continue 'run;
+                    }
                     // only a cancel produces this, so the run is stopping:
                     // record what was watched to happen and go drain the rest
                     Outcome::Killed(msg) => {
@@ -3600,6 +3653,19 @@ async fn execute_in_span(
                         // the child wrote its own row before the cancel reached
                         // it; there is nothing left to record
                         Outcome::Recorded(_) => {}
+                        // it decided there was nothing to do before the cancel
+                        // reached it, and that is what really happened, so it
+                        // is recorded like any other outcome that won the race.
+                        // nothing propagates from here: the run is stopping,
+                        // and everything still pending is about to be canceled
+                        Outcome::Skipped { reason, meta } => {
+                            if !op_skipped(&store, &run_id, &name, &reason, None, meta.as_ref())
+                                .await
+                            {
+                                unrecorded = true;
+                                break 'drain;
+                            }
+                        }
                         Outcome::Failed(msg) => {
                             if !store
                                 .landed("op_finished", || {
@@ -4099,9 +4165,48 @@ async fn give_up(
     run_id: &str,
     store: &Store,
 ) -> bool {
-    statuses.insert(name.to_string(), OpStatus::Failed);
+    stop_here(
+        name,
+        OpStatus::Failed,
+        "failed",
+        instances,
+        fanouts,
+        job,
+        pairs,
+        pending,
+        statuses,
+        run_id,
+        store,
+    )
+    .await
+}
+
+/// [`give_up`] for a unit that reached `status` instead of producing a value,
+/// with `verb` the word the downstream reason uses.
+///
+/// one function for both because the shape is one shape: whatever stopped this
+/// unit, it has no value to hand its fan-out, so the fan-out has no array to
+/// hand the level outside it, and the mapped op has none to hand downstream.
+/// an instance that [skipped itself](crate::OpCtx::skip) is that case exactly,
+/// and it differs only in the word on the rows it leaves and in the run not
+/// being failed by it.
+#[allow(clippy::too_many_arguments)]
+async fn stop_here(
+    name: &str,
+    status: OpStatus,
+    verb: &str,
+    instances: &HashMap<String, Instance>,
+    fanouts: &mut HashMap<String, Fanout>,
+    job: &Job,
+    pairs: &[(String, Vec<String>)],
+    pending: &mut Vec<String>,
+    statuses: &mut HashMap<String, OpStatus>,
+    run_id: &str,
+    store: &Store,
+) -> bool {
+    statuses.insert(name.to_string(), status);
     let Some(instance) = instances.get(name) else {
-        let reason = format!("skipped: upstream {name} failed");
+        let reason = format!("skipped: upstream {name} {verb}");
         return skip_downstream(job, pairs, name, &reason, pending, statuses, run_id, store).await;
     };
     let mut unit = instance.fanout.clone();
@@ -4109,8 +4214,8 @@ async fn give_up(
         .get_mut(&unit)
         .expect("an instance belongs to a live fan-out")
         .remaining -= 1;
-    // the first failure under a mapped op is what fails it and skips
-    // downstream; later ones just close a slot
+    // the first instance to stop under a mapped op is what stops the whole of
+    // it and skips downstream; later ones just close a slot
     loop {
         let fan = fanouts
             .get_mut(&unit)
@@ -4124,8 +4229,8 @@ async fn give_up(
         };
         unit = outer;
     }
-    statuses.insert(unit.clone(), OpStatus::Failed);
-    let reason = format!("skipped: upstream {unit} failed");
+    statuses.insert(unit.clone(), status);
+    let reason = format!("skipped: upstream {unit} {verb}");
     skip_downstream(job, pairs, &unit, &reason, pending, statuses, run_id, store).await
 }
 
@@ -4434,7 +4539,14 @@ async fn run_op(
                 };
                 match caught {
                     Ok(Ok(Ok(output))) => Ended::Value(output),
-                    Ok(Ok(Err(e))) => Ended::Failed(e.to_string()),
+                    // the one error that is not a failure: the body said there
+                    // was nothing to do. read back off the box rather than off
+                    // the message, so an op whose own error happens to read
+                    // like a skip is still a failure
+                    Ok(Ok(Err(e))) => match op::skip_reason(&*e) {
+                        Some(reason) => Ended::Skipped(reason.to_string()),
+                        None => Ended::Failed(e.to_string()),
+                    },
                     // as_ref, not &: &Box<dyn Any> would downcast against the box
                     Ok(Err(panic)) => Ended::Failed(match panic_payload(panic.as_ref()) {
                         Some(s) => format!("op panicked: {s}"),
@@ -4507,6 +4619,21 @@ async fn run_op(
             Ended::Handle(handle) => {
                 told(OpStatus::Success, None);
                 return (name, Outcome::Recorded(handle));
+            }
+            // terminal on this attempt and never retried: a skip is a decision
+            // the body reached, and a retry is for work that might go
+            // differently, not for a decision that would be reached again.
+            // `Skipped` rather than `Failed` here is the whole of why a
+            // failure hook does not hear about it
+            Ended::Skipped(reason) => {
+                told(OpStatus::Skipped, None);
+                return (
+                    name,
+                    Outcome::Skipped {
+                        reason,
+                        meta: op::staged_meta(&new_meta),
+                    },
+                );
             }
             Ended::Killed(msg) => {
                 told(OpStatus::Canceled, Some(&msg));
@@ -4630,7 +4757,7 @@ async fn skip_downstream(
     while i < pending.len() {
         if down.contains(&pending[i]) {
             let name = pending.remove(i);
-            if !op_skipped(store, run_id, &name, reason, Some(root)).await {
+            if !op_skipped(store, run_id, &name, reason, Some(root), None).await {
                 return false;
             }
             statuses.insert(name, OpStatus::Skipped);
@@ -4643,15 +4770,26 @@ async fn skip_downstream(
 
 /// record one op that will not run, with the reason on its row and in the log.
 ///
+/// the reason lands on the op run row as well as in the event log, so a run
+/// page says why an op is grey without anybody opening the log. every skip
+/// comes through here (a [rule](When) that refused it, a failure above it, a
+/// body that [skipped itself](crate::OpCtx::skip)) so that one shape of row
+/// answers all three.
+///
 /// `upstream` names the op whose failure reached this one, and is `None` when
 /// nothing above it is what stopped it: a run that could not build a
-/// [run-scoped resource](crate::Hestan::run_resource) never ran an op at all.
+/// [run-scoped resource](crate::Hestan::run_resource) never ran an op at all,
+/// and a body that skipped itself had nothing above it to blame.
+///
+/// `meta` is what the body staged before it skipped, which only a self-skip
+/// ever has.
 async fn op_skipped(
     store: &Store,
     run_id: &str,
     name: &str,
     reason: &str,
     upstream: Option<&str>,
+    meta: Option<&Value>,
 ) -> bool {
     // event first, like every other terminal transition
     note(store.append_event(
@@ -4664,7 +4802,15 @@ async fn op_skipped(
     ));
     store
         .landed("op_finished", || {
-            store.op_finished(run_id, name, OpStatus::Skipped, None, None, None, &[])
+            store.op_finished(
+                run_id,
+                name,
+                OpStatus::Skipped,
+                None,
+                meta,
+                Some(reason),
+                &[],
+            )
         })
         .await
 }

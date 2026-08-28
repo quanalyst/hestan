@@ -79,6 +79,10 @@ pub(crate) fn requested() -> Option<Request> {
 pub(crate) enum Worked {
     Success,
     Failed,
+    /// the body [skipped itself](crate::OpCtx::skip). the row it wrote says
+    /// `skipped` and carries the reason, which is what the parent reads back:
+    /// the exit code is only how the child says whether it got that far.
+    Skipped,
     /// the body ran and the store would not take the row that says what it
     /// did. the parent reads the op's row rather than this process's exit
     /// code, so what this changes is what gets *said* about an attempt that
@@ -237,6 +241,14 @@ fn recorded(store: &Store, run_id: &str, name: &str) -> Option<Ended> {
         OpStatus::Failed => {
             Some(Ended::Failed(row.error.unwrap_or_else(|| {
                 "the op failed without recording why".to_string()
+            })))
+        }
+        // the child wrote its own terminal row for this too, reason and all,
+        // so the parent has nothing to add: it only has to not read `skipped`
+        // as `failed`, which is what a missing arm here would have done
+        OpStatus::Skipped => {
+            Some(Ended::Skipped(row.error.unwrap_or_else(|| {
+                "the op skipped itself without recording why".to_string()
             })))
         }
         _ => None,
@@ -481,6 +493,17 @@ pub(crate) async fn run_one_op(
                 .await;
             match called {
                 Ok(Ok(output)) => Ok(output),
+                // a body that [skipped itself](crate::OpCtx::skip) is terminal
+                // here, before anything is persisted: it produced no output, so
+                // there is nothing for the io manager to store and nothing for
+                // a materialization to point at. the row it writes is what the
+                // parent reads back, so the two processes agree without a
+                // protocol, the same way they agree about a success
+                Ok(Err(e)) if op::skip_reason(&*e).is_some() => {
+                    let reason = e.to_string();
+                    let meta = op::staged_meta(&new_meta);
+                    return Ok(skipped_in_child(store, req, meta.as_ref(), &reason).await);
+                }
                 Ok(Err(e)) => Err(e.to_string()),
                 Err(panic) => Err(match panic_payload(panic.as_ref()) {
                     Some(s) => format!("op panicked: {s}"),
@@ -572,6 +595,46 @@ pub(crate) async fn run_one_op(
                 false => Ok(Worked::Unrecorded),
             }
         }
+    }
+}
+
+/// the child's terminal write for a body that
+/// [skipped itself](crate::OpCtx::skip).
+///
+/// it writes the event as well as the row, unlike the failure path above,
+/// because the parent writes no event of its own for a skip: a skip is
+/// terminal on the attempt that reached it, so there is no "was that the last
+/// attempt" for the parent to decide.
+async fn skipped_in_child(
+    store: &Store,
+    req: &crate::isolate::Request,
+    meta: Option<&Value>,
+    reason: &str,
+) -> Worked {
+    note(store.append_event(
+        &req.run_id,
+        Some(&req.op),
+        EventLevel::Warn,
+        EventKind::OpSkipped,
+        reason,
+        Some(&json!({ "reason": reason, "upstream": Value::Null })),
+    ));
+    match store
+        .landed("op_finished", || {
+            store.op_finished(
+                &req.run_id,
+                &req.op,
+                OpStatus::Skipped,
+                None,
+                meta,
+                Some(reason),
+                &[],
+            )
+        })
+        .await
+    {
+        true => Worked::Skipped,
+        false => Worked::Unrecorded,
     }
 }
 

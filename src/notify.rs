@@ -124,6 +124,10 @@ impl Alert for OpEvent {
                 self.error.as_deref().unwrap_or("unknown error")
             ),
             OpStatus::Canceled => format!("was canceled on attempt {}", self.attempt),
+            // an op that [skipped itself](crate::OpCtx::skip) ran and decided
+            // there was nothing to do, which is not a success and must not be
+            // reported as one
+            OpStatus::Skipped => format!("skipped itself on attempt {}", self.attempt),
             _ => format!("succeeded on attempt {}", self.attempt),
         };
         format!(

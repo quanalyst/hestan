@@ -1,5 +1,5 @@
 import { Link } from "react-router-dom";
-import Markdown from "./Markdown";
+import Markdown from "./MarkdownView";
 import MicroBars from "./MicroBars";
 import SeriesChart from "./SeriesChart";
 import type { Deltas, MetaDelta, MetaPoint, MetaTable, MetaValue, Metadata, Trends } from "./types";

@@ -2,10 +2,10 @@
 // the subset is documented exhaustively in docs/metadata.md; anything outside
 // it is left as the literal text it was written as.
 //
-// this file produces data. Markdown.tsx turns the data into react elements,
-// which is what makes injection impossible rather than merely escaped: no node
-// type here can carry markup, so there is never an html string for the
-// renderer to hand to react in the first place.
+// this file produces data. MarkdownView.tsx turns the data into react
+// elements, which is what makes injection impossible rather than merely
+// escaped: no node type here can carry markup, so there is never an html
+// string for the renderer to hand to react in the first place.
 
 export type Inline =
   | { kind: "text"; text: string }

@@ -68,6 +68,12 @@ pub struct RunEvent {
 /// facts, and a hook that only wants the last one filters on `status`. an op
 /// skipped by its [trigger rule](crate::When), or one canceled before it was
 /// ever spawned, produces nothing at all: there was no attempt.
+///
+/// an op that [skipped itself](crate::OpCtx::skip) is the other way round: its
+/// body ran, so there *was* an attempt, and this arrives with
+/// [`Skipped`](crate::OpStatus::Skipped) on it. it is neither a success nor a
+/// failure, and a hook that treats "not failed" as "worked" is the one place
+/// that distinction has to be made deliberately.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct OpEvent {
     /// the run this attempt belonged to.

@@ -4795,3 +4795,229 @@ async fn retention_takes_what_the_run_wrote_and_leaves_the_runs_it_keeps() {
         "the row stayed behind a directory that was already gone"
     );
 }
+
+// ---------------------------------------------------------------- an op that
+// says it had nothing to do
+
+// the row says skipped, the run says success, and the reason is in both places
+// somebody looks: on the op row and in the event log
+#[tokio::test]
+async fn an_op_that_skips_itself_is_skipped_and_the_run_still_succeeds() {
+    let job = Job::builder("vendor")
+        .op(Op::new("pull", |ctx: OpCtx| async move {
+            ctx.meta("checked", 1);
+            Err(ctx.skip("no drop from the vendor yet"))
+        }))
+        .build()
+        .unwrap();
+
+    let runner = Runner::new([job], Store::open(":memory:").unwrap()).unwrap();
+    let run = runner
+        .run("vendor", json!({}), Trigger::Manual)
+        .await
+        .unwrap();
+
+    // a run that did nothing and failed nothing is the same success an
+    // all-rule-skipped run already is
+    assert_eq!(run.status, RunStatus::Success);
+    assert_eq!(run.error, None);
+
+    let row = runner.store().op_run(&run.id, "pull").unwrap().unwrap();
+    assert_eq!(row.status, OpStatus::Skipped);
+    assert_eq!(row.output, None);
+    assert_eq!(row.error.as_deref(), Some("no drop from the vendor yet"));
+    // what it staged on the way to deciding is the evidence for the decision,
+    // so it survives
+    assert_eq!(row.metadata.unwrap()["checked"], json!({"int": 1}));
+
+    let events = runner.store().events(&run.id, 0).unwrap();
+    let skipped: Vec<&hestan::Event> = events
+        .iter()
+        .filter(|e| e.kind == EventKind::OpSkipped)
+        .collect();
+    assert_eq!(skipped.len(), 1);
+    assert_eq!(skipped[0].message, "no drop from the vendor yet");
+    assert_eq!(skipped[0].op.as_deref(), Some("pull"));
+}
+
+/// a job whose `head` op either skips itself or is declined by a rule, with the
+/// same two ops hanging off it either way: one that runs whatever happened and
+/// reports what it was handed, and one on the default rule that must not run.
+fn skipping_job(self_skip: bool, seen: Arc<Mutex<Vec<String>>>) -> Job {
+    let head = match self_skip {
+        true => Op::new("head", |ctx: OpCtx| async move {
+            Err(ctx.skip("nothing to do"))
+        }),
+        // declined by its own rule: every dep succeeded, so `any_failed` says no
+        false => Op::new("head", |_| async { Ok(json!("unreachable")) })
+            .after(["gate"])
+            .when(When::AnyFailed),
+    };
+    Job::builder("shaped")
+        .op(Op::new("gate", |_| async { Ok(json!("open")) }))
+        .op(head)
+        .op(Op::new("after", move |ctx: OpCtx| {
+            let seen = seen.clone();
+            async move {
+                seen.lock().unwrap().push(format!(
+                    "head={} input={:?}",
+                    ctx.dep_status("head").map_or("none", |s| s.as_str()),
+                    ctx.input("head"),
+                ));
+                Ok(json!(null))
+            }
+        })
+        .after(["head"])
+        .when(When::Always))
+        .op(Op::new("needs_head", |_| async { Ok(json!(null)) }).after(["head"]))
+        .build()
+        .unwrap()
+}
+
+// the whole point of routing a self-skip through the machinery a rule skip
+// already uses: downstream cannot tell them apart, so nothing downstream has
+// to learn a second notion of skip
+#[tokio::test]
+async fn a_self_skip_and_a_rule_skip_look_the_same_downstream() {
+    let mut both = Vec::new();
+    for self_skip in [true, false] {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let runner = Runner::new(
+            [skipping_job(self_skip, seen.clone())],
+            Store::open(":memory:").unwrap(),
+        )
+        .unwrap();
+        let run = runner
+            .run("shaped", json!({}), Trigger::Manual)
+            .await
+            .unwrap();
+        let ops = runner.store().op_runs(&run.id).unwrap();
+        let row = |name: &str| ops.iter().find(|o| o.op == name).unwrap().clone();
+        both.push((
+            run.status,
+            row("head").status,
+            row("after").status,
+            row("needs_head").status,
+            row("needs_head").error,
+            seen.lock().unwrap().clone(),
+        ));
+    }
+
+    assert_eq!(both[0], both[1], "a self-skip and a rule skip diverged");
+    let (status, head, after, needs, why, seen) = both[0].clone();
+    assert_eq!(status, RunStatus::Success);
+    assert_eq!(head, OpStatus::Skipped);
+    // `Always` runs and is told what happened; there is no output to read
+    assert_eq!(after, OpStatus::Success);
+    assert_eq!(seen, ["head=skipped input=None"]);
+    // and the default rule cuts off, naming the op that stopped it
+    assert_eq!(needs, OpStatus::Skipped);
+    assert_eq!(
+        why.as_deref(),
+        Some("skipped: upstream head was skipped"),
+        "the reason a cut-off op did not run is on its row"
+    );
+}
+
+// a skip wakes nobody: it is neither the failure a failure hook is for nor the
+// success an op hook must not mistake it for
+#[tokio::test]
+async fn a_skip_is_not_a_failure_to_a_failure_hook() {
+    let (failures, failure_hook) = collector();
+    let (ops, op_hook) = op_events();
+    let job = Job::builder("quiet")
+        .on_op_finished(move |e| op_hook(e))
+        .op(Op::new("maybe", |ctx: OpCtx| async move {
+            Err(ctx.skip("nothing arrived"))
+        }))
+        .build()
+        .unwrap();
+
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("hestan.db");
+    let run = Hestan::new()
+        .job(job)
+        .db(db.to_str().unwrap())
+        .on_failure(move |f| failure_hook(f))
+        .run_once("quiet", json!({}))
+        .await
+        .unwrap();
+    assert_eq!(run.status, RunStatus::Success);
+    wait_until(|| !ops.lock().unwrap().is_empty()).await;
+
+    assert!(
+        failures.lock().unwrap().is_empty(),
+        "a skip paged the failure hook"
+    );
+    // the body did run, so there was an attempt and the op hook hears about
+    // it: what it must not say is that the attempt worked
+    let seen = ops.lock().unwrap();
+    assert_eq!(seen.len(), 1);
+    assert_eq!(seen[0].status, OpStatus::Skipped);
+    assert_eq!(seen[0].error, None);
+}
+
+// a skip is a decision the body reached, not a failure it might reach
+// differently next time, so the retry policy does not apply to it
+#[tokio::test]
+async fn a_skip_is_terminal_on_the_first_attempt() {
+    let calls = Arc::new(AtomicU32::new(0));
+    let n = calls.clone();
+    let job = Job::builder("patient")
+        .op(Op::new("look", move |ctx: OpCtx| {
+            let n = n.clone();
+            async move {
+                n.fetch_add(1, Ordering::SeqCst);
+                Err(ctx.skip("still nothing"))
+            }
+        })
+        .retries(3))
+        .build()
+        .unwrap();
+
+    let runner = Runner::new([job], Store::open(":memory:").unwrap()).unwrap();
+    let run = runner
+        .run("patient", json!({}), Trigger::Manual)
+        .await
+        .unwrap();
+
+    assert_eq!(run.status, RunStatus::Success);
+    assert_eq!(calls.load(Ordering::SeqCst), 1, "the skip was retried");
+    let row = runner.store().op_run(&run.id, "look").unwrap().unwrap();
+    assert_eq!(row.status, OpStatus::Skipped);
+    assert_eq!(row.attempts, 1);
+}
+
+// a watermark is a promise about work that was done, so a skip does not move
+// one: the next run starts from where the last one that really ran left off
+#[tokio::test]
+async fn a_skip_does_not_commit_the_state_it_staged() {
+    let store = Store::open(":memory:").unwrap();
+    let seen: Arc<Mutex<Vec<Option<Value>>>> = Arc::new(Mutex::new(Vec::new()));
+    let s = seen.clone();
+    let job = Job::builder("watermark")
+        .op(Op::new("read", move |ctx: OpCtx| {
+            let s = s.clone();
+            async move {
+                s.lock().unwrap().push(ctx.state().cloned());
+                ctx.set_state(json!({"cursor": "moved"}));
+                match ctx.state() {
+                    None => Err(ctx.skip("nothing new upstream")),
+                    Some(_) => Ok(json!("worked")),
+                }
+            }
+        }))
+        .build()
+        .unwrap();
+
+    let runner = Runner::new([job], store.clone()).unwrap();
+    for _ in 0..2 {
+        runner
+            .run("watermark", json!({}), Trigger::Manual)
+            .await
+            .unwrap();
+    }
+    // the first run skipped and committed nothing, so the second saw the same
+    // absence the first did and skipped for the same reason
+    assert_eq!(*seen.lock().unwrap(), vec![None, None]);
+}
