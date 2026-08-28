@@ -351,3 +351,101 @@ fn every_file_the_source_includes_is_packaged() {
         "only {found} compile-time includes found in src/"
     );
 }
+
+/// the repository files the gate is written in twice. absent from the packaged
+/// crate, which is a legitimate place to run this suite from, so these return
+/// `None` there and the tests below assert nothing rather than failing on a
+/// file that was never meant to ship.
+fn repo_file(rel: &str) -> Option<String> {
+    std::fs::read_to_string(root().join(rel)).ok()
+}
+
+/// which cargo invocations a line asks for, as (subcommand, feature set).
+///
+/// the toolchain token and any leading environment assignment are dropped, so
+/// `cargo +nightly doc --all-features` and `cargo doc --all-features` are the
+/// same entry: what is being compared is which configuration got run, not how
+/// the line was spelled.
+fn cargo_configs(text: &str) -> BTreeSet<(String, String)> {
+    const SUBS: [&str; 5] = ["fmt", "clippy", "test", "check", "doc"];
+    let mut found = BTreeSet::new();
+    for line in text.lines() {
+        let line = line.trim();
+        if line.starts_with('#') || !line.contains("cargo") {
+            continue;
+        }
+        let tokens: Vec<&str> = line.split_whitespace().collect();
+        let Some(start) = tokens.iter().position(|t| t.ends_with("cargo")) else {
+            continue;
+        };
+        let Some(sub) = tokens[start + 1..]
+            .iter()
+            .find(|t| !t.starts_with('+') && !t.starts_with("\"+"))
+            .filter(|t| SUBS.contains(&t.trim_matches('"')))
+        else {
+            continue;
+        };
+        let features = if line.contains("--all-features") {
+            "all-features".to_string()
+        } else if line.contains("--no-default-features") {
+            "no-default-features".to_string()
+        } else if let Some(rest) = line.split("--features ").nth(1) {
+            format!("features {}", rest.split_whitespace().next().unwrap_or(""))
+        } else {
+            "default".to_string()
+        };
+        found.insert((sub.trim_matches('"').to_string(), features));
+    }
+    found
+}
+
+/// the gate is written down twice, in `ci.yml` and in the justfile, and only
+/// one of them is what actually guards `main`. a justfile that has quietly
+/// stopped covering a configuration prints the same green as one that covers
+/// it, and the first anybody hears of the difference is a red push.
+///
+/// this is the same failure as the stale lists above: nothing about it shows
+/// up in a compile or a clippy pass, so it is asserted.
+#[test]
+fn the_justfile_runs_every_configuration_ci_runs() {
+    let (Some(ci), Some(just)) = (repo_file(".github/workflows/ci.yml"), repo_file("justfile"))
+    else {
+        return;
+    };
+    let missing: Vec<_> = cargo_configs(&ci)
+        .difference(&cargo_configs(&just))
+        .cloned()
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "ci runs these and the justfile does not, so `just ci` is a weaker \
+         gate than a push: {missing:?}"
+    );
+}
+
+/// ci pins the msrv job to a literal version and the manifest declares one.
+/// if they drift, the job is checking a rustc the crate never promised, in
+/// whichever direction: too new and the promise is untested, too old and the
+/// build fails for a version nobody claimed to support.
+#[test]
+fn the_msrv_ci_checks_is_the_msrv_the_manifest_promises() {
+    let Some(ci) = repo_file(".github/workflows/ci.yml") else {
+        return;
+    };
+    let declared = read("Cargo.toml")
+        .lines()
+        .find_map(|l| l.strip_prefix("rust-version = "))
+        .map(|v| v.trim_matches('"').to_string())
+        .expect("rust-version in Cargo.toml");
+    let pinned: Vec<String> = ci
+        .lines()
+        .filter_map(|l| l.trim().strip_prefix("- uses: dtolnay/rust-toolchain@"))
+        .map(str::to_string)
+        .filter(|t| t != "stable" && t != "nightly")
+        .collect();
+    assert_eq!(
+        pinned,
+        vec![declared.clone()],
+        "ci pins {pinned:?} and Cargo.toml promises {declared}"
+    );
+}
