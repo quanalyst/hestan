@@ -2174,7 +2174,9 @@ fn render_schedules(answer: &Value, out: &Out) {
         }
         return;
     }
-    let mut table = Table::new(["JOB", "CRON", "TZ", "STATE", "NEXT FIRE"]);
+    // "target" rather than "job": an asset schedule is stored under `asset:<name>`
+    // and is not a job, so a column headed JOB would be wrong for half of them
+    let mut table = Table::new(["TARGET", "CRON", "TZ", "STATE", "NEXT FIRE"]);
     for row in &schedules {
         let paused = row["paused"] == json!(true);
         table.row([

@@ -65,7 +65,10 @@ named test go red.
 **match a closed enum exhaustively.** `RunStatus`, `OpStatus`, `BackfillStatus`
 and friends document themselves as closed sets; a `_` arm over one turns the
 next variant into a wrong answer at runtime instead of a compile error, and
-that has already shipped once as an alert reporting a skipped op as a success.
+that has already happened once here: the notification summary sent every op
+status it did not name out as "succeeded", and stayed correct only for as long
+as no op could reach it with any other. `ctx.skip` made one reachable and the
+arm was wrong the same day.
 
 schema changes need a migration and a fixture test that opens a database at
 the old version, and migrations are forward-only. see
