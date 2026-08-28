@@ -9,6 +9,7 @@
 
 use std::future::Future;
 use std::path::PathBuf;
+use std::sync::{LazyLock, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use hestan::prelude::*;
@@ -23,6 +24,23 @@ const DB: &str = "HESTAN_ISOLATION_DB";
 /// what the ops that skip themselves say, in the child and in what the parent
 /// reads back off the row.
 const SKIPPED_BECAUSE: &str = "no drop from the vendor yet";
+
+/// every skip an op hook was handed in **this** process, as
+/// `(run, op, what the hook was told)`.
+///
+/// a static because both sides of the spawn build the same jobs from the same
+/// function and only one of them fires hooks: an op subprocess runs the body
+/// and records the row, and the parent is the process that tells anybody about
+/// it. so anything in here was put there by the parent.
+static SKIPS: LazyLock<Mutex<Vec<SkipTold>>> = LazyLock::new(|| Mutex::new(Vec::new()));
+
+/// one op hook's account of one skip.
+struct SkipTold {
+    run: String,
+    op: String,
+    /// what the hook was handed on `OpEvent.error`, which is the whole case.
+    told: Option<String>,
+}
 
 /// how long the process an op leaves behind holds the child's pipes open.
 /// longer than the capture grace, so the parent is provably still finishing
@@ -238,6 +256,15 @@ fn jobs() -> Vec<Job> {
             })
             .isolated())
             .op(Op::new("load", |_| async { Ok(json!("loaded")) }).after(["decide"]))
+            .on_op_finished(|e: hestan::OpEvent| {
+                if e.status == hestan::OpStatus::Skipped {
+                    SKIPS.lock().unwrap().push(SkipTold {
+                        run: e.run_id.clone(),
+                        op: e.op.clone(),
+                        told: e.error.clone(),
+                    });
+                }
+            })
             .build()
             .unwrap(),
         // the same, with a process left behind holding the child's pipes open
@@ -405,6 +432,11 @@ async fn cases(db: &str) {
     case(
         "a_cancel_racing_an_isolated_self_skip_does_not_record_it_again",
         a_cancel_leaves_the_childs_skip_alone(&runner),
+    )
+    .await;
+    case(
+        "a_hook_fired_for_an_isolated_op_that_skipped_itself_is_told_why",
+        the_skip_hook_is_told_why(&runner),
     )
     .await;
 }
@@ -857,6 +889,50 @@ async fn a_cancel_leaves_the_childs_skip_alone(runner: &Runner) {
     let rows = runner.store().op_runs(&id).unwrap();
     let events = runner.store().events(&id, 0).unwrap();
     the_childs_skip_survived(&rows, &events);
+}
+
+async fn the_skip_hook_is_told_why(runner: &Runner) {
+    let run = runner
+        .run("nothing_to_do", json!({}), Trigger::Manual)
+        .await
+        .unwrap();
+    // a skip is an attempt that really happened, so a hook hears about it; the
+    // question is whether it hears why
+    let told = wait_for_skip_hook(&run.id, "decide").await;
+    assert_eq!(
+        told.as_deref(),
+        Some(SKIPPED_BECAUSE),
+        "the hook was told an op skipped itself and not what it decided on"
+    );
+    // and the op the skip propagated to is a skip the hook never sees: it was
+    // not an attempt, nothing ran it, and there is no reason of its own to give
+    assert!(
+        !SKIPS
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|s| s.run == run.id && s.op == "load"),
+        "a hook fired for an op that never ran"
+    );
+}
+
+/// what an op hook was told about a skip of `op`, once one has been fired.
+/// hooks are handed off to a blocking task, so this waits rather than reading
+/// once.
+async fn wait_for_skip_hook(run_id: &str, op: &str) -> Option<String> {
+    for _ in 0..600 {
+        let found = SKIPS
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|s| s.run == run_id && s.op == op)
+            .map(|s| s.told.clone());
+        if let Some(told) = found {
+            return told;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    panic!("no op hook was fired for {op} of run {run_id}");
 }
 
 /// what a child said on one of its pipes, in the order it said it.

@@ -89,7 +89,11 @@ pub struct OpEvent {
     /// one that ends the op look identical here; `attempt` against
     /// [`Op::max_retries`](crate::Op::max_retries) is the difference.
     pub status: OpStatus,
-    /// what it failed with; `None` unless it did.
+    /// what it failed with, or the reason a
+    /// [self-skip](crate::OpCtx::skip) gave; `None` on every attempt that did
+    /// neither. a `skipped` attempt carries its reason here as well as on the
+    /// op run row and in the log, so a hook is never told an op decided there
+    /// was nothing to do without being told what it looked at.
     pub error: Option<String>,
     /// when **this attempt** started, which on a retry is later than the
     /// `started_at` on the op run row: that one keeps the first attempt's.

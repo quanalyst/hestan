@@ -4770,7 +4770,11 @@ async fn run_op(
             // `Skipped` rather than `Failed` here is the whole of why a
             // failure hook does not hear about it
             Ended::Skipped(reason) => {
-                told(OpStatus::Skipped, None);
+                // told before the reason is moved into the outcome. `skipped`
+                // was the one non-success terminal status whose `error` was
+                // always empty, so a hook could say an op skipped itself and
+                // never why, though the row and the log both had it
+                told(OpStatus::Skipped, Some(&reason));
                 return (
                     name,
                     Outcome::Skipped {
@@ -4783,7 +4787,7 @@ async fn run_op(
             // the child recorded its own skip, row, reason and event: nothing
             // this process staged applies, because nothing here ran the body
             Ended::SkippedInChild(reason) => {
-                told(OpStatus::Skipped, None);
+                told(OpStatus::Skipped, Some(&reason));
                 return (
                     name,
                     Outcome::Skipped {

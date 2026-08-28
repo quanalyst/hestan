@@ -4954,7 +4954,11 @@ async fn a_skip_is_not_a_failure_to_a_failure_hook() {
     let seen = ops.lock().unwrap();
     assert_eq!(seen.len(), 1);
     assert_eq!(seen[0].status, OpStatus::Skipped);
-    assert_eq!(seen[0].error, None);
+    // and it says what the body decided on. `skipped` was the one non-success
+    // terminal status whose `error` was always empty, so a hook could report
+    // that an op skipped itself and never why, though the row and the log both
+    // had the reason
+    assert_eq!(seen[0].error.as_deref(), Some("nothing arrived"));
 }
 
 // a skip is a decision the body reached, not a failure it might reach
