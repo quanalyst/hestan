@@ -20,6 +20,15 @@ use hestan::{LogStream, OpRun, Runner, Store, Trigger};
 /// is what children inherit.
 const DB: &str = "HESTAN_ISOLATION_DB";
 
+/// what the ops that skip themselves say, in the child and in what the parent
+/// reads back off the row.
+const SKIPPED_BECAUSE: &str = "no drop from the vendor yet";
+
+/// how long the process an op leaves behind holds the child's pipes open.
+/// longer than the capture grace, so the parent is provably still finishing
+/// the attempt while the test cancels the run.
+const LINGER_SECS: &str = "6";
+
 fn main() {
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -219,6 +228,39 @@ fn jobs() -> Vec<Job> {
             .cpu_limit(Duration::from_secs(1)))
             .build()
             .unwrap(),
+        // an isolated op that decides there is nothing to do, and stages
+        // something on the way to deciding. the child is the process that ran
+        // the body, so the child is the one that records what it did
+        Job::builder("nothing_to_do")
+            .op(Op::new("decide", |ctx: OpCtx| async move {
+                ctx.meta("files_seen", 0_i64);
+                Err(ctx.skip(SKIPPED_BECAUSE))
+            })
+            .isolated())
+            .op(Op::new("load", |_| async { Ok(json!("loaded")) }).after(["decide"]))
+            .build()
+            .unwrap(),
+        // the same, with a process left behind holding the child's pipes open
+        // after it has gone. the parent waits out its capture grace before it
+        // is done with the attempt, and that window is where a cancel has to
+        // land for the run's cancellation drain to be what reads the outcome
+        Job::builder("nothing_to_do_slowly")
+            .op(Op::new("decide", |ctx: OpCtx| async move {
+                ctx.meta("files_seen", 0_i64);
+                // backgrounded by a shell that then exits, so nothing here
+                // owns the process that is left behind: this op is finished
+                // with it, and what it holds is the pipes it inherited
+                let mut sh = std::process::Command::new("sh")
+                    .arg("-c")
+                    .arg(format!("sleep {LINGER_SECS} &"))
+                    .spawn()
+                    .expect("a shell to leave a process behind");
+                sh.wait().expect("the shell exits once it has forked");
+                Err(ctx.skip(SKIPPED_BECAUSE))
+            })
+            .isolated())
+            .build()
+            .unwrap(),
         // the same work under a timeout, beside an ordinary op that must be
         // left to finish
         Job::builder("impatient")
@@ -353,6 +395,16 @@ async fn cases(db: &str) {
     case(
         "a_retry_captures_its_output_as_a_separate_attempt",
         attempts_are_separate(&runner),
+    )
+    .await;
+    case(
+        "an_isolated_op_that_skips_itself_is_recorded_once_by_the_child",
+        a_self_skip_is_recorded_once(&runner),
+    )
+    .await;
+    case(
+        "a_cancel_racing_an_isolated_self_skip_does_not_record_it_again",
+        a_cancel_leaves_the_childs_skip_alone(&runner),
     )
     .await;
 }
@@ -705,6 +757,108 @@ async fn attempts_are_separate(runner: &Runner) {
     );
 }
 
+/// the one `op_skipped` event this run holds for `op`, or a failure naming how
+/// many there really are.
+///
+/// the count is the whole case: the child writes the row and the event, and a
+/// parent writing its own on top appends a second event and rewrites the row
+/// with the metadata the child staged bound to null.
+fn only_skip_event<'a>(events: &'a [hestan::Event], op: &str) -> &'a hestan::Event {
+    let skips: Vec<&hestan::Event> = events
+        .iter()
+        .filter(|e| e.op.as_deref() == Some(op) && e.kind == hestan::EventKind::OpSkipped)
+        .collect();
+    assert_eq!(
+        skips.len(),
+        1,
+        "op {op} has {} skip events, not one: {:?}",
+        skips.len(),
+        skips
+            .iter()
+            .map(|e| (e.seq, &e.message))
+            .collect::<Vec<_>>()
+    );
+    skips[0]
+}
+
+/// the row, the reason, the staged metadata and the finish time of a child's
+/// own skip, asserted the same way whichever path the parent read it back on.
+fn the_childs_skip_survived(rows: &[OpRun], events: &[hestan::Event]) {
+    let decide = row(rows, "decide");
+    assert_eq!(decide.status, hestan::OpStatus::Skipped);
+    assert_eq!(decide.error.as_deref(), Some(SKIPPED_BECAUSE));
+    // what the body staged before it decided. the parent staged nothing, so a
+    // second write from it binds this column to null
+    assert_eq!(
+        decide
+            .metadata
+            .as_ref()
+            .and_then(|m| m["files_seen"]["int"].as_i64()),
+        Some(0),
+        "the metadata the child staged is gone: {:?}",
+        decide.metadata
+    );
+    let skipped = only_skip_event(events, "decide");
+    // the row's finish time and its metadata come out of one statement, so a
+    // finish time sitting on the child's own event, with the child's metadata
+    // still beside it, is the child's
+    let finished = decide
+        .finished_at
+        .expect("a skipped op has a finish time, because something watched it end");
+    assert!(
+        finished >= skipped.ts && finished - skipped.ts < chrono::Duration::seconds(1),
+        "the finish time is not the child's: {finished} against an event at {}",
+        skipped.ts
+    );
+}
+
+async fn a_self_skip_is_recorded_once(runner: &Runner) {
+    let run = runner
+        .run("nothing_to_do", json!({}), Trigger::Manual)
+        .await
+        .unwrap();
+    // an op that skipped is not an op that failed, and a run whose ops all
+    // skipped is a success
+    assert_eq!(run.status, RunStatus::Success, "{:?}", run.error);
+
+    let rows = runner.store().op_runs(&run.id).unwrap();
+    let events = runner.store().events(&run.id, 0).unwrap();
+    the_childs_skip_survived(&rows, &events);
+
+    // and downstream is cut off by the same propagation a rule skip uses, so
+    // a self-skip in a child and one in this process are the same thing to
+    // everything below them
+    let load = row(&rows, "load");
+    assert_eq!(load.status, hestan::OpStatus::Skipped);
+    let why = load
+        .error
+        .clone()
+        .expect("a skipped op says why on its row");
+    assert!(why.contains("decide"), "{why}");
+}
+
+async fn a_cancel_leaves_the_childs_skip_alone(runner: &Runner) {
+    let id = runner
+        .launch("nothing_to_do_slowly", json!({}), Trigger::Manual)
+        .unwrap();
+    // the child has recorded its skip and gone; the parent is still draining
+    // the pipes the process it left behind is holding open, so the run's
+    // cancellation drain is what will read this outcome
+    wait_for_op_status(runner, &id, "decide", hestan::OpStatus::Skipped).await;
+    assert_eq!(
+        runner.cancel(&id).unwrap(),
+        hestan::CancelOutcome::Requested
+    );
+    let run = wait_terminal(runner, &id).await;
+    assert_eq!(run.status, RunStatus::Canceled);
+
+    // the cancel does not un-record what really happened before it, and does
+    // not record it a second time either
+    let rows = runner.store().op_runs(&id).unwrap();
+    let events = runner.store().events(&id, 0).unwrap();
+    the_childs_skip_survived(&rows, &events);
+}
+
 /// what a child said on one of its pipes, in the order it said it.
 fn said(lines: &[hestan::OpLog], stream: LogStream) -> Vec<&str> {
     lines
@@ -753,6 +907,19 @@ async fn wait_for_marker(path: &std::path::Path) {
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
     panic!("{} never appeared", path.display());
+}
+
+/// wait until an op's row says `want`.
+async fn wait_for_op_status(runner: &Runner, run_id: &str, op: &str, want: hestan::OpStatus) {
+    for _ in 0..600 {
+        if let Some(row) = runner.store().op_run(run_id, op).unwrap()
+            && row.status == want
+        {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    panic!("op {op} of run {run_id} never reached {want:?}");
 }
 
 async fn wait_for_pid(runner: &Runner, run_id: &str, op: &str) -> libc::pid_t {

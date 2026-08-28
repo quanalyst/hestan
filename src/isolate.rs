@@ -245,9 +245,12 @@ fn recorded(store: &Store, run_id: &str, name: &str) -> Option<Ended> {
         }
         // the child wrote its own terminal row for this too, reason and all,
         // so the parent has nothing to add: it only has to not read `skipped`
-        // as `failed`, which is what a missing arm here would have done
+        // as `failed`, which is what a missing arm here would have done.
+        // `SkippedInChild` rather than `Skipped` is what says the write has
+        // happened, so the run propagates it downstream without recording it
+        // a second time over the child's own row
         OpStatus::Skipped => {
-            Some(Ended::Skipped(row.error.unwrap_or_else(|| {
+            Some(Ended::SkippedInChild(row.error.unwrap_or_else(|| {
                 "the op skipped itself without recording why".to_string()
             })))
         }
@@ -605,9 +608,11 @@ pub(crate) async fn run_one_op(
 /// [skipped itself](crate::OpCtx::skip).
 ///
 /// it writes the event as well as the row, unlike the failure path above,
-/// because the parent writes no event of its own for a skip: a skip is
-/// terminal on the attempt that reached it, so there is no "was that the last
-/// attempt" for the parent to decide.
+/// because the parent writes neither of its own for a skip: a skip is terminal
+/// on the attempt that reached it, so there is no "was that the last attempt"
+/// for the parent to decide. the parent reads this row back as
+/// [`Ended::SkippedInChild`], which is what tells the run to propagate the skip
+/// without recording it again.
 async fn skipped_in_child(
     store: &Store,
     req: &crate::isolate::Request,

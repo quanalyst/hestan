@@ -393,6 +393,17 @@ pub(crate) enum Ended {
     /// with the reason it gave. terminal on the first attempt, since a
     /// decision is not something a retry reaches differently.
     Skipped(String),
+    /// an [isolated](Op::isolated) child said the same thing and recorded it
+    /// for itself: the terminal row, the reason and the `OpSkipped` event are
+    /// already written, and this is the reason they were written with.
+    ///
+    /// apart from [`Handle`](Ended::Handle) for exactly the same reason: the
+    /// process that ran the body is the one that recorded what it did, so what
+    /// the parent still owes is the hook and the propagation downstream, and
+    /// what it does not owe is a second write. writing one anyway appended a
+    /// second event and rewrote the row with the metadata the child staged
+    /// bound to null.
+    SkippedInChild(String),
     /// an isolated child was stopped for real: signalled, then killed, and
     /// watched to die.
     Killed(String),
@@ -424,7 +435,16 @@ enum Outcome {
         /// what [`OpCtx::meta`](crate::OpCtx::meta) staged, kept because a
         /// skip is a finished op rather than a discarded attempt. the state
         /// and the asset builds are not kept; see [`OpCtx::skip`](crate::OpCtx::skip).
+        ///
+        /// always `None` when `recorded`: what the body staged was staged in
+        /// the child, which wrote it, and this process staged nothing.
         meta: Option<Value>,
+        /// the child that ran the body already wrote the row and the event;
+        /// see [`Ended::SkippedInChild`]. the propagation downstream is still
+        /// this run's, which is why this is a flag on the one outcome rather
+        /// than an outcome of its own: a skip has to reach `stop_here` by one
+        /// path however it was recorded.
+        recorded: bool,
     },
     /// an isolated op the run's cancellation killed. unlike the cooperative
     /// path this one gets a real finish time, because for once hestan watched
@@ -3505,8 +3525,22 @@ async fn execute_in_span(
                     // handle for `outputs` and no value for a fan-out slot.
                     // `failed` is untouched, which is what leaves a run whose
                     // ops all skipped a success
-                    Outcome::Skipped { reason, meta } => {
-                        if !op_skipped(&store, &run_id, &name, &reason, None, meta.as_ref()).await {
+                    Outcome::Skipped {
+                        reason,
+                        meta,
+                        recorded,
+                    } => {
+                        // unless the child that ran the body wrote it: a
+                        // second write here appends a second `OpSkipped` and
+                        // rewrites the row, erasing the metadata the child
+                        // staged and moving `finished_at` off the moment the
+                        // op actually ended. the propagation below happens
+                        // either way, which is what keeps a self-skip and a
+                        // rule skip indistinguishable downstream
+                        if !recorded
+                            && !op_skipped(&store, &run_id, &name, &reason, None, meta.as_ref())
+                                .await
+                        {
                             unrecorded = true;
                             break 'run;
                         }
@@ -3757,9 +3791,14 @@ async fn execute_in_span(
                         // is recorded like any other outcome that won the race.
                         // nothing propagates from here: the run is stopping,
                         // and everything still pending is about to be canceled
-                        Outcome::Skipped { reason, meta } => {
-                            if !op_skipped(&store, &run_id, &name, &reason, None, meta.as_ref())
-                                .await
+                        Outcome::Skipped {
+                            reason,
+                            meta,
+                            recorded,
+                        } => {
+                            if !recorded
+                                && !op_skipped(&store, &run_id, &name, &reason, None, meta.as_ref())
+                                    .await
                             {
                                 unrecorded = true;
                                 break 'drain;
@@ -4737,6 +4776,20 @@ async fn run_op(
                     Outcome::Skipped {
                         reason,
                         meta: op::staged_meta(&new_meta),
+                        recorded: false,
+                    },
+                );
+            }
+            // the child recorded its own skip, row, reason and event: nothing
+            // this process staged applies, because nothing here ran the body
+            Ended::SkippedInChild(reason) => {
+                told(OpStatus::Skipped, None);
+                return (
+                    name,
+                    Outcome::Skipped {
+                        reason,
+                        meta: None,
+                        recorded: true,
                     },
                 );
             }
