@@ -41,16 +41,28 @@ with `meta` is kept, because a skip is a finished op rather than a discarded
 attempt; `set_state` is dropped, because a watermark is a promise about work
 that was done.
 
+**an isolated op's skip is recorded once, by the child that ran the body.** the
+child writes the terminal row and the `op_skipped` event for itself, exactly as
+it does for a success, and the run wrote both again on top: the second write
+bound the metadata the child had staged to null and moved `finished_at` off the
+moment the op really ended, leaving two skip events in the log for one
+decision. the run now propagates the skip and writes nothing, on the ordinary
+path and in a cancellation drain alike.
+
 **the reason now lands on the op run row as well as in the event log, for every
 kind of skip.** the row carried `NULL` where the reason had already been
 computed, so a run page said an op was grey and never why. the run page renders
 it.
 
 an `on_op_finished` hook now sees an attempt with `status: skipped` on it,
-which it could not before: a self-skip is an attempt that really happened. a
-hook that treats "not failed" as "worked" is the one place that has to be said
-out loud, and the built-in notification summary no longer reports one as a
-success. `on_failure` hears nothing: no run failed.
+which it could not before: a self-skip is an attempt that really happened, and
+the reason it gave is on `error`, the way a failed attempt carries its message.
+`skipped` was the one non-success terminal status whose `error` was always
+empty, so a hook could report that an op decided there was nothing to do and
+never what it looked at, though the row and the log both had it. a hook that
+treats "not failed" as "worked" is the one place that has to be said out loud,
+and the built-in notification summary no longer reports one as a success.
+`on_failure` hears nothing: no run failed.
 
 ### A cron on an asset
 
@@ -89,8 +101,21 @@ a schedule is keyed on what it fires, so an asset schedule is stored under
 `asset:{name}`: that pair is the row key, what a pause names and the index that
 makes one occurrence fire once, and keying every asset scheduled at 06:00 on
 the one internal job would make them one schedule. `GET /api/schedules` gains
-`kind` and `asset` so nothing has to parse the prefix. the prefix is reserved
-only in a deployment that declares an asset schedule.
+`kind` and `asset` so nothing has to parse the prefix.
+
+**`asset:` is reserved in every deployment, and a job named into it now fails
+at startup.** the check was gated on the deployment declaring an asset
+schedule, and that was the wrong condition: the schedule that collides with
+such a job need not be an asset one. `Job::builder("asset:foo")` beside
+`Schedule::new("asset:foo", "0 6 * * *")` passed every startup check, and the
+entry was then rebuilt through `Target::from_id`, which strips the prefix, so
+the schedule ticked `unknown asset` every occurrence, the job it named never
+ran and `GET /api/schedules` reported it as an asset schedule.
+
+**what changes for a deployment with a job whose name starts with `asset:`**:
+it no longer comes up. the error names the job and says to rename it. that is
+the point of the change rather than a cost of it, since such a deployment was
+already running one job fewer than it declared and saying nothing about it.
 
 ### Builds that do not intersect run at the same time
 
@@ -110,6 +135,20 @@ the caller does first, and it is derived from the run rows rather than kept in
 a table of its own: it is exactly what the run's recorded plan says it will
 build. so a terminal status releases it, there is nothing to leak, and the
 sweeps that already recover a dead process's runs release it too.
+
+**every way of asking for a build takes it.** the scan ran in one arm of the
+dispatch over what a launch claims, so a launch that carried its builds under
+any other arm wrote a run row everything else collided with and scanned for
+nothing itself. an asset schedule's fire is exactly that, and it carries the
+cron occurrence rather than nothing, so `Schedule::asset("prices", "0 6 * * *")`
+coming round while `POST /api/assets/prices/build` was still running gave two
+runs materializing `prices` from two plans: the race the claim exists to stop.
+the claim is now decided by whether the run's plan says what it builds, which
+is the one place that knows, so the api, the command line, a policy pass, a
+backfill chunk and a cron are all refused by one scan and all hold one against
+the next. a fire refused this way takes no occurrence either: the tick is
+`skipped`, saying which asset it met and which run holds it, and the asset is
+still stale for the next pass.
 
 the api's 409 keeps its meaning and narrows: it is "something is building
 **this**", and it names the asset and the run

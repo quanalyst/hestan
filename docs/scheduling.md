@@ -84,9 +84,16 @@ makes one occurrence fire once, and keying every asset scheduled at 06:00 on
 one job would make them all one schedule. so it is `asset:vendor_prices` that
 `hestan pause schedule` takes and that `GET /api/schedules` reports as `job`;
 the same row also carries `kind: "asset"` and `asset: "vendor_prices"`, so
-nothing has to parse a prefix to tell the two apart. the prefix is reserved
-only in a deployment that declares an asset schedule, and a job named into it
-there is a startup error.
+nothing has to parse a prefix to tell the two apart.
+
+**`asset:` is reserved, in every deployment.** a job whose name starts with it
+is a startup error naming the job and asking you to rename it, whether or not
+anything here declares an asset schedule. it was conditional, and the
+condition was wrong: the schedule that collides with such a job need not be an
+asset one. `Schedule::new("asset:foo", ..)` on a job called `asset:foo` passed
+every check, and the entry was then read back as a build of an asset called
+`foo`, so it ticked `unknown asset` every occurrence, the job it named never
+ran, and `GET /api/schedules` reported it as an asset schedule.
 
 ### What is refused at startup
 
@@ -361,7 +368,10 @@ an [asset schedule](#building-an-asset-on-a-schedule) has no job of its own to
 declare a policy on, and needs none: what keeps two builds of one asset apart
 is the [claim](assets.md#builds-that-do-not-intersect-run-at-once) each takes,
 which is narrower than any policy here could be, since it lets a build of
-something unrelated go ahead.
+something unrelated go ahead. a cron's build takes that claim exactly as one
+somebody asked for does, so a 06:00 build that meets one already running is
+refused by it: the tick is `skipped`, saying which asset it met and which run
+holds it, and the asset stays stale for the next pass.
 
 "active" means the job has a run **outstanding** (queued or running, claimed
 or not) and not "a run is executing this second". the distinction only came

@@ -164,6 +164,15 @@ a child that *did* record a result is believed, whatever its exit status says
 afterwards: it is the process that ran the body, and if it got as far as
 writing an output that output is what happened.
 
+that covers a body that
+[skipped itself](concepts.md#an-op-that-had-nothing-to-do) as well as one that
+returned a value. the child writes the row, the reason and the `op_skipped`
+event, and the parent adds nothing of its own: it fires the op hook, with the
+reason on it, and propagates the skip downstream exactly as it does for one
+decided in this process. a parent that wrote the row again would append a
+second `op_skipped`, erase the metadata the body staged before it decided, and
+move the finish time off the moment the op really ended.
+
 ## Stopping it for real
 
 cancelling a run, or an `Op::timeout` expiring, does this to an isolated op:

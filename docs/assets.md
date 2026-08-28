@@ -645,6 +645,14 @@ from two runs materializing one asset from two plans, and narrowing the rule
 from "any build" to "an intersecting build" is exactly what makes concurrent
 callers ordinary rather than rare.
 
+**it is decided by what the run's plan says it builds**, and by nothing about
+which way the build was asked for. the api, the command line, a policy pass, a
+backfill chunk and a [cron on the asset](#a-cron-on-an-asset) all write a run
+row carrying the same list, so all of them are refused by the same scan and
+all of them refuse the next one. a build launched down a path that wrote the
+list and did not read it would be a run everything else stood aside for while
+it stood aside for nothing.
+
 it is also **derived from the run rows** rather than kept in a table of its
 own: what a build claims is exactly what its own recorded plan says it will
 build. so a run reaching a terminal status releases it, there is nothing to
@@ -696,8 +704,15 @@ it plans through the same function the endpoint and the command line plan
 through, so it builds that asset plus whatever upstream of it is stale, and a
 partitioned one takes the same default target set a build that names no keys
 takes. the run is `trigger: schedule` and is tagged with the asset, so it
-appears here like any other build. `docs/scheduling.md` has the rest: what is
-refused at startup, and what a fire that found nothing to build records.
+appears here like any other build.
+
+it takes the same [claim](#builds-that-do-not-intersect-run-at-once) too. a
+06:00 cron firing while `POST /api/assets/{name}/build` is still running is
+refused by it, and refused without taking the occurrence: the tick is
+`skipped`, saying which asset the two shared and which run holds it, and the
+asset is still stale for the next pass to pick up. `docs/scheduling.md` has
+the rest: what is refused at startup, and what a fire that found nothing to
+build records.
 
 ## Automation policies
 

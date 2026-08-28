@@ -471,11 +471,11 @@ fn advance(runner: &Runner, entry: &ScheduleEntry, at: DateTime<Utc>) {
 /// whether what this schedule fires is already going.
 ///
 /// a job schedule asks the run log, which is what [`Overlap`] is about. an
-/// asset schedule does not ask anything: a build is refused by the claim it
-/// takes in the same transaction as its run row, so a read here would be a
-/// second opinion that could disagree with the only one that decides. a fire
-/// refused that way lands as a skipped tick carrying the reason, which is
-/// where a job schedule's refusal lands too.
+/// asset schedule does not ask anything: its build is refused by the claim it
+/// takes in the same transaction as its run row, off the plan that run
+/// carries, so a read here would be a second opinion that could disagree with
+/// the only one that decides. a fire refused that way lands as a skipped tick
+/// carrying the reason, which is where a job schedule's refusal lands too.
 fn busy(runner: &Runner, entry: &ScheduleEntry) -> bool {
     match &entry.target {
         Target::Job(job) => matches!(runner.store().has_active_run(job), Ok(true) | Err(_)),

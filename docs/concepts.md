@@ -380,7 +380,9 @@ vendor yet" is better for having them. a failed attempt drops its metadata
 because a retry is about to replace it, and a skip has no retry to be replaced
 by. `ctx.set_state` is the exception and is dropped: a watermark is a promise
 about work that was done, and moving it without doing the work is how the next
-run skips real input.
+run skips real input. an [isolated](isolation.md) op is no different: the child
+that ran the body is the process that records the skip, so what it staged is on
+the row it wrote, and the run adds nothing on top of it.
 
 the reason is not optional. it lands in the event log as an `op_skipped` event
 at warn level, the way `ctx.warn` does, and on the op run's row, so the run
@@ -389,8 +391,9 @@ reason for every kind of skip**, including the two that already existed
 (`skipped by rule any_failed: every dep succeeded`, `skipped: upstream load
 failed`), which used to be computed and then written only to the log.
 
-a hook sees an attempt that really happened, with `status: skipped` on it. it
-is neither a success nor a failure, and a hook that treats "not failed" as
+a hook sees an attempt that really happened, with `status: skipped` on it and
+the reason on `error`, the way a failed attempt carries its message. it is
+neither a success nor a failure, and a hook that treats "not failed" as
 "worked" is the one place that has to be said out loud. an `on_failure` hook
 hears nothing: no run failed.
 
