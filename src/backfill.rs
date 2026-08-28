@@ -3,8 +3,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::asset::{
-    ASSETS_JOB, AssetRegistry, asset_tag, check_named_keys, launch_plan, mats_map, plan_partitions,
-    staleness,
+    AssetRegistry, asset_tag, check_named_keys, launch_plan, mats_map, plan_partitions, staleness,
 };
 use crate::error::Error;
 use crate::executor::Runner;
@@ -149,11 +148,6 @@ fn launch_next(
     registry: &AssetRegistry,
     backfill: &Backfill,
 ) -> Result<(), Error> {
-    // the same gate the build endpoints answer 409 on: while any assets run is
-    // active, wait for the next tick rather than overlapping lineage writes
-    if runner.store().has_active_run(ASSETS_JOB)? {
-        return Ok(());
-    }
     let limit = registry
         .get(&backfill.asset)
         .and_then(|m| m.partitions.as_ref())
@@ -177,7 +171,18 @@ fn launch_next(
     // no way back to the backfill it belongs to is a run you cannot follow
     let mut tags = asset_tag(&backfill.asset);
     tags.insert("backfill".to_string(), backfill.id.to_string());
-    let run_id = launch_plan(runner, plan, Trigger::Build, tags)?;
+    // a chunk that meets a build already running waits for the next tick
+    // rather than failing the backfill: nothing was written, the chunk is
+    // still unlaunched, and `launched` has not moved, so this pass simply
+    // tries the same chunk again in two seconds
+    let run_id = match launch_plan(runner, registry, plan, Trigger::Build, tags) {
+        Ok(id) => id,
+        Err(Error::Conflict(why)) => {
+            tracing::debug!(backfill = backfill.id, "chunk held: {why}");
+            return Ok(());
+        }
+        Err(e) => return Err(e),
+    };
     runner.store().backfill_launched(
         backfill.id,
         &backfill.asset,
@@ -237,7 +242,10 @@ mod tests {
     async fn settle(runner: &Runner, reg: &AssetRegistry) {
         // let the launched run finish, then let the chunker see that it did
         for _ in 0..300 {
-            let active = runner.store().has_active_run(ASSETS_JOB).unwrap();
+            let active = runner
+                .store()
+                .has_active_run(crate::asset::ASSETS_JOB)
+                .unwrap();
             if !active {
                 break;
             }
@@ -361,6 +369,45 @@ mod tests {
         // once it is over, another may start
         cancel(&runner, first.id).unwrap();
         start(&runner, &reg, "sales", "r1", "r2", false).unwrap();
+    }
+
+    // a backfill of one asset used to stop every unrelated build in the
+    // deployment for as long as it ran, which in a graph with several families
+    // is most of the value of having a graph. it no longer does: what a chunk
+    // claims is the keys it is filling
+    #[tokio::test]
+    async fn a_backfill_and_an_unrelated_build_run_at_the_same_time() {
+        let store = Store::open(":memory:").unwrap();
+        let sales = Asset::new("sales", |ctx: OpCtx| async move {
+            Ok(json!({ "region": ctx.partition() }))
+        })
+        .partitioned(Partitions::keys(["r1", "r2", "r3", "r4", "r5"]).build_limit(2));
+        let stock = Asset::new("stock", |_: OpCtx| async { Ok(json!(null)) });
+        let reg = Arc::new(AssetRegistry::new(vec![sales, stock], Vec::new(), Vec::new()).unwrap());
+        // decides and does not execute, so the chunk it launches stays queued
+        let runner = Runner::new([reg.lower_job().unwrap()], store.clone())
+            .unwrap()
+            .with_role(crate::model::Role::Scheduler, 1);
+
+        let b = start(&runner, &reg, "sales", "r1", "r5", true).unwrap();
+        assert_eq!(b.launched, 2, "the first chunk did not go out");
+
+        // an unrelated asset builds beside it
+        let other = crate::asset::build_one(&runner, &reg, "stock", &[])
+            .unwrap()
+            .expect("stock was held behind the backfill");
+        assert!(!b.run_ids.contains(&other));
+        assert_eq!(
+            store
+                .runs(None, None, None, None, None, None, 10)
+                .unwrap()
+                .len(),
+            2
+        );
+
+        // and a build of a key the chunk in flight is filling still meets it
+        let err = crate::asset::build_one(&runner, &reg, "sales", &["r1".into()]).unwrap_err();
+        assert!(err.to_string().starts_with("sales[r1] is already"), "{err}");
     }
 
     #[tokio::test]

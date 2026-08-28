@@ -17,7 +17,7 @@ use include_dir::{Dir, include_dir};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use crate::asset::{ASSETS_JOB, AssetRegistry, launch_plan, mapped_reads, mats_map, plan_all};
+use crate::asset::{AssetRegistry, launch_plan, mapped_reads, mats_map, plan_all};
 use crate::auth::{self, Access, Auth, Identity};
 use crate::backfill;
 use crate::error::Error;
@@ -1030,6 +1030,10 @@ fn launch_subset(
         params,
         Trigger::Manual,
         Lineage::None,
+        // a hand-picked subset of any job, including the assets job. it is not
+        // a plan hestan worked out, so it claims no builds and reads as
+        // unbounded to anything checking
+        None,
         tags,
         priority,
     ))
@@ -1720,20 +1724,6 @@ fn check_summary(latest: &[AssetCheckRow], asset: &str) -> Value {
     json!({ "passed": passed, "failed": failed, "last_run_at": last })
 }
 
-// one build at a time: overlapping builds record lineage that never happened
-// (assets.md). a manual launch of the assets job stays ungated
-fn build_gate(st: &AppState) -> Result<(), ApiError> {
-    if st
-        .runner
-        .store()
-        .has_active_run(ASSETS_JOB)
-        .map_err(internal)?
-    {
-        return Err(err(StatusCode::CONFLICT, "asset build already running"));
-    }
-    Ok(())
-}
-
 #[derive(Deserialize, Default)]
 struct BuildBody {
     /// the keys to build, for a partitioned asset. omitted, the build takes
@@ -1867,7 +1857,6 @@ async fn build_all_assets(
     State(st): State<AppState>,
     who: Who,
 ) -> Result<(StatusCode, Json<Value>), ApiError> {
-    build_gate(&st)?;
     let mats = mats_map(st.runner.store()).map_err(internal)?;
     // one plan, one run, so a build reads as a single run in the ui
     let Some(plan) = plan_all(&st.assets, &mats) else {
@@ -1875,12 +1864,13 @@ async fn build_all_assets(
     };
     match launch_plan(
         &st.runner.as_actor(actor(&who)),
+        &st.assets,
         plan,
         Trigger::Build,
         RunTags::new(),
     ) {
         Ok(run_id) => Ok((StatusCode::ACCEPTED, Json(json!({ "run_ids": [run_id] })))),
-        Err(e) => Err(internal(e)),
+        Err(e) => Err(bad_plan(e)),
     }
 }
 
@@ -6573,8 +6563,12 @@ mod tests {
         assert_eq!(status, StatusCode::NOT_FOUND);
     }
 
+    // the 409 keeps its meaning and narrows: it is "something is building this"
+    // rather than "something is building". the run planted here records no
+    // plan, so hestan cannot bound what it will materialize and every build
+    // meets it, which is the one case where the old answer is still the answer
     #[tokio::test]
-    async fn build_endpoints_409_while_build_active() {
+    async fn build_endpoints_409_while_an_unbounded_assets_run_is_active() {
         let st = asset_state();
         st.runner
             .store()
@@ -6587,10 +6581,21 @@ mod tests {
                 .await
                 .unwrap_err();
         assert_eq!(status, StatusCode::CONFLICT);
-        assert_eq!(body["error"], "asset build already running");
+        // the asset and the run it collided with, rather than "a build is
+        // running", because which one is the next thing anybody asks
+        assert_eq!(
+            body["error"],
+            "stats (and whatever that run builds) is already being built by run b1"
+        );
         let (status, Json(body)) = build_all_assets(State(st.clone()), None).await.unwrap_err();
         assert_eq!(status, StatusCode::CONFLICT);
-        assert_eq!(body["error"], "asset build already running");
+        assert!(
+            body["error"]
+                .as_str()
+                .unwrap()
+                .contains("already being built by run b1"),
+            "{body}"
+        );
         assert_eq!(
             st.runner
                 .store()

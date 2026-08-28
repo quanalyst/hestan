@@ -146,6 +146,14 @@ impl Job {
         self.max_concurrent_runs
     }
 
+    /// the same, set on a job that was [assembled](Job::assemble) rather than
+    /// built: the internal assets job is lowered from a graph and has no
+    /// builder to declare it on.
+    pub(crate) fn with_max_concurrent_runs(mut self, n: usize) -> Job {
+        self.max_concurrent_runs = Some(n.max(1));
+        self
+    }
+
     /// what a schedule of this job does when it fires while a run is still
     /// outstanding, from [`JobBuilder::overlap`]. it gates scheduled fires
     /// only: a manual launch is never held back.

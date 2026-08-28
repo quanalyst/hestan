@@ -276,6 +276,26 @@ impl Hestan {
         self
     }
 
+    /// at most `n` asset builds executing at once; the rest wait on the queue
+    /// and start as earlier ones finish. a value below 1 means 1.
+    ///
+    /// builds no longer wait for each other unless their plans intersect, so
+    /// a deployment with unrelated families of assets can have several going;
+    /// this is what bounds how many. it defaults to
+    /// [four](crate::Hestan::assets), and it is the ordinary
+    /// [per-job limit](crate::Limits::job) on the internal assets job rather
+    /// than a mechanism of its own, so it counts executing runs and a queued
+    /// one costs nothing.
+    ///
+    /// **it is not the knob for an api that rate limits you.**
+    /// [`rate`](Self::rate) caps calls per second whatever is running, and
+    /// [`pool`](Self::pool) caps how many ops hold a connection at once; both
+    /// hold however the builds around them are arranged, and this does not.
+    pub fn max_concurrent_builds(mut self, n: usize) -> Self {
+        self.limits = std::mem::take(&mut self.limits).job(crate::asset::ASSETS_JOB, n);
+        self
+    }
+
     /// at most `n` runs carrying the tag `key: value` executing at once:
     /// `tag_limit("env", "prod", 2)` whatever the jobs are. stackable; the same
     /// pair twice keeps the last. a value below 1 means 1.

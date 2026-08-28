@@ -23,6 +23,26 @@ use crate::whose::{Owner, check_namespace};
 /// the internal job every asset build runs under.
 pub(crate) const ASSETS_JOB: &str = "assets";
 
+/// how many asset builds execute at once unless a deployment says otherwise.
+///
+/// builds used to be serialized, and a deployment that leaned on that for load
+/// control would find it gone if this were unbounded. four is a cap rather
+/// than a target: it is above the one build at a time a 0.1.0 deployment got
+/// and well below "as many as the graph has disjoint families", so a backfill
+/// no longer stops every unrelated build and nothing suddenly opens forty
+/// connections that used to open one.
+///
+/// it is the ordinary [per-job limit](crate::Limits::job) on the assets job
+/// rather than a second mechanism, so it counts *executing* runs, the rest
+/// wait on the queue, and
+/// [`Hestan::max_concurrent_builds`](crate::Hestan::max_concurrent_builds) is
+/// the one knob. what a build does to somebody's api is a different question
+/// with a different answer already:
+/// [`Hestan::rate`](crate::Hestan::rate) caps calls per second whatever is
+/// running, and a [pool](crate::Hestan::pool) caps how many ops hold a
+/// connection at once.
+pub(crate) const DEFAULT_CONCURRENT_BUILDS: usize = 4;
+
 /// the external name a partitioned asset fans out over: the keys one build
 /// targets, which only a [`BuildPlan`] can work out.
 pub(crate) fn partition_keys_name(asset: &str) -> String {
@@ -1271,6 +1291,7 @@ impl AssetRegistry {
             ops,
             external,
         )
+        .map(|job| job.with_max_concurrent_runs(DEFAULT_CONCURRENT_BUILDS))
     }
 }
 
@@ -2494,15 +2515,66 @@ pub(crate) fn mats_map(store: &Store) -> Result<Mats, Error> {
     Ok(store.latest_materializations()?.into_iter().collect())
 }
 
+/// every `(asset, partition key)` a plan will materialize, as the json the run
+/// row carries and the store intersects.
+///
+/// **key level rather than asset level.** a claim on the asset alone would put
+/// a backfill of january and a build of february back into each other's way,
+/// which is the case worth having: a backfill is the long one, and it is the
+/// one whose blocking everything hurt. an unpartitioned asset takes one claim
+/// with a null key, which is its sentinel: it has one thing to build.
+///
+/// **the whole plan is claimed, not the asset the caller named.** a build of
+/// `forecast` drags its stale upstream in, so two builds whose plans share an
+/// upstream conflict even though the two names typed at them do not, and the
+/// asset the refusal names is the shared one rather than either target.
+///
+/// a check op produces no asset and claims nothing; it is in the plan and is
+/// simply not in the registry's op table, which is what filters it out here.
+pub(crate) fn claimed_by(reg: &AssetRegistry, plan: &BuildPlan) -> Value {
+    let mut claims: Vec<Value> = Vec::new();
+    for op in &plan.ops {
+        let Some(meta) = reg.op(op) else {
+            continue;
+        };
+        // the keys the plan chose are the seed the fan-out expands over, so
+        // the claim is exactly what the run will build rather than a second
+        // reading of the same question
+        let keys: Option<Vec<&str>> = meta.partitions.is_some().then(|| {
+            plan.seeds
+                .get(&partition_keys_name(&meta.name))
+                .and_then(Value::as_array)
+                .map(|a| a.iter().filter_map(Value::as_str).collect())
+                .unwrap_or_default()
+        });
+        for asset in &meta.produces {
+            match &keys {
+                None => claims.push(json!({ "asset": asset, "partition": Value::Null })),
+                Some(keys) => claims.extend(
+                    keys.iter()
+                        .map(|k| json!({ "asset": asset, "partition": k })),
+                ),
+            }
+        }
+    }
+    Value::Array(claims)
+}
+
 /// launch a plan as one subset run of the assets job, [tagged](RunTags) with
 /// whatever the caller can say that `Trigger::Build` cannot: which asset it
 /// was asked for, which backfill it is a chunk of, which sensor set it off.
+///
+/// the claim goes with it, so the store refuses this launch if what it would
+/// build meets what something else is already building. `Error::Conflict` is
+/// that refusal, naming the asset and the run.
 pub(crate) fn launch_plan(
     runner: &crate::executor::Runner,
+    reg: &AssetRegistry,
     plan: BuildPlan,
     trigger: Trigger,
     tags: RunTags,
 ) -> Result<String, Error> {
+    let claims = claimed_by(reg, &plan);
     runner.launch_subset(
         ASSETS_JOB,
         plan.ops.into_iter().collect(),
@@ -2510,6 +2582,7 @@ pub(crate) fn launch_plan(
         json!({}),
         trigger,
         Lineage::None,
+        Some(&claims),
         tags,
         None,
     )
@@ -2550,11 +2623,6 @@ pub(crate) fn plan_one(
             HashMap::from([(name.to_string(), keys.to_vec())])
         }
     };
-    // one build at a time: they share the assets job, and two overlapping ones
-    // would materialize the same asset twice from different plans
-    if runner.store().has_active_run(ASSETS_JOB)? {
-        return Err(Error::Conflict("asset build already running".into()));
-    }
     let mats = mats_map(runner.store())?;
     if named.is_empty() && !staleness(reg, &mats)[name].stale {
         return Ok(None);
@@ -2572,7 +2640,7 @@ pub(crate) fn build_one(
     let Some(plan) = plan_one(runner, reg, name, keys)? else {
         return Ok(None);
     };
-    launch_plan(runner, plan, Trigger::Build, asset_tag(name)).map(Some)
+    launch_plan(runner, reg, plan, Trigger::Build, asset_tag(name)).map(Some)
 }
 
 /// [`plan_one`] fired by a [schedule on the asset](crate::Schedule::asset):
@@ -2595,12 +2663,14 @@ pub(crate) fn fire_build(
     let Some(plan) = plan_one(runner, reg, name, &[])? else {
         return Ok(None);
     };
+    let claims = claimed_by(reg, &plan);
     runner
         .fire_subset(
             ASSETS_JOB,
             plan.ops.into_iter().collect(),
             plan.seeds,
             fire,
+            &claims,
             asset_tag(name),
         )
         .map(Some)
@@ -3691,6 +3761,7 @@ mod tests {
                 json!({}),
                 Trigger::Build,
                 Lineage::None,
+                None,
                 RunTags::new(),
                 None,
             )
@@ -3750,6 +3821,7 @@ mod tests {
                 json!({}),
                 Trigger::Build,
                 Lineage::None,
+                None,
                 RunTags::new(),
                 None,
             )
@@ -5101,5 +5173,325 @@ mod tests {
             store.materialization("t", None).unwrap().unwrap().value,
             Some(json!({"n": 5}))
         );
+    }
+}
+
+#[cfg(test)]
+mod overlap_tests {
+    use super::*;
+    use crate::executor::Runner;
+    use crate::model::{Reclaim, Role, RunStatus};
+    use crate::op::OpCtx;
+    use crate::partition::Partitions;
+    use chrono::Utc;
+
+    /// two unrelated families over two sources, plus one asset that reads both,
+    /// which is what makes "shares only an upstream" expressible.
+    fn families() -> AssetRegistry {
+        let west = Asset::source("west");
+        let east = Asset::source("east");
+        let sales = Asset::new("sales", |_: OpCtx| async { Ok(json!({"rows": 1})) }).from(&west);
+        let stock = Asset::new("stock", |_: OpCtx| async { Ok(json!({"rows": 2})) }).from(&east);
+        let sales_report =
+            Asset::new("sales_report", |_: OpCtx| async { Ok(json!(null)) }).from(&sales);
+        let stock_report =
+            Asset::new("stock_report", |_: OpCtx| async { Ok(json!(null)) }).from(&stock);
+        AssetRegistry::new(
+            vec![west, east, sales, stock, sales_report, stock_report],
+            Vec::new(),
+            Vec::new(),
+        )
+        .unwrap()
+    }
+
+    /// a process that decides and does not execute, so a launched run stays
+    /// queued: that is what "a build is in flight" looks like without a clock
+    /// in the test.
+    fn holding(reg: &AssetRegistry, store: Store) -> Runner {
+        Runner::new([reg.lower_job().unwrap()], store)
+            .unwrap()
+            .with_role(Role::Scheduler, 1)
+    }
+
+    fn probed(store: &Store, sources: &[&str]) {
+        for s in sources {
+            store
+                .record_materialization(s, None, "f1", &json!({}), None, None, None)
+                .unwrap();
+        }
+    }
+
+    // the one the whole part is for: two families with nothing in common build
+    // at the same time instead of one waiting for the other
+    #[test]
+    fn two_disjoint_plans_build_at_once() {
+        let reg = families();
+        let store = Store::open(":memory:").unwrap();
+        let runner = holding(&reg, store.clone());
+        probed(&store, &["west", "east"]);
+
+        let first = build_one(&runner, &reg, "sales_report", &[])
+            .unwrap()
+            .unwrap();
+        let second = build_one(&runner, &reg, "stock_report", &[])
+            .unwrap()
+            .unwrap();
+        assert_ne!(first, second);
+        assert_eq!(
+            store
+                .runs(None, None, None, None, None, None, 10)
+                .unwrap()
+                .len(),
+            2
+        );
+    }
+
+    // and two that would materialize the same asset still do not, with the
+    // asset and the run named rather than "a build is running"
+    #[test]
+    fn two_intersecting_plans_are_refused_with_the_asset_named() {
+        let reg = families();
+        let store = Store::open(":memory:").unwrap();
+        let runner = holding(&reg, store.clone());
+        probed(&store, &["west", "east"]);
+
+        let first = build_one(&runner, &reg, "sales_report", &[])
+            .unwrap()
+            .unwrap();
+        let err = build_one(&runner, &reg, "sales_report", &[]).unwrap_err();
+        let msg = err.to_string();
+        // an asset both plans would materialize, and the run already doing it.
+        // the plan is what is claimed, so the first thing the two meet on is
+        // the stale upstream rather than the name the caller typed
+        assert_eq!(msg, format!("sales is already being built by run {first}"));
+        assert_eq!(
+            store
+                .runs(None, None, None, None, None, None, 10)
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    // the plan is what is claimed, not the name the caller typed: `sales` is
+    // stale under both reports, so the two collide on it even though nobody
+    // asked for `sales`
+    #[test]
+    fn two_plans_sharing_only_an_upstream_conflict() {
+        let west = Asset::source("west");
+        let sales = Asset::new("sales", |_: OpCtx| async { Ok(json!({"rows": 1})) }).from(&west);
+        let daily = Asset::new("daily", |_: OpCtx| async { Ok(json!(null)) }).from(&sales);
+        let weekly = Asset::new("weekly", |_: OpCtx| async { Ok(json!(null)) }).from(&sales);
+        let reg =
+            AssetRegistry::new(vec![west, sales, daily, weekly], Vec::new(), Vec::new()).unwrap();
+        let store = Store::open(":memory:").unwrap();
+        let runner = holding(&reg, store.clone());
+        probed(&store, &["west"]);
+
+        build_one(&runner, &reg, "daily", &[]).unwrap().unwrap();
+        let err = build_one(&runner, &reg, "weekly", &[]).unwrap_err();
+        // the shared upstream is what they meet on, and it is what the refusal
+        // names, rather than either of the two names typed at it
+        assert!(err.to_string().starts_with("sales is already"), "{err}");
+    }
+
+    // key level is what lets a long backfill of one range run beside a build of
+    // another. asset level would put them back in each other's way, which is
+    // the case this whole change exists for
+    #[test]
+    fn two_ranges_of_one_partitioned_asset_build_at_once() {
+        let sales = Asset::new("sales", |ctx: OpCtx| async move {
+            Ok(json!({ "key": ctx.partition() }))
+        })
+        .partitioned(Partitions::keys(["jan", "feb", "mar", "apr"]).build_limit(4));
+        let reg = AssetRegistry::new(vec![sales], Vec::new(), Vec::new()).unwrap();
+        let store = Store::open(":memory:").unwrap();
+        let runner = holding(&reg, store.clone());
+
+        let jan = build_one(&runner, &reg, "sales", &["jan".into(), "feb".into()])
+            .unwrap()
+            .unwrap();
+        let mar = build_one(&runner, &reg, "sales", &["mar".into(), "apr".into()])
+            .unwrap()
+            .unwrap();
+        assert_ne!(jan, mar);
+        // and a third naming a key the first holds still meets it
+        let err = build_one(&runner, &reg, "sales", &["feb".into()]).unwrap_err();
+        assert!(
+            err.to_string().starts_with("sales[feb] is already"),
+            "{err}"
+        );
+    }
+
+    // two callers on two connections, one asset, one run. the claim is taken in
+    // the transaction that writes the run, so this resolves rather than racing:
+    // a read followed by a launch would be two callers away from two runs
+    // materializing one asset from two plans
+    #[test]
+    fn two_callers_racing_one_asset_make_exactly_one_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hestan.db");
+        let path = path.to_str().unwrap().to_string();
+        let reg = Arc::new(families());
+        {
+            let store = Store::open(&path).unwrap();
+            probed(&store, &["west"]);
+        }
+
+        let barrier = Arc::new(std::sync::Barrier::new(8));
+        let outcomes: Vec<Result<Option<String>, Error>> = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..8)
+                .map(|_| {
+                    let (path, reg, barrier) = (path.clone(), reg.clone(), barrier.clone());
+                    scope.spawn(move || {
+                        let store = Store::open(&path).unwrap();
+                        let runner = holding(&reg, store);
+                        barrier.wait();
+                        build_one(&runner, &reg, "sales_report", &[])
+                    })
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+
+        let launched: Vec<&String> = outcomes
+            .iter()
+            .filter_map(|o| o.as_ref().ok().and_then(Option::as_ref))
+            .collect();
+        assert_eq!(launched.len(), 1, "{outcomes:?}");
+        let store = Store::open(&path).unwrap();
+        let runs = store.runs(None, None, None, None, None, None, 20).unwrap();
+        assert_eq!(runs.len(), 1, "two callers made two runs");
+        // and the losers were told which asset and which run, rather than
+        // being handed a database error
+        for refused in outcomes.iter().filter_map(|o| o.as_ref().err()) {
+            assert!(
+                matches!(refused, Error::Conflict(m) if m.contains(launched[0])),
+                "{refused}"
+            );
+        }
+    }
+
+    // a claim is the run row, so whatever ends a run releases it. a process
+    // that dies mid-build leaves a non-terminal run with a lapsed lease, and
+    // the reclaimer that already exists for that is the whole of the recovery:
+    // there is no second table to leak
+    #[tokio::test]
+    async fn a_run_killed_mid_build_releases_its_claim() {
+        let reg = families();
+        let store = Store::open(":memory:").unwrap();
+        let runner = holding(&reg, store.clone());
+        probed(&store, &["west"]);
+
+        let stuck = build_one(&runner, &reg, "sales_report", &[])
+            .unwrap()
+            .unwrap();
+        store.run_started(&stuck, Utc::now()).unwrap();
+        // claimed by a process that then stopped renewing, which is what a
+        // process killed mid-build looks like from the store's side
+        store
+            .plant_claim(
+                &stuck,
+                "vanished",
+                Some(Utc::now() - chrono::Duration::seconds(60)),
+            )
+            .unwrap();
+        assert!(
+            build_one(&runner, &reg, "sales_report", &[]).is_err(),
+            "the claim was already gone before anything reaped it"
+        );
+
+        // the reaper that already runs every heartbeat settles it, and that is
+        // the whole of the recovery
+        let taken = store.reclaim_expired(Reclaim::Fail, |_| None).unwrap();
+        assert_eq!(taken.len(), 1);
+        assert_eq!(
+            store.run(&stuck).unwrap().unwrap().status,
+            RunStatus::Failed
+        );
+
+        // and the asset is buildable again, with nothing having been swept
+        let next = build_one(&runner, &reg, "sales_report", &[])
+            .unwrap()
+            .unwrap();
+        assert_ne!(next, stuck);
+    }
+
+    // unbounded is not the goal, and the cap is enforced by the dispatcher
+    // rather than by the claim: a build past it waits on the queue rather than
+    // being refused, which is what a limit does and a claim does not
+    #[tokio::test]
+    async fn the_cap_holds_and_the_rest_wait_on_the_queue() {
+        let hold = Arc::new(tokio::sync::Semaphore::new(0));
+        let assets: Vec<Asset> = (0..3)
+            .map(|i| {
+                let hold = hold.clone();
+                Asset::new(format!("a{i}"), move |_: OpCtx| {
+                    let hold = hold.clone();
+                    async move {
+                        let _p = hold.acquire().await.unwrap();
+                        Ok(json!(null))
+                    }
+                })
+            })
+            .collect();
+        let reg = AssetRegistry::new(assets, Vec::new(), Vec::new()).unwrap();
+        let store = Store::open(":memory:").unwrap();
+        let runner = Runner::new([reg.lower_job().unwrap()], store.clone())
+            .unwrap()
+            .with_limits(crate::Limits::new().job(ASSETS_JOB, 2), 0);
+
+        // three plans with nothing in common, so the claim admits all three
+        for i in 0..3 {
+            build_one(&runner, &reg, &format!("a{i}"), &[])
+                .unwrap()
+                .expect("a disjoint build was refused");
+        }
+        // two execute; the third is on the queue, which is a wait rather than a
+        // refusal
+        for _ in 0..200 {
+            let runs = store.runs(None, None, None, None, None, None, 10).unwrap();
+            let running = runs
+                .iter()
+                .filter(|r| r.status == RunStatus::Running)
+                .count();
+            if running == 2 {
+                assert_eq!(
+                    runs.iter()
+                        .filter(|r| r.status == RunStatus::Queued)
+                        .count(),
+                    1,
+                    "{runs:?}"
+                );
+                hold.add_permits(3);
+                return;
+            }
+            assert!(running <= 2, "the cap was broken: {runs:?}");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        hold.add_permits(3);
+        panic!("two builds never reached running");
+    }
+
+    // and the default is that same limit, so a deployment that says nothing
+    // gets a bound rather than however many disjoint families it declared
+    #[test]
+    fn the_default_cap_is_a_per_job_limit_on_the_assets_job() {
+        let reg = families();
+        let job = reg.lower_job().unwrap();
+        assert_eq!(job.max_concurrent_runs(), Some(DEFAULT_CONCURRENT_BUILDS));
+        let runner = Runner::new([job], Store::open(":memory:").unwrap())
+            .unwrap()
+            .with_limits(crate::Limits::new(), 0);
+        assert_eq!(
+            runner.limits().jobs(),
+            [(ASSETS_JOB, DEFAULT_CONCURRENT_BUILDS)]
+        );
+        // and one knob overrides it, because a declared limit wins over a
+        // default folded in from the job
+        let runner = Runner::new([reg.lower_job().unwrap()], Store::open(":memory:").unwrap())
+            .unwrap()
+            .with_limits(crate::Limits::new().job(ASSETS_JOB, 1), 0);
+        assert_eq!(runner.limits().jobs(), [(ASSETS_JOB, 1)]);
     }
 }

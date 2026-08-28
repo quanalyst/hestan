@@ -827,6 +827,22 @@ fn note_launched(
             tracing::warn!(job = %job, expr = %expr, "fire refused: {NOT_DECIDING}");
             Ok(())
         }
+        // an asset schedule whose build meets one already running. the
+        // occurrence is accounted for, saying which asset and which run, and
+        // the asset is still stale for the next pass to pick up
+        Launched::Overlaps { what, run: held } => {
+            let msg = format!("{what} is already being built by run {held}");
+            tracing::info!(job = %job, expr = %expr, "fire refused: {msg}");
+            runner.store().record_tick(
+                job,
+                expr,
+                due,
+                TickOutcome::Skipped,
+                caught_up,
+                None,
+                Some(&msg),
+            )
+        }
     };
     if let Err(e) = tick {
         tracing::warn!(job = %job, "tick write failed: {e}");

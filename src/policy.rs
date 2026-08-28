@@ -6,8 +6,8 @@ use std::time::Duration;
 use chrono::{DateTime, Utc};
 
 use crate::asset::{
-    ASSETS_JOB, AssetMeta, AssetRegistry, Mats, Staleness, key_sets, launch_plan, mats_map,
-    plan_partitions, staleness,
+    AssetMeta, AssetRegistry, Mats, Staleness, key_sets, launch_plan, mats_map, plan_partitions,
+    staleness,
 };
 use crate::error::Error;
 use crate::executor::Runner;
@@ -515,16 +515,6 @@ pub(crate) fn launch(
     if wants.is_empty() {
         return Ok(None);
     }
-    // the same gate the build endpoints answer 409 on. checked before planning
-    // rather than after: `build_one` refuses with an error a person is reading,
-    // and a loop that tripped that every pass would be a log nobody reads
-    if runner.store().has_active_run(ASSETS_JOB)? {
-        tracing::debug!(
-            assets = %wants.iter().map(|w| w.asset.as_str()).collect::<Vec<_>>().join(", "),
-            "policy build held: an asset build is already running"
-        );
-        return Ok(None);
-    }
     let targets: Vec<String> = wants.iter().map(|w| w.asset.clone()).collect();
     let named: HashMap<String, Vec<String>> = wants
         .iter()
@@ -532,7 +522,21 @@ pub(crate) fn launch(
         .map(|w| (w.asset.clone(), w.keys.clone()))
         .collect();
     let plan = plan_partitions(reg, mats, &targets, &named)?;
-    let run_id = launch_plan(runner, plan, Trigger::Build, tags)?;
+    // the claim decides, in the transaction that writes the run. a pass whose
+    // plan meets one already building is held rather than failed: this loop
+    // asks again in a minute of fresher data, and an error a nobody reads
+    // every pass is worse than the debug line it replaces
+    let run_id = match launch_plan(runner, reg, plan, Trigger::Build, tags) {
+        Ok(id) => id,
+        Err(Error::Conflict(why)) => {
+            tracing::debug!(
+                assets = %wants.iter().map(|w| w.asset.as_str()).collect::<Vec<_>>().join(", "),
+                "policy build held: {why}"
+            );
+            return Ok(None);
+        }
+        Err(e) => return Err(e),
+    };
     for want in wants {
         // after the launch, and best-effort past it: the run exists whatever
         // the log says about it, and a pass that failed here would launch the
@@ -1081,6 +1085,48 @@ mod tests {
                 .filter(|e| e.kind == EventKind::PolicyLaunched)
                 .count(),
             1
+        );
+    }
+
+    // and a build of something unrelated no longer holds the pass. it used to:
+    // any active assets run stopped every pass, so one long build in one corner
+    // of the graph meant the automation did nothing at all until it finished
+    #[tokio::test]
+    async fn a_pass_launches_beside_a_build_of_something_unrelated() {
+        let west = Asset::source("west");
+        let east = Asset::source("east");
+        let watched = Asset::new("watched", |_: OpCtx| async { Ok(json!(null)) })
+            .from(&west)
+            .auto();
+        let other = Asset::new("other", |_: OpCtx| async { Ok(json!(null)) }).from(&east);
+        let reg = reg(vec![west, east, watched, other]);
+        let store = store_with(vec![
+            ("west", None, "w1", json!({})),
+            ("east", None, "e1", json!({})),
+        ]);
+        // decides and does not execute, so the build it launches stays queued
+        let runner = runner_for(&reg, store.clone()).with_role(Role::Scheduler, 1);
+
+        let building = crate::asset::build_one(&runner, &reg, "other", &[])
+            .unwrap()
+            .unwrap();
+        let launched = tick(&runner, &reg, at("2026-08-14T09:00:00Z"))
+            .unwrap()
+            .expect("the pass held behind an unrelated build");
+        assert_ne!(launched, building);
+        assert_eq!(
+            store
+                .runs(None, None, None, None, None, None, 10)
+                .unwrap()
+                .len(),
+            2
+        );
+
+        // and a second pass still holds behind the build it just launched,
+        // because that one is the same plan
+        assert_eq!(
+            tick(&runner, &reg, at("2026-08-14T09:00:00Z")).unwrap(),
+            None
         );
     }
 

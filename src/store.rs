@@ -785,6 +785,17 @@ pub(crate) enum Landed {
     /// the deciding lease moved on before this reached the store. nothing was
     /// written.
     Stale,
+    /// a [build claim](Claimed::Build) that intersects one an active run
+    /// already holds. nothing was written, and the caller is told which asset
+    /// collided and which run holds it, because "something is building" is not
+    /// an answer somebody can act on.
+    Overlaps {
+        /// the first asset both plans would materialize, as `sales` or
+        /// `sales[2026-01]`.
+        what: String,
+        /// the run already building it.
+        run: String,
+    },
 }
 
 /// what a launch has to claim before it is allowed to exist.
@@ -804,6 +815,32 @@ pub(crate) enum Claimed<'a> {
     Key(RunKey<'a>),
     /// a [cron occurrence](Fire).
     Fire(Fire<'a>),
+    /// an [asset build](crate::Hestan::assets): the set of `(asset, partition)`
+    /// its plan will materialize, which no other active run of the same job
+    /// may also be about to materialize.
+    ///
+    /// **derived from the run rows, not from a table of its own.** the claim a
+    /// build holds is exactly what its own `runs.plan` says it will build, so
+    /// a run reaching a terminal status releases it and there is nothing
+    /// separate that can leak or disagree. a process that dies mid-build
+    /// leaves a non-terminal run, and the sweeps that already exist for that
+    /// ([`fail_interrupted`](Store::fail_interrupted) at boot,
+    /// [`reclaim_expired`](Store::reclaim_expired) every heartbeat once the
+    /// lease lapses) end the run and with it the claim. a second table would
+    /// have needed a reaper of its own, and a reaper of its own is a second
+    /// answer to "what is building" that can be wrong.
+    ///
+    /// **the check is inside the insert's transaction**, under the same lock
+    /// dispatchers take, which is the whole reason this is a `Claimed` and not
+    /// a call the caller makes first. widening the rule from "any build" to
+    /// "an intersecting build" makes concurrent callers the ordinary case
+    /// rather than the rare one, so a read followed by a launch would be two
+    /// callers away from two runs materializing one asset from two plans, each
+    /// recording the other's lineage.
+    ///
+    /// it carries nothing: what is claimed is read out of `plan` below, so the
+    /// run row that is written **is** the claim rather than a copy of it.
+    Build,
     /// a launch carrying an idempotency key: at most one run per key, ever, by
     /// [`SCHEMA_V23`].
     ///
@@ -1998,7 +2035,15 @@ impl Store {
         let at = Utc::now();
         let mut conn = self.conn();
         let (insert, ignore) = conn.dialect().insert_or_ignore();
-        let mut tx = conn.begin()?;
+        // a build claim is a read of what is already running followed by the
+        // insert that joins it, and on sqlite only an immediate transaction
+        // keeps another writer out of the middle of that pair. every other
+        // claim is decided by a unique index and needs no such thing, so only
+        // this one pays for it
+        let mut tx = match claimed {
+            Claimed::Build => conn.begin_immediate()?,
+            _ => conn.begin()?,
+        };
         // the fence first, because the lock it takes is what makes everything
         // under it part of the same term
         if let Fenced::Under { holder, term } = fenced
@@ -2008,6 +2053,29 @@ impl Store {
         }
         match claimed {
             Claimed::Nothing => {}
+            // postgres has no database-wide writer lock to inherit, so two
+            // launches would read the same snapshot of "what is running" from
+            // their own transactions and both pass. the same lock two
+            // dispatchers take to spend one slot is what makes this pair one
+            // decision there
+            Claimed::Build => {
+                tx.take_turns()?;
+                let mine = claim_set(plan);
+                let active: Vec<(String, Option<Value>)> = tx.query(
+                    "SELECT id, plan FROM runs
+                     WHERE job = ?1 AND status IN ('queued', 'running')",
+                    args![&run.job],
+                    |r| Ok((r.text(0)?, r.opt_json(1)?)),
+                )?;
+                for (id, theirs) in &active {
+                    if let Some(what) = overlap(&mine, &claim_set(theirs.as_ref())) {
+                        return Ok(Landed::Overlaps {
+                            what,
+                            run: id.clone(),
+                        });
+                    }
+                }
+            }
             Claimed::Key(k) => {
                 let claimed = tx.execute(
                     &format!(
@@ -2148,7 +2216,64 @@ impl Store {
         }
         Ok(Landed::Yes)
     }
+}
 
+/// what a run of the assets job is about to materialize, read off its own
+/// stored plan.
+///
+/// `None` is **everything**, and it is the honest answer for a run whose plan
+/// does not list what it builds: a full launch of the assets job records no
+/// plan at all, and a resume, a replay or `Hestan::build_asset` records the
+/// ops it will run without the assets those ops produce. hestan cannot say
+/// what such a run will write, so it may not say that anything is free of it.
+///
+/// `Some(set)` is a plan that listed its builds. a pair is `(asset, key)`, and
+/// the key is `None` for an unpartitioned asset: it has one thing to build, so
+/// it takes one claim.
+fn claim_set(plan: Option<&Value>) -> Option<Vec<(String, Option<String>)>> {
+    let builds = plan?.get("builds")?.as_array()?;
+    Some(
+        builds
+            .iter()
+            .filter_map(|b| {
+                Some((
+                    b.get("asset")?.as_str()?.to_string(),
+                    b.get("partition")
+                        .and_then(Value::as_str)
+                        .map(str::to_string),
+                ))
+            })
+            .collect(),
+    )
+}
+
+/// the first thing two claim sets both hold, named the way a person reads it.
+///
+/// either side being `None` (a run that will not say what it builds) makes
+/// every pair an overlap, which is what stops a build racing something whose
+/// reach hestan cannot bound. two sets that are both empty do not overlap: a
+/// plan that builds nothing collides with nothing.
+fn overlap(
+    mine: &Option<Vec<(String, Option<String>)>>,
+    theirs: &Option<Vec<(String, Option<String>)>>,
+) -> Option<String> {
+    let named = |one: &(String, Option<String>)| match &one.1 {
+        Some(key) => format!("{}[{key}]", one.0),
+        None => one.0.clone(),
+    };
+    match (mine, theirs) {
+        (Some(mine), Some(theirs)) => mine.iter().find(|m| theirs.contains(m)).map(named),
+        // one of the two will not say, so the only safe answer is that they
+        // meet. named by whichever side does say, and by the job otherwise
+        (Some(mine), None) => Some(mine.first().map_or_else(
+            || "the assets job".to_string(),
+            |first| format!("{} (and whatever that run builds)", named(first)),
+        )),
+        (None, _) => Some("the assets job".to_string()),
+    }
+}
+
+impl Store {
     /// whether `sensor` has already launched a run under `key`.
     pub(crate) fn run_key_claimed(&self, sensor: &str, key: &str) -> Result<bool, Error> {
         let found = self.conn().query_opt(
@@ -11226,6 +11351,190 @@ mod tests {
             let waiting = store.run("waiting").unwrap().unwrap();
             assert_eq!(waiting.status, RunStatus::Queued);
             assert_eq!(store.queue_depth().unwrap(), 1);
+        });
+    }
+
+    /// a plan claiming exactly these `(asset, key)` pairs, in the shape
+    /// `enqueue` writes.
+    fn build_plan(builds: &[(&str, Option<&str>)]) -> Value {
+        json!({
+            "ops": [],
+            "seeds": {},
+            "builds": builds
+                .iter()
+                .map(|(a, k)| json!({ "asset": a, "partition": k }))
+                .collect::<Vec<Value>>(),
+        })
+    }
+
+    // the claim is taken in the transaction that writes the run, on both
+    // backends. sqlite gets it from an immediate transaction being the only
+    // writer; postgres has no such thing and takes the same lock two
+    // dispatchers take, and a case that only ran on sqlite would be a case
+    // that never tested the half that needed the lock
+    #[test]
+    fn a_build_claim_refuses_an_intersecting_plan_and_admits_a_disjoint_one() {
+        both(|db| {
+            let store = db.store();
+            let plan = build_plan(&[("sales", None), ("sales_report", None)]);
+            assert_eq!(
+                store
+                    .create_run_keyed(
+                        &mk_run("first", "assets", Utc::now()),
+                        &[],
+                        Claimed::Build,
+                        Some(&plan),
+                        Fenced::Never,
+                    )
+                    .unwrap(),
+                Landed::Yes
+            );
+
+            // nothing in common, so it launches
+            let disjoint = build_plan(&[("stock", None)]);
+            assert_eq!(
+                store
+                    .create_run_keyed(
+                        &mk_run("beside", "assets", Utc::now()),
+                        &[],
+                        Claimed::Build,
+                        Some(&disjoint),
+                        Fenced::Never,
+                    )
+                    .unwrap(),
+                Landed::Yes
+            );
+
+            // one asset in common is enough, even though neither plan is the
+            // other and the shared one is not what either caller named
+            let meets = build_plan(&[("sales", None), ("weekly", None)]);
+            assert_eq!(
+                store
+                    .create_run_keyed(
+                        &mk_run("third", "assets", Utc::now()),
+                        &[],
+                        Claimed::Build,
+                        Some(&meets),
+                        Fenced::Never,
+                    )
+                    .unwrap(),
+                Landed::Overlaps {
+                    what: "sales".into(),
+                    run: "first".into(),
+                }
+            );
+            // and the refused one wrote nothing at all
+            assert!(store.run("third").unwrap().is_none());
+
+            // key level: two ranges of one asset are two claims
+            let jan = build_plan(&[("orders", Some("jan"))]);
+            let feb = build_plan(&[("orders", Some("feb"))]);
+            for (id, plan) in [("jan", &jan), ("feb", &feb)] {
+                assert_eq!(
+                    store
+                        .create_run_keyed(
+                            &mk_run(id, "assets", Utc::now()),
+                            &[],
+                            Claimed::Build,
+                            Some(plan),
+                            Fenced::Never,
+                        )
+                        .unwrap(),
+                    Landed::Yes
+                );
+            }
+            assert_eq!(
+                store
+                    .create_run_keyed(
+                        &mk_run("again", "assets", Utc::now()),
+                        &[],
+                        Claimed::Build,
+                        Some(&jan),
+                        Fenced::Never,
+                    )
+                    .unwrap(),
+                Landed::Overlaps {
+                    what: "orders[jan]".into(),
+                    run: "jan".into(),
+                }
+            );
+
+            // the claim is the run row, so ending the run releases it, and
+            // nothing had to be swept for that to be true
+            store
+                .run_finished("first", RunStatus::Success, None, Utc::now(), None)
+                .unwrap();
+            assert_eq!(
+                store
+                    .create_run_keyed(
+                        &mk_run("after", "assets", Utc::now()),
+                        &[],
+                        Claimed::Build,
+                        Some(&meets),
+                        Fenced::Never,
+                    )
+                    .unwrap(),
+                Landed::Yes
+            );
+        });
+    }
+
+    // a run of the assets job that records no plan, or one whose plan does not
+    // say what it builds (a resume, a replay, a headless build_asset), is a run
+    // whose reach hestan cannot bound. it may not be read as claiming nothing,
+    // or a build would materialize the same asset beside it
+    #[test]
+    fn a_run_that_will_not_say_what_it_builds_claims_everything() {
+        both(|db| {
+            let store = db.store();
+            store
+                .create_run_keyed(
+                    &mk_run("opaque", "assets", Utc::now()),
+                    &[],
+                    Claimed::Nothing,
+                    Some(&json!({ "ops": ["a"], "seeds": {} })),
+                    Fenced::Never,
+                )
+                .unwrap();
+            let landed = store
+                .create_run_keyed(
+                    &mk_run("mine", "assets", Utc::now()),
+                    &[],
+                    Claimed::Build,
+                    Some(&build_plan(&[("anything", None)])),
+                    Fenced::Never,
+                )
+                .unwrap();
+            assert!(
+                matches!(&landed, Landed::Overlaps { run, .. } if run == "opaque"),
+                "{landed:?}"
+            );
+
+            // and a run of another job is not a build at all
+            store
+                .run_finished("opaque", RunStatus::Success, None, Utc::now(), None)
+                .unwrap();
+            store
+                .create_run_keyed(
+                    &mk_run("elsewhere", "etl", Utc::now()),
+                    &[],
+                    Claimed::Nothing,
+                    None,
+                    Fenced::Never,
+                )
+                .unwrap();
+            assert_eq!(
+                store
+                    .create_run_keyed(
+                        &mk_run("mine2", "assets", Utc::now()),
+                        &[],
+                        Claimed::Build,
+                        Some(&build_plan(&[("anything", None)])),
+                        Fenced::Never,
+                    )
+                    .unwrap(),
+                Landed::Yes
+            );
         });
     }
 

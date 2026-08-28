@@ -900,6 +900,8 @@ fn launch_request(sensor: &str, req: RunRequest, runner: &Runner) -> Result<Fire
         // and the launch. nothing launched and nothing is claimed, so whoever
         // holds the lease now will make the same request on its next turn
         Ok(Launched::Stale) => Err(fail(Error::NotDeciding)),
+        // a sensor request launches a whole job and claims no build
+        Ok(Launched::Overlaps { .. }) => unreachable!("a sensor request claims no build"),
         Err(e) => Err(fail(e)),
     }
 }

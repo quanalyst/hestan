@@ -502,6 +502,10 @@ pub(crate) enum Launched {
     /// the work is done or under way, and this is the answer rather than a
     /// refusal. nothing was written.
     Repeat(String),
+    /// an asset build whose plan intersects one an active run is already
+    /// executing, naming the first asset both would materialize and the run
+    /// holding it. nothing was written.
+    Overlaps { what: String, run: String },
 }
 
 impl Launched {
@@ -516,11 +520,21 @@ impl Launched {
         match self {
             Launched::Queued(id) => Ok(id),
             Launched::Stale => Err(Error::NotDeciding),
+            Launched::Overlaps { what, run } => Err(overlapping(&what, &run)),
             Launched::Taken | Launched::Repeat(_) => {
                 unreachable!("a launch with nothing to claim cannot lose it")
             }
         }
     }
+}
+
+/// the 409 an intersecting build is answered with.
+///
+/// it names the asset and the run rather than saying "a build is running",
+/// because the rule it enforces is narrow now: something is building *this*,
+/// and which run it is, is the next thing anybody asks.
+pub(crate) fn overlapping(what: &str, run: &str) -> Error {
+    Error::Conflict(format!("{what} is already being built by run {run}"))
 }
 
 /// what a [keyed launch](Runner::launch_once) came to: the run, and whether
@@ -1290,6 +1304,7 @@ impl Runner {
             Lineage::None,
             None,
             Claimed::Nothing,
+            None,
             tags,
             priority,
         )?
@@ -1316,6 +1331,7 @@ impl Runner {
             Lineage::None,
             scheduled_for,
             Claimed::Nothing,
+            None,
             RunTags::new(),
             None,
         )?
@@ -1361,6 +1377,7 @@ impl Runner {
             Lineage::None,
             Some(fire.scheduled_for),
             Claimed::Fire(fire),
+            None,
             RunTags::new(),
             None,
         )
@@ -1379,6 +1396,7 @@ impl Runner {
         ops: HashSet<String>,
         seeded: HashMap<String, Value>,
         fire: Fire<'_>,
+        builds: &Value,
         tags: RunTags,
     ) -> Result<Launched, Error> {
         self.enqueue(
@@ -1389,6 +1407,7 @@ impl Runner {
             Lineage::None,
             Some(fire.scheduled_for),
             Claimed::Fire(fire),
+            Some(builds),
             tags,
             None,
         )
@@ -1415,6 +1434,7 @@ impl Runner {
             Lineage::None,
             None,
             Claimed::Key(key),
+            None,
             tags,
             None,
         )
@@ -1485,6 +1505,7 @@ impl Runner {
             Lineage::None,
             None,
             Claimed::Launch(key),
+            None,
             tags,
             priority,
         )?;
@@ -1501,6 +1522,9 @@ impl Runner {
                  and the next, so nothing was launched and nothing can be named. \
                  launch again"
             ))),
+            // a keyed launch takes no build claim, so there is nothing here to
+            // have intersected
+            Launched::Overlaps { .. } => unreachable!("a keyed launch claims no build"),
         }
     }
 
@@ -1859,6 +1883,11 @@ impl Runner {
     /// every subset member's dep must be in the subset or seeded, else
     /// [`Error::Graph`]. asset builds, resumes and replays are the callers.
     #[allow(clippy::too_many_arguments)]
+    /// `builds` is what an asset build claims: every `(asset, key)` its plan
+    /// will materialize. `None` is every other subset run (a resume, a replay,
+    /// a headless `build_asset`), which claims nothing of its own and is read
+    /// by anything checking as unbounded; see [`Claimed::Build`].
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn launch_subset(
         &self,
         job: &str,
@@ -1867,6 +1896,7 @@ impl Runner {
         params: Value,
         trigger: Trigger,
         lineage: Lineage<'_>,
+        builds: Option<&Value>,
         tags: RunTags,
         priority: Option<i64>,
     ) -> Result<String, Error> {
@@ -1877,7 +1907,11 @@ impl Runner {
             trigger,
             lineage,
             None,
-            Claimed::Nothing,
+            match builds {
+                Some(_) => Claimed::Build,
+                None => Claimed::Nothing,
+            },
+            builds,
             tags,
             priority,
         )?
@@ -1905,6 +1939,10 @@ impl Runner {
             plan.params,
             Trigger::Resume,
             Lineage::Resumed(&plan.resumed_from),
+            // a resume of an assets run re-runs recorded ops rather than a
+            // plan hestan worked out, so it cannot say which assets it will
+            // materialize and does not claim to
+            None,
             RunTags::new(),
             None,
         )
@@ -2142,6 +2180,9 @@ impl Runner {
             plan.params,
             Trigger::Replay,
             Lineage::Replayed(&plan.replay_of),
+            // a replay re-runs recorded ops on their recorded inputs, so like
+            // a resume it cannot say which assets it will materialize
+            None,
             RunTags::new(),
             None,
         )
@@ -2320,8 +2361,17 @@ impl Runner {
         trigger: Trigger,
         tags: RunTags,
     ) -> Result<Run, Error> {
-        let id =
-            self.launch_subset(job, ops, seeded, params, trigger, Lineage::None, tags, None)?;
+        let id = self.launch_subset(
+            job,
+            ops,
+            seeded,
+            params,
+            trigger,
+            Lineage::None,
+            None,
+            tags,
+            None,
+        )?;
         self.settle(&id).await
     }
 
@@ -2374,6 +2424,7 @@ impl Runner {
         lineage: Lineage<'_>,
         scheduled_for: Option<DateTime<Utc>>,
         claimed: Claimed<'_>,
+        builds: Option<&Value>,
         tags: RunTags,
         priority: Option<i64>,
     ) -> Result<Launched, Error> {
@@ -2489,7 +2540,15 @@ impl Runner {
         // anything to record, and it has to, because its seeds are outputs of
         // an earlier run that live in this process's memory and nowhere a
         // claimer in another process could look
-        let plan = subset_plan.then(|| json!({ "ops": &pending, "seeds": &seeded }));
+        // `builds` is what the run claims, and it lives on the run's own plan
+        // rather than beside it: the row that is written is the claim, so
+        // nothing has to be released and nothing can disagree with it. a
+        // subset run of the assets job that does not carry one is a run whose
+        // reach hestan cannot bound, and `claim_set` reads that as everything
+        let plan = subset_plan.then(|| match builds {
+            None => json!({ "ops": &pending, "seeds": &seeded }),
+            Some(builds) => json!({ "ops": &pending, "seeds": &seeded, "builds": builds }),
+        });
         // held before the insert, so that the insert itself is already a write
         // this process refuses to let a secret into
         secrets.hold(&run.id, held);
@@ -2518,6 +2577,12 @@ impl Runner {
             Landed::Held(id) => {
                 secrets.release(&run.id);
                 return Ok(Launched::Repeat(id));
+            }
+            // the plan meets one already executing. nothing was written, so
+            // nothing is going to run under the id this call generated
+            Landed::Overlaps { what, run: held } => {
+                secrets.release(&run.id);
+                return Ok(Launched::Overlaps { what, run: held });
             }
         }
         // enqueued and on disk; whether it starts now is the dispatcher's
@@ -5295,6 +5360,7 @@ mod tests {
                 json!({}),
                 Trigger::Manual,
                 Lineage::None,
+                None,
                 RunTags::new(),
                 None,
             )
@@ -5310,6 +5376,7 @@ mod tests {
                 json!({}),
                 Trigger::Manual,
                 Lineage::None,
+                None,
                 RunTags::new(),
                 None,
             )
@@ -5324,6 +5391,7 @@ mod tests {
                 json!({}),
                 Trigger::Manual,
                 Lineage::None,
+                None,
                 RunTags::new(),
                 None,
             )
