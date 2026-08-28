@@ -558,8 +558,7 @@ async fn an_asset_schedule_that_could_never_fire_is_refused_at_startup() {
             .db(db)
             .build_asset("totals")
             .await
-            .err()
-            .expect("the schedule was accepted")
+            .expect_err("the schedule was accepted")
             .to_string()
     };
 
