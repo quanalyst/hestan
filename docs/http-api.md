@@ -1108,13 +1108,15 @@ that. `reasons` is this key's own staleness evidence, in the shape
 declared no policy. 404 for an unknown asset and 400 for one that is not
 partitioned.
 
-while any run of the `assets` job is active, both build endpoints are a 409
-(`asset build already running`): builds are serialized so overlapping runs
-cannot record each other's half-written lineage ([assets](assets.md)). the
-checks apply in that order: unknown, source, build-active, freshness. the
-gate is on these two endpoints only, so a manual
-`POST /api/jobs/assets/runs` and a retry of an earlier assets run both stay
-ungated, and both rebuild every derived asset.
+a build whose plan **intersects one already running** is a 409 naming the asset
+and the run holding it (`sales is already being built by run 01a0...`): two
+builds of one asset would record each other's half-written lineage, and two
+with nothing in common cannot ([assets](assets.md)). the checks apply in that
+order: unknown, source, freshness, intersection. an outstanding run of the
+assets job that does not say what it will build (a manual
+`POST /api/jobs/assets/runs`, a retry, a resume, a replay) is unbounded as far
+as this can tell, so while one is outstanding every build is a 409, as every
+build was before.
 
 `POST /api/assets/build` builds everything stale in one plan and one run:
 202 `{"run_ids": ["..."]}`, 200 `{"up_to_date": true}` when the whole

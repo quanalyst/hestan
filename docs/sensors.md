@@ -166,10 +166,10 @@ one combined build run (trigger `build`), so
 re-deriving what is owed on every tick is the probe's self-heal. the
 fingerprint commits before the launch, so once it is written nothing in the
 data will ask for that build again: the source would have to change a
-second time. a launch that failed, or that was skipped because an assets
-build was already active (builds are serialized; see [assets](assets.md)),
-is therefore picked up by the next tick instead of stranding the descendant
-stale. the usual unchanged tick stays the cheap, boring `fired` /
+second time. a launch that failed, or that was held because an
+[intersecting build](assets.md#builds-that-do-not-intersect-run-at-once) was
+already running, is therefore picked up by the next tick instead of stranding
+the descendant stale. the usual unchanged tick stays the cheap, boring `fired` /
 `launched: 0`.
 
 sensor names share one namespace: two sensors named alike, or a user sensor

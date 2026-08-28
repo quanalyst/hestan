@@ -34,6 +34,85 @@ Hestan::new()
 of these with the defaults filled in (utc, `{}`, `Catchup::Skip`), so nothing
 that already works changes.
 
+## Building an asset on a schedule
+
+a schedule fires a **job** or a **build of an asset**:
+
+```rust
+Hestan::new()
+    .assets([vendor_prices, forecast])
+    .add_schedule(Schedule::asset("vendor_prices", "0 6 * * *"))
+```
+
+this is the clock an [automation policy](assets.md#automation-policies) is not.
+a policy reacts to staleness, which answers "rebuild when what it is made of
+moved". a cron answers "build at 06:00, because that is when the vendor
+publishes", which is a fact about the world rather than about the graph.
+`AutoPolicy::after_cron` is the two together and is still the right answer when
+you want the clock *and* the staleness check; this one builds when the hour
+comes round.
+
+**it fires exactly what `hestan build <asset>` and
+`POST /api/assets/{name}/build` fire**, because all three plan through the same
+function: that asset plus whatever upstream of it is stale, as one run. a
+partitioned asset takes the same default target set a build that names no keys
+takes, which is the stale and missing keys, newest first, capped by the
+[build limit](assets.md#the-build-limit-counts-keys-not-instances). not "the
+latest key", and not "every stale key at once".
+
+the run is `trigger: schedule`, carries the occurrence it fired for on
+`scheduled_for`, and is tagged with the asset, so the asset page lists it
+beside a build somebody asked for.
+
+**the web ui does not show asset schedules yet.** the jobs table and the
+timeline's ghost marks both find a schedule by looking up its job, and
+`asset:vendor_prices` is not one, so an asset schedule appears in
+`GET /api/schedules` and in `hestan schedules` and nowhere on a page. the ticks
+it writes are in the run log like any others.
+
+### The two kinds are one list
+
+both are `Schedule` values in the same list, in the same `schedules` table,
+ticked by the same loop, caught up by the same cursor and the same catch-up
+rules. everything below about pausing, the cursor, downtime, the tick log and
+the upcoming projection applies to both.
+
+a schedule is keyed on **what it fires**, so an asset schedule is stored under
+`asset:{name}` rather than under the internal `assets` job it launches: that
+pair is the row's primary key, what a pause names, and the unique index that
+makes one occurrence fire once, and keying every asset scheduled at 06:00 on
+one job would make them all one schedule. so it is `asset:vendor_prices` that
+`hestan pause schedule` takes and that `GET /api/schedules` reports as `job`;
+the same row also carries `kind: "asset"` and `asset: "vendor_prices"`, so
+nothing has to parse a prefix to tell the two apart. the prefix is reserved
+only in a deployment that declares an asset schedule, and a job named into it
+there is a startup error.
+
+### What is refused at startup
+
+three things, all from `serve` and `run_once`, the way a job schedule's params
+are checked against the job's ops. a schedule that could never do what it says
+is a declaration that is wrong now, not a tick that fails at 6am forever.
+
+- **an unknown asset**, and **a source asset**: sources are probed, never
+  built, so a cron that builds one can only ever fail.
+- **`Catchup::All`**, which is not so much wrong as meaningless here. catching
+  up fires each missed occurrence for its own logical time, and a build has no
+  logical time to be for: the first of three missed builds makes the asset
+  fresh, so the other two plan nothing. write `Catchup::One` to build once on
+  the way back up, or leave the default `Catchup::Skip`. the refusal says so.
+- **params**. a build's params are `{}`, so params on one of these would be
+  dropped on the floor.
+
+### What an occurrence can come to
+
+a fire that finds nothing owed (the asset and its upstream are already fresh)
+launches no run and records a `skipped` tick saying so. a fire whose build
+[meets one already running](assets.md#builds-that-do-not-intersect-run-at-once)
+records a `skipped` tick naming the asset and the run holding it, and the asset
+is still stale for the next occurrence to pick up. neither is an error, and
+neither is silence.
+
 ## Params
 
 `schedule` and `schedule_tz` fire with params `{}`. `schedule_with` and
@@ -277,6 +356,12 @@ job's overlap policy: `Job::builder(..).overlap(Overlap::...)`.
 
 the policy gates scheduled fires only. manual launches, the retry endpoint,
 and `run_once` are never held back.
+
+an [asset schedule](#building-an-asset-on-a-schedule) has no job of its own to
+declare a policy on, and needs none: what keeps two builds of one asset apart
+is the [claim](assets.md#builds-that-do-not-intersect-run-at-once) each takes,
+which is narrower than any policy here could be, since it lets a build of
+something unrelated go ahead.
 
 "active" means the job has a run **outstanding** (queued or running, claimed
 or not) and not "a run is executing this second". the distinction only came

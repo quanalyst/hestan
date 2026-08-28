@@ -2,7 +2,7 @@
 
 - [getting started](getting-started.md): `cargo add hestan` to a scheduled job with a ui, in one pass.
 - [choosing](choosing.md): job or asset, sqlite or postgres, in-process or isolated, schedule or sensor.
-- [concepts](concepts.md): ops, jobs, runs, events, triggers, and exactly how a run executes.
+- [concepts](concepts.md): ops, jobs, runs, events, triggers, an op that had nothing to do, and exactly how a run executes.
 - [typed io](typed-io.md): `Op::typed`, `input_as`, `.params::<P>()`, and what a type-check failure does.
 - [resources](resources.md): values hestan builds and hands to the ops that name them, for the process or for one run, through `Hestan::resource`, `Hestan::run_resource`, `ctx.resource::<T>` and `Op::requires`.
 - [op state](state.md): persisted watermarks through `ctx.state`/`set_state`, the at-least-once commit order, the state endpoint.
@@ -13,10 +13,10 @@
 - [connecting to your data](connecting.md): the seam between an op and the system it reads, a client in an op, a pool as a resource, secrets from the environment, retries and timeouts, and why hestan wraps nobody's sdk.
 - [io managers](io-managers.md): where op outputs live, the `IoManager` trait, `Inline`, `FileIo`, per-op managers, and where handles are resolved.
 - [dbt](dbt.md): a dbt project's models as assets, read from the manifest dbt compiled, with what shells out, the schema versions read, freshness without querying your warehouse, and what is deliberately not covered.
-- [assets](assets.md): fingerprints, provable staleness, memoized builds, serialized builds, probes, and the policies that say when one rebuilds itself.
+- [assets](assets.md): fingerprints, provable staleness, memoized builds, builds that only wait for one they intersect, a cron on an asset, probes, and the policies that say when one rebuilds itself.
 - [freshness](freshness.md): declared policies, `fresh_within`, fresh/late/never, `on_late` alerts, and how a policy relates to `overdue` and to staleness.
 - [sensors](sensors.md): the sensor loop, cursor commit-on-success, `RunRequest` and run keys, timeouts and concurrency, failure backoff, probes and run-status chains as sensors, pausing and tick history.
-- [scheduling](scheduling.md): cron syntax, timezones, the durable cursor, missed-fire catch-up, pause/resume, ticks, and the scheduler loop.
+- [scheduling](scheduling.md): a cron on a job or on an asset, cron syntax, timezones, the durable cursor, missed-fire catch-up, pause/resume, ticks, and the scheduler loop.
 - [http sources](http-sources.md): declarative REST pulls, the full `HttpSource` builder, fan-out, retry policy.
 - [notifications](notifications.md): hooks, `on_run_finished`/`RunEvent`, `on_op_finished`/`OpEvent`, per-job scoping, `on_failure`/`RunFailure`, `on_late`/`LateEvent`, the webhook and slack helpers, and durable at-least-once delivery.
 - [replay](replay.md): re-running ops of a finished run on the inputs it gave them, what it is for, what it reproduces, the four things it does not, the retention horizon, and the three ways in.

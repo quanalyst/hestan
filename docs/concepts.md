@@ -320,6 +320,80 @@ nothing to expand over, so it expands into **zero instances**: no bodies run,
 no instance rows, an `op_expanded` event with `instances: 0`, and output `[]`
 downstream, exactly the empty fan-out an empty array would have given.
 
+### An op that had nothing to do
+
+the rules above are what the *run* decides about an op. `ctx.skip(reason)` is
+what the op decides about itself:
+
+```rust
+Op::new("load", |ctx: OpCtx| async move {
+    if !vendor_file_is_there() {
+        return Err(ctx.skip("no drop from the vendor yet"));
+    }
+    Ok(json!({"loaded": true}))
+})
+```
+
+the two things an op could say before this both said something untrue.
+`Ok(..)` records a success, so freshness, any materialization and every success
+hook take a build that did not happen as one that did. `Err(..)` fails the run,
+which wakes whoever owns it for a non-event.
+
+**it returns the error rather than setting a flag, so the body stops.** a skip
+that only marked something and let the body carry on would be wrong the first
+time somebody wrote it inside an `if` and forgot the `return`, and wrong
+silently. going out through the error channel is the one shape the compiler
+enforces: the op either returns this or returns a value, because those are the
+two arms of one `Result`, so skipping and also succeeding is not a state that
+exists. `Op::typed` bodies return their own output type, which is why what you
+get back is the boxed error rather than an `OpResult`.
+
+**a wrapped one is a failure.** an op that catches this and re-raises it inside
+its own error type has turned it into something else, and hestan reading
+through a conversion somebody wrote on purpose would be a guess.
+
+**downstream cannot tell it from a rule skip**, and that is deliberate: the row
+is `skipped` either way, and the run propagates from it through the same
+function, so an op on the default rule is skipped naming the one that skipped
+itself, and an `always` op runs and reads `ctx.dep_status(dep)` as `skipped`.
+there is nothing to seed such an op with, so `ctx.input(dep)` is `None`: a skip
+produced no output, and a downstream op that needs one wants `all_succeeded`,
+which is the default.
+
+**the run's status is unchanged.** a run whose ops all skipped is `success`,
+which is already what an all-rule-skipped run is: it did nothing and it failed
+nothing, and two ways of doing nothing must not end in two statuses.
+
+**it never retries.** a skip is a decision the body reached, not a failure it
+might reach differently next time, so `.retries(n)` does not apply to it.
+
+**an asset op that skips materializes nothing.** what an asset op stages is
+written in the transaction that records the op as having *succeeded*, and this
+is not that. so the asset is still stale and the next real build still happens;
+a skip that wrote a materialization would suppress it.
+
+**what it staged is kept, except the state.** `ctx.meta` and `ctx.saved`
+survive, because a skip is a finished op rather than a discarded attempt: the
+numbers the body read on the way to deciding there was nothing to do are the
+evidence for the decision, and a run page saying "skipped: no drop from the
+vendor yet" is better for having them. a failed attempt drops its metadata
+because a retry is about to replace it, and a skip has no retry to be replaced
+by. `ctx.set_state` is the exception and is dropped: a watermark is a promise
+about work that was done, and moving it without doing the work is how the next
+run skips real input.
+
+the reason is not optional. it lands in the event log as an `op_skipped` event
+at warn level, the way `ctx.warn` does, and on the op run's row, so the run
+page says why without anybody opening the log. **that row now carries the
+reason for every kind of skip**, including the two that already existed
+(`skipped by rule any_failed: every dep succeeded`, `skipped: upstream load
+failed`), which used to be computed and then written only to the log.
+
+a hook sees an attempt that really happened, with `status: skipped` on it. it
+is neither a success nor a failure, and a hook that treats "not failed" as
+"worked" is the one place that has to be said out loud. an `on_failure` hook
+hears nothing: no run failed.
+
 ## Resources
 
 a *resource* is a value built once at startup and shared by every op that asks

@@ -2,6 +2,125 @@
 
 ## unreleased
 
+an op can say it had nothing to do, an asset can own a cron, and builds that
+do not intersect run at the same time.
+
+### An op that had nothing to do
+
+`ctx.skip(reason)` ends an op as `skipped`. it was the missing third answer:
+`Ok(..)` recorded a success, so freshness, materializations and every success
+hook took a build that did not happen as one that did, and `Err(..)` failed the
+run and woke whoever owns it for a non-event.
+
+```rust
+Op::new("load", |ctx: OpCtx| async move {
+    if !vendor_file_is_there() {
+        return Err(ctx.skip("no drop from the vendor yet"));
+    }
+    Ok(json!({"loaded": true}))
+})
+```
+
+**it returns the error rather than setting a flag, so the body stops.** a skip
+that only marked something and let the body carry on would be wrong the first
+time somebody wrote it inside an `if` and forgot the `return`, and wrong
+silently. the error channel is the one shape the compiler enforces: an op
+either returns this or returns a value, because those are the two arms of one
+`Result`, so skipping and also succeeding is not a state that exists.
+
+**downstream cannot tell it from a rule skip.** it is recorded through the
+function every other skip goes through and propagated by the one a rule skip
+propagates by, so an op on the default rule is cut off naming the op that
+skipped itself, and a `When::Always` op runs and reads `dep_status` as
+`skipped` with no input to read. a run whose ops all skipped is a success,
+which is already what an all-rule-skipped run was.
+
+it never retries, and an asset op that skips materializes nothing, so the asset
+stays stale and the next real build is not suppressed. what the body staged
+with `meta` is kept, because a skip is a finished op rather than a discarded
+attempt; `set_state` is dropped, because a watermark is a promise about work
+that was done.
+
+**the reason now lands on the op run row as well as in the event log, for every
+kind of skip.** the row carried `NULL` where the reason had already been
+computed, so a run page said an op was grey and never why. the run page renders
+it.
+
+an `on_op_finished` hook now sees an attempt with `status: skipped` on it,
+which it could not before: a self-skip is an attempt that really happened. a
+hook that treats "not failed" as "worked" is the one place that has to be said
+out loud, and the built-in notification summary no longer reports one as a
+success. `on_failure` hears nothing: no run failed.
+
+### A cron on an asset
+
+`Schedule::asset(name, expr)` beside `Schedule::new(job, expr)`. an `auto()`
+policy reacts to staleness, which answers "rebuild when what it is made of
+moved"; a cron answers "build at 06:00, because that is when the vendor
+publishes", and the only way to say that was a hand-written job duplicating
+what a build does.
+
+```rust
+Hestan::new()
+    .assets([vendor_prices, forecast])
+    .add_schedule(Schedule::asset("vendor_prices", "0 6 * * *"))
+```
+
+**one type in one list.** both kinds are the same entry in the same
+`schedules` table, ticked by the same loop, caught up by the same cursor and
+the same catch-up rules, and firing through the same function. a parallel
+system with its own table and its own tick loop would be a second place a fire
+can be lost.
+
+it fires exactly what `hestan build <asset>` and
+`POST /api/assets/{name}/build` fire, because all three plan through one
+function; a partitioned asset takes the same default target set a build that
+names no keys takes. the run is `trigger: schedule`, carries the occurrence on
+`scheduled_for`, and is tagged with the asset, so the asset page lists it
+beside a build somebody asked for.
+
+three refusals, all at startup, from `serve` and from `run_once`: an unknown
+asset, a source asset ("sources are probed, never built"), and `Catchup::All`,
+which is meaningless here because the first of three missed builds makes the
+asset fresh and the other two plan nothing. the message says to write
+`Catchup::One`. params are refused too: a build's params are `{}`.
+
+a schedule is keyed on what it fires, so an asset schedule is stored under
+`asset:{name}`: that pair is the row key, what a pause names and the index that
+makes one occurrence fire once, and keying every asset scheduled at 06:00 on
+the one internal job would make them one schedule. `GET /api/schedules` gains
+`kind` and `asset` so nothing has to parse the prefix. the prefix is reserved
+only in a deployment that declares an asset schedule.
+
+### Builds that do not intersect run at the same time
+
+**a build is now refused only when it intersects one already running.** three
+sites refused it while *any* assets run was active, so a backfill of one
+asset's 2019 partitions blocked every unrelated build in the deployment for as
+long as it ran, and the auto loop quietly did nothing each pass.
+
+what is claimed is `(asset, partition key)`, which is what lets a backfill of
+january run beside a build of february, and it is the **whole plan** rather
+than the name the caller typed: a build of `forecast` drags its stale upstream
+in, so two builds that share an upstream conflict even though the two names do
+not, and the refusal names the shared asset.
+
+the claim is taken in the transaction that writes the run row, not by a read
+the caller does first, and it is derived from the run rows rather than kept in
+a table of its own: it is exactly what the run's recorded plan says it will
+build. so a terminal status releases it, there is nothing to leak, and the
+sweeps that already recover a dead process's runs release it too.
+
+the api's 409 keeps its meaning and narrows: it is "something is building
+**this**", and it names the asset and the run
+(`sales is already being built by run 01a0...`) rather than saying a build is
+running.
+
+**what changes for a running 0.1.0 deployment.** builds used to be serialized,
+so if that was doing load control for you by accident, it is gone: unrelated
+builds now overlap, and up to four execute at once. write
+`Hestan::max_concurrent_builds(1)` to get the old behaviour back.
+
 a job says which group it belongs to, and the run timeline folds a group of
 lanes into one.
 

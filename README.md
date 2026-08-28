@@ -184,6 +184,13 @@ standalone binary for those two. [docs/cli.md](docs/cli.md).
   failure expressible, where the default `AllSucceeded` skips it. skip
   propagation stops at such an op, and `ctx.dep_status(dep)` tells it what
   each dep actually did
+- an op can also say for itself that there was nothing to do:
+  `return Err(ctx.skip("no drop from the vendor yet"))` ends it `skipped`
+  with the reason on its row and in the log, and neither succeeds (which would
+  record a build that did not happen) nor fails the run (which would wake
+  somebody for a non-event). it goes out through the error channel so the
+  compiler makes the body stop, and it is recorded and propagated exactly as a
+  rule skip is, so nothing downstream has a second notion of skip to learn
 - one op can fan out over a list only known at run time: `Op::mapped(f)
   .over("pages")` runs an instance per element of that dep's json array, each
   with its own op run row and its element as a typed argument, and hands
@@ -310,6 +317,18 @@ standalone binary for those two. [docs/cli.md](docs/cli.md).
   exactly the stale ancestors plus the target, seeding fresh values instead
   of recomputing them. source assets stand for external data and carry a
   cheap fingerprint probe
+- an asset can own a **cron**: `Schedule::asset("vendor_prices", "0 6 * * *")`
+  builds it at 06:00 because that is when the vendor publishes, which is a
+  different question from the staleness the policies below answer. it is a
+  `Schedule` in the same list, the same table and the same tick loop as a job's,
+  and it plans exactly what `hestan build <asset>` plans
+- **builds only wait for a build they intersect.** two families of assets with
+  nothing in common build at the same time, and a backfill of one asset's 2019
+  partitions no longer blocks every unrelated build in the deployment. what a
+  build claims is every `(asset, key)` its plan will materialize, taken in the
+  transaction that writes the run row and released by that row reaching a
+  terminal status. four execute at once by default;
+  `Hestan::max_concurrent_builds(n)` is the knob
 - an **automation policy** says when an asset rebuilds itself:
   `AutoPolicy::when_stale()` (which is what `.auto()` is), `when_missing()` for
   the fresh deployment and the newly declared asset, `after_cron("0 2 * * *")`

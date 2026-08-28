@@ -551,9 +551,11 @@ last one succeeded, `failed` when one failed (chunking stops there), and
 the keys handed to a run so far, against `total`.
 
 limits: **one backfill per asset at a time** (a second is a 409) and no
-cross-asset backfills; back one asset at a time. a backfill also respects the
-one-build-at-a-time gate: while any assets run is active the next chunk simply
-waits for the following tick, the same self-heal the probe path uses.
+cross-asset backfills; back one asset at a time. a chunk that
+[meets a build already running](#builds-that-do-not-intersect-run-at-once)
+waits for the following tick, the same self-heal the probe path uses. a chunk
+of one asset's january no longer waits behind a build of something else: what
+it claims is the keys it is filling.
 
 ### Probes mark everything stale
 
@@ -609,25 +611,93 @@ every derived asset, staleness ignored. cheap enough for small graphs; for
 an expensive one, prefer the build endpoints, which re-plan from current
 staleness.
 
-## One build at a time
+## Builds that do not intersect run at once
 
 when an asset materializes, it records its deps' fingerprints by re-reading
-the store at that moment. two overlapping builds interleaving those reads
-and writes could record lineage that never happened: an asset claiming it
-consumed a fingerprint its actual input value never had. so builds are
-serialized. while any run of the `assets` job is active, the incremental
-build endpoints answer 409 (`asset build already running`) and the
-[policy](#automation-policies) pass launches nothing, on its own clock or on a
-probe's, leaving the next pass to self-heal (below).
+the store at that moment. two builds of the *same* asset interleaving those
+reads and writes could record lineage that never happened: an asset claiming
+it consumed a fingerprint its actual input value never had. two builds with
+nothing in common cannot: they read and write different rows.
 
-the gate covers five paths: the two build endpoints, the policy pass, the
-probe's evaluation of the same policies, and each chunk a
-[backfill](#backfills) launches. anything that reaches the
-executor by the ordinary run path launches regardless: a manual
-`POST /api/jobs/assets/runs`, a retry of an earlier assets run, and
-`build_asset` in a headless process. those are the documented escape
-hatches, and they cost what they cost: concurrent rebuilds can interleave,
-so their recorded lineage is only as coherent as the interleaving.
+so a build is refused when, and only when, it intersects one already running.
+the endpoints answer 409 with the asset and the run that holds it
+(`sales is already being built by run 01a0...`), and the
+[policy](#automation-policies) pass and each chunk a [backfill](#backfills)
+sends hold quietly and ask again on their next tick.
+
+### What is claimed
+
+**`(asset, partition key)`**, with a null key for an unpartitioned asset. key
+level is what lets a backfill of january run beside a build of february, which
+is the case worth having: a backfill is the long one, and it is the one whose
+blocking hurt.
+
+**the whole plan, not the asset you named.** a build of `forecast` drags its
+stale upstream in, so two builds whose plans share an upstream conflict even
+though the two names typed at them do not, and the refusal names the shared
+asset rather than either target.
+
+### How it is decided, and how it is released
+
+the claim is taken **in the transaction that writes the run row**, not by a
+read the caller does first. a read followed by a launch is one process away
+from two runs materializing one asset from two plans, and narrowing the rule
+from "any build" to "an intersecting build" is exactly what makes concurrent
+callers ordinary rather than rare.
+
+it is also **derived from the run rows** rather than kept in a table of its
+own: what a build claims is exactly what its own recorded plan says it will
+build. so a run reaching a terminal status releases it, there is nothing to
+leak, and nothing can disagree with the run log. a process that dies mid-build
+leaves a non-terminal run, and the sweeps that already recover those settle it:
+`fail_interrupted` at the next boot, and the reclaimer every heartbeat once the
+[lease](scaling.md) lapses, which is about a minute and a quarter after the
+process stopped.
+
+**a run that will not say what it builds claims everything.** a full manual
+`POST /api/jobs/assets/runs` records no plan; a resume, a replay and
+`build_asset` in a headless process record the ops they will run without the
+assets those ops produce. hestan cannot bound their reach, so while one of them
+is outstanding every build is refused, exactly as every build was refused
+before. those are still the documented escape hatches, and they still cost what
+they cost: nothing checks them on the way in, so their own recorded lineage is
+only as coherent as the interleaving.
+
+### How many at once
+
+unbounded is not the goal. **four builds execute at once by default**, and the
+rest wait on the queue in the ordinary way; `Hestan::max_concurrent_builds(n)`
+is the knob. it is the [per-job limit](scaling.md#limits) on the `assets` job
+rather than a mechanism of its own, so it counts *executing* runs and a queued
+one costs nothing.
+
+it is not the knob for an api that rate limits you. `Hestan::rate` caps calls
+per second whatever is running, and a pool caps how many ops hold a connection
+at once; both hold however the builds around them are arranged, and this does
+not.
+
+## A cron on an asset
+
+an asset can own a schedule, which builds it when the expression comes round:
+
+```rust
+Hestan::new()
+    .assets([vendor_prices, forecast])
+    .add_schedule(Schedule::asset("vendor_prices", "0 6 * * *"))
+```
+
+this is the clock the policies below are not. a policy reacts to staleness,
+which answers "rebuild when what it is made of moved"; a cron answers "build at
+06:00, because that is when the vendor publishes". `AutoPolicy::after_cron` is
+the two together, and is still what you want when the answer is "nightly, but
+do not rebuild what has not moved".
+
+it plans through the same function the endpoint and the command line plan
+through, so it builds that asset plus whatever upstream of it is stale, and a
+partitioned one takes the same default target set a build that names no keys
+takes. the run is `trigger: schedule` and is tagged with the asset, so it
+appears here like any other build. `docs/scheduling.md` has the rest: what is
+refused at startup, and what a fire that found nothing to build records.
 
 ## Automation policies
 
@@ -681,12 +751,14 @@ say what is late, and launches everything it wants as one plan and one run
 (trigger `build`, tagged `policy` with the rule and `asset` when it is the only
 one). one process decides, so one process launches.
 
-it holds rather than stampeding. builds are [serialized](#one-build-at-a-time),
-so the pass checks for an active assets run before planning: the build endpoints
-answer 409 there because a person is reading the refusal, and a pass that
-answered 409 every minute would be a log nobody can read. it launches nothing,
-says so at debug, and asks again next minute of fresher data. nothing queues in
-between: "is this stale" is not a question that expires.
+it holds rather than stampeding, and only against what it actually meets: the
+launch takes its [claim](#builds-that-do-not-intersect-run-at-once) like any
+other build, and a pass whose plan intersects one already running launches
+nothing, says so at debug and asks again next minute of fresher data. the build
+endpoints answer 409 there instead, because a person is reading that refusal,
+and a loop that logged one every minute would be a log nobody can read. nothing
+queues in between: "is this stale" is not a question that expires. a build of
+something unrelated no longer holds the pass at all.
 
 a rule that cannot be satisfied sits quietly. the pass writes when it launches
 and at no other time, so a rollup waiting for an hour that will never arrive
