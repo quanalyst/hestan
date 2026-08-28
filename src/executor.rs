@@ -1882,11 +1882,12 @@ impl Runner {
     /// launch over a subset of the job's ops with upstream outputs pre-seeded.
     /// every subset member's dep must be in the subset or seeded, else
     /// [`Error::Graph`]. asset builds, resumes and replays are the callers.
-    #[allow(clippy::too_many_arguments)]
+    ///
     /// `builds` is what an asset build claims: every `(asset, key)` its plan
-    /// will materialize. `None` is every other subset run (a resume, a replay,
-    /// a headless `build_asset`), which claims nothing of its own and is read
-    /// by anything checking as unbounded; see [`Claimed::Build`].
+    /// will materialize. it goes onto the run's plan, and the plan is what the
+    /// store reads the claim off. `None` is every other subset run (a resume,
+    /// a replay, a headless `build_asset`), which claims nothing of its own
+    /// and is read by anything checking as unbounded.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn launch_subset(
         &self,
@@ -1907,10 +1908,9 @@ impl Runner {
             trigger,
             lineage,
             None,
-            match builds {
-                Some(_) => Claimed::Build,
-                None => Claimed::Nothing,
-            },
+            // no second claim: a build's claim is the run row it is about to
+            // write, taken off `builds` below
+            Claimed::Nothing,
             builds,
             tags,
             priority,

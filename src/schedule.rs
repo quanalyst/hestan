@@ -1054,6 +1054,105 @@ mod tests {
         assert_eq!(ticks[0].error.as_deref(), Some(NOTHING_STALE));
     }
 
+    /// `priced()` with the build of `prices` slow enough to still be going
+    /// when something fires beside it, plus an asset over a source of its own
+    /// that nothing in that chain touches, so a plan for one and a plan for
+    /// the other have nothing in common.
+    fn priced_and_beside() -> Arc<crate::asset::AssetRegistry> {
+        use crate::asset::Asset;
+        let vendor = Asset::source("vendor");
+        let prices = Asset::new("prices", |_| async {
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            Ok(json!({"rows": 3}))
+        })
+        .from(&vendor);
+        let report = Asset::new("report", |_| async { Ok(json!({"lines": 3})) }).from(&prices);
+        let feed = Asset::source("feed");
+        let stock = Asset::new("stock", |_| async { Ok(json!({"rows": 1})) }).from(&feed);
+        Arc::new(
+            crate::asset::AssetRegistry::new(
+                vec![vendor, prices, report, feed, stock],
+                Vec::new(),
+                Vec::new(),
+            )
+            .unwrap(),
+        )
+    }
+
+    // a cron on an asset writes a run row saying what it will materialize, so
+    // it has to be refused by what is already materializing it: two runs
+    // building one asset from two plans is the whole thing the claim exists to
+    // stop. the occurrence is accounted for, saying which asset and which run
+    #[tokio::test]
+    async fn an_asset_schedule_firing_into_an_intersecting_build_is_refused() {
+        let store = Store::open(":memory:").unwrap();
+        let reg = priced_and_beside();
+        let runner = crate::Runner::new([reg.lower_job().unwrap()], store.clone()).unwrap();
+        seen(&store, "vendor", "v1");
+        seen(&store, "feed", "f1");
+
+        // a build somebody asked for, still going: `prices` does not finish
+        let held = crate::asset::build_one(&runner, &reg, "report", &[])
+            .unwrap()
+            .unwrap();
+
+        let entry = parse("asset:report", "0 6 * * *", "UTC").unwrap();
+        let at = "2026-03-04T06:00:00Z".parse::<DateTime<Utc>>().unwrap();
+        note_tick(&runner, Some(&reg), &entry, at, false);
+
+        let runs = store.runs(None, None, None, None, None, None, 10).unwrap();
+        assert_eq!(
+            runs.len(),
+            1,
+            "the cron launched a second run over a build already under way"
+        );
+        assert_eq!(runs[0].id, held);
+
+        let ticks = store.ticks(Some("asset:report"), 10).unwrap();
+        assert_eq!(ticks.len(), 1);
+        assert_eq!(ticks[0].outcome, TickOutcome::Skipped);
+        assert_eq!(ticks[0].run_id, None);
+        let why = ticks[0].error.clone().unwrap();
+        assert!(
+            why.contains(&format!("is already being built by run {held}")),
+            "the refusal does not name the run holding the claim: {why}"
+        );
+        assert!(
+            why.starts_with("prices ") || why.starts_with("report "),
+            "the refusal does not name an asset both plans build: {why}"
+        );
+    }
+
+    // and it is an intersection rather than a lock on the assets job: a cron
+    // building something the run under way does not touch fires as usual
+    #[tokio::test]
+    async fn an_asset_schedule_fires_beside_a_build_it_shares_nothing_with() {
+        let store = Store::open(":memory:").unwrap();
+        let reg = priced_and_beside();
+        let runner = crate::Runner::new([reg.lower_job().unwrap()], store.clone()).unwrap();
+        seen(&store, "vendor", "v1");
+        seen(&store, "feed", "f1");
+
+        let held = crate::asset::build_one(&runner, &reg, "report", &[])
+            .unwrap()
+            .unwrap();
+
+        let entry = parse("asset:stock", "0 6 * * *", "UTC").unwrap();
+        let at = "2026-03-04T06:00:00Z".parse::<DateTime<Utc>>().unwrap();
+        note_tick(&runner, Some(&reg), &entry, at, false);
+
+        let ticks = store.ticks(Some("asset:stock"), 10).unwrap();
+        assert_eq!(ticks.len(), 1);
+        assert_eq!(ticks[0].outcome, TickOutcome::Fired);
+        let fired = ticks[0].run_id.clone().expect("a fired tick names its run");
+        assert_ne!(fired, held);
+        assert_eq!(
+            store.run(&fired).unwrap().unwrap().tags["asset"],
+            "stock",
+            "the cron built something other than what it was declared on"
+        );
+    }
+
     // one list, one loop, one table: the two kinds are the same entry, and a
     // deployment with both ticks both without either knowing about the other
     #[tokio::test]

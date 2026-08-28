@@ -785,10 +785,10 @@ pub(crate) enum Landed {
     /// the deciding lease moved on before this reached the store. nothing was
     /// written.
     Stale,
-    /// a [build claim](Claimed::Build) that intersects one an active run
-    /// already holds. nothing was written, and the caller is told which asset
-    /// collided and which run holds it, because "something is building" is not
-    /// an answer somebody can act on.
+    /// a [build claim](claim_set) that intersects one an active run already
+    /// holds. nothing was written, and the caller is told which asset collided
+    /// and which run holds it, because "something is building" is not an
+    /// answer somebody can act on.
     Overlaps {
         /// the first asset both plans would materialize, as `sales` or
         /// `sales[2026-01]`.
@@ -807,40 +807,23 @@ pub(crate) enum Landed {
 /// no run key, and everything else carries neither.
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) enum Claimed<'a> {
-    /// a manual launch, an api launch, a resume, a replay: nothing to be the
-    /// second of, so nothing to claim.
+    /// a manual launch, an api launch, a resume, a replay, an asset build:
+    /// no second claim beside the run row itself.
+    ///
+    /// **a build is one of these**, because the run row *is* its claim: what
+    /// it will materialize is on its own `plan`, and
+    /// [`create_run_keyed`](Store::create_run_keyed) decides the build scan
+    /// from that plan rather than from which of these variants a launch is.
+    /// see [`claim_set`]. a variant of its own would have been a second answer
+    /// to "does this take the build claim", and the two disagreed: an asset
+    /// schedule's fire carries builds under [`Fire`](Claimed::Fire), wrote a
+    /// row everything else collided with, and scanned for nothing itself.
     #[default]
     Nothing,
     /// a [sensor request with a run key](RunKey).
     Key(RunKey<'a>),
     /// a [cron occurrence](Fire).
     Fire(Fire<'a>),
-    /// an [asset build](crate::Hestan::assets): the set of `(asset, partition)`
-    /// its plan will materialize, which no other active run of the same job
-    /// may also be about to materialize.
-    ///
-    /// **derived from the run rows, not from a table of its own.** the claim a
-    /// build holds is exactly what its own `runs.plan` says it will build, so
-    /// a run reaching a terminal status releases it and there is nothing
-    /// separate that can leak or disagree. a process that dies mid-build
-    /// leaves a non-terminal run, and the sweeps that already exist for that
-    /// ([`fail_interrupted`](Store::fail_interrupted) at boot,
-    /// [`reclaim_expired`](Store::reclaim_expired) every heartbeat once the
-    /// lease lapses) end the run and with it the claim. a second table would
-    /// have needed a reaper of its own, and a reaper of its own is a second
-    /// answer to "what is building" that can be wrong.
-    ///
-    /// **the check is inside the insert's transaction**, under the same lock
-    /// dispatchers take, which is the whole reason this is a `Claimed` and not
-    /// a call the caller makes first. widening the rule from "any build" to
-    /// "an intersecting build" makes concurrent callers the ordinary case
-    /// rather than the rare one, so a read followed by a launch would be two
-    /// callers away from two runs materializing one asset from two plans, each
-    /// recording the other's lineage.
-    ///
-    /// it carries nothing: what is claimed is read out of `plan` below, so the
-    /// run row that is written **is** the claim rather than a copy of it.
-    Build,
     /// a launch carrying an idempotency key: at most one run per key, ever, by
     /// [`SCHEMA_V23`].
     ///
@@ -2035,14 +2018,28 @@ impl Store {
         let at = Utc::now();
         let mut conn = self.conn();
         let (insert, ignore) = conn.dialect().insert_or_ignore();
+        // **what this run says it will build is the whole of what decides
+        // whether it takes the build claim**, and the [`Claimed`] variant it
+        // arrives under decides nothing about it. a build asked for by hand
+        // arrives as `Claimed::Nothing` and an asset schedule's arrives as
+        // `Claimed::Fire`, and both write a run row that everything else
+        // collides with, so both have to scan for what they collide with.
+        //
+        // gated on the plan carrying a `builds` key and on nothing broader:
+        // `claim_set` answers `None` for a plan that will not say what it
+        // builds, `overlap` reads that as colliding with everything, and an
+        // ordinary job launch carries no plan at all. a scan every launch ran
+        // would refuse the second run of every job in the deployment
+        let mine = claim_set(plan);
+        let claims_builds = mine.is_some();
         // a build claim is a read of what is already running followed by the
         // insert that joins it, and on sqlite only an immediate transaction
         // keeps another writer out of the middle of that pair. every other
         // claim is decided by a unique index and needs no such thing, so only
         // this one pays for it
-        let mut tx = match claimed {
-            Claimed::Build => conn.begin_immediate()?,
-            _ => conn.begin()?,
+        let mut tx = match claims_builds {
+            true => conn.begin_immediate()?,
+            false => conn.begin()?,
         };
         // the fence first, because the lock it takes is what makes everything
         // under it part of the same term
@@ -2051,31 +2048,38 @@ impl Store {
         {
             return Ok(Landed::Stale);
         }
-        match claimed {
-            Claimed::Nothing => {}
+        // **and the builds before whatever else this launch claims**, because
+        // this one is a read of the runs table and has to decide before the
+        // row below joins the set it read: the other claims are decided by a
+        // unique index, which says the same thing wherever in the transaction
+        // it is asked. so a fire that carries builds is refused here having
+        // taken nothing, occurrence included, which is what leaves the
+        // scheduler free to record the refusal against that occurrence and the
+        // asset still stale for the next pass
+        if claims_builds {
             // postgres has no database-wide writer lock to inherit, so two
             // launches would read the same snapshot of "what is running" from
             // their own transactions and both pass. the same lock two
             // dispatchers take to spend one slot is what makes this pair one
             // decision there
-            Claimed::Build => {
-                tx.take_turns()?;
-                let mine = claim_set(plan);
-                let active: Vec<(String, Option<Value>)> = tx.query(
-                    "SELECT id, plan FROM runs
-                     WHERE job = ?1 AND status IN ('queued', 'running')",
-                    args![&run.job],
-                    |r| Ok((r.text(0)?, r.opt_json(1)?)),
-                )?;
-                for (id, theirs) in &active {
-                    if let Some(what) = overlap(&mine, &claim_set(theirs.as_ref())) {
-                        return Ok(Landed::Overlaps {
-                            what,
-                            run: id.clone(),
-                        });
-                    }
+            tx.take_turns()?;
+            let active: Vec<(String, Option<Value>)> = tx.query(
+                "SELECT id, plan FROM runs
+                 WHERE job = ?1 AND status IN ('queued', 'running')",
+                args![&run.job],
+                |r| Ok((r.text(0)?, r.opt_json(1)?)),
+            )?;
+            for (id, theirs) in &active {
+                if let Some(what) = overlap(&mine, &claim_set(theirs.as_ref())) {
+                    return Ok(Landed::Overlaps {
+                        what,
+                        run: id.clone(),
+                    });
                 }
             }
+        }
+        match claimed {
+            Claimed::Nothing => {}
             Claimed::Key(k) => {
                 let claimed = tx.execute(
                     &format!(
@@ -2230,6 +2234,30 @@ impl Store {
 /// `Some(set)` is a plan that listed its builds. a pair is `(asset, key)`, and
 /// the key is `None` for an unpartitioned asset: it has one thing to build, so
 /// it takes one claim.
+///
+/// **this is what decides the claim**, in
+/// [`create_run_keyed`](Store::create_run_keyed): a launch whose plan carries
+/// builds scans the active runs for one it intersects, whatever else that
+/// launch is claiming, and one whose plan does not carries on. answering the
+/// question here rather than from the kind of launch is what keeps the two
+/// from disagreeing.
+///
+/// **derived from the run rows, not from a table of its own.** the claim a
+/// build holds is exactly what its own `runs.plan` says it will build, so a
+/// run reaching a terminal status releases it and there is nothing separate
+/// that can leak or disagree. a process that dies mid-build leaves a
+/// non-terminal run, and the sweeps that already exist for that
+/// ([`fail_interrupted`](Store::fail_interrupted) at boot,
+/// [`reclaim_expired`](Store::reclaim_expired) every heartbeat once the lease
+/// lapses) end the run and with it the claim. a second table would have needed
+/// a reaper of its own, and a reaper of its own is a second answer to "what is
+/// building" that can be wrong.
+///
+/// **the scan is inside the insert's transaction**, under the same lock
+/// dispatchers take. widening the rule from "any build" to "an intersecting
+/// build" makes concurrent callers the ordinary case rather than the rare one,
+/// so a read followed by a launch would be two callers away from two runs
+/// materializing one asset from two plans, each recording the other's lineage.
 fn claim_set(plan: Option<&Value>) -> Option<Vec<(String, Option<String>)>> {
     let builds = plan?.get("builds")?.as_array()?;
     Some(
@@ -11387,7 +11415,7 @@ mod tests {
                     .create_run_keyed(
                         &mk_run("first", "assets", Utc::now()),
                         &[],
-                        Claimed::Build,
+                        Claimed::Nothing,
                         Some(&plan),
                         Fenced::Never,
                     )
@@ -11402,7 +11430,7 @@ mod tests {
                     .create_run_keyed(
                         &mk_run("beside", "assets", Utc::now()),
                         &[],
-                        Claimed::Build,
+                        Claimed::Nothing,
                         Some(&disjoint),
                         Fenced::Never,
                     )
@@ -11418,7 +11446,7 @@ mod tests {
                     .create_run_keyed(
                         &mk_run("third", "assets", Utc::now()),
                         &[],
-                        Claimed::Build,
+                        Claimed::Nothing,
                         Some(&meets),
                         Fenced::Never,
                     )
@@ -11440,7 +11468,7 @@ mod tests {
                         .create_run_keyed(
                             &mk_run(id, "assets", Utc::now()),
                             &[],
-                            Claimed::Build,
+                            Claimed::Nothing,
                             Some(plan),
                             Fenced::Never,
                         )
@@ -11453,7 +11481,7 @@ mod tests {
                     .create_run_keyed(
                         &mk_run("again", "assets", Utc::now()),
                         &[],
-                        Claimed::Build,
+                        Claimed::Nothing,
                         Some(&jan),
                         Fenced::Never,
                     )
@@ -11474,7 +11502,7 @@ mod tests {
                     .create_run_keyed(
                         &mk_run("after", "assets", Utc::now()),
                         &[],
-                        Claimed::Build,
+                        Claimed::Nothing,
                         Some(&meets),
                         Fenced::Never,
                     )
@@ -11505,7 +11533,7 @@ mod tests {
                 .create_run_keyed(
                     &mk_run("mine", "assets", Utc::now()),
                     &[],
-                    Claimed::Build,
+                    Claimed::Nothing,
                     Some(&build_plan(&[("anything", None)])),
                     Fenced::Never,
                 )
@@ -11533,13 +11561,160 @@ mod tests {
                     .create_run_keyed(
                         &mk_run("mine2", "assets", Utc::now()),
                         &[],
-                        Claimed::Build,
+                        Claimed::Nothing,
                         Some(&build_plan(&[("anything", None)])),
                         Fenced::Never,
                     )
                     .unwrap(),
                 Landed::Yes
             );
+        });
+    }
+
+    // a cron on an asset writes a run row carrying its builds, which everything
+    // else collides with, so it has to scan for what it collides with itself.
+    // it claims the occurrence in the same transaction, and the occurrence is
+    // not taken when the builds are refused: nothing at all is written, which
+    // is what leaves the scheduler free to record the refusal against it
+    #[test]
+    fn a_fire_that_says_what_it_builds_takes_the_claim_for_it() {
+        both(|db| {
+            let store = db.store();
+            let at = "2026-03-04T06:00:00Z".parse::<DateTime<Utc>>().unwrap();
+            let sales = build_plan(&[("sales", None)]);
+            assert_eq!(
+                store
+                    .create_run_keyed(
+                        &mk_run("asked_for", "assets", Utc::now()),
+                        &[],
+                        Claimed::Nothing,
+                        Some(&sales),
+                        Fenced::Never,
+                    )
+                    .unwrap(),
+                Landed::Yes
+            );
+
+            let fire = Fire {
+                job: "asset:sales",
+                expr: "0 6 * * *",
+                scheduled_for: at,
+                caught_up: false,
+            };
+            assert_eq!(
+                store
+                    .create_run_keyed(
+                        &mk_run("cron", "assets", Utc::now()),
+                        &[],
+                        Claimed::Fire(fire),
+                        Some(&sales),
+                        Fenced::Never,
+                    )
+                    .unwrap(),
+                Landed::Overlaps {
+                    what: "sales".into(),
+                    run: "asked_for".into(),
+                }
+            );
+            // nothing at all: no run, and the occurrence still has no fire
+            // against it, so it is the scheduler's to account for
+            assert!(store.run("cron").unwrap().is_none());
+            assert!(store.ticks(Some("asset:sales"), 10).unwrap().is_empty());
+
+            // and a cron building something else goes ahead beside it, which
+            // is the whole point of the claim being an intersection
+            let stock = Fire {
+                job: "asset:stock",
+                expr: "0 6 * * *",
+                scheduled_for: at,
+                caught_up: false,
+            };
+            assert_eq!(
+                store
+                    .create_run_keyed(
+                        &mk_run("beside", "assets", Utc::now()),
+                        &[],
+                        Claimed::Fire(stock),
+                        Some(&build_plan(&[("stock", None)])),
+                        Fenced::Never,
+                    )
+                    .unwrap(),
+                Landed::Yes
+            );
+            let ticks = store.ticks(Some("asset:stock"), 10).unwrap();
+            assert_eq!(ticks.len(), 1);
+            assert_eq!(ticks[0].outcome, TickOutcome::Fired);
+            assert_eq!(ticks[0].run_id.as_deref(), Some("beside"));
+        });
+    }
+
+    // the guard on the scan above. `claim_set` answers `None` for a plan with
+    // no `builds` key and `overlap` reads `None` as colliding with everything,
+    // and an ordinary job launch has no plan at all, so a scan gated on
+    // anything less precise than "this plan carries builds" would refuse the
+    // second run of every job in the deployment
+    #[test]
+    fn two_runs_of_a_job_that_never_says_what_it_builds_both_launch() {
+        both(|db| {
+            let store = db.store();
+            // launched by hand, twice
+            for id in ["first", "second"] {
+                assert_eq!(
+                    store
+                        .create_run_keyed(
+                            &mk_run(id, "etl", Utc::now()),
+                            &[],
+                            Claimed::Nothing,
+                            None,
+                            Fenced::Never,
+                        )
+                        .unwrap(),
+                    Landed::Yes
+                );
+            }
+            // and fired by a cron on the job, twice, which is the same launch
+            // carrying an occurrence
+            for (id, minute) in [("cron_one", "06:00"), ("cron_two", "06:01")] {
+                let at = format!("2026-03-04T{minute}:00Z")
+                    .parse::<DateTime<Utc>>()
+                    .unwrap();
+                let fire = Fire {
+                    job: "etl",
+                    expr: "* * * * *",
+                    scheduled_for: at,
+                    caught_up: false,
+                };
+                assert_eq!(
+                    store
+                        .create_run_keyed(
+                            &mk_run(id, "etl", Utc::now()),
+                            &[],
+                            Claimed::Fire(fire),
+                            None,
+                            Fenced::Never,
+                        )
+                        .unwrap(),
+                    Landed::Yes
+                );
+            }
+            // a resume and a replay of the assets job record the ops they will
+            // run and no builds, and they are not scanned for either: two of
+            // them launch, exactly as they did before there was a claim
+            for id in ["resumed", "replayed"] {
+                assert_eq!(
+                    store
+                        .create_run_keyed(
+                            &mk_run(id, "assets", Utc::now()),
+                            &[],
+                            Claimed::Nothing,
+                            Some(&json!({ "ops": ["a"], "seeds": {} })),
+                            Fenced::Never,
+                        )
+                        .unwrap(),
+                    Landed::Yes
+                );
+            }
+            assert_eq!(store.queue_depth().unwrap(), 6);
         });
     }
 
