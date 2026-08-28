@@ -1,9 +1,31 @@
 # changelog
 
-## unreleased
+## 0.2.0 (2026-08-28)
 
-an op can say it had nothing to do, an asset can own a cron, and builds that
-do not intersect run at the same time.
+a job says which group it belongs to and the run timeline folds by it, an op
+can say it had nothing to do, an asset can own a cron, and builds that do not
+intersect run at the same time.
+
+**upgrading from `0.1.0`: nothing here is a source break, and two things change
+what an unchanged deployment does.** `cargo update` does not bring a deployment
+here by itself. `hestan = "0.1.0"` reads as `>=0.1.0, <0.2.0`, so this one
+waits for somebody to edit the manifest, which is the whole reason it is a
+`0.2.0` and not a `0.1.1`: neither behaviour below is something to meet by
+surprise on a collector nobody is watching.
+
+- **builds are no longer serialized.** an assets run used to refuse to start
+  while any other was active. if that was doing load control for you by
+  accident it is gone: unrelated builds now overlap, and up to four execute at
+  once. write `Hestan::max_concurrent_builds(1)` for what 0.1.0 did.
+- **`asset:` is reserved in every deployment, and a job named into it now fails
+  at startup.** the error names the job and says to rename it. a deployment
+  with no job whose name begins `asset:` is untouched.
+
+everything else is an addition: `JobBuilder::group`, `Job::group`,
+`OpCtx::skip`, `Schedule::asset` and `Hestan::max_concurrent_builds`. no enum
+gained a variant, no public struct gained a field, nothing was renamed and
+nothing was removed, so code that built against 0.1.0 builds against this
+unchanged.
 
 ### An op that had nothing to do
 
@@ -251,9 +273,12 @@ svg draws, and none of them drops a bar.
 
 `RunStatus`, `OpStatus` and `BackfillStatus` each document themselves as a
 closed set, and six matches over them ended in a `_` arm anyway. one of those
-had already turned into a wrong answer: `notify`'s op summary sent every status
-it did not name out as "succeeded on attempt N", so the alert for an op that
-had just skipped itself said it worked.
+was a wrong answer waiting for a variant to arrive: `notify`'s op summary sent
+every status it did not name out as "succeeded on attempt N", which was
+harmless in 0.1.0 only because a hook could be told nothing but `success`,
+`failed` and `canceled`. **no released version ever mis-reported an op**;
+`ctx.skip` above is what would have made the arm reachable, in this same
+release, had it not been spelled out first.
 
 the arms are now spelled out. nothing about a run or an op that existed before
 reads differently; what changes is that the next variant added to one of these

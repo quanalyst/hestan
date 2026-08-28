@@ -1,6 +1,6 @@
 # Stability
 
-hestan is `0.1.0`, which is a 0.x version and therefore one that says out loud
+hestan is `0.2.0`, which is a 0.x version and therefore one that says out loud
 that it will move. this page is what it will not move, so that something can be
 built on it in the meantime.
 
@@ -11,25 +11,30 @@ what moved and what to write instead.**
 
 ## The version
 
-cargo reads `hestan = "0.1.0"` as `>=0.1.0, <0.2.0`, so under 0.x the **minor
-number is the compatibility number**. a `0.1.1` is additions and fixes and
-`cargo update` takes it; a break lands on `0.2.0`, which the same requirement
+cargo reads `hestan = "0.2.0"` as `>=0.2.0, <0.3.0`, so under 0.x the **minor
+number is the compatibility number**. a `0.2.1` is additions and fixes and
+`cargo update` takes it; a break lands on `0.3.0`, which the same requirement
 refuses until somebody edits the manifest.
 
-that much is new as of 0.1.0, and it is the one thing the release changed about
-this page. up to `0.1.0-beta.3` the version carried a pre-release tag, whose
-requirement has the same `<0.2.0` ceiling: `cargo update` moved a deployment
-from `beta.3` to `beta.4`, and then onto `0.1.0` itself, without anybody
-asking. so a break has to be the **first line** of its changelog entry rather
-than a paragraph inside it, and it stays there: the first line is the only part
-somebody reads before finding out the hard way, and a requirement written
-`hestan = "0"` still takes a `0.2.0` on its own.
+`0.2.0` is the first release to spend that. it carries no source break at all
+and two changes to what an unchanged deployment does, and either one of those
+on its own is what the minor number is for: a deployment that met them through
+a `cargo update` nobody ran deliberately would have met them at 3am. the size
+of a release is not the question the number answers.
 
-what may land in a `0.1.x` without breaking a build: a new method, a new
+that rule arrived with 0.1.0. up to `0.1.0-beta.3` the version carried a
+pre-release tag, whose requirement has the same ceiling: `cargo update` moved a
+deployment from `beta.3` to `beta.4`, and then onto `0.1.0` itself, without
+anybody asking. so a break has to be the **first line** of its changelog entry
+rather than a paragraph inside it, and it stays there: the first line is the
+only part somebody reads before finding out the hard way, and a requirement
+written `hestan = "0"` still takes a `0.3.0` on its own.
+
+what may land in a `0.2.x` without breaking a build: a new method, a new
 variant on one of the enums marked `#[non_exhaustive]` below, a new endpoint, a
 new column behind a migration, a better sentence in an error.
 
-what may not, and is therefore what a `0.2.0` is for: a variant on any other
+what may not, and is therefore what a `0.3.0` is for: a variant on any other
 enum, a **field on a public struct** (that is a source break for a struct
 literal, and hestan counts it as one), a required method on a trait somebody
 implements, a rename, a removal, a default that changes what an unchanged
