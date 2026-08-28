@@ -100,7 +100,15 @@ impl Alert for RunEvent {
                 self.error.as_deref().unwrap_or("unknown error")
             ),
             RunStatus::Canceled => "was canceled".to_string(),
-            _ => "succeeded".to_string(),
+            RunStatus::Success => "succeeded".to_string(),
+            // a hook fires on a terminal status, so neither of these reaches
+            // here. they are named rather than absorbed by a `_` because
+            // `RunStatus` is a closed set whose own documentation says a sixth
+            // variant would change what terminal means: a catch-all would send
+            // that variant out as good news instead of failing to compile
+            RunStatus::Queued | RunStatus::Running => {
+                format!("is {}", self.status.as_str())
+            }
         };
         format!(
             "job {} {what}{} ({}){}",
@@ -128,7 +136,13 @@ impl Alert for OpEvent {
             // there was nothing to do, which is not a success and must not be
             // reported as one
             OpStatus::Skipped => format!("skipped itself on attempt {}", self.attempt),
-            _ => format!("succeeded on attempt {}", self.attempt),
+            OpStatus::Success => format!("succeeded on attempt {}", self.attempt),
+            // as above: not reachable from a terminal hook, and named anyway
+            // so that a new `OpStatus` is a compile error here rather than an
+            // alert that says the op worked
+            OpStatus::Pending | OpStatus::Running => {
+                format!("is {} on attempt {}", self.status.as_str(), self.attempt)
+            }
         };
         format!(
             "op {} of job {} {what}{} ({})",
@@ -252,6 +266,76 @@ mod tests {
         assert_eq!(
             never.summary(),
             "job orders_etl failed at load: connection refused (0192-abc)"
+        );
+    }
+
+    // the bug this guards: a `_` arm sent every status it did not name out as
+    // "succeeded", so the first `OpStatus` nobody thought about was alerted as
+    // good news. both enums are closed sets, so every variant is listed here
+    // and a new one is a compile error in the summary before it is a wrong
+    // alert in somebody's channel
+    #[test]
+    fn no_status_but_success_is_ever_alerted_as_a_success() {
+        for status in [
+            RunStatus::Queued,
+            RunStatus::Running,
+            RunStatus::Failed,
+            RunStatus::Canceled,
+        ] {
+            let line = run(status).summary();
+            assert!(
+                !line.contains("succeeded"),
+                "a {status} run was alerted as a success: {line}"
+            );
+        }
+        assert!(run(RunStatus::Success).summary().contains("succeeded"));
+
+        let op = |status| OpEvent {
+            run_id: "0192-abc".into(),
+            job: "orders_etl".into(),
+            op: "load".into(),
+            attempt: 1,
+            status,
+            error: None,
+            started_at: Utc::now(),
+            finished_at: Utc::now(),
+            duration: Duration::from_millis(400),
+        };
+        for status in [
+            OpStatus::Pending,
+            OpStatus::Running,
+            OpStatus::Failed,
+            OpStatus::Skipped,
+            OpStatus::Canceled,
+        ] {
+            let line = op(status).summary();
+            assert!(
+                !line.contains("succeeded"),
+                "a {status} op was alerted as a success: {line}"
+            );
+        }
+        assert!(op(OpStatus::Success).summary().contains("succeeded"));
+    }
+
+    // a skip is the one an alert used to get wrong outright: the op ran, found
+    // nothing to do and said so, which is neither the failure that wakes
+    // somebody nor the success that says work happened
+    #[test]
+    fn an_op_that_skipped_itself_is_alerted_as_a_skip() {
+        let event = OpEvent {
+            run_id: "0192-abc".into(),
+            job: "orders_etl".into(),
+            op: "load".into(),
+            attempt: 2,
+            status: OpStatus::Skipped,
+            error: Some("no drop from the vendor yet".into()),
+            started_at: Utc::now(),
+            finished_at: Utc::now(),
+            duration: Duration::from_millis(400),
+        };
+        assert_eq!(
+            event.summary(),
+            "op load of job orders_etl skipped itself on attempt 2 in 0.4s (0192-abc)"
         );
     }
 

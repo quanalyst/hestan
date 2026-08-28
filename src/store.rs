@@ -5787,7 +5787,12 @@ fn backfill_over(
     let (kind, level) = match status {
         BackfillStatus::Canceled => (EventKind::BackfillCanceled, EventLevel::Warn),
         BackfillStatus::Failed => (EventKind::BackfillFinished, EventLevel::Error),
-        _ => (EventKind::BackfillFinished, EventLevel::Info),
+        // `BackfillStatus` is a closed set of four, and a `_` here would file a
+        // fifth as finished and fine, which is the one thing this line must
+        // never say about a backfill that is not
+        BackfillStatus::Complete | BackfillStatus::Running => {
+            (EventKind::BackfillFinished, EventLevel::Info)
+        }
     };
     NewEvent::about(
         SubjectKind::Backfill,

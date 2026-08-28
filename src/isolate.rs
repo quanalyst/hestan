@@ -251,7 +251,10 @@ fn recorded(store: &Store, run_id: &str, name: &str) -> Option<Ended> {
                 "the op skipped itself without recording why".to_string()
             })))
         }
-        _ => None,
+        // not a terminal row the parent can adopt. named rather than caught
+        // by a `_`, so a new `OpStatus` has to be classified here instead of
+        // silently reading as "the child never finished"
+        OpStatus::Pending | OpStatus::Running | OpStatus::Canceled => None,
     }
 }
 

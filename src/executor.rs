@@ -1975,7 +1975,11 @@ impl Runner {
             RunStatus::Success if from.is_none() => {
                 return Err(Error::RunNotFailed(run_id.to_string()));
             }
-            _ => {}
+            // what is left is resumable: a failed run, a canceled one, and a
+            // success being re-run from a chosen op. spelled out rather than
+            // caught by a `_`, so a new `RunStatus` has to be classified here
+            // instead of silently becoming resumable
+            RunStatus::Success | RunStatus::Failed | RunStatus::Canceled => {}
         }
         let job = self
             .jobs
@@ -3866,7 +3870,13 @@ async fn execute_in_span(
     let (level, kind, msg) = match status {
         RunStatus::Failed => (EventLevel::Error, EventKind::RunFailed, "run failed"),
         RunStatus::Canceled => (EventLevel::Warn, EventKind::RunCanceled, "run canceled"),
-        _ => (EventLevel::Info, EventKind::RunSuccess, "run succeeded"),
+        RunStatus::Success => (EventLevel::Info, EventKind::RunSuccess, "run succeeded"),
+        // the chain above yields exactly the three terminal statuses, so these
+        // two are unreachable. naming them keeps a sixth `RunStatus` a compile
+        // error here rather than a terminal event that says the run succeeded
+        RunStatus::Queued | RunStatus::Running => {
+            unreachable!("a run reaching its terminal event is not {status}")
+        }
     };
     // the run's own error: the first op that terminally failed, named, so a
     // hook or an alert reading the run row sees what RunFailure carries. or
