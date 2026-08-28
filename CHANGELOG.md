@@ -208,6 +208,40 @@ svg draws, and none of them drops a bar.
   now refuses a job's, so the two say one thing. both were and remain
   `Error::Graph` from the build, naming the asset and the group.
 
+### A closed enum is matched exhaustively
+
+`RunStatus`, `OpStatus` and `BackfillStatus` each document themselves as a
+closed set, and six matches over them ended in a `_` arm anyway. one of those
+had already turned into a wrong answer: `notify`'s op summary sent every status
+it did not name out as "succeeded on attempt N", so the alert for an op that
+had just skipped itself said it worked.
+
+the arms are now spelled out. nothing about a run or an op that existed before
+reads differently; what changes is that the next variant added to one of these
+enums is a compile error at each of these six places rather than a silently
+wrong status word in somebody's channel.
+
+a test walks every variant of both status enums and asserts that nothing but
+`Success` is ever summarised as a success, so this cannot come back by way of
+a `_` somebody adds for convenience.
+
+### The gate is one gate
+
+`just ci` runs all four jobs of the ci workflow: the ten feature
+configurations, the msrv check, the docs.rs build and the ui job. it existed
+as four things to remember and one of them, `--no-default-features`, is the
+only configuration a consumer can reach that `--all-features` does not cover.
+
+two ways of passing without having run are now said out loud rather than
+discovered: `just check` reports when `HESTAN_TEST_PG` is unset, because the
+postgres half of the store suite skips itself silently without it, and the ui
+recipe records that it needs a case-sensitive filesystem.
+
+a test asserts the justfile still runs every configuration the workflow does,
+and that the msrv the workflow pins is the one the manifest promises. a gate
+that has quietly stopped covering something reports the same green as one that
+covers it, which is the whole reason both are written down twice.
+
 ## 0.1.0 (2026-08-24)
 
 the first release that is not a pre-release. the surfaces in
