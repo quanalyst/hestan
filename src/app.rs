@@ -1475,17 +1475,21 @@ impl Hestan {
         let ids: Vec<String> = schedules.iter().map(Schedule::id).collect();
         let mut pairs: HashSet<(&str, &str)> = HashSet::new();
         // a job whose name is where an asset schedule is stored would share a
-        // row, a pause flag, a cursor and a fire index with it. the prefix is
-        // only reserved once something uses it, so a deployment that declares
-        // no asset schedule is unaffected by this existing at all
-        if schedules.iter().any(|s| s.target.asset().is_some())
-            && let Some(clash) = jobs
-                .iter()
-                .find(|j| j.name().starts_with(schedule::ASSET_PREFIX))
+        // row, a pause flag, a cursor and a fire index with it. reserved
+        // whether or not this deployment declares an asset schedule, because
+        // the schedule that collides with such a job need not be an asset one:
+        // `Schedule::new("asset:foo", ..)` on a job of that name is read back
+        // through `Target::from_id` as a build of the asset `foo`, so the
+        // entry ticks `unknown asset` forever, the job it names never runs and
+        // `GET /api/schedules` reports it as something it is not. a deployment
+        // that will not start beats one that starts and silently does nothing
+        if let Some(clash) = jobs
+            .iter()
+            .find(|j| j.name().starts_with(schedule::ASSET_PREFIX))
         {
             return Err(Error::Graph(format!(
-                "job {}: {:?} names where an asset schedule is stored, and this \
-                 deployment declares one. rename the job",
+                "job {}: {:?} is reserved for where an asset schedule is stored, \
+                 whether or not this deployment declares one. rename the job",
                 clash.name(),
                 schedule::ASSET_PREFIX
             )));
@@ -1853,6 +1857,45 @@ mod tests {
             .run_once("report", json!({"days": 2}))
             .await
             .unwrap();
+    }
+
+    // the prefix an asset schedule is stored under is reserved in every
+    // deployment, and this one declares no asset schedule at all: no assets,
+    // no `Schedule::asset`. it was conditional, and the condition was the bug.
+    // a job named into the prefix beside an ordinary `Schedule::new` on that
+    // name passed every check, and the entry was then read back as a build of
+    // an asset called `foo`: the schedule ticked `unknown asset` forever and
+    // the job never ran
+    #[tokio::test]
+    async fn a_job_named_into_the_asset_prefix_is_refused_with_no_asset_schedule_anywhere() {
+        let job = |name: &str| {
+            Job::builder(name)
+                .op(Op::new("work", |_| async { Ok(json!(null)) }))
+                .build()
+                .unwrap()
+        };
+        let err = Hestan::new()
+            .job(job("asset:foo"))
+            .add_schedule(crate::Schedule::new("asset:foo", "0 6 * * *"))
+            .db(":memory:")
+            .run_once("asset:foo", json!({}))
+            .await
+            .expect_err("the deployment came up on a job named into the prefix");
+        assert!(matches!(err, Error::Graph(_)), "{err}");
+        let err = err.to_string();
+        // it names the job and says what to do about it
+        assert!(err.contains("asset:foo"), "{err}");
+        assert!(err.contains("rename the job"), "{err}");
+
+        // and a job named anything else still comes up, schedule and all
+        let run = Hestan::new()
+            .job(job("assets_foo"))
+            .add_schedule(crate::Schedule::new("assets_foo", "0 6 * * *"))
+            .db(":memory:")
+            .run_once("assets_foo", json!({}))
+            .await
+            .unwrap();
+        assert_eq!(run.status, RunStatus::Success);
     }
 
     fn pooled(job: &str) -> Job {
