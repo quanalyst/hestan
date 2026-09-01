@@ -78,8 +78,8 @@ declaration they would be permanently undividable.
 ## A namespace is not a group
 
 they overlap in practice and answer different questions, and hestan keeps them
-apart mechanically: the graph, the hue, the legend and the folding read the
-group and never the namespace; a token's scope and `?namespace=` read the
+apart mechanically: the graph, the hue, the legend and the timeline's outline
+read the group and never the namespace; a token's scope and `?namespace=` read the
 namespace and never the group. **nothing derives one from the other, in either
 direction**, and the two sit side by side wherever narrowing a list is on offer
 (the assets page has both filters, and so does `hestan assets`) precisely
@@ -116,7 +116,8 @@ Job::builder("weather_pull").group("weather")
 ```
 
 the same label, said the same way, and the [jobs
-overview](web-ui.md#jobs-overview) folds a group's lanes into one row with it.
+overview](web-ui.md#jobs-overview) makes a group a row of its own on the
+timeline with it, with the member jobs a disclosure away.
 a group is still a label and not a boundary: nothing reads it to decide who may
 touch what, and the boundary is still the namespace beside it.
 
@@ -135,7 +136,8 @@ because that is how the asset graph grouped before `Asset::group` existed and
 the fallback is what keeps an existing graph looking the way it looked. no
 timeline has ever grouped by anything, so the same rule produces the opposite
 mechanics here: a job's group is declared or it is absent, a job called
-`finance/etl` is in no group, and a deployment that declares none folds nothing.
+`finance/etl` is in no group, and a deployment that declares none gets the flat
+timeline it always had.
 
 both are refused at build by the one function, so a name one of them may carry
 is a name the other may carry: an empty or whitespace-only group, and a group

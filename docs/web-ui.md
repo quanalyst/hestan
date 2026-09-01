@@ -61,8 +61,9 @@ with no runs it says so ("no runs in the last 6 hours") rather than showing
 zeros.
 
 under it, the timeline: one lane per registered job (runs of a job that has
-since left the code still get a lane, and a group of lanes can be
-[folded](#folding-a-group-of-lanes) into one), a 1h/6h/24h window switch, and
+since left the code still get a lane), or one lane per
+[group](#opening-a-group) where anything declares one, a 1h/6h/24h window
+switch, and
 about 15% of the axis reserved right of the "now" line for the future. runs
 draw as bars; overlapping runs within a job pack greedily into stacked
 sub-lanes rather than drawing over each other. projected schedule fires
@@ -95,33 +96,56 @@ apply), and the statline counts everything currently late.
 rows click through to the job page. the page polls jobs every 5s, window
 runs every 10s, and upcoming fires every 30s.
 
-### Folding a group of lanes
+### Opening a group
 
 twenty jobs is twenty lanes, and a namespace is too coarse to cut that down:
-two chips over one bucket of fourteen is not a fold anybody wants. so where a
-job declares a [group](namespaces.md#a-job-has-one-too), `fold` chips above the
-plot collapse that group's lanes onto one row, with the group's name and how
-many jobs it stands for in the gutter and the jobs themselves on the hover.
+two chips over one bucket of fourteen is not the cut anybody wanted.
+so where a job declares a [group](namespaces.md#a-job-has-one-too) the gutter
+is an outline two levels deep, and the group is the outer one.
 
-**a folded row draws every run its members have.** the same greedy sub-lane
-packing one job's lane already uses, run over all the members' runs at once, so
-three runs live at one moment is a row three sub-lanes tall whether or not it
-is folded. a fold makes the plot shorter and never quieter: drawing the first
-run and hiding the rest would make a busy period look like a quiet one, which
-is a worse lie than not folding at all.
+**a group is a row of its own whether it is open or shut, and that row always
+draws the aggregate**: every run of every member, packed by the same greedy
+sub-lane rule one job's lane already uses, so three runs live at one moment is
+a row three sub-lanes tall. a group makes the plot shorter and never quieter:
+drawing the first run and hiding the rest would make a busy period look like a
+quiet one, which is a worse lie than showing no group at all.
 
-the bars on a folded row carry the group's [hue](assets.md#colour), except
-where the outcome already has a mark of its own: a failure keeps its hatch and
-its × in the strip under the plot, a queued run its hollow outline, a canceled
-one its dimmed grey. shape carries state here, and a colour where an outcome
-already is would be a colour meaning two things. the group is written in the
-gutter beside the row, so the hue is never the only thing carrying it.
+**a group starts shut**, so a deployment that declares one opens on a row per
+group rather than a row per job. the disclosure is in the gutter on the group's
+own row: the whole of that row is the target, so the name is what you click,
+and it is a button, so tab reaches it and space works.
 
-the fold is in the url like every other view state
-(`/jobs?folded=weather,eia`), so a folded view is a link somebody can send.
-**a deployment where nothing declares a group gets no chips and the plot it
-always had**: there is nothing to fold, a job in no group is never folded into
-anything, and inventing a fold out of a naming convention would be a guess.
+opening a group adds its jobs as rows directly underneath it, indented, and the
+group's row goes on drawing the aggregate. **while a group is open a run is
+drawn twice**, once on the group's row as part of the group's load and once on
+its job's row as itself. that is what opening one is for, and the two marks are
+one run: pointing at either lights both.
+
+every row inside a group carries a block of the group's [hue](assets.md#colour)
+behind its name, the full height of the row and the same on the group's row as
+on its jobs' rows, so the colour reads as one band down the gutter rather than
+a mark per row. the block is a wash of the group's angle rather than the angle
+itself, at the one strength that keeps a name on it readable against both
+themes. a job in no group carries no block.
+
+the bars on those rows carry the group's hue too, except where the outcome
+already has a mark of its own: a failure keeps its hatch and its × in the strip
+under the plot, a queued run its hollow outline, a canceled one its dimmed
+grey. shape carries state here, and a colour where an outcome already is would
+be a colour meaning two things. the group is written in the gutter beside the
+row, so the hue is never the only thing carrying it. a failure inside a shut
+group still reaches the strip, and a failure inside an open one gets one × and
+not two: a run drawn twice is still one run that failed.
+
+which groups are open is in the url like every other view state
+(`/jobs?open=weather,eia`), so an opened view is a link somebody can send.
+starting shut is why the parameter carries what is open rather than what is
+not: it is the shorter half of the answer.
+
+**a deployment where nothing declares a group gets the plot it always had**:
+one row per job, no blocks, no disclosures. there is nothing to group by, a job
+in no group is never gathered into anything, and inventing a group out of a
+naming convention would be a guess.
 
 ## Job page
 
@@ -188,7 +212,8 @@ still waiting), when the fire was scheduled for, a link to the launched run,
 and the error message when the launch failed.
 
 then a single-lane timeline (same windows, ghosts, and brushing as the
-overview, and no fold chips: one lane is nothing to fold), a bar chart of the
+overview, and no outline: one job is one lane, and the group it declares is
+structure for the overview rather than for this page), a bar chart of the
 last finished runs' durations, and a table of the ten most recent runs, with
 an "all runs" link into the runs page pre-filtered to this job.
 

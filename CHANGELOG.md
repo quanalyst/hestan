@@ -1,5 +1,50 @@
 # changelog
 
+## unreleased
+
+### The run timeline is an outline of groups and their jobs
+
+the `fold` chips over the jobs overview are gone. a
+[group](docs/namespaces.md#a-job-has-one-too) is permanent structure in the
+gutter now: [a row of its own](docs/web-ui.md#opening-a-group) whether it is
+open or shut, always drawing every run every member had, with the disclosure on
+that row rather than in a chip above the plot.
+
+- **a group's row draws the aggregate, open or shut.** the same greedy
+  sub-lane packing one job's lane already uses, run over every member's runs at
+  once, so three runs live at one moment is a row three sub-lanes tall. it is
+  what the chips already did when a group was folded, and it is now what a
+  group's row does at all times.
+- **opening a group adds its jobs underneath and takes nothing off the group's
+  row**, so a run inside an open group is drawn twice: once as part of the
+  group's load, once as itself. that is the point of opening one. the two rows
+  are packed independently, and there is a case asserting the group's row keeps
+  its own three sub-lanes while its members' rows each keep one.
+- **every row inside a group carries a block of the group's hue behind its
+  name**, the full height of the row and the same on the group's row as on its
+  jobs' rows, so the colour is one band down the gutter. the angle comes from
+  the one function in the ui that emits a hue; the block is a wash of it, at
+  the strength that leaves a name on it readable against both themes.
+- **the disclosure is a button.** it is in the gutter on the group's row, the
+  whole of that row is its target, it says `aria-expanded`, and it takes a
+  focus ring.
+- **a failure inside a shut group still reaches the strip** under the plot, and
+  a failure inside an open one gets one glyph rather than two: a run drawn
+  twice is one run that failed.
+- **which groups are open is in the url** as `?open=`, beside the namespace
+  filter and for the same reason. groups start shut, so the parameter carries
+  what is open, which is the shorter half of the answer.
+
+`?folded=` is not read any more. a saved link that carries it opens the plot
+shut, which is what a link to a control that no longer exists can honestly do.
+
+### What an existing deployment sees change
+
+**a deployment that declares no group sees no change at all**: one row per job,
+no blocks, no disclosures, exactly the plot it had. there is a case asserting
+that rather than assuming it. nothing outside the ui reads any of this: no
+schema version, no migration, no route, and no api response changed.
+
 ## 0.2.0 (2026-08-28)
 
 a job says which group it belongs to and the run timeline folds by it, an op
