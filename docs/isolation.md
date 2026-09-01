@@ -173,6 +173,15 @@ decided in this process. a parent that wrote the row again would append a
 second `op_skipped`, erase the metadata the body staged before it decided, and
 move the finish time off the moment the op really ended.
 
+**a cancel arriving in that window does not overwrite it either.** a child can
+record its outcome and exit while its parent is still draining pipes some
+process the child left behind is holding open, and for as long as that lasts
+the parent believes the op is running. cancelling then reaches an op whose
+truth is already on the row, and the row refuses it: the terminal status, the
+reason, the staged metadata and the child's own finish time all stay, and no
+`op_canceled` event is written for an op nothing happened to. the run still
+ends `canceled`, because the run really was.
+
 ## Stopping it for real
 
 cancelling a run, or an `Op::timeout` expiring, does this to an isolated op:

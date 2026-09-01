@@ -2,6 +2,48 @@
 
 ## unreleased
 
+### Fixed: a cancel could overwrite an op that had already finished
+
+**this shipped in `0.2.0`.** cancelling a run wrote `canceled` onto every op
+row the run believed was unfinished, with nothing on the write to stop it
+landing on a row that already said what the op did. an op that recorded its
+outcome in the window between the cancel being requested and the run reading
+that outcome back lost it: the status, the output, the metadata the body staged
+with `ctx.meta`, the skip reason or the failure message, and the finish time of
+the attempt that really ended, all replaced by `canceled` and `"canceled"`.
+
+**whether it could have bitten you.** it needed a cancel (by hand, over
+`POST /api/runs/{id}/cancel`, or from the ui) to land inside a window measured
+in milliseconds, so a deployment that does not cancel running runs was never
+exposed. the window is widest for an [isolated](docs/isolation.md) op, whose
+child records its own terminal row and whose parent can still be draining that
+child's pipes afterwards: a process the op left behind holding those pipes open
+stretches the window to seconds. an op that succeeded, failed, skipped itself or
+was skipped by its trigger rule was all equally losable. nothing else wrote onto
+a finished op, so a run nobody cancelled has always been recorded correctly, and
+no stored row needs repairing: what was lost was lost at the time and there is
+nothing on disk to migrate.
+
+- **a row that already holds a terminal status is not moved to another one.**
+  the condition is on the `UPDATE` itself, so the database is what declines the
+  write. the two things that have to agree are two processes, and a check run a
+  moment before the write would have the same race in it that the write did.
+- **a declined write is not an error.** it does not count as an unrecorded
+  write, does not mark the store unhealthy, does not warn, and does not stop
+  the run. the truth was already recorded, which is the outcome the caller
+  wanted.
+- **no `op_canceled` event for an op nothing happened to.** an `op_skipped` and
+  an `op_canceled` on one attempt is a log saying two different things ended
+  it. the run's own `run_canceled` still records that somebody asked.
+- **a retry is unaffected**, and it is the case this had to be careful about:
+  an isolated op's child writes `failed` on its own row, and the attempt that
+  follows writes `success` over it. `op_started` puts the row back to `running`
+  before a fresh attempt writes anything, so it is the only thing that moves an
+  op off a terminal status, and both halves are asserted.
+- **the same guard on the "not observed to stop" write**, which lands on ops
+  that never came back from the cancellation grace. an isolated op whose child
+  recorded an outcome the parent has not read yet is exactly such an op.
+
 ### The run timeline is an outline of groups and their jobs
 
 the `fold` chips over the jobs overview are gone. a

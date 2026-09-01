@@ -204,7 +204,11 @@ there are two kinds of write behind that, and the difference is deliberate:
   [watermark](state.md). one that fails is retried (four attempts, capped
   exponential with full jitter, under a second in the worst case), because a
   busy database is the ordinary reason a write does not land and it is over in
-  milliseconds.
+  milliseconds. an op's terminal row is the one of these that can also be
+  *declined*: a row already holding a terminal status is not moved to another
+  one (see [cancellation](#cancellation)), and a declined write counts as
+  landed, because the outcome is on the row either way. what does not land is
+  a write the store would not take.
 - **what a run said** is best-effort: the [event log](events.md) and captured
   [op output](logs.md). losing a line of narration is survivable where losing
   a run's outcome is not, so these are let go rather than retried. they are
@@ -578,6 +582,18 @@ and an `op_canceled` event, then the run gets its `run_canceled` event and
 finishes with status `canceled`. retry sleeps die with the abort, so a
 canceled op mid-backoff doesn't linger.
 
+"isn't terminal yet" is enforced where it cannot be raced: **an op run row that
+already holds `success`, `failed`, `skipped` or `canceled` is not moved to
+another terminal status**, by a cancel or by anything else. the condition is on
+the write itself rather than on a check the run ran a moment earlier, because
+the two things that have to agree here are two processes: an
+[isolated](isolation.md) op's child records what it did on its own row, and its
+parent can still be draining that child's pipes when the cancel arrives. an op
+the guard declines gets no `op_canceled` event either, since nothing happened
+to it. the one way off a terminal status is a fresh attempt, which puts the row
+back to `running` before it writes anything, and that is what makes a retry
+`failed -> running -> success` rather than a contradiction.
+
 what actually stops, and what hestan claims about it, depends on the op:
 
 - an **[isolated op](isolation.md)** is stopped, full stop. its body runs in a
@@ -622,14 +638,20 @@ an isolated op is spending a grace of its own inside it:
 - an op that comes back in time is recorded as whatever really happened. one
   that finished in the instant between the cancel request and the abort keeps
   its real result: its success (and any staged [state](state.md)) is
-  recorded, not overwritten with `canceled`.
+  recorded, not overwritten with `canceled`. that holds whether or not the run
+  noticed in time, because it is the row that refuses the write and not the
+  run that remembers to skip it: an op whose result was already on the row when
+  the cancel arrived keeps its status, its output, its metadata, its error and
+  the finish time of the attempt that really ended.
 - an op that does not come back is recorded `canceled` with the error
   `cancellation requested; this op was not observed to stop within 3s and may
   still be running (...)`, and **no `finished_at`**. a finish time there
   would be hestan asserting that work stopped when all it knows is that it
   asked. the missing timestamp is the point: the op has no duration in the
   gantt or in op stats, because its duration is not a thing this process
-  knows.
+  knows. an op that does not come back but had already written its own row
+  (an isolated op's child records its outcome itself) keeps that row: not
+  coming back is a fact about the parent's wait, not about the work.
 
 note that a blocking closure launched with `spawn_blocking` is invisible to
 this: the op's own task is awaiting the join handle, so it aborts and comes

@@ -175,6 +175,13 @@ provably stopped (an [isolated](isolation.md) op's process was signalled,
 killed and reaped), `false` means cancellation was *requested* and the op was
 never observed to stop.
 
+an op that had already finished when the cancel reached it gets **no
+`op_canceled` at all**, because nothing happened to it: its row keeps the
+outcome it recorded, and one attempt keeps one terminal event rather than an
+`op_skipped` and an `op_canceled` disagreeing about it. the run's own
+`run_canceled` still says somebody asked. see
+[cancellation](concepts.md#cancellation).
+
 ### Assets
 
 | kind | level | payload |
