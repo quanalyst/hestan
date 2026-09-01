@@ -74,6 +74,15 @@ str_enum!(RunStatus {
 /// [`Pending`](OpStatus::Pending) forever, which is how a failed run shows what
 /// it did not get to.
 ///
+/// the last four are **terminal**: an op that reached one of them has finished,
+/// and nothing moves it to another one. a later write that says otherwise (a
+/// cancel that reached an op after it had already recorded what it did) is
+/// declined, so the outcome that really happened is the one that stays on the
+/// row. the one way off a terminal status is a fresh attempt of the same op,
+/// which puts it back to [`Running`](OpStatus::Running) before it writes
+/// anything: that is what makes `failed` -> `running` -> `success` a retry
+/// rather than a contradiction.
+///
 /// **a closed set**, and it stays one: an op is waiting, running, or done
 /// in one of four ways, and anything counting op rows wants the compile
 /// error if that stops being true.

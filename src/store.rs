@@ -1475,10 +1475,9 @@ fn parse_json(idx: usize, text: &str) -> Result<Value, Error> {
 ///
 /// an event, a captured log line, the pid of a child: each is worth having and
 /// none of them is what a run *did*. a write that records that (a terminal
-/// row, a status, a watermark) returns `Result<(), Error>` like everything
-/// else and goes through [`Store::landed`], so `note(store.op_finished(..))`
-/// is a thing the compiler refuses rather than a thing to remember not to
-/// write.
+/// row, a status, a watermark) returns a `Result` like everything else and
+/// goes through [`Store::landed`], so `note(store.op_finished(..))` is a thing
+/// the compiler refuses rather than a thing to remember not to write.
 ///
 /// only this module makes one, and only in the signature of a write it has
 /// declared best-effort. **a write added later is critical until somebody says
@@ -1893,20 +1892,43 @@ impl Store {
     /// every caller has to say what it does when a write did not land, and the
     /// answer is never "carry on as if it had"; `docs/concepts.md` is what
     /// hestan promises about writes, and what it stops promising here.
-    pub(crate) async fn landed(&self, what: &str, write: impl Fn() -> Result<(), Error>) -> bool {
+    ///
+    /// **a write that landed and changed nothing landed.**
+    /// [`op_finished`](Store::op_finished) declines a write onto an op that had
+    /// already finished, and that is the store agreeing with the caller rather
+    /// than failing it: it is not counted as unrecorded, it does not warn, and
+    /// it does not stop a run. [`landed_with`](Store::landed_with) is how a
+    /// caller hears which of the two it got.
+    pub(crate) async fn landed<T>(&self, what: &str, write: impl Fn() -> Result<T, Error>) -> bool {
+        self.landed_with(what, write).await.is_some()
+    }
+
+    /// [`landed`](Store::landed), for a caller that needs what the write said
+    /// as well as whether it landed.
+    ///
+    /// `None` is a write that did not land, and is exactly the news `landed`
+    /// returning `false` is. `Some` carries the write's own answer, which for
+    /// an op's terminal write is whether the row moved: a cancel that arrived
+    /// after the op had already recorded an outcome has nothing to say about
+    /// it, and this is how it finds that out.
+    pub(crate) async fn landed_with<T>(
+        &self,
+        what: &str,
+        write: impl Fn() -> Result<T, Error>,
+    ) -> Option<T> {
         let mut attempt = 0;
         loop {
             let e = match write() {
-                Ok(()) => {
+                Ok(said) => {
                     self.health.wrote();
-                    return true;
+                    return Some(said);
                 }
                 Err(e) => e,
             };
             if attempt + 1 == WRITE_ATTEMPTS || !transient(&e) {
                 tracing::error!("{what} could not be written: {e}");
                 self.health.unrecorded();
-                return false;
+                return None;
             }
             self.health.retried();
             tracing::warn!("{what} did not land, trying again: {e}");
@@ -3704,6 +3726,25 @@ impl Store {
     /// the op can still fail; written after it and a crash in the gap leaves a
     /// build nothing recorded. an op that produces several assets writes all
     /// of them here or none of them.
+    ///
+    /// **a row that already holds a terminal status is left exactly as it is.**
+    /// the `WHERE` is what refuses the write, so the refusal is the database's
+    /// and not a check this process ran a moment earlier and hoped was still
+    /// true: an op recording that it finished and a cancel deciding that op is
+    /// still running are two different processes, and the window between them
+    /// is where an outcome that really happened used to be overwritten. see
+    /// [`OpStatus`] for which statuses are terminal.
+    ///
+    /// `running` is not terminal, which is the whole reason the guard can be
+    /// this strict: a retry goes `failed` -> [`op_started`](Store::op_started)
+    /// -> `running` -> `success`, so nothing but a fresh attempt's start moves
+    /// an op off a terminal status, and `op_started` is the only write that
+    /// does it.
+    ///
+    /// says whether the row moved. **`false` is not a failure**: it is a write
+    /// correctly declined because the truth was already recorded, and
+    /// [`Store::landed`] still reads it as landed. the materializations go with
+    /// it: a build is a claim about the op run this write did not make.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn op_finished(
         &self,
@@ -3714,7 +3755,7 @@ impl Store {
         metadata: Option<&Value>,
         error: Option<&str>,
         built: &[Built],
-    ) -> Result<(), Error> {
+    ) -> Result<bool, Error> {
         #[cfg(test)]
         {
             if let Some(e) = self.injected("op_finished") {
@@ -3726,10 +3767,10 @@ impl Store {
         let mut tx = conn.begin()?;
         // pid goes with it: the row says where an op is running, and nothing is
         // running once this write lands
-        tx.execute(
+        let moved = tx.execute(
             "UPDATE op_runs SET status = ?1, finished_at = ?2, output = ?3, metadata = ?4,
                  error = ?5, pid = NULL
-             WHERE run_id = ?6 AND op = ?7",
+             WHERE run_id = ?6 AND op = ?7 AND status IN ('pending', 'running')",
             args![
                 status.as_str(),
                 at.to_rfc3339(),
@@ -3740,30 +3781,39 @@ impl Store {
                 op,
             ],
         )?;
+        if moved == 0 {
+            return Ok(false);
+        }
         for one in built {
             write_materialization(&mut tx, one, Some(run_id), at)?;
         }
         tx.commit()?;
-        Ok(())
+        Ok(true)
     }
 
     /// mark an op canceled without claiming a finish time: cancellation was
     /// requested and the task never joined, so when (or whether) the work
     /// stopped is exactly what this process does not know.
-    pub(crate) fn op_unstopped(&self, run_id: &str, op: &str, error: &str) -> Result<(), Error> {
+    ///
+    /// guarded exactly as [`op_finished`](Store::op_finished) is, and says the
+    /// same thing: an op whose row already says what it did is one this
+    /// process was wrong to think was still running, and the row it wrote is
+    /// worth more than the guess. an op that never joined is very often one
+    /// whose own child recorded an outcome the parent has not read yet.
+    pub(crate) fn op_unstopped(&self, run_id: &str, op: &str, error: &str) -> Result<bool, Error> {
         #[cfg(test)]
         {
             if let Some(e) = self.injected("op_unstopped") {
                 return Err(e);
             }
         }
-        self.conn().execute(
+        let moved = self.conn().execute(
             "UPDATE op_runs SET status = ?1, finished_at = NULL, output = NULL, metadata = NULL,
                  error = ?2, pid = NULL
-             WHERE run_id = ?3 AND op = ?4",
+             WHERE run_id = ?3 AND op = ?4 AND status IN ('pending', 'running')",
             args![OpStatus::Canceled.as_str(), error, run_id, op],
         )?;
-        Ok(())
+        Ok(moved > 0)
     }
 
     /// record the child process an [isolated](crate::Op::isolated) op is
@@ -10239,6 +10289,327 @@ mod tests {
         });
     }
 
+    /// a run with one op `a` sitting in `status`, reached the way a run
+    /// reaches it: created for `pending`, started for `running`, finished for
+    /// each of the four terminal ones. what is under test is the guard, so
+    /// nothing here plants a row around it.
+    fn op_sitting_in(store: &Store, run_id: &str, status: OpStatus) {
+        store
+            .create_run(&mk_run(run_id, "etl", Utc::now()), &["a".into()])
+            .unwrap();
+        if status == OpStatus::Pending {
+            return;
+        }
+        store.op_started(run_id, "a", 1).unwrap();
+        if status == OpStatus::Running {
+            return;
+        }
+        assert!(
+            store
+                .op_finished(run_id, "a", status, None, None, Some("what it did"), &[])
+                .unwrap(),
+            "a fresh op could not be finished as {status}"
+        );
+    }
+
+    // the guard, over every status an op row can be holding when a late write
+    // arrives. `running` lets a write through and that is not an oversight: it
+    // is what makes a retry legal, and the case below asserts the retry that
+    // depends on it
+    #[test]
+    fn a_terminal_op_row_is_not_moved_to_another_terminal_status() {
+        both(|db| {
+            let store = db.store();
+            for (status, open) in [
+                (OpStatus::Pending, true),
+                (OpStatus::Running, true),
+                (OpStatus::Success, false),
+                (OpStatus::Failed, false),
+                (OpStatus::Skipped, false),
+                (OpStatus::Canceled, false),
+            ] {
+                let id = format!("r-{status}");
+                op_sitting_in(&store, &id, status);
+                let moved = store
+                    .op_finished(
+                        &id,
+                        "a",
+                        OpStatus::Canceled,
+                        None,
+                        None,
+                        Some("canceled"),
+                        &[],
+                    )
+                    .unwrap();
+                assert_eq!(moved, open, "a write onto a {status} row said {moved}");
+
+                let row = store.op_run(&id, "a").unwrap().unwrap();
+                match open {
+                    true => {
+                        assert_eq!(row.status, OpStatus::Canceled, "from {status}");
+                        assert_eq!(row.error.as_deref(), Some("canceled"), "from {status}");
+                    }
+                    false => {
+                        assert_eq!(row.status, status, "a terminal row was moved");
+                        assert_eq!(
+                            row.error.as_deref(),
+                            Some("what it did"),
+                            "a terminal row kept its status and lost its error"
+                        );
+                    }
+                }
+            }
+        });
+    }
+
+    // the loss this guard exists to stop: a cancel that arrives after the op
+    // recorded what it did used to take the output and the staged metadata
+    // with it, and stamp its own finish time over the real one
+    #[test]
+    fn a_cancel_after_a_success_keeps_the_output_and_the_metadata() {
+        both(|db| {
+            let store = db.store();
+            store
+                .create_run(&mk_run("r1", "etl", Utc::now()), &["a".into()])
+                .unwrap();
+            store.op_started("r1", "a", 1).unwrap();
+            assert!(
+                store
+                    .op_finished(
+                        "r1",
+                        "a",
+                        OpStatus::Success,
+                        Some(&json!({ "rows": 12 })),
+                        Some(&json!({ "files_seen": 3 })),
+                        None,
+                        &[],
+                    )
+                    .unwrap()
+            );
+            let finished = store.op_run("r1", "a").unwrap().unwrap().finished_at;
+
+            assert!(
+                !store
+                    .op_finished(
+                        "r1",
+                        "a",
+                        OpStatus::Canceled,
+                        None,
+                        None,
+                        Some("canceled"),
+                        &[],
+                    )
+                    .unwrap(),
+                "the cancel claimed to have moved a finished op"
+            );
+
+            let row = store.op_run("r1", "a").unwrap().unwrap();
+            assert_eq!(row.status, OpStatus::Success);
+            assert_eq!(row.output, Some(json!({ "rows": 12 })));
+            assert_eq!(row.metadata, Some(json!({ "files_seen": 3 })));
+            assert_eq!(row.error, None);
+            assert_eq!(
+                row.finished_at, finished,
+                "the finish time moved to the cancel's"
+            );
+        });
+    }
+
+    // the same for an op that failed: the message is the whole of why anybody
+    // opens the row, and a cancel replacing it with "canceled" is the same
+    // loss wearing a different word
+    #[test]
+    fn a_cancel_after_a_failure_keeps_the_error() {
+        both(|db| {
+            let store = db.store();
+            store
+                .create_run(&mk_run("r1", "etl", Utc::now()), &["a".into()])
+                .unwrap();
+            store.op_started("r1", "a", 1).unwrap();
+            assert!(
+                store
+                    .op_finished(
+                        "r1",
+                        "a",
+                        OpStatus::Failed,
+                        None,
+                        None,
+                        Some("upstream refused the batch"),
+                        &[],
+                    )
+                    .unwrap()
+            );
+
+            assert!(
+                !store
+                    .op_finished(
+                        "r1",
+                        "a",
+                        OpStatus::Canceled,
+                        None,
+                        None,
+                        Some("canceled"),
+                        &[],
+                    )
+                    .unwrap()
+            );
+
+            let row = store.op_run("r1", "a").unwrap().unwrap();
+            assert_eq!(row.status, OpStatus::Failed);
+            assert_eq!(row.error.as_deref(), Some("upstream refused the batch"));
+        });
+    }
+
+    // the guard's counter-case, and the whole reason it can refuse a terminal
+    // row at all: a retry is not a second write onto a finished op, it is a
+    // fresh attempt, and `op_started` is what says so
+    #[test]
+    fn a_retry_writes_over_a_failed_row_because_op_started_reopened_it() {
+        both(|db| {
+            let store = db.store();
+            store
+                .create_run(&mk_run("r1", "etl", Utc::now()), &["a".into()])
+                .unwrap();
+            store.op_started("r1", "a", 1).unwrap();
+            assert!(
+                store
+                    .op_finished(
+                        "r1",
+                        "a",
+                        OpStatus::Failed,
+                        None,
+                        None,
+                        Some("transient"),
+                        &[]
+                    )
+                    .unwrap()
+            );
+
+            store.op_started("r1", "a", 2).unwrap();
+            assert!(
+                store
+                    .op_finished(
+                        "r1",
+                        "a",
+                        OpStatus::Success,
+                        Some(&json!("done")),
+                        None,
+                        None,
+                        &[],
+                    )
+                    .unwrap(),
+                "a retried op could not record that it worked"
+            );
+
+            let row = store.op_run("r1", "a").unwrap().unwrap();
+            assert_eq!(row.status, OpStatus::Success);
+            assert_eq!(row.attempts, 2);
+            assert_eq!(row.output, Some(json!("done")));
+            assert_eq!(row.error, None);
+        });
+    }
+
+    // a build is a claim about an op run, so a write the guard declined
+    // records no part of itself: an asset saying it is current on the strength
+    // of a row that says something else is the half-applied write this
+    // transaction exists to rule out
+    #[test]
+    fn a_declined_terminal_write_records_no_materialization() {
+        both(|db| {
+            let store = db.store();
+            store
+                .create_run(&mk_run("r1", "etl", Utc::now()), &["a".into()])
+                .unwrap();
+            store.op_started("r1", "a", 1).unwrap();
+            assert!(
+                store
+                    .op_finished(
+                        "r1",
+                        "a",
+                        OpStatus::Skipped,
+                        None,
+                        None,
+                        Some("nothing to do"),
+                        &[],
+                    )
+                    .unwrap()
+            );
+
+            let built = Built {
+                asset: "orders".to_string(),
+                partition: None,
+                fingerprint: "fp".to_string(),
+                inputs: json!({}),
+                value: None,
+                is_output: false,
+                meta: None,
+            };
+            assert!(
+                !store
+                    .op_finished(
+                        "r1",
+                        "a",
+                        OpStatus::Success,
+                        Some(&json!("late")),
+                        None,
+                        None,
+                        std::slice::from_ref(&built),
+                    )
+                    .unwrap()
+            );
+
+            assert!(
+                store
+                    .materializations("orders", None, 10)
+                    .unwrap()
+                    .is_empty(),
+                "a build landed for an op run that was never written"
+            );
+            assert_eq!(
+                store.op_run("r1", "a").unwrap().unwrap().status,
+                OpStatus::Skipped
+            );
+        });
+    }
+
+    // an op that never joined is very often one whose child recorded an
+    // outcome nothing in the parent has read yet, so this write is guarded
+    // exactly as the terminal one is
+    #[test]
+    fn an_op_that_never_joined_does_not_overwrite_what_it_had_recorded() {
+        both(|db| {
+            let store = db.store();
+            store
+                .create_run(&mk_run("r1", "etl", Utc::now()), &["a".into()])
+                .unwrap();
+            store.op_started("r1", "a", 1).unwrap();
+            assert!(
+                store
+                    .op_finished(
+                        "r1",
+                        "a",
+                        OpStatus::Success,
+                        Some(&json!("stored")),
+                        None,
+                        None,
+                        &[],
+                    )
+                    .unwrap()
+            );
+
+            assert!(
+                !store
+                    .op_unstopped("r1", "a", "not observed to stop")
+                    .unwrap()
+            );
+
+            let row = store.op_run("r1", "a").unwrap().unwrap();
+            assert_eq!(row.status, OpStatus::Success);
+            assert_eq!(row.output, Some(json!("stored")));
+            assert!(row.finished_at.is_some());
+        });
+    }
+
     #[test]
     fn materialization_records_and_latest_wins() {
         both(|db| {
@@ -12261,11 +12632,11 @@ mod tests {
 
     /// a write that fails `n` times, then does what `then` does, counting the
     /// attempts it took.
-    fn flaky(
+    fn flaky<T>(
         n: u64,
         tries: &AtomicU64,
-        then: impl Fn() -> Result<(), Error>,
-    ) -> impl Fn() -> Result<(), Error> {
+        then: impl Fn() -> Result<T, Error>,
+    ) -> impl Fn() -> Result<T, Error> {
         move || match tries.fetch_add(1, Ordering::SeqCst) < n {
             true => Err(Error::Sqlite(rusqlite::Error::SqliteFailure(
                 rusqlite::ffi::Error::new(5),
@@ -12329,7 +12700,7 @@ mod tests {
         let store = Store::open(":memory:").unwrap();
         let tries = AtomicU64::new(0);
         let landed = store
-            .landed("op_finished", || {
+            .landed("op_finished", || -> Result<bool, Error> {
                 tries.fetch_add(1, Ordering::SeqCst);
                 Err(Error::Sqlite(rusqlite::Error::SqliteFailure(
                     rusqlite::ffi::Error::new(19),

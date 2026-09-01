@@ -128,6 +128,25 @@ fn jobs() -> Vec<Job> {
             .retry_delay(Duration::from_millis(10)))
             .build()
             .unwrap(),
+        // fails its first attempt the ordinary way, so its child records
+        // `failed` on the op row itself before the parent decides to retry it.
+        // that makes this the one path that writes a terminal op row twice
+        // without either write being a mistake, and `op_started` is what sits
+        // between them
+        Job::builder("failed_then_worked")
+            .op(Op::new("try_again", |_| async {
+                let marker = marker_named("failed_then_worked");
+                if !marker.exists() {
+                    std::fs::write(&marker, b"first attempt was here").unwrap();
+                    return Err("the vendor hung up".into());
+                }
+                Ok(json!({ "attempt": 2 }))
+            })
+            .isolated()
+            .retries(1)
+            .retry_delay(Duration::from_millis(10)))
+            .build()
+            .unwrap(),
         // one permit, one isolated op and one in-process op that both want it
         Job::builder("pooled")
             .op(
@@ -422,6 +441,11 @@ async fn cases(db: &str) {
     case(
         "a_retry_captures_its_output_as_a_separate_attempt",
         attempts_are_separate(&runner),
+    )
+    .await;
+    case(
+        "a_retry_writes_over_the_failed_row_its_own_child_recorded",
+        the_retry_replaces_the_recorded_failure(&runner),
     )
     .await;
     case(
@@ -786,6 +810,42 @@ async fn attempts_are_separate(runner: &Runner) {
             (2, "attempt two, and it worked"),
         ],
         "a retry's output is not separable from the attempt it replaced"
+    );
+}
+
+/// the counter-case to "a terminal op row is not overwritten": a row that says
+/// `failed` because this op's own child wrote it there, and a second attempt
+/// that has every right to write over it.
+///
+/// it is the only path in hestan that writes an op's terminal row twice
+/// without either write being wrong, and what makes it legal is `op_started`
+/// putting the row back to `running` in between. a guard that refused a
+/// terminal row without that would leave this op `failed` on a run that
+/// succeeded.
+async fn the_retry_replaces_the_recorded_failure(runner: &Runner) {
+    let _ = std::fs::remove_file(marker_named("failed_then_worked"));
+    let run = runner
+        .run("failed_then_worked", json!({}), Trigger::Manual)
+        .await
+        .unwrap();
+    assert_eq!(run.status, RunStatus::Success, "{:?}", run.error);
+
+    let rows = runner.store().op_runs(&run.id).unwrap();
+    let again = row(&rows, "try_again");
+    assert_eq!(again.status, hestan::OpStatus::Success);
+    assert_eq!(again.attempts, 2);
+    assert_eq!(
+        again.error, None,
+        "the first attempt's error outlived the attempt that worked"
+    );
+    assert_eq!(again.output, Some(json!({ "attempt": 2 })));
+    // and the failure is still in the log, because it happened
+    let events = runner.store().events(&run.id, 0).unwrap();
+    assert!(
+        events.iter().any(|e| e.op.as_deref() == Some("try_again")
+            && e.kind == hestan::EventKind::OpRetry
+            && e.message.contains("the vendor hung up")),
+        "the attempt that failed left no trace"
     );
 }
 

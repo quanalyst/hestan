@@ -4378,9 +4378,19 @@ async fn stop_here(
     skip_downstream(job, pairs, &unit, &reason, pending, statuses, run_id, store).await
 }
 
+/// the row, then the event, and the event only if the row moved.
+///
+/// a cancel reaches ops the run believes are unfinished, and "believes" is the
+/// whole of it: an op whose own child recorded a skip a moment ago, and whose
+/// parent is still draining the pipes that child left behind, is an op this
+/// path is about to cancel and must not. the store declines the row, and the
+/// event goes with it, because an `op_canceled` beside an `op_skipped` for one
+/// attempt is a log saying two different things happened to it. the run's own
+/// `run_canceled` still records that somebody asked, so nothing about the
+/// request goes missing with it.
 async fn op_canceled(store: &Store, run_id: &str, name: &str) -> bool {
-    let landed = store
-        .landed("op_finished", || {
+    let moved = store
+        .landed_with("op_finished", || {
             store.op_finished(
                 run_id,
                 name,
@@ -4392,59 +4402,75 @@ async fn op_canceled(store: &Store, run_id: &str, name: &str) -> bool {
             )
         })
         .await;
-    note(store.append_event(
-        run_id,
-        Some(name),
-        EventLevel::Warn,
-        EventKind::OpCanceled,
-        "canceled",
-        Some(&json!({ "reason": "canceled", "stopped": true })),
-    ));
-    landed
+    if moved == Some(true) {
+        note(store.append_event(
+            run_id,
+            Some(name),
+            EventLevel::Warn,
+            EventKind::OpCanceled,
+            "canceled",
+            Some(&json!({ "reason": "canceled", "stopped": true })),
+        ));
+    }
+    moved.is_some()
 }
 
 /// canceled, and stopped: an [isolated](Op::isolated) op's process was
 /// signalled, killed and reaped, so this row gets a real finish time. that is
 /// the difference the subprocess buys: everywhere else hestan can only record
 /// what it asked for.
+///
+/// the process being gone is not the same fact as the op not having finished:
+/// a child that wrote its own terminal row and then exited is one this still
+/// signals and reaps, and one there is nothing left to record about. so the
+/// row is written first and the event follows it, as in `op_canceled`.
 async fn op_killed(store: &Store, run_id: &str, name: &str, msg: &str) -> bool {
-    note(store.append_event(
-        run_id,
-        Some(name),
-        EventLevel::Warn,
-        EventKind::OpCanceled,
-        msg,
-        // the process was signalled, killed and reaped, so this one is a fact
-        // about the work having stopped rather than about having asked it to
-        Some(&json!({ "reason": msg, "stopped": true })),
-    ));
-    store
-        .landed("op_finished", || {
+    let moved = store
+        .landed_with("op_finished", || {
             store.op_finished(run_id, name, OpStatus::Canceled, None, None, Some(msg), &[])
         })
-        .await
+        .await;
+    if moved == Some(true) {
+        note(store.append_event(
+            run_id,
+            Some(name),
+            EventLevel::Warn,
+            EventKind::OpCanceled,
+            msg,
+            // the process was signalled, killed and reaped, so this one is a
+            // fact about the work having stopped rather than about having
+            // asked it to
+            Some(&json!({ "reason": msg, "stopped": true })),
+        ));
+    }
+    moved.is_some()
 }
 
 // canceled, but only the request is a fact: the op never joined, so it gets no
-// finish time and an error that says exactly that
+// finish time and an error that says exactly that. an op that never joined is
+// very often one whose child recorded an outcome nothing in this process has
+// read yet, so this is guarded and ordered exactly as the two above are
 async fn op_unstopped(store: &Store, run_id: &str, name: &str, grace: Duration) -> bool {
     let msg = format!(
         "cancellation requested; this op was not observed to stop within {grace:?} \
          and may still be running (blocking work stops only if it polls ctx.is_cancelled())"
     );
-    note(store.append_event(
-        run_id,
-        Some(name),
-        EventLevel::Warn,
-        EventKind::OpCanceled,
-        &msg,
-        // `stopped` is the whole difference between this and the two above:
-        // the request is the fact, and whether the work stopped is not known
-        Some(&json!({ "reason": &msg, "stopped": false })),
-    ));
-    store
-        .landed("op_unstopped", || store.op_unstopped(run_id, name, &msg))
-        .await
+    let moved = store
+        .landed_with("op_unstopped", || store.op_unstopped(run_id, name, &msg))
+        .await;
+    if moved == Some(true) {
+        note(store.append_event(
+            run_id,
+            Some(name),
+            EventLevel::Warn,
+            EventKind::OpCanceled,
+            &msg,
+            // `stopped` is the whole difference between this and the two above:
+            // the request is the fact, and whether the work stopped is not known
+            Some(&json!({ "reason": &msg, "stopped": false })),
+        ));
+    }
+    moved.is_some()
 }
 
 #[allow(clippy::too_many_arguments)]
