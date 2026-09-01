@@ -600,10 +600,11 @@ function JobView({ name }: { name: string }) {
         </>
       )}
 
-      {/* one job, so nothing to fold: no chips, and the row is drawn in the
-          ink every other row is */}
+      {/* one job, so there is no outline to draw: the group is handed over as
+          null rather than becoming a group row of one, and the row is drawn in
+          the ink every other row is */}
       <TimelinePlot
-        jobs={[job]}
+        jobs={[{ name: job.name, group: null, group_hue: null }]}
         runs={tlRuns}
         upcoming={upcoming}
         windowSecs={windowSecs}

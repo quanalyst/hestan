@@ -5,6 +5,7 @@ import "./backfill.test";
 import "./catalog.test";
 import "./colour.test";
 import "./fanout.test";
+import "./gutter.test";
 import "./lineage.test";
 import "./log.test";
 import "./markdown.test";

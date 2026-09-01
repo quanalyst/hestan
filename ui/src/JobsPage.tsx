@@ -6,7 +6,7 @@ import MicroBars from "./MicroBars";
 import type { MicroBar } from "./MicroBars";
 import StatusDot from "./StatusDot";
 import TimelinePlot, { futureWindowSecs } from "./TimelinePlot";
-import { foldParam, foldedFrom, toggleFold as toggle } from "./timeline";
+import { openFrom, openParam, toggleOpen as toggle } from "./timeline";
 import type { JobSummary, LateEntry, Run, UpcomingSchedule } from "./types";
 import { durationMs, fmtDuration, relTime } from "./util";
 
@@ -35,15 +35,17 @@ export default function JobsPage() {
       },
       { replace: true },
     );
-  // which groups the timeline draws as one row, beside the namespace filter
-  // and for the same reason: a folded view is a link somebody can send
-  const folded = foldedFrom(params.get("folded"));
-  const toggleFold = (group: string) =>
+  // which groups on the timeline have their job rows showing, beside the
+  // namespace filter and for the same reason: an opened view is a link
+  // somebody can send. groups open shut, so the parameter carries what is
+  // open, which is the shorter half of the answer
+  const opened = openFrom(params.get("open"));
+  const toggleOpen = (group: string) =>
     setParams(
       (prev) => {
-        const next = foldParam(toggle(folded, group));
-        if (next === "") prev.delete("folded");
-        else prev.set("folded", next);
+        const next = openParam(toggle(opened, group));
+        if (next === "") prev.delete("open");
+        else prev.set("open", next);
         return prev;
       },
       { replace: true },
@@ -154,8 +156,8 @@ export default function JobsPage() {
         upcoming={upcoming}
         windowSecs={windowSecs}
         onWindow={setWindowSecs}
-        folded={folded}
-        onFold={toggleFold}
+        open={opened}
+        onOpen={toggleOpen}
       />
 
       {namespaces.length > 0 && (

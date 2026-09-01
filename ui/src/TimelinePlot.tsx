@@ -6,23 +6,12 @@ import { clampTipX, DIM, HatchPattern } from "./chart";
 import { GlyphShape } from "./StatusGlyph";
 import StatusDot from "./StatusDot";
 import { at } from "./Swatch";
-import {
-  BAR_H,
-  NONE,
-  TOP,
-  failuresIn,
-  groupsOf,
-  hueOf,
-  laneLabel,
-  lanesOf,
-  place,
-  rowsOf,
-} from "./timeline";
-import type { Bar, TimelineJob } from "./timeline";
+import TimelineGutter from "./TimelineGutter";
+import { BAR_H, GUTTER, NONE, TOP, failuresIn, hueOf, lanesOf, place, rowsOf } from "./timeline";
+import type { Bar, Row, TimelineJob } from "./timeline";
 import type { OpRun, Run, RunStatus, UpcomingSchedule } from "./types";
 import { clockTime, durationMs, fmtDuration, shortId } from "./util";
 
-const GUTTER = 168;
 const AXIS_H = 24;
 const MIN_BAR_W = 4;
 const FUTURE = 0.15; // fraction of the axis right of the now line
@@ -75,19 +64,19 @@ export default function TimelinePlot({
   upcoming,
   windowSecs,
   onWindow,
-  folded = NONE,
-  onFold,
+  open = NONE,
+  onOpen,
 }: {
   jobs: TimelineJob[];
   runs: Run[];
   upcoming: UpcomingSchedule[];
   windowSecs: number;
   onWindow: (secs: number) => void;
-  // which groups are drawn as one row, and how to turn one of them around.
-  // both absent is a plot that offers no folding, which is what a page
-  // showing one job wants
-  folded?: ReadonlySet<string>;
-  onFold?: (group: string) => void;
+  // which groups have their job rows showing under them, and how to turn one
+  // of them around. both absent is a plot with no outline to work, which is
+  // what a page showing one job wants
+  open?: ReadonlySet<string>;
+  onOpen?: (group: string) => void;
 }) {
   const nav = useNavigate();
   const hatch = useId();
@@ -107,11 +96,8 @@ export default function TimelinePlot({
   for (const r of runs) {
     if (!all.some((j) => j.name === r.job)) all.push({ name: r.job, group: null, group_hue: null });
   }
-  const lanes = lanesOf(all, folded);
+  const lanes = lanesOf(all, open);
   const hasLanes = lanes.length > 0;
-  // the groups on this plot, which is what the chips fold. a group whose every
-  // job was filtered out has no row here to fold, so it gets no chip either
-  const groups = groupsOf(all);
 
   useEffect(() => {
     const el = wrapRef.current;
@@ -163,24 +149,6 @@ export default function TimelinePlot({
     </h2>
   );
 
-  // the same chips the catalog folds a group with. nothing declares a group in
-  // most deployments, and that case gets no row of chips at all rather than
-  // the word "fold" with nothing after it
-  const chips = onFold && groups.length > 0 && (
-    <div className="group-chips">
-      <span className="filter-label">fold</span>
-      {groups.map((g) => (
-        <button
-          key={g}
-          className={folded.has(g) ? "text-btn active" : "text-btn"}
-          onClick={() => onFold(g)}
-        >
-          {g}
-        </button>
-      ))}
-    </div>
-  );
-
   if (!hasLanes)
     return (
       <>
@@ -193,7 +161,6 @@ export default function TimelinePlot({
     return (
       <>
         {header}
-        {chips}
         <div className="tl" ref={wrapRef} />
       </>
     );
@@ -213,9 +180,9 @@ export default function TimelinePlot({
     else byJob.set(run.job, [bar]);
   }
 
-  // a folded row's bars are every member's, packed by the same rule one job's
-  // row has always used, so the fold changes how many rows there are and never
-  // how many bars
+  // a group row's bars are every member's, packed by the same rule one job's
+  // row has always used. opening a group adds rows and never takes a bar off
+  // the group's own
   const rows = rowsOf(lanes, byJob);
   const plotBottom = rows.reduce((y, row) => y + row.h, TOP);
 
@@ -231,22 +198,37 @@ export default function TimelinePlot({
   const ticks: number[] = [];
   for (let t = midnight.getTime(); t <= t1; t += step) if (t >= t0) ticks.push(t);
 
-  // one entry per run, and one rect below per entry: nothing between here and
-  // the svg drops a bar, which is what a fold has to leave true
+  // one entry per run per row it is on, and one rect below per entry: nothing
+  // between here and the svg drops a bar
   const placed = place(rows, { x, nowX, gutter: GUTTER, minBarW: MIN_BAR_W });
 
-  // a ghost lands on whatever row its job's runs land on, which for a member
-  // of a folded group is the group's
-  const rowByJob = new Map(rows.flatMap((r) => r.lane.jobs.map((job) => [job, r] as const)));
-  const ghosts = upcoming.flatMap((u) => {
-    const row = rowByJob.get(u.job);
-    if (!row) return [];
-    return u.times
-      .map((iso) => ({ iso, t: new Date(iso).getTime() }))
-      .filter(({ t }) => t > now && t <= t1)
-      // a fire at exactly t1 maps to the plot edge; keep the 3px ghost inside
-      .map(({ iso, t }) => ({ job: u.job, expr: u.expr, iso, gx: Math.min(x(t), width - 1.5), gy: row.y + (row.h - BAR_H) / 2 }));
-  });
+  // a ghost lands on every row its job's runs land on, which inside an open
+  // group is the group's row and the job's own
+  const rowsByJob = new Map<string, Row[]>();
+  for (const row of rows)
+    for (const job of row.lane.jobs) {
+      const held = rowsByJob.get(job);
+      if (held) held.push(row);
+      else rowsByJob.set(job, [row]);
+    }
+  const ghosts = upcoming.flatMap((u) =>
+    (rowsByJob.get(u.job) ?? []).flatMap((row) =>
+      u.times
+        .map((iso) => ({ iso, t: new Date(iso).getTime() }))
+        .filter(({ t }) => t > now && t <= t1)
+        // a fire at exactly t1 maps to the plot edge; keep the 3px ghost inside
+        .map(({ iso, t }) => ({
+          // the row, and the schedule on it: two jobs of one group can be due
+          // at the same moment, and both land on the group's row
+          key: `${row.lane.key}|${u.job}|${u.expr}|${iso}`,
+          job: u.job,
+          expr: u.expr,
+          iso,
+          gx: Math.min(x(t), width - 1.5),
+          gy: row.y + (row.h - BAR_H) / 2,
+        })),
+    ),
+  );
 
   const present = (["success", "failed", "running", "queued", "canceled"] as RunStatus[]).filter((s) =>
     placed.some((b) => b.run.status === s),
@@ -258,8 +240,6 @@ export default function TimelinePlot({
   const failures = stripFits ? failuresIn(placed) : [];
   const stripH = failures.length ? STRIP_H : 0;
   const height = plotBottom + stripH + AXIS_H;
-
-  const truncate = (s: string) => (s.length > 23 ? s.slice(0, 22) + "…" : s);
 
   const clampX = (v: number) => Math.min(Math.max(v, GUTTER), width);
 
@@ -359,7 +339,6 @@ export default function TimelinePlot({
   return (
     <>
       {header}
-      {chips}
       <div className="tl" ref={wrapRef}>
         <svg width={width} height={height} onMouseDown={startBrush}>
           <HatchPattern id={hatch} />
@@ -383,23 +362,19 @@ export default function TimelinePlot({
             </g>
           ))}
 
-          {rows.map((row, i) => (
-            <g key={row.lane.key}>
-              {i > 0 && <line className="tl-row" x1={GUTTER} y1={px(row.y)} x2={width} y2={px(row.y)} />}
-              <text
-                className="tl-label"
-                x={GUTTER - 10}
-                y={row.y + row.h / 2}
-                textAnchor="end"
-                dominantBaseline="central"
-              >
-                {truncate(laneLabel(row.lane))}
-                {/* a folded row says which jobs it swallowed, since the label
-                    itself only has room for the count */}
-                {row.lane.group !== null && <title>{row.lane.jobs.join(", ")}</title>}
-              </text>
-            </g>
-          ))}
+          {rows.map((row, i) =>
+            i === 0 ? null : (
+              <line
+                key={row.lane.key}
+                className="tl-row"
+                x1={GUTTER}
+                y1={px(row.y)}
+                x2={width}
+                y2={px(row.y)}
+              />
+            ),
+          )}
+          <TimelineGutter rows={rows} onToggle={onOpen} />
           <line className="tl-row" x1={GUTTER} y1={px(plotBottom)} x2={width} y2={px(plotBottom)} />
 
           {failures.length > 0 && (
@@ -434,11 +409,15 @@ export default function TimelinePlot({
           )}
 
           {placed.map((b) => {
+            // the same run on an open group's row and on its job's row lights
+            // up on both when either is under the cursor: the tip is keyed by
+            // the run, and saying "these two marks are one run" is worth more
+            // than lighting only the one being pointed at
             const hot = tip?.key === b.run.id;
             if (b.run.status === "queued")
               return (
                 <rect
-                  key={b.run.id}
+                  key={b.key}
                   className={hot ? "bar bar-hot" : "bar"}
                   x={b.bx + 0.5}
                   y={b.by + 0.5}
@@ -453,7 +432,7 @@ export default function TimelinePlot({
             if (b.run.status === "canceled")
               return (
                 <rect
-                  key={b.run.id}
+                  key={b.key}
                   className={hot ? "bar bar-hot" : "bar"}
                   x={b.bx}
                   y={b.by}
@@ -464,14 +443,14 @@ export default function TimelinePlot({
                   fillOpacity={DIM}
                 />
               );
-            // a folded row's bars carry the group's hue, and a failed one
+            // a row inside a group carries that group's hue, and a failed bar
             // carries none: `hueOf` says why. the group is named in the gutter
             // beside the row either way, so the colour is never the only thing
             // carrying it
             const hue = hueOf(b);
             return (
               <rect
-                key={b.run.id}
+                key={b.key}
                 className={`${hot ? "bar bar-hot" : "bar"}${b.run.status === "running" ? " tl-running" : ""}${
                   hue === null ? "" : " tl-hued"
                 }`}
@@ -488,7 +467,7 @@ export default function TimelinePlot({
 
           {ghosts.map((g) => (
             <rect
-              key={`${g.job}:${g.expr}:${g.iso}`}
+              key={g.key}
               className="tl-ghost"
               x={g.gx - 1.5}
               y={g.gy}
@@ -527,7 +506,7 @@ export default function TimelinePlot({
             const hw = Math.max(b.bw, 12);
             return (
               <rect
-                key={b.run.id}
+                key={b.key}
                 data-hit="1"
                 x={b.bx + b.bw / 2 - hw / 2}
                 y={b.by - 3}
@@ -556,7 +535,7 @@ export default function TimelinePlot({
           })}
           {ghosts.map((g) => (
             <rect
-              key={`${g.job}:${g.expr}:${g.iso}`}
+              key={g.key}
               data-hit="1"
               x={g.gx - 6}
               y={g.gy - 3}
@@ -566,7 +545,7 @@ export default function TimelinePlot({
               style={{ cursor: "pointer" }}
               onMouseEnter={() =>
                 setTip({
-                  key: `${g.job}:${g.expr}:${g.iso}`,
+                  key: g.key,
                   x: g.gx,
                   y: g.gy,
                   node: (

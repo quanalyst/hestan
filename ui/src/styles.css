@@ -756,10 +756,59 @@ button.text-btn.active {
   padding-bottom: 7px;
 }
 
-/* a bar on a folded row, in the group's own hue. the group is written in the
-   gutter beside it, so the colour says which group faster and never alone */
+/* a bar on a row inside a group, in that group's own hue. the group is written
+   in the gutter beside it, so the colour says which group faster and never
+   alone */
 .tl-hued {
   fill: hsl(var(--h) var(--hue-sat) var(--hue-light));
+}
+
+/* the block behind a name in the gutter: the group's own hue, the full height
+   of the row, and the same on the group's row as on its jobs' rows, so the
+   colour reads as one band rather than a mark per row.
+   the angle arrives in --h from `at`, which is the only thing in this ui that
+   emits one; the wash is this end's, because this end knows a name is drawn on
+   it. picked by checking --ink2 against the block over both grounds at all 360
+   angles: at 22% the worst is 6.12:1 light (hue 240 on --page) and 4.99:1 dark
+   (hue 60 on --surface), and the next step up drops under the 4.5:1 small text
+   needs */
+.tl-block {
+  fill: hsl(var(--h) var(--hue-sat) var(--hue-light));
+  fill-opacity: 0.22;
+}
+
+/* the disclosure on a group's row. the whole gutter row is the target, so the
+   name is what you click, and it is a real button so the keyboard reaches it */
+.tl-disc {
+  display: flex;
+  align-items: center;
+  width: 100%;
+  height: 100%;
+  padding: 0 0 0 6px;
+  border: 0;
+  background: none;
+  cursor: pointer;
+}
+
+.tl-disc:focus-visible {
+  /* inside the edge, because the button is the size of its foreignObject and
+     an outline drawn outside one is clipped */
+  outline: 2px solid var(--ink);
+  outline-offset: -2px;
+}
+
+.tl-caret {
+  fill: var(--muted);
+  transition: transform 0.12s ease;
+}
+
+.tl-caret-open {
+  transform: rotate(90deg);
+}
+
+.tl-disc:hover .tl-caret,
+.tl-disc:focus-visible .tl-caret {
+  fill: var(--ink);
 }
 
 .tl-running {
@@ -1542,6 +1591,10 @@ table.plain-rows tbody tr:hover {
   .tl-running,
   .part-cell.running {
     animation: none;
+  }
+
+  .tl-caret {
+    transition: none;
   }
 }
 
