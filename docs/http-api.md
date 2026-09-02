@@ -255,7 +255,7 @@ my run" and "which one has gone quiet".
     "name": "prod-eu",
     "build": "9f2c1ab",
     "hestan": {
-      "version": "0.2.1",
+      "version": "0.2.2",
       "schema": 24,
       "features": ["bundled", "cli", "postgres"],
       "platform": "linux/aarch64",

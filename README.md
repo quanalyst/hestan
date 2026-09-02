@@ -20,7 +20,7 @@ where a break lands.
 
 ```toml
 [dependencies]
-hestan = "0.2.1"
+hestan = "0.2.2"
 tokio = { version = "1", features = ["full"] }
 ```
 
@@ -72,7 +72,7 @@ Hestan::new()
 ```
 
 ```toml
-hestan = { version = "0.2.1", features = ["http"] }
+hestan = { version = "0.2.2", features = ["http"] }
 ```
 
 transport errors, 429s, and 5xx responses are retried with capped exponential
@@ -527,7 +527,7 @@ release notes are in [CHANGELOG.md](CHANGELOG.md).
 
 ```toml
 [dependencies]
-hestan = "0.2.1"
+hestan = "0.2.2"
 ```
 
 the binary is yours: define jobs, then `Hestan::new()...serve(addr)`, or

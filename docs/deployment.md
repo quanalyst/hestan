@@ -79,7 +79,7 @@ the page because a release build running ten times slower than expected is the
 reason somebody looks.
 
 **hestan's version is never offered in place of yours.** a deployment that
-declared no build reads `"build": null` beside `"version": "0.2.1"`, and
+declared no build reads `"build": null` beside `"version": "0.2.2"`, and
 the two are in different halves of the object for exactly that reason.
 
 ## Where it surfaces
@@ -92,7 +92,7 @@ the two are in different halves of the object for exactly that reason.
     "name": "prod-eu",
     "build": "9f2c1ab",
     "hestan": {
-      "version": "0.2.1",
+      "version": "0.2.2",
       "schema": 24,
       "features": ["bundled", "cli", "postgres"],
       "platform": "linux/aarch64",
@@ -107,7 +107,7 @@ about:
 
 ```
 ok    deployment prod-eu, running build 9f2c1ab
-ok    hestan     0.2.1 in this deployment's binary, linux/aarch64, features: bundled cli postgres
+ok    hestan     0.2.2 in this deployment's binary, linux/aarch64, features: bundled cli postgres
 ```
 
 **`hestan doctor --db /var/lib/hestan/hestan.db` reports the operator binary's

@@ -745,7 +745,7 @@ worse than one that says it has. `load older` walks back a page at a time.
 under the heading, two lines saying **what this deployment is**. the first is
 its declared name, the build of your application it runs, and the hestan
 version and platform compiled into it: `prod-eu · build 9f2c1ab · hestan
-0.2.1 on linux/aarch64`. a deployment that declared no build says `build
+0.2.2 on linux/aarch64`. a deployment that declared no build says `build
 not declared` rather than putting hestan's own version where yours would go,
 which would be a confident answer to a different question. **said once, and
 here**, for the reason the deciding line below is: which build is running is a

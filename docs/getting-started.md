@@ -22,7 +22,7 @@ declared. to track the repository instead of the release, with a tag
 or a sibling checkout for hacking on both at once:
 
 ```toml
-hestan = { git = "https://github.com/quanalyst/hestan", tag = "v0.2.1" }
+hestan = { git = "https://github.com/quanalyst/hestan", tag = "v0.2.2" }
 hestan = { path = "../hestan" }
 ```
 

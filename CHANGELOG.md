@@ -1,8 +1,9 @@
 # changelog
 
-## unreleased
+## 0.2.2 (2026-09-02)
 
-three things the deployment running 0.2.1 reported.
+three things the deployment running 0.2.1 reported. no api moved, so this is a
+patch and `cargo update` takes it.
 
 ### Fixed: the run timeline is grey again
 

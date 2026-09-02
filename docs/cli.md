@@ -361,7 +361,7 @@ thing it is about is worse than no check at all.
 ```
 $ orders doctor
 ok    deployment prod-eu, running build 9f2c1ab
-ok    hestan     0.2.1 in this deployment's binary, linux/aarch64,
+ok    hestan     0.2.2 in this deployment's binary, linux/aarch64,
                  features: bundled cli postgres
 ok    store      sqlite at /var/lib/hestan.db, schema v24
 ok    writes     the store took a write lock and gave it back
