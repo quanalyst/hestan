@@ -767,12 +767,15 @@ button.text-btn.active {
    needs */
 .tl-block {
   fill: hsl(var(--h) var(--hue-sat) var(--hue-light));
-  fill-opacity: 0.22;
 }
 
 /* the disclosure on a group's row. the whole gutter row is the target, so the
    name is what you click, and it is a real button so the keyboard reaches it */
-.tl-disc {
+.tl-disc,
+/* the page's own `button:hover` paints a button `--ink2` and this one sits on
+   top of the name it opens, so without the hover here the row goes dark and
+   the name it is named after disappears under it */
+.tl-disc:hover:not(:disabled) {
   display: flex;
   align-items: center;
   width: 100%;

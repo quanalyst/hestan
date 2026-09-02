@@ -16,8 +16,10 @@ const LABEL_X = GUTTER - 10;
 // how far a job row steps back inside its group. the alignment edge is the
 // right one, so nesting steps away from it
 const INDENT = 12;
-// the block, from the left edge across to just short of the bars
-const BLOCK_W = GUTTER - 10;
+// the band down the left edge. narrow on purpose: it says which group a row
+// belongs to and hands the rest of the gutter back to the name, which has to
+// stay readable on the page's own ground rather than on a wash of colour
+const BLOCK_W = 5;
 // the column the disclosure sits in, kept clear of a group's name
 const DISC_W = 22;
 // what an ungrouped name is kept clear of the left edge by
@@ -92,7 +94,7 @@ export default function TimelineGutter({
             {group !== null && onToggle && (
               // the whole of the gutter row is the target, so the name is what
               // you click, and the row it opens is the row you are on
-              <foreignObject x={0} y={row.y} width={BLOCK_W} height={row.h}>
+              <foreignObject x={0} y={row.y} width={LABEL_X} height={row.h}>
                 <button
                   type="button"
                   className="tl-disc"

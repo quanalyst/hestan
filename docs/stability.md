@@ -1,6 +1,6 @@
 # Stability
 
-hestan is `0.2.2`, which is a 0.x version and therefore one that says out loud
+hestan is `0.2.3`, which is a 0.x version and therefore one that says out loud
 that it will move. this page is what it will not move, so that something can be
 built on it in the meantime.
 
@@ -11,15 +11,15 @@ what moved and what to write instead.**
 
 ## The version
 
-cargo reads `hestan = "0.2.2"` as `>=0.2.2, <0.3.0`, so under 0.x the **minor
-number is the compatibility number**. a `0.2.3` is additions and fixes and
+cargo reads `hestan = "0.2.3"` as `>=0.2.3, <0.3.0`, so under 0.x the **minor
+number is the compatibility number**. a `0.2.4` is additions and fixes and
 `cargo update` takes it; a break lands on `0.3.0`, which the same requirement
 refuses until somebody edits the manifest.
 
-`0.2.1` and `0.2.2` are what that looks like from the other side: fixes and a
-redrawn page in the ui, nothing added or moved on any public type, and `cargo
-update` takes them without being asked because there is nothing in either to be
-asked about.
+`0.2.1` through `0.2.3` are what that looks like from the other side: fixes and
+a redrawn page in the ui, nothing added or moved on any public type, and `cargo
+update` takes them without being asked because there is nothing in any of them
+to be asked about.
 
 `0.2.0` was the first release to spend the minor number. it carried no source
 break at all and two changes to what an unchanged deployment does, and either

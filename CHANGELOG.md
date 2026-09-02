@@ -1,5 +1,27 @@
 # changelog
 
+## 0.2.3 (2026-09-02)
+
+both of these were found by opening the page in a browser.
+
+### Fixed: hovering a group hid its name
+
+the page styles every `button` and paints it `--ink2` on hover. the gutter's
+disclosure is a button covering the row it opens, and it had no hover rule of
+its own, so the global one won on specificity: hovering a group turned the row
+dark and the name went with it. it now keeps its own background in every state.
+
+**it was found by opening the page in a browser**, which is the only way it was
+ever going to be found. the tests render the gutter to markup and assert what
+is in it, and a rule that only applies on `:hover` is not in it.
+
+### The group's colour is a band, not a wash
+
+the block behind a name spanned the whole gutter, so a deployment with groups
+had a column of colour rather than a plot with colour in it. it is a narrow
+band down the left edge now, at full strength rather than a wash, and the name
+sits back on the page's own ground where it is readable.
+
 ## 0.2.2 (2026-09-02)
 
 three things the deployment running 0.2.1 reported. no api moved, so this is a

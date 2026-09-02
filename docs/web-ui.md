@@ -126,12 +126,13 @@ drawn twice**, once on the group's row as part of the group's load and once on
 its job's row as itself. that is what opening one is for, and the two marks are
 one run: pointing at either lights both.
 
-every row inside a group carries a block of the group's [hue](assets.md#colour)
-behind its name, the full height of the row and the same on the group's row as
-on its jobs' rows, so the colour reads as one band down the gutter rather than
-a mark per row. the block is a wash of the group's angle rather than the angle
-itself, at the one strength that keeps a name on it readable against both
-themes. a job in no group carries no block.
+every row inside a group carries a narrow band of the group's
+[hue](assets.md#colour) down the left edge of the gutter, the full height of the
+row and the same on the group's row as on its jobs' rows, so consecutive rows
+abut and the colour reads as one band rather than a mark per row. it is a band
+rather than a wash behind the name because a name is easier to read on the
+page's own ground than on a colour, and the gutter is mostly names. a job in no
+group carries no band.
 
 **the bars carry no hue at all.** the plot is greys: a run says what it did by
 its shape and its fill, a failure by its hatch and its × in the strip under the
@@ -745,7 +746,7 @@ worse than one that says it has. `load older` walks back a page at a time.
 under the heading, two lines saying **what this deployment is**. the first is
 its declared name, the build of your application it runs, and the hestan
 version and platform compiled into it: `prod-eu · build 9f2c1ab · hestan
-0.2.2 on linux/aarch64`. a deployment that declared no build says `build
+0.2.3 on linux/aarch64`. a deployment that declared no build says `build
 not declared` rather than putting hestan's own version where yours would go,
 which would be a confident answer to a different question. **said once, and
 here**, for the reason the deciding line below is: which build is running is a
