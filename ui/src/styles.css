@@ -756,13 +756,6 @@ button.text-btn.active {
   padding-bottom: 7px;
 }
 
-/* a bar on a row inside a group, in that group's own hue. the group is written
-   in the gutter beside it, so the colour says which group faster and never
-   alone */
-.tl-hued {
-  fill: hsl(var(--h) var(--hue-sat) var(--hue-light));
-}
-
 /* the block behind a name in the gutter: the group's own hue, the full height
    of the row, and the same on the group's row as on its jobs' rows, so the
    colour reads as one band rather than a mark per row.

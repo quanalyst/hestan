@@ -110,6 +110,11 @@ a row three sub-lanes tall. a group makes the plot shorter and never quieter:
 drawing the first run and hiding the rest would make a busy period look like a
 quiet one, which is a worse lie than showing no group at all.
 
+**the gutter is alphabetical**, groups and ungrouped jobs on one list: a group
+sorts by its name, a job in no group by its own, and the jobs inside an open
+group by theirs. a reader looking for a word finds it where the word falls
+rather than where the deployment happened to declare it.
+
 **a group starts shut**, so a deployment that declares one opens on a row per
 group rather than a row per job. the disclosure is in the gutter on the group's
 own row: the whole of that row is the target, so the name is what you click,
@@ -128,14 +133,17 @@ a mark per row. the block is a wash of the group's angle rather than the angle
 itself, at the one strength that keeps a name on it readable against both
 themes. a job in no group carries no block.
 
-the bars on those rows carry the group's hue too, except where the outcome
-already has a mark of its own: a failure keeps its hatch and its × in the strip
-under the plot, a queued run its hollow outline, a canceled one its dimmed
-grey. shape carries state here, and a colour where an outcome already is would
-be a colour meaning two things. the group is written in the gutter beside the
-row, so the hue is never the only thing carrying it. a failure inside a shut
-group still reaches the strip, and a failure inside an open one gets one × and
-not two: a run drawn twice is still one run that failed.
+**the bars carry no hue at all.** the plot is greys: a run says what it did by
+its shape and its fill, a failure by its hatch and its × in the strip under the
+plot, a queued run by its hollow outline, a canceled one by its dimmed grey.
+that is what leaves hue free to mean where work came from, and the block in the
+gutter is the whole of where it says it. a plot that was also coloured by group
+would be a screen where colour meant two things at once, and the group is
+already written in the gutter beside every row it belongs to.
+
+a failure inside a shut group still reaches the strip, and a failure inside an
+open one gets one × and not two: a run drawn twice is still one run that
+failed.
 
 which groups are open is in the url like every other view state
 (`/jobs?open=weather,eia`), so an opened view is a link somebody can send.

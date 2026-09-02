@@ -1,5 +1,36 @@
 # changelog
 
+## unreleased
+
+three things the deployment running 0.2.1 reported.
+
+### Fixed: the run timeline is grey again
+
+0.2.0 tinted a grouped run bar with its group's hue, and 0.2.1 then put a block
+of that hue behind the name in the gutter. With both, a deployment that
+declares groups had colour on every bar and every row, which is not what this
+ui is: **the plot is greys because a run's shape and fill say what it did, and
+that is what leaves hue free to mean where the work came from.**
+
+the bars are `--mark` again, as they were before groups existed. the gutter
+block stays and is now the only place a hue appears on the page. this reverses
+part of 0.2.0 deliberately: the block is what the colour was wanted for, and
+two carriers of one meaning is one too many.
+
+### The gutter sorts by name
+
+rows were ordered by whatever order the jobs were declared in, with a group
+standing where its first member happened to be. the gutter is now alphabetical,
+groups and ungrouped jobs on one list, and the jobs inside an open group sorted
+among themselves. a reader looking for a word finds it where the word falls.
+
+### hestan's own job says which group it is
+
+the internal `assets` job was the one lane in a deployment that could not be
+named or folded, because it is assembled inside the library rather than
+declared. it is now in the group `hestan`. a deployment with no assets
+registers no assets job and sees nothing new.
+
 ## 0.2.1 (2026-09-02)
 
 a fix for something 0.2.0 shipped, and the run timeline's grouping redone as an

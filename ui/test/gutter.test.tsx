@@ -86,7 +86,7 @@ test("the disclosure is a button that says which way the group goes", () => {
   assert.ok(shut.includes(">weather · 2<"), shut);
   // the row has room for the count and not for the names, so the names are on
   // the hover, on the control that covers them
-  assert.ok(shut.includes('title="weather_pull, weather_clean"'), shut);
+  assert.ok(shut.includes('title="weather_clean, weather_pull"'), shut);
   // shut, the caret points at the row it would add
   assert.equal(count(shut, /tl-caret-open/g), 0);
 
@@ -110,9 +110,9 @@ test("the disclosure is a button that says which way the group goes", () => {
 test("a job row is indented inside its group, and an ungrouped one is not", () => {
   const markup = draw(WEATHER, ["weather"]);
   const xs = [...markup.matchAll(/<text class="tl-label" x="(\d+)"/g)].map((m) => Number(m[1]));
-  // the group's name ends against the bars, its jobs step back from that edge,
-  // and the job in no group is where it always was
-  assert.deepEqual(xs, [158, 146, 146, 158]);
+  // the job in no group sorts first by its own name, then the group's name
+  // ends against the bars and its jobs step back from that edge
+  assert.deepEqual(xs, [158, 158, 146, 146]);
 });
 
 test("a name too long for the room it has is cut, and the cut is marked", () => {

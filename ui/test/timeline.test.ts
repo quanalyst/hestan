@@ -16,7 +16,6 @@ import {
   MIN_ROW_H,
   ROW_PAD,
   failuresIn,
-  hueOf,
   laneLabel,
   lanesOf,
   openFrom,
@@ -101,8 +100,9 @@ const OPEN = new Set(["weather"]);
 test("a shut group is drawn a bar per member run, not a bar for the first member", () => {
   const rows = rowsOf(lanesOf(WEATHER, SHUT), byJob(RUNS));
   // shut is the default, and a deployment with groups opens on one row per
-  // group rather than one per job
-  assert.deepEqual(labels(rows), ["weather · 3", "billing"]);
+  // group rather than one per job. `billing` is in none and sorts by its own
+  // name, so it comes first
+  assert.deepEqual(labels(rows), ["billing", "weather · 3"]);
 
   // the whole of it: the group is a row rather than a row per member, and
   // nothing at all changed about how many bars get drawn. `place` is the last
@@ -110,9 +110,9 @@ test("a shut group is drawn a bar per member run, not a bar for the first member
   assert.equal(drawn(rows).length, RUNS.length);
   assert.deepEqual(ids(drawn(rows)), ids(RUNS));
 
-  const weather = rows[0];
+  const weather = rows[1];
   assert.equal(weather.bars.length, 5);
-  assert.deepEqual(weather.lane.jobs, ["weather_pull", "weather_clean", "weather_derive"]);
+  assert.deepEqual(weather.lane.jobs, ["weather_clean", "weather_derive", "weather_pull"]);
   assert.equal(weather.lane.open, false);
 
   // and the density is in the height rather than lost: at minute 20 three runs
@@ -134,29 +134,29 @@ test("a shut group is drawn a bar per member run, not a bar for the first member
     }
   }
 
-  // three distinct rows of pixels on the group's row, and the group's hue on
-  // every bar of it. a row that stacked them would have one
-  const ys = new Set(drawn(rows).filter((b) => b.hue !== null).map((b) => b.by));
+  // three distinct rows of pixels on the group's row. a row that stacked them
+  // would have one
+  const ys = new Set(drawn([weather]).map((b) => b.by));
   assert.equal(ys.size, 3);
-  assert.deepEqual([...new Set(drawn(rows).map((b) => b.hue))].sort(), [200, null]);
 });
 
 test("an open group draws its aggregate and its job rows under it", () => {
   const rows = rowsOf(lanesOf(WEATHER, OPEN), byJob(RUNS));
-  // the group keeps its row and the jobs are added beneath it, in the order
-  // they were listed, with the ungrouped job left where it was
+  // the group keeps its row and the jobs are added beneath it, alphabetical
+  // within the group, with the ungrouped job sorted among the group names
   assert.deepEqual(labels(rows), [
+    "billing",
     "weather · 3",
-    "weather_pull",
     "weather_clean",
     "weather_derive",
-    "billing",
+    "weather_pull",
   ]);
   assert.deepEqual(
     rows.map((r) => r.lane.kind),
-    ["group", "job", "job", "job", "job"],
+    ["job", "group", "job", "job", "job"],
   );
-  assert.equal(rows[0].lane.open, true);
+  // the group is the second row: `billing` sorts ahead of it by name
+  assert.equal(rows[1].lane.open, true);
 
   // **every run of the group is drawn twice**: once on the group's row and
   // once on its job's. that is what opening one is for, and it is the thing a
@@ -175,28 +175,28 @@ test("an open group draws its aggregate and its job rows under it", () => {
   // the group's row is still packed as the group: three sub-lanes, three rows
   // of pixels. the job rows pack themselves, and a bar shared between the two
   // would leave the group laid out by whichever row packed it last
-  const group = rows[0];
+  const group = rows[1];
   assert.equal(group.laneCount, 3);
   const groupBars = drawn(rows).filter((b) => b.key.startsWith("group:"));
   assert.equal(groupBars.length, 5);
   assert.equal(new Set(groupBars.map((b) => b.by)).size, 3);
 
   // while a job's own row is as tall as that one job needs: two runs that do
-  // not overlap are one sub-lane
+  // not overlap are one sub-lane. only the group's row stacks
   assert.deepEqual(
-    rows.slice(1).map((r) => r.laneCount),
-    [1, 1, 1, 1],
+    rows.map((r) => r.laneCount),
+    [1, 3, 1, 1, 1],
   );
 
-  // every row inside the group carries the group's hue, which is what the
-  // gutter draws the block from and what the bars are drawn in
+  // every row inside the group carries the group's hue, which is the one thing
+  // the gutter draws its block from. nothing on the plot itself reads it
   assert.deepEqual(
     rows.map((r) => r.lane.hue),
-    [200, 200, 200, 200, null],
+    [null, 200, 200, 200, 200],
   );
   assert.deepEqual(
     rows.map((r) => r.lane.group),
-    ["weather", "weather", "weather", "weather", null],
+    [null, "weather", "weather", "weather", "weather"],
   );
 });
 
@@ -219,7 +219,7 @@ test("a deployment that declares no group has one row per job and no block on an
   // grouping to be had, so there is nothing here that any of those can change
   for (const open of [SHUT, OPEN, new Set(["etl"])]) {
     const rows = rowsOf(lanesOf(plain, open), byJob([bar("etl", 0, 10)]));
-    assert.deepEqual(labels(rows), ["etl", "billing", "cron_sweep"]);
+    assert.deepEqual(labels(rows), ["billing", "cron_sweep", "etl"]);
     // a row is a job's, so there is no disclosure to draw
     assert.deepEqual(
       rows.map((r) => r.lane.kind),
@@ -244,34 +244,30 @@ test("a deployment that declares no group has one row per job and no block on an
 
 test("a job in no group gets no block in a deployment that has one", () => {
   const rows = rowsOf(lanesOf(WEATHER, OPEN), byJob(RUNS));
-  const billing = rows[rows.length - 1];
+  // it sorts first on its own name, ahead of the group
+  const billing = rows[0];
   assert.equal(laneLabel(billing.lane), "billing");
   assert.equal(billing.lane.kind, "job");
   assert.equal(billing.lane.group, null, "no group, so no block behind the name");
   assert.equal(billing.lane.hue, null);
-  // and its bars are drawn in the ink everything else is
-  assert.deepEqual(
-    drawn(rows)
-      .filter((b) => b.run.job === "billing")
-      .map((b) => b.hue),
-    [null],
-  );
+  // and it is drawn like every other bar, because no bar carries a hue
+  assert.equal(drawn(rows).filter((b) => b.run.job === "billing").length, 1);
 });
 
-test("a group is a row where its first member was, and gathers the members listed apart from it", () => {
+test("the gutter is alphabetical, groups and ungrouped jobs on one list", () => {
   const mixed = [job("a", "one", 10), job("b", null), job("c", "one", 10), job("d", "two", 20)];
   const shut = rowsOf(lanesOf(mixed, SHUT), new Map());
-  // `one` stands where `a` was, `c` is gathered onto it from further down, and
-  // `b` keeps the place it had between them
-  assert.deepEqual(labels(shut), ["one · 2", "b", "two · 1"]);
-  assert.equal(shut[1].lane.group, null);
+  // `b` is in no group and sorts by its own name, so it comes before both
+  // groups rather than keeping the place it was declared in
+  assert.deepEqual(labels(shut), ["b", "one \u00b7 2", "two \u00b7 1"]);
+  assert.equal(shut[0].lane.group, null);
 
-  // and opening one group leaves the other where it was
+  // opening a group puts its jobs under it, alphabetical within the group
   const open = rowsOf(lanesOf(mixed, new Set(["one"])), new Map());
-  assert.deepEqual(labels(open), ["one · 2", "a", "c", "b", "two · 1"]);
+  assert.deepEqual(labels(open), ["b", "one \u00b7 2", "a", "c", "two \u00b7 1"]);
   assert.deepEqual(
     open.map((r) => r.lane.hue),
-    [10, 10, 10, null, 20],
+    [null, 10, 10, 10, 20],
   );
 });
 
@@ -290,15 +286,15 @@ test("a failed run inside a shut group still reaches the strip under the plot", 
   assert.deepEqual(ids(failuresIn(drawn(open))), ids(failuresIn(drawn(shut))));
   assert.equal(failuresIn(drawn(open)).length, 1);
 
-  // and it is drawn in no hue, so the hatch its status has is what it wears:
-  // shape carries state here, and a colour where an outcome already is would
-  // be a colour meaning two things
+  // and no bar carries a hue of its own. shape and fill say what a run did;
+  // hue says where work came from and lives in the gutter block, so nothing
+  // placed on the plot has a colour to be read two ways
   const bars = drawn(shut);
-  assert.equal(hueOf(failuresIn(bars)[0]), null);
-  // while everything else on the same row is the group's colour
-  const rest = bars.filter((b) => b.hue === 200 && b.run.status !== "failed");
-  assert.equal(rest.length, 4);
-  assert.deepEqual([...new Set(rest.map(hueOf))], [200]);
+  assert.ok(bars.length > 0);
+  assert.ok(
+    bars.every((b) => !("hue" in b)),
+    "a placed bar still carries a hue, which is what tinted the plot",
+  );
 });
 
 test("the open set round-trips through the url", () => {

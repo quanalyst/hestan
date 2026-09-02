@@ -23,6 +23,12 @@ use crate::whose::{Owner, check_namespace};
 /// the internal job every asset build runs under.
 pub(crate) const ASSETS_JOB: &str = "assets";
 
+/// what the assets job is grouped under. it is hestan's own work showing up in
+/// somebody's deployment, so it is named after hestan: a reader scanning the
+/// timeline can tell it apart from the jobs they wrote without knowing what
+/// the assets job is.
+pub(crate) const ASSETS_GROUP: &str = "hestan";
+
 /// how many asset builds execute at once unless a deployment says otherwise.
 ///
 /// builds used to be serialized, and a deployment that leaned on that for load
@@ -1291,7 +1297,10 @@ impl AssetRegistry {
             ops,
             external,
         )
-        .map(|job| job.with_max_concurrent_runs(DEFAULT_CONCURRENT_BUILDS))
+        .map(|job| {
+            job.with_max_concurrent_runs(DEFAULT_CONCURRENT_BUILDS)
+                .with_group(ASSETS_GROUP)
+        })
     }
 }
 
@@ -3047,6 +3056,28 @@ mod tests {
         );
         let said = reg_err(vec![echo("daily").namespace("finance ")]).to_string();
         assert!(said.contains("declare \"finance\""), "{said}");
+    }
+
+    // hestan's own job appears in a deployment's timeline whether or not
+    // anybody asked for it, so it says which group it is and folds like the
+    // rest. an ungrouped lane nobody declared is one nobody can put away
+    #[test]
+    fn the_assets_job_is_grouped_under_hestan() {
+        let reg = AssetRegistry::new(
+            vec![Asset::new("totals", |_| async { Ok(json!(1)) })],
+            Vec::new(),
+            Vec::new(),
+        )
+        .unwrap();
+        let job = reg.lower_job().unwrap();
+        assert_eq!(job.name(), ASSETS_JOB);
+        assert_eq!(
+            job.group(),
+            Some(ASSETS_GROUP),
+            "the assets job is an ungrouped lane in every deployment that has assets"
+        );
+        // and it is a group like any other: its hue comes from its name
+        assert_eq!(hue(ASSETS_GROUP), hue("hestan"));
     }
 
     // a multi-asset produces names rather than `Asset` values, so its

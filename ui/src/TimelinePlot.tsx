@@ -5,9 +5,8 @@ import { get } from "./api";
 import { clampTipX, DIM, HatchPattern } from "./chart";
 import { GlyphShape } from "./StatusGlyph";
 import StatusDot from "./StatusDot";
-import { at } from "./Swatch";
 import TimelineGutter from "./TimelineGutter";
-import { BAR_H, GUTTER, NONE, TOP, failuresIn, hueOf, lanesOf, place, rowsOf } from "./timeline";
+import { BAR_H, GUTTER, NONE, TOP, failuresIn, lanesOf, place, rowsOf } from "./timeline";
 import type { Bar, Row, TimelineJob } from "./timeline";
 import type { OpRun, Run, RunStatus, UpcomingSchedule } from "./types";
 import { clockTime, durationMs, fmtDuration, shortId } from "./util";
@@ -443,24 +442,20 @@ export default function TimelinePlot({
                   fillOpacity={DIM}
                 />
               );
-            // a row inside a group carries that group's hue, and a failed bar
-            // carries none: `hueOf` says why. the group is named in the gutter
-            // beside the row either way, so the colour is never the only thing
-            // carrying it
-            const hue = hueOf(b);
+            // a bar takes no hue. what a run is doing is carried by its shape
+            // and its fill, and that is what leaves hue free to mean where the
+            // work came from; the gutter block beside the row is where that
+            // lives, and it is the only place on this page colour appears
             return (
               <rect
                 key={b.key}
-                className={`${hot ? "bar bar-hot" : "bar"}${b.run.status === "running" ? " tl-running" : ""}${
-                  hue === null ? "" : " tl-hued"
-                }`}
-                style={hue === null ? undefined : at(hue)}
+                className={`${hot ? "bar bar-hot" : "bar"}${b.run.status === "running" ? " tl-running" : ""}`}
                 x={b.bx}
                 y={b.by}
                 width={b.bw}
                 height={BAR_H}
                 rx={1}
-                fill={b.run.status === "failed" ? `url(#${hatch})` : hue === null ? "var(--mark)" : undefined}
+                fill={b.run.status === "failed" ? `url(#${hatch})` : "var(--mark)"}
               />
             );
           })}

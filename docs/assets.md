@@ -53,6 +53,12 @@ appears in the jobs table like any other. one consequence: launching the
 every derived asset, ignoring staleness; the build endpoints below are the
 incremental path.
 
+**it is in the group `hestan`**, which is the one group a deployment does not
+declare. the job is hestan's own work turning up in your timeline, so it is
+named after hestan rather than after anything you wrote, and it folds and takes
+a colour like any other group. a deployment with no assets registers no assets
+job and has no such group.
+
 a source contributes no op to that job. its "value" is null everywhere: a
 derived fn whose dep is a source reads the external data itself, and the dep
 exists so staleness can flow, not to carry bytes.

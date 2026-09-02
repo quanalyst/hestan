@@ -154,6 +154,15 @@ impl Job {
         self
     }
 
+    /// the group of a job that was [assembled](Job::assemble) rather than
+    /// built. the internal assets job is lowered from a graph and has no
+    /// builder to declare one on, and a deployment with assets should not have
+    /// one permanent lane it never named and cannot fold.
+    pub(crate) fn with_group(mut self, group: impl Into<String>) -> Job {
+        self.group = Some(group.into());
+        self
+    }
+
     /// what a schedule of this job does when it fires while a run is still
     /// outstanding, from [`JobBuilder::overlap`]. it gates scheduled fires
     /// only: a manual launch is never held back.

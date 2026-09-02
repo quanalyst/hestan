@@ -94,48 +94,63 @@ export function laneLabel(lane: Lane): string {
 // there is no grouping to be had, and inventing one out of a naming convention
 // would be a guess.
 export function lanesOf(jobs: TimelineJob[], open: ReadonlySet<string>): Lane[] {
-  // the order the rows come out in, with each group standing where its first
-  // member was, and the members gathered onto it wherever they were listed
-  const order: (TimelineJob | string)[] = [];
+  // the whole gutter is alphabetical, groups and ungrouped jobs together on
+  // one list. a reader scanning for a word finds it where the word falls
+  // rather than where the deployment happened to declare it, and a group and
+  // a job that is in none are the same kind of thing to scan past
   const members = new Map<string, TimelineJob[]>();
+  const loose: TimelineJob[] = [];
   for (const job of jobs) {
     const group = job.group === "" ? null : job.group;
     if (group === null) {
-      order.push(job);
+      loose.push(job);
       continue;
     }
     const held = members.get(group);
     if (held) held.push(job);
-    else {
-      members.set(group, [job]);
-      order.push(group);
-    }
+    else members.set(group, [job]);
   }
 
+  const rows: { name: string; group: string | null }[] = [
+    ...[...members.keys()].map((group) => ({ name: group, group })),
+    ...loose.map((job) => ({ name: job.name, group: null })),
+  ];
+  rows.sort((a, b) => byName(a.name, b.name));
+
   const lanes: Lane[] = [];
-  for (const item of order) {
-    if (typeof item !== "string") {
-      lanes.push({ key: `job:${item.name}`, kind: "job", group: null, hue: null, jobs: [item.name], open: false });
+  for (const row of rows) {
+    if (row.group === null) {
+      const job = loose.find((j) => j.name === row.name)!;
+      lanes.push({ key: `job:${job.name}`, kind: "job", group: null, hue: null, jobs: [job.name], open: false });
       continue;
     }
-    const held = members.get(item) ?? [];
+    const held = [...(members.get(row.group) ?? [])].sort((a, b) => byName(a.name, b.name));
     // one group, one angle: the server hands the same one to every member, and
     // a member that arrived without one does not get to blank the row
     const hue = held.find((job) => job.group_hue !== null)?.group_hue ?? null;
-    const shown = open.has(item);
+    const shown = open.has(row.group);
     lanes.push({
-      key: `group:${item}`,
+      key: `group:${row.group}`,
       kind: "group",
-      group: item,
+      group: row.group,
       hue,
       jobs: held.map((job) => job.name),
       open: shown,
     });
     if (!shown) continue;
     for (const job of held)
-      lanes.push({ key: `job:${job.name}`, kind: "job", group: item, hue, jobs: [job.name], open: false });
+      lanes.push({ key: `job:${job.name}`, kind: "job", group: row.group, hue, jobs: [job.name], open: false });
   }
   return lanes;
+}
+
+// two names in the order a reader scans them: case is not a sort key, and a
+// tie on the lowercased form falls back to the raw one so the order is total
+function byName(a: string, b: string): number {
+  const la = a.toLowerCase();
+  const lb = b.toLowerCase();
+  if (la !== lb) return la < lb ? -1 : 1;
+  return a < b ? -1 : a > b ? 1 : 0;
 }
 
 // the greedy sub-lane packing, and the reason a group row can be trusted:
@@ -190,7 +205,6 @@ export interface Placed extends Bar {
   bx: number;
   bw: number;
   by: number;
-  hue: number | null;
 }
 
 // the plot's horizontal scale, as much of it as placing a bar needs
@@ -216,7 +230,7 @@ export function place(rows: Row[], scale: Scale): Placed[] {
       const bx = Math.max(scale.x(bar.start), scale.gutter);
       const bw = Math.max(scale.minBarW, Math.min(scale.x(bar.end), scale.nowX) - bx);
       const by = blockTop + bar.lane * (BAR_H + LANE_GAP);
-      return { ...bar, key: `${row.lane.key}|${bar.run.id}`, bx, bw, by, hue: row.lane.hue };
+      return { ...bar, key: `${row.lane.key}|${bar.run.id}`, bx, bw, by };
     });
   });
 }
@@ -235,13 +249,6 @@ export function failuresIn(placed: Placed[]): Placed[] {
   });
 }
 
-// the hue a bar is actually drawn in: its row's, and **null on a failed one**.
-// shape carries state everywhere in this ui, and a hue an outcome could
-// overwrite would be a hue meaning two things, so a failure keeps its hatch
-// and the group it belongs to is read off the row's label instead
-export function hueOf(bar: Placed): number | null {
-  return bar.run.status === "failed" ? null : bar.hue;
-}
 
 // which groups are open, as it travels in the url beside the filters already
 // there, so an opened view is a link somebody can send. **the parameter holds
