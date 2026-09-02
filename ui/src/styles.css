@@ -20,8 +20,6 @@
      checked across all 360 angles against both grounds of this theme: the
      worst is 3.13:1 at hue 60 on --page, which clears the 3:1 a non-text mark
      needs, and at 60% saturation none of them can be read as a status grey */
-  --hue-sat: 60%;
-  --hue-light: 36%;
 }
 
 @media (prefers-color-scheme: dark) {
@@ -40,8 +38,6 @@
        --surface, checked the same way. the saturation happens to be the same
        number on both grounds, and it is written out rather than inherited so
        that changing one theme cannot quietly change the other */
-    --hue-sat: 60%;
-    --hue-light: 68%;
   }
 }
 
@@ -765,8 +761,13 @@ button.text-btn.active {
    angles: at 22% the worst is 6.12:1 light (hue 240 on --page) and 4.99:1 dark
    (hue 60 on --surface), and the next step up drops under the 4.5:1 small text
    needs */
+/* the band behind a name: the page's own ink at a fifth of the shade the
+   group's name picked. a fifth because a name is read on top of it, and `--ink`
+   flips with the theme, so a light ground gets a dark wash and a dark ground a
+   light one without a second palette */
 .tl-block {
-  fill: hsl(var(--h) var(--hue-sat) var(--hue-light));
+  fill: var(--ink);
+  fill-opacity: calc(var(--shade) * 0.18);
 }
 
 /* the disclosure on a group's row. the whole gutter row is the target, so the
@@ -1515,7 +1516,8 @@ tbody tr.plain-row:hover {
   width: 4px;
   height: 11px;
   border-radius: 1px;
-  background: hsl(var(--h) var(--hue-sat) var(--hue-light));
+  background: var(--ink);
+  opacity: var(--shade);
 }
 
 .swatch-more {
@@ -1559,7 +1561,8 @@ tbody tr.plain-row:hover {
 }
 
 .dag-swatch {
-  fill: hsl(var(--h) var(--hue-sat) var(--hue-light));
+  fill: var(--ink);
+  fill-opacity: var(--shade);
 }
 
 .group-chips {

@@ -1,5 +1,27 @@
 # changelog
 
+## unreleased
+
+### The ui is black, white and grey
+
+`hue` picked a colour for a label and every mark that stood for provenance was
+drawn in it: the swatches, the split-source stripes, the graph's nodes and the
+band down the run timeline's gutter. it is shades of the page's own ink now.
+
+`Swatch::at` is still the one place a mark's shade is decided, and it hands out
+a fraction of the ink rather than an angle: six steps, picked by the same hash
+of the same name, so a label still has one mark of its own and two labels are
+still told apart. each place spends the fraction differently, because a 4px
+stripe wants nearly all of the ink and a band behind a name wants a fifth of
+it. `--hue-sat` and `--hue-light` are gone, and there is no `hsl()` left in the
+stylesheet.
+
+**what this costs.** six shades is fewer than 360 angles, so more labels share
+a mark than used to. the answer is the one the page already had: a mark is
+never the only carrier. every swatch has its name beside it, every group is
+written in the gutter, and `hestan doctor` still reports the pairs that landed
+on one mark.
+
 ## 0.2.3 (2026-09-02)
 
 both of these were found by opening the page in a browser.

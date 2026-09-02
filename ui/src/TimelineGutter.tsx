@@ -16,16 +16,17 @@ const LABEL_X = GUTTER - 10;
 // how far a job row steps back inside its group. the alignment edge is the
 // right one, so nesting steps away from it
 const INDENT = 12;
-// the band down the left edge. narrow on purpose: it says which group a row
-// belongs to and hands the rest of the gutter back to the name, which has to
-// stay readable on the page's own ground rather than on a wash of colour
-const BLOCK_W = 5;
+// the band is the whole of the name's cell, which is what it was asked to be.
+// it works as a background because it is grey rather than a colour: a fifth of
+// the ink is a shade you read a name on, where a fifth of an angle was a wash
+const BLOCK_W = GUTTER - 10;
 // the column the disclosure sits in, kept clear of a group's name
 const DISC_W = 22;
 // what an ungrouped name is kept clear of the left edge by
 const EDGE = 6;
 // 11px monospace, close enough to size a truncation by
 const CH = 6.6;
+
 
 // a name too long for the room it has, cut to fit with the cut marked
 export function truncate(name: string, max: number): string {
@@ -78,7 +79,14 @@ export default function TimelineGutter({
                 band down the gutter. `at` is the only thing in this ui that
                 says what a hue is; this end only says what to do with it */}
             {lane.hue !== null && (
-              <rect className="tl-block" style={at(lane.hue)} x={0} y={row.y} width={BLOCK_W} height={row.h} />
+              <rect
+                className="tl-block"
+                style={at(lane.hue)}
+                x={0}
+                y={row.y}
+                width={BLOCK_W}
+                height={row.h}
+              />
             )}
             <text
               className="tl-label"

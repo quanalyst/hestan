@@ -126,21 +126,19 @@ drawn twice**, once on the group's row as part of the group's load and once on
 its job's row as itself. that is what opening one is for, and the two marks are
 one run: pointing at either lights both.
 
-every row inside a group carries a narrow band of the group's
-[hue](assets.md#colour) down the left edge of the gutter, the full height of the
-row and the same on the group's row as on its jobs' rows, so consecutive rows
-abut and the colour reads as one band rather than a mark per row. it is a band
-rather than a wash behind the name because a name is easier to read on the
-page's own ground than on a colour, and the gutter is mostly names. a job in no
-group carries no band.
+every row inside a group carries a wash of the page's own ink behind its name,
+at the [shade](assets.md#colour) the group's name picked, the full height of
+the row and the same on the group's row as on its jobs' rows, so consecutive
+rows abut and it reads as one band down the gutter rather than a mark per row.
+a job in no group carries none.
 
-**the bars carry no hue at all.** the plot is greys: a run says what it did by
-its shape and its fill, a failure by its hatch and its × in the strip under the
-plot, a queued run by its hollow outline, a canceled one by its dimmed grey.
-that is what leaves hue free to mean where work came from, and the block in the
-gutter is the whole of where it says it. a plot that was also coloured by group
-would be a screen where colour meant two things at once, and the group is
-already written in the gutter beside every row it belongs to.
+**the plot is black, white and grey, and so is the band.** a run says what it
+did by its shape and its fill: a failure by its hatch and its × in the strip
+under the plot, a queued run by its hollow outline, a canceled one by its
+dimmed grey. where the work came from is carried by how dark its band is, which
+is a different channel on the same greyscale rather than a second palette. a
+bar takes no shade of its own: the group is written in the gutter beside every
+row it belongs to, and a mark repeated on the bars would be saying it twice.
 
 a failure inside a shut group still reaches the strip, and a failure inside an
 open one gets one × and not two: a run drawn twice is still one run that

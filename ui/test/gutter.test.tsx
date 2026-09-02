@@ -38,14 +38,14 @@ const draw = (jobs: TimelineJob[], open: string[], onToggle = () => {}) =>
   );
 
 // every `--h` in the markup, in the order it was drawn
-const angles = (markup: string) => [...markup.matchAll(/--h:\s*(\d+)/g)].map((m) => Number(m[1]));
-// the angle `at` hands an element, as the style it sets it in
-const angleOf = (hue: number) => (at(hue) as Record<string, string>)["--h"];
+const shades = (markup: string) => [...markup.matchAll(/--shade:\s*([\d.]+)/g)].map((m) => Number(m[1]));
+// the shade `at` hands an element, as the style it sets it in
+const shadeOf = (hue: number) => Number((at(hue) as Record<string, string>)["--shade"]);
 const count = (markup: string, needle: RegExp) => (markup.match(needle) ?? []).length;
 
 test("a deployment that declares no group gets a gutter of names and nothing else", () => {
   const markup = draw([job("etl"), job("billing")], []);
-  assert.deepEqual(angles(markup), [], "no group, so no hue anywhere in the gutter");
+  assert.deepEqual(shades(markup), [], "no group, so no band anywhere in the gutter");
   assert.equal(count(markup, /tl-block/g), 0, "no block behind a name that is in no group");
   assert.equal(count(markup, /<button/g), 0, "nothing to open, so no disclosure");
   assert.ok(markup.includes(">etl<"), markup);
@@ -54,24 +54,25 @@ test("a deployment that declares no group gets a gutter of names and nothing els
   assert.equal(count(markup, /x="158"/g), 2);
 });
 
-test("a group carries a block of its own hue, and the hue comes from at()", () => {
+test("a group's band is a shade of the ink, and no colour is written", () => {
   const shut = draw(WEATHER, []);
   // one row in the group while it is shut, so one block
-  assert.deepEqual(angles(shut), [200]);
   assert.equal(count(shut, /tl-block/g), 1);
 
   const open = draw(WEATHER, ["weather"]);
-  // the group's row and both of its jobs' rows, all the same angle: the band
+  // the group's row and both of its jobs' rows, all the same shade: the band
   // is continuous down the gutter rather than a mark on the group alone
-  assert.deepEqual(angles(open), [200, 200, 200]);
   assert.equal(count(open, /tl-block/g), 3);
+  assert.deepEqual(shades(open), [shadeOf(200), shadeOf(200), shadeOf(200)]);
 
-  // the angle is `at`'s and only `at`'s. nothing here writes a colour of its
-  // own: the block is a var(--h) rule in the stylesheet, and this is the
-  // element that hands it the angle
-  assert.equal(angleOf(200), "200");
-  assert.ok(open.includes(`--h:${angleOf(200)}`), open);
-  assert.equal(count(open, /hsl\(|rgb\(|#[0-9a-f]{3}/gi), 0, "no colour is written here");
+  // **the plot is black, white and grey.** the band is the page's own ink at
+  // an opacity the group's name picks, so nothing here writes a colour and
+  // nothing hands an angle to a stylesheet that would
+  assert.equal(count(open, /hsl\(|rgb\(|#[0-9a-f]{3}/gi), 0, "a colour is written here");
+  assert.equal(count(open, /--h:/g), 0, "an angle still reaches the gutter");
+
+  // two groups whose names sit apart get shades that are not the same one
+  assert.notEqual(shadeOf(200), shadeOf(203));
 
   // and the job in no group is left alone: three rows in the markup, three
   // names, and only the two inside the group are backed
