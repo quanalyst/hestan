@@ -1,6 +1,6 @@
 # Stability
 
-hestan is `0.2.0`, which is a 0.x version and therefore one that says out loud
+hestan is `0.2.1`, which is a 0.x version and therefore one that says out loud
 that it will move. this page is what it will not move, so that something can be
 built on it in the meantime.
 
@@ -11,16 +11,20 @@ what moved and what to write instead.**
 
 ## The version
 
-cargo reads `hestan = "0.2.0"` as `>=0.2.0, <0.3.0`, so under 0.x the **minor
-number is the compatibility number**. a `0.2.1` is additions and fixes and
+cargo reads `hestan = "0.2.1"` as `>=0.2.1, <0.3.0`, so under 0.x the **minor
+number is the compatibility number**. a `0.2.2` is additions and fixes and
 `cargo update` takes it; a break lands on `0.3.0`, which the same requirement
 refuses until somebody edits the manifest.
 
-`0.2.0` is the first release to spend that. it carries no source break at all
-and two changes to what an unchanged deployment does, and either one of those
-on its own is what the minor number is for: a deployment that met them through
-a `cargo update` nobody ran deliberately would have met them at 3am. the size
-of a release is not the question the number answers.
+`0.2.1` is what that looks like from the other side: a fix and a redrawn page
+in the ui, nothing added or moved on any public type, and `cargo update` takes
+it without being asked because there is nothing in it to be asked about.
+
+`0.2.0` was the first release to spend the minor number. it carried no source
+break at all and two changes to what an unchanged deployment does, and either
+one of those on its own is what the minor number is for: a deployment that met
+them through a `cargo update` nobody ran deliberately would have met them at
+3am. the size of a release is not the question the number answers.
 
 that rule arrived with 0.1.0. up to `0.1.0-beta.3` the version carried a
 pre-release tag, whose requirement has the same ceiling: `cargo update` moved a

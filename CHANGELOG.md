@@ -1,6 +1,10 @@
 # changelog
 
-## unreleased
+## 0.2.1 (2026-09-02)
+
+a fix for something 0.2.0 shipped, and the run timeline's grouping redone as an
+outline. no api moved: nothing was added, removed or renamed on any public
+type, so this is a patch and `cargo update` takes it.
 
 ### Fixed: a cancel could overwrite an op that had already finished
 
@@ -86,6 +90,14 @@ shut, which is what a link to a control that no longer exists can honestly do.
 no blocks, no disclosures, exactly the plot it had. there is a case asserting
 that rather than assuming it. nothing outside the ui reads any of this: no
 schema version, no migration, no route, and no api response changed.
+
+**a deployment that adopted job groups in 0.2.0 sees two.** the timeline opens
+with a row per group rather than a row per job, because a group is now shut
+until it is opened, and that is the point of the change rather than a side of
+it. and the url parameter is `open` where it was `folded`, holding what is open
+rather than what is shut, so a link saved from 0.2.0 arrives with everything
+shut instead of restoring what it named. nothing else it saved is affected: the
+filters either side of it are untouched.
 
 ## 0.2.0 (2026-08-28)
 
