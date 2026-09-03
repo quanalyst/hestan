@@ -307,40 +307,48 @@ becomes `waiting` when the policy wants a build it cannot have yet, with the
 whole sentence ("when stale, once upstream is ready · 2026-08-14 waiting for
 `hours[2026-08-14T23]`") on hover and on the asset's own page.
 
-### Colour
+### Shade
 
-**everywhere else in this ui the palette is grey and shape carries state.**
-that is exactly what leaves colour free, and it stays free only while it means
-one thing: a hue here is where an asset [belongs or where it came
-from](assets.md#group), and never how
-it is doing. the moment a hue meant "failed" the channel would be carrying two
-answers and neither reliably.
+**this ui is black, white and grey, and shape carries state.** that is what
+leaves a second channel free, and it stays free only while it means one thing:
+a shade here is where an asset [belongs or where it came
+from](assets.md#group), and never how it is doing. the moment a shade meant
+"failed" the channel would be carrying two answers and neither reliably.
 
 the toggle beside the graph picks which: `by group`, `by origin`, or
-`no colour`. one meaning at a time, because two hue meanings on one screen is
+`no colour`. one meaning at a time, because two meanings on one screen is
 noise, and the choice is in the url like every other view state. **`no colour`
-returns the page to the monochrome it was**, which is both something somebody
-will want and the proof that colour is carrying nothing on its own.
+takes the shading off altogether**, which is both something somebody will want
+and the proof that the channel carries nothing on its own.
 
-the server sends an angle rather than a colour, and this end picks the shade:
-saturation and lightness are pinned per theme in `styles.css`, checked across
-all 360 angles against both grounds of both themes, so no generated colour is
-illegible and none of them can be read as a status grey.
+the server sends an [angle](assets.md#colour) and this end spends it as ink:
+`at` in `Swatch.tsx` folds the angle onto one of six shades of `--ink`, and
+each place spends that fraction differently, because a 4px stripe wants nearly
+all of the ink and a band behind a name wants a fifth of it. `--ink` flips with
+the theme, so a light ground gets a dark mark and a dark ground a light one
+without a second palette to keep in step.
 
-three things follow from "colour is never the only carrier":
+**six shades is fewer than 360 angles**, so two labels share a mark here long
+before they share a hue. `hestan doctor` speaks in angles rather than shades,
+deliberately: the angle is what the api publishes and what a consumer painting
+in colour actually gets, so the check reports the pairs that consumer would
+struggle to tell apart, which is a different question from which two landed on
+one shade in this ui. what makes that survivable is the next paragraph.
 
-- a **legend** under the graph names every hue in the view. without it a
-  colour is decoration.
+three things follow from "a shade is never the only carrier":
+
+- a **legend** under the graph names every label in the view. without it a
+  mark is decoration.
 - every swatch sits beside its own name: the group's on the section heading it
   belongs to, the origins' in the row's own `descends from` cell.
 - an asset descending from several sources gets a **split swatch, one stripe
-  per source in name order, never a blend.** averaging two hues produces a
-  third hue, and a third hue stands for a source nobody has. past three
+  per source in name order, never a blend.** averaging two shades produces a
+  third shade, and a third shade stands for a source nobody has. past three
   stripes the rest become `+k`, and they are still named in the legend and on
   the asset's own page.
 
-the asset's own page carries no colour at all: one asset is nothing to tell
-apart from anything, and a group hue beside an origin hue would be two
+the asset's own page carries no shading at all: one asset is nothing to tell
+apart from anything, and a group's mark beside an origin's would be two
 meanings of one channel on one screen. it says both in words instead, the
 group beside the kind and what it descends from under its lineage.
 
@@ -691,7 +699,7 @@ is [sampled across its range](metadata.md#series), so what is drawn is the
 whole range at a coarser step and never the front of it. an empty series says
 "no points" and draws nothing.
 
-the chart takes **no hue**. [colour means group or origin](#colour) in this ui
+the chart takes **no hue**. [a shade means group or origin](#shade) in this ui
 and shape carries status; one series has neither to say, so it is drawn in the
 same ink as everything else.
 
@@ -744,7 +752,7 @@ worse than one that says it has. `load older` walks back a page at a time.
 under the heading, two lines saying **what this deployment is**. the first is
 its declared name, the build of your application it runs, and the hestan
 version and platform compiled into it: `prod-eu · build 9f2c1ab · hestan
-0.2.3 on linux/aarch64`. a deployment that declared no build says `build
+0.2.4 on linux/aarch64`. a deployment that declared no build says `build
 not declared` rather than putting hestan's own version where yours would go,
 which would be a confident answer to a different question. **said once, and
 here**, for the reason the deciding line below is: which build is running is a

@@ -6,7 +6,7 @@ hestan [asset](assets.md) per dbt model, wired from the manifest's own
 `depends_on`.
 
 ```toml
-hestan = { version = "0.2.3", features = ["dbt"] }
+hestan = { version = "0.2.4", features = ["dbt"] }
 ```
 
 ```rust

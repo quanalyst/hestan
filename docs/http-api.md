@@ -255,7 +255,7 @@ my run" and "which one has gone quiet".
     "name": "prod-eu",
     "build": "9f2c1ab",
     "hestan": {
-      "version": "0.2.3",
+      "version": "0.2.4",
       "schema": 24,
       "features": ["bundled", "cli", "postgres"],
       "platform": "linux/aarch64",
@@ -1012,11 +1012,14 @@ source contributes its own name, and `[]` is a real answer meaning no source
 is upstream of it. `group_hue` is the same number for the group, and null
 wherever `group` is.
 
-**the hues are angles, 0..=359, and not colours**: what lightness is legible
-depends on the reader's theme and this end does not know it, so the client
-picks saturation and lightness. the angle is a pure function of the label's
-name, stable across restarts and processes, and `hestan doctor` reports any
-two labels whose angles are too close to tell apart.
+**the hues are angles, 0..=359, and not colours**: what is legible depends on
+the reader's theme and this end does not know it, so what the angle is spent on
+is the client's own decision. hestan's [web ui](web-ui.md#shade) spends it as
+one of six shades of the page's ink rather than as a colour at all; a client
+that does paint in colour picks its own saturation and lightness. the angle is
+a pure function of the label's name, stable across restarts and processes, and
+`hestan doctor` reports any two labels whose angles are too close to tell
+apart, which is the question a client painting the angle asks.
 
 `op` is the op that materializes the asset: its own name, unless a
 [multi-asset](assets.md#one-op-several-assets) produces it alongside others,

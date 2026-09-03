@@ -1,6 +1,6 @@
 # changelog
 
-## unreleased
+## 0.2.4 (2026-09-03)
 
 ### The ui is black, white and grey
 
@@ -19,8 +19,13 @@ stylesheet.
 **what this costs.** six shades is fewer than 360 angles, so more labels share
 a mark than used to. the answer is the one the page already had: a mark is
 never the only carrier. every swatch has its name beside it, every group is
-written in the gutter, and `hestan doctor` still reports the pairs that landed
-on one mark.
+written in the gutter, and the asset's own page carries no mark at all.
+
+`hestan doctor` is unchanged and still speaks in angles rather than shades. the
+angle is what the api publishes and what a client painting in colour actually
+gets, so the check answers that client's question: which two labels are hard to
+tell apart on the wheel. it is not the same question as which two landed on one
+shade here, and with six shades the answer to the second is "several, always".
 
 ## 0.2.3 (2026-09-02)
 

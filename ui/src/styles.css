@@ -12,14 +12,12 @@
   --mark-muted: #6e6e6e;
   --dim: 0.55; /* recedes a mark without changing its ink; DIM mirrors it in tsx */
 
-  /* the one channel here that is not grey. a hue means where an asset belongs
-     or where it came from, and never how it is doing: shape carries state, and
-     that is exactly what leaves colour free. the angle arrives per element in
-     --h; saturation and lightness are pinned per theme, because what is
-     legible depends on the ground and the server does not know the theme.
-     checked across all 360 angles against both grounds of this theme: the
-     worst is 3.13:1 at hue 60 on --page, which clears the 3:1 a non-text mark
-     needs, and at 60% saturation none of them can be read as a status grey */
+  /* a mark that stands for provenance, which group a job is in or where an
+     asset came from, is a shade of the page's own ink rather than a colour,
+     and never says how a thing is doing: shape carries state, and that is what
+     keeps the two apart. the fraction arrives per element in --shade from
+     `at`, the only thing in this ui that emits one, and every place spends it
+     against --ink, so one palette serves both themes instead of two */
 }
 
 @media (prefers-color-scheme: dark) {
@@ -752,15 +750,6 @@ button.text-btn.active {
   padding-bottom: 7px;
 }
 
-/* the block behind a name in the gutter: the group's own hue, the full height
-   of the row, and the same on the group's row as on its jobs' rows, so the
-   colour reads as one band rather than a mark per row.
-   the angle arrives in --h from `at`, which is the only thing in this ui that
-   emits one; the wash is this end's, because this end knows a name is drawn on
-   it. picked by checking --ink2 against the block over both grounds at all 360
-   angles: at 22% the worst is 6.12:1 light (hue 240 on --page) and 4.99:1 dark
-   (hue 60 on --surface), and the next step up drops under the 4.5:1 small text
-   needs */
 /* the band behind a name: the page's own ink at a fifth of the shade the
    group's name picked. a fifth because a name is read on top of it, and `--ink`
    flips with the theme, so a light ground gets a dark wash and a dark ground a
