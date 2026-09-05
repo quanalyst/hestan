@@ -181,9 +181,11 @@ changelog line rather than quietly.
   gets its changelog line, but it is not an api break.
 - **which two names collide.** `hue` gives the same angle for the same name
   forever, and that much is deliberate (sha-256 rather than a hasher out of
-  `std`, which is free to change between releases). that two names land close
-  enough together to be hard to tell apart is not something any pure function
-  of one name can prevent, and `hestan doctor` reports the pairs instead.
+  `std`, which is free to change between releases). that two names land on a
+  mark that cannot be told from another is not something any pure function of
+  one name can prevent, and `hestan doctor` reports them instead. how many
+  marks there are to land on is a property of the ui rather than of the api,
+  and it may change with it.
 
 ## What is checked rather than claimed
 

@@ -41,7 +41,7 @@ export interface Lane {
   // the group this row is inside: the one it stands for on a group row, the
   // one it is a member of on a job row, and null on a job in no group. **a
   // row with a group here is a row that carries a block of that group's hue**,
-  // which is what makes the colour a band down the gutter rather than a mark
+  // which is what makes the shade a band down the gutter rather than a mark
   // per row
   group: string | null;
   // the angle that group is drawn at, and null wherever the group is

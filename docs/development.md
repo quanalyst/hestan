@@ -281,9 +281,9 @@ the ui has suites of its own under `ui/test/`, run with `npm test` (or
 the injection cases asserted against the exact string react renders, the
 metadata row, the run page's log merge, the activity feed's merge and filters,
 the backfill range arithmetic, the catalog's grouping and filters, the lineage
-walk, the [colour channel's](assets.md#colour) three rules against a fixture
-(one meaning at a time, off draws nothing, and every hue has its name beside
-it), the split swatch in the markup it renders, and what each role may see.
+walk, the [provenance channel's](assets.md#hue) three rules against a
+fixture (one meaning at a time, off draws nothing, and every mark has its name
+beside it), the split swatch in the markup it renders, and what each role may see.
 they need no test framework and no browser:
 vite bundles them for node with the same config the app is built with, and
 `node:test` runs them.

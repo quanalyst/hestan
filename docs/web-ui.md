@@ -127,7 +127,7 @@ its job's row as itself. that is what opening one is for, and the two marks are
 one run: pointing at either lights both.
 
 every row inside a group carries a wash of the page's own ink behind its name,
-at the [shade](assets.md#colour) the group's name picked, the full height of
+at the [shade](assets.md#hue) the group's name picked, the full height of
 the row and the same on the group's row as on its jobs' rows, so consecutive
 rows abut and it reads as one band down the gutter rather than a mark per row.
 a job in no group carries none.
@@ -316,24 +316,34 @@ from](assets.md#group), and never how it is doing. the moment a shade meant
 "failed" the channel would be carrying two answers and neither reliably.
 
 the toggle beside the graph picks which: `by group`, `by origin`, or
-`no colour`. one meaning at a time, because two meanings on one screen is
-noise, and the choice is in the url like every other view state. **`no colour`
-takes the shading off altogether**, which is both something somebody will want
-and the proof that the channel carries nothing on its own.
+`no shade`. one meaning at a time, because two meanings on one screen is noise,
+and the choice is in the url like every other view state, under `shade`
+(`colour` is still read there, which is what that parameter was called before
+this ui went monochrome, so a link saved then still opens in the mode it was
+saved in). **`no shade` takes the shading off altogether**, which is both
+something somebody will want and the proof that the channel carries nothing on
+its own.
 
-the server sends an [angle](assets.md#colour) and this end spends it as ink:
+the server sends an [angle](assets.md#hue) and this end spends it as ink:
 `at` in `Swatch.tsx` folds the angle onto one of six shades of `--ink`, and
 each place spends that fraction differently, because a 4px stripe wants nearly
-all of the ink and a band behind a name wants a fifth of it. `--ink` flips with
-the theme, so a light ground gets a dark mark and a dark ground a light one
-without a second palette to keep in step.
+all of the ink and a band read through has to stay under the name on top of it.
+`--ink` flips with the theme, so a light ground gets a dark mark and a dark
+ground a light one without a second palette to keep in step.
 
-**six shades is fewer than 360 angles**, so two labels share a mark here long
-before they share a hue. `hestan doctor` speaks in angles rather than shades,
-deliberately: the angle is what the api publishes and what a consumer painting
-in colour actually gets, so the check reports the pairs that consumer would
-struggle to tell apart, which is a different question from which two landed on
-one shade in this ui. what makes that survivable is the next paragraph.
+**six shades is the whole of the channel, and it is smaller than it looks.**
+an angle is folded with `hue % 6`, so two labels a hundred degrees apart can
+land on one shade and two a degree apart need not; past six labels some pair
+must share one whatever anybody does. that is why every mark has its name
+written beside it and why the legend names all of them: the shade is what makes
+a set of rows findable at a glance, and the name is what says which. `hestan
+doctor` reports the labels that share a mark, and
+[`Asset::hue(n)`](assets.md#hue) moves one where there is room to move it.
+
+the angle the api serves is the wider thing, and a consumer that paints in
+colour has 360 of them to spend rather than six; the check in `doctor` is about
+what *this* ui draws, because that is the one somebody is looking at. what
+makes the sharing survivable is below.
 
 three things follow from "a shade is never the only carrier":
 

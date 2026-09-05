@@ -399,9 +399,9 @@ standalone binary for those two. [docs/cli.md](docs/cli.md).
   with no past. the name prefix is still the fallback, so a graph that never
   declares one groups exactly as it always did. from a source's group, which
   names the external system it stands for, hestan computes what every
-  downstream asset descends from, and the ui colours by group or by origin:
-  colour never means status, the legend names every hue, and turning it off
-  loses nothing
+  downstream asset descends from, and the ui marks a row by group or by
+  origin: a mark never means status, the legend names every one of them, and
+  turning it off loses nothing
 - **backfills you can start**: drag a range across the partition grid, see
   which keys it covers and what it will cost from what a build of one has
   actually taken, then start it. no timings on record means it says so rather

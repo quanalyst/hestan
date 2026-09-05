@@ -1,5 +1,5 @@
-import { shownAndMore } from "./colour";
-import type { Stripe } from "./colour";
+import { shownAndMore } from "./shade";
+import type { Stripe } from "./shade";
 import { GlyphShape } from "./StatusGlyph";
 import type { Status } from "./StatusGlyph";
 import { at } from "./Swatch";
@@ -30,10 +30,10 @@ export interface DagNode {
   // the group this node belongs to, which is what `collapseGroups` folds by.
   // absent on an op, which belongs to no asset group
   group?: string | null;
-  // what it is coloured by, already decided by the caller: one stripe under
-  // `group`, one per origin under `origin`, none at all with colour off. the
-  // labels are named in the legend beside the graph, so the hue is never the
-  // only thing saying which
+  // what it is marked by, already decided by the caller: one stripe under
+  // `group`, one per origin under `origin`, none at all with the marks off.
+  // the labels are named in the legend beside the graph, so the shade is never
+  // the only thing saying which
   hues?: Stripe[];
 }
 
@@ -49,7 +49,7 @@ const STRIPE_GAP = 2;
 const MORE_W = 15;
 
 // how much of a node's width its swatch takes, which is nothing at all where
-// there is no swatch: colour off leaves the layout exactly as it was
+// there is no swatch: the marks off leaves the layout exactly as it was
 function swatchWidth(node: DagNode): number {
   const { shown, more } = shownAndMore(node.hues ?? []);
   if (shown.length === 0) return 0;

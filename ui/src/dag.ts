@@ -8,7 +8,7 @@
 // these stay testable.
 import type { DagNode } from "./DagView";
 import { SEPARATOR } from "./catalog";
-import type { Stripe } from "./colour";
+import type { Stripe } from "./shade";
 
 // past this many nodes the whole graph is a picture of having a lot of assets
 // rather than of how they fit together, so the view opens focused instead.
@@ -82,7 +82,7 @@ export const groupNode = (group: string) => `${group}${SEPARATOR}`;
 // rather than a prefix sliced off the name here. a node with no group of its
 // own (an op, which is what the other graphs in this ui draw) folds into
 // nothing
-// what a folded node is coloured by: every label its members carry, once each,
+// what a folded node is marked by: every label its members carry, once each,
 // in name order. under `group` that is one label, since they share a group;
 // under `origin` it is everything the group descends from, which is the claim
 // the folded node can honestly make
@@ -115,7 +115,7 @@ export function collapseGroups(nodes: DagNode[], collapsed: Set<string>): DagNod
         name === n.name
           ? { ...n, deps }
           : // the folded node stands for the group, so it carries what its
-            // members are coloured by rather than one member's share of it
+            // members are marked by rather than one member's share of it
             { name, deps, group: n.group, hues: n.hues, badge: "×1", find: n.name };
       held.set(name, node);
       out.push(node);

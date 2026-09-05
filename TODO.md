@@ -68,5 +68,3 @@ maybe". there are two different things in that sentence.
 - 31 public structs have public fields, so a new field breaks a literal.
   `docs/stability.md` records the decision to leave them and why constructors
   come first.
-- the `ui/dist` bundles accumulate: every `npm run build` leaves the old hashed
-  files behind and nothing prunes them.

@@ -1002,7 +1002,7 @@ null where nothing was declared. `?namespace=` narrows the list; see
 `group` is what the asset is [labeled with](assets.md#group) on the graph:
 what it declared, else the part of its name before the first `/`, else null
 for an asset in no group at all. **it is not the namespace**: a group clusters
-and colours a picture and falls back to the name, a namespace is a boundary and
+and marks a picture and falls back to the name, a namespace is a boundary and
 has no fallback. [namespaces and owners](namespaces.md) is the whole of that.
 the group fallback is applied here, so nothing reading this has to know the
 rule. `provenance` is where it came from: the

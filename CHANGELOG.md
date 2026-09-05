@@ -1,5 +1,49 @@
 # changelog
 
+## unreleased
+
+### `hestan doctor` answers the question the ui actually asks
+
+0.2.4 folded provenance marks onto six shades of the page's ink and left the
+`colours` check comparing angles around the 360, which is a different question
+with a different answer. over eighteen ordinary group names it flagged nine
+pairs, eight of which the ui draws plainly apart, and said nothing about
+twenty-one of the twenty-two pairs it draws the same. the check was not
+reporting a limit; it was reporting a limit of a ui that is no longer here.
+
+it folds through `hue % 6` now, the way `Swatch.tsx` does, and names the labels
+that land on one mark. a test reads the shade count back out of
+`ui/src/Swatch.tsx` wherever the ui sources are on disk, so the two copies of
+that number cannot drift apart unseen.
+
+past six labels the pigeonhole settles it and no pin can help, so that case is
+stated as a fact about the palette rather than raised as a note: a note nobody
+can clear teaches people to skip the whole report. the check keeps its name
+under `--json`, and `Asset::hue(n)` still moves a label where there is room.
+
+### The band behind a name has a floor
+
+`.tl-block` spent the shade as a bare share of the ink, so the palest of the
+six landed at 2.9% of it, which on either ground is not a band at all: a third
+of the palette drew nothing. it starts at a visible wash now and ends where it
+ended before, because a name is still read on top of it. six steps inside
+eleven points of opacity are not six things a reader can name apart, and the
+stylesheet now says so rather than implying otherwise.
+
+### Also
+
+- the toggle beside the graph reads `no shade` rather than `no colour`, and its
+  url parameter is `shade`. `colour` is still read there, so a link saved
+  before the ui went monochrome still opens in the mode it was saved in.
+- `docs/assets.md` had a section called `Colour` describing a ui that paints in
+  colour. it is `Hue` now, which is what the number is, and it says what this
+  end spends it on. the same stale claim is corrected in `README.md`,
+  `docs/cli.md`, `docs/development.md`, `docs/stability.md` and
+  `docs/web-ui.md`.
+- `TODO.md` listed the `ui/dist` bundles accumulating across builds. vite
+  empties the directory and `just ui` fails on a dirty one, so there was
+  nothing there to fix.
+
 ## 0.2.4 (2026-09-03)
 
 ### The ui is black, white and grey

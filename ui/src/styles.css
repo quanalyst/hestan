@@ -750,13 +750,20 @@ button.text-btn.active {
   padding-bottom: 7px;
 }
 
-/* the band behind a name: the page's own ink at a fifth of the shade the
-   group's name picked. a fifth because a name is read on top of it, and `--ink`
-   flips with the theme, so a light ground gets a dark wash and a dark ground a
-   light one without a second palette */
+/* the band behind a name: the page's own ink at a floor plus a share of the
+   shade the group's name picked.
+   the floor is not decoration. a bare share put the palest of the six at three
+   percent of the ink, which on either ground is not a band at all, so a third
+   of the palette was drawing nothing. this starts where a wash is visible and
+   ends where it was, because a name is read on top of it.
+   what is left is six steps inside eleven points of opacity, and they are not
+   six things a reader can name apart. they are not asked to be: the band tells
+   one run of rows from the next and the name written in it says which group.
+   `--ink` flips with the theme, so a light ground gets a dark wash and a dark
+   ground a light one without a second palette */
 .tl-block {
   fill: var(--ink);
-  fill-opacity: calc(var(--shade) * 0.18);
+  fill-opacity: calc(0.06 + var(--shade) * 0.12);
 }
 
 /* the disclosure on a group's row. the whole gutter row is the target, so the
@@ -1514,9 +1521,9 @@ tbody tr.plain-row:hover {
   font-size: 10px;
 }
 
-/* what each hue is, in words, on the same screen as the hues. without it a
-   colour is decoration */
-.hue-legend {
+/* what each mark is, in words, on the same screen as the marks. without it a
+   mark is decoration */
+.shade-legend {
   display: flex;
   flex-wrap: wrap;
   gap: 4px 18px;
@@ -1525,7 +1532,7 @@ tbody tr.plain-row:hover {
   color: var(--ink2);
 }
 
-.hue-legend-item {
+.shade-legend-item {
   display: inline-flex;
   align-items: center;
   gap: 6px;
@@ -1537,14 +1544,14 @@ tbody tr.plain-row:hover {
   margin-top: 16px;
 }
 
-/* the origin cell: names first, colour beside them */
+/* the origin cell: names first, the mark beside them */
 .origin-cell {
   display: inline-flex;
   align-items: center;
   gap: 7px;
 }
 
-/* a group heading carries its own colour, right beside the name it stands for */
+/* a group heading carries its own mark, right beside the name it stands for */
 .group-row .swatch {
   margin-right: 8px;
 }

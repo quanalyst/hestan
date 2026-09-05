@@ -443,9 +443,10 @@ export default function TimelinePlot({
                 />
               );
             // a bar takes no hue. what a run is doing is carried by its shape
-            // and its fill, and that is what leaves hue free to mean where the
-            // work came from; the gutter block beside the row is where that
-            // lives, and it is the only place on this page colour appears
+            // and its fill, and that is what leaves the hue free to mean where
+            // the work came from; the gutter block beside the row is where that
+            // lives, and it is the only place on this page a shade stands for
+            // anything
             return (
               <rect
                 key={b.key}

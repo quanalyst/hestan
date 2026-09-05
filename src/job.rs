@@ -981,14 +981,14 @@ impl JobBuilder {
     /// ```
     ///
     /// **a group is a label, not a boundary.** it clusters the timeline and
-    /// colours it, and nothing reads it to decide who may touch what. the
+    /// marks it, and nothing reads it to decide who may touch what. the
     /// boundary is a [`namespace`](Self::namespace), it is declared, and
     /// neither is derived from the other. `docs/namespaces.md` says which to
     /// reach for.
     ///
     /// **it is the same label an [asset](crate::Asset::group) declares**, so a
-    /// job in group `weather` and the assets in group `weather` are drawn in
-    /// one colour, and pinning that colour with
+    /// job in group `weather` and the assets in group `weather` are drawn with
+    /// one mark, and pinning the angle behind it with
     /// [`Asset::hue`](crate::Asset::hue) moves both. one name, one hue, in the
     /// timeline, the graph, the api and the command line.
     ///

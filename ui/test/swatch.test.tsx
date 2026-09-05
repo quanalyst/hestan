@@ -1,8 +1,8 @@
 // what a swatch actually draws, in markup rather than in a claim about it.
 //
 // the two things worth asserting at this level are that a multi-source swatch
-// is split into one stripe per source and never averaged into a third colour,
-// and that turning colour off leaves markup with no hue in it at all.
+// is split into one stripe per source and never averaged into a third shade,
+// and that turning the marks off leaves markup with no shade in it at all.
 import assert from "node:assert/strict";
 import test from "node:test";
 import { renderToStaticMarkup } from "react-dom/server";
@@ -10,8 +10,8 @@ import { at } from "../src/Swatch";
 import DagView from "../src/DagView";
 import type { DagNode } from "../src/DagView";
 import Swatch from "../src/Swatch";
-import { HueLegend, OriginCell } from "../src/AssetsPage";
-import { stripesFor } from "../src/colour";
+import { ShadeLegend, OriginCell } from "../src/AssetsPage";
+import { stripesFor } from "../src/shade";
 import { asset } from "./catalog.test";
 
 const stripes = [
@@ -43,7 +43,7 @@ test("a split swatch draws each source's own shade and averages nothing", () => 
   // and the one that was counted away is still named on the hover
   assert.ok(capped.includes("zulu"), capped);
 
-  // nothing to colour draws nothing at all, not an empty box
+  // nothing to mark draws nothing at all, not an empty box
   assert.equal(renderToStaticMarkup(<Swatch stripes={[]} />), "");
 });
 
@@ -52,7 +52,7 @@ const graph = (hues: DagNode["hues"]): DagNode[] => [
   { name: "margin", deps: ["orders"], group: "finance", hues },
 ];
 
-test("colour off leaves the graph with no shade in its markup", () => {
+test("the marks off leave the graph with no shade in its markup", () => {
   const margin = asset("margin", {
     group: "finance",
     provenance: [
@@ -61,37 +61,37 @@ test("colour off leaves the graph with no shade in its markup", () => {
     ],
   });
 
-  const coloured = renderToStaticMarkup(
+  const marked = renderToStaticMarkup(
     <DagView nodes={graph(stripesFor(margin, "origin"))} />,
   );
-  assert.deepEqual(angles(coloured), [shade(105), shade(274), shade(105), shade(274)]);
-  assert.equal((coloured.match(/dag-swatch/g) ?? []).length, 4);
+  assert.deepEqual(angles(marked), [shade(105), shade(274), shade(105), shade(274)]);
+  assert.equal((marked.match(/dag-swatch/g) ?? []).length, 4);
 
   const off = renderToStaticMarkup(<DagView nodes={graph(stripesFor(margin, "off"))} />);
   assert.deepEqual(angles(off), []);
   assert.equal(off.includes("dag-swatch"), false);
   assert.equal(off.includes("hsl"), false);
-  // the node names are still there, which is the whole of what colour was
+  // the node names are still there, which is the whole of what the mark was
   // adding: it carries nothing on its own
   assert.ok(off.includes("orders") && off.includes("margin"), off);
 });
 
-// the third place a hue is drawn. `Swatch.tsx` exports the only function that
+// the third place a mark is drawn. `Swatch.tsx` exports the only function that
 // emits one, and `Swatch` and `DagView` are asserted above; the legend and the
-// origin cell reach for it directly, so the rule that a colour is never the
-// only carrier is asserted here too rather than left to the two that were
+// origin cell reach for it directly, so the rule that a mark is never the only
+// carrier is asserted here too rather than left to the two that were
 // convenient to render
 test("every shade in the legend and the origin cell is drawn beside its own name", () => {
-  const legend = renderToStaticMarkup(<HueLegend stripes={stripes} says="by group" />);
+  const legend = renderToStaticMarkup(<ShadeLegend stripes={stripes} says="by group" />);
   // one shade drawn, one name written, for every stripe: no bare mark
   assert.deepEqual(angles(legend), [shade(12), shade(105), shade(274), shade(300)]);
   for (const s of stripes) assert.ok(legend.includes(s.label), `${s.label} missing: ${legend}`);
-  // the block of colour is decoration and says so, so a screen reader is not
+  // the block of ink is decoration and says so, so a screen reader is not
   // told about a swatch it cannot use
   assert.equal((legend.match(/aria-hidden="true"/g) ?? []).length, stripes.length);
 
   // and the cell: the words do not depend on the mode, which is what makes
-  // turning colour off cost a reader nothing
+  // turning the marks off cost a reader nothing
   const a = asset("margin", {
     provenance: [
       { name: "vendor", hue: 105 },

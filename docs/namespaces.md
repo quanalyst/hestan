@@ -124,7 +124,7 @@ touch what, and the boundary is still the namespace beside it.
 **a job group and an asset group of the same name are one label and are drawn
 in one colour.** `hestan::hue` is a pure function of a name, so the timeline and
 the graph agree without either being told about the other, and
-[`Asset::hue(n)`](assets.md#colour) pins the angle for both. that is deliberate
+[`Asset::hue(n)`](assets.md#hue) pins the angle for both. that is deliberate
 rather than incidental: they are the same word on one screen, and two colours
 for one word is a reader's problem rather than a designer's. `hestan doctor`
 counts a job's group among the labels it checks for hues too close to tell

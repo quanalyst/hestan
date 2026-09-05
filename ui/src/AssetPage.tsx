@@ -5,7 +5,7 @@ import AssetDetail, { StateGlyph } from "./AssetDetail";
 import BackfillLauncher from "./BackfillLauncher";
 import type { KeyRange } from "./backfill";
 import { policySays } from "./catalog";
-import { originWords } from "./colour";
+import { originWords } from "./shade";
 import { CHAIN_DEPTH, downstreamOf, linkKind, movedInputs, whenChanged } from "./lineage";
 import type { ChainLink } from "./lineage";
 import { useMay } from "./role";
@@ -326,8 +326,8 @@ function AssetView({ name }: { name: string }) {
               all assets
             </Link>
           </h1>
-          {/* no colour on this page, on purpose: one asset is nothing to tell
-              apart from anything, and a group hue beside an origin hue would
+          {/* no mark on this page, on purpose: one asset is nothing to tell
+              apart from anything, and a group's shade beside an origin's would
               be two meanings of one channel on one screen. the names are the
               information, so the names are what is here */}
           <p className="muted">

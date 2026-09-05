@@ -17,8 +17,10 @@ const LABEL_X = GUTTER - 10;
 // right one, so nesting steps away from it
 const INDENT = 12;
 // the band is the whole of the name's cell, which is what it was asked to be.
-// it works as a background because it is grey rather than a colour: a fifth of
-// the ink is a shade you read a name on, where a fifth of an angle was a wash
+// it works as a background because it is a shade of the ink rather than a
+// colour: a wash you read a name on, where an angle at the same strength was
+// something to look at. `styles.css` puts a floor under it so the palest group
+// still gets a band
 const BLOCK_W = GUTTER - 10;
 // the column the disclosure sits in, kept clear of a group's name
 const DISC_W = 22;
@@ -75,9 +77,10 @@ export default function TimelineGutter({
         return (
           <g key={lane.key}>
             {/* the group's own hue, the full height of the row and the same on
-                the group's row and its jobs' rows, so the colour reads as one
+                the group's row and its jobs' rows, so the mark reads as one
                 band down the gutter. `at` is the only thing in this ui that
-                says what a hue is; this end only says what to do with it */}
+                turns an angle into a shade; this end only says where to put
+                it */}
             {lane.hue !== null && (
               <rect
                 className="tl-block"

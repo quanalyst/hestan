@@ -190,8 +190,8 @@ export interface JobSummary {
   // what it is labeled with on the timeline; null wherever nothing declared
   // one, which for a job has no fallback out of it
   group: string | null;
-  // and the angle that group is drawn at; null wherever the group is. the same
-  // angle an asset group of the same name gets: one label, one colour
+  // and the angle that group is drawn from; null wherever the group is. the
+  // same angle an asset group of the same name gets: one label, one mark
   group_hue: number | null;
   // who to wake when a run of it fails; null for a job nobody claimed
   owner: Owner | null;
@@ -583,8 +583,8 @@ export interface AssetSummary {
 }
 
 // one source group an asset descends from, and the hue the server picked for
-// it. a hue rather than a colour: the lightness that is legible depends on the
-// theme, which is this end's business
+// it. an angle rather than a shade: how much ink is legible depends on the
+// theme and on what is drawn, which is this end's business
 export interface Origin {
   name: string;
   hue: number;
