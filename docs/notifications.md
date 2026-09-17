@@ -274,6 +274,10 @@ surprises people.
 
 ### Retry and giving up
 
+The built-in `notify::slack` and `notify::webhook` helpers return after spawning
+an HTTP request. They log request failures without reporting them to the delivery
+loop; enabling durable delivery does not make those HTTP requests retryable.
+
 a hook that panics is a failed delivery. it retries on the same capped
 exponential backoff with full jitter that op retries use (10s, doubling)
 for **eight attempts**, which is seven gaps and so at most about twenty

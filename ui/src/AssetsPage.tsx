@@ -1,3 +1,6 @@
+import GroupingControls from "./GroupingControls";
+import { RegisteredName } from "./RegistryNames";
+import { displayName, hierarchy, matchesName, readSet, writeSet, summary, visibleSections, viewFrom, matchesLabel, isDefaultView, filterHierarchy } from "./presentation";
 import { useState } from "react";
 import { Link, useNavigate, useSearchParams } from "react-router-dom";
 import { get, post, usePoll } from "./api";
@@ -9,11 +12,9 @@ import type { NodeStatus } from "./DagView";
 import { GlyphShape } from "./StatusGlyph";
 import type { Status } from "./StatusGlyph";
 import {
-  SEPARATOR,
   STATE_FILTERS,
   filterAssets,
   groupAssets,
-  groupOf,
   namespacesOf,
   policySays,
   sortAssets,
@@ -22,7 +23,7 @@ import type { Dir, SortKey, StateFilter } from "./catalog";
 import { HUE_MODES, hueMode, legendFor, originWords, shownAndMore, stripesFor } from "./colour";
 import type { HueMode, Stripe } from "./colour";
 import Swatch, { at } from "./Swatch";
-import { FOCUS_MAX, WHOLE_GRAPH_MAX, collapseGroups, groupNode, neighbourhood } from "./dag";
+import { FOCUS_MAX, WHOLE_GRAPH_MAX, collapseHierarchy, neighbourhood } from "./dag";
 import type {
   AssetSummary,
   Backfill,
@@ -73,13 +74,6 @@ function staleTitle(a: AssetSummary): string | undefined {
     .join("\n");
 }
 
-// inside a group the heading already says the group, so a name that repeats it
-// as a prefix drops it. a name that has nothing to do with its declared group
-// keeps every character: cutting one off it would be a lie about what it is
-// called, and the name is the thing you send somebody
-const leafName = (name: string, group: string) =>
-  group !== "" && name.startsWith(`${group}${SEPARATOR}`) ? name.slice(group.length + 1) : name;
-
 const coverTitle = (a: AssetSummary) =>
   a.partitions === null
     ? undefined
@@ -109,13 +103,6 @@ function Column({
       </span>
     </th>
   );
-}
-
-// a node's staleness, whether it is one asset or a folded group of them
-function staleOf(assets: AssetSummary[], node: string): boolean {
-  const group = node.endsWith(SEPARATOR) ? node.slice(0, -1) : null;
-  if (group === null) return assets.some((a) => a.name === node && a.stale);
-  return assets.some((a) => groupOf(a) === group && a.stale);
 }
 
 // what each hue in the view stands for, in words, beside the view. without
@@ -192,9 +179,10 @@ export default function AssetsPage() {
   const [params, setParams] = useSearchParams();
   const sel = params.get("asset");
   const query = params.get("q") ?? "";
-  const stateFilter = (params.get("state") ?? "all") as StateFilter;
-  const sortKey = (params.get("sort") ?? "name") as SortKey;
-  const dir = (params.get("dir") ?? "asc") as Dir;
+  const view = viewFrom(params);
+  const stateFilter = STATE_FILTERS.includes(params.get("state") as StateFilter) ? params.get("state") as StateFilter : "all";
+  const sortKey = ["name", "state", "built", "freshness", "coverage"].includes(params.get("sort") ?? "") ? params.get("sort") as SortKey : "name";
+  const dir: Dir = params.get("dir") === "desc" ? "desc" : "asc";
   // which of the two things a hue may mean here, or neither. in the url like
   // every other view state, so a coloured view is a link
   const colour = hueMode(params.get("colour"));
@@ -206,7 +194,7 @@ export default function AssetsPage() {
   // one hop is what feeds it and what it feeds, which is the question that
   // brought you to a focused graph; two is already most of a wide graph
   const depth = Number(params.get("depth") ?? 1);
-  const closed = new Set((params.get("closed") ?? "").split(",").filter(Boolean));
+  const closed = readSet(params.get("closed"));
 
   const set = (edits: Record<string, string | null>) =>
     setParams(
@@ -224,7 +212,7 @@ export default function AssetsPage() {
   const toggleGroup = (prefix: string) => {
     const next = new Set(closed);
     if (!next.delete(prefix)) next.add(prefix);
-    set({ closed: [...next].join(",") });
+    set({ closed: writeSet(next) });
   };
   // a column already sorted turns around rather than re-sorting the same way
   const sortBy = (key: SortKey) =>
@@ -308,11 +296,19 @@ export default function AssetsPage() {
   const anyStale = assets.some((a) => a.stale);
   const selected = assets.find((a) => a.name === sel) ?? null;
   const shown = sortAssets(
-    filterAssets(assets, query, stateFilter, groupFilter, namespaceFilter),
+    filterAssets(assets, query, stateFilter, groupFilter, namespaceFilter).filter((a) => matchesLabel(a, params)),
     sortKey,
     dir,
   );
-  const groups = groupAssets(shown);
+  const shownNames = new Set(shown.map((a) => a.name));
+  const sections = filterHierarchy(hierarchy(assets, view), (a) => shownNames.has(a.name));
+  const effectiveClosed = new Set(closed);
+  const allSections = hierarchy(assets, view);
+  if (query.trim()) for (const s of allSections) {
+    if (s.members.some((a) => matchesName(a, query))) effectiveClosed.delete(s.key);
+    for (const c of s.children) if (c.members.some((a) => matchesName(a, query))) effectiveClosed.delete(c.key);
+  }
+  const groups = visibleSections(sections, effectiveClosed).map((s) => ({ ...s, assets: s.members }));
   // the fold chips are about the registry, not about what survived a filter:
   // a group filtered down to nothing still has a name and still folds
   const allGroups = groupAssets(assets).filter((g) => g.name !== "");
@@ -321,7 +317,7 @@ export default function AssetsPage() {
   const anyFreshness = assets.some((a) => a.freshness !== null);
   const anyPartitioned = assets.some((a) => a.partitions !== null);
   const anyOrigin = assets.some((a) => a.provenance.length > 0);
-  const columns = 6 + Number(anyFreshness) + Number(anyPartitioned) + Number(anyOrigin);
+  const columns = 7 + Number(anyFreshness) + Number(anyPartitioned) + Number(anyOrigin);
   // what the colours in this view stand for, named beside them
   const legend = legendFor(assets, colour);
 
@@ -330,27 +326,27 @@ export default function AssetsPage() {
   // search highlights in it instead
   const whole = assets.map((a) => ({
     name: a.name,
+    display_name: a.display_name,
     deps: a.deps,
     note: a.kind === "source" ? "source" : undefined,
     group: a.group,
     hues: stripesFor(a, colour),
   }));
-  const folded = collapseGroups(whole, closed);
+  const collapsed = collapseHierarchy(whole, allSections, effectiveClosed);
+  const folded = collapsed.nodes.map((n) => { const group = collapsed.groups.find((g) => g.node === n.name); return group ? { ...n, note: summary(group.section.members) } : n; });
   // past the threshold the whole graph is a picture of having a lot of assets
   // rather than of how they fit together, so it opens focused: on the
   // selection, or on the first thing that is stale, which is what anyone
   // opening a graph of three hundred assets came to look at
   const mode = params.get("graph") ?? (folded.length > WHOLE_GRAPH_MAX ? "focus" : "whole");
-  const stale = folded.find((n) => staleOf(assets, n.name));
-  const focus = mode === "whole" ? null : (sel ?? stale?.name ?? folded[0]?.name ?? null);
-  const nodes = focus === null ? folded : neighbourhood(folded, focus, depth);
+  const stale = folded.find((n) => assets.some((a) => a.stale && collapsed.representative(a.name) === n.name));
+  const focus = mode === "whole" ? null : (sel ? collapsed.representative(sel) : stale?.name ?? folded[0]?.name ?? null);
+  const nodes = focus === null || query.trim() ? folded : neighbourhood(folded, focus, depth);
   const staleness: Record<string, NodeStatus> = Object.fromEntries([
     ...assets.map((a) => [a.name, a.stale ? "stale" : "fresh"] as const),
     // a folded group is stale if anything in it is: the one claim that is
     // true of the group rather than of one of its members
-    ...groupAssets(assets)
-      .filter((g) => g.name !== "" && closed.has(g.name))
-      .map((g) => [groupNode(g.name), g.assets.some((a) => a.stale) ? "stale" : "fresh"] as const),
+    ...collapsed.groups.map(({ node, section }) => [node, section.members.some((a) => a.stale) ? "stale" : "fresh"] as const),
   ]);
 
   return (
@@ -367,6 +363,7 @@ export default function AssetsPage() {
         )}
       </div>
 
+      <GroupingControls items={assets} params={params} onChange={(p) => setParams(p, { replace: true })} />
       {assets.length === 0 ? (
         <p className="muted">no assets registered: declare them with Hestan::assets</p>
       ) : (
@@ -411,16 +408,16 @@ export default function AssetsPage() {
               ))}
             </span>
           </h2>
-          {allGroups.length > 0 && (
+          {allSections.some((s) => s.key !== "" || !isDefaultView(view)) && (
             <div className="group-chips">
               <span className="filter-label">fold</span>
-              {allGroups.map((g) => (
+              {allSections.map((g) => (
                 <button
-                  key={g.name}
-                  className={closed.has(g.name) ? "text-btn active" : "text-btn"}
-                  onClick={() => toggleGroup(g.name)}
+                  key={g.key}
+                  className={effectiveClosed.has(g.key) ? "text-btn active" : "text-btn"}
+                  onClick={() => toggleGroup(g.key)}
                 >
-                  {g.name}/
+                  {g.name}
                 </button>
               ))}
             </div>
@@ -434,7 +431,7 @@ export default function AssetsPage() {
             nodes={nodes}
             statuses={staleness}
             selected={sel}
-            onSelect={select}
+            onSelect={(name) => { const folded = collapsed.groups.find((g) => g.node === name); if (folded) toggleGroup(folded.section.key); else select(name); }}
             highlight={query}
           />
           <p className="muted dag-action">
@@ -528,6 +525,7 @@ export default function AssetsPage() {
                 <tr>
                   <Column label="name" sort="name" active={sortKey} dir={dir} onSort={sortBy} />
                   <Column label="state" sort="state" active={sortKey} dir={dir} onSort={sortBy} />
+                  <th>execution</th>
                   <Column label="built" sort="built" active={sortKey} dir={dir} onSort={sortBy} />
                   <th>run</th>
                   {anyFreshness && (
@@ -554,39 +552,26 @@ export default function AssetsPage() {
                 </tr>
               </thead>
               {groups.map((g) => (
-                <tbody key={g.name}>
-                  {/* the ungrouped assets are a heading too, or the first of
-                      them reads as the last row of the group above */}
-                  {groups.length > 1 && g.name === "" && (
-                    <tr className="group-row plain-row">
-                      <td colSpan={columns}>
-                        <span className="group-mark" aria-hidden="true" />
-                        <span className="muted">no group · {g.assets.length}</span>
+                <tbody key={g.key}>
+                  {(g.key !== "" || groups.length > 1) && (
+                    <tr className="group-row">
+                      <td colSpan={columns} style={{ paddingLeft: g.level * 20 }}>
+                        <button className="text-btn" aria-expanded={!effectiveClosed.has(g.key)} onClick={() => toggleGroup(g.key)}>
+                          {effectiveClosed.has(g.key) ? "▸" : "▾"} {g.name}
+                        </button>
+                        <Swatch stripes={stripesFor(g.assets[0], isDefaultView(view) && colour === "group" ? "group" : "off")} />
+                        <span className="muted"> · {summary(g.assets)}</span>
                       </td>
                     </tr>
                   )}
-                  {g.name !== "" && (
-                    <tr className="group-row" onClick={() => toggleGroup(g.name)}>
-                      <td colSpan={columns}>
-                        <span className="group-mark" aria-hidden="true">
-                          {closed.has(g.name) ? "▸" : "▾"}
-                        </span>
-                        {/* the colour sits beside the name it stands for, so
-                            the heading is the legend for its own section */}
-                        <Swatch stripes={stripesFor(g.assets[0], colour === "group" ? "group" : "off")} />
-                        {g.name}
-                        <span className="muted"> · {g.assets.length}</span>
-                      </td>
-                    </tr>
-                  )}
-                  {(g.name === "" || !closed.has(g.name)) &&
+                  {(!effectiveClosed.has(g.key) && g.children.length === 0) &&
                     g.assets.map((a) => (
                       <tr key={a.name} onClick={() => select(a.name)}>
                         <td>
                           {/* the row opens the panel; the name is the permanent
                               address, which is the thing you send somebody */}
                           <Link to={assetPath(a.name)} onClick={(e) => e.stopPropagation()}>
-                            {leafName(a.name, g.name)}
+                            <span title={a.name}>{displayName(a)}</span>
                           </Link>
                           {a.kind === "source" && <span className="tag">source</span>}
                           {a.policy && (
@@ -605,6 +590,11 @@ export default function AssetsPage() {
                               </span>
                             )}
                           </span>
+                        </td>
+                        <td className="muted">
+                          {(a.execution?.failed ?? 0) > 0 && <span>failed </span>}
+                          {(a.execution?.running ?? 0) > 0 && <span>running </span>}
+                          {!a.execution?.failed && !a.execution?.running && "—"}
                         </td>
                         <td className="muted" title={a.built_at ?? undefined}>
                           {a.partitions ? "per key" : relTime(a.built_at)}
@@ -700,7 +690,7 @@ export default function AssetsPage() {
                       </Link>
                     </td>
                     <td>
-                      <Link to={assetPath(b.asset)}>{b.asset}</Link>
+                      <Link to={assetPath(b.asset)}><RegisteredName kind="asset" name={b.asset} /></Link>
                     </td>
                     <td className="mono">
                       {b.from_key} → {b.to_key}

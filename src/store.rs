@@ -139,9 +139,8 @@ ALTER TABLE schedules ADD COLUMN params TEXT NOT NULL DEFAULT '{}';
 
 // materializations become append-only history. the keyed table kept only the
 // latest, so "when did this asset actually change" had no answer at all; every
-// existing row carries across as that asset's first history entry. the other
-// two changes are the same phase's later parts (`op_runs.metadata` and the
-// `asset_checks` table) landed here so nothing after this migrates again.
+// existing row carries across as that asset's first history entry.
+// This migration also adds op metadata and asset checks.
 const SCHEMA_V8: &str = r#"
 CREATE TABLE asset_materializations_v8 (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -177,8 +176,7 @@ CREATE INDEX asset_checks_asset ON asset_checks(asset, id DESC);
 // materializations and check results become per `(asset, partition)`, with
 // NULL standing for an unpartitioned asset, which is every asset that exists
 // before this migration, so existing rows carry across unchanged and every
-// lookup below reads them exactly as it did. `backfills` is the same phase's
-// last part, landed here so nothing after this migrates again.
+// lookup below reads them exactly as it did. This also creates `backfills`.
 const SCHEMA_V9: &str = r#"
 ALTER TABLE asset_materializations ADD COLUMN partition TEXT;
 DROP INDEX IF EXISTS asset_materializations_asset;
@@ -203,8 +201,7 @@ CREATE TABLE backfills (
 CREATE INDEX backfills_asset ON backfills(asset, id DESC);
 "#;
 
-// the whole phase's schema, landed at once so nothing after this migrates
-// again. `freshness_state` remembers what the last freshness check concluded,
+// `freshness_state` remembers what the last freshness check concluded,
 // so a job late for a week alerts once rather than every minute across every
 // restart. the `schedules` columns are the scheduler's durable cursor and its
 // catch-up policy, and `runs.scheduled_for` is the logical time a scheduled or
@@ -228,9 +225,8 @@ ALTER TABLE runs ADD COLUMN scheduled_for TEXT;
 // per sensor. the key is claimed in the same transaction that creates the run,
 // so a key can never name a run that was never created: a key recorded for a
 // run that did not launch drops that work forever, which is strictly worse than
-// the duplicate the key exists to prevent. the two `sensor_ticks` columns are
-// the same phase's last part (how long an evaluation took and how many keyed
-// requests it skipped) landed here so nothing after this migrates again.
+// the duplicate the key exists to prevent. The `sensor_ticks` columns record
+// evaluation duration and skipped keyed requests.
 const SCHEMA_V11: &str = r#"
 CREATE TABLE sensor_run_keys (
     sensor TEXT NOT NULL,
@@ -277,8 +273,7 @@ ALTER TABLE op_runs ADD COLUMN inputs TEXT;
 "#;
 
 // the run queue, and the claims that make it safe for more than one process to
-// pull from. the whole phase's schema, landed at once so nothing after this
-// migrates again.
+// pull from.
 //
 // `priority` orders the queue (higher first, ties by `created_at`), and the
 // three claim columns are the whole of the ownership protocol: `claimed_by` is
@@ -623,7 +618,7 @@ fn migrate(conn: &mut Connection) -> Result<(), Error> {
     let tx = conn.transaction()?;
     let mut version: u32 = tx.query_row("PRAGMA user_version", [], |r| r.get(0))?;
     if version == 0 && table_exists(&tx, "runs")? {
-        // phase-1 dbs predate versioning: v1 schema at user_version 0
+        // Unstamped legacy databases have the initial schema at user_version 0
         version = 1;
     }
     if version > SCHEMA_VERSION {
@@ -877,13 +872,6 @@ const PG_SCHEMES: [&str; 2] = ["postgres://", "postgresql://"];
 /// what the two backends spell differently, listed once: the seven methods
 /// below, plus the placeholder sigil, which is a lexical rewrite on the way
 /// out (`?1` to `$1`, in [`pg`](crate::pg)) and needs no branch anywhere.
-///
-/// the survey that opened this phase found six of the seven: nine
-/// `AUTOINCREMENT`s that are DDL and nothing else, four inserts that yield to
-/// whatever is already there, sqlite's null-safe `IS`, one json walk, one json
-/// append and the claim itself. running the store's suite against postgres
-/// found the seventh, which is what running it was for. everything else is the
-/// same text on both.
 ///
 /// naming each one here rather than at eighty call sites is the point: an
 /// explicit branch at a divergence is auditable, and a renderer that
@@ -1951,7 +1939,7 @@ impl Store {
     /// fail the next `n` writes a run makes, whatever the database would have
     /// said. `0` is a store that works again.
     ///
-    /// tests only, and the whole of this phase is about the state it produces:
+    /// Tests only:
     /// a store that will not take a write is the one thing a test cannot ask a
     /// working database for. what it fails with is sqlite's "database is
     /// locked" whichever backend is underneath, because what a caller needs
@@ -2748,6 +2736,17 @@ impl Store {
             |_| Ok(()),
         )?;
         Ok(found.is_some())
+    }
+
+    /// Running execution count for presentation, excluding queued work.
+    pub(crate) fn running_count(&self, job: &str) -> Result<i64, Error> {
+        self.conn()
+            .query_opt(
+                "SELECT COUNT(*) FROM runs WHERE job = ?1 AND status = 'running'",
+                args![job],
+                |row| row.int(0),
+            )
+            .map(|n| n.unwrap_or(0))
     }
 
     /// take the best queued run this claimer is allowed to start, and claim it.
@@ -4607,6 +4606,22 @@ impl Store {
              ORDER BY r.created_at DESC",
             args![job, runs],
             op_run_from_row,
+        )
+    }
+
+    /// Latest attempt and active attempts per asset op, independent of freshness.
+    pub(crate) fn asset_execution(&self) -> Result<Vec<(String, String, i64)>, Error> {
+        self.conn().query(
+            "SELECT op, status, active FROM (
+                SELECT o.op, o.status,
+                       SUM(CASE WHEN o.status = 'running' THEN 1 ELSE 0 END)
+                           OVER (PARTITION BY o.op) AS active,
+                       ROW_NUMBER() OVER (PARTITION BY o.op ORDER BY r.created_at DESC, r.id DESC) AS rank
+                FROM op_runs o JOIN runs r ON r.id = o.run_id
+                WHERE r.job = ?1 AND o.status <> 'pending'
+            ) latest WHERE rank = 1",
+            args![crate::asset::ASSETS_JOB],
+            |row| Ok((row.text(0)?, row.text(1)?, row.int(2)?)),
         )
     }
 
@@ -7165,7 +7180,7 @@ mod tests {
         })
     }
 
-    // the point of the whole phase: every subsystem's work reaches the one log,
+    // Every subsystem's work reaches the one log,
     // saying what it was about. written by the subsystem that does the work and
     // in the transaction that does it, which is what the cases below reach
     // through the store method rather than through an event api of their own
@@ -7436,7 +7451,7 @@ mod tests {
             assert_eq!(data["trigger"], json!("schedule"));
             assert_eq!(data["priority"], json!(0));
 
-            // the phase-19 tagged map, unchanged from what the op reported:
+            // the tagged metadata map, unchanged from what the op reported:
             // a reader that already renders `Meta` renders this
             let meta = json!({
                 "rows": {"count": 1_240},
@@ -8404,8 +8419,8 @@ mod tests {
         });
     }
 
-    // the schema as phase 1 shipped it: no kind/data on events, no schedule tables
-    const PHASE1_SCHEMA: &str = r#"
+    // the legacy schema: no kind/data on events, no schedule tables
+    const LEGACY_SCHEMA: &str = r#"
     CREATE TABLE runs (
         id TEXT PRIMARY KEY,
         job TEXT NOT NULL,
@@ -8444,9 +8459,9 @@ mod tests {
         VALUES ('r1', NULL, 'info', 'run queued', '2026-01-01T00:00:00+00:00');
     "#;
 
-    fn phase1_db(path: &str, user_version: u32) {
+    fn legacy_db(path: &str, user_version: u32) {
         let conn = Connection::open(path).unwrap();
-        conn.execute_batch(PHASE1_SCHEMA).unwrap();
+        conn.execute_batch(LEGACY_SCHEMA).unwrap();
         conn.pragma_update(None, "user_version", user_version)
             .unwrap();
     }
@@ -8479,17 +8494,17 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("v1.db");
         let path = path.to_str().unwrap();
-        phase1_db(path, 1);
+        legacy_db(path, 1);
         assert_migrated(path);
     }
 
     #[test]
-    fn unversioned_phase1_db_detected_as_v1() {
+    fn unversioned_legacy_db_detected_as_v1() {
         // dbs written before the migration mechanism existed: v1 tables, user_version 0
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("v0.db");
         let path = path.to_str().unwrap();
-        phase1_db(path, 0);
+        legacy_db(path, 0);
         assert_migrated(path);
     }
 
@@ -8524,7 +8539,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("v1.db");
         let path = path.to_str().unwrap();
-        phase1_db(path, 1);
+        legacy_db(path, 1);
         {
             let conn = Connection::open(path).unwrap();
             conn.execute_batch("CREATE TABLE schedules (x)").unwrap();
@@ -8555,7 +8570,7 @@ mod tests {
         // one past whatever this build is at, so the case keeps asking the
         // question it was written to ask after the next migration lands
         let future = SCHEMA_VERSION + 1;
-        phase1_db(path, future);
+        legacy_db(path, future);
         let err = Store::open(path).err().unwrap();
         assert_eq!(
             err.to_string(),
@@ -8577,7 +8592,7 @@ mod tests {
         // all for what an op printed
         let conn = Connection::open(path).unwrap();
         for batch in [
-            PHASE1_SCHEMA,
+            LEGACY_SCHEMA,
             SCHEMA_V2,
             SCHEMA_V3,
             SCHEMA_V4,
@@ -8622,7 +8637,7 @@ mod tests {
         // down an alert it owes
         let conn = Connection::open(path).unwrap();
         for batch in [
-            PHASE1_SCHEMA,
+            LEGACY_SCHEMA,
             SCHEMA_V2,
             SCHEMA_V3,
             SCHEMA_V4,
@@ -8692,7 +8707,7 @@ mod tests {
             Backend::Sqlite(dir) => {
                 let conn = Connection::open(dir.path().join("hestan.db")).unwrap();
                 for batch in [
-                    PHASE1_SCHEMA,
+                    LEGACY_SCHEMA,
                     SCHEMA_V2,
                     SCHEMA_V3,
                     SCHEMA_V4,
@@ -8799,7 +8814,7 @@ mod tests {
             Backend::Sqlite(dir) => {
                 let conn = Connection::open(dir.path().join("hestan.db")).unwrap();
                 for batch in [
-                    PHASE1_SCHEMA,
+                    LEGACY_SCHEMA,
                     SCHEMA_V2,
                     SCHEMA_V3,
                     SCHEMA_V4,
@@ -8900,7 +8915,7 @@ mod tests {
             Backend::Sqlite(dir) => {
                 let conn = Connection::open(dir.path().join("hestan.db")).unwrap();
                 for batch in [
-                    PHASE1_SCHEMA,
+                    LEGACY_SCHEMA,
                     SCHEMA_V2,
                     SCHEMA_V3,
                     SCHEMA_V4,
@@ -8954,7 +8969,7 @@ mod tests {
 
             // every run written before this replayed nothing, which is what a
             // null column honestly says. the sqlite fixture's r1 comes from
-            // the phase-1 schema and the postgres one is written above, so
+            // the legacy schema and the postgres one is written above, so
             // only what both have is asserted
             for run in store.runs(None, None, None, None, None, None, 10).unwrap() {
                 assert_eq!(run.replay_of, None, "{}", run.id);
@@ -9022,7 +9037,7 @@ mod tests {
             Backend::Sqlite(dir) => {
                 let conn = Connection::open(dir.path().join("hestan.db")).unwrap();
                 for batch in [
-                    PHASE1_SCHEMA,
+                    LEGACY_SCHEMA,
                     SCHEMA_V2,
                     SCHEMA_V3,
                     SCHEMA_V4,
@@ -9538,7 +9553,7 @@ mod tests {
         // every batch up to v11, stamped 11: no presets table, no runs.tags
         let conn = Connection::open(path).unwrap();
         for batch in [
-            PHASE1_SCHEMA,
+            LEGACY_SCHEMA,
             SCHEMA_V2,
             SCHEMA_V3,
             SCHEMA_V4,
@@ -9555,7 +9570,7 @@ mod tests {
         conn.pragma_update(None, "user_version", 11).unwrap();
         drop(conn);
 
-        // the run planted by the phase-1 batch reads back, and presets start empty
+        // the run planted by the legacy batch reads back, and presets start empty
         let store = Store::open(path).unwrap();
         assert_eq!(store.run("r1").unwrap().unwrap().status, RunStatus::Success);
         assert!(store.presets("etl").unwrap().is_empty());
@@ -9575,7 +9590,7 @@ mod tests {
         // every batch up to v12, stamped 12: op_runs has neither pid nor inputs
         let conn = Connection::open(path).unwrap();
         for batch in [
-            PHASE1_SCHEMA,
+            LEGACY_SCHEMA,
             SCHEMA_V2,
             SCHEMA_V3,
             SCHEMA_V4,
@@ -9747,7 +9762,7 @@ mod tests {
         // every batch up to v10, stamped 10: no run keys and no tick metrics
         let conn = Connection::open(path).unwrap();
         for batch in [
-            PHASE1_SCHEMA,
+            LEGACY_SCHEMA,
             SCHEMA_V2,
             SCHEMA_V3,
             SCHEMA_V4,
@@ -9896,9 +9911,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("v2.db");
         let path = path.to_str().unwrap();
-        // the phase-1 schema plus the v2 batch, stamped 2
+        // the legacy schema plus the v2 batch, stamped 2
         let conn = Connection::open(path).unwrap();
-        conn.execute_batch(PHASE1_SCHEMA).unwrap();
+        conn.execute_batch(LEGACY_SCHEMA).unwrap();
         conn.execute_batch(SCHEMA_V2).unwrap();
         conn.execute(
             "INSERT INTO schedules (job, expr) VALUES ('etl', '0 * * * *')",
@@ -9928,10 +9943,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("v3.db");
         let path = path.to_str().unwrap();
-        // the phase-1 schema plus the v2 and v3 batches, with rows in every
+        // the legacy schema plus the v2 and v3 batches, with rows in every
         // generation of table, stamped 3
         let conn = Connection::open(path).unwrap();
-        conn.execute_batch(PHASE1_SCHEMA).unwrap();
+        conn.execute_batch(LEGACY_SCHEMA).unwrap();
         conn.execute_batch(SCHEMA_V2).unwrap();
         conn.execute_batch(SCHEMA_V3).unwrap();
         conn.execute(
@@ -9977,7 +9992,7 @@ mod tests {
         let path = path.to_str().unwrap();
         // every batch up to v4, stamped 4: the runs table has no resumed_from yet
         let conn = Connection::open(path).unwrap();
-        conn.execute_batch(PHASE1_SCHEMA).unwrap();
+        conn.execute_batch(LEGACY_SCHEMA).unwrap();
         conn.execute_batch(SCHEMA_V2).unwrap();
         conn.execute_batch(SCHEMA_V3).unwrap();
         conn.execute_batch(SCHEMA_V4).unwrap();
@@ -10011,7 +10026,7 @@ mod tests {
         let path = path.to_str().unwrap();
         // every batch up to v5, stamped 5: the runs table has no error yet
         let conn = Connection::open(path).unwrap();
-        conn.execute_batch(PHASE1_SCHEMA).unwrap();
+        conn.execute_batch(LEGACY_SCHEMA).unwrap();
         conn.execute_batch(SCHEMA_V2).unwrap();
         conn.execute_batch(SCHEMA_V3).unwrap();
         conn.execute_batch(SCHEMA_V4).unwrap();
@@ -10058,7 +10073,7 @@ mod tests {
         let path = path.to_str().unwrap();
         // every batch up to v6, stamped 6: schedules has no params column yet
         let conn = Connection::open(path).unwrap();
-        conn.execute_batch(PHASE1_SCHEMA).unwrap();
+        conn.execute_batch(LEGACY_SCHEMA).unwrap();
         conn.execute_batch(SCHEMA_V2).unwrap();
         conn.execute_batch(SCHEMA_V3).unwrap();
         conn.execute_batch(SCHEMA_V4).unwrap();
@@ -10097,7 +10112,7 @@ mod tests {
         // every batch up to v7, stamped 7: asset_materializations is still
         // keyed by asset, op_runs has no metadata, asset_checks does not exist
         let conn = Connection::open(path).unwrap();
-        conn.execute_batch(PHASE1_SCHEMA).unwrap();
+        conn.execute_batch(LEGACY_SCHEMA).unwrap();
         conn.execute_batch(SCHEMA_V2).unwrap();
         conn.execute_batch(SCHEMA_V3).unwrap();
         conn.execute_batch(SCHEMA_V4).unwrap();
@@ -10149,8 +10164,7 @@ mod tests {
         assert_eq!(store.materializations("stats", None, 10).unwrap().len(), 2);
         drop(store);
 
-        // the rest of v8 is columns and a table later parts of this phase
-        // fill: they exist from this one migration on
+        // The migration also creates the check table and op metadata column.
         let conn = Connection::open(path).unwrap();
         assert!(table_exists(&conn, "asset_checks").unwrap());
         let metadata_cols: u32 = conn
@@ -10171,7 +10185,7 @@ mod tests {
         // every batch up to v8, stamped 8: no partition column anywhere and
         // no backfills table
         let conn = Connection::open(path).unwrap();
-        conn.execute_batch(PHASE1_SCHEMA).unwrap();
+        conn.execute_batch(LEGACY_SCHEMA).unwrap();
         for batch in [
             SCHEMA_V2, SCHEMA_V3, SCHEMA_V4, SCHEMA_V5, SCHEMA_V6, SCHEMA_V7, SCHEMA_V8,
         ] {
@@ -11698,8 +11712,7 @@ mod tests {
         });
     }
 
-    // the review finding from the phase that made the queue durable, asserted
-    // on both backends: process B booting must not touch process A's work
+    // On both backends, process B booting must not touch process A's work.
     #[test]
     fn a_live_lease_survives_another_processs_boot_and_an_expired_one_does_not() {
         both(|db| {
@@ -12593,10 +12606,8 @@ mod tests {
         )
     }
 
-    // the property this phase exists for is a type error, and a type error is
-    // the one thing a green suite cannot show you. so it is put to rustc
-    // directly, against the return types this file actually declares: an event
-    // may be dropped, and what an op did is not the kind of thing `note` takes
+    // Compile against the declared return types: an event may be dropped,
+    // but a write recording an op outcome must not be passed to `note`.
     #[test]
     fn a_write_that_records_what_a_run_did_cannot_be_noted() {
         let dir = tempfile::tempdir().unwrap();
@@ -13229,7 +13240,7 @@ mod tests {
             Backend::Sqlite(dir) => {
                 let conn = Connection::open(dir.path().join("hestan.db")).unwrap();
                 for batch in [
-                    PHASE1_SCHEMA,
+                    LEGACY_SCHEMA,
                     SCHEMA_V2,
                     SCHEMA_V3,
                     SCHEMA_V4,
@@ -13613,7 +13624,7 @@ mod tests {
             Backend::Sqlite(dir) => {
                 let conn = Connection::open(dir.path().join("hestan.db")).unwrap();
                 for batch in [
-                    PHASE1_SCHEMA,
+                    LEGACY_SCHEMA,
                     SCHEMA_V2,
                     SCHEMA_V3,
                     SCHEMA_V4,

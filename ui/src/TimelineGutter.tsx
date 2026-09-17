@@ -7,7 +7,7 @@
 // deployment that declares no group has to come out of here with no block, no
 // disclosure and nothing but the names it always had.
 import { at } from "./Swatch";
-import { GUTTER, laneLabel } from "./timeline";
+import { GUTTER, laneLabel, summaryLines } from "./timeline";
 import type { Row } from "./timeline";
 
 // where a name ends. the gutter is aligned on its right edge, against the bars
@@ -36,7 +36,7 @@ export function truncate(name: string, max: number): string {
 // how many characters of a name fit on a row: what is left of the gutter once
 // the indent and whatever sits left of the name are taken out of it
 export function roomFor(row: Row): number {
-  const indent = row.lane.kind === "job" && row.lane.group !== null ? INDENT : 0;
+  const indent = (row.lane.level ?? (row.lane.kind === "job" && row.lane.group !== null ? 1 : 0)) * INDENT;
   const left = row.lane.kind === "group" ? DISC_W : EDGE;
   return Math.floor((LABEL_X - indent - left) / CH);
 }
@@ -68,10 +68,11 @@ export default function TimelineGutter({
     <>
       {rows.map((row) => {
         const lane = row.lane;
+        const lines = summaryLines(lane);
         // hoisted so the disclosure's handler is holding a group rather than a
         // `string | null` narrowed somewhere it cannot see
         const group = lane.kind === "group" ? lane.group : null;
-        const indent = lane.kind === "job" && lane.group !== null ? INDENT : 0;
+        const indent = lane.level === undefined ? (lane.kind === "job" && lane.group !== null ? INDENT : 0) : lane.level * INDENT;
         return (
           <g key={lane.key}>
             {/* the group's own hue, the full height of the row and the same on
@@ -91,14 +92,15 @@ export default function TimelineGutter({
             <text
               className="tl-label"
               x={LABEL_X - indent}
-              y={row.y + row.h / 2}
+              y={row.y + row.h / 2 - lines.length * 6}
               textAnchor="end"
               dominantBaseline="central"
             >
               {truncate(laneLabel(lane), roomFor(row))}
               {/* a group row stands for jobs whose names it has no room for */}
-              {lane.kind === "group" && <title>{lane.jobs.join(", ")}</title>}
+              <title>{[laneLabel(lane), lane.summary, lane.jobs.join(", ")].filter(Boolean).join(" · ")}</title>
             </text>
+            {lines.map((line, i) => <text key={i} className="tl-summary" x={LABEL_X - indent} y={row.y + row.h / 2 - lines.length * 6 + 13 + i * 12} textAnchor="end" fontSize="8">{line}</text>)}
             {group !== null && onToggle && (
               // the whole of the gutter row is the target, so the name is what
               // you click, and the row it opens is the row you are on
@@ -107,11 +109,11 @@ export default function TimelineGutter({
                   type="button"
                   className="tl-disc"
                   aria-expanded={lane.open}
-                  aria-label={group}
+                  aria-label={lane.level ? lane.label : group}
                   // the disclosure covers the name, so the members are named
                   // here rather than on the text underneath it
-                  title={lane.jobs.join(", ")}
-                  onClick={() => onToggle(group)}
+                  title={[lane.summary, lane.jobs.join(", ")].filter(Boolean).join(" · ")}
+                  onClick={() => onToggle(lane.toggle ?? group)}
                 >
                   <Caret open={lane.open} />
                 </button>

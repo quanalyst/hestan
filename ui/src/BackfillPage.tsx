@@ -1,3 +1,4 @@
+import { RegisteredName } from "./RegistryNames";
 import { useState } from "react";
 import { Link, useParams } from "react-router-dom";
 import { get, HttpError, post, usePoll } from "./api";
@@ -97,7 +98,7 @@ function BackfillView({ id }: { id: string }) {
       <div className="page-head">
         <div>
           <h1>
-            <Link to={assetPath(backfill.asset)}>{backfill.asset}</Link>{" "}
+            <Link to={assetPath(backfill.asset)}><RegisteredName kind="asset" name={backfill.asset} /></Link>{" "}
             <span className="mono secondary">backfill {backfill.id}</span>
           </h1>
           <p className="muted">

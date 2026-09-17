@@ -312,7 +312,7 @@ schedule do its job at 09:00" separately from "did the run succeed".
 
 **the store holds at most one `fired` tick per `(job, expr, scheduled_for)`,
 ever**, on a unique index added in
-[schema v20](storage.md#one-fire-per-occurrence). the tick and the run are
+[a unique constraint](storage.md#one-fire-per-occurrence). the tick and the run are
 written in one transaction, so a fire the index refuses launches nothing at
 all: no run row, no op rows, no event.
 

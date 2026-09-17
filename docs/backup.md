@@ -229,7 +229,7 @@ what the operator has to do, in this order:
 5. `hestan resettle`.
 6. start one process, check `hestan doctor`, then start the rest.
 
-`hestan resettle` is a second pair of eyes on step 1, and it is worth knowing
+`hestan resettle` checks that writers have stopped, and it is worth knowing
 exactly how much it can see. before it writes anything it reads every lease in
 the database, waits twenty seconds, and reads them again. a process executing a
 run renews its run leases every fifteen seconds and a process running an

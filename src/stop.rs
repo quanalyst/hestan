@@ -24,7 +24,7 @@
 //! 5. whatever the deadline did not cover is handed back rather than left to
 //!    expire.
 //!
-//! a **second signal** cuts step 4 short. somebody pressing ctrl-c twice is
+//! a **second signal** ends the grace period immediately. somebody pressing ctrl-c twice is
 //! saying something, and the second one is not swallowed.
 
 use std::sync::Arc;
@@ -47,8 +47,7 @@ use crate::executor::Runner;
 /// longer runs on kubernetes and can say so.
 pub(crate) const WITHIN: Duration = Duration::from_secs(8);
 
-/// how often the drain looks at what is still in flight. small, because the
-/// number this phase exists to shrink is how long a stop takes.
+/// How often the drain checks in-flight work; a short interval limits stop latency.
 const LOOK: Duration = Duration::from_millis(20);
 
 /// the stop signals this process has been sent, and how many.

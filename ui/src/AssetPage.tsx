@@ -1,3 +1,5 @@
+import { RegisteredName } from "./RegistryNames";
+import { displayName } from "./presentation";
 import { useEffect, useRef, useState } from "react";
 import { Link, useNavigate, useParams } from "react-router-dom";
 import { get, post, usePoll } from "./api";
@@ -104,7 +106,7 @@ function Chain({ links }: { links: ChainLink[] }) {
         <div key={`${link.asset}[${link.partition ?? ""}]`} className="chain-link">
           <div className="chain-row">
             <Link className="mono" to={assetPath(link.asset)}>
-              {link.asset}
+              <RegisteredName kind="asset" name={link.asset} />
               {link.partition !== null && `[${link.partition}]`}
             </Link>
             <span className="muted">
@@ -180,7 +182,7 @@ function LineageList({
         <div className="lineage-names">
           {shown.map((d) => (
             <Link key={d} className="mono" to={assetPath(d)}>
-              {d}
+              <RegisteredName kind="asset" name={d} />
             </Link>
           ))}
           {names.length > shown.length && (
@@ -321,7 +323,8 @@ function AssetView({ name }: { name: string }) {
       <div className="page-head">
         <div>
           <h1>
-            {asset.name}
+            {displayName(asset)}
+            {asset.display_name && <small className="muted"> · {asset.name}</small>}
             <Link className="head-link" to="/assets">
               all assets
             </Link>

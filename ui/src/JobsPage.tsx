@@ -1,3 +1,7 @@
+import GroupingControls from "./GroupingControls";
+import type { Section } from "./presentation";
+import { Fragment } from "react";
+import { displayName, hierarchy, matchesName, summary, viewFrom, matchesLabel, filterHierarchy } from "./presentation";
 import { useState } from "react";
 import { useNavigate, useSearchParams } from "react-router-dom";
 import { get, usePoll } from "./api";
@@ -26,6 +30,8 @@ export default function JobsPage() {
   // assets page's filters, so one team's view is a link
   const [params, setParams] = useSearchParams();
   const namespace = params.get("namespace");
+  const query = params.get("q") ?? "";
+  const view = viewFrom(params);
   const setNamespace = (want: string | null) =>
     setParams(
       (prev) => {
@@ -54,7 +60,13 @@ export default function JobsPage() {
   const [runs, setRuns] = useState<Run[] | null>(null);
   const [upcoming, setUpcoming] = useState<UpcomingSchedule[]>([]);
   const [late, setLate] = useState<LateEntry[]>([]);
-  const [windowSecs, setWindowSecs] = useState(21600);
+  const requestedWindow = Number(params.get("window") ?? 21600);
+  const windowSecs = [3600, 21600, 86400].includes(requestedWindow) ? requestedWindow : 21600;
+  const setWindowSecs = (seconds: number) => setParams((previous) => {
+    const next = new URLSearchParams(previous);
+    if (seconds === 21600) next.delete("window"); else next.set("window", String(seconds));
+    return next;
+  }, { replace: true });
 
   usePoll(
     () => {
@@ -94,9 +106,20 @@ export default function JobsPage() {
   if (!jobs) return <p className="muted">loading…</p>;
 
   const namespaces = namespacesOf(jobs);
-  const shown = onlyNamespace(jobs, namespace);
+  const shown = onlyNamespace(jobs, namespace).filter((j) => matchesName(j, query) && matchesLabel(j, params));
+  const shownNames = new Set(shown.map((j) => j.name));
+  const sections = filterHierarchy(hierarchy(jobs, view), (j) => shownNames.has(j.name));
+  const effectiveOpen = new Set(opened);
+  if (query.trim()) for (const s of sections) { effectiveOpen.add(s.key); for (const c of s.children) effectiveOpen.add(c.key); }
+  const rows = sections.flatMap<{ section: Section<JobSummary> | null; members: JobSummary[] }>((s) => {
+    if (s.key === "") return [{ section: null, members: s.members }];
+    return [{ section: s, members: effectiveOpen.has(s.key) && !s.children.length ? s.members : [] },
+      ...(effectiveOpen.has(s.key) ? s.children.map((c) => ({ section: c, members: effectiveOpen.has(c.key) ? c.members : [] })) : [])];
+  });
   const winStart = Date.now() - windowSecs * 1000;
-  const winRuns = (runs ?? []).filter((r) => new Date(r.created_at).getTime() >= winStart);
+  const winRuns = (runs ?? []).filter((r) => new Date(r.created_at).getTime() >= winStart &&
+    (shownNames.has(r.job) || (!query && !namespace && !params.has("label") && !jobs.some((j) => j.name === r.job))));
+  const shownLate = late.filter((l) => l.kind === "job" && shownNames.has(l.name));
   // canceled excluded: its duration measures when someone hit stop
   const finished = winRuns.filter((r) => r.status === "success" || r.status === "failed");
   const durs = finished
@@ -142,21 +165,24 @@ export default function JobsPage() {
         )}
         {/* a declared policy is a claim about the world, not about this
             window, so it is counted whether anything ran in the window or not */}
-        {late.length > 0 && (
+        {shownLate.length > 0 && (
           <>
             {" · "}
-            <b>{late.length}</b> late
+            <b>{shownLate.length}</b> late
           </>
         )}
       </div>
 
+      <GroupingControls items={jobs} params={params} onChange={(p) => setParams(p, { replace: true })} />
+      <label>find <input value={query} placeholder="name or identifier" onChange={(e) => setParams((p) => { if (e.target.value) p.set("q", e.target.value); else p.delete("q"); return p; }, { replace: true })} /></label>
       <TimelinePlot
         jobs={shown}
+        view={view}
         runs={winRuns}
         upcoming={upcoming}
         windowSecs={windowSecs}
         onWindow={setWindowSecs}
-        open={opened}
+        open={effectiveOpen}
         onOpen={toggleOpen}
       />
 
@@ -206,12 +232,18 @@ export default function JobsPage() {
               </tr>
             </thead>
             <tbody>
-              {shown.map((job) => {
+              {rows.map(({ section, members }, i) => <Fragment key={section?.key ?? `loose:${i}`}>
+                {section && <tr className="group-row"><td colSpan={6} style={{ paddingLeft: section.level * 20 }}>
+                  <button className="text-btn" aria-expanded={effectiveOpen.has(section.key)} onClick={() => toggleOpen(section.key)}>
+                    {effectiveOpen.has(section.key) ? "▾" : "▸"} {section.name}
+                  </button> <span className="muted">{summary(section.members)}</span>
+                </td></tr>}
+              {members.map((job) => {
                 const run = job.last_run;
                 return (
                   <tr key={job.name} onClick={() => nav(`/jobs/${encodeURIComponent(job.name)}`)}>
                     <td>
-                      {job.name}
+                      <span title={job.name}>{displayName(job)}</span>
                       {job.overdue && <span className="tag">overdue</span>}
                       {job.freshness?.status === "late" && <span className="tag">late</span>}
                     </td>
@@ -243,7 +275,7 @@ export default function JobsPage() {
                     </td>
                   </tr>
                 );
-              })}
+              })}</Fragment>)}
             </tbody>
           </table>
         </>

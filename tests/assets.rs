@@ -407,7 +407,7 @@ async fn asset_graph_validation_happens_at_build() {
 // a database written before an asset's value went through a manager holds the
 // value in the row, and a database written after it may hold a handle. nothing
 // tells them apart and nothing needs to: `get` hands back what it did not
-// write, which is what makes this a phase with no migration in it
+// write, so existing materializations need no migration
 #[tokio::test]
 async fn a_materialization_written_before_any_of_this_still_seeds_a_build() {
     let dir = tempfile::tempdir().unwrap();

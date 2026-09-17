@@ -262,10 +262,9 @@ fn sample_across(points: Vec<(DateTime<Utc>, f64)>) -> Vec<(DateTime<Utc>, f64)>
 /// yourself, or say which kind of number you meant with
 /// [`count`](Meta::count) or [`bytes`](Meta::bytes).
 ///
-/// **not a closed set** (`#[non_exhaustive]`). it gained `Series` and
-/// `Saved` in one phase and gains another whenever the ui learns to draw
-/// something, and a caller matching on it is picking a rendering, which is
-/// a thing a `_` arm can do for a type it has never seen.
+/// **not a closed set** (`#[non_exhaustive]`). New renderable metadata may
+/// add variants. Callers matching on this type should provide a `_` arm for
+/// values they do not yet know how to render.
 #[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
 pub enum Meta {
@@ -2236,10 +2235,10 @@ mod tests {
             .expect("cancelled() never resolved");
     }
 
-    // exactly what phase 12 wrote, and what is on disk in every database made
-    // since. the enum has grown four times over since; these six rows have to
+    // A stored metadata fixture from before the enum gained variants.
+    // These six rows must
     // read back as the same six values or history stops being readable
-    const PHASE12_ROW: &str = r##"{
+    const LEGACY_METADATA_ROW: &str = r##"{
         "rows": {"int": 1234},
         "ratio": {"float": 0.5},
         "note": {"text": "backfilled from the archive"},
@@ -2249,8 +2248,8 @@ mod tests {
     }"##;
 
     #[test]
-    fn phase12_metadata_still_reads_after_the_enum_grew() {
-        let stored: Value = serde_json::from_str(PHASE12_ROW).unwrap();
+    fn legacy_metadata_still_reads_after_the_enum_grew() {
+        let stored: Value = serde_json::from_str(LEGACY_METADATA_ROW).unwrap();
         let read: BTreeMap<String, Meta> = stored
             .as_object()
             .unwrap()
@@ -2271,8 +2270,7 @@ mod tests {
         assert_eq!(read["report"], Meta::Markdown("# heading\n\nbody".into()));
         assert_eq!(read["shape"], Meta::Json(json!({"cols": 3})));
 
-        // and writing them again produces byte-for-byte the same row: the tags
-        // this phase added are new tags, not renamed ones
+        // Writing them again preserves the stored tags and values.
         assert_eq!(tagged_map(&read), Some(stored));
         // the numbers among them are still numbers, which is what deltas read
         assert_eq!(read["rows"].as_f64(), Some(1234.0));

@@ -171,26 +171,17 @@ worker processes racing one queue either way.
 
 ## Adding a migration
 
-migrations live in `src/store.rs` and run forward from `PRAGMA user_version`
-on every open. **this is the sqlite chain**; a postgres database is created
-whole at the current version by `src/pg.rs`, so a new step means editing that
-schema as well. to add the next one (call it vN, one past whatever
-`SCHEMA_VERSION` says today):
+SQLite migrations live in `src/store.rs`; PostgreSQL's current schema and
+forward migrations live in `src/pg.rs`. Both backends must support fresh stores
+and upgrades from existing stores.
 
-1. write a `SCHEMA_VN` const with the DDL (`ALTER TABLE` / `CREATE TABLE`,
-   the same style as the one below it).
-2. in `migrate`, add `if version < N { conn.execute_batch(SCHEMA_VN)?; }`
-   and bump the final `pragma_update` to N.
-3. add the same columns or tables to `SCHEMA` in `src/pg.rs`, and bump
-   `SCHEMA_VERSION`. a fresh postgres database is stamped with it; an existing
-   one needs a forward step of its own, in `pg::migrate`.
-4. add tests like the existing ones: build a fixture database at the old
-   version (see `phase1_db`), open it, assert old rows survive and new
-   tables/columns work, then reopen to prove the migration doesn't run twice.
-5. the postgres fixtures rewind rather than replay: each `at_vN` drops
-   everything added *after* its version off a database created whole. so a new
-   step means adding its drop to **every** earlier `at_vN`, not only the one
-   for N-1, or the older cases fail on a column that is already there.
+- Add the migration SQL and advance `SCHEMA_VERSION` and the stored schema stamp.
+- Update PostgreSQL's fresh-store schema and its forward migration chain.
+- Test an older fixture (see `legacy_db`): preserve its rows, check new fields
+  and tables, then reopen it to confirm migration is idempotent.
+- Update every affected PostgreSQL rewind fixture so it removes all objects
+  newer than the schema it represents.
+
 
 a column added to `runs` also wants `RUN_COLS`, `run_from_row`, the insert and
 `RUN_COL_COUNT`, which is what the one query selecting a column *beside* a run
@@ -198,9 +189,9 @@ reads that column by. get the count wrong and the run's last column is read as
 the other one, quietly, because both are nullable text; there is a case
 asserting the two agree.
 
-keep the v0 quirk in mind: version 0 plus an existing `runs` table means a
-pre-versioning database and is stamped v1 before migrating. don't reuse
-version 0 for anything.
+A schema stamp of zero with an existing `runs` table identifies a legacy
+unstamped database. The migration code recognizes it as the initial schema;
+do not reuse zero for another format.
 
 ## Tests
 

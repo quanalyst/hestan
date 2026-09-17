@@ -1,3 +1,5 @@
+import type { GroupingView } from "./presentation";
+import { displayName } from "./presentation";
 import { useEffect, useId, useRef, useState } from "react";
 import type { MouseEvent as ReactMouseEvent, ReactNode } from "react";
 import { useNavigate } from "react-router-dom";
@@ -65,7 +67,9 @@ export default function TimelinePlot({
   onWindow,
   open = NONE,
   onOpen,
+  view,
 }: {
+  view?: GroupingView;
   jobs: TimelineJob[];
   runs: Run[];
   upcoming: UpcomingSchedule[];
@@ -95,7 +99,8 @@ export default function TimelinePlot({
   for (const r of runs) {
     if (!all.some((j) => j.name === r.job)) all.push({ name: r.job, group: null, group_hue: null });
   }
-  const lanes = lanesOf(all, open);
+  const readable = (id: string) => { const job = all.find((j) => j.name === id); return job ? displayName(job) : id; };
+  const lanes = lanesOf(all, open, view);
   const hasLanes = lanes.length > 0;
 
   useEffect(() => {
@@ -311,7 +316,7 @@ export default function TimelinePlot({
     const key = `f:${run.id}`;
     const node = (op: string | null | undefined) => (
       <>
-        <span className="mono">{run.job}</span> · failed
+        <span className="mono" title={run.job}>{readable(run.job)}</span> · failed
         {op && (
           <>
             {" "}
@@ -516,7 +521,7 @@ export default function TimelinePlot({
                     y: b.by,
                     node: (
                       <>
-                        <span className="mono">{b.run.job}</span> ·{" "}
+                        <span className="mono" title={b.run.job}>{readable(b.run.job)}</span> ·{" "}
                         {b.run.status === "canceled" ? <StatusDot status="canceled" /> : b.run.status} ·{" "}
                         {clockTime(b.run.started_at ?? b.run.created_at)} · {fmtDuration(b.end - b.start)}
                       </>
@@ -628,7 +633,7 @@ export default function TimelinePlot({
                       <StatusDot status={run.status} />
                     </td>
                     <td className="mono">{shortId(run.id)}</td>
-                    <td>{run.job}</td>
+                    <td title={run.job}>{readable(run.job)}</td>
                     <td className="muted">{clockTime(run.started_at ?? run.created_at)}</td>
                     <td className="num">{fmtDuration(durationMs(run))}</td>
                   </tr>

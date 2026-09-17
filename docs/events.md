@@ -1,18 +1,8 @@
 # Events
 
-the event log is hestan's answer to "what happened last night".
-
-until v17 it could not answer that, and the reason was structural rather than
-cosmetic: `events.run_id` was `NOT NULL`, so **an event could only ever be
-about a run**. an asset materialized, a schedule that fired, a sensor tick, a
-backfill's progress, an alert that never got through, a lease reclaimed from a
-dead worker: each of those happened in a table of its own and reached no
-stream at all. you could ask a run what it did. you could not ask the
-deployment.
-
-now every subsystem writes into one log, and each event says what it is about.
-`hestan events --follow` is that log in a terminal, and the Activity view is
-the same one in the ui.
+The event log records activity across runs, assets, schedules, sensors,
+backfills, notifications and worker leases. Use `hestan events --follow` in a
+terminal or the Activity view in the UI.
 
 ## The shape of an event
 
@@ -40,12 +30,10 @@ the same one in the ui.
   fire that launched a run puts that run in its *payload* rather than in this
   column, because the event is about the schedule. this column is what makes
   a run's page exactly the run's own log and nothing else.
-- **`subject` is null on a run event.** the run is `run_id`, which was already
-  there and already indexed; v17 deliberately did not copy it into `subject`,
-  because doing so is a full rewrite of the largest table in the database to
-  store a second copy of a column. `Event::about()` in rust (and
-  `ev.subject ?? ev.run_id` in the ui) is where the two become one answer, and
-  the api's `subject=` filter matches either.
+- **`subject` is null on a run event.** Its identity is already stored in
+  `run_id`. `Event::about()` in Rust and `ev.subject ?? ev.run_id` in the UI
+  resolve either form; the API's `subject=` filter matches both.
+
 - **`op`** is set on the run events that belong to one op.
 - **`level`** is `info`, `warn` or `error`, and it is not the same claim as the
   kind: a check that failed at severity `warn` is a `check_failed` at level
@@ -62,9 +50,8 @@ the same one in the ui.
 an event is a claim that something happened. if it is written *next to* the
 thing rather than *with* it, then a crash in the gap produces one of two lies:
 a log that says a thing happened which did not, or a thing that happened and
-left no record. so every event added in v17 is written by the subsystem that
-does the work, in the same transaction as the row that is the work, the same
-rule phase 21 applied to a run's terminal notification.
+left no record. Subsystem events join the transaction that changes the recorded state.
+The table below lists the guarantees and exceptions.
 
 | what | transaction it joins | atomic |
 | --- | --- | --- |
@@ -90,8 +77,7 @@ rule phase 21 applied to a run's terminal notification.
 `op_success`, `op_failed`, `op_skipped`, `op_canceled` and `type_check_failed`
 are each a separate statement, written immediately before or after the
 `op_runs` update they describe. a crash in that gap loses the event and keeps
-the status, or vice versa. this is not new in v17 and it is not fixable by
-moving the write: an op *starting* is not a row anywhere, so there is nothing
+the status, or vice versa. moving the write does not fix this: an op *starting* is not a row anywhere, so there is nothing
 to join. what the gap costs is one line of narration; the op run row is the
 record of record, and the ui reads both.
 
@@ -289,7 +275,7 @@ size limits rather than policy and write no event.
 `GET /api/events` reports `"schema": 1` beside every page, and
 `hestan::EVENT_SCHEMA` is the same number.
 
-while hestan is 0.x, that number promises this:
+The schema number defines these compatibility guarantees:
 
 - a key documented above keeps its **name, its type and its meaning** for as
   long as the number does not move.
@@ -299,7 +285,7 @@ while hestan is 0.x, that number promises this:
   what it is about.
 
 so: **read the keys you know and ignore the rest.** a consumer written that way
-survives the whole of 0.x. one that matches exhaustively on `kind` does not,
+handles additive changes. One that matches exhaustively on `kind` does not,
 which is why hestan's own reader does not either: an unrecognised kind reads
 as `EventKind::Unknown("…")` carrying the stored word, rather than failing the
 query and taking the rest of the page with it. the same is true of
@@ -530,7 +516,7 @@ than pretending the constraint is not there.
 a run's events are deleted with the run, by [retention](storage.md), and always
 were.
 
-everything v17 added belongs to no run and so belongs to no run's retention
+events without a run belong to no run's retention
 either. those events are capped instead at the newest **50,000**, swept by the
 same loop, unconditionally: an asset built every five minutes writes a row
 here forever otherwise. the cap is not configurable today; it is a size limit

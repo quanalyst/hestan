@@ -1,3 +1,4 @@
+import { displayName } from "./presentation";
 import { useEffect, useRef, useState } from "react";
 import type { KeyboardEvent as ReactKeyboardEvent, ReactNode } from "react";
 import { useNavigate } from "react-router-dom";
@@ -68,24 +69,25 @@ export default function CommandPalette() {
 
   const jobItems: Item[] = jobs.map((j) => ({
     key: `j:${j.name}`,
-    node: <span>{j.name}</span>,
+    node: <span title={j.name}>{displayName(j)}</span>,
     meta: j.description ?? undefined,
-    hay: `${j.name} ${j.description ?? ""}`.toLowerCase(),
+    hay: `${j.name} ${displayName(j)} ${j.description ?? ""}`.toLowerCase(),
     perform: () => {
       setOpen(false);
       nav(`/jobs/${encodeURIComponent(j.name)}`);
     },
   }));
 
+  const readable = (id: string) => { const job = jobs.find((j) => j.name === id); return job ? displayName(job) : id; };
   const runItems: Item[] = runs.map((r) => ({
     key: `r:${r.id}`,
     node: (
       <span>
-        <span className="mono">{shortId(r.id)}</span> {r.job}
+        <span className="mono">{shortId(r.id)}</span> <span title={r.job}>{readable(r.job)}</span>
       </span>
     ),
     meta: `${r.status} · ${relTime(r.created_at)}`,
-    hay: `${r.id} ${r.job} ${r.status} ${r.trigger}`.toLowerCase(),
+    hay: `${r.id} $<span title={r.job}>{readable(r.job)}</span> ${r.status} ${r.trigger}`.toLowerCase(),
     perform: () => {
       setOpen(false);
       nav(`/runs/${r.id}`);
@@ -104,11 +106,11 @@ export default function CommandPalette() {
         key: `a:${j.name}:${s.expr}`,
         node: (
           <span>
-            {verb} {j.name}
+            {verb} {displayName(j)}
           </span>
         ),
         meta: s.expr,
-        hay: `${verb} ${j.name} ${s.expr}`.toLowerCase(),
+        hay: `${verb} ${j.name} ${displayName(j)} ${s.expr}`.toLowerCase(),
         perform: () => doSched(j.name, s.expr, !s.paused),
       };
       }),

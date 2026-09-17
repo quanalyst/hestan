@@ -213,7 +213,7 @@ async fn cases(db: &str) {
 
 // ------------------------------------------------------------------ the cases
 
-/// the finding this phase came from, as an assertion: a served process sent
+/// A served process sent
 /// SIGTERM exits on the signal, rather than sitting there until something
 /// kills it.
 async fn it_exits_on_a_signal(db: &str) {
@@ -248,8 +248,6 @@ async fn it_exits_on_a_signal(db: &str) {
     );
 }
 
-/// the regression this phase could most easily have introduced.
-///
 /// `run_once` installs no handler, so a one-shot does the work it was asked
 /// for and is then killed by SIGTERM exactly as any program with no handler
 /// is. both halves are asserted, because a handler installed process-wide

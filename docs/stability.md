@@ -1,53 +1,17 @@
 # Stability
 
-hestan is `0.2.4`, which is a 0.x version and therefore one that says out loud
-that it will move. this page is what it will not move, so that something can be
-built on it in the meantime.
+Public API changes are documented in [Changes](../CHANGELOG.md), with migration
+instructions for breaking changes. Hestan follows Cargo's compatibility rules:
+while the package is pre-stable, breaking changes require a minor release.
 
-it is not a promise about 1.0. it is a description of how 0.x is run, and the
-whole of it is one sentence: **the things a caller reads, and the traits a
-caller implements, change only with a line at the top of the changelog naming
-what moved and what to write instead.**
-
-## The version
-
-cargo reads `hestan = "0.2.4"` as `>=0.2.4, <0.3.0`, so under 0.x the **minor
-number is the compatibility number**. a `0.2.5` is additions and fixes and
-`cargo update` takes it; a break lands on `0.3.0`, which the same requirement
-refuses until somebody edits the manifest.
-
-`0.2.1` through `0.2.4` are what that looks like from the other side: fixes and
-a redrawn page in the ui, nothing added or moved on any public type, and `cargo
-update` takes them without being asked because there is nothing in any of them
-to be asked about.
-
-`0.2.0` was the first release to spend the minor number. it carried no source
-break at all and two changes to what an unchanged deployment does, and either
-one of those on its own is what the minor number is for: a deployment that met
-them through a `cargo update` nobody ran deliberately would have met them at
-3am. the size of a release is not the question the number answers.
-
-that rule arrived with 0.1.0. up to `0.1.0-beta.3` the version carried a
-pre-release tag, whose requirement has the same ceiling: `cargo update` moved a
-deployment from `beta.3` to `beta.4`, and then onto `0.1.0` itself, without
-anybody asking. so a break has to be the **first line** of its changelog entry
-rather than a paragraph inside it, and it stays there: the first line is the
-only part somebody reads before finding out the hard way, and a requirement
-written `hestan = "0"` still takes a `0.3.0` on its own.
-
-what may land in a `0.2.x` without breaking a build: a new method, a new
-variant on one of the enums marked `#[non_exhaustive]` below, a new endpoint, a
-new column behind a migration, a better sentence in an error.
-
-what may not, and is therefore what a `0.3.0` is for: a variant on any other
-enum, a **field on a public struct** (that is a source break for a struct
-literal, and hestan counts it as one), a required method on a trait somebody
-implements, a rename, a removal, a default that changes what an unchanged
-deployment does.
+Additions may include methods, endpoints, migrated columns and variants on
+`#[non_exhaustive]` enums. Renames, removals, fields on public structs, variants
+on closed enums, required trait methods and changed defaults require explicit
+compatibility review.
 
 ## The surfaces
 
-five, and they move together on the one version number.
+These contracts cover the library and its interfaces.
 
 | surface | written down in | what it holds still |
 | --- | --- | --- |
@@ -88,14 +52,9 @@ row a newer hestan wrote. neither replaces the other.
 
 ## The structs
 
-thirty-one public structs have public fields, and a new field on any of them
-breaks a struct literal. twenty-eight are things hestan hands you: `Run`,
-`Event`, `OpRun`, `Materialization`, `Tick`, the hook payloads, the rest of the
-store's rows, and `IoKey`, which an `IoManager` receives rather than builds.
-**read them; do not build them.** they gain fields as hestan records more, and
-that is announced rather than avoided.
-
-the three a caller does build have a way in that a new field does not break:
+Public structs with public fields can be constructed with literals; adding a
+field breaks those literals. Prefer constructors or default-based updates where
+available:
 
 ```rust
 EventQuery { level: Some(EventLevel::Error), ..Default::default() }
@@ -103,31 +62,12 @@ RunRequest::new("publish").params(json!({ "day": day })).key(day)
 Identity::new("alice", Access::Operator)
 ```
 
-none of the thirty-one is `#[non_exhaustive]`, on purpose. on a struct that
-attribute blocks the literal outright, functional update syntax included, so
-putting it on the row types would leave anybody with a good reason to build one
-(a test fixture, a fake store) with no way to do it. that wants constructors
-first.
+Store rows and hook payloads remain constructible for fixtures and custom
+integrations. Adding fields requires a documented compatibility change.
 
-[`Owner`](namespaces.md#an-owner) is the first one built that way, and it is
-the pattern for the ones after it: **public struct, private fields,
-constructors and accessors**. it is a thing callers build (`Owner::team("x")
-.contact("#y")`) and a thing hestan hands back on a hook payload, and it is
-expected to grow, so a literal of it was never offered. it is not counted in
-the thirty-one, and adding a field to it will not break anybody.
-
-`Launch`, `Restored` and `Resettled` are built the same way and for the same
-reason. each answers a question that is expected to gain a second half:
-[`Launch`](launching.md#launching-once) is what a keyed launch came to,
-[`Restored`](backup.md) is what a run log says about having come out of a copy,
-and [`Resettled`](backup.md#resettle) is what a resettle handed back. none of
-them is a thing you build, so accessors cost a caller nothing and a new field
-costs them nothing either.
-
-[`Deployment`](deployment.md) is the same pattern on the other side of the
-line: a thing callers *do* build, with private fields and a builder, for the
-reason `Owner` has one. it names what an installation is and it is exactly the
-sort of thing that grows a third half.
+Types intended to grow, including `Owner`, `Launch`, `Restored`, `Resettled` and
+`Deployment`, use private fields with constructors and accessors. Prefer this
+pattern for new public types.
 
 ## The extension points
 
@@ -150,13 +90,9 @@ back what `Auth::bearer` or `Auth::custom` gave you and there is nothing to
 implement. `IoResult` and `IoDropped` are aliases naming what the three methods
 above return, so they move if and only if `IoManager` does.
 
-`IoManager` is the one with history worth reading. `drop_run` was made a
-**required** method rather than a defaulted one on purpose: a default returning
-`Ok(())` would have compiled for every manager that already existed and gone on
-leaking every file each of them had ever written, which is the bug the method
-exists to fix. that is the rule for this trait. hestan adds a required method
-when a defaulted one would hide a bug, it is a break, and it arrives with a
-changelog line rather than quietly.
+`IoManager::drop_run` is required because a default that does nothing would
+silently leak stored outputs. Required trait methods are breaking changes even
+when they prevent a bug.
 
 ## Not a surface
 

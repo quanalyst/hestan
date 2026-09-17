@@ -16,7 +16,7 @@
 //!
 //! **timestamps stay text.** every query in the store compares and orders them
 //! as rfc3339 strings, and `timestamptz` would change ordering and comparison
-//! semantics across all eighty for no gain in this phase. the columns hestan
+//! semantics across the store. the columns hestan
 //! reads as booleans stay integers for the same reason. both are deliberate,
 //! and both are why a row reads identically off either backend.
 //!

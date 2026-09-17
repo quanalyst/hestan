@@ -1,3 +1,4 @@
+import { useRegistryName } from "./RegistryNames";
 import { useEffect, useRef, useState } from "react";
 import { Link } from "react-router-dom";
 import { get } from "./api";
@@ -53,12 +54,13 @@ function LevelTag({ level }: { level: EventLevel }) {
 }
 
 function EventRow({ event }: { event: RunEvent }) {
+  const resolveName = useRegistryName();
   const subject = subjectOf(event);
   const to = linkFor(event);
   // a run id is a uuid and reads as eight characters everywhere else in the ui;
   // in full it is two lines of a column that is one word wide for every other
   // subject there is
-  const shown = subject === null ? null : event.subject_kind === "run" ? shortId(subject) : subject;
+  const shown = subject === null ? null : event.subject_kind === "run" ? shortId(subject) : event.subject_kind === "asset" ? resolveName("asset", subject) : event.subject_kind === "job" || event.subject_kind === "schedule" ? resolveName("job", subject) : subject;
   return (
     <tr className={event.level === "info" ? undefined : `ev-${event.level}`}>
       <td className="muted" title={event.ts}>
@@ -137,6 +139,7 @@ function Whose() {
 }
 
 export default function ActivityPage() {
+  const resolveName = useRegistryName();
   const [feed, setFeed] = useState<FeedRow[] | null>(null);
   const [live, setLive] = useState(false);
   const [subjectKind, setSubjectKind] = useState<(typeof SUBJECTS)[number]>("all");
@@ -222,7 +225,11 @@ export default function ActivityPage() {
   if (feed === null) return <p className="muted">loading…</p>;
 
   const filters: Filters = { subjectKind, level, find };
-  const shown = feed.filter((r) => r.kind === "gap" || matches(r.event, filters));
+  const shown = feed.filter((r) => r.kind === "gap" || matches(r.event, filters) || (
+    matches(r.event, { ...filters, find: "" }) &&
+    (r.event.subject_kind === "asset" || r.event.subject_kind === "job" || r.event.subject_kind === "schedule") &&
+    resolveName(r.event.subject_kind === "asset" ? "asset" : "job", subjectOf(r.event) ?? "").toLowerCase().includes(filters.find.toLowerCase())
+  ));
   const filtered = subjectKind !== "all" || level !== "all" || find.trim() !== "";
 
   return (

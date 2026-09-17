@@ -106,7 +106,7 @@ test("a kind reads without saying its subject twice", () => {
 // several processes may serve this ui and exactly one of them decides, so the
 // line has to say which one this is rather than only what is happening
 const hestan = {
-  version: "0.1.0-beta.3",
+  version: "test-build",
   schema: 24,
   features: ["bundled", "cli", "postgres"],
   platform: "linux/aarch64",
@@ -158,7 +158,7 @@ test("the deciding line says whether this is the process that decides", () => {
 test("the deployment line separates what was declared from what hestan knows", () => {
   assert.equal(
     deploymentLine(health(null, { name: "prod-eu", build: "9f2c1ab", hestan })),
-    "prod-eu · build 9f2c1ab · hestan 0.1.0-beta.3 on linux/aarch64",
+    "prod-eu · build 9f2c1ab · hestan test-build on linux/aarch64",
   );
   // hestan's own version is never offered in place of the application's build:
   // a deployment that declared none is told it declared none
@@ -168,6 +168,6 @@ test("the deployment line separates what was declared from what hestan knows", (
   // and a build with no name still says the half that matters
   assert.equal(
     deploymentLine(health(null, { name: null, build: "9f2c1ab", hestan })),
-    "build 9f2c1ab · hestan 0.1.0-beta.3 on linux/aarch64",
+    "build 9f2c1ab · hestan test-build on linux/aarch64",
   );
 });

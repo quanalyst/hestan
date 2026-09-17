@@ -1,3 +1,4 @@
+import { RegisteredName, useRegistryName } from "./RegistryNames";
 import { useEffect, useRef, useState } from "react";
 import type { MouseEvent as ReactMouseEvent } from "react";
 import { Link, useNavigate, useSearchParams } from "react-router-dom";
@@ -110,6 +111,7 @@ function Undelivered({ rows }: { rows: Notification[] }) {
 }
 
 export default function RunsPage() {
+  const resolveName = useRegistryName();
   const mayDrive = useMay("operator");
   // moving a run up the queue changes what the deployment does with work
   // nobody asked about, which is an admin's
@@ -250,7 +252,7 @@ export default function RunsPage() {
       (status === "all" || r.status === status) &&
       (trigger === "all" || r.trigger === trigger) &&
       (cutoff === null || new Date(r.created_at).getTime() >= cutoff) &&
-      (needle === "" || r.job.toLowerCase().includes(needle) || r.id.toLowerCase().includes(needle)),
+      (needle === "" || (r.job.toLowerCase().includes(needle) || resolveName("job", r.job).toLowerCase().includes(needle)) || r.id.toLowerCase().includes(needle)),
   );
   const maxDur = Math.max(0, ...shown.map((r) => durationMs(r) ?? 0));
 
@@ -384,7 +386,7 @@ export default function RunsPage() {
                       <td className="num muted">{q.position}</td>
                       <td className="mono">{shortId(q.run.id)}</td>
                       <td>
-                        {q.run.job}
+                        <RegisteredName kind="job" name={q.run.job} />
                         <TagChips tags={q.run.tags} />
                       </td>
                       <td className="num">{q.run.priority}</td>
@@ -423,7 +425,7 @@ export default function RunsPage() {
                 <div key={r.id} className="live-row" onClick={() => nav(`/runs/${r.id}`)}>
                   <StatusDot status={r.status} />
                   <span className="mono">{shortId(r.id)}</span>
-                  <span>{r.job}</span>
+                  <span><RegisteredName kind="job" name={r.job} /></span>
                   <span className="muted live-dur">{fmtDuration(elapsed(r))}</span>
                 </div>
               ))}
@@ -510,7 +512,7 @@ export default function RunsPage() {
                       </td>
                       <td className="mono">{shortId(run.id)}</td>
                       <td>
-                        {run.job}
+                        <RegisteredName kind="job" name={run.job} />
                         <TagChips tags={run.tags} />
                       </td>
                       <td>

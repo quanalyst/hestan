@@ -1,38 +1,53 @@
-# hestan docs
+# Hestan documentation
 
-- [getting started](getting-started.md): `cargo add hestan` to a scheduled job with a ui, in one pass.
-- [choosing](choosing.md): job or asset, sqlite or postgres, in-process or isolated, schedule or sensor.
-- [concepts](concepts.md): ops, jobs, runs, events, triggers, an op that had nothing to do, and exactly how a run executes.
-- [typed io](typed-io.md): `Op::typed`, `input_as`, `.params::<P>()`, and what a type-check failure does.
-- [resources](resources.md): values hestan builds and hands to the ops that name them, for the process or for one run, through `Hestan::resource`, `Hestan::run_resource`, `ctx.resource::<T>` and `Op::requires`.
-- [op state](state.md): persisted watermarks through `ctx.state`/`set_state`, the at-least-once commit order, the state endpoint.
-- [metadata](metadata.md): typed facts an op attaches to what it produced, `ctx.meta` and the `Meta` variants, per-attempt staging, and where they surface.
-- [events](events.md): the one log every subsystem writes to, the kinds, what each payload carries, where each event is written and which of them cannot be atomic, and the schema's stability.
-- [logs](logs.md): what an op *printed*, subprocess capture, the `capture` feature's tracing layer, why an in-process `println!` is not captured, the caps, and the endpoints.
-- [isolation](isolation.md): `Op::isolated()` puts an op in its own process, with what a dead child is recorded as, cancellation and timeouts that are kills, memory and cpu limits, and the honest cost.
-- [connecting to your data](connecting.md): the seam between an op and the system it reads, a client in an op, a pool as a resource, secrets from the environment, retries and timeouts, and why hestan wraps nobody's sdk.
-- [io managers](io-managers.md): where op outputs live, the `IoManager` trait, `Inline`, `FileIo`, per-op managers, and where handles are resolved.
-- [dbt](dbt.md): a dbt project's models as assets, read from the manifest dbt compiled, with what shells out, the schema versions read, freshness without querying your warehouse, and what is deliberately not covered.
-- [assets](assets.md): fingerprints, provable staleness, memoized builds, builds that only wait for one they intersect, a cron on an asset, probes, and the policies that say when one rebuilds itself.
-- [freshness](freshness.md): declared policies, `fresh_within`, fresh/late/never, `on_late` alerts, and how a policy relates to `overdue` and to staleness.
-- [sensors](sensors.md): the sensor loop, cursor commit-on-success, `RunRequest` and run keys, timeouts and concurrency, failure backoff, probes and run-status chains as sensors, pausing and tick history.
-- [scheduling](scheduling.md): a cron on a job or on an asset, cron syntax, timezones, the durable cursor, missed-fire catch-up, pause/resume, ticks, and the scheduler loop.
-- [http sources](http-sources.md): declarative REST pulls, the full `HttpSource` builder, fan-out, retry policy.
-- [notifications](notifications.md): hooks, `on_run_finished`/`RunEvent`, `on_op_finished`/`OpEvent`, per-job scoping, `on_failure`/`RunFailure`, `on_late`/`LateEvent`, the webhook and slack helpers, and durable at-least-once delivery.
-- [replay](replay.md): re-running ops of a finished run on the inputs it gave them, what it is for, what it reproduces, the four things it does not, the retention horizon, and the three ways in.
-- [secrets in params](secrets.md): `Op::secret_params`, where the redaction is and why it is in the store rather than in a renderer, what a secret does to a replay, what the second line catches and what it does not, and the limits.
-- [launching](launching.md): presets, params schemas, run tags, subset launches, and cloning a past run.
-- [the command line](cli.md): `hestan::cli::run` in your own binary, the mount, the three ways to reach a deployment, every command, the exit codes a cron line reads, the output contract, `doctor`, `explain` and dynamic completion.
-- [web ui](web-ui.md): a page-by-page tour of the embedded ui and how it draws status.
-- [namespaces and owners](namespaces.md): dividing one deployment between teams, how a namespace differs from an asset group, a token scoped to one, who owns a job or an asset, how that owner reaches a failure hook, and where the line is drawn on escalation.
-- [authentication](auth.md): the refusal that keeps an unguarded deployment off a public address, the two authenticators, the three roles endpoint by endpoint, where the ui keeps a token and what that does not protect against, the audit trail, and what this deliberately is not.
-- [scaling](scaling.md): the run queue, concurrency limits, priority, claims and leases, scheduler and worker roles, the compose example, and what several hosts needs.
-- [deployment and build identity](deployment.md): declaring which installation this is and which build of your application it runs, what hestan knows about itself without being told, the build a run records at launch, filtering a run list by it, and what the column costs.
-- [containers](containers.md): the image and what is in it, the compose stack of one scheduler and three workers, what a stop is worth next to a kill, what happened when the deciding process was cut off the network, and the kubernetes manifests nobody has applied to a cluster.
-- [http api](http-api.md): every endpoint, parameter, response shape, and error code.
-- [metrics](metrics.md): the prometheus endpoint, every metric with its type and labels, what to alert on, which side of the auth guard it sits and why, what may be a label and what may not, and what is deliberately not there.
-- [storage](storage.md): the two backends and how to choose, the schema, migrations, and crash recovery.
-- [backup and recovery](backup.md): taking a consistent copy of each backend, what a restored store says about claims, leases and running runs, the io manager files a copy does not contain, and the hazard of restoring one while workers are still up.
-- [embedding](embedding.md): `serve` vs `run_once` vs `Runner`, testing, consuming from another repo.
-- [stability](stability.md): what a caller may rely on while hestan is 0.x, the five surfaces and what each holds still, which types are a closed set and which will grow, the extension points that are contracts, and what is deliberately not a surface at all.
-- [development](development.md): repo layout, quality gates, the ui build loop, adding a migration.
+## Start here
+
+- [Getting started](getting-started.md): create and schedule a job.
+- [Concepts](concepts.md): jobs, ops, runs and dependencies.
+- [Choosing components](choosing.md): jobs or assets, schedules or sensors, and storage options.
+- [Web UI](web-ui.md): navigation, status and run inspection.
+- [Command line](cli.md): commands, configuration and exit codes.
+
+## Define work
+
+- [Assets](assets.md): lineage, fingerprints and materialization.
+- [Display names and grouping](presentation.md): names, subgroups, labels and grouping views.
+- [Scheduling](scheduling.md): cron, timezones and missed runs.
+- [Sensors](sensors.md): event-driven runs and source probes.
+- [Freshness](freshness.md): policies and late-work detection.
+- [Launching](launching.md): parameters, presets, tags and subsets.
+- [Replay](replay.md): rerun work using recorded inputs.
+- [Notifications](notifications.md): hooks and delivery.
+
+## Work with data
+
+- [Connecting to data](connecting.md): clients, retries and credentials.
+- [Resources](resources.md): shared and per-run dependencies.
+- [Typed I/O](typed-io.md): typed inputs, outputs and parameters.
+- [I/O managers](io-managers.md): output storage.
+- [Op state](state.md): persisted watermarks.
+- [Metadata](metadata.md): structured facts attached to outputs.
+- [HTTP sources](http-sources.md): REST pulls.
+- [dbt](dbt.md): register models as assets.
+- [Secrets](secrets.md): parameter redaction and its limits.
+
+## Run Hestan
+
+- [Embedding](embedding.md): integrate Hestan into an application.
+- [Authentication](auth.md): identities, roles and access controls.
+- [Namespaces and owners](namespaces.md): scopes and ownership metadata.
+- [Scaling](scaling.md): workers, queues, concurrency and leases.
+- [Isolation](isolation.md): subprocess execution and resource limits.
+- [Containers](containers.md): Docker, Compose and Kubernetes examples.
+- [Deployment identity](deployment.md): installation and application-build metadata.
+- [Storage](storage.md): backends, schema and migrations.
+- [Backup and recovery](backup.md): backup and restore procedures.
+
+## Reference
+
+- [HTTP API](http-api.md): endpoints, fields and errors.
+- [Events](events.md): event types and payloads.
+- [Logs](logs.md): capture and retrieval.
+- [Metrics](metrics.md): Prometheus metrics.
+- [Stability](stability.md): compatibility policy.
+- [Development](development.md): repository layout, tests and build instructions.

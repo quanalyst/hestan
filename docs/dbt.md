@@ -6,7 +6,7 @@ hestan [asset](assets.md) per dbt model, wired from the manifest's own
 `depends_on`.
 
 ```toml
-hestan = { version = "0.2.4", features = ["dbt"] }
+hestan = { version = "0.2.5", features = ["dbt"] }
 ```
 
 ```rust
@@ -153,7 +153,7 @@ written down rather than discovered:
   `dbt seed` and `dbt snapshot` as ops of your own if you need them.
 - **`dbt test` is not run.** an [asset check](assets.md) of your own can shell
   out to `dbt test --select <model>` if you want the results in hestan; a
-  future phase may read them from `run_results.json` rather than guessing at
+  future implementation could read them from `run_results.json` rather than guessing at
   them.
 - **`run_results.json` is not read**, so rows affected, per-model timing and
   dbt's own status words are not in hestan's metadata. what is there is what

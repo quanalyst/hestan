@@ -43,6 +43,9 @@ pub struct Job {
     description: Option<String>,
     namespace: Option<String>,
     group: Option<String>,
+    display_name: Option<String>,
+    subgroup: Option<String>,
+    labels: BTreeMap<String, String>,
     owner: Option<Owner>,
     ops: Vec<Op>,
     order: Vec<String>,
@@ -72,6 +75,9 @@ impl Job {
             description: None,
             namespace: None,
             group: None,
+            display_name: None,
+            subgroup: None,
+            labels: BTreeMap::new(),
             owner: None,
             ops: Vec::new(),
             instances: Vec::new(),
@@ -111,6 +117,21 @@ impl Job {
     /// and there is no fallback: a job's group is declared or it is absent.
     pub fn group(&self) -> Option<&str> {
         self.group.as_deref()
+    }
+
+    /// The declared readable name, or `None` to present [`Self::name`].
+    pub fn display_name(&self) -> Option<&str> {
+        self.display_name.as_deref()
+    }
+
+    /// Explicit subgroup within [`Self::group`], identified together with its parent.
+    pub fn subgroup(&self) -> Option<&str> {
+        self.subgroup.as_deref()
+    }
+
+    /// Generic presentation labels, ordered by key. Empty when none were declared.
+    pub fn labels(&self) -> &BTreeMap<String, String> {
+        &self.labels
     }
 
     /// who to wake when a run of this job fails, from
@@ -297,6 +318,9 @@ impl Job {
             description,
             namespace: None,
             group: None,
+            display_name: None,
+            subgroup: None,
+            labels: BTreeMap::new(),
             owner: None,
             ops,
             order,
@@ -919,6 +943,9 @@ pub struct JobBuilder {
     description: Option<String>,
     namespace: Option<String>,
     group: Option<String>,
+    display_name: Option<String>,
+    subgroup: Option<String>,
+    labels: BTreeMap<String, String>,
     owner: Option<Owner>,
     ops: Vec<Op>,
     instances: Vec<Instance>,
@@ -968,8 +995,8 @@ impl JobBuilder {
         self
     }
 
-    /// what this job is labeled with on the timeline: one flat name, with
-    /// nothing nested inside it.
+    /// The parent group on the timeline. An optional [`Self::subgroup`]
+    /// declares one explicit level beneath it.
     ///
     /// ```
     /// # use hestan::Job;
@@ -1012,6 +1039,29 @@ impl JobBuilder {
     /// gets from the same function.
     pub fn group(mut self, name: impl Into<String>) -> Self {
         self.group = Some(name.into());
+        self
+    }
+
+    /// A readable name for presentation. Does not change the persistent name,
+    /// schedules or history. Blank names fail [`Self::build`].
+    pub fn display_name(mut self, name: impl Into<String>) -> Self {
+        self.display_name = Some(name.into());
+        self
+    }
+
+    /// One explicit subgroup beneath the declared group. Blank names, `/`,
+    /// or a subgroup without a parent group fail [`Self::build`].
+    /// This metadata has no execution or authorization semantics.
+    pub fn subgroup(mut self, name: impl Into<String>) -> Self {
+        self.subgroup = Some(name.into());
+        self
+    }
+
+    /// Add a generic presentation label. Keys and values must be nonblank;
+    /// duplicate keys use the last declared value. Labels have no execution,
+    /// origin, namespace or authorization semantics.
+    pub fn label(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
+        self.labels.insert(key.into(), value.into());
         self
     }
 
@@ -1175,6 +1225,14 @@ impl JobBuilder {
         if let Some(group) = self.group.as_deref() {
             check_group("job", &self.name, group)?;
         }
+        crate::asset::check_presentation(
+            "job",
+            &self.name,
+            self.display_name.as_deref(),
+            self.group.as_deref(),
+            self.subgroup.as_deref(),
+        )?;
+        crate::asset::check_labels("job", &self.name, &self.labels)?;
         let ops = flatten(&self.name, self.ops, self.instances)?;
         let pairs: Vec<_> = ops
             .iter()
@@ -1190,6 +1248,9 @@ impl JobBuilder {
             description: self.description,
             namespace: self.namespace,
             group: self.group,
+            display_name: self.display_name,
+            subgroup: self.subgroup,
+            labels: self.labels,
             owner: self.owner,
             ops,
             order,
@@ -1209,6 +1270,46 @@ impl JobBuilder {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn labels_are_generic_optional_and_last_value_wins() {
+        let job = Job::builder("stable")
+            .label("anything", "first")
+            .label("anything", "second")
+            .build()
+            .unwrap();
+        assert_eq!(job.labels()["anything"], "second");
+        assert_eq!(job.name(), "stable");
+        assert!(Job::builder("old").build().unwrap().labels().is_empty());
+        assert!(Job::builder("bad").label(" ", "value").build().is_err());
+        assert!(Job::builder("bad").label("key", " ").build().is_err());
+    }
+
+    #[test]
+    fn presentation_metadata_is_optional_and_validated() {
+        let old = Job::builder("stable/id").build().unwrap();
+        assert_eq!(old.display_name(), None);
+        assert_eq!(old.subgroup(), None);
+        assert_eq!(old.group(), None);
+        for parent in ["one", "two"] {
+            let job = Job::builder("stable/id")
+                .display_name("Readable")
+                .group(parent)
+                .subgroup("shared")
+                .build()
+                .unwrap();
+            assert_eq!(job.name(), "stable/id");
+            assert_eq!(job.display_name(), Some("Readable"));
+            assert_eq!(job.subgroup(), Some("shared"));
+            assert_eq!(job.group(), Some(parent));
+            assert_eq!(job.namespace(), None);
+        }
+        assert!(Job::builder("a/b").subgroup("child").build().is_err());
+        for bad in ["", " ", "a/b"] {
+            assert!(Job::builder("id").group("g").subgroup(bad).build().is_err());
+        }
+        assert!(Job::builder("id").display_name(" ").build().is_err());
+    }
 
     fn op(name: &str) -> Op {
         Op::new(name, |_| async { Ok(json!(null)) })
@@ -1315,7 +1416,7 @@ mod tests {
 
         let said = build_err(Job::builder("etl").op(op("run")).group("a/b"));
         assert!(said.contains("job etl") && said.contains("a/b"), "{said}");
-        assert!(said.contains("a group is flat"), "{said}");
+        assert!(said.contains("declare a subgroup explicitly"), "{said}");
     }
 
     // a limit caps a process. in-process that process is the orchestrator, so

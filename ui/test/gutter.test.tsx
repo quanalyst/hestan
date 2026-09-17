@@ -87,7 +87,7 @@ test("the disclosure is a button that says which way the group goes", () => {
   assert.ok(shut.includes(">weather · 2<"), shut);
   // the row has room for the count and not for the names, so the names are on
   // the hover, on the control that covers them
-  assert.ok(shut.includes('title="weather_clean, weather_pull"'), shut);
+  assert.ok(shut.includes('title="2 members · weather_clean, weather_pull"'), shut);
   // shut, the caret points at the row it would add
   assert.equal(count(shut, /tl-caret-open/g), 0);
 

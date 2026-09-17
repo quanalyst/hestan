@@ -1,3 +1,5 @@
+import { displayName, hierarchy, readSet, writeSet, summary, DEFAULT_VIEW } from "./presentation";
+import type { Health, GroupingView } from "./presentation";
 // which rows the timeline draws, and what a group does to them.
 //
 // a module of its own for the reason `catalog.ts` is one: the outline is a
@@ -23,7 +25,10 @@ export const GUTTER = 168;
 
 // as much of a job as the timeline reads. `JobSummary` satisfies it, so a page
 // hands over what it already fetched rather than mapping it into a shape
-export interface TimelineJob {
+export interface TimelineJob extends Health {
+  display_name?: string | null;
+  subgroup?: string | null;
+  labels?: Record<string, string>;
   name: string;
   group: string | null;
   group_hue: number | null;
@@ -37,6 +42,10 @@ export type LaneKind = "group" | "job";
 export interface Lane {
   // what react and the open set go by
   key: string;
+  label?: string;
+  toggle?: string;
+  level?: number;
+  summary?: string;
   kind: LaneKind;
   // the group this row is inside: the one it stands for on a group row, the
   // one it is a member of on a job row, and null on a job in no group. **a
@@ -78,7 +87,19 @@ export const NONE: ReadonlySet<string> = new Set<string>();
 // stands for: a row aggregating six jobs and a row aggregating one are
 // different rows, and a reader cannot see the difference from the bars
 export function laneLabel(lane: Lane): string {
-  return lane.kind === "group" ? `${lane.group} · ${lane.jobs.length}` : lane.jobs[0];
+  return lane.label ?? (lane.kind === "group" ? `${lane.group} · ${lane.jobs.length}` : lane.jobs[0]);
+}
+
+// Wrap problem counts instead of hiding them outside a narrow gutter.
+export function summaryLines(lane: Lane): string[] {
+  const parts = lane.summary?.split(" · ").slice(1) ?? [];
+  const lines: string[] = [];
+  for (const part of parts) {
+    const last = lines.length - 1;
+    if (last >= 0 && (lines[last] + " · " + part).length <= 28) lines[last] += ` · ${part}`;
+    else lines.push(part);
+  }
+  return lines;
 }
 
 // the rows, top to bottom. a group takes the place its first member would have
@@ -93,53 +114,22 @@ export function laneLabel(lane: Lane): string {
 // deployment that declares no group gets exactly the rows it always had**:
 // there is no grouping to be had, and inventing one out of a naming convention
 // would be a guess.
-export function lanesOf(jobs: TimelineJob[], open: ReadonlySet<string>): Lane[] {
-  // the whole gutter is alphabetical, groups and ungrouped jobs together on
-  // one list. a reader scanning for a word finds it where the word falls
-  // rather than where the deployment happened to declare it, and a group and
-  // a job that is in none are the same kind of thing to scan past
-  const members = new Map<string, TimelineJob[]>();
-  const loose: TimelineJob[] = [];
-  for (const job of jobs) {
-    const group = job.group === "" ? null : job.group;
-    if (group === null) {
-      loose.push(job);
-      continue;
-    }
-    const held = members.get(group);
-    if (held) held.push(job);
-    else members.set(group, [job]);
-  }
-
-  const rows: { name: string; group: string | null }[] = [
-    ...[...members.keys()].map((group) => ({ name: group, group })),
-    ...loose.map((job) => ({ name: job.name, group: null })),
-  ];
-  rows.sort((a, b) => byName(a.name, b.name));
-
+export function lanesOf(jobs: TimelineJob[], open: ReadonlySet<string>, view: GroupingView = DEFAULT_VIEW): Lane[] {
   const lanes: Lane[] = [];
-  for (const row of rows) {
-    if (row.group === null) {
-      const job = loose.find((j) => j.name === row.name)!;
-      lanes.push({ key: `job:${job.name}`, kind: "job", group: null, hue: null, jobs: [job.name], open: false });
-      continue;
+  const sorted = [...jobs].sort((a, b) => byName(displayName(a), displayName(b)));
+  const sections = hierarchy(sorted, view).flatMap((s) => s.key === "" ? s.members.map((j) => ({ ...s, name: displayName(j), members: [j] })) : [s]).sort((a, b) => byName(a.name, b.name));
+  const jobLane = (job: TimelineJob, level: number): Lane => ({ key: `job:${job.name}`, kind: "job", group: job.group, hue: job.group_hue, jobs: [job.name], open: false, label: displayName(job), level });
+  for (const section of sections) {
+    if (section.key === "") { lanes.push(...section.members.map((j) => jobLane(j, 0))); continue; }
+    const hue = section.members.every((j) => j.group === section.members[0].group) ? section.members.find((j) => j.group_hue !== null)?.group_hue ?? null : null;
+    const groupLane = (s: typeof section): Lane => ({ key: `group:${s.key}`, toggle: s.key, kind: "group", group: section.name, hue, jobs: s.members.map((j) => j.name), open: open.has(s.key), label: `${s.name} · ${s.members.length}`, level: s.level, summary: summary(s.members) });
+    lanes.push(groupLane(section));
+    if (!open.has(section.key)) continue;
+    if (section.children.length === 0) lanes.push(...section.members.map((j) => jobLane(j, 1)));
+    else for (const child of section.children) {
+      lanes.push(groupLane(child));
+      if (open.has(child.key)) lanes.push(...child.members.map((j) => jobLane(j, 2)));
     }
-    const held = [...(members.get(row.group) ?? [])].sort((a, b) => byName(a.name, b.name));
-    // one group, one angle: the server hands the same one to every member, and
-    // a member that arrived without one does not get to blank the row
-    const hue = held.find((job) => job.group_hue !== null)?.group_hue ?? null;
-    const shown = open.has(row.group);
-    lanes.push({
-      key: `group:${row.group}`,
-      kind: "group",
-      group: row.group,
-      hue,
-      jobs: held.map((job) => job.name),
-      open: shown,
-    });
-    if (!shown) continue;
-    for (const job of held)
-      lanes.push({ key: `job:${job.name}`, kind: "job", group: row.group, hue, jobs: [job.name], open: false });
   }
   return lanes;
 }
@@ -189,7 +179,7 @@ export function rowsOf(lanes: Lane[], byJob: Map<string, Bar[]>): Row[] {
     const bars = lane.jobs.flatMap((job) => (byJob.get(job) ?? []).map((bar) => ({ ...bar })));
     const laneCount = pack(bars);
     const block = laneCount * BAR_H + (laneCount - 1) * LANE_GAP;
-    const h = Math.max(MIN_ROW_H, ROW_PAD * 2 + block);
+    const h = Math.max(MIN_ROW_H, ROW_PAD * 2 + block, 26 + summaryLines(lane).length * 12);
     rows.push({ lane, y, h, bars, laneCount });
     y += h;
   }
@@ -255,11 +245,11 @@ export function failuresIn(placed: Placed[]): Placed[] {
 // what is open**, because shut is the default: a blank one is nothing open,
 // which is what an absent one means too
 export function openFrom(raw: string | null): Set<string> {
-  return new Set((raw ?? "").split(",").filter(Boolean));
+  return readSet(raw);
 }
 
 export function openParam(open: ReadonlySet<string>): string {
-  return [...open].join(",");
+  return [...open].some((s) => s.includes(",") || s.startsWith("[")) ? writeSet(open) : [...open].join(",");
 }
 
 // one group opened or shut, which is what the disclosure in the gutter does

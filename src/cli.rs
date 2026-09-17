@@ -4762,7 +4762,7 @@ mod tests {
         assert!(sensors[0].fix.as_deref() == Some("unpause sensor inbox"));
     }
 
-    // the question this phase creates: a deployment where two processes could
+    // A deployment where two processes could
     // decide and one of them is
     #[test]
     fn doctor_says_who_holds_the_deciding_lease_and_when_nobody_does() {
@@ -5051,7 +5051,7 @@ mod tests {
                 "deployment": {
                     "name": name,
                     "build": build,
-                    "hestan": { "version": "0.1.0-beta.3", "platform": "linux/aarch64" },
+                    "hestan": { "version": "test-build", "platform": "linux/aarch64" },
                 }
             })
         };
@@ -5060,7 +5060,7 @@ mod tests {
         assert!(declared.says.contains("prod-eu"), "{}", declared.says);
         assert!(declared.says.contains("9f2c1ab"), "{}", declared.says);
         // the remote's hestan, not this command's
-        assert!(declared.says.contains("0.1.0-beta.3"), "{}", declared.says);
+        assert!(declared.says.contains("test-build"), "{}", declared.says);
 
         let silent = check_remote_deployment(&health(Value::Null, Value::Null));
         assert_eq!(silent.level, Level::Note);

@@ -1,3 +1,4 @@
+import RegistryNames from "./RegistryNames";
 import { useCallback, useEffect, useState } from "react";
 import { Link, NavLink, Route, Routes } from "react-router-dom";
 import ActivityPage from "./ActivityPage";
@@ -52,7 +53,7 @@ export default function App() {
 
   const identity = who.identity;
   return (
-    <RoleContext.Provider value={identity?.role ?? OPEN}>
+    <RoleContext.Provider value={identity?.role ?? OPEN}><RegistryNames>
       <header>
         <div className="header-inner">
           <Link to="/" className="wordmark">
@@ -104,6 +105,6 @@ export default function App() {
         </Routes>
       </main>
       <CommandPalette />
-    </RoleContext.Provider>
+    </RegistryNames></RoleContext.Provider>
   );
 }

@@ -257,10 +257,7 @@ fn drop_outputs(io: &Io, job: &str, runs: &[String]) {
 
 /// the sweeper loop: its own task beside the scheduler, sweeping on `every`.
 ///
-/// the loop is the whole point of this being a phase. retention used to run
-/// once, at startup, so a server up for three months pruned nothing after
-/// boot: the one deployment shape where a retention policy matters is the one
-/// where it never ran.
+/// Periodic sweeping enforces retention while a server remains running.
 pub(crate) async fn run_sweeper(runner: Runner, policy: Retention, every: Duration) {
     let mut ticker = tokio::time::interval(every);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -368,7 +365,7 @@ mod tests {
         assert_eq!(ids(&store), ["kept"]);
     }
 
-    // the same class of mistake as the phase-17 boot sweep: several processes
+    // Only deciding processes may sweep: several processes
     // share one database, and a worker deleting the scheduler's history is
     // data loss nothing would ever report
     #[test]

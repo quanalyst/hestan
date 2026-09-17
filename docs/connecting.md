@@ -92,12 +92,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-**that example is a doctest.** it lives on
-[`Hestan::resource`](https://docs.rs/hestan/latest/hestan/struct.Hestan.html#method.resource),
-it connects to a real postgres when the test suite is given one in
-`HESTAN_TEST_PG`, and a test holds this page to it character for character. a
-docs example that has never been compiled is a guess, and a page nobody runs is
-the page that tells you to call a method that was renamed two releases ago.
+The example is also tested in
+[`Hestan::resource`](https://docs.rs/hestan/latest/hestan/struct.Hestan.html#method.resource).
+Set `HESTAN_TEST_PG` to exercise it against PostgreSQL.
 
 four things in it are the point:
 

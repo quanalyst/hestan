@@ -5,7 +5,7 @@ scheduled REST poll you'd otherwise hand-write, as one block. it lives behind
 the `http` cargo feature:
 
 ```toml
-hestan = { version = "0.2.4", features = ["http"] }
+hestan = { version = "0.2.5", features = ["http"] }
 ```
 
 the one-block form registers a job named after the source, plus a schedule
@@ -28,7 +28,7 @@ Hestan::new()
 
 ## Builder reference
 
-`HttpSource::get(url)` is the only constructor; GET is the only method in v1.
+`HttpSource::get(url)` is the only constructor; GET is the only supported method.
 
 | method | default | effect |
 | --- | --- | --- |

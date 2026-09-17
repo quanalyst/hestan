@@ -97,7 +97,7 @@ impl Deciding {
     /// definition is that it decides nothing. no deciding loop is spawned on a
     /// worker today, so nothing asks; a loop added later that checks the lease
     /// and not the role would decide on every worker in the deployment, which
-    /// is the failure this phase exists to make impossible.
+    /// this guard prevents.
     pub(crate) fn never() -> Deciding {
         Deciding {
             held: Some(Arc::new(Held {
@@ -859,7 +859,7 @@ mod tests {
     }
 
     // the other half of the handover: a fire that was already *queued* when the
-    // decider went away. the tick log is the queue (phase 18), so it survives,
+    // decider went away. the tick log is the queue, so it survives,
     // and the new decider drains it as its own
     #[tokio::test]
     async fn a_fire_queued_before_a_handover_is_launched_after_it() {

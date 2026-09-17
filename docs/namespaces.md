@@ -1,15 +1,8 @@
-# namespaces and owners
+# Namespaces and owners
 
-two questions one deployment cannot answer about itself until somebody
-declares the answer: **whose slice of this is this**, and **who to wake when it
-breaks**.
-
-a run fails at 3am and the log says which job. it does not say whose job, and
-until phase 48 there was nowhere to write that down: [run hooks and
-notifications](notifications.md) knew what had happened and had nothing to look
-a recipient up in. and two teams sharing one deployment shared one flat list of
-jobs, so an [api token](auth.md) that should reach one team's work had to name
-every job in it by hand.
+Namespaces define the sets that write scopes can target. Owners supply contact
+metadata to [notification hooks](notifications.md) and the UI. Both are explicit
+declarations, independent of names and presentation groups.
 
 ## The rule, in one sentence
 
@@ -51,7 +44,7 @@ asked.
 
 ### Declared, not parsed out of the name
 
-for the reason phase 40 established for groups: **the name is the key.**
+**The persistent name is the key.**
 `runs.job`, `asset_materializations.asset`, every lineage ref, every schedule
 row and every api path refers to a job or an asset by its name. renaming
 `orders_etl` to `finance.orders_etl` to put it in a namespace is not a
@@ -106,8 +99,7 @@ group `finance` without anybody declaring anything. that is exactly right for a
 colour and exactly wrong for an authorization boundary, where what a scope
 admits would then be decided by a naming convention.
 
-so `group` was left as phase 40 shipped it and its documentation narrowed to
-what it does. nothing about an existing graph changed.
+Groups retain their existing presentation and origin semantics.
 
 ### A job has one too
 
@@ -145,7 +137,7 @@ containing `/`, which reads as nesting that is not there.
 
 ## It composes with a scope
 
-this is the point of having one. [phase 47's scopes](auth.md#the-scopes) narrow
+[Scopes](auth.md#the-scopes) narrow
 what a token may change, and before namespaces the only way to say "this team's
 work" was to list every job in it:
 
@@ -177,7 +169,7 @@ two things that follow, and are asserted:
   `POST /api/schedules/state` and anything else naming no job or asset in its
   path is refused for every scoped token, namespace or not.
 
-and the limit phase 47 stated has not moved: **a scope is not a
+**A scope is not a
 confidentiality boundary.** reads are not narrowed by one, so a token scoped to
 `finance` still reads the whole deployment. `docs/auth.md` has the reasoning.
 
@@ -324,24 +316,15 @@ not. so hestan promises exactly one thing here, and it is small: **the second
 contact reaches your hook alongside the first, and what to do about it is your
 hook's decision.** wire it to the thing that does paging.
 
-## What an existing deployment sees change
+## Defaults and API metadata
 
-- **nothing behaves differently until something declares one.** no schema
-  version, no migration, no new column, no new route, and a deployment that
-  declares no namespace and no owner answers every request the way it did.
-  there are cases asserting that on both halves rather than assuming it.
-- **the responses are not byte for byte**, and that is the one thing that does
-  change without being asked for: `namespace` and `owner` are new keys on
-  `GET /api/jobs` and `GET /api/assets`, `namespace` on `/api/schedules` and
-  `/api/sensors`, `owner` on `/api/late`, and each is `null` where nothing was
-  declared. a client that reads keys by name is unaffected; one that compares
-  whole documents is not.
-- **one source break**: `Scope::may_touch_job` and `Scope::may_touch_asset`
-  take a second argument, the namespace the thing is declared in. it is a
-  compile error rather than a behaviour change, and passing `None` is exactly
-  what those calls meant before.
-- `RunEvent`, `RunFailure` and `LateEvent` gain an `owner` field, which breaks
-  a struct literal of one. they are things hestan hands you; `docs/stability.md`
-  has always said they gain fields.
-- the ui shows a namespace filter only where something declared one, and an
-  owner line only where somebody is named.
+Namespace and owner declarations are optional. API responses expose nullable
+metadata on jobs and assets, namespaces on schedules and sensors, and owners
+on late items. Declarations do not migrate stored history.
+
+`Scope::may_touch_job` and `Scope::may_touch_asset` receive the declared
+namespace as their second argument; pass `None` for unnamespaced registrations.
+Hook payloads carry the owner where applicable.
+
+The UI shows a namespace filter when namespaces are declared and an owner line
+when an owner is supplied.

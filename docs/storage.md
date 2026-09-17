@@ -125,18 +125,18 @@ CREATE TABLE runs (
     created_at TEXT NOT NULL,
     started_at TEXT,
     finished_at TEXT,
-    resumed_from TEXT,                  -- added in v5
-    error TEXT,                         -- added in v6
-    scheduled_for TEXT,                 -- added in v10
-    tags TEXT,                          -- added in v12
-    priority INTEGER NOT NULL DEFAULT 0,-- added in v14
-    claimed_by TEXT,                    -- added in v14
-    claimed_at TEXT,                    -- added in v14
-    lease_until TEXT,                   -- added in v14
-    plan TEXT,                          -- added in v14
-    actor TEXT,                         -- added in v18
-    replay_of TEXT,                     -- added in v19
-    build TEXT                          -- added in v24
+    resumed_from TEXT,
+    error TEXT,
+    scheduled_for TEXT,
+    tags TEXT,
+    priority INTEGER NOT NULL DEFAULT 0,
+    claimed_by TEXT,
+    claimed_at TEXT,
+    lease_until TEXT,
+    plan TEXT,
+    actor TEXT,
+    replay_of TEXT,
+    build TEXT
 );
 CREATE INDEX runs_job_created ON runs(job, created_at DESC);
 CREATE INDEX runs_queue ON runs(status, claimed_by, priority DESC, created_at);
@@ -150,24 +150,24 @@ CREATE TABLE op_runs (
     finished_at TEXT,
     output TEXT,
     error TEXT,
-    metadata TEXT,                      -- added in v8
-    pid INTEGER,                        -- added in v13
-    inputs TEXT,                        -- added in v13
+    metadata TEXT,
+    pid INTEGER,
+    inputs TEXT,
     PRIMARY KEY (run_id, op)
 );
 
 CREATE TABLE events (
     seq INTEGER PRIMARY KEY AUTOINCREMENT,
-    run_id TEXT,                        -- nullable since v17
+    run_id TEXT,
     op TEXT,
     level TEXT NOT NULL,
     message TEXT NOT NULL,
     ts TEXT NOT NULL,
-    kind TEXT NOT NULL DEFAULT 'log',   -- added in v2
-    data TEXT,                          -- added in v2
-    subject_kind TEXT NOT NULL DEFAULT 'run',  -- added in v17
-    subject TEXT,                       -- added in v17
-    actor TEXT                          -- added in v18
+    kind TEXT NOT NULL DEFAULT 'log',
+    data TEXT,
+    subject_kind TEXT NOT NULL DEFAULT 'run',
+    subject TEXT,
+    actor TEXT
 );
 CREATE INDEX events_run ON events(run_id, seq);
 CREATE INDEX events_subject ON events(subject_kind, subject, seq DESC);
@@ -177,9 +177,9 @@ CREATE TABLE schedules (
     expr TEXT NOT NULL,
     tz TEXT NOT NULL DEFAULT 'UTC',
     paused INTEGER NOT NULL DEFAULT 0,
-    params TEXT NOT NULL DEFAULT '{}',  -- added in v7
-    cursor TEXT,                        -- added in v10
-    catchup TEXT NOT NULL DEFAULT 'skip', -- added in v10
+    params TEXT NOT NULL DEFAULT '{}',
+    cursor TEXT,
+    catchup TEXT NOT NULL DEFAULT 'skip',
     PRIMARY KEY (job, expr)
 );
 
@@ -193,11 +193,10 @@ CREATE TABLE schedule_ticks (
     run_id TEXT,
     error TEXT
 );
--- added in v20: one fire per occurrence, whoever asks
 CREATE UNIQUE INDEX schedule_ticks_fire
     ON schedule_ticks(job, expr, scheduled_for) WHERE outcome = 'fired';
 
-CREATE TABLE op_state (          -- added in v3
+CREATE TABLE op_state (
     job TEXT NOT NULL,
     op TEXT NOT NULL,
     value TEXT NOT NULL,
@@ -205,24 +204,24 @@ CREATE TABLE op_state (          -- added in v3
     PRIMARY KEY (job, op)
 );
 
-CREATE TABLE asset_materializations (  -- added in v4, rebuilt in v8
+CREATE TABLE asset_materializations (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     asset TEXT NOT NULL,      -- not unique: this is append-only history
-    partition TEXT,           -- added in v9; null = unpartitioned
+    partition TEXT,
     fingerprint TEXT NOT NULL,
     inputs TEXT NOT NULL,     -- json map: dep name -> consumed fingerprint
     value TEXT,               -- what the io manager returned; null for sources
     run_id TEXT,              -- null for probe-written source rows
     built_at TEXT NOT NULL,
-    metadata TEXT             -- added in v8
+    metadata TEXT
 );
 CREATE INDEX asset_materializations_asset
     ON asset_materializations(asset, partition, id DESC);
 
-CREATE TABLE asset_checks (            -- added in v8
+CREATE TABLE asset_checks (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     asset TEXT NOT NULL,
-    partition TEXT,           -- added in v9; null = unpartitioned
+    partition TEXT,
     check_name TEXT NOT NULL,
     run_id TEXT NOT NULL,
     status TEXT NOT NULL,     -- passed | failed
@@ -233,7 +232,7 @@ CREATE TABLE asset_checks (            -- added in v8
 );
 CREATE INDEX asset_checks_asset ON asset_checks(asset, partition, id DESC);
 
-CREATE TABLE backfills (               -- added in v9
+CREATE TABLE backfills (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     asset TEXT NOT NULL,
     from_key TEXT NOT NULL,
@@ -248,25 +247,25 @@ CREATE TABLE backfills (               -- added in v9
 );
 CREATE INDEX backfills_asset ON backfills(asset, id DESC);
 
-CREATE TABLE sensors (                 -- added in v4
+CREATE TABLE sensors (
     name TEXT NOT NULL PRIMARY KEY,
     paused INTEGER NOT NULL DEFAULT 0,
     cursor TEXT,
     updated_at TEXT NOT NULL
 );
 
-CREATE TABLE sensor_ticks (            -- added in v4
+CREATE TABLE sensor_ticks (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     sensor TEXT NOT NULL,
     evaluated_at TEXT NOT NULL,
     outcome TEXT NOT NULL,    -- fired | error | skipped
     launched INTEGER NOT NULL DEFAULT 0,
-    skipped INTEGER NOT NULL DEFAULT 0,      -- added in v11: keyed duplicates
-    duration_ms INTEGER NOT NULL DEFAULT 0,  -- added in v11; 0 on a skipped tick
+    skipped INTEGER NOT NULL DEFAULT 0,
+    duration_ms INTEGER NOT NULL DEFAULT 0,
     error TEXT
 );
 
-CREATE TABLE sensor_run_keys (         -- added in v11
+CREATE TABLE sensor_run_keys (
     sensor TEXT NOT NULL,
     run_key TEXT NOT NULL,
     run_id TEXT NOT NULL,
@@ -274,7 +273,7 @@ CREATE TABLE sensor_run_keys (         -- added in v11
     PRIMARY KEY (sensor, run_key)
 );
 
-CREATE TABLE launch_keys (             -- added in v23
+CREATE TABLE launch_keys (
     launch_key TEXT NOT NULL PRIMARY KEY,
     job TEXT NOT NULL,
     params_hash TEXT NOT NULL, -- sha-256 of the params as stored
@@ -283,14 +282,14 @@ CREATE TABLE launch_keys (             -- added in v23
 );
 CREATE INDEX launch_keys_run ON launch_keys(run_id);
 
-CREATE TABLE store_copy (              -- added in v22
+CREATE TABLE store_copy (
     only_row INTEGER PRIMARY KEY CHECK (only_row = 1),
     taken_at TEXT,             -- when hestan took the copy; null if it did not
     taken_from TEXT,           -- the store it was copied from
     settled_at TEXT            -- when `hestan resettle` handed its claims back
 );
 
-CREATE TABLE presets (                  -- added in v12
+CREATE TABLE presets (
     job TEXT NOT NULL,
     name TEXT NOT NULL,
     params TEXT NOT NULL,
@@ -298,7 +297,7 @@ CREATE TABLE presets (                  -- added in v12
     PRIMARY KEY (job, name)
 );
 
-CREATE TABLE op_logs (                  -- added in v15
+CREATE TABLE op_logs (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     run_id TEXT NOT NULL,
     op TEXT NOT NULL,
@@ -311,7 +310,7 @@ CREATE TABLE op_logs (                  -- added in v15
 );
 CREATE INDEX op_logs_run ON op_logs(run_id, op, id);
 
-CREATE TABLE notifications (            -- added in v16
+CREATE TABLE notifications (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     kind TEXT NOT NULL,        -- which event shape payload holds; "run" today
     payload TEXT NOT NULL,     -- the event, as the hook will receive it
@@ -325,7 +324,7 @@ CREATE INDEX notifications_due ON notifications(next_attempt_at)
     WHERE delivered_at IS NULL;
 CREATE INDEX notifications_delivered ON notifications(delivered_at);
 
-CREATE TABLE decider (                  -- added in v21
+CREATE TABLE decider (
     only_row INTEGER PRIMARY KEY CHECK (only_row = 1),
     term INTEGER NOT NULL DEFAULT 0,    -- +1 on every acquisition, never on a renewal
     claimed_by TEXT,                    -- the instance id holding it
@@ -433,93 +432,23 @@ this section is sqlite's chain, which every existing file walks and no
 postgres database ever will; see [postgres](#postgres) for why one is created
 whole instead.
 
-the schema version lives in `PRAGMA user_version` and `Store::open` migrates
-forward on every open. version 1 is the phase-1 schema (`runs`, `op_runs`,
-`events` without `kind`/`data`); version 2 adds `events.kind` and
-`events.data` plus the `schedules` and `schedule_ticks` tables; version 3
-adds `op_state`; version 4 adds `asset_materializations`, `sensors`, and
-`sensor_ticks`; version 5 adds `runs.resumed_from`, the link a
-[resume](concepts.md#resume) follows back to the run it continued; version 6
-adds `runs.error`; version 7 adds `schedules.params`, the params a cron fire
-launches with ([scheduling](scheduling.md)), and schedules declared before it
-default to `{}`, which is what they always fired with; version 8 rebuilds
-`asset_materializations` as append-only [history](assets.md), adds
-`op_runs.metadata` ([metadata](metadata.md)) and adds the `asset_checks`
-table ([checks](assets.md#asset-checks)); version 9 adds `partition` to
-`asset_materializations` and `asset_checks` and re-keys every latest lookup
-per `(asset, partition)` ([partitions](assets.md#partitioned-assets)), and
-adds the `backfills` table ([backfills](assets.md#backfills)); version 10
-adds the `freshness_state` table ([freshness](freshness.md)), `schedules.cursor`
-and `schedules.catchup` ([catch-up](scheduling.md#missed-fire-catch-up)) and
-`runs.scheduled_for`, the logical time a scheduled or caught-up run stands
-for; version 11 adds the `sensor_run_keys` table
-([run keys](sensors.md#run-keys)) plus `sensor_ticks.skipped` and
-`sensor_ticks.duration_ms`, which existing ticks read as 0 (they were never
-measured, and 0 is the only honest thing to say about that); version 12 adds
-the `presets` table and `runs.tags`, the flat `{"k": "v"}` map a run carries
-([tags](launching.md#run-tags)), null on every run written before it and on
-every run launched without any, which reads back as `{}`; version 13 adds
-`op_runs.pid` and `op_runs.inputs`, both for [isolated ops](isolation.md) and
-both null for every op that runs in this process; version 14 adds the
-[queue](scaling.md) columns to `runs` (`priority`, `claimed_by`,
-`claimed_at`, `lease_until` and `plan`) plus the `runs_queue` index. every
-run written before it reads back as priority 0 and unclaimed, which is what a
-run that finished before there was a queue is. `plan` is what a launch decided
-the run would execute (`{"ops": [...], "seeds": {...}}`) and is null for a run
-of the whole job, which is most of them: it exists because a resume's reused
-outputs and an asset build's memoized seeds live in the launching process's
-memory, and whoever claims the run may not be that process; version 15 adds
-the `op_logs` table ([logs](logs.md)), empty for every run that finished
-before there was anywhere to put what an op printed; version 16 adds the
-`notifications` table ([durable delivery](notifications.md#durable-delivery)),
-which stays empty unless a process asks for it; version 17 makes
-`events.run_id` nullable and adds `events.subject_kind` and `events.subject`,
-which is what stops the log being only about runs ([events](events.md)):
-every existing row is a run event and is stamped `subject_kind = 'run'`, and
-`subject` stays null on a run event because the run is already `run_id` and
-copying it would rewrite the largest table in the database to say the same
-thing twice; version 18 adds `runs.actor` and `events.actor`, the name of the
-[identity](auth.md) that asked for a run, a cancel, a pause or a backfill:
-null on every row written before it, and null on everything a schedule, a
-sensor or a loop did on its own, which is the same thing those rows always
-meant; version 19 adds `runs.replay_of`, the run a
-[replay](replay.md) re-ran, beside `resumed_from` rather than sharing it,
-because a resume continues a run and a replay re-runs one; version 20 adds the
-`schedule_ticks_fire` unique index, which is
-[one fire per occurrence](#one-fire-per-occurrence) and is the only unique
-constraint in this schema that was not already a primary key; version 21 adds
-the `decider` table, one row holding the
-[deciding lease](scaling.md#the-deciding-lease) and the term it is on; version
-22 adds the `store_copy` table, empty on every database that is not a
-[copy](backup.md) and one row on one that is; version 23 adds the
-`launch_keys` table and its `launch_keys_run` index, which is
-[one run per launch key](launching.md#launching-once). both are new tables and
-neither reads or rewrites a row, so the upgrade is two `CREATE TABLE`s on
-either backend and a deployment that uses neither notices nothing; version 24
-adds `runs.build`, which build of your application launched the run
-([deployment and build identity](deployment.md)). one nullable column, no
-index, and no rewrite on either backend: null on every row written before it,
-which is an absence and not an empty string, because a run that predates the
-column and a deployment that declares no build are the same thing, which is
-nobody having told hestan.
+SQLite records its schema in `PRAGMA user_version`; PostgreSQL records a schema
+stamp in the store. Opening a store applies pending migrations and updates the
+stamp in one transaction. Failure leaves the database unmigrated, with its rows
+intact. A binary refuses to open a schema newer than it understands.
 
-an older file at any version opens straight into the current one, rows
-intact: the v8 rebuild copies every keyed materialization across, where it becomes
-that asset's first history entry and stays its current one, and v9 leaves every
-existing row with a null partition, which is exactly what an unpartitioned
-asset is. every pending step and the version stamp run in one transaction
-(sqlite DDL is transactional), so a crash or failure mid-migration leaves the
-file exactly as it was found, never half-migrated. a database stamped
-with a version newer than the build refuses to open (`db schema v25 is newer
-than this build`) instead of quietly writing an older stamp over it.
+Existing materializations retain their history, and rows created before
+partition support remain unpartitioned. New optional fields retain their absence
+on older rows. Migration SQL lives in `src/store.rs` and `src/pg.rs`.
+
+Take a [backup](backup.md) before upgrading. Downgrades require restoring that
+backup; there are no down migrations.
 
 ### One fire per occurrence
 
-`schedule_ticks` had an autoincrement id and no unique index on anything, so
-two processes firing the same `(job, expr, scheduled_for)` each inserted a tick
-and each launched a run, and nothing refused either. v20 adds the index that
-refuses the second one, and the [scheduler](scheduling.md#one-fire-per-occurrence)
-records the tick and creates the run in one transaction, so a refused tick
+A unique index prevents two `fired` ticks for the same
+`(job, expr, scheduled_for)`. The [scheduler](scheduling.md#one-fire-per-occurrence)
+records the tick and creates its run in one transaction, so a refused tick
 launches nothing.
 
 the index is **partial, over `fired` alone.** the tick log is also the queue: a
@@ -530,49 +459,17 @@ launched something. `deferred`, `skipped` and `error` ticks stay
 unconstrained, and a duplicate among them is a duplicate line in a log rather
 than a duplicate run.
 
-**the migration is the hazard.** a deployment that has already been running two
-schedulers has duplicate `fired` ticks in this table now, and
-`CREATE UNIQUE INDEX` over them fails outright. so v20 collapses them first,
-keeping the earliest `fired_at` of each occurrence and deleting the rest, and
-reports the count at warn level:
+When adding this constraint to an older store, migration keeps the earliest
+`fired_at` for each occurrence and removes duplicate fired ticks. It logs a
+warning with the count. Runs launched by those duplicates remain in history
+and their effects are not undone; inspect the run log for duplicate executions.
 
-```
-schema v20: 37 duplicate schedule fires collapsed. more than one process has
-been firing the same occurrences against this store. each collapsed tick may
-have launched a run of its own: those runs are still in the run log, they still
-executed, and deleting a tick does not unlaunch one. check the run log for
-scheduled runs that came in pairs
-```
+For older event tables, making `run_id` nullable requires SQLite to rebuild and
+copy the table. PostgreSQL changes the constraint without copying rows, though
+index creation still reads the table. Allow time for this work on large stores.
 
-that last sentence is the point. **the collapse does not undo anything.** each
-deleted tick may have launched a run; that run executed, wrote what it wrote and
-is still in the run log. the count is how many times this deployment fired an
-occurrence twice, and the runs are the thing to go and look at. the report is a
-`tracing` warning emitted from `Store::open`, before there is a store to write
-an event to, so a process with no subscriber installed will not see it.
-
-**v17 is the one step where the two backends do genuinely different amounts of
-work,** and it is worth knowing which way round. sqlite has no
-`ALTER TABLE ... ALTER COLUMN`, so dropping a `NOT NULL` means rebuilding the
-table and copying every row. on a database with a year of events in it that is
-the expensive part of the upgrade, and it happens inside the one transaction
-like everything else, so an interrupted one leaves the file as it was found.
-postgres drops the constraint and adds two defaulted columns in the catalog and
-touches no row at all; only the new index reads the table. a large postgres
-database migrates in about as long as it takes to build one index, and a large
-sqlite one takes as long as it takes to copy the table.
-
-postgres has a forward chain of its own as of v17. before it, a postgres
-database was always created whole at the current version (there had never been
-an older one to move), so `pg::migrate` only ever stamped or refused. it now
-reads the stamp and applies the steps above it, in order, in one transaction,
-exactly as the sqlite chain does.
-
-one wrinkle: databases written before the migration mechanism existed carry
-the v1 tables at `user_version` 0. open detects that case (version 0 with a
-`runs` table already present) and treats the file as v1, so the
-`ALTER TABLE`s aren't run twice and old rows survive. existing events get
-`kind = 'log'` backfilled by the column default.
+Stores created before schema stamping are recognized by their existing `runs`
+table. Opening them preserves existing rows and gives old events the `log` kind.
 
 ## Crash recovery
 
@@ -773,7 +670,7 @@ history, it is something outstanding.
 three logs are trimmed by the same sweep whether or not a retention policy is
 configured, because all of them grow with time rather than with what you keep:
 `schedule_ticks` and `sensor_ticks` are each capped at their newest 5000 rows,
-and the [events](events.md) that belong to no run (everything v17 added) at
+and the [events](events.md) that belong to no run at
 their newest 50,000. a run's own events go when the run does and always did;
 what is new is that an asset built every five minutes writes a row nothing
 would otherwise ever collect.
@@ -786,19 +683,10 @@ asset summary counts ([assets](assets.md)).
 
 ### What the build column costs
 
-`runs.build` is one nullable text column on the largest table in the database,
-so it is the one addition of phase 50 with a size to it. it is **measured**
-rather than estimated, in a case in `store.rs`: 2,000 runs written into two
-databases, identical but for a forty-character git sha, both vacuumed, the
-files compared.
-
-**43 bytes per run row**, which is the forty characters plus sqlite's
-per-value overhead and page rounding. a million runs is about 41 MiB, and a ci
-build number or a short tag costs proportionally less. the case asserts a range
-rather than the number, so it cannot drift quietly, and an index over the column
-would land well outside it, which is the other thing the range guards: there is
-no index, and the filter is a scan, exactly as the tag filter has been since
-v12.
+`runs.build` is nullable text, stored once per run. Storage grows with the length
+of the supplied identifier. The column has no index, so filtering by build
+scans the run rows, as filtering by tag does. Adding the column does not rewrite
+existing rows on either backend; their value remains null.
 
 ## What's stored and what stays in memory
 

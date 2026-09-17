@@ -160,8 +160,7 @@ async fn the_slack_line_says_who_owns_what_broke() {
     );
 }
 
-/// **the row this exists for.** phase 33 shipped hooks with nowhere to look up
-/// a recipient: a failure hook knew which job broke and not who to wake.
+/// A failure hook receives the owning contact from the job declaration.
 ///
 /// nothing here threads an owner through. the hook is a plain closure over the
 /// event, registered before the job was even looked at, and it reads the owner

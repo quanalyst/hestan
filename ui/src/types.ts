@@ -182,6 +182,10 @@ export interface Owner {
 }
 
 export interface JobSummary {
+  execution?: { failed: number; running: number };
+  labels?: Record<string, string>;
+  display_name?: string | null;
+  subgroup?: string | null;
   name: string;
   description: string | null;
   // which slice of the deployment it is in; null in one that declares no
@@ -541,6 +545,10 @@ export interface PolicyWait {
 }
 
 export interface AssetSummary {
+  execution?: { failed: number; running: number };
+  labels?: Record<string, string>;
+  display_name?: string | null;
+  subgroup?: string | null;
   name: string;
   // whose it is: what it declared, else null. a boundary the api and a token
   // scope are narrowed by, and never derived from the group below

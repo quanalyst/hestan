@@ -1,3 +1,4 @@
+import type { Section } from "./presentation";
 // what a graph draws when it has too many nodes to draw.
 //
 // `DagView` lays out every node it is handed, which stops working somewhere
@@ -127,4 +128,39 @@ export function collapseGroups(nodes: DagNode[], collapsed: Set<string>): DagNod
     }
   }
   return out;
+}
+
+// Fold either level, mapping every original endpoint once. Synthetic names are
+// allocated outside the asset namespace, so even unusual identifiers cannot collide.
+export function collapseHierarchy<T extends { name: string }>(nodes: DagNode[], sections: Section<T>[], closed: ReadonlySet<string>) {
+  const used = new Set(nodes.map((n) => n.name));
+  const representatives = new Map<string, string>();
+  const groups: { node: string; section: Section<T>; label: string }[] = [];
+  for (const parent of sections) {
+    const folded = closed.has(parent.key) ? [parent] : parent.children.filter((c) => closed.has(c.key));
+    for (const section of folded) {
+      let node = `group:${section.key}`;
+      while (used.has(node)) node = `:${node}`;
+      used.add(node);
+      groups.push({ node, section, label: section.level ? `${parent.name} / ${section.name}` : section.name });
+      for (const member of section.members) representatives.set(member.name, node);
+    }
+  }
+  const fold = (name: string) => representatives.get(name) ?? name;
+  const held = new Map<string, DagNode>();
+  for (const original of nodes) {
+    const name = fold(original.name);
+    const deps = original.deps.map(fold).filter((d) => d !== name);
+    const existing = held.get(name);
+    if (existing) {
+      existing.deps = [...new Set([...existing.deps, ...deps])];
+      existing.hues = mergeHues(existing.hues, original.hues);
+      existing.find += ` ${original.name} ${original.display_name ?? ""}`;
+    } else {
+      const group = groups.find((g) => g.node === name);
+      const section = group?.section;
+      held.set(name, section ? { name, display_name: group!.label, badge: `×${section.members.length}`, deps: [...new Set(deps)], hues: original.hues, find: `${original.name} ${original.display_name ?? ""}` } : { ...original, deps });
+    }
+  }
+  return { nodes: [...held.values()], groups, representative: fold };
 }

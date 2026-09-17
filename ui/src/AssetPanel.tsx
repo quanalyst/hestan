@@ -1,3 +1,4 @@
+import { displayName } from "./presentation";
 import { useEffect } from "react";
 import { Link } from "react-router-dom";
 import AssetDetail from "./AssetDetail";
@@ -25,8 +26,8 @@ export default function AssetPanel({
   return (
     <aside className="op-panel">
       <div className="op-panel-head">
-        <Link className="mono op-title" to={assetPath(asset.name)}>
-          {asset.name}
+        <Link title={asset.name} className="mono op-title" to={assetPath(asset.name)}>
+          {displayName(asset)}
         </Link>
         <button className="text-btn" onClick={onClose} aria-label="close">
           ×

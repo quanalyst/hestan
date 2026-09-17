@@ -6708,7 +6708,7 @@ mod tests {
         );
     }
 
-    // the whole point of the phase: an op that worked, a store that will not
+    // An op that worked, a store that will not
     // say so, and a run that reports nothing rather than reporting success
     #[tokio::test]
     async fn a_run_whose_outcome_cannot_be_written_does_not_claim_one() {
@@ -6815,9 +6815,7 @@ mod tests {
     }
 
     // a process that cannot record a run has no business claiming another one:
-    // a queue draining into something that will not write it down is the
-    // failure this phase exists to end, and it is not an improvement on one
-    // lost run
+    // draining the queue would lose further outcomes.
     #[tokio::test]
     async fn a_process_whose_store_is_failing_stops_claiming() {
         let dir = tempfile::tempdir().unwrap();

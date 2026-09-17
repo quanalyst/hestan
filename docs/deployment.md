@@ -1,24 +1,8 @@
 # Deployment and build identity
 
-a run log says what ran and when. until phase 50 it did not say **which build
-of your code ran it**, so "this started failing on Tuesday" could not be joined
-to "we deployed on Tuesday" without going outside hestan and lining up two
-timelines by eye.
-
-three identities are tangled in that sentence, and hestan keeps them apart
-because only one of them is hestan's to know.
-
-| what | who knows it | where it comes from |
-| --- | --- | --- |
-| hestan's own version | hestan | its own manifest, at compile time |
-| your application's build | **you** | told, or absent |
-| this deployment's name | **you** | told, or absent |
-
-**the one an operator cares about is the middle one, and hestan cannot see
-it.** hestan is a library compiled into your binary. the sha it would want
-belongs to a repository it is not in, the image digest belongs to an image it
-did not build, and a version it invented would be worse than the absence. so
-it is told, and what it is told is what it carries.
+Hestan records an optional deployment name and application build identifier.
+The application supplies both; Hestan cannot infer them from its own package
+metadata. A run retains the build identifier supplied when it was launched.
 
 ## Declaring it
 
@@ -79,7 +63,7 @@ the page because a release build running ten times slower than expected is the
 reason somebody looks.
 
 **hestan's version is never offered in place of yours.** a deployment that
-declared no build reads `"build": null` beside `"version": "0.2.4"`, and
+declared no build reads `"build": null` beside `"version": "0.2.5"`, and
 the two are in different halves of the object for exactly that reason.
 
 ## Where it surfaces
@@ -92,7 +76,7 @@ the two are in different halves of the object for exactly that reason.
     "name": "prod-eu",
     "build": "9f2c1ab",
     "hestan": {
-      "version": "0.2.4",
+      "version": "0.2.5",
       "schema": 24,
       "features": ["bundled", "cli", "postgres"],
       "platform": "linux/aarch64",
@@ -107,7 +91,7 @@ about:
 
 ```
 ok    deployment prod-eu, running build 9f2c1ab
-ok    hestan     0.2.4 in this deployment's binary, linux/aarch64, features: bundled cli postgres
+ok    hestan     0.2.5 in this deployment's binary, linux/aarch64, features: bundled cli postgres
 ```
 
 **`hestan doctor --db /var/lib/hestan/hestan.db` reports the operator binary's
@@ -149,7 +133,7 @@ changes and this is not one of them. there is a case for it that runs two
 processes on two builds against one database and asserts exactly that.
 
 `null` means **nobody told hestan**, and it means that in three ways that
-hestan cannot tell apart: a run written before phase 50, a run launched by a
+hestan cannot tell apart: a run written before build tracking, a run launched by a
 deployment that declares no build, and a run launched through a `Runner` that
 was never given one.
 
@@ -177,20 +161,8 @@ column. see the cost below.
 
 ### What it costs
 
-one nullable text column on `runs`, which is the largest table in the database.
-measured rather than estimated, in `store.rs`: 2,000 rows written twice, once
-with a forty-character git sha and once without, both vacuumed, the file sizes
-compared.
-
-**43 bytes per run row** for a forty-character sha, which is the forty
-characters plus sqlite's per-value overhead and the page rounding on top. a
-million runs is about 41 MiB. a short tag or a ci build number costs less in
-proportion. the case asserts a range so the number cannot drift without
-somebody noticing, and an index over the column would land well outside it,
-which is the other thing the range is guarding.
-
-nothing is rewritten on either backend by the migration, and the postgres half
-is a catalog change. see [storage](storage.md#schema).
+See [storage costs](storage.md#what-the-build-column-costs) for the build column
+and filter behavior.
 
 ## What is deliberately not here
 

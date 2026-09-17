@@ -193,7 +193,7 @@ async fn main() -> Result<(), hestan::Error> {
     // fill the hours that have never been built, and leave the ones that have
     .policy(AutoPolicy::when_missing());
 
-    // and the rollup this phase exists for: one daily key reading the 24 hourly
+    // A rollup: one daily key reading the 24 hourly
     // keys inside it. today's key covers hours that have not happened yet: it
     // rolls up the ones that have, and goes stale as each next one lands
     let start_day = (Utc::now() - chrono::Duration::days(1))

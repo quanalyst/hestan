@@ -1,3 +1,5 @@
+import PresentationDetails from "./PresentationDetails";
+import { displayName } from "./presentation";
 import { useCallback, useEffect, useState } from "react";
 import { Link, useNavigate, useParams, useSearchParams } from "react-router-dom";
 import { del, get, HttpError, post, put, usePoll } from "./api";
@@ -372,7 +374,8 @@ function JobView({ name }: { name: string }) {
     <>
       <div className="page-head">
         <div>
-          <h1>{job.name}</h1>
+          <h1 title={job.name}>{displayName(job)}</h1>
+          <PresentationDetails item={job} />
           {job.description && <p className="secondary">{job.description}</p>}
           {policy && <p className="muted">{policy}</p>}
         </div>
@@ -604,7 +607,7 @@ function JobView({ name }: { name: string }) {
           null rather than becoming a group row of one, and the row is drawn in
           the ink every other row is */}
       <TimelinePlot
-        jobs={[{ name: job.name, group: null, group_hue: null }]}
+        jobs={[{ name: job.name, display_name: job.display_name, group: null, group_hue: null }]}
         runs={tlRuns}
         upcoming={upcoming}
         windowSecs={windowSecs}

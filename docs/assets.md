@@ -173,9 +173,9 @@ in every op run, so moving `sales/orders` into `finance` by renaming it is not
 a reorganisation: it is a new asset with no past. moving it with `.group`
 leaves the name, and therefore the history, exactly where it was.
 
-a group is flat. there is no nesting inside one, and nothing is parsed out of
-the name you give it. three groups are refused at build, each naming both the
-asset and the group:
+A group name is a single value. An optional explicit [subgroup](presentation.md)
+adds one level beneath it; nothing is parsed out of either declaration.
+Three groups are refused at build, each naming both the asset and the group:
 
 - an empty or whitespace-only name, since a group with no name is no group;
 - a name containing `/`, since `/` is the character a name uses to say which

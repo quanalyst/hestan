@@ -31,12 +31,8 @@ pub(crate) const ASSETS_GROUP: &str = "hestan";
 
 /// how many asset builds execute at once unless a deployment says otherwise.
 ///
-/// builds used to be serialized, and a deployment that leaned on that for load
-/// control would find it gone if this were unbounded. four is a cap rather
-/// than a target: it is above the one build at a time a 0.1.0 deployment got
-/// and well below "as many as the graph has disjoint families", so a backfill
-/// no longer stops every unrelated build and nothing suddenly opens forty
-/// connections that used to open one.
+/// Four permits independent builds to overlap while limiting concurrent load.
+/// Use `Hestan::max_concurrent_builds(1)` to serialize asset builds.
 ///
 /// it is the ordinary [per-job limit](crate::Limits::job) on the assets job
 /// rather than a second mechanism, so it counts *executing* runs, the rest
@@ -154,6 +150,9 @@ pub struct Asset {
     name: String,
     source: bool,
     group: Option<String>,
+    display_name: Option<String>,
+    subgroup: Option<String>,
+    labels: BTreeMap<String, String>,
     namespace: Option<String>,
     owner: Option<Owner>,
     hue: Option<u16>,
@@ -179,6 +178,9 @@ impl Asset {
             name: name.into(),
             source: true,
             group: None,
+            display_name: None,
+            subgroup: None,
+            labels: BTreeMap::new(),
             namespace: None,
             owner: None,
             hue: None,
@@ -210,6 +212,9 @@ impl Asset {
             name,
             source: false,
             group: None,
+            display_name: None,
+            subgroup: None,
+            labels: BTreeMap::new(),
             namespace: None,
             owner: None,
             hue: None,
@@ -242,6 +247,9 @@ impl Asset {
             name,
             source: false,
             group: None,
+            display_name: None,
+            subgroup: None,
+            labels: BTreeMap::new(),
             namespace: None,
             owner: None,
             hue: None,
@@ -348,7 +356,7 @@ impl Asset {
     }
 
     /// what this asset is labeled with on the graph: one flat name, with
-    /// nothing nested inside it and no separator parsed out of it.
+    /// no separator parsed out of it. Use [`Self::subgroup`] for an explicit child.
     ///
     /// **a group is a label, not a boundary.** it clusters the graph, colours
     /// it and names a source's origin, and nothing reads it to decide who may
@@ -382,6 +390,29 @@ impl Asset {
     /// falling back to a bare source name and the two would be one entry.
     pub fn group(mut self, name: impl Into<String>) -> Asset {
         self.group = Some(name.into());
+        self
+    }
+
+    /// A readable name for presentation; the persistent name and history stay
+    /// unchanged. The registry rejects blank names.
+    pub fn display_name(mut self, name: impl Into<String>) -> Self {
+        self.display_name = Some(name.into());
+        self
+    }
+
+    /// One explicit subgroup beneath the effective group (including the legacy
+    /// group-prefix fallback). The registry rejects blank names, `/`, and a
+    /// subgroup without a parent. No execution or authorization semantics.
+    pub fn subgroup(mut self, name: impl Into<String>) -> Self {
+        self.subgroup = Some(name.into());
+        self
+    }
+
+    /// Add a generic presentation label. Keys and values must be nonblank;
+    /// duplicate keys use the last declared value. Labels have no execution,
+    /// origin, namespace or authorization semantics.
+    pub fn label(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
+        self.labels.insert(key.into(), value.into());
         self
     }
 
@@ -563,6 +594,14 @@ impl Asset {
     }
 }
 
+#[derive(Default)]
+struct OutputPresentation {
+    display_name: Option<String>,
+    group: Option<String>,
+    subgroup: Option<String>,
+    labels: BTreeMap<String, String>,
+}
+
 /// one computation, several assets: a query or a pull whose result splits into
 /// tables you do not want to fetch twice.
 ///
@@ -591,6 +630,7 @@ impl Asset {
 /// register with `Hestan::multi_assets`.
 pub struct MultiAsset {
     name: String,
+    presentation: BTreeMap<String, OutputPresentation>,
     produces: Vec<String>,
     namespace: Option<String>,
     owner: Option<Owner>,
@@ -615,6 +655,7 @@ impl MultiAsset {
             op: Op::new(name.clone(), f),
             name,
             produces: Vec::new(),
+            presentation: BTreeMap::new(),
             namespace: None,
             owner: None,
             deps: Vec::new(),
@@ -629,8 +670,8 @@ impl MultiAsset {
     ///
     /// declared here because a multi-asset produces *names* rather than
     /// [`Asset`] values, so there is nowhere else to hang one, and one op
-    /// producing two teams' assets is not a thing worth expressing. a
-    /// [`group`](Asset::group) needs no equivalent: it falls back to the part
+    /// producing two teams' assets is not a thing worth expressing.
+    /// Output groups fall back to the part
     /// of each name before the first `/`, and a namespace deliberately has no
     /// fallback.
     pub fn namespace(mut self, name: impl Into<String>) -> MultiAsset {
@@ -653,6 +694,44 @@ impl MultiAsset {
         I::Item: Into<String>,
     {
         self.produces.extend(names.into_iter().map(Into::into));
+        self
+    }
+
+    /// A readable name for one output named by [`Self::produces`].
+    /// Unknown outputs and blank values fail registry validation.
+    pub fn display_name(mut self, output: impl Into<String>, name: impl Into<String>) -> Self {
+        self.presentation
+            .entry(output.into())
+            .or_default()
+            .display_name = Some(name.into());
+        self
+    }
+
+    /// Explicit group for one output, with the same validation and fallback
+    /// rules as [`Asset::group`]. Does not rename the output or its producing op.
+    pub fn group(mut self, output: impl Into<String>, group: impl Into<String>) -> Self {
+        self.presentation.entry(output.into()).or_default().group = Some(group.into());
+        self
+    }
+
+    /// Explicit subgroup for one output, with the same rules as [`Asset::subgroup`].
+    pub fn subgroup(mut self, output: impl Into<String>, subgroup: impl Into<String>) -> Self {
+        self.presentation.entry(output.into()).or_default().subgroup = Some(subgroup.into());
+        self
+    }
+
+    /// Generic label for one output, with the same rules as [`Asset::label`].
+    pub fn label(
+        mut self,
+        output: impl Into<String>,
+        key: impl Into<String>,
+        value: impl Into<String>,
+    ) -> Self {
+        self.presentation
+            .entry(output.into())
+            .or_default()
+            .labels
+            .insert(key.into(), value.into());
         self
     }
 
@@ -829,6 +908,9 @@ pub(crate) struct AssetMeta {
     /// in which case the name prefix answers instead. kept as declared rather
     /// than resolved so `doctor` can see the two disagree.
     pub declared_group: Option<String>,
+    pub display_name: Option<String>,
+    pub subgroup: Option<String>,
+    pub labels: BTreeMap<String, String>,
     /// which slice of the deployment this asset is in, from
     /// [`Asset::namespace`] or from the [`MultiAsset`] that produces it.
     /// `None` in a deployment that declares no namespaces.
@@ -1027,6 +1109,9 @@ impl AssetRegistry {
                 name: a.name.clone(),
                 source: a.source,
                 declared_group: a.group,
+                display_name: a.display_name,
+                subgroup: a.subgroup,
+                labels: a.labels,
                 namespace: a.namespace,
                 owner: a.owner,
                 declared_hue: a.hue,
@@ -1053,14 +1138,24 @@ impl AssetRegistry {
                 Some(policy) => policy.parse_cron(&m.name)?,
                 None => None,
             };
+            for output in m.presentation.keys() {
+                if !m.produces.contains(output) {
+                    return Err(Error::Graph(format!(
+                        "multi-asset {}: presentation metadata names unknown output {output}",
+                        m.name
+                    )));
+                }
+            }
             for produced in &m.produces {
+                let empty = OutputPresentation::default();
+                let presentation = m.presentation.get(produced).unwrap_or(&empty);
                 metas.push(AssetMeta {
                     name: produced.clone(),
                     source: false,
-                    // a multi-asset produces names rather than `Asset` values,
-                    // so there is nowhere to declare a group on one of them;
-                    // the name prefix is what answers for them
-                    declared_group: None,
+                    declared_group: presentation.group.clone(),
+                    display_name: presentation.display_name.clone(),
+                    subgroup: presentation.subgroup.clone(),
+                    labels: presentation.labels.clone(),
                     // a namespace has no fallback to be had from the name, so
                     // a multi-asset declares one for everything it produces
                     namespace: m.namespace.clone(),
@@ -1403,6 +1498,49 @@ fn walk_provenance(metas: &mut [AssetMeta], by_name: &HashMap<String, usize>) {
 ///
 /// `what` and `which` name the thing declaring it, so the build error says
 /// which line to go and look at.
+pub(crate) fn check_labels(
+    what: &str,
+    name: &str,
+    labels: &BTreeMap<String, String>,
+) -> Result<(), Error> {
+    if labels
+        .iter()
+        .any(|(k, v)| k.trim().is_empty() || v.trim().is_empty())
+    {
+        return Err(Error::Graph(format!(
+            "{what} {name}: label keys and values must be nonblank"
+        )));
+    }
+    Ok(())
+}
+
+pub(crate) fn check_presentation(
+    what: &str,
+    name: &str,
+    display: Option<&str>,
+    group: Option<&str>,
+    subgroup: Option<&str>,
+) -> Result<(), Error> {
+    if display.is_some_and(|s| s.trim().is_empty()) {
+        return Err(Error::Graph(format!(
+            "{what} {name}: display name must not be blank"
+        )));
+    }
+    if let Some(subgroup) = subgroup {
+        if group.is_none() {
+            return Err(Error::Graph(format!(
+                "{what} {name}: subgroup requires an effective parent group"
+            )));
+        }
+        if subgroup.trim().is_empty() || subgroup.contains('/') {
+            return Err(Error::Graph(format!(
+                "{what} {name}: subgroup must be nonblank and contain no /"
+            )));
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn check_group(what: &str, which: &str, group: &str) -> Result<(), Error> {
     if group.trim().is_empty() {
         return Err(Error::Graph(format!(
@@ -1412,9 +1550,8 @@ pub(crate) fn check_group(what: &str, which: &str, group: &str) -> Result<(), Er
     }
     if group.contains(GROUP_SEPARATOR) {
         return Err(Error::Graph(format!(
-            "{what} {which}: declared group {group:?} contains {GROUP_SEPARATOR:?}, which is the \
-             character a name uses to say which group it is in, so {group:?} reads as nesting \
-             that is not there. a group is flat"
+            "{what} {which}: declared group {group:?} contains {GROUP_SEPARATOR:?}, which is reserved for \
+             the legacy group-prefix fallback. declare a subgroup explicitly"
         )));
     }
     Ok(())
@@ -1435,6 +1572,14 @@ fn check_groups(metas: &[AssetMeta]) -> Result<(), Error> {
         .map(|m| m.name.as_str())
         .collect();
     for meta in metas {
+        check_labels("asset", &meta.name, &meta.labels)?;
+        check_presentation(
+            "asset",
+            &meta.name,
+            meta.display_name.as_deref(),
+            meta.group(),
+            meta.subgroup.as_deref(),
+        )?;
         let Some(group) = meta.declared_group.as_deref() else {
             continue;
         };
@@ -2841,6 +2986,100 @@ mod tests {
     }
 
     #[test]
+    fn labels_and_multi_output_metadata_are_validated() {
+        let multi = MultiAsset::new("split", |_| async { Ok(json!({"a": 1, "b": 2})) })
+            .produces(["a", "b"])
+            .group("a", "parent")
+            .subgroup("a", "child")
+            .display_name("a", "Readable")
+            .label("a", "key", "first")
+            .label("a", "key", "last");
+        let reg = AssetRegistry::new(vec![], vec![multi], vec![]).unwrap();
+        let a = reg.get("a").unwrap();
+        assert_eq!(a.display_name.as_deref(), Some("Readable"));
+        assert_eq!(a.group(), Some("parent"));
+        assert_eq!(a.subgroup.as_deref(), Some("child"));
+        assert_eq!(a.labels["key"], "last");
+        let b = reg.get("b").unwrap();
+        assert!(b.labels.is_empty());
+        assert_eq!(b.group(), None);
+        assert_eq!(a.op, b.op);
+        assert!(
+            reg_err(vec![echo("bad").label("key", "")])
+                .to_string()
+                .contains("label")
+        );
+        let unknown = MultiAsset::new("split", |_| async { Ok(json!({})) })
+            .produces(["a"])
+            .label("missing", "key", "value");
+        assert!(
+            multi_err(vec![], vec![unknown])
+                .to_string()
+                .contains("unknown output")
+        );
+        let missing_parent = MultiAsset::new("split", |_| async { Ok(json!({})) })
+            .produces(["a"])
+            .subgroup("a", "child");
+        assert!(
+            multi_err(vec![], vec![missing_parent])
+                .to_string()
+                .contains("parent")
+        );
+    }
+
+    #[test]
+    fn presentation_keeps_origins_and_explicit_subgroups() {
+        let make = |decorate: bool| {
+            let a = Asset::source("left/data");
+            let b = Asset::source("right/data");
+            let out = echo("result").from(&a).from(&b).group("results");
+            let decorate = |a: Asset| {
+                if decorate {
+                    a.display_name("Readable")
+                        .subgroup("shared")
+                        .label("anything", "value")
+                } else {
+                    a
+                }
+            };
+            AssetRegistry::new(
+                vec![decorate(a), decorate(b), decorate(out)],
+                vec![],
+                vec![],
+            )
+            .unwrap()
+        };
+        let old = make(false);
+        let new = make(true);
+        for name in ["left/data", "right/data", "result"] {
+            let a = old.get(name).unwrap();
+            let b = new.get(name).unwrap();
+            assert_eq!(a.provenance, b.provenance);
+            assert_eq!(a.group(), b.group());
+            assert_eq!(a.deps, b.deps);
+            assert_eq!(a.namespace, b.namespace);
+            assert_eq!(b.subgroup.as_deref(), Some("shared"));
+        }
+        assert_eq!(new.get("result").unwrap().provenance, ["left", "right"]);
+        assert!(
+            reg_err(vec![echo("bare").subgroup("child")])
+                .to_string()
+                .contains("parent")
+        );
+        assert!(
+            reg_err(vec![echo("a/b").subgroup("x/y")])
+                .to_string()
+                .contains("subgroup")
+        );
+        assert!(
+            reg_err(vec![echo("a/b").display_name(" ")])
+                .to_string()
+                .contains("display name")
+        );
+        assert_eq!(old.get("left/data").unwrap().subgroup, None);
+    }
+
+    #[test]
     fn registry_orders_topologically_and_validates() {
         // declared sink-first; the registry reorders
         let s = Asset::source("s");
@@ -2900,7 +3139,12 @@ mod tests {
 
         // moved to another group, name untouched
         let moved = AssetRegistry::new(
-            vec![echo("sales/orders").group("finance")],
+            vec![
+                echo("sales/orders")
+                    .group("finance")
+                    .display_name("Readable orders")
+                    .subgroup("daily"),
+            ],
             Vec::new(),
             Vec::new(),
         )

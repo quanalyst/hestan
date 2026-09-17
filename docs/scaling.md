@@ -197,7 +197,7 @@ what a stop does, in order:
 Hestan::new().stop_within(Duration::from_secs(25)).work(None).await
 ```
 
-a **second signal** skips step 4. ctrl-c twice is somebody saying something,
+A **second signal** ends the grace period immediately. ctrl-c twice is somebody saying something,
 and the second one is not swallowed.
 
 three things follow, and the first of them is a cost:
@@ -313,14 +313,10 @@ seconds of nobody deciding is ten more seconds of downtime, and
 [catch-up](scheduling.md#missed-fire-catch-up) already has an answer for
 downtime.
 
-**a stop is the other case, and a deploy is a stop.** a process
-[asked to stop](#stopping-a-process-on-purpose) hands the lease back, so the
-row is free before it has finished leaving and what is left is how long the
-next process takes to look: one two-second renewal rather than the rest of a
-ten-second lease. measured in containers, with hestan as pid 1 and no init shim
-in front of it:
-[containers](containers.md#signals-and-what-a-stop-is-worth) has the stop and
-the kill side by side.
+A process [asked to stop](#stopping-a-process-on-purpose) releases the deciding
+lease. Another process can acquire it on its next poll rather than waiting for
+expiry. A forced kill cannot release it; see
+[container shutdown](containers.md#signals-and-what-a-stop-is-worth).
 
 ### What the term fences, and what it does not
 
@@ -454,10 +450,8 @@ would have to be built differently than it sounds.
   database server" is a worse promise than one that is small and true
   everywhere.
 
-so dividing is the answer for a known number of workers, which is most
-deployments, and a shared bucket is a later phase's problem, one that would
-start with the lease rather than with the row, and would be opt-in by name with
-the local bucket still the default.
+Divide the limit by the number of workers when a deployment-wide cap is
+required. Hestan does not provide a shared rate bucket.
 
 ## The compose example
 

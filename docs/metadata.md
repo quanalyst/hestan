@@ -156,11 +156,9 @@ version knows. `Meta::as_f64` is the number a numeric variant carries and
 `None` for every other variant. the two of them are how anything computes
 over rows that were written long before.
 
-**tags are never renumbered.** rows written by every hestan since phase 12 are
-on disk, so `int`, `float`, `text`, `url`, `markdown` and `json` mean today
-exactly what they meant then; this phase added tags beside them rather than
-changing any. there is a test with a phase-12 row in it that fails if that
-ever stops being true.
+**Stored tags keep their meaning.** `int`, `float`, `text`, `url`, `markdown`
+and `json` remain readable as new variants are added. A legacy-row fixture
+checks backward compatibility.
 
 ## What a run saved
 

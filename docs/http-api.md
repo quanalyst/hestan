@@ -255,7 +255,7 @@ my run" and "which one has gone quiet".
     "name": "prod-eu",
     "build": "9f2c1ab",
     "hestan": {
-      "version": "0.2.4",
+      "version": "0.2.5",
       "schema": 24,
       "features": ["bundled", "cli", "postgres"],
       "platform": "linux/aarch64",
@@ -1395,3 +1395,23 @@ a GET outside `/api` serves the embedded ui: the file from the bundled
 `/api` itself) gets a json 404 (`{"error": "no such endpoint: /api/nope"}`)
 instead of a confusing html page, and a non-GET request to a ui path gets a
 json 405 rather than a 200 full of html.
+
+## Presentation metadata
+
+Job list/detail and asset summaries include these fields alongside the persistent
+`name`, effective `group`, `namespace` and existing status fields:
+
+| Field | Default | Meaning |
+| --- | --- | --- |
+| `display_name` | `null` | Optional readable name; use `name` when absent. |
+| `subgroup` | `null` | Explicit subgroup within the effective group. |
+| `labels` | `{}` | User-defined string keys and values. |
+| `execution.failed` | `0` | `1` if the latest job run or attempted asset-producing op failed. |
+| `execution.running` | `0` | Number of currently running runs or asset-producing op attempts. |
+
+Sources and assets without attempts report zero execution counts. Multi-asset
+outputs share their producing op's execution status. Execution, failed checks
+and freshness are separate measures. Metadata changes do not rewrite historical
+records or change existing response fields.
+
+See [display names and grouping](presentation.md) for declarations and validation.

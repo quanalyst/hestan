@@ -92,67 +92,29 @@ half an interval in the past, with no successful run finishing since,
 carries an `overdue` tag; [scheduling](scheduling.md) has the exact rule. a
 job or asset past its declared [freshness policy](freshness.md) carries a
 `late` tag instead (a different claim, and the one that wins where both could
-apply), and the statline counts everything currently late.
+apply), and the statline counts the visible jobs that are currently late.
 rows click through to the job page. the page polls jobs every 5s, window
 runs every 10s, and upcoming fires every 30s.
 
 ### Opening a group
 
-twenty jobs is twenty lanes, and a namespace is too coarse to cut that down:
-two chips over one bucket of fourteen is not the cut anybody wanted.
-so where a job declares a [group](namespaces.md#a-job-has-one-too) the gutter
-is an outline two levels deep, and the group is the outer one.
+The Jobs list and timeline use the declared group/subgroup hierarchy by default.
+Groups start collapsed. Use the disclosure button to reveal subgroups and jobs;
+keyboard users can reach it with Tab and activate it with Space.
 
-**a group is a row of its own whether it is open or shut, and that row always
-draws the aggregate**: every run of every member, packed by the same greedy
-sub-lane rule one job's lane already uses, so three runs live at one moment is
-a row three sub-lanes tall. a group makes the plot shorter and never quieter:
-drawing the first run and hiding the rest would make a busy period look like a
-quiet one, which is a worse lie than showing no group at all.
+A group lane aggregates every member's runs, including overlapping runs. Opening
+it adds member lanes while retaining the aggregate. A failed run receives one
+marker in the failure strip even when it appears in more than one lane.
+Summaries show failed, running, late and overdue members while groups are closed.
 
-**the gutter is alphabetical**, groups and ungrouped jobs on one list: a group
-sorts by its name, a job in no group by its own, and the jobs inside an open
-group by theirs. a reader looking for a word finds it where the word falls
-rather than where the deployment happened to declare it.
+The gutter sorts groups and ungrouped jobs alphabetically. Group marks remain
+stable, and ungrouped jobs have their own lanes. Search matches display names
+and identifiers and reveals the matching hierarchy.
 
-**a group starts shut**, so a deployment that declares one opens on a row per
-group rather than a row per job. the disclosure is in the gutter on the group's
-own row: the whole of that row is the target, so the name is what you click,
-and it is a button, so tab reaches it and space works.
-
-opening a group adds its jobs as rows directly underneath it, indented, and the
-group's row goes on drawing the aggregate. **while a group is open a run is
-drawn twice**, once on the group's row as part of the group's load and once on
-its job's row as itself. that is what opening one is for, and the two marks are
-one run: pointing at either lights both.
-
-every row inside a group carries a wash of the page's own ink behind its name,
-at the [shade](assets.md#colour) the group's name picked, the full height of
-the row and the same on the group's row as on its jobs' rows, so consecutive
-rows abut and it reads as one band down the gutter rather than a mark per row.
-a job in no group carries none.
-
-**the plot is black, white and grey, and so is the band.** a run says what it
-did by its shape and its fill: a failure by its hatch and its × in the strip
-under the plot, a queued run by its hollow outline, a canceled one by its
-dimmed grey. where the work came from is carried by how dark its band is, which
-is a different channel on the same greyscale rather than a second palette. a
-bar takes no shade of its own: the group is written in the gutter beside every
-row it belongs to, and a mark repeated on the bars would be saying it twice.
-
-a failure inside a shut group still reaches the strip, and a failure inside an
-open one gets one × and not two: a run drawn twice is still one run that
-failed.
-
-which groups are open is in the url like every other view state
-(`/jobs?open=weather,eia`), so an opened view is a link somebody can send.
-starting shut is why the parameter carries what is open rather than what is
-not: it is the shorter half of the answer.
-
-**a deployment where nothing declares a group gets the plot it always had**:
-one row per job, no blocks, no disclosures. there is nothing to group by, a job
-in no group is never gathered into anything, and inventing a group out of a
-naming convention would be a guess.
+Choose two grouping dimensions—group, subgroup or a label—to change the view.
+Grouping, filters, expansion and the timeline window are shareable through the
+URL. See [display names and grouping](presentation.md) for declarations,
+validation and missing-value handling.
 
 ## Job page
 
@@ -251,9 +213,8 @@ ways of drawing fewer:
   boundary rewired to it and the ones inside it gone. the same chips fold the
   table's groups: one set of folded groups, two views of it.
 - **find.** what the search box below matches is marked in the graph with a
-  heavy outline and everything else recedes. a folded group is findable by
-  what it swallowed, and a search nothing matches marks nothing rather than
-  dimming the whole graph, which would read as a fault.
+  heavy outline. Search matches display names and persistent identifiers,
+  reveals containing groups, and shows matching nodes even in a focused view.
 
 **past 60 nodes the graph opens focused rather than whole**, on the selected
 asset, or on the first stale one, which is what anyone opening a graph of
@@ -263,22 +224,16 @@ and the choice is remembered in the url.
 
 ### The table
 
-a search box filters by name substring as you type, and a state filter
+a search box filters by display name or identifier as you type, and a state filter
 separates four questions the engine answers with one word: `fresh`, `stale`,
 `never built` (which is the same verdict as stale, and a different thing to
 look at), and `failed check`, which cuts across the other three.
 
-rows are sectioned by the [group](assets.md#group)
-the api resolved: what the asset declared, else the part of its name before
-the first `/`, else none. `sales/orders` and `sales/returns` are one
-collapsible `sales` group, and where the name repeats the group as a prefix it
-is dropped from the rows underneath, since the heading already says it. a name
-that has nothing to do with its declared group keeps every character: cutting
-one off would be a lie about what the asset is called. **with no group
-anywhere there is no grouping**; assets in none sort last under their own
-heading, or the first of them reads as the last row of the group above. a
-`group` filter beside the search narrows to one, exactly, and lives in the url
-with everything else.
+Rows follow the selected grouping view, with collapsible groups and subgroups.
+The default uses the effective group and explicitly declared subgroup. Members
+without a subgroup are shown separately within a mixed parent. Display names
+fall back to persistent identifiers; tooltips retain the identifier.
+A `group` filter narrows to an effective group regardless of the selected view.
 
 beside it, where anything declares one, a `namespace` filter. it is the other
 question, and one asset can answer the two differently: a group is what it is
@@ -286,12 +241,11 @@ labeled with on this graph, a namespace is whose slice of the deployment it is
 in, and neither is derived from the other. [namespaces and
 owners](namespaces.md) says which to reach for.
 
-the columns are state (with the reason beside it), when it was last built, the
+the columns are state (with the reason beside it), execution, when it was last built, the
 run that built it, freshness where a policy is declared, partition coverage
 where the asset is [partitioned](assets.md#partitioned-assets), and what it
 descends from where anything does; the last three only when something fills
-them. all of them sort, and clicking the
-column already sorted turns it around. deps and the current fingerprint are
+them. Sortable column headings toggle ascending and descending order. deps and the current fingerprint are
 not columns: both live on the asset's own page, and neither was ever read
 across three hundred rows.
 
@@ -752,7 +706,7 @@ worse than one that says it has. `load older` walks back a page at a time.
 under the heading, two lines saying **what this deployment is**. the first is
 its declared name, the build of your application it runs, and the hestan
 version and platform compiled into it: `prod-eu · build 9f2c1ab · hestan
-0.2.4 on linux/aarch64`. a deployment that declared no build says `build
+0.2.5 on linux/aarch64`. a deployment that declared no build says `build
 not declared` rather than putting hestan's own version where yours would go,
 which would be a confident answer to a different question. **said once, and
 here**, for the reason the deciding line below is: which build is running is a

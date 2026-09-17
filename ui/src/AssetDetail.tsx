@@ -1,3 +1,4 @@
+import PresentationDetails from "./PresentationDetails";
 import { useEffect, useState } from "react";
 import type { ReactNode } from "react";
 import { Link } from "react-router-dom";
@@ -157,6 +158,13 @@ export default function AssetDetail({
         )}
         {/* and whose slice of the deployment it is in, which is not the group
             it is drawn under */}
+        {asset.execution && (asset.execution.failed > 0 || asset.execution.running > 0) && (
+          <div className="op-line">
+            <span className="op-line-label">execution</span>
+            <span>{[asset.execution.failed > 0 ? "latest attempt failed" : "", asset.execution.running > 0 ? `${asset.execution.running} running` : ""].filter(Boolean).join(" · ")}</span>
+          </div>
+        )}
+        <PresentationDetails item={asset} />
         {asset.namespace !== null && (
           <div className="op-line">
             <span className="op-line-label">namespace</span>

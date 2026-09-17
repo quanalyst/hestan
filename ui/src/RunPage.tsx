@@ -1,3 +1,4 @@
+import { displayName } from "./presentation";
 import { useEffect, useRef, useState } from "react";
 import { Link, useNavigate, useParams } from "react-router-dom";
 import { get, HttpError, post, usePoll } from "./api";
@@ -375,7 +376,7 @@ function RunView({ id }: { id: string }) {
       <div className="page-head">
         <div>
           <h1>
-            <Link to={`/jobs/${encodeURIComponent(run.job)}`}>{run.job}</Link>{" "}
+            <Link to={`/jobs/${encodeURIComponent(run.job)}`} title={run.job}>{job ? displayName(job) : run.job}</Link>{" "}
             <span className="mono secondary">{shortId(run.id)}</span>
           </h1>
           <p className="muted">

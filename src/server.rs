@@ -584,6 +584,10 @@ pub(crate) fn job_summary(
         .pop();
     Ok(json!({
         "name": job.name(),
+        "display_name": job.display_name(),
+        "subgroup": job.subgroup(),
+        "labels": job.labels(),
+        "execution": { "failed": usize::from(last_run.as_ref().is_some_and(|r| r.status == RunStatus::Failed)), "running": store.running_count(job.name())? },
         "description": job.description(),
         // which slice of the deployment it is in; null in a deployment that
         // declares no namespaces, which is every one built before they existed
@@ -1354,6 +1358,7 @@ pub(crate) fn assets_json(registry: &AssetRegistry, store: &Store) -> Result<Val
     let pass = Pass::new(registry, &mats, now);
     let stale = pass.stale();
     let latest_checks = store.latest_asset_checks()?;
+    let execution = store.asset_execution()?;
     let assets: Vec<Value> = registry
         .topo()
         .map(|meta| {
@@ -1403,6 +1408,12 @@ pub(crate) fn assets_json(registry: &AssetRegistry, store: &Store) -> Result<Val
                 .collect();
             json!({
                 "name": meta.name,
+                "display_name": meta.display_name,
+                "subgroup": meta.subgroup,
+                "labels": meta.labels,
+                "execution": meta.op.as_ref().and_then(|op| execution.iter().find(|(name, _, _)| name == op))
+                    .map(|(_, status, running)| json!({ "failed": usize::from(status == "failed"), "running": running }))
+                    .unwrap_or_else(|| json!({ "failed": 0, "running": 0 })),
                 // whose it is: what it declared, and null in a deployment that
                 // declares no namespaces. not the group below, which is a
                 // label on the graph and falls back to the name
@@ -7611,19 +7622,52 @@ mod tests {
     /// a deployment split in two, plus a job and an asset in no namespace at
     /// all: what an existing deployment is entirely made of.
     fn divided() -> AppState {
+        divided_with_presentation(false)
+    }
+
+    fn divided_with_presentation(decorate: bool) -> AppState {
+        let decorate_asset = |a: crate::Asset| {
+            if decorate {
+                a.display_name("Readable")
+                    .group("shared")
+                    .subgroup("shared")
+                    .label("namespace", "finance")
+            } else {
+                a
+            }
+        };
+        let decorate_job = |j: crate::JobBuilder| {
+            if decorate {
+                j.display_name("Readable")
+                    .group("shared")
+                    .subgroup("shared")
+                    .label("namespace", "finance")
+            } else {
+                j
+            }
+        };
         let orders = crate::Asset::source("orders").namespace("finance");
         let payroll = crate::Asset::source("payroll").namespace("people");
         let legacy = crate::Asset::source("legacy");
         let registry = Arc::new(
-            AssetRegistry::new(vec![orders, payroll, legacy], Vec::new(), Vec::new()).unwrap(),
+            AssetRegistry::new(
+                vec![
+                    decorate_asset(orders),
+                    decorate_asset(payroll),
+                    decorate_asset(legacy),
+                ],
+                Vec::new(),
+                Vec::new(),
+            )
+            .unwrap(),
         );
         let jobs = vec![
-            Job::builder("etl")
+            decorate_job(Job::builder("etl"))
                 .namespace("finance")
                 .op(Op::new("echo", |_| async { Ok(json!(null)) }))
                 .build()
                 .unwrap(),
-            Job::builder("payslips")
+            decorate_job(Job::builder("payslips"))
                 .namespace("people")
                 .op(Op::new("echo", |_| async { Ok(json!(null)) }))
                 .build()
@@ -7843,6 +7887,97 @@ mod tests {
         assert_eq!(after.runner.store().run("r1").unwrap().unwrap().job, "etl");
     }
 
+    #[tokio::test]
+    async fn presentation_is_additive_and_keeps_job_history() {
+        let store = Store::open(":memory:").unwrap();
+        let before = state_over(vec![echo_job("stable")], store.clone());
+        insert_run(&before, "r1", "stable", RunStatus::Success, json!({}));
+        let job = Job::builder("stable")
+            .display_name("Readable")
+            .label("classification", "one")
+            .group("parent")
+            .subgroup("child")
+            .build()
+            .unwrap();
+        let after = state_over(vec![job], store);
+        let Json(one) = get_job(State(after.clone()), Path("stable".into()))
+            .await
+            .unwrap();
+        let Json(list) = list_jobs(State(after), everything()).await.unwrap();
+        assert_eq!(one["display_name"], "Readable");
+        assert_eq!(one["subgroup"], "child");
+        assert_eq!(one["labels"], json!({"classification": "one"}));
+        assert_eq!(one["name"], "stable");
+        assert_eq!(one["last_run"]["id"], "r1");
+        assert_eq!(listed(&list, "stable"), one);
+        let registry = AssetRegistry::new(
+            vec![
+                crate::Asset::source("stable")
+                    .label("classification", "one")
+                    .display_name("Readable")
+                    .group("parent")
+                    .subgroup("child"),
+            ],
+            vec![],
+            vec![],
+        )
+        .unwrap();
+        let body = assets_json(&registry, before.runner.store()).unwrap();
+        for field in [
+            "name",
+            "display_name",
+            "group",
+            "subgroup",
+            "namespace",
+            "labels",
+        ] {
+            assert_eq!(body["assets"][0][field], one[field]);
+        }
+    }
+
+    #[tokio::test]
+    async fn asset_execution_reports_failure_and_running_independently_of_freshness() {
+        let reg = AssetRegistry::new(
+            vec![crate::Asset::new("stable", |_| async { Ok(json!(1)) })],
+            vec![],
+            vec![],
+        )
+        .unwrap();
+        let st = state(vec![reg.lower_job().unwrap()]);
+        insert_run_with_ops(&st, "r1", "assets", RunStatus::Running, &["stable"]);
+        let store = st.runner.store();
+        store.op_started("r1", "stable", 1).unwrap();
+        let body = assets_json(&reg, store).unwrap();
+        assert_eq!(
+            body["assets"][0]["execution"],
+            json!({"failed": 0, "running": 1})
+        );
+        store
+            .op_finished(
+                "r1",
+                "stable",
+                OpStatus::Failed,
+                None,
+                None,
+                Some("failed"),
+                &[],
+            )
+            .unwrap();
+        let body = assets_json(&reg, store).unwrap();
+        assert_eq!(
+            body["assets"][0]["execution"],
+            json!({"failed": 1, "running": 0})
+        );
+        assert_eq!(body["assets"][0]["freshness"], Value::Null);
+        assert_eq!(body["assets"][0]["checks"]["failed"], 0);
+        // A later queued attempt must not conceal the last failure.
+        insert_run_with_ops(&st, "r2", "assets", RunStatus::Queued, &["stable"]);
+        assert_eq!(
+            assets_json(&reg, store).unwrap()["assets"][0]["execution"]["failed"],
+            1
+        );
+    }
+
     // ------------------------------------------------------------ groups
 
     /// a deployment where a job and an asset are in one group, which is the
@@ -7990,6 +8125,28 @@ mod tests {
         };
         let Json(jobs) = list_jobs(State(st), everything()).await.unwrap();
         assert_eq!(listed(&jobs, "weather_pull")["group_hue"], json!(pinned));
+    }
+
+    #[tokio::test]
+    async fn presentation_metadata_cannot_change_namespace_permissions() {
+        for decorate in [false, true] {
+            let st = divided_with_presentation(decorate);
+            for path in ["/api/jobs/etl/runs", "/api/assets/orders/build"] {
+                assert!(!refused(
+                    status_of(&st, "POST", path, Some(("x-user", "fin"))).await
+                ));
+            }
+            for path in [
+                "/api/jobs/payslips/runs",
+                "/api/assets/payroll/build",
+                "/api/assets/legacy/build",
+            ] {
+                assert_eq!(
+                    status_of(&st, "POST", path, Some(("x-user", "fin"))).await,
+                    StatusCode::FORBIDDEN
+                );
+            }
+        }
     }
 
     // a token scoped to a namespace admits its jobs and its assets without

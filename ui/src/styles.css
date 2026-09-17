@@ -1887,3 +1887,5 @@ table.plain-rows tbody tr:hover {
 .signin-refused {
   font-weight: 500;
 }
+
+.tl-summary { fill: currentColor; font-family: ui-monospace, monospace; }

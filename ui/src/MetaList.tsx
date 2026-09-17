@@ -1,3 +1,4 @@
+import { RegisteredName } from "./RegistryNames";
 import { Link } from "react-router-dom";
 import Markdown from "./MarkdownView";
 import MicroBars from "./MicroBars";
@@ -129,7 +130,7 @@ export function MetaValueView({ value }: { value: MetaValue }) {
   if ("asset" in value) {
     return (
       <Link className="mono meta-val" to={assetPath(value.asset)}>
-        {value.asset}
+        <RegisteredName kind="asset" name={value.asset} />
       </Link>
     );
   }

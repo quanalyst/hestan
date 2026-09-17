@@ -19,6 +19,7 @@ const STATUS_ROW_Y = 34;
 // the minimum a node needs to be drawn; OpSummary satisfies it structurally
 export interface DagNode {
   name: string;
+  display_name?: string | null;
   deps: string[];
   output_type?: string | null;
   note?: string;
@@ -90,7 +91,7 @@ export default function DagView({
   if (nodes.length === 0) return null;
   const nodeH = statuses ? STATUS_NODE_H : NODE_H;
   const glyphW = statuses ? 16 : 0;
-  const hay = (n: DagNode) => `${n.name} ${n.find ?? ""}`.toLowerCase();
+  const hay = (n: DagNode) => `${n.name} ${n.display_name ?? ""} ${n.find ?? ""}`.toLowerCase();
   const wanted = (highlight ?? "").trim().toLowerCase();
   // a search nothing matches dims the whole graph, which looks like a fault
   // rather than an answer, so it does not count as a search
@@ -132,7 +133,7 @@ export default function DagView({
     const sub = subOf(n);
     const badge = n.badge ? Math.round(n.badge.length * 6.6) + 5 : 0;
     const text = Math.max(
-      Math.round(n.name.length * 7.5) + glyphW + badge,
+      Math.round((n.display_name ?? n.name).length * 7.5) + glyphW + badge,
       sub ? Math.round(sub.length * 5.6) : 0,
     );
     return Math.max(72, text + swatchWidth(n) + PAD_X * 2);
@@ -199,9 +200,9 @@ export default function DagView({
               .join(" ") || undefined;
           return (
             <g key={node.name} className={cls} onClick={onSelect ? () => onSelect(node.name) : undefined}>
-              {node.output_type && <title>{`${node.name} -> ${node.output_type}`}</title>}
+              {node.output_type && <title>{`${node.name} ${node.display_name ?? ""} -> ${node.output_type}`}</title>}
               {!node.output_type && node.hues && node.hues.length > 0 && (
-                <title>{`${node.name} · ${node.hues.map((h) => h.label).join(", ")}`}</title>
+                <title>{`${node.name} ${node.display_name ?? ""} · ${node.hues.map((h) => h.label).join(", ")}`}</title>
               )}
               <rect className="dag-node" x={nx} y={y} width={w} height={nodeH} rx={4} />
               {/* one stripe per label, side by side and never blended: two
@@ -235,8 +236,9 @@ export default function DagView({
               )}
               <text className="dag-label" x={textX} y={labelCy} dominantBaseline="central">
                 {/* a graph instance's ops share a prefix; muting it groups them by eye */}
-                {prefixOf(node.name) && <tspan className="dag-prefix">{prefixOf(node.name)}</tspan>}
-                {leafOf(node.name)}
+                {!node.display_name && prefixOf(node.name) && <tspan className="dag-prefix">{prefixOf(node.name)}</tspan>}
+                {node.display_name ?? leafOf(node.name)}
+                <title>{node.find ?? node.name}</title>
                 {node.badge && <tspan className="dag-badge"> {node.badge}</tspan>}
               </text>
               {st && (

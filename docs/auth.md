@@ -1,15 +1,9 @@
 # Authentication
 
-the api launches runs, cancels them, pauses schedules, starts backfills and
-moves queue positions. on loopback that is a process talking to itself. on any
-other address it is a button on the internet that runs arbitrary jobs, and
-until this phase the only thing standing between those two situations was a
-sentence in the documentation.
+The API can launch and cancel runs, pause schedules, start backfills and
+change queue positions. **`serve` refuses a non-loopback address unless an
+authenticator is configured or unauthenticated access is explicitly enabled.**
 
-documentation is not a control. so:
-
-**`serve` refuses to start on an address that is not loopback while no
-authenticator is configured.**
 
 ```
 $ orders serve --addr 0.0.0.0:4000
@@ -292,8 +286,7 @@ in its path what it is about, so one check in one place can rule on every write
 there will ever be. a read is mostly a *list*: `/api/runs`, `/api/events`,
 `/api/queue`, `/api/assets`, the sse stream, `/metrics`. narrowing those means
 a filter inside each handler that builds one, which is a check that has to be
-remembered at every list, and phase 33's lesson is that a check which must be
-remembered at each call site is one that will be forgotten at one. a
+applied consistently to every list. a
 confidentiality promise that holds in nine places out of ten is worse than no
 promise, because people plan around it and the tenth is where the leak is.
 
@@ -452,7 +445,7 @@ one that refused to run.
 
 ## Who did what
 
-phase 24 built an event log for the whole system. it now says who.
+The event log records the identity responsible for authenticated actions.
 
 the identity that caused a run, a cancel, a pause or a backfill goes on the
 event, and on the run row:
@@ -536,6 +529,6 @@ deliberately, and none of these are coming later by accident:
 | the refusal, the loopback rule, the constant-time comparison, `Scope` | `src/auth.rs` |
 | what a namespace is and what declares one | `src/whose.rs`, and [namespaces and owners](namespaces.md) |
 | the guard, the roles table, what a request is about, `whoami` | `src/server.rs` |
-| who did what, in the store | `src/store.rs` (schema v18: `runs.actor`, `events.actor`) |
+| who did what, in the store | `src/store.rs` (`runs.actor`, `events.actor`) |
 | the token, the prompt, and what it does not protect against | `ui/src/identity.ts` |
 | the token leaving no trace | `tests/auth.rs` |

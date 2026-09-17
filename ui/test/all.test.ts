@@ -17,3 +17,5 @@ import "./role.test";
 import "./saved.test";
 import "./swatch.test";
 import "./timeline.test";
+
+import "./presentation.test";

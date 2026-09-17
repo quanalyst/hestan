@@ -1,3 +1,4 @@
+import { displayName, matchesName } from "./presentation";
 // what the assets table shows, out of everything registered: the search, the
 // state filter, the grouping and the sort.
 //
@@ -101,7 +102,7 @@ export function filterAssets(
       matchesState(a, filter) &&
       (group === null || a.group === group) &&
       inNamespace(a, namespace) &&
-      (needle === "" || a.name.toLowerCase().includes(needle)),
+      matchesName(a, needle),
   );
 }
 
@@ -150,7 +151,7 @@ const coverage = (a: AssetSummary) =>
   a.partitions === null ? 2 : a.partitions.materialized / Math.max(a.partitions.total, 1);
 
 const COMPARE: Record<SortKey, (a: AssetSummary, b: AssetSummary) => number> = {
-  name: (a, b) => a.name.localeCompare(b.name),
+  name: (a, b) => displayName(a).localeCompare(displayName(b)),
   state: (a, b) => stateRank(a) - stateRank(b),
   built: (a, b) => builtAt(a) - builtAt(b),
   freshness: (a, b) => windowUsed(a) - windowUsed(b),

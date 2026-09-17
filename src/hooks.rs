@@ -600,7 +600,7 @@ mod tests {
     async fn a_notification_written_before_owners_existed_still_delivers() {
         let store = Store::open(":memory:").unwrap();
         plant(&store, "r1");
-        // the payload as it was written before this phase: every key it had,
+        // The payload before owner metadata was added: every key it had,
         // and not one it did not
         let id = store.notifications(None, 10).unwrap()[0].id;
         let mut payload = store.notifications(None, 10).unwrap()[0].payload.clone();

@@ -24,7 +24,7 @@ start/finish times, and the output or error.
 
 *events* are the append-only log of the whole deployment. each carries a level
 (`info | warn | error`), a kind, a message, optional structured json `data`,
-and (this is the part that stopped being about runs in v17) a **subject**:
+and a **subject**:
 `subject_kind` is one of `run`, `job`, `asset`, `schedule`, `sensor`,
 `backfill` or `system`, and `subject` names which one. so an asset
 materialized, a schedule that fired or was skipped, a sensor tick, a backfill's
