@@ -56,7 +56,7 @@ incremental path.
 **it is in the group `hestan`**, which is the one group a deployment does not
 declare. the job is hestan's own work turning up in your timeline, so it is
 named after hestan rather than after anything you wrote, and it folds and takes
-a colour like any other group. a deployment with no assets registers no assets
+a mark like any other group. a deployment with no assets registers no assets
 job and has no such group.
 
 a source contributes no op to that job. its "value" is null everywhere: a
@@ -151,7 +151,7 @@ everything below is the first.
 the picture here is this graph. a [job declares the same
 label](namespaces.md#a-job-has-one-too) and its picture is the run timeline:
 one sentence and one concept rather than two, and a group of one name on both
-is one label drawn in one colour.
+is one label drawn with one mark.
 
 ### Group
 
@@ -195,8 +195,8 @@ what makes `orders` and `returns` above one thing downstream rather than two.
 that is also the clearest reason a group is not a tenancy boundary: `vendor` is
 a feed, not a team, and two teams reading one vendor is ordinary. neither is
 the fallback: an asset called `finance/orders` is in group `finance` without
-anybody declaring anything, which is right for a colour and wrong for anything
-that decides who may touch what. a [namespace](namespaces.md) is declared, has
+anybody declaring anything, which is right for a mark on a picture and wrong
+for anything that decides who may touch what. a [namespace](namespaces.md) is declared, has
 no fallback, and is the thing an api filter and a token's scope read.
 
 ### Origin
@@ -220,42 +220,51 @@ a partition [mapping](#what-a-partition-reads-of-its-dep) changes nothing
 here: a mapping says which keys a read takes, and where the data came from is
 the same answer at every key.
 
-### Colour
+### Hue
 
 a group and an origin each have a **hue**: an integer 0..=359 degrees around
 the colour wheel, from `hestan::hue(name)`.
 
-it is a pure function of the name and nothing else, so a group keeps its
-colour across restarts, across processes, across machines, and across however
-many other groups appear beside it. it is deliberately **not** an index into a
+it is a pure function of the name and nothing else, so a group keeps its hue
+across restarts, across processes, across machines, and across however many
+other groups appear beside it. it is deliberately **not** an index into a
 palette: an index renumbers every group after the one you added, and a graph
-that repaints itself when somebody declares an asset is a graph nobody trusts
-the colours of.
+that redraws every mark on it because somebody declared an asset is a graph
+nobody trusts the marks of.
 
-the number is a hue and not a colour. what lightness is legible depends on the
-ground it is drawn on, so the reader picks saturation and lightness and hestan
-picks the angle: the web ui does that in css per theme, and anything painting
-a terminal gets the same angle to work from.
+**the number is an angle and not a colour.** hestan picks the angle and the
+reader decides what to draw with it, because what is legible depends on the
+ground it lands on. hestan's own [web ui](web-ui.md#shade) does not paint it as
+a colour at all: it spends the angle as one of six shades of the page's ink,
+and a client that does paint in colour picks its own saturation and lightness
+from the same number.
 
 **a job's group is in the same space.** `hue` reads a name and nothing else, so
 a job in group `weather` and the assets in group `weather` land on the same
 angle without either end being told about the other, and a pin moves both. one
-name, one colour, on the graph and on the [timeline](web-ui.md#jobs-overview).
+name, one mark, on the graph and on the [timeline](web-ui.md#jobs-overview).
 
-**the limit, stated plainly**: two names can hash close enough together to be
-hard to tell apart, and no pure function of a single name can prevent that,
-because preventing it needs the whole set of names and a function of the whole
-set is exactly the unstable thing above. so `hestan doctor` reports the pairs
-it finds, naming both and how far apart they are, and `Asset::hue(n)` pins one
-of the two. a hue belongs to the label rather than to one asset, so two assets
-in one group may not pin two different angles, and a hue outside 0..=359 fails
-the build.
+**the limit, stated plainly**: two names can hash to marks that cannot be told
+apart, and no pure function of a single name can prevent that, because
+preventing it needs the whole set of names and a function of the whole set is
+exactly the unstable thing above. so `hestan doctor` reports the labels it
+finds sharing a mark, and `Asset::hue(n)` moves one of them. a hue belongs to
+the label rather than to one asset, so two assets in one group may not pin two
+different angles, and a hue outside 0..=359 fails the build.
 
-**colour never means status.** the palette everywhere else in the ui is grey
-and shape carries state, which is exactly what leaves colour free; the moment
-a hue meant "failed" the channel would be carrying two things. and colour is
-never the only carrier: every group and origin name is written on the same
-screen as the hue that stands for it. `docs/web-ui.md` is where that is drawn.
+the check is about the ui in the binary, so it asks the question that ui
+answers: **which labels land on the same one of six shades**, rather than which
+angles sit close together. those are different questions — six degrees apart
+can be one mark and a hundred degrees apart can be two — and past six labels
+the pigeonhole settles it, so the check states that plainly rather than raising
+something nobody can act on.
+
+**a mark never means status.** the palette in the ui is grey and shape carries
+state, which is exactly what leaves the mark free to mean provenance; the
+moment a hue meant "failed" the channel would be carrying two things. and the
+mark is never the only carrier: every group and origin name is written on the
+same screen as the mark that stands for it. `docs/web-ui.md` is where that is
+drawn.
 
 ### Namespace, and who owns it
 

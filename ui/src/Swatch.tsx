@@ -1,6 +1,6 @@
 import type { CSSProperties } from "react";
-import { shownAndMore } from "./colour";
-import type { Stripe } from "./colour";
+import { shownAndMore } from "./shade";
+import type { Stripe } from "./shade";
 
 // six steps of the page's own ink, picked by a label's angle. the palette is
 // black, white and grey: what a thing is doing is carried by shape and what it
@@ -11,12 +11,13 @@ import type { Stripe } from "./colour";
 const SHADES = [0.16, 0.32, 0.48, 0.64, 0.82, 1];
 
 // the css variable a mark's shade arrives in, as a fraction of full ink. each
-// site decides how much of it to spend: a 4px stripe wants nearly all of it, a
-// band behind a name wants a fifth, and `styles.css` is where that is said
+// site decides how much of it to spend: a 4px stripe wants nearly all of it,
+// and a band with a name read on top of it wants a floor plus a small share,
+// so the palest of the six is still a band. `styles.css` is where that is said
 export const at = (hue: number) => ({ "--shade": String(SHADES[hue % SHADES.length]) }) as CSSProperties;
 
-// one asset's colour: **one stripe per label, side by side, never blended.**
-// averaging two hues produces a third hue, and a third hue stands for a source
+// one asset's mark: **one stripe per label, side by side, never blended.**
+// averaging two shades produces a third, and a third shade stands for a source
 // nobody has. past `MAX_STRIPES` the rest become a count, and they are still
 // named in the legend.
 //

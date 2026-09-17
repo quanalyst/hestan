@@ -3,7 +3,7 @@
 import "./activity.test";
 import "./backfill.test";
 import "./catalog.test";
-import "./colour.test";
+import "./shade.test";
 import "./fanout.test";
 import "./gutter.test";
 import "./lineage.test";

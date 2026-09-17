@@ -288,8 +288,8 @@ threshold on.
 
 what doctor has that this page does not, and deliberately: the reason and the
 fix, and the checks that need the registry rather than the store. an automation
-policy that can never fire, a rate that is per process, two asset colours that
-collide, a retention policy in a role that never sweeps: each of those is
+policy that can never fire, a rate that is per process, two asset labels the
+ui draws on one mark, a retention policy in a role that never sweeps: each of those is
 per-asset or per-declaration, and a metric carrying them would need exactly the
 labels the section above rules out.
 

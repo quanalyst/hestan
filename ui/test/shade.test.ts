@@ -1,22 +1,22 @@
-// the colour channel's three rules, asserted rather than described.
+// the provenance channel's three rules, asserted rather than described.
 //
-// colour means where an asset belongs or where it came from and never how it
-// is doing; a colour is never the only thing carrying an answer; and one hue
-// meaning at a time. the first is a rule about what the code may not do, and
+// a mark means where an asset belongs or where it came from and never how it
+// is doing; a mark is never the only thing carrying an answer; and one meaning
+// at a time. the first is a rule about what the code may not do, and
 // the other two are checkable over a fixture, which is what this is.
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
-  DEFAULT_HUE_MODE,
-  HUE_MODES,
+  DEFAULT_SHADE_MODE,
+  SHADE_MODES,
   MAX_STRIPES,
   groupWords,
-  hueMode,
+  shadeMode,
   legendFor,
   originWords,
   shownAndMore,
   stripesFor,
-} from "../src/colour";
+} from "../src/shade";
 import { asset } from "./catalog.test";
 import type { AssetSummary } from "../src/types";
 
@@ -32,15 +32,15 @@ const catalog: AssetSummary[] = [
   asset("heartbeat", { provenance: [] }),
 ];
 
-const labels = (a: AssetSummary, mode: (typeof HUE_MODES)[number]) =>
+const labels = (a: AssetSummary, mode: (typeof SHADE_MODES)[number]) =>
   stripesFor(a, mode).map((s) => s.label);
 
 test("a hue means the group or the origin, one at a time, or nothing", () => {
-  assert.equal(DEFAULT_HUE_MODE, "group");
+  assert.equal(DEFAULT_SHADE_MODE, "group");
   // an unknown mode in the url is the default rather than a blank page
-  assert.equal(hueMode("sideways"), "group");
-  assert.equal(hueMode(null), "group");
-  assert.equal(hueMode("origin"), "origin");
+  assert.equal(shadeMode("sideways"), "group");
+  assert.equal(shadeMode(null), "group");
+  assert.equal(shadeMode("origin"), "origin");
 
   const margin = catalog[2];
   assert.deepEqual(labels(margin, "group"), ["finance"]);
@@ -50,17 +50,17 @@ test("a hue means the group or the origin, one at a time, or nothing", () => {
   assert.equal(labels(margin, "origin").includes("finance"), false);
 });
 
-test("colour off draws no hue at all, anywhere, and loses no words", () => {
+test("the marks off draw nothing at all, anywhere, and lose no words", () => {
   for (const a of catalog) {
     assert.deepEqual(stripesFor(a, "off"), []);
     // the words are the same three sentences in every mode, which is what
-    // makes turning colour off cost nothing
+    // makes turning the marks off cost nothing
     assert.equal(groupWords(a), groupWords(a));
     assert.deepEqual(originWords(a), originWords(a));
   }
   assert.deepEqual(legendFor(catalog, "off"), []);
   // an asset in no group has no group hue in group mode either: null is not
-  // an angle, and inventing one would colour "nothing" as a something
+  // an angle, and inventing one would mark "nothing" as a something
   assert.deepEqual(stripesFor(catalog[3], "group"), []);
 });
 
@@ -72,32 +72,32 @@ test("an empty origin is an answer in words, not a blank", () => {
 });
 
 test("every hue drawn has its own name beside it and in the legend", () => {
-  for (const mode of HUE_MODES) {
+  for (const mode of SHADE_MODES) {
     const legend = legendFor(catalog, mode).map((s) => s.label);
     for (const a of catalog) {
       const drawn = labels(a, mode);
-      // the legend turns any hue in the view back into a name
+      // the legend turns any mark in the view back into a name
       for (const label of drawn) {
-        assert.ok(legend.includes(label), `${label} is coloured and not in the ${mode} legend`);
+        assert.ok(legend.includes(label), `${label} is marked and not in the ${mode} legend`);
       }
       // and the words on the row itself already say it: the group heading the
       // row sits under, or the origin cell on the row
       const beside = mode === "group" ? [groupWords(a)] : originWords(a);
       for (const label of drawn) {
-        assert.ok(beside.includes(label), `${label} is coloured with nothing beside it`);
+        assert.ok(beside.includes(label), `${label} is marked with nothing beside it`);
       }
     }
   }
 });
 
-test("no two rows are told apart by a colour alone", () => {
-  for (const mode of HUE_MODES) {
+test("no two rows are told apart by a mark alone", () => {
+  for (const mode of SHADE_MODES) {
     for (const a of catalog) {
       for (const b of catalog) {
         if (a === b) continue;
         const differ = labels(a, mode).join("|") !== labels(b, mode).join("|");
         if (!differ) continue;
-        // a colour tells these two apart, so the words have to as well
+        // a mark tells these two apart, so the words have to as well
         const words = (x: AssetSummary) => [groupWords(x), ...originWords(x)].join("|");
         assert.notEqual(
           words(a),

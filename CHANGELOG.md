@@ -11,6 +11,12 @@
 
 See [presentation metadata](docs/presentation.md) for declarations and defaults.
 
+## Display fixes
+
+- `hestan doctor` checks collisions in the UI’s six shades.
+- Timeline group bands have a visible minimum opacity.
+- Asset views use the `shade` URL parameter and still accept existing `colour` links.
+
 ## Compatibility notes
 
 For callers updating older integrations:

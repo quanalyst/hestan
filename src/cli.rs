@@ -3118,31 +3118,35 @@ fn check_asset_groups(app: &Inspected) -> Finding {
     }
 }
 
-/// how close two hues may sit before they stop being two colours, in degrees
-/// of the 360.
+/// how many shades the web ui has to tell labels apart with.
 ///
-/// eight, and the number is a compromise said out loud. two swatches that
-/// close, at one saturation and lightness, are not reliably told apart when
-/// they are rows apart on a page rather than edge to edge. it is also where
-/// the check earns its keep: labels land on the wheel wherever their names
-/// hash to, so with n of them the pairs inside eight degrees come to roughly
-/// n squared over 45. five groups and this is almost always quiet; twenty and
-/// it almost always has something to say, which is the truth about one hue per
-/// name rather than a fault in the check.
-const HUE_APART: u16 = 8;
+/// six, and `ui/src/Swatch.tsx` is where that is decided: the ui folds an
+/// angle into `SHADES[hue % 6]` and paints the page's own ink at that
+/// fraction. the number is written here as well because the alternative is a
+/// check that reasons about the 360 degrees and so answers a question about a
+/// ui hestan does not ship; a test reads the other copy back wherever the ui
+/// sources are on disk, so the two cannot drift apart unseen.
+const UI_SHADES: u16 = 6;
 
-/// the pairs of live labels whose hues are too close to tell apart.
+/// the live labels the web ui draws on one mark.
 ///
 /// [`hue`](crate::hue) is a pure function of one name, which is what keeps a
-/// colour still when somebody adds a group, and the price is that two names
-/// can land next to each other. nothing that reads one name at a time can
+/// label's mark still when somebody adds a group, and the price is that two
+/// names can land on the same one. nothing that reads one name at a time can
 /// prevent that, so this reports it instead: a limit found with a tool rather
 /// than by squinting at a screen.
+///
+/// **what it measures is the shade drawn and not the angle underneath it.**
+/// the two are different questions: a hue spans 360 degrees and the ui spends
+/// six of them, so two labels a hundred degrees apart share a mark and two one
+/// degree apart need not. the angle is still what the http api serves, and a
+/// client that paints in colour has its own version of this question; this one
+/// is about the ui in this binary.
 fn check_colours(app: &Inspected) -> Finding {
-    // every channel at once: a group is a colour and so is an origin, and a
-    // pair that collides collides in whichever view is showing. a job's group
-    // is in here for the same reason it shares the hue with an asset's, which
-    // is that it is the same label
+    // every channel at once: a group is a label and so is an origin, and a
+    // pair that lands on one mark lands on it in whichever view is showing. a
+    // job's group is in here for the same reason it shares the mark with an
+    // asset's, which is that it is the same label
     let mut labels: BTreeSet<&str> = BTreeSet::new();
     for meta in app.registry.topo() {
         if let Some(group) = meta.group() {
@@ -3154,44 +3158,62 @@ fn check_colours(app: &Inspected) -> Finding {
     if labels.len() < 2 {
         return Finding::ok(
             "colours",
-            format!("{} label(s) to colour; nothing to confuse", labels.len()),
+            format!("{} label(s) to draw; nothing to confuse", labels.len()),
         );
     }
-    let hues: Vec<(&str, u16)> = labels
-        .iter()
-        .map(|label| (*label, app.registry.hue_of(label)))
-        .collect();
-    let mut close: Vec<String> = Vec::new();
-    for (i, (a, one)) in hues.iter().enumerate() {
-        for (b, other) in &hues[i + 1..] {
-            let round = one.abs_diff(*other);
-            let apart = round.min(360 - round);
-            if apart <= HUE_APART {
-                close.push(format!(
-                    "{a} at {one} and {b} at {other}, {apart} degrees apart"
-                ));
-            }
-        }
+    // gathered by the mark rather than by the angle, because the mark is what
+    // is on the screen. a `BTreeMap` so one deployment reports the same
+    // sentence twice running rather than whatever order a hash landed in
+    let mut marks: BTreeMap<u16, Vec<&str>> = BTreeMap::new();
+    for label in &labels {
+        marks
+            .entry(app.registry.hue_of(label) % UI_SHADES)
+            .or_default()
+            .push(label);
     }
-    let Some(first) = close.first() else {
+    let shared: Vec<String> = marks
+        .values()
+        .filter(|held| held.len() > 1)
+        .map(|held| held.join(" and "))
+        .collect();
+    let Some(first) = shared.first() else {
         return Finding::ok(
             "colours",
             format!(
-                "{} label(s), no two within {HUE_APART} degrees of each other",
-                hues.len()
+                "{} label(s) across {UI_SHADES} shades, no two on one mark",
+                labels.len()
             ),
         );
     };
+    // more labels than shades is the pigeonhole rather than a fault, and no
+    // pin answers it: past `UI_SHADES` some pair must share a mark whatever
+    // anybody does. so it is said once, as a fact about the palette, rather
+    // than raised as a note nobody can act on. the name written beside every
+    // mark is what still tells them apart, and that is the design rather than
+    // a consolation
+    if labels.len() > UI_SHADES as usize {
+        return Finding::ok(
+            "colours",
+            format!(
+                "{} label(s) share {UI_SHADES} shades, so marks repeat ({}); \
+                 the name beside each one is what tells them apart",
+                labels.len(),
+                shared.join("; ")
+            ),
+        );
+    }
     Finding::note(
         "colours",
         format!(
-            "{} pair(s) of labels are too close to tell apart: {}",
-            close.len(),
-            close.join("; ")
+            "{} set(s) of labels are drawn on one mark: {}",
+            shared.len(),
+            shared.join("; ")
         ),
         format!(
-            "{first}. the hue is a hash of the name, so the two are stuck there \
-             until one is moved: pin one with Asset::hue(n), which is what it is for"
+            "{first} share a mark. the shade is the hue mod {UI_SHADES} and the \
+             hue is a hash of the name, so the two are stuck there until one is \
+             moved: pin one with Asset::hue(n) for an n that lands elsewhere, \
+             which is what it is for"
         ),
     )
 }
@@ -4625,18 +4647,17 @@ mod tests {
         assert_eq!(check_asset_groups(&deployment).level, Level::Ok);
     }
 
-    // three answers, because "nothing upstream" and "this mode cannot see the
-    // graph" would otherwise both be a blank cell
-    // a hue is a hash of one name, so two names can land next to each other
-    // and nothing that reads one name at a time can stop them. this is the
-    // check that says so instead of leaving it to be noticed on a screen
+    // a hue is a hash of one name, so two names can land on one mark and
+    // nothing that reads one name at a time can stop them. this is the check
+    // that says so instead of leaving it to be noticed on a screen
     #[test]
-    fn doctor_names_two_labels_whose_colours_are_too_close_together() {
+    fn doctor_names_two_labels_the_ui_draws_on_one_mark() {
         let mut deployment = app(Store::open(":memory:").unwrap(), Vec::new());
         assert_eq!(check_colours(&deployment).level, Level::Ok);
 
-        // warehouse hashes to 274 and orders to 268, six degrees apart, which
-        // is the failure mode written down rather than described
+        // orders hashes to 268 and warehouse to 274, and 268 % 6 and 274 % 6
+        // are both 4, so the ui paints the two of them the same. the angles
+        // are six apart and that is not what makes this a finding: the mark is
         let orders = crate::Asset::source("orders");
         let stock = crate::Asset::source("stock").group("warehouse");
         let joined = crate::Asset::new("joined", |_| async { Ok(json!(null)) })
@@ -4647,9 +4668,11 @@ mod tests {
         );
         let found = check_colours(&deployment);
         assert_eq!(found.level, Level::Note);
-        assert!(found.says.contains("orders at 268"), "{}", found.says);
-        assert!(found.says.contains("warehouse at 274"), "{}", found.says);
-        assert!(found.says.contains("6 degrees apart"), "{}", found.says);
+        assert!(
+            found.says.contains("orders and warehouse"),
+            "{}",
+            found.says
+        );
         assert!(
             found
                 .fix
@@ -4661,7 +4684,8 @@ mod tests {
         );
 
         // pinning one of the two is the fix, and taking it makes the check
-        // quiet again
+        // quiet again. 60 % 6 is 0 where 274 % 6 is 4, which is the whole of
+        // what moving a label means here
         let orders = crate::Asset::source("orders").hue(60);
         let stock = crate::Asset::source("stock").group("warehouse");
         let joined = crate::Asset::new("joined", |_| async { Ok(json!(null)) })
@@ -4672,9 +4696,58 @@ mod tests {
         );
         let quiet = check_colours(&deployment);
         assert_eq!(quiet.level, Level::Ok);
-        assert!(quiet.says.contains("no two within 8"), "{}", quiet.says);
+        assert!(quiet.says.contains("no two on one mark"), "{}", quiet.says);
     }
 
+    // past six labels the pigeonhole decides it and no pin helps, so the check
+    // says so as a fact rather than raising a note nobody can act on. the
+    // difference matters: a note that cannot be cleared trains people to skip
+    // the whole report
+    #[test]
+    fn doctor_states_the_pigeonhole_rather_than_noting_it() {
+        let mut deployment = app(Store::open(":memory:").unwrap(), Vec::new());
+        let sources: Vec<crate::Asset> = ["a", "b", "c", "d", "e", "f", "g"]
+            .into_iter()
+            .map(crate::Asset::source)
+            .collect();
+        let mut joined = crate::Asset::new("joined", |_| async { Ok(json!(null)) });
+        for source in &sources {
+            joined = joined.from(source);
+        }
+        let mut all = sources;
+        all.push(joined);
+        deployment.registry = Arc::new(AssetRegistry::new(all, Vec::new(), Vec::new()).unwrap());
+        let found = check_colours(&deployment);
+        assert_eq!(found.level, Level::Ok, "{}", found.says);
+        assert!(found.says.contains("marks repeat"), "{}", found.says);
+        assert!(found.fix.is_none(), "{:?}", found.fix);
+    }
+
+    // the shade count lives in two languages and neither can see the other, so
+    // it is asserted here rather than trusted. `ui/src` is not in the published
+    // crate (the `include` allowlist in Cargo.toml), so a consumer running
+    // `cargo test` on the crate has no file to read and skips this
+    #[test]
+    fn the_shade_count_matches_the_ui_that_draws_them() {
+        let swatch = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("ui/src/Swatch.tsx");
+        let Ok(source) = std::fs::read_to_string(&swatch) else {
+            return;
+        };
+        let line = source
+            .lines()
+            .find(|l| l.starts_with("const SHADES = ["))
+            .expect("ui/src/Swatch.tsx declares SHADES");
+        let drawn = line.matches(',').count() + 1;
+        assert_eq!(
+            drawn,
+            UI_SHADES as usize,
+            "{} draws {drawn} shades and doctor checks {UI_SHADES}: {line}",
+            swatch.display()
+        );
+    }
+
+    // three answers, because "nothing upstream" and "this mode cannot see the
+    // graph" would otherwise both be a blank cell
     #[test]
     fn the_origin_cell_tells_no_source_apart_from_no_registry() {
         assert_eq!(

@@ -20,8 +20,8 @@ import {
   sortAssets,
 } from "./catalog";
 import type { Dir, SortKey, StateFilter } from "./catalog";
-import { HUE_MODES, hueMode, legendFor, originWords, shownAndMore, stripesFor } from "./colour";
-import type { HueMode, Stripe } from "./colour";
+import { SHADE_MODES, shadeMode, legendFor, originWords, shownAndMore, stripesFor } from "./shade";
+import type { ShadeMode, Stripe } from "./shade";
 import Swatch, { at } from "./Swatch";
 import { FOCUS_MAX, WHOLE_GRAPH_MAX, collapseHierarchy, neighbourhood } from "./dag";
 import type {
@@ -80,7 +80,7 @@ const coverTitle = (a: AssetSummary) =>
     : `${a.partitions.materialized} fresh · ${a.partitions.stale} stale · ${a.partitions.missing} never built`;
 
 // a sortable heading: clicking it sorts, clicking it again turns it around.
-// the arrow is the only thing that says which, since the ui has no colour to
+// the arrow is the only thing that says which, since the ui has no hue to
 // say it with
 function Column({
   label,
@@ -106,15 +106,15 @@ function Column({
 }
 
 // what each hue in the view stands for, in words, beside the view. without
-// this a colour is decoration, and with it somebody who cannot tell two hues
+// this a mark is decoration, and with it somebody who cannot tell two of them
 // apart still has every name on the same screen
-export function HueLegend({ stripes, says }: { stripes: Stripe[]; says: string }) {
+export function ShadeLegend({ stripes, says }: { stripes: Stripe[]; says: string }) {
   if (stripes.length === 0) return null;
   return (
-    <div className="hue-legend">
+    <div className="shade-legend">
       <span className="filter-label">{says}</span>
       {stripes.map((stripe) => (
-        <span key={stripe.label} className="hue-legend-item">
+        <span key={stripe.label} className="shade-legend-item">
           <span className="swatch" aria-hidden="true">
             <span className="swatch-stripe" style={at(stripe.hue)} />
           </span>
@@ -125,10 +125,10 @@ export function HueLegend({ stripes, says }: { stripes: Stripe[]; says: string }
   );
 }
 
-// what a row descends from, in words with the colour beside them rather than
+// what a row descends from, in words with the mark beside them rather than
 // instead of them. the names past the cap are in the legend and on the
 // asset's own page
-export function OriginCell({ asset, mode }: { asset: AssetSummary; mode: HueMode }) {
+export function OriginCell({ asset, mode }: { asset: AssetSummary; mode: ShadeMode }) {
   const words = originWords(asset);
   const { shown, more } = shownAndMore(words.map((label) => ({ label, hue: 0 })));
   return (
@@ -185,7 +185,7 @@ export default function AssetsPage() {
   const dir: Dir = params.get("dir") === "desc" ? "desc" : "asc";
   // which of the two things a hue may mean here, or neither. in the url like
   // every other view state, so a coloured view is a link
-  const colour = hueMode(params.get("colour"));
+  const shade = shadeMode(params.get("shade") ?? params.get("colour"));
   const groupFilter = params.get("group");
   // whose assets these are, and the coarser of the two filters: a group is a
   // label on this graph, a namespace is the slice of the deployment a team
@@ -319,7 +319,7 @@ export default function AssetsPage() {
   const anyOrigin = assets.some((a) => a.provenance.length > 0);
   const columns = 7 + Number(anyFreshness) + Number(anyPartitioned) + Number(anyOrigin);
   // what the colours in this view stand for, named beside them
-  const legend = legendFor(assets, colour);
+  const legend = legendFor(assets, shade);
 
   // the graph draws the whole registry rather than the filtered rows: what
   // feeds a thing does not stop mattering because it was filtered out. the
@@ -330,7 +330,7 @@ export default function AssetsPage() {
     deps: a.deps,
     note: a.kind === "source" ? "source" : undefined,
     group: a.group,
-    hues: stripesFor(a, colour),
+    hues: stripesFor(a, shade),
   }));
   const collapsed = collapseHierarchy(whole, allSections, effectiveClosed);
   const folded = collapsed.nodes.map((n) => { const group = collapsed.groups.find((g) => g.node === n.name); return group ? { ...n, note: summary(group.section.members) } : n; });
@@ -394,16 +394,16 @@ export default function AssetsPage() {
                 ))}
               </span>
             )}
-            {/* one meaning at a time: two hue meanings at once is noise, and
+            {/* one meaning at a time: two mark meanings at once is noise, and
                 off is the proof that neither is carrying anything alone */}
             <span className="log-filter">
-              {HUE_MODES.map((m) => (
+              {SHADE_MODES.map((m) => (
                 <button
                   key={m}
-                  className={colour === m ? "text-btn active" : "text-btn"}
-                  onClick={() => set({ colour: m })}
+                  className={shade === m ? "text-btn active" : "text-btn"}
+                  onClick={() => set({ shade: m, colour: null })}
                 >
-                  {m === "off" ? "no colour" : `by ${m}`}
+                  {m === "off" ? "no shade" : `by ${m}`}
                 </button>
               ))}
             </span>
@@ -422,9 +422,9 @@ export default function AssetsPage() {
               ))}
             </div>
           )}
-          <HueLegend
+          <ShadeLegend
             stripes={legend}
-            says={colour === "group" ? "group" : "descends from"}
+            says={shade === "group" ? "group" : "descends from"}
           />
           <DagView
             label="asset dependency graph"
@@ -559,7 +559,7 @@ export default function AssetsPage() {
                         <button className="text-btn" aria-expanded={!effectiveClosed.has(g.key)} onClick={() => toggleGroup(g.key)}>
                           {effectiveClosed.has(g.key) ? "▸" : "▾"} {g.name}
                         </button>
-                        <Swatch stripes={stripesFor(g.assets[0], isDefaultView(view) && colour === "group" ? "group" : "off")} />
+                        <Swatch stripes={stripesFor(g.assets[0], isDefaultView(view) && shade === "group" ? "group" : "off")} />
                         <span className="muted"> · {summary(g.assets)}</span>
                       </td>
                     </tr>
@@ -630,7 +630,7 @@ export default function AssetsPage() {
                         )}
                         {anyOrigin && (
                           <td>
-                            <OriginCell asset={a} mode={colour === "origin" ? "origin" : "off"} />
+                            <OriginCell asset={a} mode={shade === "origin" ? "origin" : "off"} />
                           </td>
                         )}
                         <td>
