@@ -63,7 +63,12 @@ The UI and `hestan --server <url>` use this same API.
 | GET | `/api/schedules/ticks` | fire history |
 | GET | `/api/schedules/upcoming` | projected future fires |
 | GET | `/api/late` | everything past its declared freshness policy |
-| GET | `/api/notifications` | the durable notification queue |
+| GET | `/api/notifications` | legacy durable callback invocations |
+| GET | `/api/notification-deliveries` | named deliveries, filtered and paginated |
+| GET | `/api/notification-deliveries/{id}` | one named delivery and its immutable event |
+| GET | `/api/notification-deliveries/{id}/attempts` | chronological send attempts |
+| POST | `/api/notification-deliveries/{id}/retry` | start a new retry cycle for a failed delivery; unscoped admin |
+| POST | `/api/notification-deliveries/{id}/dismiss` | dismiss inactive owed delivery; unscoped admin |
 | GET | `/api/whoami` | whether this deployment checks who is asking, and who you are |
 
 ## Who may call it
@@ -1383,6 +1388,17 @@ the list is empty unless a process asked for `durable_notifications()`, which
 is off by default. the runs page shows the undelivered and given-up rows,
 because an alert nobody received should be visible in the ui the alert was
 about.
+
+### Named deliveries
+
+Named delivery queries accept `run`, `job`, `destination`, `state`, `since`,
+`until`, `before` (exclusive delivery ID), and `limit` (1–500, default 50).
+Times are RFC3339; `since` is inclusive and `until` exclusive. Lists return
+`deliveries` and `next_cursor`. Detail returns `delivery`; attempt history returns
+`attempts`. Retry and dismiss accept `{"generation": <current generation>}`;
+a stale generation or incompatible state returns 409. Repeating a successful
+action with the old generation cannot reset its budget again. See
+[named notification delivery](notifications.md#named-destinations).
 
 ## Everything else
 

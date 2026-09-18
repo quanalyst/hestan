@@ -599,6 +599,9 @@ fn migrate(client: &mut Client) -> Result<(), Error> {
             if version < 24 {
                 tx.batch(MIGRATE_V24)?;
             }
+            if version < 25 {
+                tx.batch(crate::store::deliveries::SCHEMA)?;
+            }
             if version != SCHEMA_VERSION {
                 tx.execute(
                     "UPDATE schema_version SET version = ?1",
@@ -608,6 +611,7 @@ fn migrate(client: &mut Client) -> Result<(), Error> {
         }
         _ => {
             tx.batch(SCHEMA)?;
+            tx.batch(crate::store::deliveries::SCHEMA)?;
             tx.execute(
                 "INSERT INTO schema_version (version) VALUES (?1)",
                 args![i64::from(SCHEMA_VERSION)],

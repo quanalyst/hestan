@@ -66,6 +66,8 @@ wait for its schedule, which fires every ten minutes in UTC. `load` runs after
 - **History and inspection** include run timelines, logs, output metadata,
   notifications and Prometheus metrics. [Web UI](docs/web-ui.md) ·
   [Notifications](docs/notifications.md) · [Metrics](docs/metrics.md).
+  Named notification destinations provide independent durable retries for
+  webhooks, Slack, Teams Workflows, and application-provided async senders.
 - **Presentation metadata** gives jobs and assets readable display names,
   groups, optional subgroups and labels. Grouping views organize the same
   registrations without changing identity, dependencies or permissions.

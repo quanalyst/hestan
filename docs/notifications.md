@@ -1,5 +1,172 @@
 # Notifications
 
+## Named destinations
+
+Register a named destination for durable delivery that awaits the sender's
+acknowledgement. HTTP adapters require the `http` feature:
+
+```rust
+# #[cfg(feature = "http")]
+# fn example(url: String) -> Result<(), hestan::Error> {
+use hestan::{Hestan, NotificationDestination, notify};
+
+let alerts = NotificationDestination::builder("run-alerts")
+    .on_failure()
+    .sender(notify::Slack::new(url))
+    .build()?;
+
+Hestan::new().notification(alerts);
+# Ok(())
+# }
+```
+
+Use `.on_run_finished()` for success, failure, and cancellation. `.jobs(["a",
+"b"])` restricts the subscription to persistent job names; no restriction
+includes asset-build runs. Registration automatically enables durable delivery
+for that destination. It does not change ordinary callbacks or require
+`.durable_notifications()`.
+
+Destination IDs are explicit, unique within the application, and at most 256
+bytes. Missing selectors, senders, unknown selected jobs, invalid policies,
+invalid HTTP endpoints, and duplicate IDs are rejected before execution.
+Groups, labels, namespaces, and owner contact strings do not select recipients.
+
+| Sender | Submission contract |
+| --- | --- |
+| `notify::Webhook::new(url)` | JSON event envelope; 2xx acknowledges submission. `.header(name, value)` adds application-provided authentication. |
+| `notify::Slack::new(url)` | Slack incoming webhook; a successful `ok` acknowledgement is required. Default spacing is one second. |
+| `notify::TeamsWorkflow::new(url)` | Adaptive Card for a configured Teams Workflows webhook. Acceptance does not prove the workflow's later actions succeeded. |
+| Async closure or `NotificationSender` | Await the application client's submission; return success, retryable failure, or permanent failure. |
+
+Use `.public_url("https://hestan.example")` for explicit run links. Credentials
+and endpoint URLs stay in process configuration and are excluded from delivery
+history. HTTP redirects are refused. Built-in errors contain status codes and
+safe transport descriptions, not response bodies or credential-bearing URLs.
+
+A custom sender receives `NotificationDeliveryCtx`: the immutable event,
+destination, lifetime attempt number, timeout, and a cancellation signal. The
+event includes the original run outcome and readable name, persistent job/run
+IDs, and stable event and delivery IDs. Parameters and output values are not
+included. Error excerpts are bounded and marked when truncated.
+
+```rust
+use hestan::{NotificationDeliveryCtx, NotificationDeliveryError, NotificationDestination};
+
+let destination = NotificationDestination::builder("receiver")
+    .on_run_finished()
+    .sender(|ctx: NotificationDeliveryCtx| async move {
+        // Await your client's send here. Do not detach delivery work.
+        let _stable_id = &ctx.event.delivery_id;
+        Ok::<(), NotificationDeliveryError>(())
+    })
+    .build()?;
+# Ok::<(), hestan::Error>(())
+```
+
+[The local receiver example](../examples/notifications.rs) runs without an
+external service. [The email example](../examples/notification_email.rs) adapts
+an application-owned HTTP mail service, with one recipient per destination and
+a stable Message-ID. Hestan does not bundle SMTP, provision Teams workflows,
+or manage OAuth credentials. A mail server accepting a message does not prove
+inbox delivery; Message-ID alone does not guarantee deduplication.
+
+## Delivery and recovery
+
+Subscriptions, policy, and presentation context are captured when a run is
+queued. Terminal recording atomically creates one delivery per matching
+destination. This includes startup interruption, lease recovery as failure,
+resource failure, and cancellation while queued. Enabling a destination does
+not notify historical runs. A failed notification never changes run status.
+
+Each destination retries independently. Database claims prevent an expired
+worker from overwriting a recovered delivery. Attempts are bounded; a crash
+can leave an unknown outcome. Delivery is at least once, subject to the retry
+budget: the receiver can accept a request before the acknowledgement is stored.
+Use the stable delivery ID to deduplicate. Generic webhooks send it in the
+JSON envelope and `Idempotency-Key`; the changing attempt number is in
+`X-Hestan-Attempt`. Providers do not necessarily deduplicate these headers.
+
+`NotificationPolicy::default()` allows eight total attempts, ten seconds per
+attempt, and exponential full-jitter backoff from ten seconds to thirty
+minutes. `.attempts(n)`, `.timeout(duration)`, `.backoff(base, cap)`, and
+`.minimum_interval(duration)` override these values. A supplied policy replaces
+the adapter's default spacing. Four sends may be active in one process, with
+one per destination across processes. Strict event ordering is not guaranteed.
+
+Network errors, timeouts, HTTP 408/429, and 5xx responses retry. Other 4xx and
+redirect responses fail permanently. Valid `Retry-After` delays are respected;
+429 and 503-with-delay responses pause the destination, including later
+messages. Custom senders return `NotificationDeliveryError::retryable(...)`,
+`::permanent(...)`, or `.retry_after(duration)`. A sender panic counts as a
+retryable failure. Claimed attempts count even when a crash makes their
+external outcome unknown. Custom senders must be asynchronous, cancellation-safe,
+and must keep secrets out of error strings.
+
+Removing or disabling a destination leaves its deliveries blocked. Restoring
+its compatible registration resumes them. Changing policy or filters affects
+new runs only. Endpoint credentials are resolved at send time: rotating them
+works for pending deliveries, and changing an endpoint under the same ID also
+redirects pending deliveries. Use a new ID for a different logical recipient.
+A different sender protocol under the same ID does not reinterpret old events.
+
+## Inspecting and operating deliveries
+
+The Runs page links to named deliveries; each run also links to its filtered
+history. List filters are stored in the URL. Pending timestamps include any
+destination cooldown. The detail page shows each attempt
+and its outcome. The old callback panel is explicitly identified as legacy.
+
+| State | Meaning |
+| --- | --- |
+| `pending` | Waiting for an initial attempt or retry. |
+| `in_flight` | A dispatcher holds its claim. |
+| `blocked` | A compatible destination is missing, disabled, or otherwise unavailable. |
+| `delivered` | Submission acknowledged. |
+| `failed` | Permanently rejected or attempts exhausted. |
+| `dismissed` | An administrator deliberately stopped delivery. |
+
+Unscoped admins can retry a failed delivery or dismiss inactive owed work.
+Retry keeps the delivery ID and full history, starts another attempt budget,
+and respects provider cooldowns. Actions use the displayed generation; stale
+requests return 409 and cannot reset a budget repeatedly. Delivered or active
+requests cannot be resent or dismissed. Reads follow Hestan's existing Viewer
+access; namespace scopes do not provide read isolation.
+
+```sh
+hestan --server http://localhost:4000 notifications list --state failed
+hestan --server http://localhost:4000 notifications show DELIVERY_ID
+hestan --server http://localhost:4000 notifications retry DELIVERY_ID --generation 4
+hestan --server http://localhost:4000 notifications dismiss DELIVERY_ID --generation 7
+```
+
+Direct database CLI mode can inspect; mutations need the application registry
+or an authenticated server. See the [HTTP API](http-api.md) for list filters
+and action payloads. Health, doctor, and metrics report backlog and expired
+claims independently of execution health.
+
+Pending, blocked, active, and failed deliveries survive retention and run
+history pruning. Delivered and dismissed records and their attempts follow the
+configured retention cutoff. Delivery history can remain after its run page
+has been pruned.
+
+Server and scheduler roles dispatch; worker-only processes record owed work.
+Headless `run_once` and `build_asset` attempt their own notifications within a
+ten-second budget, configurable with `.notification_flush_within(duration)`.
+Unfinished sends remain recoverable after claim expiry. With `Runner`, call
+`flush_notifications(budget)` explicitly; it reports attempts started and
+remaining owed work. A later process must run to retry persisted work after
+all current processes exit. Shutdown stops new claims and gives active sends
+the existing shutdown grace period.
+
+Upgrades add storage tables on both backends. Stop old binaries before the
+schema upgrade; rolling execution across incompatible schema releases is not
+supported. Existing callbacks, legacy notification rows, and their API remain
+unchanged. Registering the same recipient through both APIs creates two
+independent subscriptions. Named delivery covers terminal runs; op-attempt and lateness hooks
+remain best-effort.
+
+## Ordinary callbacks
+
 `on_run_finished` registers a hook that runs whenever a run reaches a terminal
 status (succeeded, failed or canceled alike):
 
@@ -187,8 +354,8 @@ has the rest.
 
 ## Http helpers
 
-with the `http` feature, `hestan::notify` ships two ready-made hooks, and both
-serve every kind of event:
+With the `http` feature, `hestan::notify` retains two legacy best-effort hooks.
+Both serve every kind of event; use the named adapters above for awaited delivery:
 
 ```rust
 Hestan::new()
@@ -229,8 +396,8 @@ is the next section.
 
 ## Durable delivery
 
-Ordinary hooks are best-effort callbacks. Enable durable run notifications to
-persist delivery work:
+This section describes legacy callback durability. Named destinations above
+already enable their own durable delivery. To persist ordinary callback invocations:
 
 ```rust
 Hestan::new()

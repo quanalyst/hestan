@@ -1,3 +1,4 @@
+import NotificationsPage, { NotificationPage, NotificationControlsContext } from "./NotificationsPage";
 import RegistryNames from "./RegistryNames";
 import { useCallback, useEffect, useState } from "react";
 import { Link, NavLink, Route, Routes } from "react-router-dom";
@@ -53,7 +54,7 @@ export default function App() {
 
   const identity = who.identity;
   return (
-    <RoleContext.Provider value={identity?.role ?? OPEN}><RegistryNames>
+    <RoleContext.Provider value={identity?.role ?? OPEN}><NotificationControlsContext.Provider value={!who.auth || (identity?.role === "admin" && identity.scope.everything)}><RegistryNames>
       <header>
         <div className="header-inner">
           <Link to="/" className="wordmark">
@@ -101,10 +102,12 @@ export default function App() {
           <Route path="/backfills/:id" element={<BackfillPage />} />
           <Route path="/runs" element={<RunsPage />} />
           <Route path="/runs/:id" element={<RunPage />} />
+          <Route path="/notifications" element={<NotificationsPage />} />
+          <Route path="/notifications/:id" element={<NotificationPage />} />
           <Route path="/activity" element={<ActivityPage />} />
         </Routes>
       </main>
       <CommandPalette />
-    </RegistryNames></RoleContext.Provider>
+    </RegistryNames></NotificationControlsContext.Provider></RoleContext.Provider>
   );
 }

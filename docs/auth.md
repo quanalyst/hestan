@@ -485,3 +485,7 @@ that controls them.
 Authentication types are in `src/auth.rs`; HTTP enforcement is in
 `src/server.rs`. `tests/auth.rs` checks credential handling through a running
 server. See [development](development.md) for the test workflow.
+
+Named notification delivery inspection uses Viewer access. Retry and dismissal
+require an unscoped Admin; destination names and grouping metadata grant no
+permissions. See [notifications](notifications.md#inspecting-and-operating-deliveries).

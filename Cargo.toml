@@ -219,3 +219,7 @@ harness = false
 [[test]]
 name = "stopping"
 harness = false
+
+[[example]]
+name = "notification_email"
+required-features = ["http"]

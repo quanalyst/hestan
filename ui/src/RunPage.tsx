@@ -1,3 +1,4 @@
+import { DeliveryProblems } from "./NotificationsPage";
 import { displayName } from "./presentation";
 import { useEffect, useRef, useState } from "react";
 import { Link, useNavigate, useParams } from "react-router-dom";
@@ -373,6 +374,7 @@ function RunView({ id }: { id: string }) {
 
   return (
     <>
+      <DeliveryProblems run={id} />
       <div className="page-head">
         <div>
           <h1>

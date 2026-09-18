@@ -96,6 +96,8 @@ pub struct Hestan {
     retention: Retention,
     retention_every: Duration,
     durable: bool,
+    notification_flush: Duration,
+    notifications: Vec<crate::NotificationDestination>,
     asset_history: usize,
     log_bytes: u64,
     log_line_cap: u64,
@@ -141,6 +143,8 @@ impl Default for Hestan {
             retention: Retention::default(),
             retention_every: retention::DEFAULT_INTERVAL,
             durable: false,
+            notification_flush: Duration::from_secs(10),
+            notifications: Vec::new(),
             asset_history: DEFAULT_ASSET_HISTORY,
             log_bytes: logs::DEFAULT_BYTES,
             log_line_cap: logs::DEFAULT_LINES,
@@ -856,6 +860,18 @@ impl Hestan {
         self.retention(Retention::days(days))
     }
 
+    /// Overall headless delivery budget. Remaining work stays persisted.
+    pub fn notification_flush_within(mut self, budget: Duration) -> Self {
+        self.notification_flush = budget;
+        self
+    }
+
+    /// Register a named, durable destination for terminal run events.
+    pub fn notification(mut self, destination: crate::NotificationDestination) -> Self {
+        self.notifications.push(destination);
+        self
+    }
+
     /// write every run's terminal event to the database inside the same
     /// transaction as the run's terminal row, and deliver it from a loop that
     /// retries and gives up loudly.
@@ -883,6 +899,7 @@ impl Hestan {
     /// covers run events. op hooks and [`on_late`](Self::on_late) stay
     /// in-process: they fire per attempt and per poll, and a table of them is
     /// a different bargain than the one this makes.
+    /// Persist legacy callback invocations. Named destinations enable their own durability.
     pub fn durable_notifications(mut self) -> Self {
         self.durable = true;
         self
@@ -1023,9 +1040,15 @@ impl Hestan {
         if let Some(req) = crate::isolate::requested() {
             self.run_op_subprocess(req).await
         }
+        let notification_budget = self.notification_flush;
         let built = self.role(Role::All).build().await?;
         let run = built.runner.run(job, params, Trigger::Manual).await;
-        delivered(&built.runner).await;
+        delivered(
+            &built.runner,
+            run.as_ref().ok().map(|r| r.id.as_str()),
+            notification_budget,
+        )
+        .await;
         run
     }
 
@@ -1038,6 +1061,7 @@ impl Hestan {
         if let Some(req) = crate::isolate::requested() {
             self.run_op_subprocess(req).await
         }
+        let notification_budget = self.notification_flush;
         let built = self.role(Role::All).build().await?;
         let mats = mats_map(built.runner.store())?;
         let plan = plan_target(&built.registry, &mats, name)?;
@@ -1052,7 +1076,12 @@ impl Hestan {
                 asset_tag(name),
             )
             .await;
-        delivered(&built.runner).await;
+        delivered(
+            &built.runner,
+            run.as_ref().ok().map(|r| r.id.as_str()),
+            notification_budget,
+        )
+        .await;
         run
     }
 
@@ -1137,6 +1166,7 @@ impl Hestan {
             })
             .collect();
         let mut loops = Vec::new();
+        let mut notification_task = None;
         if role.decides() {
             // every loop below launches through this handle, and every run it
             // launches carries the term this process is deciding under: a
@@ -1184,6 +1214,9 @@ impl Hestan {
             // and the deliverer, if anything is writing rows for it. one
             // process delivers, for the same reason one process decides: two
             // of them would send every alert twice
+            notification_task = Some(tokio::spawn(crate::notification::run_delivery(
+                decides.clone(),
+            )));
             if built.runner.durable() {
                 loops.push(tokio::spawn(hooks::run_delivery(decides.clone())));
             }
@@ -1287,6 +1320,9 @@ impl Hestan {
                     served = (&mut serve).await;
                 }
                 stop::settled(&state_runner).await;
+                if let Some(task) = notification_task.as_mut() {
+                    let _ = task.await;
+                }
             };
             tokio::pin!(finishing);
             tokio::select! {
@@ -1300,6 +1336,9 @@ impl Hestan {
                      rather than finishing what it was doing"
                 ),
             }
+        }
+        if let Some(task) = notification_task {
+            task.abort();
         }
         leases.abort();
         // and what this process claimed and did not finish goes back on the
@@ -1567,12 +1606,20 @@ impl Hestan {
             }
         }
 
+        let notification_registry = crate::notification::Registry::new(
+            self.notifications.clone(),
+            &jobs
+                .iter()
+                .map(|j| (j.name().to_string(), j.clone()))
+                .collect(),
+        )?;
         // before the store opens: a process whose api client could not be
         // built has nothing useful to serve, and should not leave a database
         // behind saying otherwise
         let resources = resource::build(self.resources).await?;
 
         let store = Store::at(&self.db_path)?;
+        store.set_notification_registry(notification_registry);
         logs::set_caps(Some(self.log_bytes), Some(self.log_line_cap));
         // before boot recovery, and that order is the whole of it. a restored
         // store's claims and leases describe another machine, and
@@ -1613,6 +1660,7 @@ impl Hestan {
             self.run_resources,
             io,
         )?
+        .with_notifications(self.notifications)?
         .with_rates(self.rates)?
         .with_hooks(self.run_hooks, self.op_hooks)
         .with_run_tags(self.run_tags)
@@ -1653,9 +1701,14 @@ impl Hestan {
 }
 
 /// deliver what a headless one-shot just wrote down, since nothing else will:
-/// there is no loop in this process and it is about to exit. a no-op unless
-/// [`durable_notifications`](Hestan::durable_notifications) is on.
-async fn delivered(runner: &Runner) {
+/// there is no loop in this process and it is about to exit. Named deliveries
+/// have a bounded flush; legacy callback delivery keeps its existing behavior.
+async fn delivered(runner: &Runner, run: Option<&str>, budget: Duration) {
+    if run.is_some()
+        && let Err(e) = runner.flush_run_notifications(budget, run).await
+    {
+        tracing::warn!("notification flush failed: {e}");
+    }
     if runner.durable() {
         hooks::deliver_once(runner, chrono::Utc::now()).await;
     }

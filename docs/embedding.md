@@ -106,3 +106,8 @@ startup recovery preserves live claims.
 [Isolated-operation subprocesses](isolation.md) execute one operation and do
 not run scheduler or worker loops. Schedule overlap policies govern scheduled
 launches; manual launches remain subject to concurrency limits.
+
+Named notifications are recorded with terminal runs. Headless helpers allow a
+bounded delivery interval; `.notification_flush_within(duration)` configures it.
+Direct `Runner` users call `flush_notifications(budget)`. Remaining work is
+persisted and needs a later dispatcher; see [notifications](notifications.md).

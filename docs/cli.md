@@ -551,3 +551,12 @@ launching a second one, and exits with what it did.
 - `runs` has no status filter. Filter JSON output externally when needed.
 - Backup supports SQLite only. Backup and resettle require direct database
   access and are unavailable through `--server` (exit 6).
+
+## Notification deliveries
+
+`notifications list` accepts `--state`, `--destination`, `--run`, `--before`, and
+`--limit`. `notifications show ID` includes attempts. `notifications retry ID
+--generation N` and `notifications dismiss ID --generation N` guard against
+stale actions. Database-only mode is read-only for these commands; use the
+application binary or `--server` for mutations. Server mutations require an
+unscoped Admin. See [delivery semantics](notifications.md#delivery-and-recovery).

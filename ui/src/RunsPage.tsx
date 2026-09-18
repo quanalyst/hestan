@@ -1,3 +1,4 @@
+import { DeliveryProblems } from "./NotificationsPage";
 import { RegisteredName, useRegistryName } from "./RegistryNames";
 import { useEffect, useRef, useState } from "react";
 import type { MouseEvent as ReactMouseEvent } from "react";
@@ -76,7 +77,7 @@ function Undelivered({ rows }: { rows: Notification[] }) {
   return (
     <>
       <h2>
-        undelivered notifications
+        legacy callback notifications
         <span className="secondary"> · {rows.length}</span>
       </h2>
       <table>
@@ -322,6 +323,7 @@ export default function RunsPage() {
       {tagErr && <p className="muted">{tagErr}</p>}
       {/* above the runs, and outside the filters: an alert that never arrived
           is not something to go looking for */}
+      <DeliveryProblems />
       <Undelivered rows={undelivered} />
       {runs.length === 0 ? (
         <p className="muted">

@@ -134,6 +134,20 @@ pub(crate) fn router(state: AppState) -> Router {
         .route("/api/schedules/upcoming", get(upcoming_schedules))
         .route("/api/late", get(list_late))
         .route("/api/notifications", get(list_notifications))
+        .route("/api/notification-deliveries", get(list_deliveries))
+        .route("/api/notification-deliveries/{id}", get(get_delivery))
+        .route(
+            "/api/notification-deliveries/{id}/attempts",
+            get(delivery_attempts),
+        )
+        .route(
+            "/api/notification-deliveries/{id}/retry",
+            post(retry_delivery),
+        )
+        .route(
+            "/api/notification-deliveries/{id}/dismiss",
+            post(dismiss_delivery),
+        )
         .route("/api/events", get(list_events))
         .route("/api/events/stream", get(stream_events))
         // every route above and nothing below it: the ui's own files are
@@ -169,7 +183,9 @@ fn actor(who: &Who) -> Option<&str> {
 /// these are the ones that change how the deployment *behaves* rather than
 /// what it is doing now: a paused schedule stays paused, a preset is what the
 /// next launch will use, a priority reorders work nobody asked about.
-const ADMIN_ONLY: [&str; 4] = [
+const ADMIN_ONLY: [&str; 6] = [
+    "/api/notification-deliveries/{id}/retry",
+    "/api/notification-deliveries/{id}/dismiss",
     "/api/schedules/state",
     "/api/sensors/state",
     "/api/runs/{id}/priority",
@@ -644,6 +660,7 @@ async fn health(State(st): State<AppState>) -> Json<Value> {
         "ok": !store.failing(),
         "instance": st.runner.instance(),
         "holding": holding,
+        "notification_deliveries": st.runner.store().notification_health().ok(),
         "deciding": deciding(&st.runner),
         "deployment": st.runner.deployment().describe(),
         "store": {
@@ -2124,6 +2141,112 @@ struct NotificationsQuery {
 
 // an alert nobody received should be visible in the ui the alert was about,
 // which is the whole reason this is an endpoint and not a log line
+async fn list_deliveries(
+    State(st): State<AppState>,
+    q: Result<Query<crate::NotificationQuery>, QueryRejection>,
+) -> Result<Json<Value>, ApiError> {
+    let Query(q) = q.map_err(bad_query)?;
+    let deliveries = st
+        .runner
+        .store()
+        .notification_deliveries(&q)
+        .map_err(|e| match e {
+            Error::Graph(_) => err(StatusCode::BAD_REQUEST, e.to_string()),
+            other => internal(other),
+        })?;
+    let next = deliveries.last().map(|r| r.id.clone());
+    Ok(Json(json!({"deliveries":deliveries,"next_cursor":next})))
+}
+async fn get_delivery(
+    State(st): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    let row = st
+        .runner
+        .store()
+        .notification_delivery(&id)
+        .map_err(internal)?
+        .ok_or_else(|| err(StatusCode::NOT_FOUND, "unknown notification delivery"))?;
+    Ok(Json(json!({"delivery":row})))
+}
+async fn delivery_attempts(
+    State(st): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    if st
+        .runner
+        .store()
+        .notification_delivery(&id)
+        .map_err(internal)?
+        .is_none()
+    {
+        return Err(err(StatusCode::NOT_FOUND, "unknown notification delivery"));
+    }
+    Ok(Json(
+        json!({"attempts":st.runner.store().notification_attempts(&id).map_err(internal)?}),
+    ))
+}
+#[derive(Deserialize)]
+struct DeliveryAction {
+    generation: i64,
+}
+fn control_delivery(
+    st: &AppState,
+    id: &str,
+    action: DeliveryAction,
+    retry: bool,
+    who: &Who,
+) -> Result<Json<Value>, ApiError> {
+    if st
+        .runner
+        .store()
+        .notification_delivery(id)
+        .map_err(internal)?
+        .is_none()
+    {
+        return Err(err(StatusCode::NOT_FOUND, "unknown notification delivery"));
+    }
+    let row = st
+        .runner
+        .store()
+        .control_notification(id, action.generation, retry, actor(who))
+        .map_err(|e| match e {
+            Error::Conflict(_) => err(StatusCode::CONFLICT, e.to_string()),
+            other => internal(other),
+        })?;
+    Ok(Json(json!({"delivery":row})))
+}
+async fn retry_delivery(
+    State(st): State<AppState>,
+    Path(id): Path<String>,
+    who: Who,
+    body: Result<Json<DeliveryAction>, axum::extract::rejection::JsonRejection>,
+) -> Result<Json<Value>, ApiError> {
+    control_delivery(
+        &st,
+        &id,
+        body.map_err(|e| err(StatusCode::BAD_REQUEST, e.body_text()))?
+            .0,
+        true,
+        &who,
+    )
+}
+async fn dismiss_delivery(
+    State(st): State<AppState>,
+    Path(id): Path<String>,
+    who: Who,
+    body: Result<Json<DeliveryAction>, axum::extract::rejection::JsonRejection>,
+) -> Result<Json<Value>, ApiError> {
+    control_delivery(
+        &st,
+        &id,
+        body.map_err(|e| err(StatusCode::BAD_REQUEST, e.body_text()))?
+            .0,
+        false,
+        &who,
+    )
+}
+
 async fn list_notifications(
     State(st): State<AppState>,
     q: Result<Query<NotificationsQuery>, QueryRejection>,
@@ -7334,7 +7457,7 @@ mod tests {
     /// a route nobody asserted the access of, so the two lists below are
     /// checked against the router itself in
     /// [`the_table_covers_every_endpoint_the_router_serves`].
-    const READS: [&str; 35] = [
+    const READS: [&str; 38] = [
         "/api/health",
         "/metrics",
         "/api/rates",
@@ -7368,13 +7491,26 @@ mod tests {
         "/api/schedules/upcoming",
         "/api/late",
         "/api/notifications",
+        "/api/notification-deliveries",
+        "/api/notification-deliveries/n1",
+        "/api/notification-deliveries/n1/attempts",
         "/api/events",
         "/api/events/stream",
     ];
 
     /// what each mutation needs of whoever asks for it. an operator drives what
     /// is happening now; an admin changes what the deployment will do next.
-    const MUTATIONS: [(&str, &str, Access); 15] = [
+    const MUTATIONS: [(&str, &str, Access); 17] = [
+        (
+            "POST",
+            "/api/notification-deliveries/n1/retry",
+            Access::Admin,
+        ),
+        (
+            "POST",
+            "/api/notification-deliveries/n1/dismiss",
+            Access::Admin,
+        ),
         ("POST", "/api/jobs/etl/runs", Access::Operator),
         ("POST", "/api/jobs/etl/validate_params", Access::Operator),
         ("POST", "/api/runs/r1/retry", Access::Operator),
@@ -7563,7 +7699,7 @@ mod tests {
         );
         // and the count, so that a scraper that quietly stopped finding
         // anything cannot pass this by covering nothing
-        assert_eq!(declared_routes().len(), 50);
+        assert_eq!(declared_routes().len(), 55);
     }
 
     /// the same three people, plus two scoped tokens: one that owns the
@@ -7611,6 +7747,16 @@ mod tests {
             ("POST", "/api/schedules/state", "the deployment"),
             ("POST", "/api/sensors/state", "the deployment"),
             ("POST", "/api/assets/build", "the deployment"),
+            (
+                "POST",
+                "/api/notification-deliveries/n1/retry",
+                "the deployment",
+            ),
+            (
+                "POST",
+                "/api/notification-deliveries/n1/dismiss",
+                "the deployment",
+            ),
         ] {
             let (status, body) = asked(&st, method, path, Some(("x-user", "ci"))).await;
             assert_eq!(status, StatusCode::FORBIDDEN, "{method} {path}");
@@ -8437,8 +8583,8 @@ mod tests {
         assert!(stale.is_empty(), "documented but not served: {stale:?}");
         // and neither list is empty, so a scraper that stopped finding
         // anything cannot pass by comparing nothing with nothing
-        assert_eq!(declared.len(), 51);
-        assert_eq!(documented.len(), 51);
+        assert_eq!(declared.len(), 56);
+        assert_eq!(documented.len(), 56);
     }
 
     // a role that may not is 403 and says what it would take; nobody at all is
@@ -8910,6 +9056,104 @@ mod tests {
         assert!(
             body["error"].as_str().unwrap().contains("alternatives"),
             "{body}"
+        );
+    }
+    #[tokio::test]
+    async fn named_notification_api_inspects_history_and_guards_operator_actions() {
+        use tower::util::ServiceExt;
+        let mut st = state(vec![echo_job("etl")]);
+        let d = crate::NotificationDestination::builder("receiver")
+            .on_run_finished()
+            .sender(|_: crate::NotificationDeliveryCtx| async {
+                Err(crate::NotificationDeliveryError::permanent(
+                    "receiver rejected",
+                ))
+            })
+            .build()
+            .unwrap();
+        st.runner = st.runner.with_notifications([d]).unwrap();
+        st.runner
+            .run("etl", json!({}), Trigger::Manual)
+            .await
+            .unwrap();
+        st.runner
+            .flush_notifications(std::time::Duration::from_secs(1))
+            .await
+            .unwrap();
+        let row = st
+            .runner
+            .store()
+            .notification_deliveries(&Default::default())
+            .unwrap()
+            .remove(0);
+        st.auth = Some(people());
+        for (who, generation, expected) in [
+            ("vic", row.generation, StatusCode::FORBIDDEN),
+            ("ola", row.generation, StatusCode::FORBIDDEN),
+            ("ada", -1, StatusCode::CONFLICT),
+            ("ada", row.generation, StatusCode::OK),
+            ("ada", row.generation, StatusCode::CONFLICT),
+        ] {
+            let req = axum::http::Request::builder()
+                .method("POST")
+                .uri(format!("/api/notification-deliveries/{}/retry", row.id))
+                .header("x-user", who)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(axum::body::Body::from(
+                    json!({"generation":generation}).to_string(),
+                ))
+                .unwrap();
+            let response = router(st.clone()).oneshot(req).await.unwrap();
+            assert_eq!(response.status(), expected);
+        }
+        let current = st
+            .runner
+            .store()
+            .notification_delivery(&row.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(current.cycle, 2);
+        assert_eq!(current.attempts, 1);
+        st.auth = Some(scoped_people());
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri(format!("/api/notification-deliveries/{}/dismiss", row.id))
+            .header("x-user", "ci")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(axum::body::Body::from(
+                json!({"generation":current.generation}).to_string(),
+            ))
+            .unwrap();
+        assert_eq!(
+            router(st.clone()).oneshot(req).await.unwrap().status(),
+            StatusCode::FORBIDDEN
+        );
+        st.auth = None;
+        let (status, body, _) = request(
+            router(st.clone()),
+            Method::GET,
+            "/api/notification-deliveries?destination=receiver&state=pending&limit=1",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body.unwrap()["deliveries"][0]["id"], row.id);
+        let (status, body, _) = request(
+            router(st.clone()),
+            Method::GET,
+            &format!("/api/notification-deliveries/{}/attempts", row.id),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body.unwrap()["attempts"][0]["outcome"], "permanent_failure");
+        assert_eq!(
+            request(
+                router(st),
+                Method::GET,
+                "/api/notification-deliveries?state=invalid"
+            )
+            .await
+            .0,
+            StatusCode::BAD_REQUEST
         );
     }
 }

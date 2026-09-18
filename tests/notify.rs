@@ -282,7 +282,7 @@ async fn webhook_does_not_follow_redirects() {
         .unwrap();
     assert_eq!(run.status, RunStatus::Failed);
 
-    let expected = format!("failure notification to {base}/hook: 302");
+    let expected = "failure notification: HTTP 302".to_string();
     for _ in 0..300 {
         if String::from_utf8_lossy(&logs.lock().unwrap()).contains(&expected) {
             break;

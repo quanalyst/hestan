@@ -1,3 +1,5 @@
+#[path = "delivery_store.rs"]
+pub(crate) mod deliveries;
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
@@ -610,7 +612,7 @@ const SCHEMA_V24: &str = r#"
 ALTER TABLE runs ADD COLUMN build TEXT;
 "#;
 
-pub(crate) const SCHEMA_VERSION: u32 = 24;
+pub(crate) const SCHEMA_VERSION: u32 = 25;
 
 // one transaction around every pending step and the version stamp (sqlite DDL
 // is transactional), so a crash mid-migration leaves the db exactly as found
@@ -700,6 +702,9 @@ fn migrate(conn: &mut Connection) -> Result<(), Error> {
     }
     if version < 24 {
         tx.execute_batch(SCHEMA_V24)?;
+    }
+    if version < 25 {
+        tx.execute_batch(deliveries::SCHEMA)?;
     }
     if version != SCHEMA_VERSION {
         tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
@@ -1022,9 +1027,7 @@ macro_rules! args {
     ($($v:expr),+ $(,)?) => { &[$(Val::from($v)),+] as &[Val<'_>] };
 }
 
-// the postgres backend binds the same lists; without that feature the macro is
-// only ever used in this file
-#[cfg(feature = "postgres")]
+// Both the delivery store and the optional PostgreSQL backend bind these lists.
 pub(crate) use args;
 
 /// `?1, ?2, ..` for `n` values, which is how a list of ids goes into an `IN`.
@@ -1755,6 +1758,7 @@ impl ExecutionClaim {
 pub struct Store {
     db: Arc<Db>,
     claim: Option<ExecutionClaim>,
+    notifications: Arc<Mutex<crate::notification::Registry>>,
     /// the target it was opened at (a path or a url) kept so a runner can
     /// tell whether a child process could reach the same database.
     target: Arc<str>,
@@ -1785,6 +1789,7 @@ impl Store {
         Store {
             db: Arc::new(db),
             claim: None,
+            notifications: Arc::new(Mutex::new(crate::notification::Registry::default())),
             target: target.into(),
             health: Arc::new(Health::default()),
             meters: Arc::new(Meters::default()),
@@ -2271,6 +2276,7 @@ impl Store {
                 run.build.as_deref(),
             ],
         )?;
+        deliveries::snapshot(&mut tx, run, &self.notification_registry())?;
         for op in ops {
             tx.execute(
                 "INSERT INTO op_runs (run_id, op, status) VALUES (?1, ?2, ?3)",
@@ -2521,6 +2527,7 @@ impl Store {
             ),
             args![&now],
         )?;
+        deliveries::finish_terminal(&mut tx)?;
         tx.commit()?;
         // a sweep at startup, so this lands on a counter that has just been
         // reset: whatever the process that died had counted died with it
@@ -2708,6 +2715,7 @@ impl Store {
             taken_from.as_deref(),
             Some(&now),
         )?;
+        deliveries::finish_terminal(&mut tx)?;
         tx.commit()?;
         // said here rather than as an event of its own: the runs above each
         // carry the reason in the log already, and a summary line is for the
@@ -3477,6 +3485,7 @@ impl Store {
                 }
             }
         }
+        deliveries::finish_terminal(&mut tx)?;
         tx.commit()?;
         let taken = expired.len() as u64;
         self.meters.reclaimed(policy, taken);
@@ -3541,6 +3550,7 @@ impl Store {
                 .actor(actor),
             at,
         )?;
+        deliveries::finish(&mut tx, id)?;
         tx.commit()?;
         // a run taken off the queue never reaches `run_finished`, and it is
         // still a run that ended: counted here or it is counted nowhere
@@ -3622,6 +3632,7 @@ impl Store {
         if let Some(note) = note {
             queue_note(&mut tx, note, at)?;
         }
+        deliveries::finish(&mut tx, id)?;
         tx.commit()?;
         self.meters.run_finished(status, 1);
         Ok(())
@@ -3771,10 +3782,13 @@ impl Store {
     /// something outstanding, and a sweep that quietly cleared it would be the
     /// same loss this table exists to prevent.
     pub(crate) fn prune_notifications(&self, older_than: DateTime<Utc>) -> Result<usize, Error> {
-        self.conn().execute(
-            "DELETE FROM notifications WHERE delivered_at IS NOT NULL AND delivered_at < ?1",
-            args![older_than.to_rfc3339()],
-        )
+        let named = self.prune_named_notifications(older_than)?;
+        self.conn()
+            .execute(
+                "DELETE FROM notifications WHERE delivered_at IS NOT NULL AND delivered_at < ?1",
+                args![older_than.to_rfc3339()],
+            )
+            .map(|legacy| legacy + named)
     }
 
     pub(crate) fn op_started(&self, run_id: &str, op: &str, attempts: u32) -> Result<(), Error> {
@@ -8857,6 +8871,10 @@ mod tests {
                          DROP TABLE decider;
                          DROP TABLE store_copy;
                          DROP TABLE launch_keys;
+                         DROP TABLE run_notification_routes;
+                         DROP TABLE notification_attempts;
+                         DROP TABLE notification_deliveries;
+                         DROP TABLE notification_destination_state;
                          ALTER TABLE runs DROP COLUMN build;
                          UPDATE schema_version SET version = 16;"
                     ))
@@ -8959,6 +8977,10 @@ mod tests {
                          DROP TABLE decider;
                          DROP TABLE store_copy;
                          DROP TABLE launch_keys;
+                         DROP TABLE run_notification_routes;
+                         DROP TABLE notification_attempts;
+                         DROP TABLE notification_deliveries;
+                         DROP TABLE notification_destination_state;
                          ALTER TABLE runs DROP COLUMN build;
                          UPDATE schema_version SET version = 17;",
                     )
@@ -9057,6 +9079,10 @@ mod tests {
                          DROP TABLE decider;
                          DROP TABLE store_copy;
                          DROP TABLE launch_keys;
+                         DROP TABLE run_notification_routes;
+                         DROP TABLE notification_attempts;
+                         DROP TABLE notification_deliveries;
+                         DROP TABLE notification_destination_state;
                          ALTER TABLE runs DROP COLUMN build;
                          UPDATE schema_version SET version = 18;",
                     )
@@ -9175,6 +9201,10 @@ mod tests {
                          DROP TABLE decider;
                          DROP TABLE store_copy;
                          DROP TABLE launch_keys;
+                         DROP TABLE run_notification_routes;
+                         DROP TABLE notification_attempts;
+                         DROP TABLE notification_deliveries;
+                         DROP TABLE notification_destination_state;
                          ALTER TABLE runs DROP COLUMN build;
                          {ticks}
                          UPDATE schema_version SET version = 19;"
@@ -12478,7 +12508,7 @@ mod tests {
     /// every table the sqlite chain arrives at. a fresh postgres database has
     /// all of them from its first statement.
     #[cfg(feature = "postgres")]
-    const TABLES: [&str; 20] = [
+    const TABLES: [&str; 24] = [
         "asset_checks",
         "asset_materializations",
         "backfills",
@@ -12486,11 +12516,15 @@ mod tests {
         "events",
         "freshness_state",
         "launch_keys",
+        "notification_attempts",
+        "notification_deliveries",
+        "notification_destination_state",
         "notifications",
         "op_logs",
         "op_runs",
         "op_state",
         "presets",
+        "run_notification_routes",
         "runs",
         "schedule_ticks",
         "schedules",
@@ -13377,6 +13411,10 @@ mod tests {
                     .batch(
                         "DROP TABLE store_copy;
                          DROP TABLE launch_keys;
+                         DROP TABLE run_notification_routes;
+                         DROP TABLE notification_attempts;
+                         DROP TABLE notification_deliveries;
+                         DROP TABLE notification_destination_state;
                          ALTER TABLE runs DROP COLUMN build;
                          UPDATE schema_version SET version = 21;",
                     )
@@ -13761,6 +13799,10 @@ mod tests {
                     .conn()
                     .batch(
                         "DROP TABLE launch_keys;
+                         DROP TABLE run_notification_routes;
+                         DROP TABLE notification_attempts;
+                         DROP TABLE notification_deliveries;
+                         DROP TABLE notification_destination_state;
                          ALTER TABLE runs DROP COLUMN build;
                          UPDATE schema_version SET version = 22;",
                     )
@@ -13806,8 +13848,14 @@ mod tests {
                 // sqlite grew `DROP COLUMN` in 3.35, and the bundled build is
                 // well past it. the column is the whole of v24, so removing it
                 // is the whole of the reversal
-                conn.execute_batch("ALTER TABLE runs DROP COLUMN build;")
-                    .unwrap();
+                conn.execute_batch(
+                    "DROP TABLE run_notification_routes;
+                         DROP TABLE notification_attempts;
+                         DROP TABLE notification_deliveries;
+                         DROP TABLE notification_destination_state;
+                         ALTER TABLE runs DROP COLUMN build;",
+                )
+                .unwrap();
                 conn.pragma_update(None, "user_version", 23).unwrap();
             }
             #[cfg(feature = "postgres")]
@@ -13815,7 +13863,11 @@ mod tests {
                 pg.store()
                     .conn()
                     .batch(
-                        "ALTER TABLE runs DROP COLUMN build;
+                        "DROP TABLE run_notification_routes;
+                         DROP TABLE notification_attempts;
+                         DROP TABLE notification_deliveries;
+                         DROP TABLE notification_destination_state;
+                         ALTER TABLE runs DROP COLUMN build;
                          UPDATE schema_version SET version = 23;",
                     )
                     .unwrap();
@@ -14066,6 +14118,289 @@ mod tests {
                 .unwrap()
                 .expect("eligible work beyond the first page");
             assert_eq!(run.id, "ready");
+        });
+    }
+    #[test]
+    fn named_deliveries_are_atomic_and_survive_removed_registrations() {
+        both(|db| {
+            let store = db.store();
+            let d = crate::NotificationDestination::builder("sink")
+                .on_run_finished()
+                .sender(|_: crate::NotificationDeliveryCtx| async { Ok(()) })
+                .build()
+                .unwrap();
+            let job = crate::Job::builder("etl")
+                .op(crate::Op::new("a", |_| async { Ok(json!(1)) }))
+                .build()
+                .unwrap();
+            let registry =
+                crate::notification::Registry::new(vec![d], &HashMap::from([("etl".into(), job)]))
+                    .unwrap();
+            store.set_notification_registry(registry);
+            store
+                .create_run(&mk_run("named", "etl", Utc::now()), &["a".into()])
+                .unwrap();
+            store.set_notification_registry(Default::default());
+            store
+                .conn()
+                .execute(
+                    "ALTER TABLE notification_deliveries RENAME TO unavailable",
+                    args![],
+                )
+                .unwrap();
+            assert!(
+                store
+                    .run_finished("named", RunStatus::Failed, Some("failed"), Utc::now(), None)
+                    .is_err()
+            );
+            assert_eq!(
+                store.run("named").unwrap().unwrap().status,
+                RunStatus::Queued
+            );
+            store
+                .conn()
+                .execute(
+                    "ALTER TABLE unavailable RENAME TO notification_deliveries",
+                    args![],
+                )
+                .unwrap();
+            store.cancel_queued("named", None).unwrap();
+            let rows = store.notification_deliveries(&Default::default()).unwrap();
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].event.run.status, RunStatus::Canceled);
+            store.reconcile_deliveries(&Default::default()).unwrap();
+            assert_eq!(
+                store
+                    .notification_delivery(&rows[0].id)
+                    .unwrap()
+                    .unwrap()
+                    .state,
+                crate::NotificationDeliveryState::Blocked
+            );
+        });
+    }
+
+    #[test]
+    fn named_delivery_claims_fence_stale_acknowledgements_and_keep_identity() {
+        both(|db| {
+            let store = db.store();
+            let d = crate::NotificationDestination::builder("sink")
+                .on_run_finished()
+                .sender(|_: crate::NotificationDeliveryCtx| async { Ok(()) })
+                .build()
+                .unwrap();
+            let registry = crate::notification::Registry::new(vec![d], &HashMap::new()).unwrap();
+            store.set_notification_registry(registry.clone());
+            store
+                .create_run(&mk_run("named", "etl", Utc::now()), &[])
+                .unwrap();
+            store
+                .run_finished("named", RunStatus::Success, None, Utc::now(), None)
+                .unwrap();
+            store.reconcile_deliveries(&registry).unwrap();
+            let first = store.claim_delivery(&registry, None).unwrap().unwrap();
+            assert!(store.claim_delivery(&registry, None).unwrap().is_none());
+            store
+                .conn()
+                .execute(
+                    "UPDATE notification_deliveries SET expires=0 WHERE id=?1",
+                    args![&first.row.id],
+                )
+                .unwrap();
+            assert!(matches!(
+                store.settle_delivery(&first, None),
+                Err(Error::ClaimLost(_))
+            ));
+            store.reconcile_deliveries(&registry).unwrap();
+            let second = store.claim_delivery(&registry, None).unwrap().unwrap();
+            assert_eq!(first.row.id, second.row.id);
+            assert_eq!(second.row.attempts, 2);
+            assert!(matches!(
+                store.settle_delivery(&first, None),
+                Err(Error::ClaimLost(_))
+            ));
+            store.settle_delivery(&second, None).unwrap();
+            let history = store.notification_attempts(&second.row.id).unwrap();
+            assert_eq!(history[0].outcome, "outcome_unknown");
+            assert_eq!(history[1].outcome, "accepted");
+            assert_eq!(
+                store
+                    .notification_delivery(&second.row.id)
+                    .unwrap()
+                    .unwrap()
+                    .state,
+                crate::NotificationDeliveryState::Delivered
+            );
+        });
+    }
+    #[test]
+    fn named_notifications_cover_recovery_and_retention_without_retroactive_routing() {
+        both(|db| {
+            let store = db.store();
+            store
+                .create_run(&mk_run("before", "etl", Utc::now()), &[])
+                .unwrap();
+            let destination = crate::NotificationDestination::builder("sink")
+                .on_run_finished()
+                .sender(|_: crate::NotificationDeliveryCtx| async { Ok(()) })
+                .build()
+                .unwrap();
+            let registry =
+                crate::notification::Registry::new(vec![destination], &HashMap::new()).unwrap();
+            store.set_notification_registry(registry.clone());
+            store
+                .create_run(&mk_run("interrupted", "etl", Utc::now()), &[])
+                .unwrap();
+            store
+                .plant_claim(
+                    "interrupted",
+                    "dead",
+                    Some(Utc::now() - chrono::Duration::seconds(5)),
+                )
+                .unwrap();
+            store.fail_interrupted().unwrap();
+            assert_eq!(
+                store
+                    .notification_deliveries(&Default::default())
+                    .unwrap()
+                    .len(),
+                1
+            );
+            store
+                .create_run(&mk_run("expired", "etl", Utc::now()), &[])
+                .unwrap();
+            store
+                .plant_claim(
+                    "expired",
+                    "dead",
+                    Some(Utc::now() - chrono::Duration::seconds(5)),
+                )
+                .unwrap();
+            store.reclaim_expired(Reclaim::Fail, |_| None).unwrap();
+            assert_eq!(
+                store
+                    .notification_deliveries(&Default::default())
+                    .unwrap()
+                    .len(),
+                2
+            );
+            store
+                .create_run(&mk_run("requeue", "etl", Utc::now()), &[])
+                .unwrap();
+            store
+                .plant_claim(
+                    "requeue",
+                    "dead",
+                    Some(Utc::now() - chrono::Duration::seconds(5)),
+                )
+                .unwrap();
+            store.reclaim_expired(Reclaim::Requeue, |_| None).unwrap();
+            assert_eq!(
+                store
+                    .notification_deliveries(&Default::default())
+                    .unwrap()
+                    .len(),
+                2
+            );
+            store.cancel_queued("before", None).unwrap();
+            assert_eq!(
+                store
+                    .notification_deliveries(&Default::default())
+                    .unwrap()
+                    .len(),
+                2
+            );
+            store.reconcile_deliveries(&registry).unwrap();
+            let sent = store.claim_delivery(&registry, None).unwrap().unwrap();
+            store.settle_delivery(&sent, None).unwrap();
+            assert_eq!(
+                store
+                    .prune_named_notifications(Utc::now() + chrono::Duration::seconds(1))
+                    .unwrap(),
+                1
+            );
+            assert!(
+                store
+                    .notification_attempts(&sent.row.id)
+                    .unwrap()
+                    .is_empty()
+            );
+            assert_eq!(
+                store
+                    .notification_deliveries(&Default::default())
+                    .unwrap()
+                    .len(),
+                1
+            );
+        });
+    }
+
+    #[test]
+    fn named_delivery_due_times_cooldowns_pagination_and_claim_races() {
+        both(|db| {
+            let store = db.store();
+            let d = crate::NotificationDestination::builder("sink")
+                .on_run_finished()
+                .sender(|_: crate::NotificationDeliveryCtx| async { Ok(()) })
+                .build()
+                .unwrap();
+            let registry = crate::notification::Registry::new(vec![d], &HashMap::new()).unwrap();
+            store.set_notification_registry(registry.clone());
+            for id in ["one", "two", "three"] {
+                store
+                    .create_run(&mk_run(id, "etl", Utc::now()), &[])
+                    .unwrap();
+                store.cancel_queued(id, None).unwrap();
+            }
+            let page = store
+                .notification_deliveries(&crate::NotificationQuery {
+                    limit: Some(1),
+                    ..Default::default()
+                })
+                .unwrap();
+            let rest = store
+                .notification_deliveries(&crate::NotificationQuery {
+                    before: Some(page[0].id.clone()),
+                    ..Default::default()
+                })
+                .unwrap();
+            assert_eq!(rest.len(), 2);
+            assert!(rest.iter().all(|r| r.id != page[0].id));
+            store.reconcile_deliveries(&registry).unwrap();
+            let other = db.store();
+            other.set_notification_registry(registry.clone());
+            let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+            let b = barrier.clone();
+            let r = registry.clone();
+            let thread = std::thread::spawn(move || {
+                b.wait();
+                other.claim_delivery(&r, None).unwrap()
+            });
+            barrier.wait();
+            let local = store.claim_delivery(&registry, None).unwrap();
+            let remote = thread.join().unwrap();
+            assert_ne!(local.is_some(), remote.is_some());
+            let claim = local.or(remote).unwrap();
+            store
+                .settle_delivery(
+                    &claim,
+                    Some(
+                        &crate::NotificationDeliveryError::retryable("throttled")
+                            .retry_after(std::time::Duration::from_secs(60)),
+                    ),
+                )
+                .unwrap();
+            assert!(store.claim_delivery(&registry, None).unwrap().is_none());
+            let row = store.notification_delivery(&claim.row.id).unwrap().unwrap();
+            assert!(row.next_attempt_at.unwrap() > Utc::now() + chrono::Duration::seconds(50));
+            for pending in store
+                .notification_deliveries(&crate::NotificationQuery::default())
+                .unwrap()
+            {
+                assert!(
+                    pending.next_attempt_at.unwrap() > Utc::now() + chrono::Duration::seconds(50)
+                );
+            }
         });
     }
 }

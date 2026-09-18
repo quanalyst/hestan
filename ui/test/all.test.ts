@@ -19,3 +19,5 @@ import "./swatch.test";
 import "./timeline.test";
 
 import "./presentation.test";
+
+import "./notifications.test";

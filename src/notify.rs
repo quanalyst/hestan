@@ -11,8 +11,12 @@
 //! gone: the process that recorded the event may not survive to retry it, and
 //! a hook that blocked the executor to guarantee delivery would be worse than
 //! a missed alert. [`durable_notifications`](crate::Hestan::durable_notifications)
-//! is the other arrangement: the event is written down first and delivered by
-//! a loop that retries.
+//! persists callback invocation only. For awaited HTTP delivery with retries,
+//! register a named destination using [`Webhook`], [`Slack`], or [`TeamsWorkflow`].
+
+#[path = "notification_http.rs"]
+mod delivery_http;
+pub use delivery_http::{Slack, TeamsWorkflow, Webhook};
 
 use std::sync::OnceLock;
 use std::time::Duration;
@@ -42,9 +46,9 @@ fn post(url: String, body: serde_json::Value) {
     tokio::spawn(async move {
         match client().post(&url).json(&body).send().await {
             Ok(resp) if !resp.status().is_success() => {
-                tracing::warn!("failure notification to {url}: {}", resp.status());
+                tracing::warn!("failure notification: HTTP {}", resp.status());
             }
-            Err(e) => tracing::warn!("failure notification to {url}: {e}"),
+            Err(_) => tracing::warn!("failure notification: HTTP transport failed"),
             Ok(_) => {}
         }
     });

@@ -279,3 +279,9 @@ also where the credential goes, because an annotation cannot carry one.
 - [the command line](cli.md): `hestan doctor`, which answers "why is nothing
   running" by asking the store the same questions.
 - [containers](containers.md): scraping the compose stack.
+
+Named notification metrics include `hestan_notification_deliveries{state}`,
+`hestan_notification_expired_claims`, and `hestan_notification_oldest_pending_seconds`
+as deployment-wide gauges. `hestan_notification_attempts_total{outcome}` and
+`hestan_notification_attempt_seconds` describe outcomes recorded by this process.
+No destination URLs or run identifiers appear in metric labels.

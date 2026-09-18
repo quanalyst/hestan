@@ -96,6 +96,8 @@ pub(crate) struct Meters {
     claim_delay: Histogram,
     /// due to fired.
     lateness: Histogram,
+    notifications: [AtomicU64; 4],
+    notification_duration: Histogram,
 }
 
 impl Default for Meters {
@@ -108,11 +110,17 @@ impl Default for Meters {
             fires: Default::default(),
             claim_delay: Histogram::new(CLAIM_BOUNDS),
             lateness: Histogram::new(LATE_BOUNDS),
+            notifications: Default::default(),
+            notification_duration: Histogram::new(CLAIM_BOUNDS),
         }
     }
 }
 
 impl Meters {
+    pub(crate) fn notification_attempt(&self, outcome: usize, span: chrono::Duration) {
+        self.notifications[outcome].fetch_add(1, Ordering::Relaxed);
+        self.notification_duration.observe(span);
+    }
     /// `times` runs reached `status`.
     ///
     /// anything that is not terminal is ignored: `queued` and `running` are not
@@ -337,6 +345,39 @@ pub(crate) fn render(runner: &Runner) -> String {
     let store = runner.store();
     let read = store.counts(now);
 
+    if let Ok(delivery) = store.notification_health() {
+        text.family(
+            "hestan_notification_deliveries",
+            "gauge",
+            "Named deliveries by current state; aggregate with max across processes",
+        );
+        for name in [
+            "pending",
+            "in_flight",
+            "blocked",
+            "failed",
+            "delivered",
+            "dismissed",
+        ] {
+            text.sample(
+                "hestan_notification_deliveries",
+                &[("state", name)],
+                delivery["states"][name].as_u64().unwrap_or(0),
+            );
+        }
+        text.one(
+            "hestan_notification_expired_claims",
+            "gauge",
+            "Expired notification delivery claims",
+            delivery["expired_claims"].as_u64().unwrap_or(0),
+        );
+        text.one(
+            "hestan_notification_oldest_pending_seconds",
+            "gauge",
+            "Age of the oldest outstanding named notification",
+            delivery["oldest_pending_age_seconds"].as_u64().unwrap_or(0),
+        );
+    }
     // what this process knows about itself, which it knows whether or not the
     // database is answering
     text.one(
@@ -448,6 +489,31 @@ pub(crate) fn render(runner: &Runner) -> String {
         let count = meters.reclaims[slot].load(Ordering::Relaxed);
         text.sample("hestan_run_reclaims_total", &[("outcome", outcome)], count);
     }
+    text.family(
+        "hestan_notification_attempts_total",
+        "counter",
+        "Named notification outcomes recorded by this process",
+    );
+    for (slot, outcome) in [
+        "accepted",
+        "retryable_failure",
+        "permanent_failure",
+        "outcome_unknown",
+    ]
+    .iter()
+    .enumerate()
+    {
+        text.sample(
+            "hestan_notification_attempts_total",
+            &[("outcome", outcome)],
+            meters.notifications[slot].load(Ordering::Relaxed),
+        );
+    }
+    text.histogram(
+        "hestan_notification_attempt_seconds",
+        "Duration of recorded named delivery attempts",
+        &meters.notification_duration,
+    );
     text.one(
         "hestan_op_retries_total",
         "counter",

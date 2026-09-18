@@ -243,6 +243,11 @@ struct Global {
 
 #[derive(Subcommand)]
 enum Command {
+    /// inspect or recover named notification deliveries
+    Notifications {
+        #[command(subcommand)]
+        action: NotificationCommand,
+    },
     /// launch a run of a job
     Run(RunArgs),
     /// recent runs, newest first
@@ -305,6 +310,37 @@ enum Command {
     },
     /// the ui and whatever loops this process's role owns
     Serve(ServeArgs),
+}
+
+#[derive(Subcommand)]
+enum NotificationCommand {
+    /// List named deliveries, newest first
+    List {
+        #[arg(long)]
+        state: Option<String>,
+        #[arg(long)]
+        destination: Option<String>,
+        #[arg(long)]
+        run: Option<String>,
+        #[arg(long)]
+        before: Option<String>,
+        #[arg(long, default_value_t = 50)]
+        limit: u32,
+    },
+    /// Show one delivery and its attempt history
+    Show { id: String },
+    /// Start a new retry cycle for a failed delivery
+    Retry {
+        id: String,
+        #[arg(long)]
+        generation: i64,
+    },
+    /// Stop an inactive, undelivered notification
+    Dismiss {
+        id: String,
+        #[arg(long)]
+        generation: i64,
+    },
 }
 
 #[derive(Args)]
@@ -749,6 +785,108 @@ fn no_registry(target: &str, wanted: &str) -> Fail {
 
 async fn dispatch(reach: Reach, command: Command, out: &Out) -> Result<(), Fail> {
     match command {
+        Command::Notifications { action } => {
+            let (id, mutation) = match &action {
+                NotificationCommand::List { .. } => (None, None),
+                NotificationCommand::Show { id } => (Some(id.as_str()), None),
+                NotificationCommand::Retry { id, generation } => {
+                    (Some(id.as_str()), Some((true, *generation)))
+                }
+                NotificationCommand::Dismiss { id, generation } => {
+                    (Some(id.as_str()), Some((false, *generation)))
+                }
+            };
+            let query = match &action {
+                NotificationCommand::List {
+                    state,
+                    destination,
+                    run,
+                    before,
+                    limit,
+                } => crate::NotificationQuery {
+                    state: state.clone(),
+                    destination: destination.clone(),
+                    run: run.clone(),
+                    before: before.clone(),
+                    limit: Some(*limit),
+                    ..Default::default()
+                },
+                _ => Default::default(),
+            };
+            let answer = match reach {
+                Reach::Server(api) => {
+                    let path = match (id, mutation) {
+                        (Some(id), Some((retry, _))) => format!(
+                            "/api/notification-deliveries/{}/{}",
+                            escape(id),
+                            if retry { "retry" } else { "dismiss" }
+                        ),
+                        (Some(id), None) => format!("/api/notification-deliveries/{}", escape(id)),
+                        _ => {
+                            let mut q =
+                                reqwest::Url::parse("http://localhost/").expect("literal URL");
+                            {
+                                let mut p = q.query_pairs_mut();
+                                for (k, v) in [
+                                    ("state", query.state.as_deref()),
+                                    ("destination", query.destination.as_deref()),
+                                    ("run", query.run.as_deref()),
+                                    ("before", query.before.as_deref()),
+                                ] {
+                                    if let Some(v) = v {
+                                        p.append_pair(k, v);
+                                    }
+                                }
+                                p.append_pair("limit", &query.limit.unwrap_or(50).to_string());
+                            }
+                            format!(
+                                "/api/notification-deliveries?{}",
+                                q.query().unwrap_or_default()
+                            )
+                        }
+                    };
+                    if let Some((_, generation)) = mutation {
+                        api.post(&path, json!({"generation":generation})).await?
+                    } else if id.is_some() {
+                        let mut result = api.get(&path).await?;
+                        result["attempts"] =
+                            api.get(&format!("{path}/attempts")).await?["attempts"].clone();
+                        result
+                    } else {
+                        api.get(&path).await?
+                    }
+                }
+                other => {
+                    let store = if mutation.is_some() {
+                        match other {
+                            Reach::Local(app) => app.build().await?.runner.store().clone(),
+                            Reach::Store { target, .. } => {
+                                return Err(no_registry(
+                                    &target,
+                                    "changing notification deliveries",
+                                ));
+                            }
+                            Reach::Server(_) => unreachable!(),
+                        }
+                    } else {
+                        other.store()?
+                    };
+                    if let (Some(id), Some((retry, generation))) = (id, mutation) {
+                        json!({"delivery":store.control_notification(id,generation,retry,Some("cli"))?})
+                    } else if let Some(id) = id {
+                        json!({"delivery":store.notification_delivery(id)?.ok_or_else(||Fail::usage("unknown notification delivery"))?,"attempts":store.notification_attempts(id)?})
+                    } else {
+                        json!({"deliveries":store.notification_deliveries(&query)?})
+                    }
+                }
+            };
+            if out.json {
+                out.object(&answer);
+            } else if !out.quiet {
+                println!("{}", serde_json::to_string_pretty(&answer).expect("JSON"));
+            }
+            Ok(())
+        }
         Command::Run(args) => launch(reach, args, out).await,
 
         Command::Runs(args) => {
@@ -2741,6 +2879,12 @@ async fn doctor(reach: Reach, out: &Out) -> Result<(), Fail> {
     findings.extend(check_leases(store, Utc::now())?);
     findings.push(check_deciding(store, Utc::now())?);
     findings.push(check_held_values(store)?);
+    let delivery = store.notification_health()?;
+    let unresolved = delivery["states"]["blocked"].as_u64().unwrap_or(0)
+        + delivery["states"]["failed"].as_u64().unwrap_or(0);
+    findings.push(if unresolved>0 {Finding::note("notifications",format!("{unresolved} blocked or failed deliveries"),"inspect with notifications list; restore the destination or retry/dismiss the delivery")}
+    else {Finding::ok("notifications",format!("{} pending, {} in flight",delivery["states"]["pending"],delivery["states"]["in_flight"]))});
+
     match &app {
         Some(app) => {
             findings.extend(check_queue(app)?);
@@ -3430,6 +3574,28 @@ async fn remote_doctor(api: &Api, out: &Out) -> Result<(), Fail> {
             findings.push(check_remote_deployment(&health));
             findings.push(check_remote_deciding(&health));
             findings.push(check_remote_store(&health));
+            if let Some(delivery) = health
+                .get("notification_deliveries")
+                .filter(|v| !v.is_null())
+            {
+                let unresolved = delivery["states"]["blocked"].as_u64().unwrap_or(0)
+                    + delivery["states"]["failed"].as_u64().unwrap_or(0);
+                findings.push(if unresolved > 0 {
+                    Finding::note(
+                        "notifications",
+                        format!("{unresolved} blocked or failed deliveries"),
+                        "inspect notifications list and restore, retry, or dismiss owed deliveries",
+                    )
+                } else {
+                    Finding::ok(
+                        "notifications",
+                        format!(
+                            "{} pending, {} in flight",
+                            delivery["states"]["pending"], delivery["states"]["in_flight"]
+                        ),
+                    )
+                });
+            }
         }
         Err(_) => unchecked.push(
             "whether its store is taking writes and whether it is the process \
@@ -5319,5 +5485,45 @@ mod tests {
         assert!(names.contains(&"doctor".to_string()));
         assert!(names.contains(&"explain".to_string()));
         assert!(!names.contains(&"__complete".to_string()), "{names:?}");
+    }
+    #[test]
+    fn notification_commands_require_a_generation_for_mutations() {
+        for action in ["retry", "dismiss"] {
+            assert!(Cli::try_parse_from(["hestan", "notifications", action, "delivery"]).is_err());
+            assert!(
+                Cli::try_parse_from([
+                    "hestan",
+                    "notifications",
+                    action,
+                    "delivery",
+                    "--generation",
+                    "4"
+                ])
+                .is_ok()
+            );
+        }
+        let parsed = Cli::try_parse_from([
+            "hestan",
+            "notifications",
+            "list",
+            "--state",
+            "failed",
+            "--destination",
+            "receiver",
+            "--run",
+            "run",
+            "--before",
+            "cursor",
+            "--limit",
+            "10",
+        ])
+        .unwrap();
+        assert!(matches!(
+            parsed.command,
+            Some(Command::Notifications {
+                action: NotificationCommand::List { limit: 10, .. }
+            })
+        ));
+        assert!(Cli::try_parse_from(["hestan", "notifications", "show", "delivery"]).is_ok());
     }
 }

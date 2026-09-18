@@ -117,6 +117,13 @@ mod executor;
 mod freshness;
 mod graph;
 mod hooks;
+mod notification;
+pub use notification::{
+    NotificationAttempt, NotificationDelivery, NotificationDeliveryCtx, NotificationDeliveryError,
+    NotificationDeliveryState, NotificationDestination, NotificationDestinationBuilder,
+    NotificationEnvelope, NotificationFlush, NotificationPolicy, NotificationQuery,
+    NotificationSender,
+};
 #[cfg(feature = "http")]
 mod http;
 mod io;
