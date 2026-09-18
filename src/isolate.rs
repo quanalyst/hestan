@@ -56,10 +56,21 @@ pub(crate) const RUN_VAR: &str = "HESTAN_ISOLATED_RUN";
 /// the one op of it the subprocess is there to run.
 pub(crate) const OP_VAR: &str = "HESTAN_ISOLATED_OP";
 
+fn secret_error(params: &Value) -> Option<String> {
+    let missing = crate::secret::Vault::marked(params);
+    (!missing.is_empty()).then(|| {
+        format!(
+            "isolated op cannot restore secret params {}; use a resource constructed in the child",
+            missing.join(", ")
+        )
+    })
+}
+
 /// what the environment is asking this process to be.
 pub(crate) struct Request {
     pub(crate) run_id: String,
     pub(crate) op: String,
+    pub(crate) claim: Option<crate::store::ExecutionClaim>,
 }
 
 /// the op-subprocess request in this process's environment, if there is one.
@@ -72,7 +83,13 @@ pub(crate) struct Request {
 pub(crate) fn requested() -> Option<Request> {
     let run_id = std::env::var(RUN_VAR).ok()?;
     let op = std::env::var(OP_VAR).ok()?;
-    (!run_id.is_empty() && !op.is_empty()).then_some(Request { run_id, op })
+    (!run_id.is_empty() && !op.is_empty()).then_some(Request {
+        run_id,
+        op,
+        claim: std::env::var("HESTAN_ISOLATED_CLAIM")
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok()),
+    })
 }
 
 /// what an op subprocess did, which is what its exit code says.
@@ -117,6 +134,15 @@ pub(crate) async fn attempt(
     if *cancel.borrow() {
         return Ended::Killed("canceled before its process started".to_string());
     }
+    match store.run(run_id) {
+        Ok(Some(run)) => {
+            if let Some(error) = secret_error(&run.params) {
+                return Ended::Failed(error);
+            }
+        }
+        Ok(None) => return Ended::Failed(format!("unknown run {run_id}")),
+        Err(error) => return Ended::Failed(error.to_string()),
+    }
     // written before the child exists, because the child reads its inputs
     // rather than being told them. the error itself is in this process's log,
     // where `landed` put it; what belongs on the op run is that the child was
@@ -147,6 +173,10 @@ pub(crate) async fn attempt(
     let mut child = match command
         .env(RUN_VAR, run_id)
         .env(OP_VAR, name)
+        .env(
+            "HESTAN_ISOLATED_CLAIM",
+            serde_json::to_string(&store.execution_claim()).expect("claim is JSON"),
+        )
         // both pipes, and both drained below: what the child prints is the op's
         // output and belongs on the run page rather than on whatever terminal
         // the orchestrator happens to have
@@ -395,6 +425,13 @@ pub(crate) async fn run_one_op(
     io: &Io,
     resources: &Resources,
 ) -> Result<Worked, Error> {
+    let claim = req
+        .claim
+        .clone()
+        .ok_or_else(|| Error::ClaimLost(req.run_id.clone()))?;
+    let scoped = store.for_claim(claim);
+    let store = &scoped;
+    store.check_execution()?;
     let run = store
         .run(&req.run_id)?
         .ok_or_else(|| Error::UnknownRun(req.run_id.clone()))?;
@@ -418,6 +455,9 @@ pub(crate) async fn run_one_op(
         )));
     }
 
+    if let Some(error) = secret_error(&run.params) {
+        return Err(Error::Graph(error));
+    }
     let (inputs, dep_statuses) = handed_over(op, job, io, store, &req.run_id).await?;
     let state = Arc::new(store.op_state(job.name(), &req.op)?);
     let new_state = Arc::new(Mutex::new(None));

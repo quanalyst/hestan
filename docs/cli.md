@@ -10,32 +10,9 @@ async fn main() -> Result<(), hestan::Error> {
 }
 ```
 
-that is the whole mount. **with no arguments it serves**, on exactly the
-address it was handed (the same call `app.serve(addr)` was, with the same
-behaviour and the same error if the socket will not bind), so a deployment that
-swaps one line for the other and changes nothing else behaves as it did.
-
-with arguments it is a command line that already knows every job, asset,
-schedule and sensor by name. there is no workspace file to point it at, no
-module to import, no server to be running: the registry is in the process, so
-starting is opening a database and nothing else. everything below follows from
-that one fact, including the two things that are usually out of reach:
-`explain`, which resolves a real plan, and shell completion of your own job and
-asset names, asked for at the moment you press tab.
-
-```
-$ orders run orders_etl --wait
-14:22:01 run started
-14:22:01 fetch_orders starting
-14:22:02 fetch_orders fetched 1,204 rows
-14:22:02 validate starting
-14:22:02 validate dropping bad row: {"id":3}
-14:22:03 publish finished
-14:22:03 run succeeded
-019ff1b7-8df6-7732-8f54-70fa61013409  orders_etl success in 1.5s
-$ echo $?
-0
-```
+With no arguments, this serves the app at the supplied address. With arguments,
+it exposes commands over the compiled registry, including launches, plan
+inspection and completion of registered names. Enable the `cli` feature.
 
 ## The exit codes
 
@@ -54,21 +31,8 @@ These codes are stable:
 | 7 | `doctor` found something actionable |
 | 8 | the server refused this identity: no token, one it does not accept, or a role that may not |
 
-5, 8 and 1 are deliberately different answers: "nothing was reachable" is worth
-a retry, "it would not have me" is worth a person with the secret, and "the
-work went wrong" is worth a person with the pipeline. 3 is not a failure (a run
-somebody stopped is not a run that broke), so a cron line that pages on 1 and
-2 will not page when you cancel something by hand.
-
-each code has a case of its own in `tests/cli.rs`, which runs the real binary
-and reads what it exited with.
-
-`Exit` is deliberately **not** `#[non_exhaustive]`, unlike most of the enums
-hestan exposes: the table above is what a cron line matches on, so the type
-stays matchable with no `_` arm and a tenth code would owe you a compile
-error rather than appearing quietly. `tests/stability.rs` reads these nine
-numbers back out of this file and asserts them against the variants, so the
-table and the type cannot drift apart. see [stability](stability.md).
+`Exit` is a closed enum. Tests compare this table with its discriminants and
+check exit codes through real CLI processes. See [stability](stability.md).
 
 ## The output contract
 
@@ -579,20 +543,11 @@ launching a second one, and exits with what it did.
 
 ## What it does not do
 
-- **`--server` cannot `explain`, and can only half `doctor`.** both read things
-  an api does not expose: the registry, the role, the disk. `explain` says so
-  and points at the two modes that can; `doctor` answers what it can reach and
-  lists the rest as not checked.
-- **`--db` cannot launch, `explain`, or list jobs** in a binary your jobs are
-  not compiled into. a run log records what ran; it holds no definitions.
-- **`cancel` cannot stop a run executing in another process.** see above: there
-  is no cancel signal in the database, and the process holding the run is the
-  only one that can stop it.
-- **`runs` has no status filter.** the store's query does not take one, and
-  filtering a page after it was fetched would silently show you fewer rows than
-  `--limit` asked for. `--json` and `jq` is the honest workaround for now.
-- **`backup` copies sqlite only, and `--server` serves neither it nor
-  `resettle`.** a copy has to land on the filesystem the database is on, and a
-  resettle has to write to a database nothing else is writing to, which a
-  running server is the opposite of. both exit 6 with the mode that would serve
-  them.
+- `--server` cannot explain plans and can run only the doctor checks exposed by
+  the server; unavailable checks are listed.
+- A standalone `--db` client cannot launch, explain or list compiled definitions.
+- Cancellation must reach the process executing the run; there is no
+  cross-process cancellation signal in the store.
+- `runs` has no status filter. Filter JSON output externally when needed.
+- Backup supports SQLite only. Backup and resettle require direct database
+  access and are unavailable through `--server` (exit 6).

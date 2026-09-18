@@ -1,28 +1,14 @@
 # Connecting to your data
 
-an op is an async fn in your binary. connecting to postgres, snowflake, s3 or
-somebody's rest api is `cargo add` and then whatever that crate's client does:
-there is no hestan adapter to find, no plugin to install, and no configuration
-file that has to name your warehouse.
-
-that is the whole shape of it, and this page is the details: where the client
-should live, where the credential should come from, what to do about a flaky
-endpoint, and where the [io managers](io-managers.md) fit.
+Call Rust client libraries from operations and share expensive clients through
+[resources](resources.md). Hestan handles execution, dependencies and history;
+your application controls external connections and credentials.
 
 ## hestan does not wrap database clients, and will not
 
-there is no `SnowflakeResource`, no `PostgresOp`, no `S3Io`. that is a
-decision, not a gap.
-
-a wrapper around somebody else's client is a layer that can only lose: it
-carries a subset of the features, a version behind, with its own bugs and its
-own docs, and the day you need the one option it does not expose you are
-reading two apis instead of one. rust's ecosystem is crates, and an op is a
-place to call one.
-
-what hestan owns is the part a client cannot do for you: **when** the work
-runs, what happened when it did, what it produced, what to do when it fails,
-and what is downstream of it. so this page is about the seam, not about sql.
+Use the client library for the system you need. Hestan does not wrap database
+or object-storage SDKs. [HTTP sources](http-sources.md) and [dbt](dbt.md) provide
+specific scheduling and asset-registration conveniences.
 
 ## Connecting from an op
 
@@ -48,9 +34,7 @@ the message on the op run row is that error's own.
 
 ## A pool as a resource
 
-a connection pool built inside an op is a pool per op invocation, which is a
-pool per five minutes, forever. build it once as a
-[resource](resources.md) instead:
+Build a shared client or pool once as a [resource](resources.md):
 
 <!-- worked-example -->
 ```rust
@@ -96,47 +80,22 @@ The example is also tested in
 [`Hestan::resource`](https://docs.rs/hestan/latest/hestan/struct.Hestan.html#method.resource).
 Set `HESTAN_TEST_PG` to exercise it against PostgreSQL.
 
-four things in it are the point:
-
-- `ctx.resource::<Client>("warehouse")` hands every op the **same** client. no
-  reconnection per run, no credential read twice, and `Arc::ptr_eq` on two
-  ops' handles holds.
-- `requires(["warehouse"])` makes a missing resource a **startup** error
-  naming the op, rather than an op that fails at 3am.
-- `ctx.meta("rows", ..)` puts the row count on the run page and in the
-  [trend](metadata.md) beside every other build of it. the query already knew
-  the number; this is what costs you nothing to record.
-- `retries(3)` is the flaky-endpoint policy, and the next section is about
-  what it does and does not cover.
-
-`tokio_postgres` is that crate's, not hestan's. swap it for `sqlx`, `mysql`,
-`rusoto`, `aws-sdk-s3`, `duckdb` or a client you wrote this morning: the seam
-is the same, and hestan has an opinion about none of them.
+The example shares one client, validates its declaration with `requires`,
+records a row count, and retries failed attempts. The client type and connection
+configuration belong to your application.
 
 ## Secrets come from the environment
 
-read credentials in the resource constructor, from the process environment or
-from whatever secret manager your deployment has. **not from run params.**
+Load credentials in resource constructors from the environment or your secret
+manager. Ordinary run parameters are persisted and exposed through the API.
 
-params are stored on the run row and served by the api and the ui, which is
-right for `{"day": "2026-08-11"}` and wrong for a password: it would be in the
-run log, in every launch that copied that run, and in whatever your log
-aggregator keeps. a run's params are a thing anyone who can read the run can
-read.
+For launch-specific credentials, [secret parameters](secrets.md) prevent the
+specified values from being stored. Such runs cannot be retried, resumed or
+replayed from their stored parameters. Resources avoid this restriction and are
+constructed in the process executing the work.
 
-**this is still the advice**, and it is not softened by
-[`Op::secret_params`](secrets.md), which is for the case a resource cannot
-cover: a credential that belongs to *one launch* rather than to the process, a
-deploy token a ci pipeline hands over per run. that keeps the value out of the
-store and costs the run its replay: a run launched with one cannot be replayed,
-resumed or retried, because the value was never written down. a resource costs
-nothing and is rebuilt on every replay, so it is the answer whenever the
-credential is the deployment's rather than the launch's.
-
-a constructor that returns `Err` aborts startup with `Error::Resource` before
-the store is opened, so a deployment with a missing `WAREHOUSE_URL` fails at
-boot with the name of the resource rather than serving a ui over a database it
-cannot reach.
+A failing process-resource constructor aborts startup with `Error::Resource`
+before the store opens.
 
 ## Retries, timeouts, and a flaky endpoint
 
@@ -193,10 +152,8 @@ result is usually more useful than the result.
 
 ## Another tool's dag
 
-if the thing you are connecting to is dbt, it has a dag of its own and hestan
-can read it rather than being told about it: [dbt](dbt.md) turns
-`target/manifest.json` into one asset per model with dbt's own lineage. that
-is the one case a wrapper genuinely buys something a client call cannot.
+[dbt](dbt.md) imports model lineage from `target/manifest.json`, so models can
+participate in the same asset graph as application-defined work.
 
 ## Where to go next
 

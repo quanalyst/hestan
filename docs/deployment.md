@@ -18,32 +18,15 @@ Hestan::new()
     )
 ```
 
-beside `db` because it is the same sort of statement: where the run log is, and
-whose run log it is.
-
-**both halves are optional and declaring neither is the ordinary case.** one
-process on a laptop has nothing to tell itself apart from and no build to name,
-and it should not have to fill anything in to get a run log. everything below
-reads as `null` for such a deployment, which is what nobody having said looks
-like.
-
-**an empty string is an absence.** `std::env::var("APP_BUILD").unwrap_or_default()`
-in a deployment that meant to set the variable and did not is how you get here,
-and a build called `""` on every run row would read as an answer.
+Both fields are optional; empty strings become absent values. Hestan carries
+these strings without interpreting or validating the build identifier.
 
 ### Where the build comes from
 
-whatever your build already has. hestan neither parses nor validates it:
-
-- **baked in at build time**, which is the one to prefer, because the binary
-  and its answer cannot then come apart. `env!("APP_BUILD")` with the variable
-  set by your build, or an `ARG` in a `Dockerfile`, which is what
-  [the image at the repository root](containers.md#which-build-an-image-is)
-  does.
-- **read out of the environment at start**, which is what
-  `docker-compose.yml` and the manifests in `deploy/k8s` show, and what the
-  snippet above does. weaker, because the thing that started the process is
-  claiming what the binary is rather than the binary saying so.
+Supply an identifier from your own build system. `env!("APP_BUILD")` embeds it
+at compile time; `std::env::var("APP_BUILD")` reads it at startup. A runtime
+value must be kept consistent with the binary it describes. See
+[the container example](containers.md#which-build-an-image-is).
 
 ## What hestan knows without being told
 
@@ -110,32 +93,12 @@ deployment, and repeating it on a page about one run is noise on that page.
 
 ## A run remembers the build that launched it
 
-this is the half with the operational value.
+Each run stores the build identifier supplied at launch. Claims, execution and
+later deployments do not rewrite it. If a scheduler launches a run and a worker
+on another build executes it, the row identifies the scheduler's build.
 
-**every run records the build in force when it was launched**, in a column of
-its own:
-
-```json
-{"id": "0192...", "job": "orders_etl", "build": "9f2c1ab", "...": "..."}
-```
-
-**recorded, not joined.** the alternative was to answer "which build was this
-run?" by asking the process doing the reading, which would answer every run
-there has ever been with today's build. that is a confidently wrong answer, and
-it is wrong about exactly the runs somebody is looking at: the ones from before
-the deploy.
-
-so nothing rewrites it. a scheduler on last week's image queues a run and a
-worker already on this week's claims and executes it: the row says
-`last-week`, because that is what launched it. every write after the insert
-(the claim, the start, the heartbeat, the terminal row) names the columns it
-changes and this is not one of them. there is a case for it that runs two
-processes on two builds against one database and asserts exactly that.
-
-`null` means **nobody told hestan**, and it means that in three ways that
-hestan cannot tell apart: a run written before build tracking, a run launched by a
-deployment that declares no build, and a run launched through a `Runner` that
-was never given one.
+A null value means no build was recorded, including runs created before build
+tracking and runs launched without a configured build identifier.
 
 ### Filtering by it
 
@@ -166,19 +129,12 @@ and filter behavior.
 
 ## What is deliberately not here
 
-- **a build on the metrics endpoint.** a `hestan_build_info` gauge is the
-  standard prometheus shape for this and it is still not here.
-  [metrics](metrics.md#what-is-deliberately-not-here) has the reasoning: every
-  label hestan emits is a `&'static str`, which is both the cardinality rule
-  and the whole of its enforcement, and a build read out of the environment is
-  not one. `/api/health` is the endpoint that answers "what is this".
-- **anything that checks the build is real.** hestan carries the string. it
-  does not resolve it, does not ask a registry about it, and does not notice
-  when two processes on one database disagree about which build they are.
-- **a build on anything but a run.** an asset materialization, a schedule tick
-  and a sensor evaluation all record which run they belong to, and the run
-  carries the build. a second copy per table would be the same string written
-  four more times.
+Build identifiers are not verified against a repository or registry. Hestan
+does not enforce matching identifiers across processes.
+
+Build metadata is exposed through health and run records, not metric labels.
+Materializations and ticks refer to their runs instead of duplicating the build
+identifier. See [metrics](metrics.md#what-is-deliberately-not-here).
 
 ## See also
 

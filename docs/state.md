@@ -1,15 +1,8 @@
 # Op state
 
-per-op persisted state is the incremental-pull primitive: an op reads the
-value its last successful execution committed, does its work, and stages a
-new value that is written only if the attempt succeeds. the usual shape is a
-watermark ("i have everything through id 81234"), so each run fetches only
-what is new instead of re-pulling history.
-
-state is one json value per `(job, op)` pair, keyed by name rather than by
-run, so it survives restarts and outlives any particular run. it is not an
-inter-op channel: an op sees its own state only, never another op's. pass
-data between ops through outputs and `.after`.
+Op state is one persisted JSON value per `(job, op)` pair. Use it for a
+watermark or cursor that survives runs and restarts. Operations read only their
+own state; pass data between operations through outputs and dependencies.
 
 ## Reading and staging
 
@@ -37,14 +30,10 @@ leaves existing state untouched.
 
 ## At-least-once, by construction
 
-on success the executor writes the op's result row first and the state
-second, in that order deliberately. a crash between the two leaves a
-recorded success with the *old* watermark, so the next run re-fetches that
-window. the reverse order would advance the watermark past work whose
-success was never recorded: rows silently skipped. hestan picks re-do over
-skip: a state-driven op sees each window at least once, so whatever it
-writes downstream should be idempotent within a window (upserts keyed on id,
-not blind appends).
+The executor writes the successful operation result before its new state.
+A crash between these writes leaves the old cursor, so the next run may repeat
+the same window. Make external writes idempotent, for example by upserting on
+a stable key.
 
 ## A fetch-since-cursor op
 

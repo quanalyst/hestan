@@ -35,28 +35,15 @@ Kubernetes probes run outside the application container.
 
 ### The ui is copied in, not built
 
-the ui is embedded with `include_dir!`, so `ui/dist` has to exist before rustc
-runs. it is a **committed** directory rather than something the image build
-produces, because the crate has to compile on docs.rs and in anybody's `cargo
-install` with no node anywhere. so the image installs no node and runs no npm.
-
-the price is worth stating: the image carries whatever `just ui-build` last
-wrote. changing the ui means rebuilding it, committing it, and then building
-the image, in that order.
+The image embeds committed `ui/dist` and needs no Node installation. After
+editing UI source, run `just ui-build` and commit the bundle before building
+the image. See [the UI development loop](development.md#the-ui-loop).
 
 ### Features
 
-`--features cli,postgres`. `cli` because `examples/demo.rs` declares it as a
-required feature; `postgres` because the compose stack shares one database
-between a scheduler and three workers. not `--all-features`: parquet pulls in
-arrow, which is tens of megabytes of build for a deployment whose op outputs
-are `{"loaded": 4210}`.
-
-nothing is apt-installed in the build stage either, which is a claim rather
-than an omission. `rusqlite/bundled` compiles sqlite from source and wants a c
-compiler, which the rust image has. tokio-postgres speaks the wire protocol in
-rust, so there is no libpq. reqwest is rustls over ring, so there is no openssl
-and no pkg-config.
+The example image enables `cli,postgres`: the demo requires the CLI and Compose
+uses PostgreSQL. Adjust features for your application. The build uses bundled
+SQLite and Rust database/HTTP clients; it does not install libpq or OpenSSL.
 
 ### Which build an image is
 
@@ -275,12 +262,9 @@ Use Kustomize to customize images, replica counts and credentials.
 
 ## What this does not do
 
-there is no operator, no pod template, no autoscaler and no kubernetes
-executor. hestan ships [one mechanism](scaling.md) for moving work off the
-process that asked for it, a durable claimable queue, and a pod running
-`HESTAN_ROLE=worker` against a shared postgres is what the kubernetes executor
-would have been. a container and a pod are packaging around that mechanism, not
-new execution paths.
+Hestan supplies a durable queue and worker role, without a Kubernetes operator,
+autoscaler or per-run pod executor. Containers run the same application and
+execution paths described in [scaling](scaling.md).
 
 ## See also
 

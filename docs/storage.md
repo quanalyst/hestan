@@ -1,7 +1,6 @@
 # Storage
 
-two backends and one schema. sqlite is the default and needs no server;
-postgres is for the deployment one file cannot serve.
+Hestan supports SQLite and PostgreSQL through the same `Store` API.
 
 ## Choosing one
 
@@ -42,73 +41,32 @@ tests, private to the connection that made it.
 
 ## sqlite
 
-one file, no extra services. file databases run in WAL mode. the store is a
-single rusqlite connection behind a mutex, cloneable and shareable across
-tasks; one writer is plenty at this scale, and it also means hestan assumes it
-is the one *orchestrator* writing (see [embedding](embedding.md)).
+File databases use WAL mode and a five-second busy timeout. Each process holds
+one mutex-protected connection. Run claims use compare-and-set inside an
+immediate transaction, allowing multiple Hestan processes on one host.
 
-there are other writers, and they are hestan's own. an [isolated
-op](isolation.md) runs in an op subprocess that opens this same file and
-records its result through it, and a [queue worker](scaling.md) is a whole
-second orchestrator process pulling runs off the same tables. every connection
-therefore carries a five-second `busy_timeout`, so two processes writing at
-the same instant wait for each other instead of the second one failing
-outright; the claim that decides who executes a run is a compare-and-set in an
-immediate transaction, so it does not depend on timing at all.
-
-that is multi-process on one host. it is not multi-node: sqlite is not
-reachable over a network, and hestan will not ship a config pretending
-otherwise. that is what the other backend is for.
+Use PostgreSQL when workers need to share a store across hosts. Isolated ops
+need a persistent database accessible to their child process.
 
 ## Postgres
 
-`--features postgres`, then a url. the schema below is the schema, with four
-deliberate differences and no others:
+Enable `--features postgres` and pass a PostgreSQL URL. Compared with SQLite:
 
-- `BIGSERIAL` where sqlite has `INTEGER PRIMARY KEY AUTOINCREMENT`, and
-  `BIGINT` where it has `INTEGER`. postgres has two integer widths and this
-  schema only ever means the wide one.
-- **timestamps stay `TEXT`, rfc3339.** every query compares and orders them as
-  strings, and `timestamptz` would change comparison and ordering semantics
-  across the whole store for no gain here. the columns hestan reads as booleans
-  stay integers for the same reason. a row therefore reads back identically off
-  either backend, which is the point.
-- **every text column is `COLLATE "C"`.** sqlite compares text byte by byte and
-  postgres compares it in the database's collation; on an `en_US.UTF-8`
-  database that sorts names and keys in a place byte order does not, so the
-  same query would answer two different things. `C` is byte order, which is
-  what an opaque id, name or timestamp wants.
-- the version stamp is a one-row `schema_version` table, because postgres has
-  no `user_version`.
+- Auto-increment keys use `BIGSERIAL`; integer columns use `BIGINT`.
+- Timestamps remain RFC3339 text and booleans remain integers.
+- Text columns use `COLLATE "C"` for consistent ordering across backends.
+- A `schema_version` table replaces SQLite's `PRAGMA user_version`.
 
-**a fresh database is created at the current version in one statement batch.**
-there are no postgres databases in the world that predate this backend, so
-there is nothing for the sqlite chain's accumulated steps to migrate and
-walking them would be a re-enactment; from here it is forward-only. postgres ddl is
-transactional, so an interrupted first boot leaves the database exactly as
-found, and two processes booting against the same empty database take turns on
-an advisory lock rather than racing to create the same table. a database
-stamped with a version newer than the build is refused, exactly as a sqlite
-file is.
+Fresh-store creation and forward migrations are transactional. An advisory
+lock serializes startup schema work. A binary refuses a newer schema than it
+understands.
 
-**it is one connection, not a pool.** a pool would buy parallel statements and
-with them reconnection, a second set of failure modes and transactions that no
-longer sit where the code around them thinks. sqlite already blocks on one
-connection and this matches it deliberately: what postgres is here for is
-several *processes* sharing a run log, not one process issuing more statements
-at once. the client is async and hestan drives it on a runtime of its own, so
-`Store` stays synchronous and no call site changed.
+Each process uses one connection, with no pool or automatic reconnect. Restart
+the process after a lost connection. The synchronous `Store` API drives the
+PostgreSQL client on a separate runtime.
 
-**there is no tls.** the connection is what libpq calls `sslmode=disable`. use
-a unix socket, a private network, or a proxy that terminates tls for you. this
-is a real limitation and it is written down here rather than implied away.
-
-what the two backends spell differently is nine `AUTOINCREMENT`s that are ddl
-and nothing else, four inserts that yield to a row already there, sqlite's
-null-safe `IS`, one json walk for the [tag filter](launching.md#run-tags), one
-json array append, the placeholder sigil, and the claim itself. every one of
-them is named in one place in `src/store.rs`; everything else is the same text
-on both.
+The connection does not support TLS. Use a Unix socket, a trusted network or
+a proxy that provides transport protection.
 
 ## Schema
 
@@ -428,10 +386,6 @@ alone keeps the old timestamp-only exclusive compare.
 
 ## Migrations
 
-this section is sqlite's chain, which every existing file walks and no
-postgres database ever will; see [postgres](#postgres) for why one is created
-whole instead.
-
 SQLite records its schema in `PRAGMA user_version`; PostgreSQL records a schema
 stamp in the store. Opening a store applies pending migrations and updates the
 stamp in one transaction. Failure leaves the database unmigrated, with its rows
@@ -508,33 +462,15 @@ refuses to come up on a copy that has not had it. see
 
 ## When the database will not take a write
 
-a store is a dependency like any other and it can refuse. the rules are the
-same on both backends and are written out in
-[what hestan promises about writes](concepts.md#what-hestan-promises-about-writes);
-this is what they mean for the database in front of you.
+Critical writes receive bounded retries for recoverable backend errors;
+[execution write guarantees](concepts.md#what-hestan-promises-about-writes)
+describe the retry and abandonment behavior. A lost connection may leave an
+unknown commit outcome and is not blindly retried.
 
-a write that records what a run did is **retried four times** with jittered
-backoff before hestan gives up on it. that covers the ordinary case, which is
-another writer holding sqlite's write lock past its 5-second busy timeout, or
-a postgres serialization failure or deadlock. what is *not* retried is a
-failure the backend cannot have rolled back on its own: a connection that
-died. that write may have been committed with its acknowledgement lost, and
-going back for it is the one retry that could record a build twice.
-
-which is worth knowing about the postgres backend specifically: it is **one
-connection with no pool and no reconnect**. a connection that drops stays
-dropped for the life of the process, so a postgres restart under a live
-deployment is not something a retry rides out: the runs in flight are left
-for a reclaimer and the process stops claiming new ones until it is restarted.
-sqlite has no equivalent: a file that comes back is a file that works again.
-
-a run whose write cannot land is left `running` with a lease that lapses; see
-the section above for what a reclaimer then does with it. **the process stops
-claiming** while its store is refusing writes, so a queue does not drain into
-something that cannot record it, and `GET /api/health` reports `ok: false`
-with the counts. `hestan doctor` asks a database directly whether it would
-take a write lock, which is the question a command line can answer from
-outside a deployment.
+PostgreSQL connections do not reconnect: restart the affected process. Runs
+left behind are handled by lease recovery. While writes fail, the process
+stops claiming work and `/api/health` reports `ok: false` with failure counts.
+`hestan doctor` can independently test whether the store accepts a write lock.
 
 ## Retention
 

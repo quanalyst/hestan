@@ -42,10 +42,8 @@ without anything reading the value having to guess.
 | `AssetRef(String)` | `{"asset": "orders"}` | a link to that asset |
 | `Saved(Sample)` | `{"saved": {…}}` | whatever it wraps, marked as a sample |
 
-that table grows: it gained `Series` and `Saved` already. `Meta` is
-`#[non_exhaustive]` for that reason, so a `match` on it from outside hestan
-wants a `_` arm, and rendering whatever the value holds as text is the right
-thing for that arm to do. see [stability](stability.md).
+`Meta` is `#[non_exhaustive]`; include a fallback arm when matching it.
+See [stability](stability.md).
 
 the obvious rust types convert on their own: `i64`, `i32`, `u32`, `f64`,
 `String`, `&str`, `std::time::Duration`, and `serde_json::Value` (which
@@ -186,30 +184,15 @@ own rows back, and hestan is handed the result.
 
 ### It is a snapshot, not a view
 
-what is stored is what the op read at the moment it called `saved`, stamped
-with that moment. a later write to the same table does not reach it, and
-nothing goes back to look again. that is correct for a record of what a run
-wrote, and it is **not** what "what is in the table now" means. the failure
-mode is somebody trusting it as live, so the run page leads with the sentence,
-every entry carries when it was taken, and a saved value anywhere else in the
-ui is marked `snapshot`.
+`ctx.saved` records the value and timestamp at the call. Later external changes
+do not update it. The UI marks saved values as snapshots and shows when they
+were taken.
 
 ### What the mark costs
 
-- **no delta and no trend.** `Meta::as_f64` reports no number for a saved
-  value, whatever it wraps, so `ctx.saved("rows", 1_234)` puts the number on
-  the page with no `+37` beside it. the unit a delta needs to render sits
-  inside the wrapper, where nothing computing over metadata looks. a key that
-  wants a delta wants `ctx.meta`.
-- **no per-asset form.** an op producing [several assets](assets.md) stages
-  per-asset facts with `meta_of`, and there is no `saved_of` beside it: write
-  `ctx.meta_of(asset, name, Meta::saved(value))`, which is the same thing
-  spelled out. an op producing one asset needs none of that, since `ctx.saved`
-  lands on the op run and on the materialization the way every other fact
-  does.
-- **marking twice is marking once.** `Meta::saved(Meta::saved(v))` is one
-  sample at the outer moment, not a wrapper around a wrapper for everything
-  downstream to unpick.
+Saved values do not participate in numeric deltas or trends; use `ctx.meta` for
+those. For a multi-asset op, use `ctx.meta_of(asset, name, Meta::saved(value))`.
+Nested `Meta::saved` calls collapse to one wrapper with the outer timestamp.
 
 ## The markdown subset
 
@@ -247,18 +230,9 @@ visible rather than silently dropped.
 
 ### Why it cannot inject
 
-the parser produces **data** (a tree of `{kind: "text" | "code" | "strong" |
-"em" | "link" | …}` nodes), and the renderer turns that data into react
-elements. no html string is built anywhere in the path, and nothing in the ui
-uses `dangerouslySetInnerHTML`, which the test suite asserts by scanning the
-source. so markup in a metadata value is a text child that react escapes, and
-the only href that can exist is one the http check above approved. this is
-injection being impossible by construction rather than by remembering to
-escape. that is the version worth shipping.
-
-`npm test` in `ui/` runs it: every construct above, a nesting case, and the
-two attacks (`<img src=x onerror=...>`, `[x](javascript:alert(1))`) asserted
-against the exact string react renders.
+The parser produces a node tree rendered as React elements. Raw HTML remains
+escaped text, and links accept only HTTP(S) targets. Tests cover each supported
+construct and HTML/script-link injection cases.
 
 ## Deltas
 

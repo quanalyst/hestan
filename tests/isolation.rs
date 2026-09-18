@@ -78,6 +78,15 @@ fn app(db: &str) -> Hestan {
 
 fn jobs() -> Vec<Job> {
     vec![
+        Job::builder("secret_child")
+            .op(Op::new("secret", |ctx: OpCtx| async move {
+                ctx.set_state(json!({"body_executed": true}));
+                Ok(json!(true))
+            })
+            .secret_params(["token"])
+            .isolated())
+            .build()
+            .unwrap(),
         // an isolated op, its output, and an ordinary op reading it
         Job::builder("feed")
             .op(Op::new("produce", |_| async {
@@ -376,6 +385,25 @@ async fn cases(db: &str) {
         [("solo".to_string(), 1)],
     )
     .unwrap();
+
+    case("isolated_secret_is_refused_before_the_body", async {
+        let run = runner
+            .run(
+                "secret_child",
+                json!({"token":"synthetic-secret-credential"}),
+                Trigger::Manual,
+            )
+            .await
+            .unwrap();
+        assert_eq!(run.status, hestan::RunStatus::Failed);
+        let op = runner.store().op_run(&run.id, "secret").unwrap().unwrap();
+        assert!(op.error.unwrap().contains("cannot restore secret params"));
+        assert_eq!(
+            runner.store().op_state("secret_child", "secret").unwrap(),
+            None
+        );
+    })
+    .await;
 
     case(
         "an_isolated_op_runs_elsewhere_and_its_output_reaches_downstream",

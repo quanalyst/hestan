@@ -1,12 +1,7 @@
 # Launching
 
-a launch is a job name and a json params value, and for a long time the ui
-offered exactly that: a textarea. this page covers what the launchpad grew
-around it: stored parameter sets, a schema the editor can read, tags on the
-run, and launching part of a job.
-
-everything here is optional. a job with no presets, no schema and no tags
-launches exactly as it always has.
+Launch a job with JSON params. Presets, schemas, tags, launch keys and op subsets
+are optional controls described below.
 
 ## Presets
 
@@ -73,17 +68,9 @@ hand-written object works identically.
 
 ### it is a ui aid, not a second validator
 
-the authority is and remains the serde round-trip: every launch deserializes
-the params into `P` before a run row exists. a schema that disagrees with `P`
-therefore **cannot admit anything `P` refuses**: it can only describe it
-wrongly, which makes a bad legend rather than a hole. params matching a lying
-schema and not the type are still a 400 at the launch, at
-`validate_params`, and at a preset write; params matching the type and not the
-schema still launch. nothing here is ever checked against a params value.
-
-that also means a schema without a `.params::<P>()` beside it describes params
-nobody validates, which is exactly as unvalidated as it was before the schema
-existed. the schema does not make it stricter.
+`.params::<P>()` validates by deserializing into `P` before a run is created.
+The JSON schema only describes fields to the editor; it cannot accept or reject
+params. Without `.params::<P>()`, the schema adds no validation.
 
 ### merging
 
@@ -209,14 +196,9 @@ command line prints the same id either way and says which happened;
 
 ### the store refuses it, not a check
 
-the key is the primary key of a table, and the insert that takes it is in the
-same transaction as the run row. so two callers arriving at the same instant on
-two connections produce one run because the **database** said no to the second,
-not because either of them looked first. that is the same mechanism a keyed
-[sensor](sensors.md#run-keys) and a [cron
-occurrence](scheduling.md#one-fire-per-occurrence) already rest on, and it is
-deliberate: a read-then-write is two callers away from a race, and no amount of
-locking in front of it changes that.
+The launch key is claimed in the same transaction as the run insert. Concurrent
+requests for the same key therefore create at most one run, including requests
+handled by different processes.
 
 ### the same key with a different request
 
@@ -245,14 +227,9 @@ what was passed, and it is the right way round.
 
 ### how long a key is honoured
 
-until [retention](storage.md#retention)'s age cutoff passes it. keys ride the
-same knob and the same cutoff as a sensor's run keys, on purpose: two lifetimes
-for two kinds of key would be two things to reason about. **with no retention
-policy configured nothing prunes either**, and a key is honoured for as long as
-the database lives.
-
-a key is also dropped with the run it names, so it can never hand back an id
-nothing can be looked up under.
+Launch keys use the same [retention](storage.md#retention) age cutoff as sensor
+run keys. Without retention they remain indefinitely. Deleting a run also drops
+its key, so a key never returns an ID for a deleted run.
 
 ### what it does not cover
 

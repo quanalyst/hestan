@@ -1563,6 +1563,8 @@ impl Runner {
     /// can: another process claimed the run, and a limit freed up somewhere
     /// nothing here was watching.
     async fn settle(&self, id: &str) -> Result<Run, Error> {
+        let mut leases = tokio::time::interval(HEARTBEAT);
+        leases.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             // registered before the status is read, so a run that finishes
             // between the two is not a wake-up missed
@@ -1576,6 +1578,7 @@ impl Runner {
             self.dispatch();
             tokio::select! {
                 () = waiter => {}
+                _ = leases.tick() => self.heartbeat(),
                 () = tokio::time::sleep(DISPATCH_POLL) => {}
             }
         }
@@ -1671,7 +1674,9 @@ impl Runner {
                 task: None,
             },
         );
+        let store = self.store.for_execution(&run);
         let task = tokio::spawn(execute(
+            store,
             job,
             run.id,
             run.params,
@@ -1848,6 +1853,32 @@ impl Runner {
         if let Err(e) = self.store.renew_leases(self.claimer, LEASE, &given_up) {
             tracing::warn!("lease renewal failed: {e}");
         }
+        let lost: Vec<String> = self
+            .active
+            .lock()
+            .unwrap()
+            .keys()
+            .filter_map(|id| match self.store.run(id) {
+                Ok(Some(run))
+                    if run.claimed_by.as_deref() == Some(self.claimer)
+                        && matches!(run.status, RunStatus::Queued | RunStatus::Running)
+                        && run.lease_until.is_some_and(|until| until >= Utc::now()) =>
+                {
+                    None
+                }
+                Ok(_) => Some(id.clone()),
+                Err(_) => None,
+            })
+            .collect();
+        for id in lost {
+            if let Some(active) = self.active.lock().unwrap().remove(&id) {
+                if let Some(task) = active.task {
+                    task.abort();
+                }
+                self.store.secrets().release(&id);
+                self.settled.notify_waiters();
+            }
+        }
         let durable = self.durable;
         let taken = match self.store.reclaim_expired(self.reclaim, |run| {
             durable.then(|| {
@@ -2011,7 +2042,7 @@ impl Runner {
         let mut reusable: HashMap<String, Value> = HashMap::new();
         for prev in self.resume_chain(&run)? {
             let rows = self.store.op_runs(&prev.id)?;
-            for (op, status, output) in fold_instances(&self.io, job, &prev.id, rows) {
+            for (op, status, output) in fold_instances(&self.io, job, &prev.id, rows, true) {
                 latest.entry(op.clone()).or_insert(status);
                 if let (OpStatus::Success, Some(output)) = (status, output) {
                     reusable.entry(op).or_insert(output);
@@ -2251,7 +2282,7 @@ impl Runner {
         let rows = self.store.op_runs(run_id)?;
         let ran = ran(job, &rows);
         let mut had: HashMap<String, Value> = HashMap::new();
-        for (op, status, output) in fold_instances(&self.io, job, run_id, rows) {
+        for (op, status, output) in fold_instances(&self.io, job, run_id, rows, false) {
             if let (OpStatus::Success, Some(output)) = (status, output) {
                 had.insert(op, output);
             }
@@ -2321,10 +2352,22 @@ impl Runner {
         let mut seeds: HashMap<String, Value> = HashMap::new();
         for name in &replayed {
             let op = job.op(name).expect("a replayed op is an op of the job");
+            let captured = job.name() == crate::asset::ASSETS_JOB
+                && crate::asset::validate_replay_inputs(
+                    &self.store,
+                    &self.io,
+                    run_id,
+                    name,
+                    &chosen,
+                )?;
             for dep in op.deps() {
                 // a dep being replayed too produces its own value, exactly as
                 // it did for this op the first time
                 if chosen.contains(dep) || seeds.contains_key(dep) || job.is_external(dep) {
+                    continue;
+                }
+                if captured {
+                    seeds.insert(dep.clone(), Value::Null);
                     continue;
                 }
                 let Some(value) = had.get(dep).or_else(|| given.get(dep)) else {
@@ -2334,26 +2377,19 @@ impl Runner {
                         job.name()
                     )));
                 };
-                // read back now rather than when the op asks: a handle whose
-                // file went with the run that wrote it resolves to nothing,
-                // and a replay that reproduces nothing should not launch. the
-                // value is dropped: the new run resolves it again through
-                // the manager, the way every run resolves a dep
                 let manager = self.io.manager(job.op(dep).and_then(Op::io_name));
                 let key = IoKey {
                     run_id: run_id.to_string(),
                     job: run.job.clone(),
                     op: dep.clone(),
                 };
-                if let Err(e) = manager.get(&key, value) {
-                    return Err(Error::ReplayInput {
-                        run: run_id.to_string(),
-                        op: name.clone(),
-                        dep: dep.clone(),
-                        reason: e.to_string(),
-                    });
-                }
-                seeds.insert(dep.clone(), value.clone());
+                let resolved = manager.get(&key, value).map_err(|e| Error::ReplayInput {
+                    run: run_id.to_string(),
+                    op: name.clone(),
+                    dep: dep.clone(),
+                    reason: e.to_string(),
+                })?;
+                seeds.insert(dep.clone(), resolved);
             }
         }
         let inputs: Vec<String> = job
@@ -2813,13 +2849,23 @@ fn fold_instances(
     job: &Job,
     run_id: &str,
     rows: Vec<OpRun>,
+    resolve_ordinary: bool,
 ) -> Vec<(String, OpStatus, Option<Value>)> {
     let mut folded: Vec<(String, OpStatus, Option<Value>)> = Vec::with_capacity(rows.len());
     let mut groups: HashMap<String, Folded> = HashMap::new();
     let mut unfoldable: HashSet<String> = HashSet::new();
     for row in rows {
         let Some((op, labels)) = instance_of(job, &row.op) else {
-            folded.push((row.op, row.status, row.output));
+            let output = if resolve_ordinary {
+                row.output.and_then(|held| {
+                    io.manager(job.op(&row.op).and_then(Op::io_name))
+                        .get(&io_key(run_id, job, &row.op), &held)
+                        .ok()
+                })
+            } else {
+                row.output
+            };
+            folded.push((row.op, row.status, output));
             continue;
         };
         // an op that names its instances by their element has no index to
@@ -2907,6 +2953,7 @@ pub(crate) async fn run_dispatcher(runner: Runner) {
 /// span into the task it starts, and every op runs in one.
 #[allow(clippy::too_many_arguments)]
 async fn execute(
+    store: Store,
     job: Job,
     run_id: String,
     params: Value,
@@ -2924,6 +2971,7 @@ async fn execute(
         trigger = %trigger
     );
     execute_in_span(
+        store,
         job,
         run_id,
         params,
@@ -2941,6 +2989,7 @@ async fn execute(
 
 #[allow(clippy::too_many_arguments)]
 async fn execute_in_span(
+    store: Store,
     job: Job,
     run_id: String,
     mut params: Value,
@@ -2952,7 +3001,6 @@ async fn execute_in_span(
     seeded: HashMap<String, Value>,
     run_span: tracing::Span,
 ) {
-    let store = runner.store.clone();
     let started_at = Utc::now();
     // set the moment a write that records what this run did will not land.
     // from there the run stops touching the store and stops touching itself:
@@ -2961,6 +3009,10 @@ async fn execute_in_span(
     let mut unrecorded = !store
         .landed("run_started", || store.run_started(&run_id, started_at))
         .await;
+    if unrecorded {
+        runner.abandon(&run_id);
+        return;
+    }
     note(store.append_event(
         &run_id,
         None,
@@ -3013,10 +3065,15 @@ async fn execute_in_span(
     // dropped when this function returns, which every way of a run ending
     // goes through, including the task being dropped from under it. it is
     // held for that and nothing else.
-    let scoped = resource::for_run(&runner.run_resources, &runner.resources, &run_id).await;
+    let scoped = tokio::select! {
+        biased;
+        _ = cancel.wait_for(|asked| *asked) => { canceled = true; None }
+        built = resource::for_run(&runner.run_resources, &runner.resources, &run_id) => Some(built),
+    };
     let resources = match &scoped {
-        Ok(scoped) => scoped.resources(),
-        Err(e) => {
+        None => resource::none(),
+        Some(Ok(scoped)) => scoped.resources(),
+        Some(Err(e)) => {
             // no op of this run can be true without it, so none of them runs
             // and every row says why
             let reason = format!("skipped: {e}");
@@ -3051,7 +3108,7 @@ async fn execute_in_span(
         run_error = Some(e);
     }
 
-    'run: while !unrecorded {
+    'run: while !unrecorded && !canceled {
         // settle every unit whose deps have all reached a terminal status: its
         // trigger rule either admits it or skips it here, and a skip is itself
         // terminal, so this repeats until a sweep settles nothing new.
@@ -4286,6 +4343,10 @@ fn io_key(run_id: &str, job: &Job, op: &str) -> IoKey {
 /// from a resume, or memoized by an asset build, which is why a manager's
 /// `get` has to pass through anything it did not write.
 async fn resolve(io: &Io, job: &Job, run_id: &str, op: &str, held: Value) -> Result<Value, String> {
+    // Asset wrappers read captured materializations with their producing IO keys.
+    if job.name() == crate::asset::ASSETS_JOB {
+        return Ok(held);
+    }
     let name = job.op(op).and_then(Op::io_name);
     crate::io::get(io, name, io_key(run_id, job, op), held)
         .await
@@ -6032,7 +6093,11 @@ mod tests {
         let runner = Runner::new([sleepy_job("etl", 30_000)], store.clone()).unwrap();
         let stale = Utc::now() - chrono::Duration::seconds(5);
         store
-            .plant_claim("mine", runner.instance(), Some(stale))
+            .plant_claim(
+                "mine",
+                runner.instance(),
+                Some(Utc::now() + chrono::Duration::seconds(5)),
+            )
             .unwrap();
         store
             .plant_claim("theirs", "somebody-else", Some(stale))
@@ -6559,8 +6624,16 @@ mod tests {
         assert_eq!(wait_terminal(&runner, &id).await, RunStatus::Failed);
         assert_eq!(took("failure").0, id);
 
-        // it was cancelled
+        // Cancel after construction: cancellation before construction now
+        // correctly creates no resource that would need dropping.
         let id = runner.launch("slow", json!({}), Trigger::Manual).unwrap();
+        until("the resource was constructed", || {
+            store
+                .op_run(&id, "nap")
+                .unwrap()
+                .is_some_and(|r| r.status == OpStatus::Running)
+        })
+        .await;
         assert_eq!(runner.cancel(&id).unwrap(), CancelOutcome::Requested);
         assert_eq!(wait_terminal(&runner, &id).await, RunStatus::Canceled);
         assert_eq!(took("cancellation").0, id);

@@ -154,26 +154,17 @@ the ui tags a backing-off sensor rather than leaving it looking merely slow.
 
 ## Probes are sensors
 
-every source asset with a [probe](assets.md) becomes an internal sensor
-named `probe:<asset>` on the same loop: same pausing, same tick history,
-listed by the same endpoint. its evaluation compares the probe's fingerprint
-against the stored one. a changed fingerprint rewrites the source
-materialization; then, changed or not, every descendant whose
-[automation policy](assets.md#automation-policies) wants a build is launched as
-one combined build run (trigger `build`), so
-`launched` is 1 when a run went out and 0 when nothing was owed.
+A source probe registers as `probe:<asset>` on the sensor loop, with the same
+pause controls and tick history. Changed fingerprints record a source
+materialization. Each evaluation also checks descendant automation policies and
+may launch one combined build, so `launched` is zero or one.
 
-re-deriving what is owed on every tick is the probe's self-heal. the
-fingerprint commits before the launch, so once it is written nothing in the
-data will ask for that build again: the source would have to change a
-second time. a launch that failed, or that was held because an
-[intersecting build](assets.md#builds-that-do-not-intersect-run-at-once) was
-already running, is therefore picked up by the next tick instead of stranding
-the descendant stale. the usual unchanged tick stays the cheap, boring `fired` /
-`launched: 0`.
+Policies are reevaluated even when the fingerprint is unchanged. A failed or
+conflicting launch can therefore retry on the next tick. See
+[probes and automation](assets.md#probes-and-auto).
 
-sensor names share one namespace: two sensors named alike, or a user sensor
-colliding with a probe or a `run:` name, fail startup with a graph error.
+Sensor names are unique across user sensors, probes and generated `run:`
+sensors. Collisions fail startup.
 
 ## Run-status sensors
 

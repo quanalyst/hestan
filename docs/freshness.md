@@ -1,7 +1,9 @@
 # Freshness
 
-a freshness policy is a claim you make about how current something should be,
-and hestan checks it for you:
+`fresh_within(d)` limits the age of the latest successful job run or asset
+materialization. Exceeding that age makes the item late. It does not trigger a
+build; use a schedule or [automation policy](assets.md#automation-policies)
+for that.
 
 ```rust
 Hestan::new()
@@ -11,14 +13,6 @@ Hestan::new()
     .serve(([127, 0, 0, 1], 4000))
     .await
 ```
-
-`fresh_within(d)` says: the latest success may be up to `d` old. past that,
-this is **late**, and that is worth waking someone for.
-
-it says nothing about rebuilding: a freshness policy alerts, and an
-[automation policy](assets.md#automation-policies) acts. an asset can carry
-both, and a `fresh_within` with nothing rebuilding the asset is a claim about
-work somebody else has to schedule.
 
 ## Fresh, late, never
 
@@ -55,30 +49,17 @@ already says so. an asset with no key built at all is `never`.
 
 ## Which wins: policy or overdue
 
-`overdue` is a heuristic: it guesses from the cron expression that a job which
-hasn't succeeded since its last fire is behind. `fresh_within` states the same
-thing outright, in the units you actually care about.
+A declared freshness policy replaces the cron-derived overdue heuristic.
+The API retains both fields, but `overdue` is false when `freshness` is present.
+Without a policy, scheduled jobs continue to use overdue status.
 
-so a declared policy **replaces** the heuristic. `GET /api/jobs` keeps both
-fields, and once `freshness` is non-null, `overdue` is always `false`: two
-answers to "is this job behind" is one answer too many. jobs that declare no
-policy keep the heuristic exactly as it was, and it needs a schedule to say
-anything at all.
-
-they also measure different things on purpose. `overdue` anchors on the
-schedule ("it was due at 09:00 and nothing has succeeded since"); a policy
-anchors on age ("nothing has succeeded for 24 hours"), which is meaningful for
-an asset built by a sensor, a probe or a hand, with no cron anywhere.
-
-freshness is also not [staleness](assets.md#provable-staleness). stale means a dep
-moved; late means time passed. an asset can be fresh and stale (a dep changed
-a minute ago), or late and not stale (nothing upstream moved, and nothing
-rebuilt it either).
+Freshness measures elapsed time. [Staleness](assets.md#provable-staleness)
+measures changed dependencies. An asset can be fresh but stale, or late while
+its upstream fingerprints remain unchanged.
 
 ## Alerting on it
 
-**the alert is the point; the badge is a side effect.** `on_late` registers a
-hook that fires when something crosses from fresh to late:
+`on_late` registers a hook for a transition into late status:
 
 ```rust
 Hestan::new()

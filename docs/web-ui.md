@@ -1,36 +1,18 @@
 # Web ui
 
-the ui is a react bundle compiled into the binary; at deploy time the
-executable is all there is. it polls the [json api](http-api.md) and works
-entirely from real state. eight pages: jobs (the overview at `/`), a job page,
-the asset catalog, an asset page, runs, a run page, a backfill page, and the
-activity feed at `/activity`.
+The embedded UI uses the [HTTP API](http-api.md). It provides Jobs, job details,
+Assets, asset details, Runs, run details, backfills and Activity. No separate
+frontend server is needed.
 
 ## Who is driving
 
-on a deployment with no [authentication](auth.md), which is the loopback
-default, the ui is what it always was: it asks nobody who you are and offers
-everything.
+On authenticated deployments, the UI checks `/api/whoami` and prompts for a
+token when needed. Tokens live in tab-scoped `sessionStorage`; closing the tab
+or choosing Forget removes them. See [authentication](auth.md) for limits.
 
-on one that checks, the ui asks `/api/whoami` before anything else and shows a
-token prompt if it holds nothing the deployment recognizes. the token lives in
-`sessionStorage`, scoped to the tab and dropped when it closes; the prompt says
-what that does not protect against, and
-[auth.md](auth.md#where-the-token-lives-and-what-that-does-not-protect-against)
-says it at length. who you are sits at the right of the header
-(`ada · admin`), with a way to forget the token where the tab is holding one.
-
-**a control your role may not use is not rendered.** a viewer's job page says
-`launching needs an operator` where the launch controls would be; cancel,
-re-run, resume, build, backfill, pause, presets and the queue's `bump` are
-absent the same way, and the palette does not offer the actions it would
-refuse. a button that answers 403 teaches people that the ui lies about what
-they can do.
-
-one thing changes shape rather than disappearing: the activity feed **polls**
-instead of following the live stream when the tab holds a token, because an
-`EventSource` cannot carry a header and the alternative is a credential in a
-url, and so in a log, and in the browser's history.
+The header shows the current identity and role. Controls unavailable to that
+role are hidden; API scope checks still apply to submitted actions. Authenticated
+Activity views poll because browser `EventSource` cannot send the token header.
 
 ## The status language
 
@@ -263,75 +245,26 @@ whole sentence ("when stale, once upstream is ready · 2026-08-14 waiting for
 
 ### Shade
 
-**this ui is black, white and grey, and shape carries state.** that is what
-leaves a second channel free, and it stays free only while it means one thing:
-a shade here is where an asset [belongs or where it came
-from](assets.md#group), and never how it is doing. the moment a shade meant
-"failed" the channel would be carrying two answers and neither reliably.
+Choose `by group`, `by origin` or `no shade` beside the graph. This is separate
+from execution status, which uses shapes. The URL stores the choice as `shade`;
+legacy `colour` links are still accepted.
 
-the toggle beside the graph picks which: `by group`, `by origin`, or
-`no shade`. one meaning at a time, because two meanings on one screen is noise,
-and the choice is in the url like every other view state, under `shade`
-(`colour` is still read there, which is what that parameter was called before
-this ui went monochrome, so a link saved then still opens in the mode it was
-saved in). **`no shade` takes the shading off altogether**, which is both
-something somebody will want and the proof that the channel carries nothing on
-its own.
+Stable [hue values](assets.md#hue) map to six theme-aware ink shades. Labels
+can share a shade; names and the legend identify them. `hestan doctor` reports
+collisions, and `Asset::hue(n)` can adjust a label's mark.
 
-the server sends an [angle](assets.md#hue) and this end spends it as ink:
-`at` in `Swatch.tsx` folds the angle onto one of six shades of `--ink`, and
-each place spends that fraction differently, because a 4px stripe wants nearly
-all of the ink and a band read through has to stay under the name on top of it.
-`--ink` flips with the theme, so a light ground gets a dark mark and a dark
-ground a light one without a second palette to keep in step.
+Multiple origins use separate stripes in name order, never a blended shade.
+After three stripes, `+k` indicates additional origins, still listed in the
+legend and asset details. The asset detail page names group and origins without
+shading them.
 
-**six shades is the whole of the channel, and it is smaller than it looks.**
-an angle is folded with `hue % 6`, so two labels a hundred degrees apart can
-land on one shade and two a degree apart need not; past six labels some pair
-must share one whatever anybody does. that is why every mark has its name
-written beside it and why the legend names all of them: the shade is what makes
-a set of rows findable at a glance, and the name is what says which. `hestan
-doctor` reports the labels that share a mark, and
-[`Asset::hue(n)`](assets.md#hue) moves one where there is room to move it.
+Derived assets offer Build; sources do not. A launched build opens its run,
+while an unnecessary build reports “up to date.” Build stale combines stale
+assets into one run. Backfills appear below the table with progress, current
+chunk and cancellation controls.
 
-the angle the api serves is the wider thing, and a consumer that paints in
-colour has 360 of them to spend rather than six; the check in `doctor` is about
-what *this* ui draws, because that is the one somebody is looking at. what
-makes the sharing survivable is below.
-
-three things follow from "a shade is never the only carrier":
-
-- a **legend** under the graph names every label in the view. without it a
-  mark is decoration.
-- every swatch sits beside its own name: the group's on the section heading it
-  belongs to, the origins' in the row's own `descends from` cell.
-- an asset descending from several sources gets a **split swatch, one stripe
-  per source in name order, never a blend.** averaging two shades produces a
-  third shade, and a third shade stands for a source nobody has. past three
-  stripes the rest become `+k`, and they are still named in the legend and on
-  the asset's own page.
-
-the asset's own page carries no shading at all: one asset is nothing to tell
-apart from anything, and a group's mark beside an origin's would be two
-meanings of one channel on one screen. it says both in words instead, the
-group beside the kind and what it descends from under its lineage.
-
-every derived row has a `build` action; sources have none, since the endpoint
-400s on them. a launched build (202) navigates straight to the new run, while
-a build that finds nothing to do reports "up to date" inline. when any asset
-is stale the header shows a "build stale" button that materializes every stale
-asset as a single run.
-
-a **backfills** section appears under the table once any exist: the id
-(linking to [its page](#backfills)), the asset, the range, how many partitions
-have been launched against the total, the status in the usual shapes, a link
-to the chunk running now, and a cancel action while one is running.
-
-asset builds are ordinary runs of the internal `assets` job, so the run
-page, gantt, cancel, and re-run all apply unchanged; the `assets` job
-appears on the jobs overview like any other job, and asset build runs carry
-the `build` trigger on the runs page. checks are ops of that same job, so
-they appear in its dag and gantt as `check:{asset}:{check}` nodes.
+Builds and checks execute in the internal `assets` job. Their run pages provide
+the same timeline, logs and cancellation controls as other jobs.
 
 ## The asset page
 
@@ -741,7 +674,8 @@ is a row of its own rather than a silence.
 
 ## Command palette
 
-`cmd-k` / `ctrl-k` anywhere. it searches jobs (name and description), the 50
+`cmd-k` / `ctrl-k` anywhere. It searches jobs (persistent name, display name
+and description), the 50
 most recent runs (id, job, status, trigger), and, for an admin, schedule
 actions, pause and resume for every schedule. the query is tokenized; every token must match.
 arrows move, enter performs, escape closes, tab is trapped so focus stays in
@@ -750,17 +684,7 @@ prints the server's error at the foot of the palette.
 
 ## Empty states
 
-nothing in the ui fakes data. an empty database says "no runs yet: launch
-one to get started"; a timeline with no runs in the window says so; a job
-with no schedules has no schedules section; sparklines and gantt
-render nothing rather than placeholder marks. the assets page with nothing
-registered says so; a never-built asset says so rather than showing a
-fingerprint it would have to invent; and the sensors table only exists when
-sensors do.
-
-the ones this ui adds to that list: an asset never built says so and offers
-the build button rather than showing an empty history; an asset with no check
-shows nothing where a table of no rows would go; a backfill estimate with no
-timings behind it says there are none; a graph search that matches nothing
-marks nothing; and a url naming an asset or a backfill that does not exist
-says exactly that, as a missing run does.
+Empty views explain what is missing: no runs in the selected window, no
+registered assets, no materialization yet or no timing data for an estimate.
+Unknown IDs show a missing-item message. Charts do not invent placeholder data;
+optional sections appear only when relevant.

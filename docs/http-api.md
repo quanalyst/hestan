@@ -1,19 +1,16 @@
 # Http api
 
-everything lives under `/api`, speaks json, and is what the ui itself runs
-on: there is no privileged path. the one exception is `/metrics`, which is
-prometheus text rather than json and is not under `/api` because a scrape
-looks for it where every other exporter puts it. errors are always
-`{"error": "<message>"}` with an appropriate status: 400 for bad input
-(malformed query parameters included), 404 for unknown names, 409 for a
-request that conflicts with reality (a retry or resume of a run still active
-or whose job has left the code, a resume of a run that succeeded, a cancel of
-a finished run, an asset build while one is already running), 500 for storage
-failures. timestamps are rfc3339 strings in utc.
+Endpoints under `/api` use JSON; `/metrics` uses Prometheus text. Errors are
+`{"error": "<message>"}`. Timestamps are UTC RFC3339 strings.
 
-nothing below has to be reached with `curl`: `hestan --server <url> <command>`
-speaks this api and prints the same objects ([the command line](cli.md)). this
-page is for writing something that is not hestan.
+| Status | Meaning |
+| --- | --- |
+| 400 | Invalid input, including malformed query parameters. |
+| 404 | Unknown resource. |
+| 409 | Conflicting request, such as retrying a live run or an overlapping asset build. |
+| 500 | Storage failure. |
+
+The UI and `hestan --server <url>` use this same API.
 
 | method | path | purpose |
 | --- | --- | --- |
@@ -71,9 +68,9 @@ page is for writing something that is not hestan.
 
 ## Who may call it
 
-a deployment with no [authenticator](auth.md) configured answers everybody, and
-`serve` will only bind loopback under it. one with an authenticator wants a
-credential on every call but two:
+Without an [authenticator](auth.md), `serve` requires loopback unless
+`Auth::None` explicitly enables external access. Authenticated deployments
+require credentials except for the public routes described below:
 
 ```
 $ curl -H 'Authorization: Bearer '"$HESTAN_TOKEN" https://hestan.internal/api/runs

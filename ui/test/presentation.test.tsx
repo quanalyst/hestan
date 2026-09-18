@@ -104,3 +104,28 @@ test("collapsed same-named subgroups include their parents on the graph", () => 
   const collapsed = collapseHierarchy(items.map((i) => ({ name: i.name, deps: [] })), hierarchy(items), new Set([subgroupKey("a", "shared"), subgroupKey("b", "shared")]));
   assert.deepEqual(collapsed.nodes.filter((n) => n.badge).map((n) => n.display_name), ["a / shared", "b / shared"]);
 });
+
+test("collapsed dependency cycles render finite coordinates in every grouping view", async () => {
+  const { default: DagView } = await import("../src/DagView");
+  const { layersOf } = await import("../src/dag");
+  const data = [
+    { name: "a1", group: "A", subgroup: "shared", labels: { arbitrary: "X" }, deps: [] },
+    { name: "b", group: "B", subgroup: "shared", labels: { arbitrary: "Y" }, deps: ["a1"] },
+    { name: "a2", group: "A", subgroup: "shared", labels: { arbitrary: "X" }, deps: ["b"] },
+  ];
+  assert.deepEqual([...layersOf(data).values()], [0, 1, 2]);
+  const declared = hierarchy(data);
+  const projected = hierarchy(data, ["label:arbitrary", "group"]);
+  for (const [sections, keys] of [
+    [declared, declared.map((s) => s.key)],
+    [declared, declared.flatMap((s) => s.children.map((c) => c.key))],
+    [projected, projected.map((s) => s.key)],
+  ] as const) {
+    const folded = collapseHierarchy(data, sections, new Set(keys));
+    assert.equal(folded.nodes.length, 2);
+    assert.equal(folded.nodes.reduce((n, node) => n + node.deps.length, 0), 2);
+    const html = renderToStaticMarkup(<DagView nodes={folded.nodes} />);
+    assert.ok(!html.includes("NaN") && !html.includes("Infinity"), html);
+    assert.equal((html.match(/<path /g) ?? []).length >= 2, true);
+  }
+});

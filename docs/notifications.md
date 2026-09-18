@@ -229,11 +229,8 @@ is the next section.
 
 ## Durable delivery
 
-a hook is a `spawn_blocking` call. if the post fails the alert is gone; if the
-process dies between the run finishing and the hook running, the alert was
-never sent and nothing anywhere records that it should have been. for a hook
-whose job is to tell a human, that is the failure mode that matters: the
-outage that kills the process is exactly the one you wanted to hear about.
+Ordinary hooks are best-effort callbacks. Enable durable run notifications to
+persist delivery work:
 
 ```rust
 Hestan::new()
@@ -241,36 +238,19 @@ Hestan::new()
     .on_run_finished(hestan::notify::slack(url))
 ```
 
-**off by default, and meant to stay off for most people.** an embedder whose
-hook bumps a counter or writes a line wants a callback, not a table and a
-delivery loop; the ordinary dispatch costs nothing and loses nothing that
-matters.
+The notification row commits with the terminal run row, including runs failed
+by lease recovery. The active decider delivers due rows; register hooks on
+scheduler/all-role processes. `run_once` and `build_asset` attempt delivery
+before returning.
 
-with it on, each run's terminal event is written to the `notifications` table
-**in the same transaction as the run's terminal row**. that is the whole of
-what this buys: written afterwards, a crash in the gap leaves a failed run
-nothing ever alerted about and no record that anything was owed. a run failed
-by the [lease reclaimer](scaling.md) is written the same way, in the
-transaction that fails it.
-
-a delivery loop then takes what is due, hands it to the hooks, and marks it
-delivered. it belongs to the process that [decides](scaling.md) (`Role::All`
-or `Role::Scheduler`), so register the hooks there; two processes delivering
-would send every alert twice. `run_once` and `build_asset` deliver once before
-they return, since nothing else in that process will.
+Durability covers callback invocation. The built-in HTTP helpers have additional
+limits described under [retry](#retry-and-giving-up).
 
 ### At-least-once
 
-**a hook can see the same event twice, and must tolerate it.** a crash between
-a hook returning and the row being marked delivered re-delivers on the next
-pass, because the alternative is marking first and losing the delivery
-instead. of those two, a receiver seeing an alert twice is the one you
-can do something about. key on `run_id` if it matters. exactly-once needs the
-receiver's cooperation and hestan will not pretend otherwise.
-
-one hook failing fails the row, so hooks that already succeeded will see the
-event again on the retry. that is the same rule, stated for the case that
-surprises people.
+A crash after a hook returns but before delivery is marked can invoke it again.
+Use `run_id` to deduplicate when needed. If one hook fails, the whole row retries,
+including hooks that already succeeded.
 
 ### Retry and giving up
 
@@ -304,7 +284,5 @@ not history, it is something outstanding.
 
 ### What it covers
 
-run events. op hooks and `on_late` stay in-process and best-effort: they fire
-per attempt and per poll, and writing a row for every one of those is a
-different bargain than the one this makes. if you need an op-level event to be
-durable, hand it to your own queue from the hook.
+Durable delivery covers run events only. Op hooks and `on_late` remain
+best-effort; forward them to your own durable queue if required.

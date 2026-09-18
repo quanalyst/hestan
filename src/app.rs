@@ -1586,6 +1586,9 @@ impl Hestan {
         {
             return Err(Error::NotResettled(copy.describe()));
         }
+        for job in &jobs {
+            store.secrets().declare(job.name(), job.secret_params());
+        }
         store.fail_interrupted()?;
         store.sync_schedules(&schedules)?;
         // seeded, not synced: the launchpad's presets share the table, so
@@ -2341,9 +2344,22 @@ mod tests {
             .unwrap();
         drop(store);
 
+        let claimed = Store::open(&path).unwrap();
+        claimed
+            .plant_claim(
+                "mine",
+                "parent",
+                Some(chrono::Utc::now() + chrono::Duration::minutes(1)),
+            )
+            .unwrap();
+        let claim = claimed
+            .for_execution(&claimed.run("mine").unwrap().unwrap())
+            .execution_claim()
+            .cloned();
         let req = crate::isolate::Request {
             run_id: "mine".into(),
             op: "quick".into(),
+            claim,
         };
         let mut app = Hestan::new().job(job).db(path.clone());
         let worked = app.ran_op_subprocess(req).await.unwrap();

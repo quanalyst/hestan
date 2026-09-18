@@ -1,83 +1,38 @@
 # Logs
 
-there are two logs on a run page and they are not the same thing.
+Run pages show [structured events](events.md) and captured operation output.
+Use events to follow execution state and captured logs to diagnose operation
+behavior.
 
-the **run log** is hestan narrating: `run_started`, `op_retry`,
-`type_check_failed`, and whatever `ctx.info/warn/error` said. it is
-[events](events.md), it is structured, and it is what the run page
-has always shown.
+| Operation | Captured output | Setup |
+| --- | --- | --- |
+| [Isolated operation](isolation.md) | stdout and stderr | Automatic |
+| In-process operation | `tracing` events | Enable `capture` and install its layer |
+| Subprocess started by Hestan, including dbt | stdout and stderr | Automatic |
 
-**captured output** is what the op itself produced: the `println!` of a
-subprocess, the `tracing` events a library it called emitted. hestan used to
-drop all of it, which meant every op that calls a real library was half
-invisible: the run log said "attempt 1 failed", and the reason was on a
-terminal nobody was watching.
-
-the obvious answer is to scrape a step's stdout and stderr into a text blob.
-hestan does better than that in one case and refuses to do worse in the other,
-and the split is the whole design:
-
-| the op                                  | what is captured                              | how                                     |
-| --------------------------------------- | --------------------------------------------- | --------------------------------------- |
-| [isolated](isolation.md) (a subprocess)  | **everything**, verbatim, both pipes           | always on, no configuration             |
-| in process                               | its `tracing` events, with level and target    | the `capture` feature's layer, opt in    |
-| a process hestan itself spawned          | **everything**, verbatim, both pipes           | always on; a [dbt](dbt.md) model's `dbt run` is one |
+All capture is subject to the limits below.
 
 ## Why an in-process `println!` is not captured
 
-fd 1 belongs to the process, not to the op. hestan is a library inside your
-binary: redirecting stdout process-wide to catch an op's `println!` would take
-*your* application's output with it (your startup banner, your web server's
-access log, anything else running in that process) and hand it to whichever
-op happened to be running at the time. a library has no business doing that,
-so hestan does not.
-
-that is an honest limit and it is stated here rather than discovered later:
-**`println!` inside an in-process op goes to your stdout and nowhere else.**
-
-what an in-process op does emit that hestan can capture is `tracing` events,
-and those are the better half of the trade anyway. an event carries a level, a
-target, fields and a message. those are structured records rather than a
-scraped blob, so the pane can filter them by level and say which module they
-came from.
-
-an isolated op is a subprocess whose stdout and stderr belong to hestan alone,
-so there the answer is simply everything.
+In-process stdout belongs to the whole application and cannot be attributed
+reliably to concurrent operations. `println!` therefore goes to the application's
+stdout. Use `tracing` with the capture layer, or `ctx.info`, `ctx.warn` and
+`ctx.error` for structured events.
 
 ## Subprocess capture
 
-nothing to switch on. an [isolated op](isolation.md)'s parent pipes the
-child's stdout and stderr, reads both, tags each line with its stream, and
-stores it under that attempt. so does anything else hestan starts a process
-for: a [dbt](dbt.md) model's `dbt run --select` goes through the same reader,
-under the same caps.
-
-both pipes are drained **concurrently**, by a task each. this is not a
-detail: reading stdout to its end and stderr afterwards leaves stderr's pipe
-buffer to fill, and a child blocked writing into a full pipe never exits. the
-parent then waits forever for a process waiting for the parent. it looks like
-a slow op under load rather than like a bug.
-
-- per-stream order is exact. the two streams interleave in the order the lines
-  arrived, which is all a pipe can honestly tell you. hestan does not try to
-  merge them by timestamp beyond that.
-- a child that dies mid-line keeps what it wrote, and so does one that is
-  killed or aborts without recording a result. the pipes are drained *after*
-  the kill, because a pipe ends when the process holding the other side of it
-  is gone. for a segfault, what the op printed is usually the only evidence
-  there is.
-- a child that printed nothing stores no rows at all, rather than a marker
-  saying it was quiet.
-- a retry is a fresh child and its output is stored under its own attempt, so
-  what the attempt that failed printed is still there beside what the attempt
-  that worked printed.
+Hestan drains a child's stdout and stderr concurrently and stores lines under
+the operation attempt. Order within each stream is preserved; interleaving
+reflects arrival order. Partial final lines survive process exit or termination.
+A retry gets a separate attempt and log budget. A silent child creates no log
+rows.
 
 ## The tracing layer
 
 opt in, behind the `capture` feature:
 
 ```toml
-hestan = { version = "0.1", features = ["capture"] }
+hestan = { version = "0.2.5", features = ["capture"] }
 ```
 
 hestan does not install a subscriber (that is yours), so what it offers is a
@@ -127,37 +82,19 @@ attempt rather than hiding it.
 
 ## Caps
 
-**capping is a correctness property, not a nicety.** an op in a `println!`
-loop would otherwise fill the disk the run log lives on, and a run log that
-ran out of room records nothing at all, including the failure you were trying
-to read about.
+| Limit | Default |
+| --- | --- |
+| `Hestan::log_limit(bytes)` | 1 MiB per attempt |
+| `Hestan::log_lines(n)` | 10,000 lines per attempt |
+| Single line | 8 KiB, clipped with `… [truncated]` |
 
-| cap                        | default | what it is                                 |
-| -------------------------- | ------- | ------------------------------------------ |
-| `Hestan::log_limit(bytes)` | 1 MiB   | how much one **attempt** may store         |
-| `Hestan::log_lines(n)`     | 10,000  | how many lines one attempt may store       |
-| a single line              | 8 KiB   | clipped, with `… [truncated]` on the end   |
+stdout and stderr share an attempt's budget. Once a cap is reached, capture
+records a truncation notice and stops storing further output. The operation
+continues and pipes are still drained. Each retry starts with a fresh budget.
 
-per attempt, not per op or per run: a retry starts from a full budget, since
-the attempt that failed is usually the one worth reading. an isolated op's two
-pipes share one attempt's budget, because the limit is on what the attempt
-produced and not on which pipe it came out of.
-
-past either cap, capture stops for that attempt and **one line** says what was
-dropped and why. the op carries on running: capture stopping is not the op
-failing, and the parent keeps reading the pipes so a chatty child never blocks
-on one nobody is draining.
-
-the caps apply to every capture in the process, the layer included. that
-matters because you hand `capture_layer` a `Store` you opened yourself: a cap
-that only covered the writers hestan happened to build would be a cap that
-quietly does not hold.
-
-the layer never makes the emitting thread wait on the store. events go into a
-bounded buffer and a writer thread stores them; if an op fills the buffer
-faster than it drains, the excess is **dropped and counted**, and one line
-says how many. a gap that says it is a gap is worth something; one that does
-not is worse than nothing.
+The tracing layer uses a bounded writer buffer so emitting threads do not wait
+on database writes. Overflow is dropped and counted in a notice. Capture limits
+apply to both subprocess output and the tracing layer.
 
 ## Reading it
 
@@ -193,16 +130,6 @@ point everyone wants to grep it, which is also what
 
 ## Where it lives
 
-one table, `op_logs`, with a row per line; see [storage](storage.md). the
-`stream` column is `stdout`/`stderr` for subprocess capture and null for a
-captured event; `level` and `target` are the other way round. exactly one half
-is filled, and which half says where the line came from.
-
-it is not `events`. a chatty op would otherwise bury the eight lines that
-describe what the run actually did, and those two things deserve to be
-readable apart.
-
-[retention](storage.md#retention) takes captured output with its run. a
-[reclaimed](scaling.md) run goes back to the queue rather than to a terminal
-state, so what its first claimer captured is still there when the second one
-finishes it.
+Captured lines live in `op_logs`. Pipe output has a `stream`; tracing output has
+`level` and `target`. [Retention](storage.md#retention) removes logs with their
+run. Reclaiming a run preserves logs from its previous execution attempts.

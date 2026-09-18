@@ -32,12 +32,8 @@ cancellation all mean what they meant.
 
 ## Per op, not per job
 
-the usual shape is an executor chosen for a whole job: every step pays a fresh
-process and a reload of your code, whether or not it was ever going to crash.
-
-isolation here is a property of the op. one risky parser is contained while
-the other forty ops in the same job stay in-process and free. that is possible
-because the child is not a runtime being loaded: it is this binary, again.
+Apply `.isolated()` to individual ops. Other ops in the job continue in-process;
+there is no job-wide isolation requirement.
 
 ## An op subprocess is not a queue worker
 
@@ -278,25 +274,10 @@ three things to know about them:
 
 ## What it costs
 
-a process spawn per attempt. it is milliseconds, not the seconds an
-interpreter start costs, because there is no runtime to load and no code to
-re-import. it is not free, though, and it is per *attempt*, so a retried
-isolated op spawns again.
-
-the child also rebuilds what the parent built: it opens the store and
-constructs every [resource](resources.md) your builder declares. a resource
-whose constructor takes two seconds makes every isolated op cost two seconds.
-
-and both processes write the same run log. on sqlite that is one file two
-writers share, which is what the busy timeout on every connection is for; on
-postgres they are two ordinary clients of the same server and there is nothing
-to arrange. writes here are small and rare either way (a row and a few events
-per op), so this is not a throughput concern at the scale hestan is built for,
-but on sqlite it is why isolation wants a real database file rather than a
-tmpfs afterthought.
-
-reach for `isolated()` on the op that parses untrusted input, calls into a c
-library, or blocks in a way you cannot interrupt. leave the other forty alone.
+Each attempt starts a fresh copy of your binary, opens the store and rebuilds
+resources. Constructor time is paid for every child. There is no process pool
+or reuse. Parent and child both write the store; SQLite connections serialize
+through the file lock and busy timeout.
 
 ## Limits of the feature
 

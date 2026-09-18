@@ -1,13 +1,8 @@
 # Backup and recovery
 
-hestan's whole state is one store: a sqlite file or a postgres database. so a
-backup is a copy of that one thing, and there is very little to it.
-
-what there *is* to it is the other half of this page: a restored store is a
-statement about a moment that has passed. the rows in it were true when the
-copy was taken, and every claim, lease and `running` status in them describes
-processes that are somewhere else. that is what has to be dealt with before a
-deployment comes up on one.
+Back up the Hestan store and any external IO-manager files. Before starting
+from a restored store, resettle its recorded leases and active runs. Restoring
+history does not reverse work already performed in external systems.
 
 ## Taking a copy
 
@@ -280,14 +275,13 @@ then, in rough order of how much they hurt:
 
 ## Testing a backup
 
-the only backup worth having is one that has been restored. a copy is a
-complete run log, so:
+Restore into an isolated environment, then inspect it:
 
-```
+```sh
 hestan resettle --db copy.db --watch 0
 hestan doctor --db copy.db
 hestan runs --db copy.db --limit 20
 ```
 
-three commands, on a copy, on any machine. if `doctor` is happy and the runs
-you expect are there, the copy is good.
+Check expected history and resolve representative external output handles.
+A successful store check alone does not verify IO-manager files.

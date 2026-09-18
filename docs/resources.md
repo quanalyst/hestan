@@ -1,20 +1,15 @@
 # Resources
 
-a *resource* is a value hestan builds and hands to the ops that ask for it by
-name: an http client, a connection pool, a parsed config, a scratch directory.
-it is what replaces capturing a client in a closure.
+Resources are named values supplied to operations: clients, connection pools,
+configuration or temporary directories.
 
-there are two scopes, and which one you want is a question about how long the
-value should live:
+| Declaration | Created | Released |
+| --- | --- | --- |
+| `Hestan::resource` | At startup | With the process's resource registry |
+| `Hestan::run_resource` | When a run starts | When the run ends, subject to retained `Arc` handles |
 
-| declared with | built | dropped | for |
-| --- | --- | --- | --- |
-| `Hestan::resource` | once, at startup | when the process ends | a pool, a client, a config, or anything else every run may share |
-| `Hestan::run_resource` | when a run starts | when that run ends | a scratch directory, a per-tenant client, a token that belongs to one execution |
-
-ops read either with `ctx.resource::<T>(name)` and declare either with
-`Op::requires([name])`. the call site is the same on purpose: how long a value
-lives is the deployment's decision, not the op's.
+Read either scope with `ctx.resource::<T>(name)` and declare requirements with
+`Op::requires([name])`.
 
 ```rust
 Hestan::new()
@@ -30,20 +25,13 @@ Hestan::new()
 
 ## Why not a closure
 
-capturing works right up until it doesn't. two ops that each capture their own
-client are two clients, and two connection pools, and two sets of credentials
-read from the environment at slightly different moments. a client that is
-expensive to build gets built per op, or gets built once and then threaded
-through every closure by hand. and nothing anywhere can say what the process
-actually holds.
-
-a resource is one value, named, built once, and reportable.
+Closures can capture clients directly. Named resources additionally provide
+shared construction, startup validation and an inspectable list of types and
+scopes. Use a process resource for connections shared across runs.
 
 ## Building them
 
-the constructor is **async and fallible**, which is the point. most real
-clients need a handshake, a file read, or an environment variable that might
-not be there:
+Constructors are async and fallible:
 
 ```rust
 .resource("db", |_| async {
@@ -54,9 +42,7 @@ not be there:
 
 resources are built during `Hestan::build`, **before the store is opened**. a
 constructor that returns `Err` aborts startup with
-`Error::Resource { name, reason }`, and the store is never opened: a process
-whose api client could not be built has nothing useful to serve, and should
-not leave a run log behind implying otherwise.
+`Error::Resource { name, reason }`.
 
 they are built in declaration order, and each constructor is handed a
 `ResourceCtx` holding the ones declared before it. that is how a client leans
@@ -141,27 +127,13 @@ it, because there was no run for it to belong to.
 
 ### When it is dropped
 
-when the run ends, by **every** route: it succeeded, it failed, it was
-cancelled, or the process gave up on recording its outcome. the value is held
-by the task driving the run and by nothing else, so what drops it is that task
-ending, including the task simply being dropped when the process stops caring
-about the run.
+Run resources are released when execution ends, including failure and
+cancellation. Hestan schedules cleanup on the blocking pool; if the runtime is
+already shutting down, normal value destruction applies.
 
-dropping happens **on the blocking pool**, not on the async runtime. a `Drop`
-that removes a directory or closes a socket blocks, and the task driving a run
-is the one thread that must not, which is the same reason [io manager
-calls](io-managers.md) go to the pool. a runtime already shutting down runs
-nothing new and drops what it was handed instead: still off the run's stack,
-still dropped.
-
-the one limit is the one `Arc` always has: an op that kept its handle past the
-end of the run holds the value up until it lets go, and the drop then happens
-wherever that is. hestan cannot see the end of work that keeps nothing of
-hestan's.
-
-**an isolated op** runs in a child process, which builds the run's resources
-for itself: its own copy, dropped when the child exits, exactly as a
-process-wide resource in a child is that process's copy and not the parent's.
+An operation retaining an `Arc` beyond the run extends the resource lifetime;
+its final drop occurs wherever that last handle is released. Isolated
+operations construct their own resources in the child process.
 
 ## Lifetime
 
@@ -188,3 +160,6 @@ return.
 a resource is usually a client holding credentials, so the api has no business
 showing what is inside one. `GET /api/jobs/{name}` reports each op's
 `requires`, and the op inspector shows it beside the pool and timeout.
+
+Cancellation also interrupts pending run-resource construction and releases the
+resources already constructed for that run. A constructor panic fails the run.

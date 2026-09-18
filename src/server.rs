@@ -1406,14 +1406,29 @@ pub(crate) fn assets_json(registry: &AssetRegistry, store: &Store) -> Result<Val
                 .filter(|(_, m)| !m.is_identity())
                 .map(|(dep, m)| json!({ "dep": dep, "mapping": m.label() }))
                 .collect();
+            let execution_summary = {
+                let (failed, running) = execution
+                    .iter()
+                    .filter(|(name, _, _)| {
+                        meta.op.as_ref().is_some_and(|op| {
+                            name == op
+                                || (meta.partitions.is_some()
+                                    && name.strip_prefix(op).is_some_and(|tail| {
+                                        tail.starts_with('[') && tail.ends_with(']')
+                                    }))
+                        })
+                    })
+                    .fold((0usize, 0i64), |(failed, running), (_, status, active)| {
+                        (failed + usize::from(status == "failed"), running + active)
+                    });
+                json!({ "failed": failed, "running": running })
+            };
             json!({
                 "name": meta.name,
                 "display_name": meta.display_name,
                 "subgroup": meta.subgroup,
                 "labels": meta.labels,
-                "execution": meta.op.as_ref().and_then(|op| execution.iter().find(|(name, _, _)| name == op))
-                    .map(|(_, status, running)| json!({ "failed": usize::from(status == "failed"), "running": running }))
-                    .unwrap_or_else(|| json!({ "failed": 0, "running": 0 })),
+                "execution": execution_summary,
                 // whose it is: what it declared, and null in a deployment that
                 // declares no namespaces. not the group below, which is a
                 // label on the graph and falls back to the name

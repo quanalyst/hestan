@@ -304,83 +304,32 @@ next resume, which would seed a handle to nothing.
 
 ## What a backup does not contain
 
-the counterpart to the section below, and the one nobody expects. a manager
-puts op outputs **outside** the store, so a copy of the store holds the handles
-and none of what they point at. restore a run log without the directory beside
-it and you have materializations that say an asset is built, with a fingerprint
-and a row count, pointing at parquet that is not on this machine. nothing in
-the store can tell you, and nothing checks until a build, a resume or a replay
-tries to read one.
-
-so the directory is part of the backup, from the same instant.
-[backup and recovery](backup.md#what-a-copy-does-not-contain) is the whole of
-it.
+The store contains output handles, not external files. Back up IO-manager
+directories consistently with the store. Missing files are discovered when a
+build, resume or replay resolves their handles; fingerprints alone do not
+check file existence. See [backup and recovery](backup.md#what-a-copy-does-not-contain).
 
 ## What retention takes
 
-a run's rows are the only record that the run existed. so when
-[retention](storage.md#retention) prunes a run it asks **every registered
-manager** to drop what that run stored, and it does that **before** deleting
-the rows:
+For each run selected by [retention](storage.md#retention), Hestan calls
+`drop_run(run_id, job)` on every registered manager before deleting its rows.
+Managers must make this operation idempotent: a crash can cause it to repeat.
 
-1. read the ids this job's policy may no longer keep
-2. `drop_run(run_id, job)` on every manager, for each of them
-3. delete the rows
-
-that order is not arbitrary. rows first, and a crash in between loses the
-ids: nothing is left that knows which files to collect, and the leak is
-permanent. files first, and a crash leaves rows pointing at outputs that are
-gone, for runs already past retention, which the next sweep deletes anyway.
-which is also why `drop_run` has to be idempotent: it will be asked twice.
-
-every manager rather than the one each op selected, because which manager
-wrote a given run's outputs is a question about a job the sweeping process
-may no longer define. a manager that stored nothing for that run does
-nothing, which is what makes asking all of them cheap.
-
-a manager that **cannot** drop something is logged and the sweep carries on,
-to the rest of that job's rows and to the next job. a file left behind is one
-run's worth of waste that whoever owns the directory can still find; a sweep
-that stopped there would grow the database forever behind one unwritable
-directory, and go on doing it every hour.
+All managers are called because the original job definition may no longer be
+registered. A manager that stored nothing for a run should do nothing.
+Cleanup errors are logged and the sweep continues, potentially leaving files
+for manual cleanup.
 
 ### The run an asset's value is inside
 
-a value in a manager is inside the run that wrote it, and the sweep takes what
-a run wrote when it takes the run. so a run that an asset's **current**
-materialization still reads is held back from every policy, rows and files
-together, until something rebuilds the asset, at which point it is history
-like any other run and the next sweep takes it.
+A run referenced by an asset's current external value is excluded from
+retention until that asset is rebuilt. Its rows and files are kept together,
+even beyond the configured age. `hestan doctor` reports these retained runs
+under `values`. Inline values need no such retention exception.
 
-the alternative is worse in both directions: prune it and the row points at
-nothing, so the next build either fails on a hole or silently redoes work
-somebody paid for. but this is a real change to what a policy promises, and it
-is stated rather than buried: `Retention::days(30)` no longer means nothing
-older than thirty days is here. an asset built a year ago and never rebuilt
-keeps its run for as long as it stays current. `hestan doctor` counts them:
-
-```
-note  values     3 run(s) are held back from retention: an asset's current value is what they wrote, and a later build reads it
-```
-
-nothing is held back under `Inline`, whose values are in the materialization
-itself and go nowhere when a run is pruned: a deployment that never configured
-a manager prunes exactly as it did.
-
-three more things follow, and all three are worth knowing before you point a
-manager at a directory:
-
-- **only what a policy deletes is collected.** with no `Retention`
-  configured nothing is pruned and nothing is dropped, so the directory grows
-  exactly as the run log does.
-- **the process that decides is the process that deletes**; see
-  [roles](scaling.md#roles). the directory has to be on *its* filesystem: a
-  scheduler that cannot see the disk the workers wrote to cannot collect it.
-- **the whole run goes at once.** `{run_id}/{op}` means one directory per
-  run for both bundled managers, and the sweep removes it whole, after
-  checking that it is under the manager's own directory, by the same rule a
-  `put` is checked by. a path computed from a run id and removed without that
-  check would be a much worse bug than the leak it was fixing.
+Without a retention policy, no files are collected. The deciding process runs
+cleanup and must see the directories workers write. Bundled managers remove
+the run's whole directory after checking it lies under their configured root.
 
 ## In the ui
 
@@ -389,3 +338,7 @@ as the reference it is (`file · /var/lib/hestan/io/019.../extract.json`)
 rather than as pretty-printed json, because the json is not the value.
 `GET /api/jobs/{name}` reports each op's `io`: the named manager it selected,
 `null` for the default.
+
+Reused outputs are read with their producing run and op keys, including partition
+instance names. Resume planning resolves saved outputs using their original keys
+before handing the resulting values to the new run.

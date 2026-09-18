@@ -2,7 +2,8 @@ use std::any::Any;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use futures::future::BoxFuture;
+use futures::{FutureExt, future::BoxFuture};
+use std::panic::AssertUnwindSafe;
 
 use crate::error::Error;
 use crate::op::InputError;
@@ -77,15 +78,25 @@ pub(crate) async fn for_run(
             owned: false,
         });
     }
-    let mut built: HashMap<String, Resource> = (**process).clone();
+    let mut scoped = RunScoped {
+        all: Arc::new((**process).clone()),
+        owned: true,
+    };
     for decl in decls.iter() {
         let ctx = ResourceCtx {
             name: decl.name.clone(),
             run_id: Some(run_id.to_string()),
-            built: built.clone(),
+            built: (*scoped.all).clone(),
         };
-        match (decl.build)(ctx).await {
-            Ok(res) => built.insert(decl.name.clone(), res),
+        let result = AssertUnwindSafe(async { (decl.build)(ctx).await })
+            .catch_unwind()
+            .await
+            .map_err(|_| Error::Resource {
+                name: decl.name.clone(),
+                reason: "constructor panicked".into(),
+            })?;
+        match result {
+            Ok(res) => Arc::make_mut(&mut scoped.all).insert(decl.name.clone(), res),
             Err(e) => {
                 return Err(Error::Resource {
                     name: decl.name.clone(),
@@ -94,10 +105,7 @@ pub(crate) async fn for_run(
             }
         };
     }
-    Ok(RunScoped {
-        all: Arc::new(built),
-        owned: true,
-    })
+    Ok(scoped)
 }
 
 /// what one run's ops read, and what becomes of it when the run ends.

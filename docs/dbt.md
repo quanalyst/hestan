@@ -1,9 +1,8 @@
 # dbt
 
-a dbt project already has a dag. it is compiled, it is correct, and it is
-written down in `target/manifest.json`. this reads that file and produces one
-hestan [asset](assets.md) per dbt model, wired from the manifest's own
-`depends_on`.
+With the `dbt` feature, `Dbt::from_manifest` registers models and their source
+lineage from a compiled manifest as Hestan assets. Install and configure dbt
+separately.
 
 ```toml
 hestan = { version = "0.2.5", features = ["dbt"] }
@@ -21,33 +20,15 @@ Hestan::new()
     .await
 ```
 
-no dependency comes with the feature. a manifest is json and `serde_json` was
-already here.
-
-this is the one part of [connecting to your data](connecting.md) that is a
-capability rather than a convenience. calling a client from an op was always
-possible; bringing another tool's dag *into* hestan's is the thing a wrapper
-around a client cannot do.
-
 ## What you get
 
-- **one asset per model**, named after the model: `stg_orders`,
-  `orders_daily`.
-- **one source asset per dbt source a model reads**, named
-  `{source_name}.{table}`: `raw.orders`. a source dbt parsed but nothing reads
-  is not in the graph: it is a line in a yml file, not a thing anything is
-  made of.
-- **dbt's lineage**, taken from each node's `depends_on.nodes`. nobody retypes
-  it, so nobody forgets to update it.
-- the [catalog](web-ui.md), the [lineage view](assets.md), staleness,
-  [freshness policies](freshness.md), checks, and everything else an asset
-  has. a dbt model is an asset like any other.
+- One asset per model, named after the model.
+- Source assets for referenced dbt sources, named `{source_name}.{table}`.
+- Dependencies from the manifest's `depends_on.nodes`.
+- Normal asset inspection, materialization history, retries and downstream
+  dependencies, including dependencies from application-defined assets.
 
-what that buys over `dbt run` on a cron: a model is a node in the same graph
-as everything else you orchestrate, so an asset of your own can depend on
-`orders_daily` and be built when it is; the run page says which model failed
-rather than giving one exit code for the lot; and each model's output is
-stored under its own op.
+Unreferenced sources are omitted. Duplicate model names are rejected.
 
 ## What building one does
 
@@ -84,30 +65,10 @@ up from the manifest, since dbt writes `<project>/target/manifest.json`.
 
 ## Manifest versions
 
-**v9 through v12**, which is dbt 1.5 through 1.10.
-
-hestan reads four things out of a manifest: a node's `name`, its
-`resource_type`, its `depends_on.nodes`, and a source's `source_name`. those
-have meant the same thing across all four versions, and everything else in the
-file (and there is a great deal of it) is ignored, so a version that only
-adds fields keeps working.
-
-anything else is refused by version, naming the file:
-
-```
-dbt manifest analytics/target/manifest.json: it is manifest schema v14, and this
-build of hestan reads v9 to v12 (dbt 1.5 to 1.10)
-```
-
-that is a startup error, before any run exists. the alternative (parsing
-hopefully and taking what matches) produces an *empty asset graph*, which
-looks exactly like a project nobody has compiled yet, and that is a failure
-somebody debugs for an afternoon.
-
-the other refusals are the same variant and name the file the same way: it
-could not be read, it is not json a manifest could be, or two of its nodes
-would become one asset (two models of the same name in two packages; keeping
-the second quietly would drop the first's lineage).
+The parser accepts manifest schemas **v9 through v12** (dbt 1.5 through 1.10).
+It reads node names, resource types, dependencies and source names, ignoring
+unused fields. Unsupported schemas, unreadable or invalid manifests, and names
+that would collide produce startup errors identifying the file.
 
 ## Freshness, and what hestan cannot see
 
@@ -145,49 +106,20 @@ too.
 
 ## What is not covered
 
-written down rather than discovered:
-
-- **models only.** seeds, snapshots, data tests, analyses and hooks are not
-  assets. a model that depends on a seed keeps that dependency in dbt and
-  loses it in hestan's graph: hestan has no node to point the edge at. run
-  `dbt seed` and `dbt snapshot` as ops of your own if you need them.
-- **`dbt test` is not run.** an [asset check](assets.md) of your own can shell
-  out to `dbt test --select <model>` if you want the results in hestan; a
-  future implementation could read them from `run_results.json` rather than guessing at
-  them.
-- **`run_results.json` is not read**, so rows affected, per-model timing and
-  dbt's own status words are not in hestan's metadata. what is there is what
-  dbt printed and what it exited with.
-- **no `--target`, `--vars`, `--profiles-dir` or `--full-refresh`.** the
-  environment hestan was started with is the environment dbt gets
-  (`DBT_TARGET`, `DBT_PROFILES_DIR` and the rest included), and that is the
-  whole of the configuration surface. hestan does not build a second way to
-  configure dbt.
-- **the manifest is read once, at startup.** a model added by a later
-  `dbt compile` appears when the process restarts. the manifest is a build
-  artifact of your project, and hestan's registry is built from your code at
-  startup like everything else.
-- **selection is per model.** hestan builds the graph node by node, so there
-  is one `dbt run` per model rather than one for the lot. that is the price of
-  a model being a node you can see, retry and depend on, and it is a real
-  price: `dbt run` starts a process and connects to the warehouse each time.
-  a project with three hundred models is a project to think about this in.
+- Only models and referenced sources become assets. Seeds, snapshots, tests,
+  analyses and hooks are not registered. Dependencies on omitted node types
+  are absent from Hestan's graph.
+- Hestan does not run `dbt test` or read `run_results.json`. Metadata is limited
+  to captured output and process results; run additional commands in your own
+  operations when needed.
+- The wrapper accepts an executable and project directory, not arbitrary dbt
+  flags. Configure dbt through its environment or an executable wrapper.
+- The manifest is read at startup. Restart after changes to register new models.
+- Each model build starts a separate `dbt run --select <model>` process and
+  connection, which can add significant overhead for large projects.
 
 ## What the tests cover, and what they cannot
 
-**dbt is not installed in hestan's test suite and must not need to be.** the
-fixture manifest in `tests/fixtures/dbt/` (a diamond over a source, with a
-seed, a data test, a hook and a disabled model beside it) is committed, and
-the parse and the graph are asserted against it.
-
-the shell-out is asserted against a script standing in for dbt: that each
-model is invoked with `run --select <model>`, in the project directory, that
-what it printed on either stream lands under that op with the right stream,
-that a non-zero exit fails the asset and materializes nothing, and that a
-missing executable is an error naming it.
-
-what no test here can assert is the other side of the boundary: that
-`dbt run --select orders_daily` builds `orders_daily` in your warehouse. that
-is dbt's, and a test of it in this repo would be a test of whether dbt
-happened to be installed on the machine that ran it, which is the kind of
-test that passes by not running.
+Repository tests validate manifest parsing, graph construction and command
+invocation using a substitute executable. They do not validate dbt adapters or
+connect to a warehouse; test those in your application environment.

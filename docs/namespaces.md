@@ -6,18 +6,9 @@ declarations, independent of names and presentation groups.
 
 ## The rule, in one sentence
 
-**a group labels a picture and hestan draws it; a namespace divides the
-deployment and hestan enforces it, and neither is derived from the other.**
-
-that is the whole of the relationship, and everything below is it worked out.
-if you are dividing a picture, that is a [group](assets.md#group). if you are
-dividing a deployment, that is a namespace.
-
-the picture is the asset graph for an asset and the [run
-timeline](web-ui.md#jobs-overview) for a job. one sentence covers both because
-it is one concept: `Asset::group` and `JobBuilder::group` declare the same
-label in two places, and [a job has one too](#a-job-has-one-too) below is what
-follows from that.
+Groups and subgroups organize presentation. Namespaces constrain registrations
+and API mutations through scopes. Neither is derived from the other. These
+rules apply equally to jobs and assets.
 
 ## A namespace
 
@@ -44,62 +35,22 @@ asked.
 
 ### Declared, not parsed out of the name
 
-**The persistent name is the key.**
-`runs.job`, `asset_materializations.asset`, every lineage ref, every schedule
-row and every api path refers to a job or an asset by its name. renaming
-`orders_etl` to `finance.orders_etl` to put it in a namespace is not a
-reorganisation, it is a new job with no history. declaring the namespace leaves
-the name, and therefore the past, exactly where it was. there is a case for
-this: it registers a job, records a run, re-registers the same job with a
-namespace and asserts the run is still there under the same key.
+Persistent names remain the keys used by runs, materializations, lineage,
+schedules and API routes. Adding or changing a namespace preserves those keys
+and their history.
 
-a namespace is refused at build in two cases, both about a namespace nothing
-could name again:
-
-- one that is empty or only spaces, since a job in a namespace with no name is
-  a job in no namespace;
-- one that starts or ends with a space, since nothing typing it into a url or
-  a command line can reproduce it. the error quotes back the trimmed one.
-
-there is no fallback. an asset's group falls back to the part of its name
-before the first `/`, which is fine for a label on a picture; a namespace has
-no fallback at all, because **nothing should end up inside a boundary by having
-been named a certain way**. that is also why a `MultiAsset` can declare one:
-its outputs are names rather than `Asset` values, so with no fallback and no
-declaration they would be permanently undividable.
+Namespaces must be nonblank and have no leading or trailing whitespace.
+They have no fallback and are never inferred from names or groups.
 
 ## A namespace is not a group
 
-they overlap in practice and answer different questions, and hestan keeps them
-apart mechanically: the graph, the hue, the legend and the timeline's outline
-read the group and never the namespace; a token's scope and `?namespace=` read the
-namespace and never the group. **nothing derives one from the other, in either
-direction**, and the two sit side by side wherever narrowing a list is on offer
-(the assets page has both filters, and so does `hestan assets`) precisely
-because they are two questions rather than one.
+Groups are user-defined presentation values. Origins describe source ancestry.
+Namespaces are explicit values used by scope checks and namespace filters.
+Each can be selected independently; groups may span namespaces.
 
-| the question | the answer |
-| --- | --- |
-| what is this asset near, on the graph | its [group](assets.md#group) |
-| what is this job near, on the timeline | its [group](#a-job-has-one-too) |
-| where did this data come from | its [origin](assets.md#origin) |
-| whose slice of the deployment is this | its namespace |
-
-two reasons they were not merged, and each is a case that would have broken:
-
-**a source's group names the external system**, not a team.
-`Asset::source("fx_rates").group("vendor")` says the data stands for a vendor
-feed, which is what makes two tables out of one warehouse read as one thing
-downstream. two teams reading one vendor is ordinary. if the group were the
-tenancy boundary, either that vendor would belong to one team or a rule
-forbidding a group to span namespaces would refuse a graph that is correct.
-
-**a group falls back to the name.** an asset called `finance/orders` is in
-group `finance` without anybody declaring anything. that is exactly right for a
-colour and exactly wrong for an authorization boundary, where what a scope
-admits would then be decided by a naming convention.
-
-Groups retain their existing presentation and origin semantics.
+Assets retain their legacy group fallback from the prefix before `/`. That
+fallback never assigns a namespace. [Grouping views](presentation.md) do not
+change namespace enforcement or origin calculations.
 
 ### A job has one too
 
@@ -299,22 +250,10 @@ asset  margin  ada of finance     #fin-alerts   ops@example.com
 
 ## Escalation, and where the line is
 
-`escalates_to` is **a second contact string, and nothing else happens to it.**
-hestan carries it, puts it on the event, shows it on the page and hands it to
-your hook.
-
-hestan does **not**: wait, time anything, ask whether the first contact
-answered, take an acknowledgement, repeat a notification, know about a
-rotation, know about a shift, or have any notion of on-call at all.
-
-that line is drawn deliberately and it is worth being blunt about which side of
-it this is on. an escalation *policy* is timers, acknowledgement, repeat
-intervals, schedules and overrides. that is a paging product, it is somebody's
-entire company, and half of one inside an orchestrator would be the worst
-possible thing to ship: something that looks like it will keep trying and does
-not. so hestan promises exactly one thing here, and it is small: **the second
-contact reaches your hook alongside the first, and what to do about it is your
-hook's decision.** wire it to the thing that does paging.
+`escalates_to` is a second contact string passed to the UI and hooks alongside
+the primary contact. Hestan does not time escalation, track acknowledgements,
+repeat pages or manage on-call rotations. Implement those policies in the hook
+or the system it calls.
 
 ## Defaults and API metadata
 

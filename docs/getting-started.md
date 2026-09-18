@@ -1,34 +1,22 @@
 # Getting started
 
-from nothing to a job running on a schedule, with a ui, in one pass. it needs
-a rust toolchain (1.88 or newer) and nothing else: no server to install, no
-sidecar, no daemon. hestan is a library, and what you end up with is your own
-binary.
+Create a scheduled job with a local run store and web UI. You need Rust 1.88
+or newer; the default SQLite backend requires no separate database service.
 
 ## The dependency
 
-```
-cargo new orders && cd orders
+```sh
+cargo new example && cd example
 cargo add hestan
 cargo add tokio --features full
 ```
 
-tokio because everything hestan runs is async and something has to drive it,
-and that is the whole of the setup. an op hands its result back as json, and
-`json!` and `Value` come out of `hestan::prelude`, so nothing on this page
-needs a `serde_json` of its own; add that, and `serde` with `derive`, at the
-point your ops start taking [typed params](typed-io.md) or returning types you
-declared. to track the repository instead of the release, with a tag
-or a sibling checkout for hacking on both at once:
+`hestan::prelude` exports `json!` and `Value`. Add `serde` with `derive` when
+defining typed parameters or outputs. Optional features are listed in the
+[README](../README.md#using-it-from-your-project).
 
-```toml
-hestan = { git = "https://github.com/quanalyst/hestan", tag = "v0.2.5" }
-hestan = { path = "../hestan" }
-```
-
-Read [Changes](../CHANGELOG.md) before updating a dependency. Everything on this page works
-with no cargo features turned on; the optional ones are listed in
-[the readme](../README.md#using-it-from-your-project).
+For local development, use a path dependency; a Git dependency can be pinned
+to a release tag. See [embedding](embedding.md#consuming-from-another-repo).
 
 ## The smallest thing that runs
 
@@ -69,35 +57,19 @@ its launch button and you do not have to wait for one.
 
 ## What each line is
 
-an **op** is one unit of work: a name and an async closure. it is handed an
-[`OpCtx`](concepts.md#opctx) and hands back json. whatever it returns is
-recorded in the run log and passed to whatever depends on it.
-`ctx.input("extract")` is how `load` reads what `extract` produced, and
-`.after(["extract"])` is what makes `load` wait for it. there is no other
-wiring: the edge and the data path are one declaration.
+- `Op::new` defines a named async operation. Its JSON result is recorded and
+  made available to downstream operations.
+- `.after(["extract"])` declares a dependency. `ctx.input("extract")` reads
+  its result.
+- `Job::build()` rejects cycles, missing dependencies and duplicate names.
+- `.retries(2)` permits two additional attempts after a failure, with backoff
+  and jitter.
+- `ctx.info` records an event; `ctx.meta` attaches structured output metadata.
+- `serve` opens the store, starts the loops for the selected role, and serves
+  the UI and API until shutdown.
 
-a **job** is a dag of ops, and `build()` is where it is checked: a cycle, a
-dep on a name no op has, or two ops sharing a name is an error here, at
-startup, rather than a run that gets halfway through and stops.
-
-a **run** is one execution of a job. `.retries(2)` gives `load` two more
-attempts if it fails, spaced by a backoff with jitter on it; each attempt is
-recorded separately, so an op that worked on the third try says so rather than
-looking like one that worked.
-
-`ctx.info` writes a line into the run log: hestan's own structured record,
-which is [not the same thing](logs.md) as a `println!`. `ctx.meta("rows", n)`
-attaches a typed fact to what the op produced, and the ui renders it as a
-number and tracks it across runs. neither is required; both are what make a run
-readable three months later.
-
-`Hestan::new()` collects everything, and `serve` is what starts: it opens the
-database, recovers whatever a previous process left half-done, runs the
-scheduler, and serves the ui and json api on the address given. it does not
-return until the process is
-[asked to stop](scaling.md#stopping-a-process-on-purpose). for one headless run
-and no server, swap it for `run_once("etl", json!({})).await`; see
-[embedding](embedding.md).
+For a headless execution, use `run_once("etl", json!({})).await` instead of
+`serve`. See [embedding](embedding.md).
 
 ## Where the state lives
 
@@ -113,17 +85,9 @@ in your binary.
 
 ## The ui
 
-the **jobs page** at `/` lists every registered job with its schedules, a
-timeline of recent runs, and a duration sparkline each. click `etl` for its
-dag, per-op statistics, schedule controls, and a launch button with a params
-editor.
-
-a **run page** shows the ops on a gantt, the event log live as it happens, and
-whatever each op printed. `cmd-k` (or `ctrl-k`) opens a palette over jobs, runs
-and pause actions. the full tour is in [web ui](web-ui.md).
-
-nothing in the ui is a mock: an empty database says it is empty rather than
-showing a sample of something.
+Open Jobs to inspect the graph and launch a run. Run details show timings,
+operation results and logs. Cmd-K or Ctrl-K opens the command palette.
+See [web UI](web-ui.md) for the full guide.
 
 ## Then what
 
@@ -137,7 +101,8 @@ showing a sample of something.
   proceeds, what cancellation really does, trigger rules, reusable graphs,
   fan-out.
 - **serving it to anybody else** means [authentication](auth.md): `serve`
-  refuses an address that is not loopback until something checks who is asking.
+  requires an authenticator for non-loopback addresses unless `Auth::None`
+  explicitly enables unauthenticated access.
 
 ## Running the examples
 

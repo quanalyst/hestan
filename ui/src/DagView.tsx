@@ -1,3 +1,4 @@
+import { layersOf } from "./dag";
 import { shownAndMore } from "./shade";
 import type { Stripe } from "./shade";
 import { GlyphShape } from "./StatusGlyph";
@@ -105,22 +106,7 @@ export default function DagView({
     return n.note ? `${word} · ${n.note}` : word;
   };
 
-  // only rendered deps count toward the column: deps can name things that
-  // aren't (the assets job's ops depend on sources, which lower to no op)
-  const byName = new Map(nodes.map((n) => [n.name, n]));
-  const layer = new Map<string, number>();
-  const depth = (name: string): number => {
-    const seen = layer.get(name);
-    if (seen !== undefined) return seen;
-    // marked visited before recursing so a cyclic input flattens, not hangs
-    layer.set(name, 0);
-    const n = byName.get(name);
-    const present = n ? n.deps.filter((d) => byName.has(d)) : [];
-    const d = present.length ? 1 + Math.max(...present.map(depth)) : 0;
-    layer.set(name, d);
-    return d;
-  };
-  nodes.forEach((n) => depth(n.name));
+  const layer = layersOf(nodes);
 
   const cols: DagNode[][] = [];
   for (const n of nodes) {

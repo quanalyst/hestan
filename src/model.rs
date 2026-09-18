@@ -1290,7 +1290,7 @@ pub struct Tick {
 /// one entry of an asset's materialization history, newest of which is its
 /// current state. `inputs` maps each dep name to the fingerprint this asset
 /// consumed; source rows carry no value and no run.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Materialization {
     /// monotonic within the table, so ordering by it is ordering by time even
     /// when two builds land in the same millisecond.

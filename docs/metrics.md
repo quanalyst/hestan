@@ -1,107 +1,39 @@
 # Metrics
 
-`GET /metrics` is prometheus text exposition, served by every hestan process
-that serves anything. it is on in every build: it is not behind a feature,
-because unlike `otel` it adds no dependency, and every feature hestan has is a
-dependency somebody should get to decline.
+`GET /metrics` exposes Prometheus text metrics in every serving build, without
+an optional feature. On an authenticated deployment, include a bearer token:
 
-it exists because "is orchestration healthy" was a question you could only
-answer by opening the ui or querying the run log yourself. the numbers were
-already there; a surface a scrape can read was not.
-
-```
-$ curl -s -H "Authorization: Bearer $HESTAN_TOKEN" localhost:4000/metrics | head
-# HELP hestan_store_up 1 while this process can read the run log. …
-# TYPE hestan_store_up gauge
-hestan_store_up 1
+```sh
+curl -H "Authorization: Bearer $HESTAN_TOKEN" localhost:4000/metrics
 ```
 
 ## Which side of the auth guard, and why
 
-**inside it.** `/metrics` needs a viewer, the same as every other read, and an
-[authenticated deployment](auth.md) refuses an unauthenticated scrape with a
-401.
+`/metrics` requires viewer access, like other read endpoints. Configure scrape
+authorization on authenticated deployments; an unauthenticated request returns
+401. With no authenticator, anyone who can reach the port can scrape it.
 
-the argument for putting it outside is real: a scrape often cannot carry a
-credential, which is exactly why `/api/whoami` is outside the guard and why the
-kubelet probes in `deploy/k8s` point at it. that argument does not carry here,
-for two reasons.
-
-- **prometheus can hold a token and a kubelet cannot.** a kubelet's `httpGet`
-  probe has nowhere to put a bearer token, so an endpoint it must reach has to
-  be open or it cannot be probed at all. prometheus has `authorization` in
-  every scrape config, and `ServiceMonitor` has `authorization.credentials`
-  pointing at a secret. the constraint that forced `/api/whoami` open simply is
-  not present.
-- **it publishes the shape of a deployment.** no metric here carries a job
-  name, and the section below is why, but how much work there is, how much of
-  it fails, how far behind the scheduler is and whether anything is deciding
-  are all on this page. that is the same class of thing `/api/jobs` and
-  `/api/runs` return, and those are behind the guard.
-
-`/api/whoami` gives one bit to a probe that has no other way to ask. `/metrics`
-gives a deployment's shape to a scraper that has somewhere to put a credential.
-
-a deployment with no authenticator serves `/metrics` to anyone who can reach
-the port, exactly as it serves everything else. `serve` already
-[refuses to bind a reachable address](auth.md) without one, so that is either
-loopback or a deliberate `Auth::None`.
-
-there is no switch for the endpoint itself. one would be a second way to
-configure what the guard already covers; a deployment that does not want it
-blocks the path at whatever is in front of it.
+There is no endpoint-specific disable switch. Restrict the path at a proxy if
+needed. `/api/whoami` remains available for unauthenticated health probes.
 
 ## What may be a label
 
-**a job name, an asset name, an op name, a partition key and a run id are
-never labels here, and cannot become ones by accident.** a metric with a label
-per run id grows a series per run forever and kills the scrape that reads it;
-one with a label per partition key does the same a day at a time.
+Labels use fixed values from closed enums. Job, asset and op names, partition
+keys, run IDs and build identifiers are excluded, keeping the number of series
+bounded independently of deployment size.
 
-that rule is a type rather than a note. a label value in `src/metrics.rs` is a
-`&'static str`, and a name read out of a database row borrows from the row, so
-it does not typecheck as one. what is left is the words hestan spells in its
-own source, which is why every label below comes from a **closed** enum:
-`RunStatus`, `Reclaim` and `TickOutcome` each have an `as_str` returning
-`&'static str`, while an open enum's borrows from `self`. the one label that is
-not a word is a histogram's `le`, and it is a number off a const list.
-
-so the number of series this endpoint can emit is fixed at compile time.
-`neither_a_job_name_nor_a_partition_key_can_add_a_series` fills a store with
-two hundred distinct job names and two hundred partition keys and asserts the
-series count is the one an empty store produces.
-
-the cost is real and worth saying: **you cannot ask this endpoint which job is
-failing.** it will tell you that runs are failing, and `/api/runs?job=…`, the
-run log and the ui are where you find out which. that is a deliberate trade of
-one dashboard drill-down against a metric that stays the same size as the
-deployment grows.
+Use `/api/runs`, the event log and the UI to identify individual failing jobs;
+metrics report aggregate health.
 
 ## Deployment-wide or per process
 
-the two halves of this page do not mean the same thing, and aggregating them
-the same way is the mistake to avoid.
+Store-backed gauges are repeated by each process sharing the store. Aggregate
+with `max`, not `sum`: three workers reporting four queued runs still mean four
+queued runs. Process gauges are identified separately below.
 
-**gauges are read off the run log when the scrape arrives.** the run log is
-shared, so every process answers with the same figure. aggregate them with
-`max`, never with `sum`: three workers reporting a queue of four are not a
-queue of twelve.
-
-**counters and histograms belong to the process that was scraped**, and read
-**zero after a restart**. `sum` and `rate` across targets are exactly right for
-them.
-
-that split is not a compromise, it is the only honest shape. every table hestan
-keeps is prunable by [retention](replay.md#the-retention-horizon), so a
-`_total` read off a `COUNT(*)` would fall the first time a prune ran, and
-prometheus reads a counter that fell as a process that restarted and invents
-the rate to match. a counter that resets at a restart is a shape prometheus
-already knows how to handle. one that drops halfway through a Tuesday is not.
-
-each counter is incremented at the call that has just written the same fact to
-the run log, after the transaction committed. so a write that was refused and
-retried moves it once, and a write that never landed does not move it at all:
-the counter and the run log agree or neither of them says anything.
+Counters and histograms belong to each process and reset on restart. Use `sum`
+and `rate` across targets. Counters increment after successful commits; retention
+does not reduce them.
 
 ## The metrics
 
@@ -272,55 +204,18 @@ fires.
 
 ## The overlap with `hestan doctor`
 
-six of the gauges are facts [`doctor`](cli.md#doctor) already reports, off the
-same rows: `hestan_schedules_paused` and `hestan_sensors_paused` are its
-`schedules`/`sensors` check, `hestan_runs_stalled` is its `leases` check,
-`hestan_decider_lease_seconds` is its `deciding` check, `hestan_queue_depth` is
-half of its `queue` check, and `hestan_store_writing` is its `writes` check.
-neither is computed from the other; both read the store.
-
-they are not duplicates of each other because they answer at different times
-and in different words. doctor is a person asking once and getting a sentence
-and a fix (*"paused, so they will not fire: warehouse_healthcheck / unpause
-schedule warehouse_healthcheck"*). a metric is a scrape asking every fifteen
-seconds and getting a number, which is the only one of the two you can put a
-threshold on.
-
-what doctor has that this page does not, and deliberately: the reason and the
-fix, and the checks that need the registry rather than the store. an automation
-policy that can never fire, a rate that is per process, two asset labels the
-ui draws on one mark, a retention policy in a role that never sweeps: each of those is
-per-asset or per-declaration, and a metric carrying them would need exactly the
-labels the section above rules out.
-
-what this page has that doctor does not: `hestan_queue_oldest_seconds`, which
-is what tells a deep queue that is draining apart from a shallow one that is
-stuck, and the two histograms, which are about a trend rather than a moment.
+Metrics and [`doctor`](cli.md#doctor) share store facts about paused schedules
+and sensors, expired leases, deciding, queue depth and write health. Doctor adds
+explanations, remedies and registry checks such as unsatisfiable policies and
+shade collisions. Metrics add continuous measurements, queue age and histograms.
 
 ## What is deliberately not here
 
-- **op outcomes by status.** an op's terminal row is written by whichever
-  process ran the op, and an [isolated op](isolation.md) writes its own from a
-  child process that exits immediately afterwards, taking any counter with it.
-  a per-process op counter would therefore undercount exactly the deployments
-  that use isolation, silently. run outcomes have no such split, because a run
-  is executed by the one process that claimed it. op detail stays in the run
-  log and on `/api/runs/{id}`.
-- **anything per job, per asset or per partition.** see the labels section
-  above. this is the trade, not an oversight.
-- **run duration.** the useful cut of it is per job, which is barred, and the
-  aggregate across every job in a deployment is a number that means nothing.
-  `/api/jobs/{name}/op_stats` is where duration lives.
-- **sensor tick counts.** `/api/sensors` carries the two counts that answer "is
-  this sensor healthy", per sensor. a metric could not carry them per sensor
-  without a label per sensor, and summed across every sensor they are not a
-  number anybody pages on.
-- **asset freshness and staleness.** per asset, so barred, and
-  [`on_late`](notifications.md) already alerts on the one that matters without
-  going through prometheus at all.
-- **Build identity.** Metrics use static label values. Build identifiers are
-  dynamic and are exposed through `/api/health`, `hestan doctor` and run rows;
-  see [deployment and build identity](deployment.md).
+Per-op counters would omit short-lived isolated children, so op outcomes remain
+in the run log. Per-job durations, sensor health and asset freshness are exposed
+through their API resources and [late hooks](notifications.md), without adding
+unbounded metric labels. Build identity is in health, doctor and run rows; see
+[deployment](deployment.md).
 
 ## Scraping it
 

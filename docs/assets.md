@@ -136,135 +136,58 @@ one name, one that produces nothing, and two claiming the same output.
 
 ## Group, origin and namespace
 
-three questions about one asset, and they are three questions rather than one
-worded three ways. **group** is what it is labeled with on the graph.
-**origin** is where its data came from. **namespace** is whose slice of the
-deployment it is in.
+| Metadata | Purpose |
+| --- | --- |
+| Group and optional subgroup | Presentation and navigation. |
+| Origin | Computed source ancestry. |
+| Namespace | Enforced registration and access boundary. |
 
-**a group labels a picture and hestan draws it; a namespace divides the
-deployment and hestan enforces it, and neither is derived from the other.**
-that is the whole of the relationship: if you are dividing a picture, reach for
-a group; if you are dividing a deployment, reach for a namespace.
-[namespaces and owners](namespaces.md) is the page for the second one, and
-everything below is the first.
-
-the picture here is this graph. a [job declares the same
-label](namespaces.md#a-job-has-one-too) and its picture is the run timeline:
-one sentence and one concept rather than two, and a group of one name on both
-is one label drawn with one mark.
+Groups do not determine namespaces, ownership, dependencies or scheduling.
+Jobs use the same presentation metadata; see [display names and grouping](presentation.md).
 
 ### Group
 
-one flat name, one per asset, declared on the asset:
+Declare a group without changing an asset's persistent name:
 
 ```rust
-let orders  = Asset::source("orders").group("warehouse");
+let orders = Asset::source("orders").group("warehouse").subgroup("daily");
 let returns = Asset::source("returns").group("warehouse");
-let daily   = Asset::new("daily_revenue", ..).from(&orders).group("finance");
 ```
 
-**the resolution order is the declared group, else the part of the name before
-the first `/`, else no group at all.** a graph that never calls `.group`
-groups exactly as it always did.
+The effective group is the declared value, otherwise the persistent name's
+prefix before the first `/`, otherwise none. This legacy asset fallback is
+preserved. Subgroups are explicit and require an effective parent; neither
+subgroup names nor grouping views change identity or history.
 
-declaring it rather than spelling it into the name is the whole point. the
-name is the key in `asset_materializations`, in every recorded lineage ref and
-in every op run, so moving `sales/orders` into `finance` by renaming it is not
-a reorganisation: it is a new asset with no past. moving it with `.group`
-leaves the name, and therefore the history, exactly where it was.
-
-A group name is a single value. An optional explicit [subgroup](presentation.md)
-adds one level beneath it; nothing is parsed out of either declaration.
-Three groups are refused at build, each naming both the asset and the group:
-
-- an empty or whitespace-only name, since a group with no name is no group;
-- a name containing `/`, since `/` is the character a name uses to say which
-  group it is in, so `a/b` reads as nesting that is not there;
-- a name that is also the name of an ungrouped source, since an origin label
-  is a group name falling back to a bare source name and one legend entry
-  would then point at two things.
-
-the first two come from the one function a [job's
-group](namespaces.md#a-job-has-one-too) is refused by, so a name one of them
-may carry is a name the other may carry. the third is about origins and is an
-asset's alone.
-
-a source's group names the **external system** the data stands for, which is
-what makes `orders` and `returns` above one thing downstream rather than two.
-
-that is also the clearest reason a group is not a tenancy boundary: `vendor` is
-a feed, not a team, and two teams reading one vendor is ordinary. neither is
-the fallback: an asset called `finance/orders` is in group `finance` without
-anybody declaring anything, which is right for a mark on a picture and wrong
-for anything that decides who may touch what. a [namespace](namespaces.md) is declared, has
-no fallback, and is the thing an api filter and a token's scope read.
+Group declarations reject blank names and `/`. Asset groups also reject a
+name shared with an ungrouped source because it would make origin labels
+ambiguous. Groups are user-defined classifications with no prescribed meaning.
+See [validation and grouping views](presentation.md).
 
 ### Origin
 
-the set of source groups an asset descends from, transitively, computed rather
-than declared. a source with no group contributes its own name; a source's own
-origin is itself.
+Origins are the sorted set of source groups reachable upstream. An ungrouped
+source contributes its persistent name; an asset with no upstream source has
+an empty set. Sources use their own effective group or name.
 
-so `daily_revenue` above descends from `warehouse`, and so does anything built
-out of it, however many hops down. an asset with **no source anywhere
-upstream** has an empty set, which is a real state and reads as "no source"
-rather than as a blank.
-
-it is one forward pass over the topological order the build already walks,
-made once when the registry is built, so `GET /api/assets`, `hestan assets`
-and `hestan doctor` all read the same answer. the set is ordered by name
-everywhere it is exposed, because a set that reorders between two requests
-makes a swatch flicker.
-
-a partition [mapping](#what-a-partition-reads-of-its-dep) changes nothing
-here: a mapping says which keys a read takes, and where the data came from is
-the same answer at every key.
+The registry computes origins once from declared lineage. Partition mappings,
+subgroups, display names and alternative grouping views do not change them.
+The API, CLI and UI expose the same result.
 
 ### Hue
 
-a group and an origin each have a **hue**: an integer 0..=359 degrees around
-the colour wheel, from `hestan::hue(name)`.
+`hestan::hue(name)` returns a stable angle in `0..=359`. It depends only on the
+label, so adding groups or restarting does not change existing marks. Jobs and
+assets share this mapping. The UI maps angles to six ink shades; other clients
+may choose their own rendering.
 
-it is a pure function of the name and nothing else, so a group keeps its hue
-across restarts, across processes, across machines, and across however many
-other groups appear beside it. it is deliberately **not** an index into a
-palette: an index renumbers every group after the one you added, and a graph
-that redraws every mark on it because somebody declared an asset is a graph
-nobody trusts the marks of.
+`Asset::hue(n)` pins a label's angle. Values outside the range and conflicting
+pins within one group fail validation. Different labels can share a shade;
+`hestan doctor` reports collisions. With more than six labels, some sharing is
+unavoidable.
 
-**the number is an angle and not a colour.** hestan picks the angle and the
-reader decides what to draw with it, because what is legible depends on the
-ground it lands on. hestan's own [web ui](web-ui.md#shade) does not paint it as
-a colour at all: it spends the angle as one of six shades of the page's ink,
-and a client that does paint in colour picks its own saturation and lightness
-from the same number.
-
-**a job's group is in the same space.** `hue` reads a name and nothing else, so
-a job in group `weather` and the assets in group `weather` land on the same
-angle without either end being told about the other, and a pin moves both. one
-name, one mark, on the graph and on the [timeline](web-ui.md#jobs-overview).
-
-**the limit, stated plainly**: two names can hash to marks that cannot be told
-apart, and no pure function of a single name can prevent that, because
-preventing it needs the whole set of names and a function of the whole set is
-exactly the unstable thing above. so `hestan doctor` reports the labels it
-finds sharing a mark, and `Asset::hue(n)` moves one of them. a hue belongs to
-the label rather than to one asset, so two assets in one group may not pin two
-different angles, and a hue outside 0..=359 fails the build.
-
-the check is about the ui in the binary, so it asks the question that ui
-answers: **which labels land on the same one of six shades**, rather than which
-angles sit close together. those are different questions — six degrees apart
-can be one mark and a hundred degrees apart can be two — and past six labels
-the pigeonhole settles it, so the check states that plainly rather than raising
-something nobody can act on.
-
-**a mark never means status.** the palette in the ui is grey and shape carries
-state, which is exactly what leaves the mark free to mean provenance; the
-moment a hue meant "failed" the channel would be carrying two things. and the
-mark is never the only carrier: every group and origin name is written on the
-same screen as the mark that stands for it. `docs/web-ui.md` is where that is
-drawn.
+Marks identify groups or origins, never execution status. Names remain visible
+alongside them. See [UI shade controls](web-ui.md#shade).
 
 ### Namespace, and who owns it
 
@@ -275,17 +198,9 @@ Asset::source("orders")
     .owner(Owner::team("finance-data").contact("#fin-alerts"))
 ```
 
-an asset that came from the warehouse, belongs to finance, and wakes
-`#fin-alerts`. the namespace is what an api filter and a token's
-[scope](auth.md#a-namespace-is-the-coarse-half) narrow by, and the owner is on
-`GET /api/assets`, on the asset's page, on `hestan owner <name>`, and on the
-[`LateEvent`](freshness.md) a declared `fresh_within` fires. a
-[`MultiAsset`](#one-op-several-assets) declares both once for everything it
-produces, since it produces names rather than `Asset` values.
-
-**neither is a group, and no group is either of them.** the whole of that
-decision, why they were not merged, how an owner reaches a hook and where the
-line is drawn on escalation is [namespaces and owners](namespaces.md).
+The namespace constrains access; the owner is informational metadata exposed
+in the API, UI, CLI and notification payloads. `MultiAsset` declares both once
+for all outputs. See [namespaces and owners](namespaces.md).
 
 ## Fingerprints
 
@@ -988,12 +903,12 @@ current fingerprint/built_at/run_id, and the staleness verdict with reasons.
 
 `POST /api/assets/{name}/build` answers 202 `{"run_id"}` for a stale target
 and 200 `{"up_to_date": true}` for a fresh one; 404 for an unknown name, 400
-for a source (sources are probed, never built), and 409 while an assets run
-is active.
+for a source (sources are probed, never built), and 409 when the build plan
+intersects an outstanding build claim.
 
 `POST /api/assets/build` builds everything stale as one run: 202
 `{"run_ids": [..]}`, 200 `{"up_to_date": true}` when nothing is stale, and
-the same 409 while a build is active.
+409 when its plan intersects an outstanding build claim.
 
 `GET /api/assets/{name}/history?limit=` returns that asset's recent
 materializations newest first (default 20, clamped to 1..=200), each with the
@@ -1010,3 +925,13 @@ key across recent builds. see [metadata](metadata.md).
 
 shapes and details in [http api](http-api.md); the `asset_materializations`
 table in [storage](storage.md).
+
+Builds capture dependency materializations before calling the asset body. Input
+values, producing IO keys and recorded dependency fingerprints come from those
+captured rows. A dependency that changes during computation can therefore leave
+the completed output stale and eligible for rebuilding.
+
+Input snapshots are saved before the body runs and reused by asset replays.
+Legacy replays without captured fingerprints retain their recorded unpartitioned
+input values but record unknown input lineage, so they cannot falsely certify
+that the result incorporates a newer dependency.

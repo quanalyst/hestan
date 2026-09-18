@@ -15,10 +15,6 @@ Hestan::auth(Auth::None) if something in front of hestan already checks
 identity
 ```
 
-a refusal rather than a warning, because a warning is a line in a log that
-scrolled past three deploys ago and the thing it was warning about is a
-stranger's run on your warehouse.
-
 ## What did not change
 
 **loopback, with nothing configured, serves exactly as it always has.** no
@@ -277,24 +273,12 @@ are untouched.
 
 ### What a scope does to a read
 
-**nothing.** a scope limits what a token may change. a token that can read
-reads the whole deployment: every run of every job, every param, every log
-line, the event log, the queue.
+Scopes restrict mutations only. A viewer can read the entire deployment,
+including params, logs, events and the queue. Namespace filters do not change
+this rule.
 
-that is a decision, not an omission, and here is the reasoning. a write names
-in its path what it is about, so one check in one place can rule on every write
-there will ever be. a read is mostly a *list*: `/api/runs`, `/api/events`,
-`/api/queue`, `/api/assets`, the sse stream, `/metrics`. narrowing those means
-a filter inside each handler that builds one, which is a check that has to be
-applied consistently to every list. a
-confidentiality promise that holds in nine places out of ten is worse than no
-promise, because people plan around it and the tenth is where the leak is.
-
-so hestan makes the small exact promise instead. **a scope is not a
-confidentiality boundary.** if a ci token must not *see* production run params,
-a scope is the wrong tool: put a proxy in front that refuses the reads, or use
-`Auth::custom` and return `None` for the paths that token has no business
-reading, which is a decision the deployment can make exactly and hestan cannot.
+A scope is not a confidentiality boundary. If reads must be restricted, enforce
+that in the proxy or have `Auth::custom` reject disallowed paths.
 
 ### Deny by default, and why a route added later is covered
 
@@ -324,14 +308,9 @@ scrape the moment it is written, and there is no list to update.
 
 ### A scope cannot be widened by the holder
 
-an [`Identity`] is built by an authenticator, in the deployment's own process,
-and nothing in a header, a query or a body reaches the scope on it. there is no
-input for a holder of a token to widen it through, and a case sends the obvious
-attempts (`x-hestan-scope`, `x-scope`, a second `authorization`, a `scope` in
-the body) and gets the same refusal.
-
-what a scope *is* worth is bounded by what `Auth::custom` does, exactly as a
-role is: hestan checks the scope it was given, not where it came from.
+The authenticator constructs the `Identity` and its scope. Request headers,
+query parameters and bodies cannot widen it. Hestan enforces the scope supplied
+by `Auth::custom`; that callback is responsible for assigning it correctly.
 
 ### Where a scope is not
 
@@ -488,47 +467,21 @@ three rules about it:
 
 ## What this is not
 
-deliberately, and none of these are coming later by accident:
+Hestan has no user database, sessions, authentication protocol integrations,
+rate limiting, lockout or TLS termination. Supply those through your surrounding
+infrastructure as needed. Shared bearer-token rotation requires restarting with
+the new token.
 
-- **there is no user store.** hestan has no users table, no registration, no
-  password anywhere. `Auth::bearer` is one secret; `Auth::custom` asks
-  something that already knows who people are.
-- **there are no sessions.** no login endpoint, no cookie hestan sets, no
-  expiry, no logout beyond the browser forgetting the token. nothing to
-  invalidate means nothing to revoke: changing the token and restarting is the
-  whole of it.
-- **there is no oauth, oidc, saml or ldap.** a deployment that needs any of
-  them already runs something that speaks them, and `Auth::custom` is how that
-  thing's answer becomes hestan's.
-- **a scope is not a rule engine, and reads are not in it.** "ci may launch
-  `deploy`" and "finance may drive its own namespace" are expressible; "ada may
-  launch `orders_etl` between nine and five if the last run failed" is not, and
-  neither is "ci may not see `payments_reconcile`". what a scope narrows is
-  which job, asset or namespace a *change* may name. the read half is [not a
-  promise hestan makes](#what-a-scope-does-to-a-read), and
-  `?namespace=` is a filter on a list rather than a second answer to it.
-- **a namespace is not a tenant.** it divides one deployment's declarations so
-  a token and a page can name a team's half of them. it is not a separate
-  database, a separate process, a separate queue or a confidentiality boundary,
-  and [namespaces and owners](namespaces.md) says so in the same words.
-- **there is no rate limiting and no lockout.** a token that leaks can be
-  guessed at as fast as your network allows; the comparison is constant-time,
-  which closes the timing oracle and nothing else. put something in front of
-  hestan if that matters.
-- **there is no tls.** hestan serves plain http, exactly as it always has, so a
-  bearer token on a network you do not control is a bearer token anyone on that
-  network can read. terminate tls in front of it.
-- **the roles are not audited against your idea of them.** `Auth::custom` can
-  hand out `Access::Admin` to anybody; hestan checks the role it was given, not
-  where it came from.
+Scopes constrain which jobs, assets or namespaces a caller may mutate. They do
+not express conditional policies or restrict reads. Namespaces share the same
+store, processes and queue; they are not isolated tenants.
+
+Custom authenticators are responsible for assigning identities and roles
+correctly. Trust forwarded headers only when requests come through the proxy
+that controls them.
 
 ## Where each piece lives
 
-| | |
-| --- | --- |
-| the refusal, the loopback rule, the constant-time comparison, `Scope` | `src/auth.rs` |
-| what a namespace is and what declares one | `src/whose.rs`, and [namespaces and owners](namespaces.md) |
-| the guard, the roles table, what a request is about, `whoami` | `src/server.rs` |
-| who did what, in the store | `src/store.rs` (`runs.actor`, `events.actor`) |
-| the token, the prompt, and what it does not protect against | `ui/src/identity.ts` |
-| the token leaving no trace | `tests/auth.rs` |
+Authentication types are in `src/auth.rs`; HTTP enforcement is in
+`src/server.rs`. `tests/auth.rs` checks credential handling through a running
+server. See [development](development.md) for the test workflow.

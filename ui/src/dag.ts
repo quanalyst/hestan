@@ -164,3 +164,52 @@ export function collapseHierarchy<T extends { name: string }>(nodes: DagNode[], 
   }
   return { nodes: [...held.values()], groups, representative: fold };
 }
+
+// Collapsing arbitrary classifications can introduce cycles even when the
+// original assets form a DAG. Place each strongly connected component in one
+// column, then layer the acyclic component graph. All original edges remain.
+export function layersOf(nodes: DagNode[]): Map<string, number> {
+  const byName = new Map(nodes.map((n) => [n.name, n]));
+  const index = new Map<string, number>();
+  const low = new Map<string, number>();
+  const stack: string[] = [];
+  const stacked = new Set<string>();
+  const component = new Map<string, number>();
+  let next = 0;
+  let count = 0;
+  const visit = (name: string) => {
+    index.set(name, next); low.set(name, next++);
+    stack.push(name); stacked.add(name);
+    for (const dep of byName.get(name)!.deps.filter((d) => byName.has(d))) {
+      if (!index.has(dep)) {
+        visit(dep);
+        low.set(name, Math.min(low.get(name)!, low.get(dep)!));
+      } else if (stacked.has(dep)) {
+        low.set(name, Math.min(low.get(name)!, index.get(dep)!));
+      }
+    }
+    if (low.get(name) === index.get(name)) {
+      let member: string;
+      do {
+        member = stack.pop()!;
+        stacked.delete(member); component.set(member, count);
+      } while (member !== name);
+      count++;
+    }
+  };
+  for (const node of nodes) if (!index.has(node.name)) visit(node.name);
+  const deps = Array.from({ length: count }, () => new Set<number>());
+  for (const node of nodes) {
+    const own = component.get(node.name)!;
+    for (const dep of node.deps) {
+      const other = component.get(dep);
+      if (other !== undefined && other !== own) deps[own].add(other);
+    }
+  }
+  const depths = new Map<number, number>();
+  const depth = (id: number): number => {
+    if (!depths.has(id)) depths.set(id, Math.max(0, ...[...deps[id]].map((d) => depth(d) + 1)));
+    return depths.get(id)!;
+  };
+  return new Map(nodes.map((n) => [n.name, depth(component.get(n.name)!)]));
+}

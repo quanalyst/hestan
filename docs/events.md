@@ -47,11 +47,8 @@ terminal or the Activity view in the UI.
 
 ## Where an event is written, and why that is the whole design
 
-an event is a claim that something happened. if it is written *next to* the
-thing rather than *with* it, then a crash in the gap produces one of two lies:
-a log that says a thing happened which did not, or a thing that happened and
-left no record. Subsystem events join the transaction that changes the recorded state.
-The table below lists the guarantees and exceptions.
+Subsystem events generally share a transaction with the recorded state change.
+The table lists guarantees and exceptions.
 
 | what | transaction it joins | atomic |
 | --- | --- | --- |
@@ -73,37 +70,17 @@ The table below lists the guarantees and exceptions.
 
 ### The three windows, stated rather than hidden
 
-**an op's progress has no row to be atomic with.** `op_started`, `op_retry`,
-`op_success`, `op_failed`, `op_skipped`, `op_canceled` and `type_check_failed`
-are each a separate statement, written immediately before or after the
-`op_runs` update they describe. a crash in that gap loses the event and keeps
-the status, or vice versa. moving the write does not fix this: an op *starting* is not a row anywhere, so there is nothing
-to join. what the gap costs is one line of narration; the op run row is the
-record of record, and the ui reads both.
+Op events and `op_runs` updates are separate writes. A crash may leave one
+without the other; the op row is authoritative. Terminal run events are written
+before terminal status updates, but are not part of the same transaction.
 
-**a run's terminal event is written just before the terminal status.** in that
-order deliberately: anyone who can see a run marked `failed` can also see the
-line that says why. the reverse order would let a status exist with no
-explanation, which is the worse of the two.
+Schedule fires commit the run, fired tick and associated events together.
+Backfill chunk counters and policy events follow their run's launch, so a crash
+can leave a queued build without its corresponding progress event.
 
-**a fired schedule's run and its tick are two transactions.** the launch
-commits first, then the tick and its `schedule_fired` event. a crash between
-them leaves a run that is queued and will execute, with no tick and no event,
-recoverable and visible as a run whose trigger is `schedule`. the other
-direction, an event claiming a run that was never created, cannot happen. the
-same applies to `backfill_chunk`.
-
-**a policy's launch and its event are two writes.** the run is enqueued, then
-one `policy_launched` per asset in the plan. a crash between them leaves a build
-that will execute, tagged `policy`, with nothing saying which rule wanted it;
-the other direction, an event about a run that was never created, cannot happen.
-it is the same trade the fired schedule makes above, and for the same reason:
-the launch is the thing, and the narration is about it.
-
-**a delivered notification's event is about the mark, not about the hook.**
-delivery is at-least-once: the hook returns, then the row is marked and the
-event written in one transaction. a crash between the hook returning and that
-transaction re-delivers on the next pass, which is what at-least-once means.
+Notification delivery is at-least-once: the hook runs before the transaction
+that marks delivery and records the event. A crash between them can cause
+redelivery.
 
 ## Every kind, and what its payload carries
 
@@ -412,16 +389,9 @@ under.
 
 ## In the ui
 
-**Activity** is the whole log, one row per event, newest first: what it was
-about, what happened, and when. the filters are the api's (subject kind,
-level, and a find box over the message and the subject), and the feed follows
-the stream, so a run that starts while you are looking at it appears at the
-top.
-
-it is the one page that is not about a single thing. every other page answers
-"what is the state of this job / asset / run"; this one answers "what has this
-deployment been doing", which is the question you have at 3am and the one
-hestan could not previously answer at all.
+Activity shows deployment events newest first, with subject, level and text
+filters. It follows the event stream on unauthenticated deployments and polls
+when a token is required. See [Activity](web-ui.md#activity).
 
 ## The same run, as a trace
 
@@ -432,7 +402,7 @@ up in Grafana or Jaeger beside the services it calls, rather than in a tab of
 its own.
 
 ```toml
-hestan = { version = "0.1", features = ["otel"] }
+hestan = { version = "0.2.5", features = ["otel"] }
 ```
 
 **hestan installs nothing.** no subscriber, no tracer provider, no exporter,

@@ -2,86 +2,26 @@
 
 ## Vocabulary
 
-an *op* is a named async fn plus the upstream ops it waits on: `Op::new` or
-`Op::typed`, then `.after([...])`, `.when(rule)`, `.retries(n)`,
-`.retry_backoff(base, max)` or `.retry_delay(d)`, `.timeout(d)`,
-`.pool(name)`, `.params::<P>()`. it receives an `OpCtx` and returns json
-output or an error.
+| Term | Meaning |
+| --- | --- |
+| Op | A named async function with declared dependencies, retry policy and optional timeout. Receives `OpCtx`; returns JSON or an error. |
+| Job | A validated DAG of ops. Build rejects duplicate names, unknown dependencies and cycles. Declaration order breaks topological ties. |
+| Graph | A reusable set of ops, flattened into a job at build time. |
+| Run | One execution: UUID v7 ID, JSON params, trigger and status. |
+| Op run | One op's status, attempts, timing, output and error within a run. |
+| Asset | A named value with materialization history, fingerprints and explicit lineage. Builds execute in the internal `assets` job. |
+| Identity | An authenticated caller's name and role, recorded as `actor` on requested runs and events. Unauthenticated requests have no actor. |
 
-a *job* is a validated dag of ops. `Job::builder(name)...build()` rejects
-duplicate op names, deps on unknown ops, and cycles, and fixes a deterministic
-topological order (ties broken by declaration order). a *graph* is a reusable
-bundle of ops instantiated into a job by name; it is
-[flattened away at build](#reusable-graphs), so nothing past this line ever
-sees one.
+Run statuses are `queued`, `running`, `success`, `failed` and `canceled`.
+Op statuses are `pending`, `running`, `success`, `failed`, `skipped` and `canceled`.
+Triggers are `manual`, `schedule`, `retry`, `resume`, `replay`, `build` and `sensor`.
+Retry, resume and replay require a finished run; a live run returns HTTP 409.
+Manual launches can overlap, subject to concurrency limits.
 
-a *run* is one execution of a job: an id (uuid v7, so ids sort by creation
-time), params (arbitrary json), a trigger, and a status that moves
-`queued -> running -> success | failed | canceled`. each op within a run gets
-an *op run* row: status
-(`pending | running | success | failed | skipped | canceled`), attempt count,
-start/finish times, and the output or error.
-
-*events* are the append-only log of the whole deployment. each carries a level
-(`info | warn | error`), a kind, a message, optional structured json `data`,
-and a **subject**:
-`subject_kind` is one of `run`, `job`, `asset`, `schedule`, `sensor`,
-`backfill` or `system`, and `subject` names which one. so an asset
-materialized, a schedule that fired or was skipped, a sensor tick, a backfill's
-chunks, an alert nobody received and a lease reclaimed from a dead worker are
-all in the same log the run kinds are, and "what happened last night" is one
-query.
-
-a run's own kinds are `run_queued`, `run_started`, `run_success`, `run_failed`,
-`run_canceled`, `run_reclaimed`, `run_released`, `op_started`, `op_expanded`,
-`op_retry`, `op_success`, `op_failed`, `op_skipped`, `op_canceled`,
-`type_check_failed`, and `log`; the last is what `ctx.info/warn/error` emit.
-[events](events.md) has every kind, what each payload carries, where each one
-is written and which
-of them cannot be atomic, how to query and follow the log, and how a run maps
-onto a distributed trace.
-
-*captured output* is the other log, and a different thing: what the op itself
-printed rather than what hestan said about it. an [isolated op](isolation.md)'s
-stdout and stderr are piped and stored whole; an in-process op's `tracing`
-events are stored if you compose hestan's [capture layer](logs.md) into your
-subscriber. it lives in its own table for the good reason that a chatty op
-would otherwise bury the eight events that describe what the run did. the
-[logs page](logs.md) has the rest, including the one thing that is *not*
-captured and why.
-
-the *trigger* records why a run exists: `manual` (launch endpoint,
-`run_once`), `schedule` (the cron scheduler), `retry` (the re-run endpoint),
-`resume` (the [resume endpoint](#resume), which continues an earlier run),
-`replay` (the [replay endpoint](replay.md), which re-runs ops of an earlier
-run on the inputs it gave them), `build` (an [asset build](assets.md): the
-endpoints, `build_asset`, and what an
-[automation policy](assets.md#automation-policies) asked for), or `sensor` (a
-[sensor](sensors.md) evaluation asked for it). retry, resume and replay are
-for finished runs: the api answers 409 for one still queued or running, since
-a fresh copy of a live run would only double it. manual launches stay ungated,
-which is the documented escape hatch when an overlapping run is really
-wanted.
-
-an *identity* is who asked, where a person did and something
-[checked](auth.md): a name and a role, viewer, operator or admin. it lands on
-the run as `actor` and on every event the request caused, so `manual` becomes
-"manual, by ada". a deployment with no authenticator records no actor rather
-than a fabricated one, which is exactly what it knows: a person asked, and
-nothing was checking who.
-
-an *asset* is an op with identity: a persisted latest value, a fingerprint,
-and explicit lineage on other assets, which makes staleness provable and
-builds incremental: stale ancestors plus the target, fresh values seeded.
-asset builds run as ordinary runs of an internal job named `assets`, so
-everything on this page applies to them unchanged. the model has
-[its own page](assets.md).
-
-all of it lands in the store as it happens (sqlite by default, postgres if
-you point it at one); see [storage](storage.md). op outputs land there too by
-default, which is wrong for anything bulky;
-[io managers](io-managers.md) move them somewhere else and keep a handle in
-the run log.
+[Events](events.md) record deployment activity; [captured logs](logs.md) hold
+operation output separately. The [store](storage.md) persists execution
+history. [IO managers](io-managers.md) can move large outputs out of that store.
+See [assets](assets.md) for incremental builds and lineage.
 
 ## Where a duplicate name is refused
 
@@ -133,125 +73,51 @@ returns `None` even if that op ran.
 
 ## How a run executes
 
-every op whose deps have all reached a terminal status (and whose
-[trigger rule](#trigger-rules) admits it) is spawned as its own tokio
-task, so independent branches run concurrently: in a diamond
-`a -> {b, c} -> d`, `b` and `c` run at the same time.
-`Job::builder(..).max_parallel(n)` caps how many ops of one run are in
-flight at once, and ready ops over the cap wait their turn in readiness
-order (first ready, first spawned). without a cap, everything ready runs
-together. an op's output is persisted through its
-[io manager](io-managers.md) before its success is recorded (a `put` that
-fails fails the op), and its dependents are handed the resulting handle,
-resolved back to the value as each is spawned. under the default `Inline`
-manager a handle *is* the value, so this is the same in-memory handoff it has
-always been.
+Ready ops run in separate Tokio tasks once all dependencies are terminal and
+[trigger rules](#trigger-rules) allow them. Independent branches run concurrently.
+`Job::builder(..).max_parallel(n)` limits in-flight ops per run; excess ready
+ops wait in readiness order. Without a limit, all ready ops may run together.
 
-when an op exhausts its attempts, its transitive downstream is marked
-`skipped`, each with an `op_skipped` event naming the failed root, and the
-run will be failed. branches that don't depend on the failed op keep running
-to completion. propagation stops at any op whose [trigger rule](#trigger-rules)
-would still run it.
+Outputs pass through the [IO manager](io-managers.md) before success is recorded.
+A failed `put` fails the op. Inputs are resolved from stored handles when each
+dependent starts. Terminal failure skips downstream ops unless their trigger
+rules allow execution; independent branches continue.
 
-retries are extra attempts: `.retries(2)` means up to 3 total. a failed
-attempt emits `op_retry` (`data: {"attempt": n}`), sleeps, and tries again;
-the last failure emits `op_failed` (`data: {"error": msg}`). the op run's
-`started_at` is kept from the first attempt, so its recorded duration spans
-all of them. a panic in the op body is caught, turned into an
-`op panicked: ...` error, and goes through exactly the same retry policy as a
-returned `Err`.
+`.retries(2)` permits three attempts. Returned errors and caught panics use the
+same retry policy. Default backoff is exponential with full jitter, starting
+at one second and capped at 30 seconds. Set `.retry_backoff(base, max)` or use
+`.retry_delay(d)` for a fixed delay. Recorded duration includes all attempts.
 
-the pause between attempts is capped exponential backoff with full jitter by
-default: the nth retry waits a uniformly random slice of `1s * 2^n`, never
-more than 30s. `.retry_backoff(base, max)` sets the two numbers.
-`.retry_delay(d)` is the fixed-pause alternative: the same wait every time,
-no jitter. prefer the default: ops that fail together (one rate limit, one
-dead dependency) also retry together under a fixed delay, and hammer whatever
-knocked them over on the same second; jitter is what pulls the herd apart.
+`.timeout(d)` applies to each attempt after pool and rate waits. Timeout is a
+retryable failure and trips `ctx.is_cancelled()`. Without a timeout, an op can
+hold its concurrency slot indefinitely. See [cancellation](#cancellation) for
+in-process limits and [isolation](isolation.md) for process termination.
 
-`.timeout(d)` fails an attempt that runs longer than `d` with a
-`timed out after 30s` error, which then goes through the retry policy like
-any other failure. without one, a hung op runs forever: it holds its
-`max_parallel` slot, and its run stays active, so a schedule on
-[`Overlap::Skip`](scheduling.md) never fires again. the clock starts when the
-op starts running, so time spent waiting for a pool permit or a
-[rate](#rates) token is not counted against it. expiry also trips
-`ctx.is_cancelled()`; see
-[cancellation](#cancellation) for what that does and does not stop, and
-[isolation](isolation.md) for the op that it stops for real.
-
-a run is `failed` if any op finished `failed`, otherwise `success`, unless
-it was canceled, which wins over both. a failed run carries an `error` of its
-own: the first op that terminally failed, as `op {name} failed: {message}`,
-which is the same pair an [`on_failure` hook](notifications.md) receives.
-whichever status it reached, an [`on_run_finished`](notifications.md) hook
-gets one event carrying it, and each terminal **attempt** of each op gets an
-[`on_op_finished`](notifications.md) event of its own. the
-terminal event (`run_failed` / `run_success` / `run_canceled`) is committed
-before the terminal status, so anything that observes a finished run can also
-read its closing event.
+A run fails if any op terminally fails; otherwise it succeeds. Cancellation
+takes precedence. The run error names the first terminally failed op.
+[Hooks](notifications.md) receive each terminal attempt and the final run outcome.
+The terminal run event is written before the terminal status.
 
 ## What hestan promises about writes
 
-**a run never reports an outcome the run log did not take.** every status you
-read (an op that succeeded, a run that failed, an asset that was built) is a
-row that landed, not a thing the process believed at the time.
+Execution status is backed by persisted rows. Critical writes—status changes,
+fan-out rows and committed [state](state.md)—receive four attempts with capped,
+jittered backoff lasting less than a second in total. An already-terminal op
+row cannot be overwritten by another terminal status.
 
-there are two kinds of write behind that, and the difference is deliberate:
-
-- **what a run did** is critical: an op's terminal row, a run's terminal row,
-  an op starting, a fan-out instance's row, a committed
-  [watermark](state.md). one that fails is retried (four attempts, capped
-  exponential with full jitter, under a second in the worst case), because a
-  busy database is the ordinary reason a write does not land and it is over in
-  milliseconds. an op's terminal row is the one of these that can also be
-  *declined*: a row already holding a terminal status is not moved to another
-  one (see [cancellation](#cancellation)), and a declined write counts as
-  landed, because the outcome is on the row either way. what does not land is
-  a write the store would not take.
-- **what a run said** is best-effort: the [event log](events.md) and captured
-  [op output](logs.md). losing a line of narration is survivable where losing
-  a run's outcome is not, so these are let go rather than retried. they are
-  not let go *silently*: the count is on `GET /api/health`, and a store
-  dropping them says so there.
-
-what makes this a guarantee rather than a convention is that the two are
-different types in the source. an event write returns a value the "let it go"
-path accepts and a critical write does not, so dropping a run's outcome is a
-compile error rather than a thing somebody has to remember not to write.
+[Events](events.md) and [captured output](logs.md) are best-effort. Failed writes
+are counted in `GET /api/health`.
 
 ### When a write cannot land at all
 
-after its retries, a critical write can still fail: a disk that is full, a
-database that is gone, a postgres connection that died. **the run stops
-there.** it does not report success, and it does not report failure either,
-because at that point this process does not know what is true: the work may
-well have finished, and the row that would say so is the write that did not
-land. reporting either way is picking one of two guesses.
+If critical-write retries are exhausted, the run stops without inventing a
+terminal outcome. Its row remains `running` until the unrenewed claim expires
+(after 60 seconds). A process with a working store then applies the configured
+[reclaim policy](scaling.md#claims-and-leases): fail it or requeue it.
 
-what it leaves behind is worth stating plainly, because it is not tidy:
-
-> the run sits `running`, claimed by the process that gave up on it, with a
-> lease nobody is renewing. it stays that way until the lease runs out (60
-> seconds) and some process with a working store reclaims it, at which point
-> [`Reclaim`](scaling.md#claims-and-leases) decides: `Fail` marks it failed
-> with `claimer went away` and fires the failure hooks, `Requeue` puts it back
-> on the queue.
-
-that is worse than a clean failure. a run hangs around for a minute looking
-active when it is not, and anything waiting on it waits. it is far better than
-a false success, which is the only other thing hestan could do: a `success`
-the store never heard about is a lie that outlives the incident, gets read by
-the next resume, and marks an asset current that was never built.
-
-the process also stops taking new work while its store is refusing writes.
-claiming a run is promising to record what it does, and a queue draining into
-a process that cannot keep that promise turns one lost run into a shift's
-worth. it starts again on its own as soon as a write lands.
-
-the ops of an abandoned run are stopped with it: in-process ops are aborted
-and an [isolated](isolation.md) op's child process is killed, so nothing
-carries on working for a run nobody is going to record.
+The affected process stops claiming new work until a write succeeds. It aborts
+the abandoned run's in-process ops and kills isolated children. Blocking work
+remains subject to the [cancellation limits](#cancellation).
 
 ## Trigger rules
 

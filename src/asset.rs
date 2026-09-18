@@ -1000,16 +1000,13 @@ impl OpMeta {
     }
 }
 
-/// how one dep asset reaches the op that reads it: the op that produces it
-/// (which is the name the run knows it by), the key to take out of that op's
-/// output when the producer is a multi-asset, and whether the dep is itself
-/// partitioned, in which case its value is read per key from the store
-/// rather than out of the run.
+/// The producer, IO manager and partition mapping used to read a dependency's
+/// captured materialization.
 #[derive(Clone)]
 struct DepLink {
+    field: Option<String>,
     asset: String,
     op: String,
-    key: Option<String>,
     /// the dep's own key set when it is partitioned, which is what a mapping
     /// resolves against; `None` for an unpartitioned dep, read whole.
     partitions: Option<Partitions>,
@@ -1333,17 +1330,14 @@ impl AssetRegistry {
     /// declared.
     fn dep_link(&self, asset: &str, mapping: PartitionMapping) -> DepLink {
         let op = self.producer(asset);
-        // a multi-asset's output is one object keyed by what it produces, so a
-        // dep on one of them is a key of it; everything else is the whole value
-        let key = self
-            .op(&op)
-            .filter(|o| o.produces.len() > 1)
-            .map(|_| asset.to_string());
         DepLink {
+            field: self
+                .op(&op)
+                .filter(|o| o.produces.len() > 1)
+                .map(|_| asset.to_string()),
             io: self.op(&op).and_then(|o| o.io.clone()),
             asset: asset.to_string(),
             op,
-            key,
             partitions: self.get(asset).and_then(|m| m.partitions.clone()),
             mapping,
         }
@@ -1722,17 +1716,6 @@ fn check_partition_deps(metas: &[AssetMeta]) -> Result<(), Error> {
     Ok(())
 }
 
-/// the value one dep asset has, out of what the run handed the op that reads
-/// it: a multi-asset's output is an object keyed by what it produces, so the
-/// dep is one key of it, and everything else is the whole value.
-fn dep_value(ctx: &OpCtx, link: &DepLink) -> Option<Value> {
-    let held = ctx.input(&link.op)?;
-    Some(match &link.key {
-        Some(key) => held.get(key).cloned().unwrap_or(Value::Null),
-        None => held.clone(),
-    })
-}
-
 /// one asset's stored value, read back through the manager that stored it.
 ///
 /// a materialization holds what the manager returned: a handle under a file
@@ -1742,31 +1725,178 @@ fn dep_value(ctx: &OpCtx, link: &DepLink) -> Option<Value> {
 async fn stored_value(
     ctx: &OpCtx,
     link: &DepLink,
-    held: Value,
+    materialization: &Materialization,
 ) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
     let key = crate::io::IoKey {
-        run_id: ctx.run_id().to_string(),
+        run_id: materialization
+            .run_id
+            .clone()
+            .unwrap_or_else(|| ctx.run_id().to_string()),
         job: ASSETS_JOB.to_string(),
-        op: link.op.clone(),
+        op: materialization
+            .partition
+            .as_ref()
+            .map_or_else(|| link.op.clone(), |part| format!("{}[{part}]", link.op)),
     };
-    crate::io::get(&ctx.io, link.io.as_deref(), key, held)
-        .await
-        .map_err(|e| format!("could not read the value of {}: {e}", link.asset).into())
+    crate::io::get(
+        &ctx.io,
+        link.io.as_deref(),
+        key,
+        materialization.value.clone().unwrap_or(Value::Null),
+    )
+    .await
+    .map_err(|e| format!("could not read the value of {}: {e}", link.asset).into())
 }
 
-/// one key of a partitioned dep, out of the store and back through the manager
-/// that stored it; `None` when nothing has materialized there.
-async fn partition_value(
+/// Capture values and fingerprints together, including the producing IO keys.
+/// Save the rows before user code runs so a replay can use the same inputs.
+fn capture_inputs(
+    ctx: &OpCtx,
+    links: &[DepLink],
+    own: Option<&Partitions>,
+    key: Option<&str>,
+) -> Result<(Mats, bool), Box<dyn std::error::Error + Send + Sync>> {
+    let mut snapshot = Mats::default();
+    for link in links {
+        let keys = match &link.partitions {
+            None => vec![None],
+            Some(spec) => {
+                let reads = if link.mapping.is_identity() {
+                    Reads::at(key)
+                } else {
+                    link.mapping.reads(own, key, &KeySet::of(spec))
+                };
+                reads.keys.into_iter().map(Some).collect()
+            }
+        };
+        for at in keys {
+            if let Some(m) = ctx.store.materialization(&link.asset, at.as_deref())? {
+                snapshot.insert(m);
+            }
+        }
+    }
+    let replay_of = ctx.store.run(ctx.run_id())?.and_then(|r| r.replay_of);
+    let mut legacy_replay = false;
+    if let Some(original) = replay_of {
+        let saved = ctx.store.op_inputs(&original, &ctx.op)?;
+        if let Some(rows) = saved.as_ref().and_then(|s| s.get("asset_inputs")) {
+            let rows: Vec<Materialization> = serde_json::from_value(rows.clone())?;
+            let current = snapshot;
+            snapshot = rows.into_iter().collect();
+            // A dependency selected for replay too supplies its new result.
+            for m in current
+                .whole
+                .into_values()
+                .chain(current.parts.into_values().flat_map(|p| p.into_values()))
+            {
+                if m.run_id.as_deref() == Some(ctx.run_id()) {
+                    snapshot.insert(m);
+                }
+            }
+        } else {
+            // Older runs have values in their plan/output rows but no captured
+            // input fingerprints. Preserve those values without inventing lineage.
+            legacy_replay = true;
+        }
+    }
+    if !legacy_replay {
+        let rows: Vec<&Materialization> = snapshot
+            .whole
+            .values()
+            .chain(snapshot.parts.values().flat_map(|p| p.values()))
+            .collect();
+        let readers: Vec<Value> = links
+            .iter()
+            .map(|link| json!({ "asset": link.asset, "op": link.op, "io": link.io }))
+            .collect();
+        ctx.store.set_op_inputs(
+            ctx.run_id(),
+            &ctx.op,
+            &json!({ "asset_inputs": rows, "asset_readers": readers }),
+        )?;
+    }
+    Ok((snapshot, legacy_replay))
+}
+
+/// Validate saved asset inputs with the keys and managers that produced them.
+/// The wrapper reads these same snapshots when the replay executes.
+pub(crate) fn validate_replay_inputs(
+    store: &Store,
+    io: &crate::io::Io,
+    run: &str,
+    op: &str,
+    chosen: &BTreeSet<String>,
+) -> Result<bool, Error> {
+    let Some(saved) = store.op_inputs(run, op)? else {
+        return Ok(false);
+    };
+    let (Some(rows), Some(readers)) = (
+        saved.get("asset_inputs").and_then(Value::as_array),
+        saved.get("asset_readers").and_then(Value::as_array),
+    ) else {
+        return Ok(false);
+    };
+    for reader in readers {
+        let Some(producer) = reader.get("op").and_then(Value::as_str) else {
+            continue;
+        };
+        if chosen.contains(producer) {
+            continue;
+        }
+        for row in rows
+            .iter()
+            .filter(|m| m.get("asset") == reader.get("asset"))
+        {
+            let Some(origin) = row.get("run_id").and_then(Value::as_str) else {
+                continue;
+            };
+            let key = crate::io::IoKey {
+                run_id: origin.into(),
+                job: ASSETS_JOB.into(),
+                op: row
+                    .get("partition")
+                    .and_then(Value::as_str)
+                    .map_or_else(|| producer.into(), |part| format!("{producer}[{part}]")),
+            };
+            let manager = io.manager(reader.get("io").and_then(Value::as_str));
+            manager
+                .get(&key, &row["value"])
+                .map_err(|e| Error::ReplayInput {
+                    run: run.into(),
+                    op: op.into(),
+                    dep: row["asset"].as_str().unwrap_or(producer).into(),
+                    reason: e.to_string(),
+                })?;
+        }
+    }
+    Ok(true)
+}
+
+async fn legacy_input(
     ctx: &OpCtx,
     link: &DepLink,
-    key: &str,
+) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
+    let held = ctx.input(&link.op).cloned().unwrap_or(Value::Null);
+    let key = crate::io::IoKey {
+        run_id: ctx.run_id().to_string(),
+        job: ASSETS_JOB.into(),
+        op: link.op.clone(),
+    };
+    let value = crate::io::get(&ctx.io, link.io.as_deref(), key, held).await?;
+    Ok(match &link.field {
+        Some(field) => value.get(field).cloned().unwrap_or(Value::Null),
+        None => value,
+    })
+}
+
+async fn snapshot_value(
+    ctx: &OpCtx,
+    link: &DepLink,
+    mats: &Mats,
+    key: Option<&str>,
 ) -> Result<Option<Value>, Box<dyn std::error::Error + Send + Sync>> {
-    let held = ctx
-        .store
-        .materialization(&link.asset, Some(key))?
-        .and_then(|m| m.value);
-    match held {
-        Some(held) => Ok(Some(stored_value(ctx, link, held).await?)),
+    match mats.get(&link.asset, key) {
+        Some(m) => Ok(Some(stored_value(ctx, link, m).await?)),
         None => Ok(None),
     }
 }
@@ -1791,9 +1921,11 @@ async fn partition_value(
 /// "the set was empty" and "there is no such dep" stay different facts.
 async fn with_dep_inputs(
     ctx: &OpCtx,
+    mats: &Mats,
     links: &[DepLink],
     own: Option<&Partitions>,
     key: Option<&str>,
+    legacy_replay: bool,
 ) -> Result<OpCtx, Box<dyn std::error::Error + Send + Sync>> {
     let mut inputs: HashMap<String, Value> = HashMap::new();
     let mut dep_statuses: HashMap<String, crate::model::OpStatus> = HashMap::new();
@@ -1806,13 +1938,13 @@ async fn with_dep_inputs(
                 };
                 match link.mapping.reads_one() {
                     true => match reads.keys.first() {
-                        Some(key) => partition_value(ctx, link, key).await?,
+                        Some(key) => snapshot_value(ctx, link, mats, Some(key)).await?,
                         None => None,
                     },
                     false => {
                         let mut by_key = Map::new();
                         for key in reads.keys {
-                            if let Some(v) = partition_value(ctx, link, &key).await? {
+                            if let Some(v) = snapshot_value(ctx, link, mats, Some(&key)).await? {
                                 by_key.insert(key, v);
                             }
                         }
@@ -1820,7 +1952,12 @@ async fn with_dep_inputs(
                     }
                 }
             }
-            None => dep_value(ctx, link),
+            None if legacy_replay => Some(legacy_input(ctx, link).await?),
+            None => Some(
+                snapshot_value(ctx, link, mats, None)
+                    .await?
+                    .unwrap_or(Value::Null),
+            ),
         };
         if let Some(v) = value {
             inputs.insert(link.asset.clone(), v);
@@ -1846,7 +1983,7 @@ async fn with_dep_inputs(
 /// every key it read and not only the one that matches its own: a rollup that
 /// recorded a day would report fresh while the hours under it moved.
 fn dep_fingerprints(
-    ctx: &OpCtx,
+    mats: &Mats,
     links: &[DepLink],
     own: Option<&Partitions>,
     key: Option<&str>,
@@ -1854,10 +1991,7 @@ fn dep_fingerprints(
     let mut inputs = Map::new();
     for link in links {
         let fp = |at: Option<&str>| -> Result<Value, Error> {
-            let fp = ctx
-                .store
-                .materialization(&link.asset, at)?
-                .map(|m| m.fingerprint);
+            let fp = mats.get(&link.asset, at).map(|m| m.fingerprint.clone());
             Ok(fp.map(Value::String).unwrap_or(Value::Null))
         };
         let recorded = match &link.partitions {
@@ -1986,13 +2120,30 @@ fn wrap_op(reg: &AssetRegistry, meta: &OpMeta) -> Op {
                 false => None,
                 true => Some(partition_of(&ctx)?),
             };
-            let inner_ctx = with_dep_inputs(&ctx, &links, own.as_ref(), key.as_deref()).await?;
+            let (snapshot, legacy_replay) =
+                capture_inputs(&ctx, &links, own.as_ref(), key.as_deref())?;
+            let inputs = if legacy_replay {
+                Value::Object(
+                    links
+                        .iter()
+                        .map(|link| (link.asset.clone(), Value::Null))
+                        .collect(),
+                )
+            } else {
+                dep_fingerprints(&snapshot, &links, own.as_ref(), key.as_deref())?
+            };
+            let inner_ctx = with_dep_inputs(
+                &ctx,
+                &snapshot,
+                &links,
+                own.as_ref(),
+                key.as_deref(),
+                legacy_replay,
+            )
+            .await?;
             let output = inner.call(inner_ctx).await?;
             let values = split_output(&name, &produces, &output)?;
-            // deps' current fingerprints: ancestors in this run already wrote
-            // theirs. one entry per dep asset, not per op, so lineage reads in
-            // the names the asset graph uses
-            let inputs = dep_fingerprints(&ctx, &links, own.as_ref(), key.as_deref())?;
+            // The input fingerprints remain those captured before user code ran.
             // the op-wide override, which covers every output that did not
             // stage one of its own
             let shared = ctx.take_fingerprint();
@@ -2078,16 +2229,18 @@ fn check_op(reg: &AssetRegistry, meta: &CheckMeta) -> Op {
             // the value this key just produced, read back the way its consumer
             // reads it: the row holds what the manager returned, not the rows
             // themselves
-            let value = match &key {
-                Some(key) => match ctx
-                    .store
-                    .materialization(&asset, Some(key))?
-                    .and_then(|m| m.value)
-                {
-                    Some(held) => stored_value(&ctx, &link, held).await?,
-                    None => Value::Null,
-                },
-                None => dep_value(&ctx, &link).unwrap_or(Value::Null),
+            let (snapshot, legacy_replay) = capture_inputs(
+                &ctx,
+                std::slice::from_ref(&link),
+                link.partitions.as_ref(),
+                key.as_deref(),
+            )?;
+            let value = if legacy_replay && key.is_none() {
+                legacy_input(&ctx, &link).await?
+            } else {
+                snapshot_value(&ctx, &link, &snapshot, key.as_deref())
+                    .await?
+                    .unwrap_or(Value::Null)
             };
             let ctx = match &key {
                 None => ctx.clone(),

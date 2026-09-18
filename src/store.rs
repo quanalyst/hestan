@@ -1136,6 +1136,7 @@ trait Exec {
 /// to be.
 struct Conn<'a> {
     db: ConnDb<'a>,
+    claim: Option<&'a ExecutionClaim>,
     secrets: &'a secret::Vault,
 }
 
@@ -1155,7 +1156,11 @@ impl Conn<'_> {
             #[cfg(feature = "postgres")]
             ConnDb::Postgres(c) => TxDb::Postgres(c.transaction()?),
         };
-        Ok(Tx { db, secrets })
+        let mut tx = Tx { db, secrets };
+        if let Some(claim) = self.claim {
+            claim.check(&mut tx)?;
+        }
+        Ok(tx)
     }
 
     /// a transaction that takes the write lock at `BEGIN` rather than at the
@@ -1175,7 +1180,11 @@ impl Conn<'_> {
             #[cfg(feature = "postgres")]
             ConnDb::Postgres(c) => TxDb::Postgres(c.transaction()?),
         };
-        Ok(Tx { db, secrets })
+        let mut tx = Tx { db, secrets };
+        if let Some(claim) = self.claim {
+            claim.check(&mut tx)?;
+        }
+        Ok(tx)
     }
 
     /// several statements at once, no parameters: ddl and nothing else.
@@ -1199,6 +1208,12 @@ impl Exec for Conn<'_> {
     }
 
     fn execute(&mut self, sql: &str, args: &[Val<'_>]) -> Result<usize, Error> {
+        if self.claim.is_some() {
+            let mut tx = self.begin()?;
+            let moved = tx.execute(sql, args)?;
+            tx.commit()?;
+            return Ok(moved);
+        }
         let args = scrubbed(self.secrets, args);
         match &mut self.db {
             ConnDb::Sqlite(c) => sqlite_execute(c, sql, &args),
@@ -1551,7 +1566,10 @@ fn transient(e: &Error) -> bool {
         // a column that does not parse, a database from a later build, a
         // target this build cannot open: none of them is about this moment,
         // and none of them is reachable from a write in any case
-        Error::Column(..) | Error::SchemaTooNew(_) | Error::UnsupportedDb(_) => false,
+        Error::ClaimLost(_)
+        | Error::Column(..)
+        | Error::SchemaTooNew(_)
+        | Error::UnsupportedDb(_) => false,
         // which leaves the filesystem, where a call that failed once may
         // perfectly well work now
         _ => true,
@@ -1685,6 +1703,35 @@ impl Health {
     }
 }
 
+/// The owner and acquisition instant identify one execution of a run.
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+pub(crate) struct ExecutionClaim {
+    id: String,
+    owner: String,
+    acquired: String,
+}
+
+impl ExecutionClaim {
+    fn check(&self, tx: &mut impl Exec) -> Result<(), Error> {
+        // The conditional update locks the run until all accompanying writes
+        // commit. Recovery must acquire that same row before changing its ops.
+        let owned = tx.execute(
+            "UPDATE runs SET id = id WHERE id = ?1 AND claimed_by = ?2 AND claimed_at = ?3
+             AND status IN ('queued', 'running') AND lease_until >= ?4",
+            args![
+                &self.id,
+                &self.owner,
+                &self.acquired,
+                Utc::now().to_rfc3339()
+            ],
+        )?;
+        if owned == 0 {
+            return Err(Error::ClaimLost(self.id.clone()));
+        }
+        Ok(())
+    }
+}
+
 /// run history on sqlite or postgres. cheap to clone; safe to share across
 /// tasks.
 ///
@@ -1707,6 +1754,7 @@ impl Health {
 #[derive(Clone)]
 pub struct Store {
     db: Arc<Db>,
+    claim: Option<ExecutionClaim>,
     /// the target it was opened at (a path or a url) kept so a runner can
     /// tell whether a child process could reach the same database.
     target: Arc<str>,
@@ -1736,11 +1784,38 @@ impl Store {
     fn new(db: Db, target: &str) -> Store {
         Store {
             db: Arc::new(db),
+            claim: None,
             target: target.into(),
             health: Arc::new(Health::default()),
             meters: Arc::new(Meters::default()),
             secrets: Arc::new(secret::Vault::default()),
         }
+    }
+
+    pub(crate) fn for_execution(&self, run: &Run) -> Store {
+        self.for_claim(ExecutionClaim {
+            id: run.id.clone(),
+            owner: run.claimed_by.clone().expect("execution has a claimer"),
+            acquired: run
+                .claimed_at
+                .expect("execution has a claim time")
+                .to_rfc3339(),
+        })
+    }
+
+    pub(crate) fn for_claim(&self, claim: ExecutionClaim) -> Store {
+        Store {
+            claim: Some(claim),
+            ..self.clone()
+        }
+    }
+
+    pub(crate) fn execution_claim(&self) -> Option<&ExecutionClaim> {
+        self.claim.as_ref()
+    }
+
+    pub(crate) fn check_execution(&self) -> Result<(), Error> {
+        self.conn().begin()?.commit()
     }
 
     /// what this deployment calls a secret, and what it is holding.
@@ -1801,6 +1876,7 @@ impl Store {
         };
         Conn {
             db,
+            claim: self.claim.as_ref(),
             secrets: &self.secrets,
         }
     }
@@ -1915,7 +1991,9 @@ impl Store {
             };
             if attempt + 1 == WRITE_ATTEMPTS || !transient(&e) {
                 tracing::error!("{what} could not be written: {e}");
-                self.health.unrecorded();
+                if !matches!(e, Error::ClaimLost(_)) {
+                    self.health.unrecorded();
+                }
                 return None;
             }
             self.health.retried();
@@ -2791,7 +2869,7 @@ impl Store {
             tx.take_turns()?;
         }
         let counts = in_flight(&mut tx, limits)?;
-        let candidates = queued(&mut tx, QUEUE_SCAN)?;
+        let mut after = None;
         let reserve = format!(
             "SELECT id FROM runs
              WHERE id = ?1 AND claimed_by IS NULL AND status = 'queued' {}",
@@ -2799,36 +2877,43 @@ impl Store {
         );
         let now = Utc::now();
         let until = now + chrono::Duration::from_std(lease).unwrap_or(chrono::Duration::MAX);
-        for (mut run, plan) in candidates {
-            if !defined.contains(&run.job) {
-                continue;
+        loop {
+            let candidates = queued_after(&mut tx, QUEUE_SCAN, after.as_ref())?;
+            if candidates.is_empty() {
+                break;
             }
-            if counts.blocker(limits, &run.job, &run.tags).is_some() {
-                continue;
-            }
-            if tx
-                .query_opt(&reserve, args![&run.id], |_| Ok(()))?
-                .is_none()
-            {
-                continue;
-            }
-            let won = tx.execute(
-                "UPDATE runs SET claimed_by = ?1, claimed_at = ?2, lease_until = ?3
+            after = candidates.last().map(|(run, _)| run.clone());
+            for (mut run, plan) in candidates {
+                if !defined.contains(&run.job) {
+                    continue;
+                }
+                if counts.blocker(limits, &run.job, &run.tags).is_some() {
+                    continue;
+                }
+                if tx
+                    .query_opt(&reserve, args![&run.id], |_| Ok(()))?
+                    .is_none()
+                {
+                    continue;
+                }
+                let won = tx.execute(
+                    "UPDATE runs SET claimed_by = ?1, claimed_at = ?2, lease_until = ?3
                  WHERE id = ?4 AND claimed_by IS NULL AND status = 'queued'",
-                args![claimer, now.to_rfc3339(), until.to_rfc3339(), &run.id],
-            )?;
-            if won == 0 {
-                continue;
+                    args![claimer, now.to_rfc3339(), until.to_rfc3339(), &run.id],
+                )?;
+                if won == 0 {
+                    continue;
+                }
+                tx.commit()?;
+                // the claim is a fact now, so the counter moves now: written
+                // before the commit it would count a transaction that rolled back
+                // and was retried twice over
+                self.meters.claimed(now - run.created_at);
+                run.claimed_by = Some(claimer.to_string());
+                run.claimed_at = Some(now);
+                run.lease_until = Some(until);
+                return Ok(Some((run, plan)));
             }
-            tx.commit()?;
-            // the claim is a fact now, so the counter moves now: written
-            // before the commit it would count a transaction that rolled back
-            // and was retried twice over
-            self.meters.claimed(now - run.created_at);
-            run.claimed_by = Some(claimer.to_string());
-            run.claimed_at = Some(now);
-            run.lease_until = Some(until);
-            return Ok(Some((run, plan)));
         }
         tx.commit()?;
         Ok(None)
@@ -3088,7 +3173,8 @@ impl Store {
         lease: Duration,
         given_up: &[String],
     ) -> Result<usize, Error> {
-        let until = Utc::now() + chrono::Duration::from_std(lease).unwrap_or(chrono::Duration::MAX);
+        let now = Utc::now();
+        let until = now + chrono::Duration::from_std(lease).unwrap_or(chrono::Duration::MAX);
         let mut args: Vec<Val<'_>> = vec![Val::from(claimer), Val::from(until.to_rfc3339())];
         // numbered from 3, since the claimer and the new lease are already
         // bound; an empty list is no clause rather than an empty `IN ()`
@@ -3100,10 +3186,12 @@ impl Store {
                 format!(" AND id NOT IN ({})", list.join(", "))
             }
         };
+        let now_index = args.len() + 1;
+        args.push(Val::from(now.to_rfc3339()));
         let moved = self.conn().execute(
             &format!(
                 "UPDATE runs SET lease_until = ?2
-                 WHERE claimed_by = ?1 AND status IN ('queued', 'running'){except}"
+                 WHERE claimed_by = ?1 AND status IN ('queued', 'running') AND lease_until >= ?{now_index}{except}"
             ),
             &args,
         );
@@ -3318,7 +3406,8 @@ impl Store {
             &format!(
                 "SELECT {RUN_COLS} FROM runs
                  WHERE claimed_by IS NOT NULL AND status IN ('queued', 'running')
-                   AND (lease_until IS NULL OR lease_until < ?1)"
+                   AND (lease_until IS NULL OR lease_until < ?1) {}",
+                tx.dialect().claim_lock()
             ),
             args![&now],
             run_from_row,
@@ -5777,13 +5866,28 @@ fn in_flight(db: &mut impl Exec, limits: &Limits) -> Result<InFlight, Error> {
 /// a plain read on both backends, the dispatcher's own walk included: what a
 /// dispatcher locks is the one row it decides on, not every row it considered.
 fn queued(db: &mut impl Exec, limit: u32) -> Result<Vec<(Run, Option<Value>)>, Error> {
+    queued_after(db, limit, None)
+}
+
+fn queued_after(
+    db: &mut impl Exec,
+    limit: u32,
+    after: Option<&Run>,
+) -> Result<Vec<(Run, Option<Value>)>, Error> {
     db.query(
         &format!(
             "SELECT {RUN_COLS}, plan FROM runs
              WHERE status = 'queued' AND claimed_by IS NULL
+             AND (CAST(?2 AS BIGINT) IS NULL OR priority < ?2 OR (priority = ?2 AND
+                  (created_at > ?3 OR (created_at = ?3 AND id > ?4))))
              ORDER BY priority DESC, created_at, id LIMIT ?1"
         ),
-        args![limit],
+        args![
+            limit,
+            after.map(|r| r.priority),
+            after.map(|r| r.created_at.to_rfc3339()),
+            after.map(|r| r.id.as_str())
+        ],
         // `plan` is the column after the run's own, so its index is the number
         // of columns in RUN_COLS: a column added there moves this one along
         |r| Ok((run_from_row(r)?, r.opt_json(RUN_COL_COUNT)?)),
@@ -13849,5 +13953,119 @@ mod tests {
              ({with} bytes against {without} over {ROWS} rows)",
             SHA.len()
         );
+    }
+    #[test]
+    fn execution_writes_are_fenced_after_expiry_and_reclaim() {
+        both(|db| {
+            let store = db.store();
+            let defined = HashSet::from(["job".to_string()]);
+            for (id, policy) in [("fail", Reclaim::Fail), ("requeue", Reclaim::Requeue)] {
+                store
+                    .create_run(&mk_run(id, "job", Utc::now()), &["op".into()])
+                    .unwrap();
+                let (run, _) = store
+                    .claim_next("owner", Duration::from_secs(60), &Limits::new(), &defined)
+                    .unwrap()
+                    .unwrap();
+                let execution = store.for_execution(&run);
+                execution.run_started(id, Utc::now()).unwrap();
+                execution.op_started(id, "op", 1).unwrap();
+                // Preserve acquisition identity while expiring only the lease.
+                store
+                    .conn()
+                    .execute(
+                        "UPDATE runs SET lease_until = ?2 WHERE id = ?1",
+                        args![id, (Utc::now() - chrono::Duration::minutes(1)).to_rfc3339()],
+                    )
+                    .unwrap();
+                assert!(matches!(
+                    execution.set_op_state("job", "op", &json!(1)),
+                    Err(Error::ClaimLost(_))
+                ));
+                assert_eq!(
+                    store
+                        .renew_leases("owner", Duration::from_secs(60), &[])
+                        .unwrap(),
+                    0
+                );
+                store.reclaim_expired(policy, |_| None).unwrap();
+                if matches!(policy, Reclaim::Requeue) {
+                    // Even reacquisition by the same owner is a different execution.
+                    let (new, _) = store
+                        .claim_next("owner", Duration::from_secs(60), &Limits::new(), &defined)
+                        .unwrap()
+                        .unwrap();
+                    assert_ne!(run.claimed_at, new.claimed_at);
+                    store
+                        .for_execution(&new)
+                        .run_started(id, Utc::now())
+                        .unwrap();
+                }
+                assert!(matches!(
+                    execution.run_started(id, Utc::now()),
+                    Err(Error::ClaimLost(_))
+                ));
+                assert!(matches!(
+                    execution.op_started(id, "op", 2),
+                    Err(Error::ClaimLost(_))
+                ));
+                assert!(matches!(
+                    execution.op_finished(
+                        id,
+                        "op",
+                        OpStatus::Success,
+                        Some(&json!(1)),
+                        None,
+                        None,
+                        &[]
+                    ),
+                    Err(Error::ClaimLost(_))
+                ));
+                assert!(matches!(
+                    execution.set_op_state("job", "op", &json!(1)),
+                    Err(Error::ClaimLost(_))
+                ));
+                assert!(matches!(
+                    execution.run_finished(
+                        id,
+                        RunStatus::Success,
+                        None,
+                        Utc::now(),
+                        Some(&json!({}))
+                    ),
+                    Err(Error::ClaimLost(_))
+                ));
+                assert!(store.op_state("job", "op").unwrap().is_none());
+                assert!(store.due_notifications(Utc::now(), 10).unwrap().is_empty());
+                assert_ne!(store.run(id).unwrap().unwrap().status, RunStatus::Success);
+            }
+        });
+    }
+    #[test]
+    fn claim_scan_reaches_past_an_unregistered_page() {
+        both(|db| {
+            let store = db.store();
+            for i in 0..QUEUE_SCAN {
+                store
+                    .create_run(
+                        &mk_run(&format!("blocked{i}"), "elsewhere", Utc::now()),
+                        &[],
+                    )
+                    .unwrap();
+            }
+            store
+                .create_run(&mk_run("ready", "local", Utc::now()), &[])
+                .unwrap();
+            let (run, _) = store
+                .claim_next(
+                    "worker",
+                    Duration::from_secs(60),
+                    &Limits::new(),
+                    &HashSet::from(["local".into()]),
+                )
+                .unwrap()
+                .expect("eligible work beyond the first page");
+            assert_eq!(run.id, "ready");
+        });
     }
 }

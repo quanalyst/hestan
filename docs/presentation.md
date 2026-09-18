@@ -36,7 +36,7 @@ dependencies and history. The UI shows `display_name` when present, otherwise
 
 Changing display names, subgroups or labels preserves identity, history and
 origins. This metadata does not affect execution, ownership, scheduling or
-namespace permissions. Group marks continue to use the existing group colours.
+namespace permissions. Group marks continue to use the declared group’s stable shade.
 
 ## Grouping views
 
@@ -62,3 +62,7 @@ dependencies, origins or permissions.
 See the [API reference](http-api.md#presentation-metadata) for response fields.
 Run the [example](../examples/presentation.rs) with
 `cargo run --example presentation`, then open `http://127.0.0.1:4000`.
+
+Partitioned assets aggregate execution failures and running attempts across their
+partition instances. Collapsing arbitrary groups can produce cycles between the
+group nodes; the graph retains both directions and lays those nodes together.

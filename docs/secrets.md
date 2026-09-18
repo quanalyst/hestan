@@ -1,11 +1,7 @@
 # Secrets in params
 
-a launch's params are run data. they go into `runs.params`, onto the run page,
-into `GET /api/runs`, out of `hestan runs show`, and they stay there until
-[retention](storage.md) prunes them. that is right for a date, a region or a
-row limit and wrong for a deploy token.
-
-so an op may say which of its params are credentials:
+Ordinary run parameters are persisted and exposed in the UI, API and CLI.
+Declare sensitive top-level parameter keys with `Op::secret_params`:
 
 ```rust
 Op::new("push", |ctx: OpCtx| async move {
@@ -15,71 +11,25 @@ Op::new("push", |ctx: OpCtx| async move {
 .secret_params(["token"])
 ```
 
-the op still reads the value. what changes is that nothing writes it down.
-
-```
-$ curl -s localhost:4000/api/runs/019.../ | jq .params
-{ "token": "[hestan:redacted]", "env": "prod", "wait": 30 }
-```
+The operation receives the original value. Stored parameters contain
+`[hestan:redacted]` in its place. Prefer [resources](resources.md) for
+credentials shared by a deployment.
 
 ## Where the redaction is
 
-**in the store.** `Store` holds what each job declared and applies it to every
-params column it writes, before the insert:
-
-| column | written by |
-| --- | --- |
-| `runs.params` | every launch, retry, resume, replay, schedule fire, sensor fire and asset build |
-| `schedules.params` | the sync that mirrors declared schedules into the store on start |
-| `presets.params` | `Hestan::preset`, and the launchpad's save |
-
-that is the whole of it, and it is deliberately not in the ui, the api or the
-cli. a value scrubbed in a renderer is still in the database and still on
-every other renderer, and the next reader somebody adds gets it for free. a
-value the database never held cannot be read by a reader that does not exist
-yet, by a route added next month, or by whoever has a `psql` prompt.
-
-the ops get it because the process that took the launch keeps it in memory,
-keyed by run id, and puts it back into the params of the run it is about to
-execute. it goes to no disk on the way.
+The store redacts declared keys before writing `runs.params`,
+`schedules.params` or `presets.params`. The launching process keeps the original
+values in memory and restores them for local execution; it does not persist
+them for another worker.
 
 ## What a secret means for a replay
 
-**this is the sharp edge, and it is worth reading before you declare one.**
+Retry, resume and replay use stored parameters, so they cannot recover a
+redacted value. These requests and their previews return a conflict when a
+required secret value is the marker.
 
-a [replay](replay.md), a resume and a retry all read a finished run's stored
-params back and launch with them. the store holds `[hestan:redacted]` where
-the token was. re-launching from that row would run the deploy with the
-literal string `[hestan:redacted]` as its credential: a run that fails
-confusingly at best, and one that authenticates as something unintended at
-worst.
-
-**so they are refused, and the refusal names the param:**
-
-```
-$ hestan replay 019...
-error: job deploy: param token is declared secret and not stored, so what came
-back is the marker and not the value. a retry, a resume or a replay cannot
-re-read one: launch again and pass it
-```
-
-the api answers `409` with the same sentence; a resume or replay *preview*
-refuses identically, so the ui never offers a button that cannot work.
-
-the refusal is not four checks in four handlers. the marker is refused as a
-param value at `Runner::enqueue`, the one funnel every run in hestan goes
-through, so a launch path added later lands on it without anybody remembering
-to add it.
-
-**a run that carried a secret is therefore not re-runnable.** launching again
-and passing the value is the way to re-run it, and the reason to accept that
-is the same reason to declare the param at all: hestan is not a secret store,
-and the credential is somewhere that can hand it over again.
-
-if a job's re-runnability matters more than this, do not declare the param. put
-the credential in a [resource](resources.md) instead: a resource is process
-configuration, it is built where the op runs, it is never run data, and a
-replay rebuilds it like any other.
+Launch again with the credential, or move it into a resource. Ordinary retries
+within the original operation execution still have its in-memory parameters.
 
 ## What is covered
 
@@ -166,16 +116,16 @@ what it is not:
 
 ## What an existing deployment sees
 
-nothing, until an op declares a param. no schema version, no migration, no
-column, no response shape, and a job that declares nothing writes params byte
-for byte as it always did.
+Redaction is opt-in. Undeclared parameters continue to be stored normally;
+adding a declaration does not remove secrets from previously stored history.
 
 ## Where each piece lives
 
-| | |
-| --- | --- |
-| the declaration | `Op::secret_params`, merged per job by `Job::secret_params` |
-| the marker, the vault, the second line | `src/secret.rs` |
-| the choke point | `Store::params_col`, and the scrub at `Exec::execute` |
-| holding and putting back the value | `src/executor.rs` (`enqueue`, `execute_in_span`) |
-| the replay refusal | `Error::RedactedParams`, raised by `refuse_marked` |
+See `Op::secret_params` and `Job::secret_params` in the Rust API. The marker and
+in-memory values are handled in `src/secret.rs`; storage redaction is applied
+by `Store`, and launch validation rejects stored markers.
+
+Declared schedules and presets are redacted before startup writes them. This does
+not remove credentials from older database rows or backups. Isolated ops cannot
+restore secret parameters from the parent’s memory: they fail before the op body
+runs. Use a resource constructed in the child for those credentials.

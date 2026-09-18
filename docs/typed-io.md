@@ -1,9 +1,9 @@
 # Typed io
 
-ops speak json at the boundaries: every output is a `serde_json::Value` in the
-run history. `Op::typed` puts serde structs over that boundary so the compiler
-checks your wiring, and a shape mismatch at run time fails the attempt with a
-`type check failed` error in the run log.
+Operations exchange JSON. `Op::typed` deserializes inputs into a Rust type and
+serializes its result back to JSON. Dependency names and payload shapes are
+validated at build time and runtime respectively; Rust does not statically
+check the shape of upstream JSON.
 
 ## Op::typed
 
@@ -63,11 +63,8 @@ via `?`.
 
 ## Gradual typing
 
-typed and untyped ops mix freely in one job. a common shape: raw `Op::new`
-ops at the edges where payloads are still fluid, `Op::typed` at the joins
-where several branches meet and shape bugs hurt most. `examples/demo.rs`
-does exactly this (`fetch_orders`/`enrich` untyped, `aggregate`/`publish`
-typed). there is no migration step; tighten one op at a time.
+Typed and untyped operations can share a job. Convert one operation at a time;
+no stored-data migration is required. See [the demo](../examples/demo.rs).
 
 ## Params validation
 

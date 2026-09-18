@@ -1,82 +1,34 @@
 # Embedding
 
-hestan is a library; the binary is yours. there are three levels of entry,
-each dropping a layer of machinery, and one that wraps the first, so the
-binary you already have gains a [command line](cli.md) over the registry inside
-it.
+Choose an entry point based on whether your application needs a server, a
+command line or a single execution.
 
 ## cli::run
 
-`hestan::cli::run(app, addr)`, behind `features = ["cli"]`, is
-[`serve`](#serve-run_once-runner) with argv in front of it. **with no arguments
-it is exactly `app.serve(addr)`** (the same address, the same loops, the same
-error if the socket will not bind), so swapping the call in a running
-deployment changes nothing about how it behaves. with arguments it launches,
-inspects and diagnoses against the jobs compiled into that binary. see
-[the command line](cli.md).
-
-it asks the [isolated-op](isolation.md) guard before it looks at argv, like
-every other entry point does, because an op subprocess is this binary
-re-executed with no arguments at all, and no arguments is how a command line
-spells "serve".
+With the `cli` feature, `hestan::cli::run(app, addr)` adds commands over the
+application's registry. With no arguments it calls `serve` on the supplied
+address. It also handles isolated-operation subprocess startup before parsing
+normal commands. See [CLI](cli.md).
 
 ## serve, run_once, Runner
 
-`Hestan::new()...serve(addr)` is the full deal: open and migrate the
-database, sweep runs that a dead process left behind, sync the schedules and
-sensors tables to the code, start the loops this process's
-[role](scaling.md#roles) owns (the scheduler, the sensors, the backfill
-chunker, the freshness checker, the
-[policy](assets.md#automation-policies) pass and the retention sweeper for a
-role that decides, the queue dispatcher for one that executes, and the lease loop
-whatever the role is), and serve the ui and api.
-`.retention(Retention::days(n))` folds one more step into that startup work:
-terminal runs older than `n` days are pruned before anything new launches, and
-the sweeper keeps pruning every hour after that (the default keeps
-everything; see [storage](storage.md#retention)).
-it binds the listener *before* spawning the loops, so a bind failure
-(port taken) can't leave a detached loop firing jobs into a server that never
-started. it is the **bound** address that is checked against the
-[authenticator](auth.md), so `serve` refuses `Error::Unguarded` on an address
-anyone can reach with nothing configured. when serve returns, every loop is
-aborted with it.
+| Entry point | Behavior |
+| --- | --- |
+| `Hestan::serve(addr)` | Opens and migrates the store, performs startup recovery and synchronization, starts role-specific loops, and serves the UI/API. |
+| `Hestan::run_once(job, params)` | Performs startup work, executes one manual run and returns its final `Run`; no server or continuous scheduler. |
+| `Hestan::build_asset(name)` | Performs one headless build of an asset and its stale ancestors. |
+| `Runner::new(jobs, store)` | Creates an executor without startup recovery, synchronization or serving. Returns an error for duplicate jobs. |
 
-**and `serve` returns when the process is signalled.** SIGTERM or SIGINT stops
-it accepting, finishes what it is holding up to `Hestan::stop_within`, hands
-the deciding lease back and puts what it could not finish back on the queue;
-[scaling](scaling.md#stopping-a-process-on-purpose) has the order. `run_once`
-and `build_asset` install no handler at all, and a signal ends them where it
-finds them: they exist to execute the run they were asked for.
+`serve` binds and validates its address before starting background loops.
+SIGTERM or SIGINT initiates [graceful shutdown](scaling.md#stopping-a-process-on-purpose).
+`run_once` and `build_asset` install no signal handlers.
 
-`Hestan::new()...run_once(job, params)` builds the same way (including the
-crash sweep, the schedule/sensor sync and one retention sweep) but runs a
-single manual run to completion and returns the final `Run`. no server, no
-scheduler, no sensor loop. good for cron-driven containers or one-off
-backfills where hestan is the executor and something else owns the clock.
-`Hestan::new()...build_asset(name)` is the same shape for
-[assets](assets.md): one headless build run of the named asset and its
-stale ancestors.
+Configure [retention](storage.md#retention) to prune history; by default it is
+kept. A serving process performs periodic sweeps in addition to startup work.
 
-`Runner::new(jobs, store)` is the bare executor: no sweep, no schedule sync,
-no server. `launch` and `run` as described in [concepts](concepts.md), with
-`runner.store()` for reading history back. it returns
-`Result<Runner, Error>`, and two jobs of one name is `Error::DuplicateJob`:
-the same answer `Hestan` gives, since which one you would have got otherwise
-depends on the order they were handed over.
-
-`Runner::new` declares no [concurrency pools](concepts.md#concurrency-pools),
-so an op with `.pool(name)` fails at run time with
-`op takes from pool {name}, which is not declared`. running it unlimited
-would quietly break the promise the pool exists to keep. use
-`Runner::with_pools(jobs, store, hooks, [("api".into(), 3)])`, which validates
-every op's pool up front and returns `Error::Graph` if one is missing;
-`Hestan::pool(name, limit)` is the same check at build.
-
-[rates](concepts.md#rates) work the same way and are declared on the runner
-rather than in a constructor, because they compose with whichever one you
-used: `Runner::new(jobs, store)?.with_rates([("api".into(), 5, Duration::from_secs(1))])?`.
-an op with `.rate(name)` on a runner that declares none fails at run time for
-the same reason an undeclared pool does.
+When constructing a `Runner` directly, declare pools with `Runner::with_pools`
+and rates with `.with_rates(...)`. An operation using an undeclared pool or
+rate fails at runtime. `Hestan` validates those declarations during build.
 
 ## Testing your jobs
 
@@ -110,10 +62,17 @@ events. for a test that needs the sweep or schedule sync, use
 
 ## Consuming from another repo
 
-the path and git dependency forms are in
-[getting started](getting-started.md). for local iteration against a pinned
-git dep (hacking on hestan and the consumer at once), put a patch in the
-consumer's `.cargo/config.toml` rather than editing `Cargo.toml`:
+Use a registry dependency for releases (`cargo add hestan`), a path dependency
+for local development, or a git dependency pinned to a revision. For example,
+choose one of these entries in `[dependencies]`:
+
+```toml
+hestan = { path = "../hestan" }
+# Or: hestan = { git = "https://github.com/quanalyst/hestan", rev = "<commit>" }
+```
+
+To override an existing git dependency locally, add a patch to the consumer's
+`.cargo/config.toml`:
 
 ```toml
 # .cargo/config.toml: local only, don't commit
@@ -139,19 +98,11 @@ has it open.
 
 ## Single-process assumptions
 
-one *decider* at a time per database, and as many executors as you like. that
-split is what [scaling](scaling.md) is about: schedules, sensors, freshness
-checks, automation policies and backfill chunking are decisions, and the
-deployment makes each one once. which process makes them is settled by a
-[lease in the store](scaling.md#the-deciding-lease), so starting a second
-`Role::All` or `Role::Scheduler` gives you a warm spare rather than two of
-every scheduled run. any number may be `Role::Worker`, because a run is claimed
-by exactly one of them and the startup sweep respects a live claim rather than
-assuming it is alone.
+A store has one active decider and may have multiple workers. The
+[deciding lease](scaling.md#the-deciding-lease) allows additional scheduler or
+all-role processes to act as standbys. Workers claim runs individually, and
+startup recovery preserves live claims.
 
-hestan's own extra process is a third thing again: an [isolated
-op](isolation.md) runs in an op subprocess that opens the same file, takes
-neither path, and runs one op. within one process, a job slower than its own
-cron interval is handled by its overlap policy (skip by default; see
-[scheduling](scheduling.md)); manual launches are never gated, so those can
-still overlap a running job.
+[Isolated-operation subprocesses](isolation.md) execute one operation and do
+not run scheduler or worker loops. Schedule overlap policies govern scheduled
+launches; manual launches remain subject to concurrency limits.

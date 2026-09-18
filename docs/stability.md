@@ -23,32 +23,17 @@ These contracts cover the library and its interfaces.
 
 ## The enums
 
-two rules, and the type says which one it is under.
+Match `#[non_exhaustive]` enums with a wildcard arm. These are `Error`, `Meta`,
+`InputError`, `Auth`, `Trigger`, `SubjectKind`, `EventKind`, `TickOutcome`, `When`,
+`Reclaim` and `Blocked`.
 
-**an enum carrying `#[non_exhaustive]` will gain variants.** match it with a
-`_` arm. eleven do: `Error`, `Meta`, `InputError`, `Auth`, `Trigger`,
-`SubjectKind`, `EventKind`, `TickOutcome`, `When`, `Reclaim` and `Blocked`.
-each says in its own rustdoc what is coming and what a caller gives up by
-holding a fallback arm open, which in every one of those eleven is close to
-nothing: a rendering it has not seen, a cause it can group as "something else",
-a refusal it reports by its message.
+Closed enums support exhaustive matching: `Exit`, `RunStatus`, `OpStatus`,
+`BackfillStatus`, `DeliveryState`, `Access`, `EventLevel`, `Severity`, `Overlap`,
+`Catchup`, `Role`, `Freshness`, `CancelOutcome`, `SensorOutcome`, `LateKind`,
+`LogStream` and `CheckStatus`. Adding a variant is a compatibility change.
 
-**an enum without it is a closed set, and that is a promise.** seventeen are:
-`Exit`, `RunStatus`, `OpStatus`, `BackfillStatus`, `DeliveryState`, `Access`,
-`EventLevel`, `Severity`, `Overlap`, `Catchup`, `Role`, `Freshness`,
-`CancelOutcome`, `SensorOutcome`, `LateKind`, `LogStream` and `CheckStatus`.
-match them with no `_` arm, and a future hestan that wanted to add to one owes
-you the compile error rather than a silent fall into a wildcard. three reasons
-run through the seventeen: a **state machine**, where a sixth state changes
-what the five mean; an **ordered scale**, where `role >= needed` and
-`severity` comparisons are already written against the order; and a **question
-whose answers are covered**, where the next thing to say would be a field on a
-variant rather than a variant beside it.
-
-`EventKind` and `SubjectKind` carry an `Unknown` arm as well, and it is a
-different mechanism for a different problem: `#[non_exhaustive]` is about a
-build against a newer hestan, and `Unknown` is about **this** build reading a
-row a newer hestan wrote. neither replaces the other.
+`EventKind::Unknown` and `SubjectKind::Unknown` handle stored values written by
+a newer build. They complement compile-time non-exhaustive matching.
 
 ## The structs
 
@@ -125,19 +110,6 @@ when they prevent a bug.
 
 ## What is checked rather than claimed
 
-some of what is above is a `cargo test` case rather than a claim, because a
-stability claim nothing checks is a comment.
-
-- **`tests/stability.rs`** matches all seventeen closed sets with no `_` arm.
-  it is an integration test on purpose: `#[non_exhaustive]` does not restrict
-  the crate that defines the type, so the same matches written inside `src/`
-  would compile either way and prove nothing. it also reads `src/` back and
-  fails if a public enum lands there that is neither marked nor listed, so the
-  decision gets made rather than defaulted.
-- **the nine exit codes** in `cli.md`'s table are read out of the markdown and
-  asserted against the `Exit` discriminants, so the published table and the
-  type cannot drift apart.
-- **`Trigger`'s rustdoc** carries the exhaustive match that no longer builds
-  as a `compile_fail` example, beside the one that does. both are run.
-- **`tests/docs.rs`** asserts this page is in the index and that the index
-  links nothing that has gone.
+`tests/stability.rs` checks exhaustive enum matching, public enum classification
+and the CLI exit-code table. Compile-fail rustdoc examples check non-exhaustive
+matching. `tests/docs.rs` checks the documentation index and package contents.

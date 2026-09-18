@@ -14,6 +14,9 @@
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum Error {
+    /// This execution no longer owns its run. No write was committed.
+    #[error("execution claim lost for run {0}")]
+    ClaimLost(String),
     /// a declaration that does not describe anything executable: a cycle, a
     /// dep on a name nothing produces, two ops under one name, a fan-out with
     /// nothing to fan out over. every job, graph and asset registration is

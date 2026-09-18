@@ -1,113 +1,60 @@
 # Replay
 
-an op failed in production two months ago. you have a fix. the question worth
-answering is whether the fix works **on the input that broke it**, not on one
-you reconstructed by hand.
+Replay selected operations using their recorded dependency inputs and the
+original run parameters. It creates a new run with `replay_of` pointing to the
+original; it does not modify the original run.
 
 ```rust
 let id = runner.replay(&broken)?;                       // the ops that failed
 let id = runner.replay_ops(&broken, Some(&["load".into()]))?;  // or these
 ```
 
-that launches a **new** run of the same job which executes those ops and
-nothing else, with every dep of them seeded from what the original run
-recorded. the op reads byte for byte what it read then. the original run is
-never written to: no status, no event, no materialization. it is history and
-stays history, and the new run records `replay_of` pointing at it.
+By default, replay selects failed operations. Explicit selection can include
+other operations the original run executed.
 
 ## What it is not
 
-a [resume](concepts.md#resume) re-runs what did **not** succeed, together with
-everything downstream of it, and is how you finish a run that broke. a replay
-re-runs what **did**, exactly the ops named and nothing below them, and is how
-you find out whether something would go differently now. they are one letter
-apart in a run log and opposite in meaning, so they are separate triggers
-(`resume`, `replay`) and separate columns (`resumed_from`, `replay_of`), and a
-run carries at most one of them.
+| Action | What executes | Reused data |
+| --- | --- | --- |
+| [Retry](http-api.md#retry) | The whole job | Original parameters |
+| [Resume](concepts.md#resume) | Operations that did not succeed and their downstream work | Successful outputs |
+| Replay | Exactly the selected operations | Their recorded dependency inputs |
 
-a [retry](http-api.md#retry) is the third of these: the whole job again from
-the beginning, on nothing the old run produced.
+Resume records `resumed_from`; replay records `replay_of`. A run carries at
+most one of these references.
 
 ## What it does not reproduce
 
-**a replay reproduces the inputs, not the world.** four things move on
-regardless, and a replay that succeeded is only evidence about the ones that
-did not matter to it:
+Replay uses the current code, graph and resources. It does not reproduce the
+clock, randomness, external services or data fetched directly by an operation.
+Only recorded dependency inputs and parameters are reused.
 
-- **the code is today's.** that is the point (you are testing a fix), but it
-  means a replay is not a bit-for-bit re-execution of what happened. an op
-  whose body changed in twelve ways since is running all twelve.
-- **resources are rebuilt.** a connection, a client, a temp directory: the op
-  gets [today's](resources.md), not the original's. an op that read something
-  through a resource (a table, a config row, a file the client points at) read
-  a world that has moved on, and hestan captured none of it.
-- **the clock, randomness, and anything the op fetches itself** are not
-  captured and cannot be. `Utc::now()` answers today. an op that calls an api
-  gets today's answer, not the one the api gave in June. only what arrived
-  through `ctx.input` is reproduced.
-- **the params are the original's, and the job is today's.** the run's params
-  come back with it; the graph around the op does not. a job that has since
-  gained a dep on the op being replayed fails the replay rather than seeding
-  it, because there is no recorded output for a dep that did not exist.
-
-so a replay that succeeds says "this code, today, on that input, worked". it
-does not say the original run would have worked with this fix, and it is not a
-reconstruction of an incident. if the difference matters for what you are
-about to conclude, the honest reading is the narrow one.
+If a selected operation now requires an input that the original run did not
+record, replay is refused. Success demonstrates that the current code ran on
+those saved inputs; it does not reconstruct the original environment.
 
 ## A run that carried a secret param cannot be replayed at all
 
-a param an op declared [secret](secrets.md) is not in the run log: the store
-holds `[hestan:redacted]` where the value was, on purpose, and nothing anywhere
-can turn that back into the credential. so there is nothing for a replay to
-re-run it with.
-
-that is a refusal rather than a run:
-
-```
-job deploy: param token is declared secret and not stored, so what came back is
-the marker and not the value. a retry, a resume or a replay cannot re-read one:
-launch again and pass it
-```
-
-the same refusal covers a resume, a retry and both previews, because it is
-raised where params become a launch rather than in each of the four. **launch
-again and pass the value** is the way to re-run such a run, and if that is not
-acceptable for a job, the credential belongs in a [resource](resources.md)
-rather than in its params: a resource is rebuilt on a replay like any other.
+Stored [secret parameters](secrets.md) contain a redaction marker rather than
+the credential. Retry, resume, replay and their previews reject that marker.
+Launch again with the required values, or supply credentials through
+[resources](resources.md).
 
 ## The retention horizon
 
-[retention](storage.md#retention) prunes old runs, and pruning a run asks
-every registered [io manager](io-managers.md) to drop what that run wrote, so
-an old run's values go when its rows do. **a pruned run cannot be replayed**,
-and neither can one whose files a manager can no longer produce.
+A replay requires the original run and all selected dependency inputs. Hestan
+resolves every input through its I/O manager before launching and refuses the
+request if a row or stored value is unavailable.
 
-that is refused rather than run:
-
-```
-cannot replay load of run 019ff1b7-...: its input extract cannot be read back:
-No such file or directory (os error 2)
-```
-
-every seed is read back through its manager before anything is launched, so
-the refusal comes instead of a run rather than halfway through one. a run that
-executed with a silently defaulted input would be a "reproduction" that
-reproduces nothing.
-
-if replay is why you keep history, keep it for longer where it matters:
+[Retention](storage.md#retention) removes run history and managed output files.
+Keep failures longer if they are needed for diagnosis:
 
 ```rust
-Hestan::new()
-    // failures age slower than successes, and a failure is what you replay
-    .retention(Retention::days(30).failed_days(180))
-    // or per job, for the one whose inputs you will want in a year
-    .job(Job::builder("orders_etl").retention(Retention::days(365)).op(load).build()?)
+Hestan::new().retention(Retention::days(30).failed_days(180))
 ```
 
-with no policy configured nothing is ever pruned, which is the default and
-means every run stays replayable, and every `FileIo` directory grows
-forever. those are the same fact from two directions.
+Without a retention policy, Hestan keeps history. External files may still
+become unavailable independently of retention.
 
 ## The three ways in
 
@@ -139,13 +86,7 @@ and a replayed run's header links back to the run it replayed
 
 ## What a replay of a subset run reads
 
-a run that was itself a subset of its job (a resume, a replay, an
-[asset build](assets.md)) did not produce everything its ops read. what it
-was handed is recorded on the run as its plan, and that is what a replay of it
-seeds from: the ops it ran are rows, and the values it was given are the plan.
-so replaying an op of a resumed run reads what that op read, whichever run
-originally produced it, without walking a chain or guessing.
-
-an op the run never ran is refused rather than launched on its own. it has no
-inputs of its own to reproduce, and running it anyway would be a partial
-launch wearing a replay's name.
+Subset runs record their seeded inputs in their execution plan. Replaying one
+uses that plan together with the operation rows to reproduce the inputs it
+read, including values originally produced by another run. Selecting an
+operation that the original run never executed is refused.

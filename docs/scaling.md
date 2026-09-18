@@ -268,55 +268,22 @@ that is your job to arrange.
 
 ### The constraint is the guarantee
 
-**this is not built on the lease, and the order matters.** what makes a
-duplicate decision impossible is the store:
-
-- one `fired` tick per `(job, expr, scheduled_for)`, on a
-  [unique index](storage.md#one-fire-per-occurrence), with the tick and the run
-  written in one transaction so a refused tick launches nothing.
-- one run per `(sensor, run_key)`, on the `sensor_run_keys` primary key, the
-  same way and since [run keys](sensors.md#run-keys) existed.
-- one run per [launch key](launching.md#launching-once), on the `launch_keys`
-  primary key, again in the transaction that writes the run. that one is not a
-  decision a scheduler makes; it is two api processes behind a load balancer
-  taking the same retried request, which the lease has nothing to say about at
-  all.
-
-a distributed lock fails exactly when a process pauses, a disk stalls or a
-network splits, which is to say it fails at the moment its holder is most
-certain it still holds it. a unique index does not have moments. so the
-constraint went in first and the lease went in on top of it: **correctness comes
-from the constraint, and the lease is what stops the duplicate being
-attempted.**
+The store enforces one fired tick per `(job, expr, scheduled_for)`, one run per
+sensor run key and one run per launch key. Each key is claimed in the transaction
+that creates its run. These constraints prevent duplicate keyed launches even
+when callers race. The deciding lease reduces competing attempts.
 
 ### The deciding lease
 
-one row in the `decider` table, in the same vocabulary the
-[run lease](#claims-and-leases) uses: `claimed_by`, `claimed_at`,
-`lease_until`. a process that decides takes it at boot, renews it every two
-seconds, and loses it by failing to renew for ten. anybody may take an expired
-one.
+The `decider` row records its holder, acquisition time, expiry and term. A
+scheduler acquires it at startup, renews every two seconds and loses it after
+ten seconds without renewal. Another scheduler may acquire an expired lease.
 
-what the run lease has no need of is the **term**, a counter that goes up on
-every acquisition and never on a renewal. a decision is written under the term
-its process believes it holds, and the store checks that term in the same
-transaction as the write. that is what a lease alone cannot do: a leader that
-stops the world past its own expiry and resumes agrees with every check it makes
-in its own memory, and disagrees with the row.
+The term increases on acquisition. Deciding launches check that term in the
+same transaction as the run insert, rejecting a stale holder after takeover.
 
-`Role::All` pays nothing for this in the ordinary case. one process on one
-database finds the row free, takes it before `serve` binds its socket, and never
-contends with anybody. the exception is worth stating: a process **killed**
-without handing the lease back leaves it held until it expires, so a restart
-inside that window waits up to ten seconds before it decides anything. ten
-seconds of nobody deciding is ten more seconds of downtime, and
-[catch-up](scheduling.md#missed-fire-catch-up) already has an answer for
-downtime.
-
-A process [asked to stop](#stopping-a-process-on-purpose) releases the deciding
-lease. Another process can acquire it on its next poll rather than waiting for
-expiry. A forced kill cannot release it; see
-[container shutdown](containers.md#signals-and-what-a-stop-is-worth).
+Graceful shutdown releases the lease. A forced kill can delay takeover by up
+to ten seconds; missed occurrences follow the schedule's catch-up policy.
 
 ### What the term fences, and what it does not
 
@@ -394,64 +361,17 @@ environment variables that mark an op subprocess are `HESTAN_ISOLATED_RUN` and
 
 ## A rate is per process
 
-`Hestan::rate("api", 5, Duration::from_secs(1))` is five calls a second **from
-this process**. two workers each honouring it send ten, and the system on the
-other side sees ten and has no idea it was talking to two of anything. with
-`HESTAN_ROLE=worker` on two hosts, a declared rate is per host and the external
-system sees the sum.
+`Hestan::rate("api", 5, Duration::from_secs(1))` permits five calls per second
+from each process. Two workers can therefore make ten calls per second.
 
-that is not a footnote to bury. a rate exists to protect something outside
-hestan, and the deployment shape that makes hestan scale is exactly the one
-that breaks the promise. the bucket is memory: like `slots`, and unlike every
-other limit on this page, it is not a row anybody else can read.
-
-**what to do about it is arithmetic.** the number of workers is a number
-somebody chose, so divide by it: three workers against an api that allows six
-calls a second is `rate("api", 2, ..)` in the registry all three of them build.
-that costs nothing, needs no database, and is exactly right for as long as the
-count is known. where it genuinely is not (an autoscaler), the honest choices
-are to size for the maximum you will ever run, or to keep the throttled work
-where only one process does it.
-
-this is asserted rather than described. `tests/queue.rs` starts two real worker
-processes against one queue, each honouring "one call every two seconds", and
-checks both halves of the truth: each process spaces its own calls a period
-apart, and the two of them together put two calls inside one period.
+For a deployment-wide budget, divide the rate by the worker count, size it for
+the maximum worker count, or confine that work to one process. See
+[rates](concepts.md#rates) for waiting and burst behavior.
 
 ### Why the bucket is not in the store
 
-a bucket in the run log would hold across processes (a row per name, refilled
-by elapsed time, decremented in a transaction), and it is deliberately not
-here. the reasons are worth writing down, because they are also the reasons it
-would have to be built differently than it sounds.
-
-- **a round trip per call, on the path of every op that declares a rate.** the
-  latency is not the problem; a millisecond either side of an http request is
-  nothing. the write is. a token is an `UPDATE`, and at the rates people
-  actually declare (5 a second, 100 a minute), that is a write transaction per
-  call forever, against the same database the run log is going into. sqlite
-  serializes writers, so those queue behind every `op_started` and every event;
-  postgres does not, but the row is a single hot row and every worker wants it.
-- **waiting would become polling.** the local bucket wakes a waiter at the
-  instant its token arrives, because the waiter and the bucket are in one
-  process. across processes there is nobody to wake: a worker that finds the
-  bucket empty has to come back and ask, which is another round trip per waiter
-  per interval, and the fairness goes with it, because then the worker that
-  asks at the right moment wins rather than the op that has been waiting
-  longest.
-- **a token taken by a process that dies is gone.** locally a canceled op hands
-  its token to the op behind it, because dropping a future runs code. a host
-  that loses power runs nothing, so a shared bucket needs a lease per token (a
-  row, an expiry, a sweeper), which is the claim machinery the queue already
-  has, and a lot of it to protect a budget of five.
-- **it would work on postgres only**, since two hosts cannot share a sqlite
-  file, and the deployments that need a shared bucket are the ones on several
-  hosts. "the limit you declared is kept across your deployment, if you run a
-  database server" is a worse promise than one that is small and true
-  everywhere.
-
-Divide the limit by the number of workers when a deployment-wide cap is
-required. Hestan does not provide a shared rate bucket.
+Rate buckets live in memory. They do not coordinate through SQLite or PostgreSQL
+and there is no shared rate limiter. Queue limits and claims remain store-backed.
 
 ## The compose example
 
@@ -558,3 +478,9 @@ not there.
   what waiting for a token does.
 - [http api](http-api.md): `/api/queue`, `/api/runs/{id}/priority`,
   `/api/rates`, `/api/health`.
+
+Execution writes check the run’s claim owner, acquisition time and live lease in
+the same transaction as the write. Recovery locks the run before changing its
+ops. An expired executor cannot overwrite a recovered or newly claimed run.
+Headless `run_once` and `build_asset` calls also maintain their execution leases.
+External side effects still require the application’s own retry/idempotency design.
