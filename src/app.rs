@@ -91,6 +91,7 @@ pub struct Hestan {
     /// has to execute the run it was asked for, and waiting on a lease a live
     /// server is holding would leave it waiting for something never coming.
     elects: bool,
+    maintain_store: bool,
     slots: usize,
     max_instances: usize,
     retention: Retention,
@@ -138,6 +139,7 @@ impl Default for Hestan {
             reclaim: Reclaim::default(),
             role: Role::default(),
             elects: false,
+            maintain_store: true,
             slots: usize::MAX,
             max_instances: executor::DEFAULT_MAX_INSTANCES,
             retention: Retention::default(),
@@ -1032,6 +1034,16 @@ impl Hestan {
         self
     }
 
+    /// Execute against an existing store without synchronizing schedules,
+    /// sensors or presets, recovering other runs, or pruning retained history.
+    /// Use this for explicit one-shot commands sharing a live scheduler's store.
+    /// The selected job still validates, records its run and honors concurrency
+    /// controls. Serving or working in this mode is refused.
+    pub fn execution_only(mut self) -> Self {
+        self.maintain_store = false;
+        self
+    }
+
     /// run one job to completion and return it, with no ui and no loops. the
     /// [role](Self::role) does not apply: a one-shot executes its own run.
     pub async fn run_once(self, job: &str, params: Value) -> Result<Run, Error> {
@@ -1119,6 +1131,11 @@ impl Hestan {
     }
 
     async fn up(mut self, addr: Option<SocketAddr>) -> Result<(), Error> {
+        if !self.maintain_store {
+            return Err(Error::Graph(
+                "execution_only supports run_once and build_asset, not serving or working".into(),
+            ));
+        }
         // before the address, before the store, before anything: this process
         // may be an op subprocess of a hestan already running against this
         // database, and every line of boot behaviour below assumes otherwise:
@@ -1636,19 +1653,21 @@ impl Hestan {
         for job in &jobs {
             store.secrets().declare(job.name(), job.secret_params());
         }
-        store.fail_interrupted()?;
-        store.sync_schedules(&schedules)?;
-        // seeded, not synced: the launchpad's presets share the table, so
-        // there is nothing here to sweep away
-        for (job, name, params) in &self.presets {
-            store.put_preset(job, name, params)?;
-        }
-        let sensor_names: Vec<String> = sensor_entries.iter().map(|e| e.name.clone()).collect();
-        store.sync_sensors(&sensor_names)?;
-        let trimmed = store.prune_materializations(self.asset_history)?;
-        let trimmed = trimmed + store.prune_asset_checks(self.asset_history)?;
-        if trimmed > 0 {
-            tracing::info!("trimmed {trimmed} asset history rows past the cap");
+        if self.maintain_store {
+            store.fail_interrupted()?;
+            store.sync_schedules(&schedules)?;
+            // seeded, not synced: the launchpad's presets share the table, so
+            // there is nothing here to sweep away
+            for (job, name, params) in &self.presets {
+                store.put_preset(job, name, params)?;
+            }
+            let sensor_names: Vec<String> = sensor_entries.iter().map(|e| e.name.clone()).collect();
+            store.sync_sensors(&sensor_names)?;
+            let trimmed = store.prune_materializations(self.asset_history)?;
+            let trimmed = trimmed + store.prune_asset_checks(self.asset_history)?;
+            if trimmed > 0 {
+                tracing::info!("trimmed {trimmed} asset history rows past the cap");
+            }
         }
         let io = Io::new(self.io_default, self.io_named);
         let mut runner = Runner::with_resources(
@@ -1687,7 +1706,9 @@ impl Hestan {
         }
         // before anything new launches, and before the loop that takes it from
         // here: a process that runs for an hour and exits should still tidy up
-        retention::sweep(&runner, &self.retention, chrono::Utc::now());
+        if self.maintain_store {
+            retention::sweep(&runner, &self.retention, chrono::Utc::now());
+        }
         Ok(Built {
             runner,
             entries,
@@ -2581,5 +2602,86 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert!(rows[0].paused, "the pause did not survive the restart");
         assert_eq!(rows[0].params, json!({"days": 7}));
+    }
+}
+
+#[cfg(test)]
+mod execution_only_tests {
+    use super::*;
+    use crate::{Job, Op, RunStatus};
+    use serde_json::json;
+
+    #[tokio::test]
+    async fn a_one_shot_preserves_another_registrys_controls_and_history() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("runs.db").display().to_string();
+        let store = Store::open(&db).unwrap();
+        store
+            .sync_schedules(&[Schedule::new("recurring", "0 * * * *")])
+            .unwrap();
+        store
+            .set_schedule_paused("recurring", "0 * * * *", true, Some("operator"))
+            .unwrap();
+        store.sync_sensors(&["completion".into()]).unwrap();
+        store
+            .set_sensor_paused("completion", true, Some("operator"))
+            .unwrap();
+        store
+            .set_sensor_cursor("completion", &json!({"offset":42}))
+            .unwrap();
+        store
+            .put_preset("recurring", "daily", &json!({"day":"2026-09-22"}))
+            .unwrap();
+        let schedules = serde_json::to_value(store.schedules().unwrap()).unwrap();
+        let sensors = serde_json::to_value(store.sensors().unwrap()).unwrap();
+        let job = || {
+            Job::builder("manual")
+                .op(Op::new("inspect", |_| async { Ok(json!({})) }))
+                .build()
+                .unwrap()
+        };
+        let first = Hestan::new()
+            .db(&db)
+            .job(job())
+            .execution_only()
+            .run_once("manual", json!({}))
+            .await
+            .unwrap();
+        let second = Hestan::new()
+            .db(&db)
+            .job(job())
+            .execution_only()
+            .retention_days(0)
+            .run_once("manual", json!({}))
+            .await
+            .unwrap();
+        assert_eq!(second.status, RunStatus::Success);
+        assert!(store.run(&first.id).unwrap().is_some());
+        assert_eq!(
+            serde_json::to_value(store.schedules().unwrap()).unwrap(),
+            schedules
+        );
+        assert_eq!(
+            serde_json::to_value(store.sensors().unwrap()).unwrap(),
+            sensors
+        );
+        assert_eq!(
+            store.preset("recurring", "daily").unwrap().unwrap().params,
+            json!({"day":"2026-09-22"})
+        );
+    }
+
+    #[tokio::test]
+    async fn execution_only_cannot_start_scheduler_loops() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("runs.db");
+        let error = Hestan::new()
+            .db(db.to_string_lossy())
+            .execution_only()
+            .serve(([127, 0, 0, 1], 0))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("execution_only"));
+        assert!(!db.exists());
     }
 }

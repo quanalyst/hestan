@@ -427,7 +427,7 @@ table. Opening them preserves existing rows and gives old events the `log` kind.
 
 ## Crash recovery
 
-`serve`, `work` and `run_once` sweep the database at startup, before anything
+Unless `.execution_only()` is selected, `serve`, `work` and `run_once` sweep the database at startup, before anything
 new launches (an [op subprocess](isolation.md) does not: it owns nothing and
 is here to run one op). the sweep is **lease-aware**, and that is the whole of
 how several processes share one file safely:

@@ -21,6 +21,13 @@ normal commands. See [CLI](cli.md).
 
 `serve` binds and validates its address before starting background loops.
 SIGTERM or SIGINT initiates [graceful shutdown](scaling.md#stopping-a-process-on-purpose).
+Use `.execution_only()` before `run_once` or `build_asset` when a command shares
+an existing scheduler's database. This mode records and executes the selected work
+without synchronizing schedules, sensors or presets, recovering other runs, or
+pruning history. Existing pauses and cursors remain unchanged even when the command
+uses a smaller registry or different settings. Concurrency controls still apply.
+`serve` and `work` refuse this mode before binding a socket or opening the store.
+
 `run_once` and `build_asset` install no signal handlers.
 
 Configure [retention](storage.md#retention) to prune history; by default it is
