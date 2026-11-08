@@ -543,6 +543,10 @@ ALTER TABLE events ADD COLUMN subject TEXT COLLATE "C";
 CREATE INDEX events_subject ON events(subject_kind, subject, seq DESC);
 "#;
 
+// Stored control parameters use the backend's signed 64-bit integer binding.
+const SCHEDULE_CONTROL_TYPES: &str =
+    "ALTER TABLE schedule_controls ALTER COLUMN paused TYPE BIGINT;";
+
 /// create the schema, or bring an existing one forward, or refuse a database a
 /// later build wrote.
 ///
@@ -608,6 +612,9 @@ fn migrate(client: &mut Client) -> Result<(), Error> {
             if version < 27 {
                 tx.batch(crate::store::SENSOR_DECLARATIONS_SCHEMA)?;
             }
+            if version < 28 {
+                tx.batch(SCHEDULE_CONTROL_TYPES)?;
+            }
             if version != SCHEMA_VERSION {
                 tx.execute(
                     "UPDATE schema_version SET version = ?1",
@@ -620,6 +627,7 @@ fn migrate(client: &mut Client) -> Result<(), Error> {
             tx.batch(crate::store::deliveries::SCHEMA)?;
             tx.batch(crate::store::SCHEDULE_CONTROLS_SCHEMA)?;
             tx.batch(crate::store::SENSOR_DECLARATIONS_SCHEMA)?;
+            tx.batch(SCHEDULE_CONTROL_TYPES)?;
             tx.execute(
                 "INSERT INTO schema_version (version) VALUES (?1)",
                 args![i64::from(SCHEMA_VERSION)],

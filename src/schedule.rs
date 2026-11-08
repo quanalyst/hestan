@@ -860,6 +860,26 @@ fn note_launched(
     }
 }
 
+/// Names are scoped to a target, so independent jobs can both have a daily recurrence.
+pub(crate) fn validate_names(schedules: &[Schedule]) -> Result<(), crate::Error> {
+    let mut names = std::collections::HashSet::new();
+    for schedule in schedules {
+        if let Some(name) = &schedule.logical_name {
+            if name.trim().is_empty() || name.len() > 128 || name.contains('\0') {
+                return Err(crate::Error::Graph(
+                    "schedule name must contain 1–128 bytes".into(),
+                ));
+            }
+            if !names.insert((schedule.id(), name)) {
+                return Err(crate::Error::Graph(format!(
+                    "duplicate schedule name {name}"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1789,24 +1809,4 @@ mod tests {
         assert!(seen.lock().unwrap().is_empty());
         assert!(store.ticks(Some("etl"), 10).unwrap().is_empty());
     }
-}
-
-/// Names are scoped to a target, so independent jobs can both have a daily recurrence.
-pub(crate) fn validate_names(schedules: &[Schedule]) -> Result<(), crate::Error> {
-    let mut names = std::collections::HashSet::new();
-    for schedule in schedules {
-        if let Some(name) = &schedule.logical_name {
-            if name.trim().is_empty() || name.len() > 128 || name.contains('\0') {
-                return Err(crate::Error::Graph(
-                    "schedule name must contain 1–128 bytes".into(),
-                ));
-            }
-            if !names.insert((schedule.id(), name)) {
-                return Err(crate::Error::Graph(format!(
-                    "duplicate schedule name {name}"
-                )));
-            }
-        }
-    }
-    Ok(())
 }

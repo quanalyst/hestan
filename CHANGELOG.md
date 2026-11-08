@@ -1,5 +1,12 @@
 # Changes
 
+## PostgreSQL schedule controls
+
+- Named schedule pauses use the same 64-bit storage binding as other controls.
+- Existing stores migrate without losing pauses, recurrence cursors or audit events.
+- Schedule registration locks pause state before reading it, preserving concurrent
+  operator changes and allowing workers to start together.
+
 ## Retained sensor controls
 
 - Temporarily absent sensors keep their operator pause and progress cursor.

@@ -626,7 +626,7 @@ pub(crate) const SENSOR_DECLARATIONS_SCHEMA: &str = r#"
 ALTER TABLE sensors ADD COLUMN declared INTEGER NOT NULL DEFAULT 1;
 "#;
 
-pub(crate) const SCHEMA_VERSION: u32 = 27;
+pub(crate) const SCHEMA_VERSION: u32 = 28;
 
 // one transaction around every pending step and the version stamp (sqlite DDL
 // is transactional), so a crash mid-migration leaves the db exactly as found
@@ -2074,16 +2074,24 @@ impl Store {
         if into.is_some_and(|into| into != what) {
             return None;
         }
-        self.health
-            .injected
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
-            .ok()
-            .map(|_| {
-                Error::Sqlite(rusqlite::Error::SqliteFailure(
-                    rusqlite::ffi::Error::new(5),
-                    Some("database is locked (injected)".to_string()),
-                ))
-            })
+        let mut remaining = self.health.injected.load(Ordering::SeqCst);
+        loop {
+            let next = remaining.checked_sub(1)?;
+            match self.health.injected.compare_exchange_weak(
+                remaining,
+                next,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ) {
+                Ok(_) => {
+                    return Some(Error::Sqlite(rusqlite::Error::SqliteFailure(
+                        rusqlite::ffi::Error::new(5),
+                        Some("database is locked (injected)".to_string()),
+                    )));
+                }
+                Err(observed) => remaining = observed,
+            }
+        }
     }
 
     /// [`create_run_keyed`](Self::create_run_keyed) with no key and no plan,
@@ -4099,10 +4107,18 @@ impl Store {
         crate::schedule::validate_names(defined)?;
         let mut conn = self.conn();
         let (insert, ignore) = conn.dialect().insert_or_ignore();
-        let mut tx = conn.begin()?;
+        let lock = match conn.dialect() {
+            Dialect::Sqlite => "",
+            #[cfg(feature = "postgres")]
+            Dialect::Postgres => "FOR UPDATE",
+        };
+        // Adopt pauses from the same locked snapshot that registration updates.
+        let mut tx = conn.begin_immediate()?;
         let ids: Vec<String> = defined.iter().map(Schedule::id).collect();
         let prior: Vec<(String, String, bool, Option<String>)> = tx.query(
-            "SELECT job, expr, paused, logical_name FROM schedules",
+            &format!(
+                "SELECT job, expr, paused, logical_name FROM schedules ORDER BY job, expr {lock}"
+            ),
             args![],
             |r| Ok((r.text(0)?, r.text(1)?, r.flag(2)?, r.opt_text(3)?)),
         )?;
@@ -11478,6 +11494,98 @@ mod tests {
     }
 
     #[test]
+    fn schedule_control_integer_migration_preserves_operator_state() {
+        both(|db| {
+            let store = db.store();
+            store
+                .sync_schedules(&[Schedule::new("report", "0 9 * * *").named("morning")])
+                .unwrap();
+            store
+                .set_schedule_paused("report", "0 9 * * *", true, Some("operator"))
+                .unwrap();
+            store
+                .set_schedule_cursor("report", "0 9 * * *", Utc::now())
+                .unwrap();
+            let rows = serde_json::to_value(store.schedules().unwrap()).unwrap();
+            let events =
+                serde_json::to_value(store.event_log(&EventQuery::default(), 50).unwrap()).unwrap();
+            let dialect = store.conn().dialect();
+            match dialect {
+                Dialect::Sqlite => store.conn().batch("PRAGMA user_version = 27;").unwrap(),
+                #[cfg(feature = "postgres")]
+                Dialect::Postgres => store
+                    .conn()
+                    .batch(
+                        "ALTER TABLE schedule_controls ALTER COLUMN paused TYPE INTEGER;
+                     UPDATE schema_version SET version = 27;",
+                    )
+                    .unwrap(),
+            }
+            drop(store);
+            let store = db.store();
+            assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
+            assert_eq!(
+                serde_json::to_value(store.schedules().unwrap()).unwrap(),
+                rows
+            );
+            assert_eq!(
+                serde_json::to_value(store.event_log(&EventQuery::default(), 50).unwrap()).unwrap(),
+                events
+            );
+            store
+                .sync_schedules(&[Schedule::new("report", "15 9 * * *").named("morning")])
+                .unwrap();
+            assert!(store.schedules().unwrap()[0].paused);
+            store
+                .set_schedule_paused("report", "15 9 * * *", false, None)
+                .unwrap();
+            assert!(!store.schedules().unwrap()[0].paused);
+        });
+    }
+
+    #[test]
+    fn schedule_sync_waits_for_a_concurrent_pause_before_adopting_it() {
+        both(|db| {
+            let store = db.store();
+            store
+                .sync_schedules(&[Schedule::new("report", "0 9 * * *")])
+                .unwrap();
+            let writer = db.store();
+            let mut connection = writer.conn();
+            let mut transaction = connection.begin_immediate().unwrap();
+            transaction
+                .execute(
+                    "UPDATE schedules SET paused = 1 WHERE job = 'report'",
+                    args![],
+                )
+                .unwrap();
+            let concurrent = store.clone();
+            let (sent, received) = std::sync::mpsc::channel();
+            let worker = std::thread::spawn(move || {
+                sent.send(
+                    concurrent
+                        .sync_schedules(&[Schedule::new("report", "15 9 * * *").named("morning")]),
+                )
+                .unwrap();
+            });
+            assert!(
+                matches!(
+                    received.recv_timeout(Duration::from_millis(100)),
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+                ),
+                "registration must wait for the writer, not fail or read a stale pause"
+            );
+            transaction.commit().unwrap();
+            received
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap()
+                .unwrap();
+            worker.join().unwrap();
+            assert!(store.schedules().unwrap()[0].paused);
+        });
+    }
+
+    #[test]
     fn schedule_sync_and_pause_roundtrip() {
         both(|db| {
             let store = db.store();
@@ -12812,7 +12920,7 @@ mod tests {
     /// every table the sqlite chain arrives at. a fresh postgres database has
     /// all of them from its first statement.
     #[cfg(feature = "postgres")]
-    const TABLES: [&str; 24] = [
+    const TABLES: [&str; 25] = [
         "asset_checks",
         "asset_materializations",
         "backfills",
@@ -12830,6 +12938,7 @@ mod tests {
         "presets",
         "run_notification_routes",
         "runs",
+        "schedule_controls",
         "schedule_ticks",
         "schedules",
         "schema_version",
