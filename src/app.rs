@@ -1528,6 +1528,7 @@ impl Hestan {
     pub(crate) async fn build(mut self) -> Result<Built, Error> {
         let (jobs, registry) = self.lower()?;
         let schedules = std::mem::take(&mut self.schedules);
+        schedule::validate_names(&schedules)?;
         let mut entries = Vec::new();
         let ids: Vec<String> = schedules.iter().map(Schedule::id).collect();
         let mut pairs: HashSet<(&str, &str)> = HashSet::new();

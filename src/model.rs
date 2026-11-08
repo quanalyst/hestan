@@ -1226,6 +1226,7 @@ pub struct OpLog {
 /// the declaration lives in code; what is stored is the state a restart must
 /// not lose: whether it is paused, and how far the scheduler has got. a
 /// schedule the code no longer declares is deleted from here on the next start.
+/// Named recurrences retain their operator pause separately for later re-registration.
 #[derive(Debug, Clone, Serialize)]
 pub struct ScheduleRow {
     /// the job it fires, and half of the row's identity.

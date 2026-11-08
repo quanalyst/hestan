@@ -109,6 +109,7 @@ pub struct Schedule {
     pub(crate) tz: String,
     pub(crate) params: Value,
     pub(crate) catchup: Catchup,
+    pub(crate) logical_name: Option<String>,
 }
 
 impl Schedule {
@@ -167,6 +168,7 @@ impl Schedule {
             tz: "UTC".into(),
             params: json!({}),
             catchup: Catchup::default(),
+            logical_name: None,
         }
     }
 
@@ -174,6 +176,15 @@ impl Schedule {
     /// the asset's behind [`ASSET_PREFIX`].
     pub(crate) fn id(&self) -> String {
         self.target.id()
+    }
+
+    /// Give this recurrence a stable purpose within its job or asset.
+    /// Its operator pause survives cron edits and removal/re-registration.
+    /// Removed declarations do not fire; returning declarations start with no
+    /// cursor for their absent interval. Tick history stays under its original cron.
+    pub fn named(mut self, name: impl Into<String>) -> Schedule {
+        self.logical_name = Some(name.into());
+        self
     }
 
     /// evaluate the expression in a named iana timezone.
@@ -1778,4 +1789,24 @@ mod tests {
         assert!(seen.lock().unwrap().is_empty());
         assert!(store.ticks(Some("etl"), 10).unwrap().is_empty());
     }
+}
+
+/// Names are scoped to a target, so independent jobs can both have a daily recurrence.
+pub(crate) fn validate_names(schedules: &[Schedule]) -> Result<(), crate::Error> {
+    let mut names = std::collections::HashSet::new();
+    for schedule in schedules {
+        if let Some(name) = &schedule.logical_name {
+            if name.trim().is_empty() || name.len() > 128 || name.contains('\0') {
+                return Err(crate::Error::Graph(
+                    "schedule name must contain 1–128 bytes".into(),
+                ));
+            }
+            if !names.insert((schedule.id(), name)) {
+                return Err(crate::Error::Graph(format!(
+                    "duplicate schedule name {name}"
+                )));
+            }
+        }
+    }
+    Ok(())
 }

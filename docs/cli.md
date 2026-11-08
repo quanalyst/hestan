@@ -576,3 +576,23 @@ launching a second one, and exits with what it did.
 stale actions. Database-only mode is read-only for these commands; use the
 application binary or `--server` for mutations. Server mutations require an
 unscoped Admin. See [delivery semantics](notifications.md#delivery-and-recovery).
+
+
+## Stable recurrence pauses
+
+Declare `Schedule::new("report", "0 9 * * *").named("morning")` when an operator's
+pause must survive a cron edit or a host profile temporarily removing that
+recurrence. The name describes its purpose and is unique within its job or asset.
+Keep the name when changing the time. Different recurrences use different names.
+
+Pause and unpause commands keep their existing job/expression interface. Both
+update the active schedule and its retained named control in one transaction with
+the audit event. Undeclared schedules remain absent from listings and never fire;
+re-registration restores their pause without catching up the absent interval.
+Historical ticks keep their original expression. Execution-only access changes
+neither declarations nor controls.
+
+Initial naming preserves the current exact recurrence's pause. If the expression
+also changes during first naming, an existing unnamed pause on that target holds
+the replacement conservatively. An explicit unpause settles that ambiguity.
+Unnamed schedules retain their original expression-based lifecycle.

@@ -612,7 +612,17 @@ const SCHEMA_V24: &str = r#"
 ALTER TABLE runs ADD COLUMN build TEXT;
 "#;
 
-pub(crate) const SCHEMA_VERSION: u32 = 25;
+pub(crate) const SCHEDULE_CONTROLS_SCHEMA: &str = r#"
+ALTER TABLE schedules ADD COLUMN logical_name TEXT;
+CREATE TABLE schedule_controls (
+    job TEXT NOT NULL,
+    name TEXT NOT NULL,
+    paused INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (job, name)
+);
+"#;
+
+pub(crate) const SCHEMA_VERSION: u32 = 26;
 
 // one transaction around every pending step and the version stamp (sqlite DDL
 // is transactional), so a crash mid-migration leaves the db exactly as found
@@ -705,6 +715,9 @@ fn migrate(conn: &mut Connection) -> Result<(), Error> {
     }
     if version < 25 {
         tx.execute_batch(deliveries::SCHEMA)?;
+    }
+    if version < 26 {
+        tx.execute_batch(SCHEDULE_CONTROLS_SCHEMA)?;
     }
     if version != SCHEMA_VERSION {
         tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
@@ -4068,7 +4081,7 @@ impl Store {
 
     /// make the schedules table mirror the code: insert new (target, expr)
     /// pairs, refresh tz and params on existing ones (pause state survives),
-    /// drop the rest.
+    /// drop the rest. Named declarations retain their separate operator pause.
     ///
     /// the `job` column holds what the schedule fires, which for an
     /// [asset schedule](crate::Schedule::asset) is the asset behind its
@@ -4076,10 +4089,16 @@ impl Store {
     /// keeps one row per schedule, one pause flag, one cursor and one
     /// one-fire-per-occurrence index.
     pub(crate) fn sync_schedules(&self, defined: &[Schedule]) -> Result<(), Error> {
+        crate::schedule::validate_names(defined)?;
         let mut conn = self.conn();
         let (insert, ignore) = conn.dialect().insert_or_ignore();
         let mut tx = conn.begin()?;
         let ids: Vec<String> = defined.iter().map(Schedule::id).collect();
+        let prior: Vec<(String, String, bool, Option<String>)> = tx.query(
+            "SELECT job, expr, paused, logical_name FROM schedules",
+            args![],
+            |r| Ok((r.text(0)?, r.text(1)?, r.flag(2)?, r.opt_text(3)?)),
+        )?;
         for (s, id) in defined.iter().zip(&ids) {
             let declared = self.params_col(id, &s.params);
             let catchup = s.catchup.to_string();
@@ -4089,6 +4108,31 @@ impl Store {
                      VALUES (?1, ?2, ?3, ?4, ?5) {ignore}"
                 ),
                 args![id, &s.expr, &s.tz, &declared, &catchup],
+            )?;
+            if let Some(name) = &s.logical_name {
+                // Adopt an existing exact recurrence. If its cron changed during
+                // first adoption, a pre-existing unnamed pause holds the replacement.
+                let paused = prior
+                    .iter()
+                    .find(|(job, expr, _, _)| job == id && expr == &s.expr)
+                    .map(|(_, _, paused, _)| *paused)
+                    .unwrap_or_else(|| {
+                        prior
+                            .iter()
+                            .any(|(job, _, paused, name)| job == id && *paused && name.is_none())
+                    });
+                tx.execute(&format!(
+                    "{insert} schedule_controls (job, name, paused) VALUES (?1, ?2, ?3) {ignore}"
+                ), args![id, name, paused])?;
+                tx.execute(
+                    "UPDATE schedules SET paused = (SELECT paused FROM schedule_controls
+                     WHERE job = ?1 AND name = ?3) WHERE job = ?1 AND expr = ?2",
+                    args![id, &s.expr, name],
+                )?;
+            }
+            tx.execute(
+                "UPDATE schedules SET logical_name = ?3 WHERE job = ?1 AND expr = ?2",
+                args![id, &s.expr, s.logical_name.as_deref()],
             )?;
             // the cursor is deliberately not touched: it is what the scheduler
             // knows about this pair, and a restart that rewrote it would be a
@@ -4166,6 +4210,11 @@ impl Store {
             tx.commit()?;
             return Ok(false);
         }
+        tx.execute(
+            "UPDATE schedule_controls SET paused = ?3 WHERE job = ?1 AND name =
+             (SELECT logical_name FROM schedules WHERE job = ?1 AND expr = ?2)",
+            args![job, expr, paused],
+        )?;
         let verb = if paused { "paused" } else { "resumed" };
         write_event(
             &mut tx,
@@ -8876,6 +8925,8 @@ mod tests {
                          DROP TABLE notification_deliveries;
                          DROP TABLE notification_destination_state;
                          ALTER TABLE runs DROP COLUMN build;
+                         DROP TABLE schedule_controls;
+                         ALTER TABLE schedules DROP COLUMN logical_name;
                          UPDATE schema_version SET version = 16;"
                     ))
                     .unwrap();
@@ -8982,6 +9033,8 @@ mod tests {
                          DROP TABLE notification_deliveries;
                          DROP TABLE notification_destination_state;
                          ALTER TABLE runs DROP COLUMN build;
+                         DROP TABLE schedule_controls;
+                         ALTER TABLE schedules DROP COLUMN logical_name;
                          UPDATE schema_version SET version = 17;",
                     )
                     .unwrap();
@@ -9084,6 +9137,8 @@ mod tests {
                          DROP TABLE notification_deliveries;
                          DROP TABLE notification_destination_state;
                          ALTER TABLE runs DROP COLUMN build;
+                         DROP TABLE schedule_controls;
+                         ALTER TABLE schedules DROP COLUMN logical_name;
                          UPDATE schema_version SET version = 18;",
                     )
                     .unwrap();
@@ -9206,6 +9261,8 @@ mod tests {
                          DROP TABLE notification_deliveries;
                          DROP TABLE notification_destination_state;
                          ALTER TABLE runs DROP COLUMN build;
+                         DROP TABLE schedule_controls;
+                         ALTER TABLE schedules DROP COLUMN logical_name;
                          {ticks}
                          UPDATE schema_version SET version = 19;"
                     ))
@@ -11171,6 +11228,181 @@ mod tests {
             assert_eq!(states.len(), 2);
             assert!(states[1].2 >= first_update);
         });
+    }
+
+    #[test]
+    fn named_pause_survives_cron_change_removal_and_restart() {
+        both(|db| {
+            let store = db.store();
+            store
+                .sync_schedules(&[Schedule::new("report", "0 9 * * *").named("morning")])
+                .unwrap();
+            store
+                .set_schedule_paused("report", "0 9 * * *", true, Some("operator"))
+                .unwrap();
+            store
+                .set_schedule_cursor("report", "0 9 * * *", Utc::now())
+                .unwrap();
+            store.sync_schedules(&[]).unwrap();
+            assert!(store.schedules().unwrap().is_empty());
+            drop(store);
+            let store = db.store();
+            store
+                .sync_schedules(&[Schedule::new("report", "15 9 * * *").named("morning")])
+                .unwrap();
+            let rows = store.schedules().unwrap();
+            assert!(rows[0].paused);
+            assert!(
+                rows[0].cursor.is_none(),
+                "disabled intervals have no catch-up cursor"
+            );
+            store
+                .set_schedule_paused("report", "15 9 * * *", false, Some("operator"))
+                .unwrap();
+            store
+                .sync_schedules(&[Schedule::new("report", "0 9 * * *").named("morning")])
+                .unwrap();
+            assert!(!store.schedules().unwrap()[0].paused);
+        });
+    }
+
+    #[test]
+    fn named_controls_preserve_independent_recurrences_and_targets() {
+        both(|db| {
+            let store = db.store();
+            store
+                .sync_schedules(&[
+                    Schedule::new("report", "0 9 * * *").named("morning"),
+                    Schedule::new("report", "0 17 * * *").named("evening"),
+                    Schedule::new("capture", "0 9 * * *").named("morning"),
+                ])
+                .unwrap();
+            store
+                .set_schedule_paused("report", "0 9 * * *", true, None)
+                .unwrap();
+            store
+                .sync_schedules(&[
+                    Schedule::new("report", "15 9 * * *").named("morning"),
+                    Schedule::new("report", "15 17 * * *").named("evening"),
+                    Schedule::new("capture", "15 9 * * *").named("morning"),
+                ])
+                .unwrap();
+            let paused: Vec<_> = store
+                .schedules()
+                .unwrap()
+                .into_iter()
+                .filter(|row| row.paused)
+                .collect();
+            assert_eq!(paused.len(), 1);
+            assert_eq!(paused[0].job, "report");
+            assert_eq!(paused[0].expr, "15 9 * * *");
+        });
+    }
+
+    #[test]
+    fn first_naming_preserves_existing_unnamed_operator_pauses() {
+        both(|db| {
+            let store = db.store();
+            store
+                .sync_schedules(&[Schedule::new("report", "0 9 * * *")])
+                .unwrap();
+            store
+                .set_schedule_paused("report", "0 9 * * *", true, None)
+                .unwrap();
+            store
+                .sync_schedules(&[Schedule::new("report", "15 9 * * *").named("morning")])
+                .unwrap();
+            assert!(store.schedules().unwrap()[0].paused);
+        });
+    }
+
+    #[test]
+    fn invalid_names_refuse_the_entire_declaration_change() {
+        both(|db| {
+            let store = db.store();
+            for declared in [
+                vec![Schedule::new("report", "0 9 * * *").named(" ")],
+                vec![
+                    Schedule::new("report", "0 9 * * *").named("morning"),
+                    Schedule::new("report", "0 10 * * *").named("morning"),
+                ],
+            ] {
+                assert!(store.sync_schedules(&declared).is_err());
+                assert!(store.schedules().unwrap().is_empty());
+            }
+        });
+    }
+
+    #[test]
+    fn failed_pause_audit_rolls_back_both_active_and_retained_control() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("runs.db");
+        let store = Store::open(path.to_str().unwrap()).unwrap();
+        store
+            .sync_schedules(&[Schedule::new("report", "0 9 * * *").named("morning")])
+            .unwrap();
+        let raw = Connection::open(&path).unwrap();
+        raw.execute_batch(
+            "CREATE TRIGGER refuse_events BEFORE INSERT ON events
+            BEGIN SELECT RAISE(ABORT, 'audit refused'); END;",
+        )
+        .unwrap();
+        assert!(
+            store
+                .set_schedule_paused("report", "0 9 * * *", true, None)
+                .is_err()
+        );
+        assert!(!store.schedules().unwrap()[0].paused);
+        raw.execute_batch("DROP TRIGGER refuse_events").unwrap();
+        store
+            .sync_schedules(&[Schedule::new("report", "15 9 * * *").named("morning")])
+            .unwrap();
+        assert!(!store.schedules().unwrap()[0].paused);
+    }
+
+    #[test]
+    fn schedule_control_migration_preserves_pause_cursor_and_audit() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("runs.db");
+        let store = Store::open(path.to_str().unwrap()).unwrap();
+        store
+            .sync_schedules(&[Schedule::new("report", "0 9 * * *")])
+            .unwrap();
+        store
+            .set_schedule_paused("report", "0 9 * * *", true, None)
+            .unwrap();
+        store
+            .set_schedule_cursor("report", "0 9 * * *", Utc::now())
+            .unwrap();
+        let rows = serde_json::to_value(store.schedules().unwrap()).unwrap();
+        let events =
+            serde_json::to_value(store.event_log(&EventQuery::default(), 50).unwrap()).unwrap();
+        drop(store);
+        let raw = Connection::open(&path).unwrap();
+        raw.execute_batch(
+            "DROP TABLE schedule_controls;
+            ALTER TABLE schedules DROP COLUMN logical_name;
+            PRAGMA user_version = 25;",
+        )
+        .unwrap();
+        drop(raw);
+        let store = Store::open(path.to_str().unwrap()).unwrap();
+        assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
+        assert_eq!(
+            serde_json::to_value(store.schedules().unwrap()).unwrap(),
+            rows
+        );
+        assert_eq!(
+            serde_json::to_value(store.event_log(&EventQuery::default(), 50).unwrap()).unwrap(),
+            events
+        );
+        store
+            .sync_schedules(&[Schedule::new("report", "0 9 * * *").named("morning")])
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(store.schedules().unwrap()).unwrap(),
+            rows
+        );
     }
 
     #[test]
@@ -13416,6 +13648,8 @@ mod tests {
                          DROP TABLE notification_deliveries;
                          DROP TABLE notification_destination_state;
                          ALTER TABLE runs DROP COLUMN build;
+                         DROP TABLE schedule_controls;
+                         ALTER TABLE schedules DROP COLUMN logical_name;
                          UPDATE schema_version SET version = 21;",
                     )
                     .unwrap();
@@ -13804,6 +14038,8 @@ mod tests {
                          DROP TABLE notification_deliveries;
                          DROP TABLE notification_destination_state;
                          ALTER TABLE runs DROP COLUMN build;
+                         DROP TABLE schedule_controls;
+                         ALTER TABLE schedules DROP COLUMN logical_name;
                          UPDATE schema_version SET version = 22;",
                     )
                     .unwrap();
@@ -13853,7 +14089,9 @@ mod tests {
                          DROP TABLE notification_attempts;
                          DROP TABLE notification_deliveries;
                          DROP TABLE notification_destination_state;
-                         ALTER TABLE runs DROP COLUMN build;",
+                         ALTER TABLE runs DROP COLUMN build;
+                         DROP TABLE schedule_controls;
+                         ALTER TABLE schedules DROP COLUMN logical_name;",
                 )
                 .unwrap();
                 conn.pragma_update(None, "user_version", 23).unwrap();
@@ -13868,6 +14106,8 @@ mod tests {
                          DROP TABLE notification_deliveries;
                          DROP TABLE notification_destination_state;
                          ALTER TABLE runs DROP COLUMN build;
+                         DROP TABLE schedule_controls;
+                         ALTER TABLE schedules DROP COLUMN logical_name;
                          UPDATE schema_version SET version = 23;",
                     )
                     .unwrap();

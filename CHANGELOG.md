@@ -1,5 +1,12 @@
 # Changes
 
+## Stable recurrence pauses
+
+- Named recurrences retain operator pauses across cron edits and profile toggles.
+- Removed declarations remain inactive; re-registration does not replay the absent interval.
+- Pause changes and their audit events commit atomically. Unnamed schedules retain
+  their existing behavior; existing databases migrate without changing their pauses.
+
 ## Automatic build admission
 
 - Exhausted automatic asset builds back off from five minutes to one hour using
