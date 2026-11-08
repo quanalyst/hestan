@@ -14,6 +14,22 @@ With no arguments, this serves the app at the supplied address. With arguments,
 it exposes commands over the compiled registry, including launches, plan
 inspection and completion of registered names. Enable the `cli` feature.
 
+Hosts with their own command parser can delegate a subcommand without constructing
+an application or loading its credentials:
+
+```rust
+# async fn example(args: Vec<std::ffi::OsString>) -> Result<(), hestan::Error> {
+let command = hestan::cli::Invocation::try_parse_from(args)
+    .unwrap_or_else(|error| error.exit());
+command.default_server("http://127.0.0.1:4000").standalone().await
+# }
+```
+
+The argument sequence includes the displayed executable name. Parsing resolves help
+and usage errors before any store or server access. An explicit `--db` or `--server`
+takes precedence over `default_server`. This delegates to the same CLI implementation
+and exit codes as the standalone executable.
+
 ## The exit codes
 
 `run --wait` returns an exit code suitable for scripts and scheduled commands.

@@ -577,6 +577,42 @@ struct ServeArgs {
     addr: Option<SocketAddr>,
 }
 
+/// A parsed command line that can be validated before the host opens stores,
+/// loads credentials or constructs its application registry.
+pub struct Invocation(Cli);
+
+impl Invocation {
+    /// Parse arguments including the executable name. Help and invalid arguments
+    /// return clap's ordinary display/usage errors without touching the deployment.
+    pub fn try_parse_from<I, T>(args: I) -> Result<Self, clap::Error>
+    where
+        I: IntoIterator<Item = T>,
+        T: Into<std::ffi::OsString> + Clone,
+    {
+        Cli::try_parse_from(args).map(Self)
+    }
+
+    /// Supply the host application's default server only when the caller did
+    /// not explicitly select a database or server.
+    pub fn default_server(mut self, server: impl Into<String>) -> Self {
+        if self.0.global.db.is_none() && self.0.global.server.is_none() {
+            self.0.global.server = Some(server.into());
+        }
+        self
+    }
+
+    /// Execute against a database or server without constructing a registry.
+    pub async fn standalone(self) -> Result<(), Error> {
+        let cli = self.0;
+        let out = Out::new(&cli.global);
+        let Some(command) = cli.command else {
+            let _ = Cli::command().print_help();
+            std::process::exit(Exit::Usage as i32)
+        };
+        finish(reach(None, &cli.global), command, &out).await
+    }
+}
+
 /// parse argv and do what it says, in this binary, against this registry.
 ///
 /// **with no arguments this is `app.serve(addr)`**: the same call, the same
@@ -640,13 +676,7 @@ pub async fn run(app: Hestan, addr: impl Into<SocketAddr>) -> Result<(), Error> 
 /// [`run`] this needs to be told where to look: `--db` or `--server`, and
 /// nothing at all is a usage error rather than a default.
 pub async fn standalone() -> Result<(), Error> {
-    let cli = Cli::parse();
-    let out = Out::new(&cli.global);
-    let Some(command) = cli.command else {
-        let _ = Cli::command().print_help();
-        std::process::exit(Exit::Usage as i32)
-    };
-    finish(reach(None, &cli.global), command, &out).await
+    Invocation(Cli::parse()).standalone().await
 }
 
 /// run the command and turn whatever it says into an exit code.
@@ -5525,5 +5555,40 @@ mod tests {
             })
         ));
         assert!(Cli::try_parse_from(["hestan", "notifications", "show", "delivery"]).is_ok());
+    }
+}
+
+#[cfg(test)]
+mod invocation_tests {
+    use super::*;
+
+    #[test]
+    fn help_and_invalid_arguments_need_no_application() {
+        let help = Invocation::try_parse_from(["factory control", "--help"]);
+        assert!(matches!(help, Err(e) if e.kind() == clap::error::ErrorKind::DisplayHelp));
+        assert!(Invocation::try_parse_from(["factory control", "misspelled"]).is_err());
+    }
+
+    #[test]
+    fn explicit_targets_take_precedence_over_the_host_default() {
+        for (args, db, server) in [
+            (vec!["control", "runs"], None, Some("http://localhost:4300")),
+            (
+                vec!["control", "--db", "runs.db", "runs"],
+                Some("runs.db"),
+                None,
+            ),
+            (
+                vec!["control", "--server", "http://peer:4300", "runs"],
+                None,
+                Some("http://peer:4300"),
+            ),
+        ] {
+            let parsed = Invocation::try_parse_from(args)
+                .unwrap()
+                .default_server("http://localhost:4300");
+            assert_eq!(parsed.0.global.db.as_deref(), db);
+            assert_eq!(parsed.0.global.server.as_deref(), server);
+        }
     }
 }
