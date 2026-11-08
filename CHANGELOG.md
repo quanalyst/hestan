@@ -1,5 +1,10 @@
 # Changes
 
+## Retained sensor controls
+
+- Temporarily absent sensors keep their operator pause and progress cursor.
+- Current listings, pause commands and health counts include declared sensors only.
+
 ## Stable recurrence pauses
 
 - Named recurrences retain operator pauses across cron edits and profile toggles.

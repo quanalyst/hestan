@@ -622,7 +622,11 @@ CREATE TABLE schedule_controls (
 );
 "#;
 
-pub(crate) const SCHEMA_VERSION: u32 = 26;
+pub(crate) const SENSOR_DECLARATIONS_SCHEMA: &str = r#"
+ALTER TABLE sensors ADD COLUMN declared INTEGER NOT NULL DEFAULT 1;
+"#;
+
+pub(crate) const SCHEMA_VERSION: u32 = 27;
 
 // one transaction around every pending step and the version stamp (sqlite DDL
 // is transactional), so a crash mid-migration leaves the db exactly as found
@@ -718,6 +722,9 @@ fn migrate(conn: &mut Connection) -> Result<(), Error> {
     }
     if version < 26 {
         tx.execute_batch(SCHEDULE_CONTROLS_SCHEMA)?;
+    }
+    if version < 27 {
+        tx.execute_batch(SENSOR_DECLARATIONS_SCHEMA)?;
     }
     if version != SCHEMA_VERSION {
         tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
@@ -3124,7 +3131,7 @@ impl Store {
                 .unwrap_or_default();
             let sensors_paused = conn
                 .query_opt(
-                    "SELECT COUNT(*) FROM sensors WHERE paused <> 0",
+                    "SELECT COUNT(*) FROM sensors WHERE paused <> 0 AND declared <> 0",
                     args![],
                     |r| r.int(0),
                 )?
@@ -5634,35 +5641,28 @@ impl Store {
         Ok(())
     }
 
-    /// make the sensors table mirror the code: insert new names, drop the
-    /// rest. existing rows keep their paused flag and cursor.
+    /// Retain operator controls and progress for temporarily absent declarations.
+    /// Only declared sensors participate in current listings and controls.
     pub(crate) fn sync_sensors(&self, defined: &[String]) -> Result<(), Error> {
         let mut conn = self.conn();
-        let (insert, ignore) = conn.dialect().insert_or_ignore();
         let mut tx = conn.begin()?;
+        tx.execute("UPDATE sensors SET declared = 0", args![])?;
         let now = Utc::now().to_rfc3339();
         for name in defined {
             tx.execute(
-                &format!("{insert} sensors (name, updated_at) VALUES (?1, ?2) {ignore}"),
+                "INSERT INTO sensors (name, updated_at, declared) VALUES (?1, ?2, 1)
+                 ON CONFLICT (name) DO UPDATE SET declared = 1",
                 args![name, &now],
             )?;
-        }
-        let existing: Vec<String> = tx.query("SELECT name FROM sensors", args![], |r| r.text(0))?;
-        let keep: HashSet<&str> = defined.iter().map(String::as_str).collect();
-        for name in &existing {
-            if !keep.contains(name.as_str()) {
-                tx.execute("DELETE FROM sensors WHERE name = ?1", args![name])?;
-            }
         }
         tx.commit()?;
         Ok(())
     }
 
-    /// every stored sensor, by name: the paused flags and the cursors, not
-    /// the closures, which live in code.
+    /// Currently declared sensors' stored controls and progress; closures live in code.
     pub fn sensors(&self) -> Result<Vec<SensorRow>, Error> {
         self.conn().query(
-            "SELECT name, paused, cursor, updated_at FROM sensors ORDER BY name",
+            "SELECT name, paused, cursor, updated_at FROM sensors WHERE declared <> 0 ORDER BY name",
             args![],
             |r| {
                 Ok(SensorRow {
@@ -5689,7 +5689,7 @@ impl Store {
         let mut conn = self.conn();
         let mut tx = conn.begin_immediate()?;
         let n = tx.execute(
-            "UPDATE sensors SET paused = ?2 WHERE name = ?1",
+            "UPDATE sensors SET paused = ?2 WHERE name = ?1 AND declared <> 0",
             args![name, paused],
         )?;
         if n == 0 {
@@ -8927,6 +8927,7 @@ mod tests {
                          ALTER TABLE runs DROP COLUMN build;
                          DROP TABLE schedule_controls;
                          ALTER TABLE schedules DROP COLUMN logical_name;
+                         ALTER TABLE sensors DROP COLUMN declared;
                          UPDATE schema_version SET version = 16;"
                     ))
                     .unwrap();
@@ -9035,6 +9036,7 @@ mod tests {
                          ALTER TABLE runs DROP COLUMN build;
                          DROP TABLE schedule_controls;
                          ALTER TABLE schedules DROP COLUMN logical_name;
+                         ALTER TABLE sensors DROP COLUMN declared;
                          UPDATE schema_version SET version = 17;",
                     )
                     .unwrap();
@@ -9139,6 +9141,7 @@ mod tests {
                          ALTER TABLE runs DROP COLUMN build;
                          DROP TABLE schedule_controls;
                          ALTER TABLE schedules DROP COLUMN logical_name;
+                         ALTER TABLE sensors DROP COLUMN declared;
                          UPDATE schema_version SET version = 18;",
                     )
                     .unwrap();
@@ -9263,6 +9266,7 @@ mod tests {
                          ALTER TABLE runs DROP COLUMN build;
                          DROP TABLE schedule_controls;
                          ALTER TABLE schedules DROP COLUMN logical_name;
+                         ALTER TABLE sensors DROP COLUMN declared;
                          {ticks}
                          UPDATE schema_version SET version = 19;"
                     ))
@@ -11160,6 +11164,73 @@ mod tests {
     }
 
     #[test]
+    fn sensor_controls_and_cursor_survive_absence_and_restart() {
+        both(|db| {
+            let store = db.store();
+            store.sync_sensors(&["watch".into()]).unwrap();
+            store
+                .set_sensor_paused("watch", true, Some("operator"))
+                .unwrap();
+            store
+                .set_sensor_cursor("watch", &json!({"run": "accepted"}))
+                .unwrap();
+            let retained = serde_json::to_value(store.sensors().unwrap()).unwrap();
+            store.sync_sensors(&[]).unwrap();
+            assert!(store.sensors().unwrap().is_empty());
+            assert_eq!(store.counts(Utc::now()).unwrap().sensors_paused, 0);
+            assert!(!store.set_sensor_paused("watch", false, None).unwrap());
+            drop(store);
+            let store = db.store();
+            store.sync_sensors(&["watch".into()]).unwrap();
+            assert_eq!(
+                serde_json::to_value(store.sensors().unwrap()).unwrap(),
+                retained
+            );
+            assert_eq!(store.counts(Utc::now()).unwrap().sensors_paused, 1);
+            store.set_sensor_paused("watch", false, None).unwrap();
+            store.sync_sensors(&[]).unwrap();
+            store.sync_sensors(&["watch".into()]).unwrap();
+            assert!(!store.sensors().unwrap()[0].paused);
+            assert_eq!(
+                store.sensors().unwrap()[0].cursor,
+                Some(json!({"run": "accepted"}))
+            );
+        });
+    }
+
+    #[test]
+    fn sensor_declaration_migration_preserves_progress_and_audit() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("runs.db");
+        let store = Store::open(path.to_str().unwrap()).unwrap();
+        store.sync_sensors(&["watch".into()]).unwrap();
+        store
+            .set_sensor_paused("watch", true, Some("operator"))
+            .unwrap();
+        store
+            .set_sensor_cursor("watch", &json!({"sequence": 42}))
+            .unwrap();
+        let sensors = serde_json::to_value(store.sensors().unwrap()).unwrap();
+        let events =
+            serde_json::to_value(store.event_log(&EventQuery::default(), 50).unwrap()).unwrap();
+        drop(store);
+        let raw = Connection::open(&path).unwrap();
+        raw.execute_batch("ALTER TABLE sensors DROP COLUMN declared; PRAGMA user_version = 26;")
+            .unwrap();
+        drop(raw);
+        let store = Store::open(path.to_str().unwrap()).unwrap();
+        assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
+        assert_eq!(
+            serde_json::to_value(store.sensors().unwrap()).unwrap(),
+            sensors
+        );
+        assert_eq!(
+            serde_json::to_value(store.event_log(&EventQuery::default(), 50).unwrap()).unwrap(),
+            events
+        );
+    }
+
+    #[test]
     fn sensor_ticks_record_filter_and_prune() {
         both(|db| {
             let store = db.store();
@@ -11382,6 +11453,7 @@ mod tests {
         raw.execute_batch(
             "DROP TABLE schedule_controls;
             ALTER TABLE schedules DROP COLUMN logical_name;
+                         ALTER TABLE sensors DROP COLUMN declared;
             PRAGMA user_version = 25;",
         )
         .unwrap();
@@ -13650,6 +13722,7 @@ mod tests {
                          ALTER TABLE runs DROP COLUMN build;
                          DROP TABLE schedule_controls;
                          ALTER TABLE schedules DROP COLUMN logical_name;
+                         ALTER TABLE sensors DROP COLUMN declared;
                          UPDATE schema_version SET version = 21;",
                     )
                     .unwrap();
@@ -14040,6 +14113,7 @@ mod tests {
                          ALTER TABLE runs DROP COLUMN build;
                          DROP TABLE schedule_controls;
                          ALTER TABLE schedules DROP COLUMN logical_name;
+                         ALTER TABLE sensors DROP COLUMN declared;
                          UPDATE schema_version SET version = 22;",
                     )
                     .unwrap();
@@ -14091,7 +14165,8 @@ mod tests {
                          DROP TABLE notification_destination_state;
                          ALTER TABLE runs DROP COLUMN build;
                          DROP TABLE schedule_controls;
-                         ALTER TABLE schedules DROP COLUMN logical_name;",
+                         ALTER TABLE schedules DROP COLUMN logical_name;
+                         ALTER TABLE sensors DROP COLUMN declared;",
                 )
                 .unwrap();
                 conn.pragma_update(None, "user_version", 23).unwrap();
@@ -14108,6 +14183,7 @@ mod tests {
                          ALTER TABLE runs DROP COLUMN build;
                          DROP TABLE schedule_controls;
                          ALTER TABLE schedules DROP COLUMN logical_name;
+                         ALTER TABLE sensors DROP COLUMN declared;
                          UPDATE schema_version SET version = 23;",
                     )
                     .unwrap();

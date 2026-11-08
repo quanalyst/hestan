@@ -605,6 +605,9 @@ fn migrate(client: &mut Client) -> Result<(), Error> {
             if version < 26 {
                 tx.batch(crate::store::SCHEDULE_CONTROLS_SCHEMA)?;
             }
+            if version < 27 {
+                tx.batch(crate::store::SENSOR_DECLARATIONS_SCHEMA)?;
+            }
             if version != SCHEMA_VERSION {
                 tx.execute(
                     "UPDATE schema_version SET version = ?1",
@@ -616,6 +619,7 @@ fn migrate(client: &mut Client) -> Result<(), Error> {
             tx.batch(SCHEMA)?;
             tx.batch(crate::store::deliveries::SCHEMA)?;
             tx.batch(crate::store::SCHEDULE_CONTROLS_SCHEMA)?;
+            tx.batch(crate::store::SENSOR_DECLARATIONS_SCHEMA)?;
             tx.execute(
                 "INSERT INTO schema_version (version) VALUES (?1)",
                 args![i64::from(SCHEMA_VERSION)],

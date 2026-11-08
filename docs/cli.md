@@ -596,3 +596,9 @@ Initial naming preserves the current exact recurrence's pause. If the expression
 also changes during first naming, an existing unnamed pause on that target holds
 the replacement conservatively. An explicit unpause settles that ambiguity.
 Unnamed schedules retain their original expression-based lifecycle.
+
+Sensor names already provide a stable declaration identity. Removing a sensor
+from an application's profile makes it inactive and removes it from current
+listings and pause controls, while retaining its pause and cursor. Registering
+the same name restores both. Reuse a name only for the same progress contract.
+Historical ticks and audit events remain available during its absence.
