@@ -1,4 +1,4 @@
-//! the `http` feature: two ready-made hooks, for the deployment that wants an
+//! the `http` feature: ready-made hooks, for the deployment that wants an
 //! alert somewhere before it wants an integration.
 //!
 //! every hook hestan has takes a plain closure, and these are closures: there
@@ -56,7 +56,7 @@ fn post(url: String, body: serde_json::Value) {
 
 /// what these hooks can deliver: something that serializes whole, and knows
 /// how to say itself in one line. implemented for every event a hook receives,
-/// so the same two helpers serve every one of
+/// so the same helpers serve every one of
 /// [`on_failure`](crate::Hestan::on_failure),
 /// [`on_run_finished`](crate::Hestan::on_run_finished),
 /// [`on_op_finished`](crate::Hestan::on_op_finished) and
@@ -220,6 +220,20 @@ pub fn slack<A: Alert>(url: impl Into<String>) -> impl Fn(A) + Send + Sync {
     let url = url.into();
     move |a: A| {
         post(url.clone(), json!({ "text": a.summary() }));
+    }
+}
+
+/// Best-effort Adaptive Card delivery to a Teams Workflows webhook, including
+/// freshness events. Use [`TeamsWorkflow`] in a named notification destination
+/// for durable terminal-run delivery with retries.
+pub fn teams_workflow<A: Alert>(url: impl Into<String>) -> impl Fn(A) + Send + Sync {
+    let url = url.into();
+    move |alert: A| {
+        let summary = crate::notification::bounded(&alert.summary(), 4000);
+        post(
+            url.clone(),
+            delivery_http::teams_card("Hestan alert", &summary, None),
+        );
     }
 }
 

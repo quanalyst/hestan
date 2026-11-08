@@ -372,6 +372,44 @@ mod http {
         task.abort();
     }
     #[tokio::test]
+    async fn teams_freshness_hook_posts_a_bounded_adaptive_card() {
+        let (send, mut receive) = tokio::sync::mpsc::unbounded_channel();
+        let router = Router::new().route(
+            "/hook",
+            post(move |axum::Json(body): axum::Json<serde_json::Value>| {
+                let send = send.clone();
+                async move {
+                    send.send(body).unwrap();
+                    "ok"
+                }
+            }),
+        );
+        let (url, task) = serve(router).await;
+        let hook = hestan::notify::teams_workflow(url);
+        hook(hestan::LateEvent {
+            kind: hestan::LateKind::Asset,
+            name: "forecast [input]".into(),
+            owner: None,
+            late_by: Duration::from_secs(300),
+            last_success: None,
+        });
+        let body = tokio::time::timeout(Duration::from_secs(2), receive.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(body["type"], "message");
+        let card = &body["attachments"][0]["content"];
+        assert_eq!(card["type"], "AdaptiveCard");
+        assert_eq!(
+            card["body"][1]["text"],
+            "asset forecast \\[input\\] is 5m late"
+        );
+        assert!(card.get("actions").is_none());
+        assert!(serde_json::to_vec(&body).unwrap().len() < 24 * 1024);
+        task.abort();
+    }
+
+    #[tokio::test]
     async fn provider_adapters_use_expected_payloads() {
         for slack in [true, false] {
             let bodies = Arc::new(Mutex::new(Vec::new()));

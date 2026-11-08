@@ -24,6 +24,22 @@ fn markdown(text: &str) -> String {
     result
 }
 
+pub(super) fn teams_card(title: &str, text: &str, url: Option<&str>) -> Value {
+    let mut card = json!({
+        "type":"AdaptiveCard", "$schema":"http://adaptivecards.io/schemas/adaptive-card.json",
+        "version":"1.2", "body":[
+            {"type":"TextBlock","text":markdown(title),"weight":"Bolder","wrap":true},
+            {"type":"TextBlock","text":markdown(text),"wrap":true}
+        ]
+    });
+    if let Some(url) = url {
+        card["actions"] = json!([{"type":"Action.OpenUrl","title":"View run","url":url}]);
+    }
+    json!({"type":"message","attachments":[{
+        "contentType":"application/vnd.microsoft.card.adaptive","contentUrl":null,"content":card
+    }]})
+}
+
 fn tls_identity_error(error: &reqwest::Error) -> bool {
     let mut cause = std::error::Error::source(error);
     while let Some(error) = cause {
@@ -144,14 +160,11 @@ impl Http {
                 }
                 json!({"text":text,"unfurl_links":false,"unfurl_media":false})
             }
-            Format::Teams => {
-                let mut card = json!({"type":"AdaptiveCard","$schema":"http://adaptivecards.io/schemas/adaptive-card.json","version":"1.2","body":[{"type":"TextBlock","text":markdown(&title),"weight":"Bolder","wrap":true},{"type":"TextBlock","text":markdown(&format!("{identity}\n{}", excerpt(error,1000))),"wrap":true}]});
-                if let Some(url) = &event.run_url {
-                    card["actions"] =
-                        json!([{"type":"Action.OpenUrl","title":"View run","url":url}]);
-                }
-                json!({"type":"message","attachments":[{"contentType":"application/vnd.microsoft.card.adaptive","contentUrl":null,"content":card}]})
-            }
+            Format::Teams => teams_card(
+                &title,
+                &format!("{identity}\n{}", excerpt(error, 1000)),
+                event.run_url.as_deref(),
+            ),
         };
         let body = serde_json::to_vec(&body)
             .map_err(|_| Failure::permanent("notification serialization failed"))?;

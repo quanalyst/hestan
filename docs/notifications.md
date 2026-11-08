@@ -38,6 +38,11 @@ Groups, labels, namespaces, and owner contact strings do not select recipients.
 | `notify::TeamsWorkflow::new(url)` | Adaptive Card for a configured Teams Workflows webhook. Acceptance does not prove the workflow's later actions succeeded. |
 | Async closure or `NotificationSender` | Await the application client's submission; return success, retryable failure, or permanent failure. |
 
+For freshness events, `.on_late(notify::teams_workflow(url))` uses the same
+Adaptive Card format and shared HTTP client. This hook is best effort; named
+`TeamsWorkflow` destinations provide durable terminal-run delivery. Configure a
+Workflows webhook, as described in [Microsoft's webhook documentation](https://learn.microsoft.com/en-us/microsoftteams/platform/webhooks-and-connectors/how-to/connectors-using).
+
 Use `.public_url("https://hestan.example")` for explicit run links. Credentials
 and endpoint URLs stay in process configuration and are excluded from delivery
 history. HTTP redirects are refused. Built-in errors contain status codes and
