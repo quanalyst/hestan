@@ -1167,8 +1167,15 @@ fn launch_policy_builds(
     let assets: Vec<&str> = wants.iter().map(|w| w.asset.as_str()).collect();
     // a probe is a sensor named after the source it watches, and `build` does
     // not say which one woke this up
-    let launched = policy::launch(runner, registry, &mats, &wants, sensor_tag(asset))
-        .map_err(|e| format!("auto build of {} failed: {e}", assets.join(", ")))?;
+    let launched = policy::launch(
+        runner,
+        registry,
+        &mats,
+        &wants,
+        sensor_tag(asset),
+        Utc::now(),
+    )
+    .map_err(|e| format!("auto build of {} failed: {e}", assets.join(", ")))?;
     if let Some(run_id) = &launched {
         tracing::info!(assets = %assets.join(", "), run = %run_id, "auto build launched");
     }
@@ -1607,6 +1614,40 @@ mod tests {
                 .inputs,
             json!({"docs": "one"})
         );
+    }
+
+    #[tokio::test]
+    async fn unchanged_probe_respects_exhausted_build_backoff() {
+        let store = Store::open(":memory:").unwrap();
+        store.sync_sensors(&["probe:source".into()]).unwrap();
+        let fingerprint = Arc::new(Mutex::new("capture".to_owned()));
+        let read = fingerprint.clone();
+        let source = Asset::source("source").probe(move || {
+            let value = read.lock().unwrap().clone();
+            async move { Ok(value) }
+        });
+        let report = Asset::new("report", |_| async { Err("provider unavailable".into()) })
+            .from(&source)
+            .auto();
+        let reg = Arc::new(AssetRegistry::new(vec![source, report], vec![], vec![]).unwrap());
+        let runner = Runner::new([reg.lower_job().unwrap()], store.clone()).unwrap();
+        let entry = probe_entry(&reg, "source");
+        evaluate(&entry, &runner, &reg).await;
+        let runs = store.runs(None, None, None, None, None, None, 10).unwrap();
+        assert_eq!(wait_terminal(&runner, &runs[0].id).await, RunStatus::Failed);
+        evaluate(&entry, &runner, &reg).await;
+        assert_eq!(
+            store
+                .runs(None, None, None, None, None, None, 10)
+                .unwrap()
+                .len(),
+            1
+        );
+        *fingerprint.lock().unwrap() = "corrected-capture".into();
+        evaluate(&entry, &runner, &reg).await;
+        let runs = store.runs(None, None, None, None, None, None, 10).unwrap();
+        assert_eq!(runs.len(), 2);
+        assert_eq!(wait_terminal(&runner, &runs[0].id).await, RunStatus::Failed);
     }
 
     #[tokio::test]

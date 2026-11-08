@@ -1,5 +1,13 @@
 # Changes
 
+## Automatic build admission
+
+- Exhausted automatic asset builds back off from five minutes to one hour using
+  retained run history, including after scheduler restart.
+- Changed input fingerprints or a declared deployment build permit an immediate
+  attempt. Independent assets, eligible partitions and explicit recovery remain
+  available; see [asset policies](docs/assets.md#the-pass-that-acts-on-them).
+
 ## Presentation metadata
 
 - Jobs, assets and individual multi-asset outputs support optional display names,

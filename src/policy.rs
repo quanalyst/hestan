@@ -1,3 +1,6 @@
+#[path = "policy_retry.rs"]
+mod retry;
+
 use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;
@@ -271,7 +274,7 @@ pub(crate) struct Want {
     pub asset: String,
     /// the rule that fired, as the event log names it.
     pub rule: &'static str,
-    /// which keys, newest first and capped by the
+    /// which keys, newest first. Admission applies the
     /// [build limit](crate::Partitions::build_limit); empty on an unpartitioned
     /// asset, which is one of everything.
     pub keys: Vec<String>,
@@ -482,12 +485,9 @@ impl<'a> Pass<'a> {
             if !wanted {
                 continue;
             }
-            // newest first and capped, exactly as a build that names no keys
-            // chooses them: a set that has run for two years is not a run
+            // Admission filters failed keys before applying the build limit,
+            // so a failing recent key cannot starve earlier eligible work.
             keys.reverse();
-            if let Some(spec) = &meta.partitions {
-                keys.truncate(spec.limit());
-            }
             out.push(Want {
                 asset: meta.name.clone(),
                 rule: policy.rule_word(),
@@ -510,8 +510,15 @@ pub(crate) fn launch(
     reg: &AssetRegistry,
     mats: &Mats,
     wants: &[Want],
-    tags: RunTags,
+    mut tags: RunTags,
+    now: DateTime<Utc>,
 ) -> Result<Option<String>, Error> {
+    let (wants, attempts) = retry::admit(runner, reg, mats, wants, now)?;
+    tags.extend(attempts);
+    if tags.contains_key("policy") {
+        tags.remove("asset");
+        tags.extend(policy_tag(&wants));
+    }
     if wants.is_empty() {
         return Ok(None);
     }
@@ -574,7 +581,7 @@ pub(crate) fn tick(
 ) -> Result<Option<String>, Error> {
     let mats = mats_map(runner.store())?;
     let wants = Pass::new(reg, &mats, now).wants(None);
-    let launched = launch(runner, reg, &mats, &wants, policy_tag(&wants))?;
+    let launched = launch(runner, reg, &mats, &wants, policy_tag(&wants), now)?;
     if let Some(run_id) = &launched {
         tracing::info!(
             assets = %wants.iter().map(|w| w.asset.as_str()).collect::<Vec<_>>().join(", "),
@@ -922,7 +929,7 @@ mod tests {
     }
 
     #[test]
-    fn a_pass_wants_no_more_keys_than_the_build_limit() {
+    fn a_pass_keeps_keys_available_for_admission_before_the_build_limit() {
         let reg = reg(vec![
             Asset::new("sales", |_: OpCtx| async { Ok(json!(null)) })
                 .partitioned(Partitions::keys(["r1", "r2", "r3", "r4", "r5"]).build_limit(2))
@@ -930,7 +937,10 @@ mod tests {
         ]);
         let mats = Mats::default();
         let wants = Pass::new(&reg, &mats, at("2026-08-14T09:00:00Z")).wants(None);
-        assert_eq!(wants[0].keys, ["r5", "r4"], "the newest keys, and no more");
+        assert_eq!(wants[0].keys, ["r5", "r4", "r3", "r2", "r1"]);
+        let runner = runner_for(&reg, Store::open(":memory:").unwrap());
+        let (accepted, _) = retry::admit(&runner, &reg, &mats, &wants, Utc::now()).unwrap();
+        assert_eq!(accepted[0].keys, ["r5", "r4"]);
     }
 
     /// a day, as its key
@@ -1291,5 +1301,148 @@ mod tests {
             }),
             "the hours before the set starts are not hours that arrive late"
         );
+    }
+    #[tokio::test]
+    async fn exhausted_automatic_builds_back_off_across_restart_and_allow_manual_recovery() {
+        let directory = tempfile::tempdir().unwrap();
+        let db = directory.path().join("runs.db");
+        let s = source();
+        let bad = Asset::new("report", |_: OpCtx| async {
+            Err("source unavailable".into())
+        })
+        .from(&s)
+        .auto();
+        let reg = reg(vec![s, bad]);
+        let store = Store::open(&db.to_string_lossy()).unwrap();
+        store
+            .record_materialization("s", None, "source-input", &json!({}), None, None, None)
+            .unwrap();
+        let runner = runner_for(&reg, store.clone());
+        let first = tick(&runner, &reg, Utc::now()).unwrap().unwrap();
+        assert_eq!(wait_terminal(&runner, &first).await, RunStatus::Failed);
+        let finished = store.run(&first).unwrap().unwrap().finished_at.unwrap();
+        drop(runner);
+        drop(store);
+        let store = Store::open(&db.to_string_lossy()).unwrap();
+        let runner = runner_for(&reg, store.clone());
+        assert!(
+            tick(&runner, &reg, finished + chrono::Duration::seconds(299))
+                .unwrap()
+                .is_none()
+        );
+        let retry = tick(&runner, &reg, finished + chrono::Duration::seconds(300))
+            .unwrap()
+            .unwrap();
+        assert_eq!(wait_terminal(&runner, &retry).await, RunStatus::Failed);
+        let finished = store.run(&retry).unwrap().unwrap().finished_at.unwrap();
+        assert!(
+            tick(&runner, &reg, finished + chrono::Duration::seconds(599))
+                .unwrap()
+                .is_none()
+        );
+        for seconds in [600, 1200, 2400, 3600, 3600] {
+            let previous = store.runs(None, None, None, None, None, None, 1).unwrap();
+            let at = previous[0].finished_at.unwrap();
+            assert!(
+                tick(&runner, &reg, at + chrono::Duration::seconds(seconds - 1))
+                    .unwrap()
+                    .is_none()
+            );
+            let run = tick(&runner, &reg, at + chrono::Duration::seconds(seconds))
+                .unwrap()
+                .unwrap();
+            assert_eq!(wait_terminal(&runner, &run).await, RunStatus::Failed);
+        }
+        let manual = crate::asset::build_one(&runner, &reg, "report", &[])
+            .unwrap()
+            .unwrap();
+        assert_eq!(wait_terminal(&runner, &manual).await, RunStatus::Failed);
+        assert!(tick(&runner, &reg, Utc::now()).unwrap().is_none());
+        let deployed = runner.with_deployment(crate::Deployment::new().build("abc123"));
+        let changed = tick(&deployed, &reg, Utc::now()).unwrap().unwrap();
+        assert_eq!(wait_terminal(&deployed, &changed).await, RunStatus::Failed);
+        assert!(tick(&deployed, &reg, Utc::now()).unwrap().is_none());
+        store
+            .record_materialization(
+                "s",
+                None,
+                "corrected-source-input",
+                &json!({}),
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        let changed = tick(&deployed, &reg, Utc::now()).unwrap().unwrap();
+        assert_eq!(wait_terminal(&deployed, &changed).await, RunStatus::Failed);
+    }
+
+    #[tokio::test]
+    async fn failed_partition_does_not_spend_the_next_pass_build_limit() {
+        let report = Asset::new("report", |ctx: OpCtx| async move {
+            if ctx.partition() == Some("r3") {
+                Err("missing input".into())
+            } else {
+                Ok(json!(ctx.partition()))
+            }
+        })
+        .partitioned(Partitions::keys(["r1", "r2", "r3"]).build_limit(1))
+        .auto();
+        let reg = reg(vec![report]);
+        let store = Store::open(":memory:").unwrap();
+        let runner = runner_for(&reg, store.clone());
+        let failed = tick(&runner, &reg, Utc::now()).unwrap().unwrap();
+        assert_eq!(wait_terminal(&runner, &failed).await, RunStatus::Failed);
+        for key in ["r2", "r1"] {
+            let run = tick(&runner, &reg, Utc::now()).unwrap().unwrap();
+            assert_eq!(wait_terminal(&runner, &run).await, RunStatus::Success);
+            assert!(
+                store
+                    .materialization("report", Some(key))
+                    .unwrap()
+                    .is_some()
+            );
+        }
+        assert!(tick(&runner, &reg, Utc::now()).unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn descendants_cannot_bypass_upstream_backoff_and_independent_work_can_run() {
+        let s = source();
+        let bad = Asset::new("intermediate", |_: OpCtx| async {
+            Err("provider unavailable".into())
+        })
+        .from(&s);
+        let report = body("report").from(&bad).auto();
+        let independent = Asset::source("independent_input");
+        let good = body("independent").from(&independent).auto();
+        let reg = reg(vec![s, bad, report, independent, good]);
+        let store = store_with(vec![
+            ("s", None, "source-input", json!({})),
+            ("independent_input", None, "capture", json!({})),
+        ]);
+        let runner = runner_for(&reg, store.clone());
+        let first = tick(&runner, &reg, Utc::now()).unwrap().unwrap();
+        assert_eq!(wait_terminal(&runner, &first).await, RunStatus::Failed);
+        assert!(tick(&runner, &reg, Utc::now()).unwrap().is_none());
+        store
+            .record_materialization(
+                "independent_input",
+                None,
+                "correction",
+                &json!({}),
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        let run = tick(&runner, &reg, Utc::now()).unwrap().unwrap();
+        assert_eq!(wait_terminal(&runner, &run).await, RunStatus::Success);
+        assert!(store.op_run(&run, "intermediate").unwrap().is_none());
+        store
+            .record_materialization("s", None, "recovered-source", &json!({}), None, None, None)
+            .unwrap();
+        let run = tick(&runner, &reg, Utc::now()).unwrap().unwrap();
+        assert_eq!(wait_terminal(&runner, &run).await, RunStatus::Failed);
     }
 }

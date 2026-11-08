@@ -711,6 +711,21 @@ produces no run and no event, however many passes go by. what it is waiting for
 is a fact `GET /api/assets` reports and `hestan doctor` reads, rather than
 something it announces once a minute.
 
+An automatic build that exhausts its operation retries waits five minutes before
+trying the same inputs again. Consecutive failed automatic attempts double that
+wait to ten, twenty and forty minutes, then cap it at one hour. The run store
+retains the attempt identities, so restarting the scheduler does not clear the
+wait. Both the policy loop and source probes use this admission check.
+
+The delay belongs to the failed asset and partition. A descendant cannot bypass
+its failed upstream, while unrelated assets and eligible partitions continue.
+Admission applies the partition build limit after excluding delayed keys. A change
+to a relevant input fingerprint or the declared `Deployment::build` identity permits
+an immediate attempt. Declare that identity to distinguish deployed source changes;
+Hestan cannot infer a change inside an arbitrary closure. Explicit builds and
+resumes remain available for operator recovery. Only hashes of input identities
+are stored in the internal `auto:` run tags, never input values or credentials.
+
 every launch says so: one `policy_launched` [event](events.md) per asset in the
 plan, carrying the rule that fired and the keys it asked for.
 
