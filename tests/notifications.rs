@@ -29,6 +29,44 @@ fn quick() -> Policy {
 }
 
 #[tokio::test]
+async fn zero_flush_budget_preserves_pending_deliveries_without_claiming_or_sending() {
+    let store = Store::open(":memory:").unwrap();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let sent = calls.clone();
+    let destination = Destination::builder("sink")
+        .on_run_finished()
+        .sender(move |_: Ctx| {
+            let sent = sent.clone();
+            async move {
+                sent.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+        })
+        .build()
+        .unwrap();
+    let runner = Runner::new([job()], store.clone())
+        .unwrap()
+        .with_notifications([destination])
+        .unwrap();
+    runner
+        .run("task", json!({}), Trigger::Manual)
+        .await
+        .unwrap();
+    let flushed = runner.flush_notifications(Duration::ZERO).await.unwrap();
+    assert_eq!(flushed.attempted, 0);
+    assert_eq!(flushed.remaining, 1);
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    assert_eq!(rows(&store)[0].state, State::Pending);
+    assert_eq!(rows(&store)[0].attempts, 0);
+    runner
+        .flush_notifications(Duration::from_secs(1))
+        .await
+        .unwrap();
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert_eq!(rows(&store)[0].state, State::Delivered);
+}
+
+#[tokio::test]
 async fn independent_destinations_retry_actual_failures_and_preserve_payload() {
     let store = Store::open(":memory:").unwrap();
     let calls = Arc::new(AtomicUsize::new(0));

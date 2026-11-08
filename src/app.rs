@@ -863,6 +863,7 @@ impl Hestan {
     }
 
     /// Overall headless delivery budget. Remaining work stays persisted.
+    /// A zero budget leaves all deliveries for a subsequent dispatcher.
     pub fn notification_flush_within(mut self, budget: Duration) -> Self {
         self.notification_flush = budget;
         self

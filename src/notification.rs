@@ -566,8 +566,10 @@ impl Runner {
         run: Option<&str>,
     ) -> Result<NotificationFlush, Error> {
         let progress = std::sync::atomic::AtomicUsize::new(0);
-        if let Ok(result) = tokio::time::timeout(budget, pass(self, run, &progress)).await {
-            result?;
+        if !budget.is_zero() {
+            if let Ok(result) = tokio::time::timeout(budget, pass(self, run, &progress)).await {
+                result?;
+            }
         }
         let attempted = progress.load(std::sync::atomic::Ordering::Relaxed);
         Ok(NotificationFlush {
