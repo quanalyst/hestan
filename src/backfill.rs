@@ -175,7 +175,7 @@ fn launch_next(
     // rather than failing the backfill: nothing was written, the chunk is
     // still unlaunched, and `launched` has not moved, so this pass simply
     // tries the same chunk again in two seconds
-    let run_id = match launch_plan(runner, registry, plan, Trigger::Build, tags) {
+    let run_id = match launch_plan(runner, registry, plan, Trigger::Build, tags, None) {
         Ok(id) => id,
         Err(Error::Conflict(why)) => {
             tracing::debug!(backfill = backfill.id, "chunk held: {why}");

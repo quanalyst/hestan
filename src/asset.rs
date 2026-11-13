@@ -2873,15 +2873,29 @@ pub(crate) fn claimed_by(reg: &AssetRegistry, plan: &BuildPlan) -> Value {
 ///
 /// the claim goes with it, so the store refuses this launch if what it would
 /// build meets what something else is already building. `Error::Conflict` is
-/// that refusal, naming the asset and the run.
+/// that refusal, naming the asset and the run. Automatic callers also bind the
+/// observed output identities so an intervening completion invalidates their plan.
 pub(crate) fn launch_plan(
     runner: &crate::executor::Runner,
     reg: &AssetRegistry,
     plan: BuildPlan,
     trigger: Trigger,
     tags: RunTags,
+    observed: Option<&Mats>,
 ) -> Result<String, Error> {
-    let claims = claimed_by(reg, &plan);
+    let mut claims = claimed_by(reg, &plan);
+    if let Some(observed) = observed {
+        for claim in claims.as_array_mut().expect("build claims") {
+            claim["observed_materialization"] = json!(
+                observed
+                    .get(
+                        claim["asset"].as_str().expect("claimed asset"),
+                        claim["partition"].as_str()
+                    )
+                    .map(|row| row.id)
+            );
+        }
+    }
     runner.launch_subset(
         ASSETS_JOB,
         plan.ops.into_iter().collect(),
@@ -2947,7 +2961,7 @@ pub(crate) fn build_one(
     let Some(plan) = plan_one(runner, reg, name, keys)? else {
         return Ok(None);
     };
-    launch_plan(runner, reg, plan, Trigger::Build, asset_tag(name)).map(Some)
+    launch_plan(runner, reg, plan, Trigger::Build, asset_tag(name), None).map(Some)
 }
 
 /// [`plan_one`] fired by a [schedule on the asset](crate::Schedule::asset):

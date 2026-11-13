@@ -2638,8 +2638,13 @@ impl Runner {
                 secrets.release(&run.id);
                 return Ok(Launched::Repeat(id));
             }
-            // the plan meets one already executing. nothing was written, so
-            // nothing is going to run under the id this call generated
+            Landed::Superseded(asset) => {
+                secrets.release(&run.id);
+                return Err(Error::Conflict(format!(
+                    "asset {asset} materialized after automatic build planning"
+                )));
+            }
+            // A live intersecting build still owns its claim.
             Landed::Overlaps { what, run: held } => {
                 secrets.release(&run.id);
                 return Ok(Launched::Overlaps { what, run: held });

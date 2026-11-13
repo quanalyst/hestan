@@ -1911,6 +1911,7 @@ async fn build_all_assets(
         plan,
         Trigger::Build,
         RunTags::new(),
+        None,
     ) {
         Ok(run_id) => Ok((StatusCode::ACCEPTED, Json(json!({ "run_ids": [run_id] })))),
         Err(e) => Err(bad_plan(e)),

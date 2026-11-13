@@ -805,6 +805,8 @@ pub(crate) enum Landed {
     /// the deciding lease moved on before this reached the store. nothing was
     /// written.
     Stale,
+    /// An automatic build planned against an output that has since materialized.
+    Superseded(String),
     /// a [build claim](claim_set) that intersects one an active run already
     /// holds. nothing was written, and the caller is told which asset collided
     /// and which run holds it, because "something is building" is not an
@@ -2196,6 +2198,34 @@ impl Store {
                         what,
                         run: id.clone(),
                     });
+                }
+            }
+            // Check after active builds: a completion between planning and admission
+            // must invalidate the snapshot even when it no longer holds a run claim.
+            for build in plan
+                .and_then(|p| p["builds"].as_array())
+                .into_iter()
+                .flatten()
+            {
+                let Some(observed) = build.get("observed_materialization") else {
+                    continue;
+                };
+                let asset = build["asset"]
+                    .as_str()
+                    .ok_or_else(|| Error::Graph("Missing build asset".into()))?;
+                let partition = build["partition"].as_str();
+                let same = tx.dialect().null_safe_eq();
+                let current = tx.query_opt(
+                    &format!(
+                        "SELECT id FROM asset_materializations
+                             WHERE asset = ?1 AND partition {same} ?2
+                             ORDER BY id DESC LIMIT 1"
+                    ),
+                    args![asset, partition],
+                    |row| row.int(0),
+                )?;
+                if &json!(current) != observed {
+                    return Ok(Landed::Superseded(asset.into()));
                 }
             }
         }
@@ -12328,6 +12358,75 @@ mod tests {
                 .map(|(a, k)| json!({ "asset": a, "partition": k }))
                 .collect::<Vec<Value>>(),
         })
+    }
+
+    #[test]
+    fn automatic_build_admission_checks_observed_outputs_on_each_backend() {
+        both(|db| {
+            let store = db.store();
+            let writer = db.store();
+            for (index, partition) in [None, Some("jan")].into_iter().enumerate() {
+                let mut plan = build_plan(&[("sales", partition)]);
+                plan["builds"][0]["observed_materialization"] = Value::Null;
+                writer
+                    .record_materialization(
+                        "sales",
+                        partition,
+                        "current",
+                        &json!({}),
+                        None,
+                        None,
+                        None,
+                    )
+                    .unwrap();
+                let id = format!("automatic-{index}");
+                let run = mk_run(&id, "assets", Utc::now());
+                let launch = || {
+                    store
+                        .create_run_keyed(
+                            &run,
+                            &[],
+                            Claimed::Launch(&id),
+                            Some(&plan),
+                            Fenced::Never,
+                        )
+                        .unwrap()
+                };
+                assert_eq!(launch(), Landed::Superseded("sales".into()));
+                assert!(store.run(&id).unwrap().is_none());
+                plan["builds"][0]["observed_materialization"] = json!(
+                    store
+                        .materialization("sales", partition)
+                        .unwrap()
+                        .unwrap()
+                        .id
+                );
+                // A different asset cannot invalidate this plan or consume its launch key.
+                writer
+                    .record_materialization(
+                        "stock",
+                        partition,
+                        "current",
+                        &json!({}),
+                        None,
+                        None,
+                        None,
+                    )
+                    .unwrap();
+                assert_eq!(
+                    store
+                        .create_run_keyed(
+                            &run,
+                            &[],
+                            Claimed::Launch(&id),
+                            Some(&plan),
+                            Fenced::Never,
+                        )
+                        .unwrap(),
+                    Landed::Yes
+                );
+            }
+        });
     }
 
     // the claim is taken in the transaction that writes the run, on both

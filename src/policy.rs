@@ -533,7 +533,7 @@ pub(crate) fn launch(
     // plan meets one already building is held rather than failed: this loop
     // asks again in a minute of fresher data, and an error a nobody reads
     // every pass is worse than the debug line it replaces
-    let run_id = match launch_plan(runner, reg, plan, Trigger::Build, tags) {
+    let run_id = match launch_plan(runner, reg, plan, Trigger::Build, tags, Some(mats)) {
         Ok(id) => id,
         Err(Error::Conflict(why)) => {
             tracing::debug!(
@@ -1096,6 +1096,64 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[tokio::test]
+    async fn a_completed_build_invalidates_an_earlier_policy_plan() {
+        for previously_built in [false, true] {
+            let reg = sales(AutoPolicy::when_stale());
+            let store = store_with(vec![("s", None, "s1", json!({}))]);
+            if previously_built {
+                for key in ["r1", "r2", "r3"] {
+                    store
+                        .record_materialization(
+                            "sales",
+                            Some(key),
+                            "prior",
+                            &json!({"s": "s0"}),
+                            None,
+                            None,
+                            None,
+                        )
+                        .unwrap();
+                }
+            }
+            let runner = runner_for(&reg, store.clone()).with_role(Role::Scheduler, 1);
+            let now = Utc::now();
+            let mats = mats_map(&store).unwrap();
+            let wants = Pass::new(&reg, &mats, now).wants(None);
+            assert_eq!(wants.len(), 1);
+            // A competing build finishes after this pass reads its planning snapshot.
+            for key in ["r1", "r2", "r3"] {
+                store
+                    .record_materialization(
+                        "sales",
+                        Some(key),
+                        "current",
+                        &json!({"s": "s1"}),
+                        None,
+                        None,
+                        None,
+                    )
+                    .unwrap();
+            }
+            assert!(
+                launch(&runner, &reg, &mats, &wants, RunTags::new(), now)
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(
+                store
+                    .runs(None, None, None, None, None, None, 10)
+                    .unwrap()
+                    .is_empty()
+            );
+            assert!(events(&store).is_empty());
+            store
+                .record_materialization("s", None, "s2", &json!({}), None, None, None)
+                .unwrap();
+            assert!(tick(&runner, &reg, now).unwrap().is_some());
+        }
     }
 
     // and a build of something unrelated no longer holds the pass. it used to:

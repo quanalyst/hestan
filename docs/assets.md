@@ -703,7 +703,10 @@ nothing, says so at debug and asks again next minute of fresher data. the build
 endpoints answer 409 there instead, because a person is reading that refusal,
 and a loop that logged one every minute would be a log nobody can read. nothing
 queues in between: "is this stale" is not a question that expires. a build of
-something unrelated no longer holds the pass at all.
+something unrelated no longer holds the pass at all. Admission also compares the
+planned outputs' materialization identities inside the run transaction. If another
+build completed after planning, the automatic pass launches nothing and evaluates
+the current state on its next pass. Explicit builds and backfills remain unchanged.
 
 a rule that cannot be satisfied sits quietly. the pass writes when it launches
 and at no other time, so a rollup waiting for an hour that will never arrive
