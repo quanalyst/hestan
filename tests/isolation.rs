@@ -185,7 +185,8 @@ fn jobs() -> Vec<Job> {
         // an allocation nothing could satisfy, under a limit that makes it this
         // op's failure rather than the machine's problem
         Job::builder("greedy")
-            .op(Op::new("hog", |_| async {
+            .op(Op::new("hog", |ctx: OpCtx| async move {
+                std::fs::write(ctx.params()["marker"].as_str().unwrap(), b"body entered")?;
                 let huge: Vec<u8> = vec![0; 2 * 1024 * 1024 * 1024];
                 Ok(json!(huge.len()))
             })
@@ -442,8 +443,8 @@ async fn cases(db: &str) {
     )
     .await;
     case(
-        "an_op_past_its_memory_limit_fails_naming_the_limit",
-        the_memory_limit_bites(&runner),
+        "a_memory_limit_is_enforced_or_refused_before_the_body",
+        memory_limit_guards_body(&runner),
     )
     .await;
     case(
@@ -687,15 +688,27 @@ async fn a_timeout_kills(runner: &Runner) {
     );
 }
 
-async fn the_memory_limit_bites(runner: &Runner) {
+async fn memory_limit_guards_body(runner: &Runner) {
+    let directory = tempfile::tempdir().unwrap();
+    let marker = directory.path().join("body-entered");
     let run = runner
-        .run("greedy", json!({}), Trigger::Manual)
+        .run("greedy", json!({"marker": marker}), Trigger::Manual)
         .await
         .unwrap();
     assert_eq!(run.status, RunStatus::Failed);
     let rows = runner.store().op_runs(&run.id).unwrap();
-    let err = row(&rows, "hog").error.clone().unwrap();
-    // the limit, not the signal it arrived as
+    let op = row(&rows, "hog");
+    let err = op.error.as_deref().unwrap();
+    // Darwin can reject RLIMIT_AS. A refused limit must stop before the body.
+    if cfg!(target_os = "macos") && err.starts_with("could not apply the 512 MiB memory limit:") {
+        assert!(
+            !marker.exists(),
+            "body ran without its declared memory limit"
+        );
+        return;
+    }
+    // A supported limit must reach the body and name the enforced bound.
+    assert_eq!(std::fs::read(marker).unwrap(), b"body entered");
     assert!(
         err.contains("memory limit of 512 MiB"),
         "the failure does not name the limit it hit: {err}"
