@@ -101,12 +101,10 @@ release-check:
     cargo package --list
     cargo package
     version=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -1)
-    crate=$PWD/target/package/hestan-$version.crate
-    scratch=$(mktemp -d)
-    tar xzf "$crate" -C "$scratch"
-    cd "$scratch/hestan-$version"
-    cargo build --offline --all-features --all-targets
-    echo "built hestan-$version from $crate in $scratch"
+    target=$(cargo metadata --no-deps --format-version 1 | python3 -c 'import json, sys; print(json.load(sys.stdin)["target_directory"])')
+    package="$target/package/hestan-$version"
+    cargo build --manifest-path "$package/Cargo.toml" --offline --all-features --all-targets
+    echo "built the packaged hestan-$version in $package"
 
 demo:
     cargo run --example demo --features cli

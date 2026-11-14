@@ -5,7 +5,7 @@ lineage from a compiled manifest as Hestan assets. Install and configure dbt
 separately.
 
 ```toml
-hestan = { version = "0.2.5", features = ["dbt"] }
+hestan = { version = "0.2.6", features = ["dbt"] }
 ```
 
 ```rust

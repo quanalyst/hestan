@@ -15,7 +15,7 @@ Add these dependencies to your Rust project:
 
 ```toml
 [dependencies]
-hestan = "0.2.5"
+hestan = "0.2.6"
 tokio = { version = "1", features = ["full"] }
 ```
 

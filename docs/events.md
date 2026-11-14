@@ -402,7 +402,7 @@ up in Grafana or Jaeger beside the services it calls, rather than in a tab of
 its own.
 
 ```toml
-hestan = { version = "0.2.5", features = ["otel"] }
+hestan = { version = "0.2.6", features = ["otel"] }
 ```
 
 **hestan installs nothing.** no subscriber, no tracer provider, no exporter,

@@ -32,7 +32,7 @@ rows.
 opt in, behind the `capture` feature:
 
 ```toml
-hestan = { version = "0.2.5", features = ["capture"] }
+hestan = { version = "0.2.6", features = ["capture"] }
 ```
 
 hestan does not install a subscriber (that is yours), so what it offers is a

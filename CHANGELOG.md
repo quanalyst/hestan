@@ -1,25 +1,36 @@
 # Changes
 
-## PostgreSQL schedule controls
+## 0.2.6
+
+- Named notification destinations retain delivery attempts, retry policy and operator controls.
+- Explicit one-shots leave scheduler controls, unrelated queued work and expired
+  claims with their owner; cancellation and startup recovery share native execution.
+- Automatic asset admission refuses plans superseded by completed builds.
+- SQLite initialization serializes schema changes without blocking established readers.
+- Execution claims fence stale writes; run-scoped resources clean up after failed setup.
+- Store schemas migrate on open. Back up stores before upgrading; older binaries
+  cannot read the migrated schema. Public API additions retain 0.2 compatibility.
+
+### PostgreSQL schedule controls
 
 - Named schedule pauses use the same 64-bit storage binding as other controls.
 - Existing stores migrate without losing pauses, recurrence cursors or audit events.
 - Schedule registration locks pause state before reading it, preserving concurrent
   operator changes and allowing workers to start together.
 
-## Retained sensor controls
+### Retained sensor controls
 
 - Temporarily absent sensors keep their operator pause and progress cursor.
 - Current listings, pause commands and health counts include declared sensors only.
 
-## Stable recurrence pauses
+### Stable recurrence pauses
 
 - Named recurrences retain operator pauses across cron edits and profile toggles.
 - Removed declarations remain inactive; re-registration does not replay the absent interval.
 - Pause changes and their audit events commit atomically. Unnamed schedules retain
   their existing behavior; existing databases migrate without changing their pauses.
 
-## Automatic build admission
+### Automatic build admission
 
 - Exhausted automatic asset builds back off from five minutes to one hour using
   retained run history, including after scheduler restart.
@@ -27,7 +38,9 @@
   attempt. Independent assets, eligible partitions and explicit recovery remain
   available; see [asset policies](docs/assets.md#the-pass-that-acts-on-them).
 
-## Presentation metadata
+## 0.2.5
+
+### Presentation metadata
 
 - Jobs, assets and individual multi-asset outputs support optional display names,
   explicit subgroups and generic labels without changing persistent identifiers.
@@ -38,7 +51,7 @@
 
 See [presentation metadata](docs/presentation.md) for declarations and defaults.
 
-## Display fixes
+### Display fixes
 
 - `hestan doctor` checks collisions in the UI’s six shades.
 - Timeline group bands have a visible minimum opacity.
