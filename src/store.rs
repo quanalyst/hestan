@@ -631,7 +631,12 @@ pub(crate) const SCHEMA_VERSION: u32 = 28;
 // one transaction around every pending step and the version stamp (sqlite DDL
 // is transactional), so a crash mid-migration leaves the db exactly as found
 fn migrate(conn: &mut Connection) -> Result<(), Error> {
-    let tx = conn.transaction()?;
+    if conn.pragma_query_value(None, "user_version", |r| r.get::<_, u32>(0))? == SCHEMA_VERSION {
+        return Ok(());
+    }
+    // Reserve the writer before reading the schema; a deferred reader cannot
+    // upgrade after another opener commits its migration.
+    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
     let mut version: u32 = tx.query_row("PRAGMA user_version", [], |r| r.get(0))?;
     if version == 0 && table_exists(&tx, "runs")? {
         // Unstamped legacy databases have the initial schema at user_version 0
@@ -1800,7 +1805,18 @@ impl Store {
     pub fn open(path: &str) -> Result<Store, Error> {
         let mut conn = Connection::open(path)?;
         if path != ":memory:" {
-            conn.pragma_update(None, "journal_mode", "wal")?;
+            // Journal-mode lock upgrades can bypass SQLite's busy handler.
+            // Retry the statement after it releases its read lock.
+            conn.busy_timeout(Duration::ZERO)?;
+            let started = Instant::now();
+            while let Err(error) = conn.pragma_update(None, "journal_mode", "wal") {
+                if error.sqlite_error_code() != Some(rusqlite::ErrorCode::DatabaseBusy)
+                    || started.elapsed() >= BUSY_TIMEOUT
+                {
+                    return Err(error.into());
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
         }
         conn.busy_timeout(BUSY_TIMEOUT)?;
         migrate(&mut conn)?;
@@ -6781,6 +6797,44 @@ mod tests {
     use chrono::{TimeZone, Timelike};
     use serde_json::json;
     use std::collections::BTreeSet;
+
+    #[test]
+    fn concurrent_open_initializes_a_shared_database() {
+        for _ in 0..8 {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("runs.db");
+            let barrier = std::sync::Barrier::new(8);
+            let results = std::thread::scope(|scope| {
+                let handles: Vec<_> = (0..8)
+                    .map(|i| {
+                        let path = &path;
+                        let barrier = &barrier;
+                        scope.spawn(move || {
+                            barrier.wait();
+                            let store = Store::open(path.to_str().unwrap())?;
+                            store.create_run(
+                                &mk_run(&i.to_string(), "collect", Utc::now()),
+                                &["capture".to_string()],
+                            )
+                        })
+                    })
+                    .collect();
+                handles
+                    .into_iter()
+                    .map(|h| h.join().unwrap())
+                    .collect::<Vec<_>>()
+            });
+            assert!(results.iter().all(Result::is_ok), "{results:?}");
+            let mut writer = Connection::open(&path).unwrap();
+            let _transaction = writer
+                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                .unwrap();
+            let store = Store::open(path.to_str().unwrap()).unwrap();
+            for i in 0..8 {
+                assert!(store.run(&i.to_string()).unwrap().is_some());
+            }
+        }
+    }
 
     fn mk_run(id: &str, job: &str, created_at: DateTime<Utc>) -> Run {
         Run {
