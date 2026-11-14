@@ -104,15 +104,14 @@ pub(crate) fn carry(span: &Span) -> Vec<(String, String)> {
     carrier.0.into_iter().collect()
 }
 
-/// make `span` a child of the trace context in this process's environment.
+/// Make `span` a child of the supplied W3C trace context.
 ///
-/// called by an isolated op's child before it runs the body. a process started
-/// by anything other than hestan has no such variable and this does nothing,
-/// which is the same as saying the span is a root.
-pub(crate) fn adopt(span: &Span) {
+/// The isolated operation supplies its process environment. Missing context
+/// leaves the span unchanged.
+pub(crate) fn adopt(span: &Span, read: impl Fn(&str) -> Option<String>) {
     let mut carrier = Carrier::default();
     for key in [TRACEPARENT, TRACESTATE] {
-        if let Ok(value) = std::env::var(key) {
+        if let Some(value) = read(key) {
             carrier.0.insert(key.to_string(), value);
         }
     }
@@ -180,11 +179,8 @@ mod tests {
 
         // and a span in what stands for the child process joins that trace
         // rather than starting one of its own
-        for (key, value) in carried {
-            unsafe { std::env::set_var(key, value) };
-        }
         let child = tracing::info_span!("hestan.op", run_id = "r1", op = "a", attempt = 1u64);
-        adopt(&child);
+        adopt(&child, |key| carried.get(key).cloned());
         let joined: HashMap<String, String> = carry(&child).into_iter().collect();
         let child_parent = joined.get(TRACEPARENT).unwrap();
         assert_eq!(
@@ -197,9 +193,6 @@ mod tests {
             Some(parts[2].as_str()),
             "the child reused its parent's span id rather than nesting under it"
         );
-        for key in [TRACEPARENT, TRACESTATE] {
-            unsafe { std::env::remove_var(key) };
-        }
     }
 
     // the ordinary case for a build that turned the feature on and composed no

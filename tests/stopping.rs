@@ -46,11 +46,11 @@ const PORT: &str = "HESTAN_STOPPING_PORT";
 const WITHIN: Duration = Duration::from_secs(8);
 
 fn main() {
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .unwrap();
     if let Ok(role) = std::env::var(ROLE) {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
         let db = std::env::var(DB).expect("a child inherits the test database path");
         match role.as_str() {
             // one process doing everything: it decides, and it claims and
@@ -96,6 +96,10 @@ fn main() {
         std::env::set_var(DB, &db);
         std::env::set_var(MARKS, dir.path().join("marks.txt").display().to_string());
     }
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap();
     rt.block_on(cases(&db));
     println!("stopping: every case passed");
 }

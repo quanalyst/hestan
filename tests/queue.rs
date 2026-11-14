@@ -45,11 +45,11 @@ const ENQUEUED_BY: &str = "build-that-enqueued";
 const EXECUTED_BY: &str = "build-that-executed";
 
 fn main() {
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .unwrap();
     if let Ok(role) = std::env::var(ROLE) {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
         let db = std::env::var(DB).expect("a child inherits the test database path");
         let result = match role.as_str() {
             // a queue worker with no socket: claims runs, executes them, and
@@ -72,25 +72,29 @@ fn main() {
 
     let dir = tempfile::tempdir().unwrap();
     let db = dir.path().join("queue.db").display().to_string();
-    run_on(&rt, &db, dir.path().join("sqlite-marks.txt"));
+    run_on(&db, dir.path().join("sqlite-marks.txt"));
     println!("queue: every case passed on sqlite");
 
     #[cfg(feature = "postgres")]
     if let Some(pg) = Scratch::new() {
-        run_on(&rt, &pg.url, dir.path().join("postgres-marks.txt"));
+        run_on(&pg.url, dir.path().join("postgres-marks.txt"));
         println!("queue: every case passed on postgres");
     }
 }
 
 /// the whole of the suite against one database, with a mark file of its own so
 /// that the double-run detector is only ever reading this run of it.
-fn run_on(rt: &tokio::runtime::Runtime, db: &str, marks: PathBuf) {
+fn run_on(db: &str, marks: PathBuf) {
     // SAFETY: single-threaded, between runs, and long before any child exists
     // to inherit a half-written environment
     unsafe {
         std::env::set_var(DB, db);
         std::env::set_var(MARKS, marks.display().to_string());
     }
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap();
     rt.block_on(cases(db));
 }
 

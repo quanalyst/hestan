@@ -525,7 +525,7 @@ pub(crate) async fn run_one_op(
             .map_or(1, |o| o.attempts),
     );
     #[cfg(feature = "otel")]
-    crate::otel::adopt(&span);
+    crate::otel::adopt(&span, |key| std::env::var(key).ok());
 
     // last, so what the limits cap is the body and not the loading of its
     // inputs, and refused outright if they cannot be applied, since an op that

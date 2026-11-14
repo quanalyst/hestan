@@ -48,14 +48,14 @@ struct SkipTold {
 const LINGER_SECS: &str = "6";
 
 fn main() {
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .unwrap();
     // an op subprocess lands here: same builder, same jobs, same database, and
     // `serve` hands it to the op-subprocess path before it binds, recovers or
     // claims anything
     if std::env::var_os("HESTAN_ISOLATED_RUN").is_some() {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
         let db = std::env::var(DB).expect("an op subprocess inherits the test database path");
         let _ = rt.block_on(app(&db).serve(([127, 0, 0, 1], 0)));
         unreachable!("the op-subprocess guard exits before serve gets an address");
@@ -66,6 +66,10 @@ fn main() {
     // SAFETY: single-threaded, before the runtime starts and long before any
     // child exists to inherit a half-written environment
     unsafe { std::env::set_var(DB, &db) };
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap();
     rt.block_on(cases(&db));
     println!("isolation: every case passed");
 }

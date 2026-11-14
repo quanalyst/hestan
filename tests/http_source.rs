@@ -13,6 +13,25 @@ use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
+fn environment_case(name: &str, key: &str, value: &str) -> bool {
+    if std::env::var("HESTAN_HTTP_ENV_CASE").as_deref() == Ok(name) {
+        return true;
+    }
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", name, "--nocapture"])
+        .env("HESTAN_HTTP_ENV_CASE", name)
+        .env(key, value)
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success() && stdout.contains("1 passed; 0 failed"),
+        "{name}: {stdout}{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    false
+}
+
 async fn serve(app: Router) -> String {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -393,6 +412,9 @@ async fn fan_out_names() {
 
 #[tokio::test]
 async fn bearer_env() {
+    if !environment_case("bearer_env", "HESTAN_TEST_TOKEN", "secret") {
+        return;
+    }
     let seen: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
     let s = seen.clone();
     let app = Router::new().route(
@@ -410,7 +432,6 @@ async fn bearer_env() {
     );
     let base = serve(app).await;
 
-    unsafe { std::env::set_var("HESTAN_TEST_TOKEN", "secret") };
     let src = HttpSource::get(format!("{base}/private"))
         .name("private")
         .bearer_env("HESTAN_TEST_TOKEN");
@@ -515,6 +536,9 @@ async fn builder_error_fails_fast_with_cause() {
 
 #[tokio::test]
 async fn empty_bearer_env_fatal() {
+    if !environment_case("empty_bearer_env_fatal", "HESTAN_TEST_EMPTY_TOKEN", "") {
+        return;
+    }
     let hits = Arc::new(AtomicU32::new(0));
     let h = hits.clone();
     let app = Router::new().route(
@@ -529,7 +553,6 @@ async fn empty_bearer_env_fatal() {
     );
     let base = serve(app).await;
 
-    unsafe { std::env::set_var("HESTAN_TEST_EMPTY_TOKEN", "") };
     let src = HttpSource::get(format!("{base}/private"))
         .name("private")
         .bearer_env("HESTAN_TEST_EMPTY_TOKEN");
