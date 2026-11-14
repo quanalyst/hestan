@@ -1048,6 +1048,22 @@ impl Hestan {
     /// run one job to completion and return it, with no ui and no loops. the
     /// [role](Self::role) does not apply: a one-shot executes its own run.
     pub async fn run_once(self, job: &str, params: Value) -> Result<Run, Error> {
+        self.run_once_until(job, params, std::future::pending())
+            .await
+    }
+
+    /// Run one job with the same startup recovery as [`run_once`](Self::run_once).
+    /// When `cancel` resolves, request cancellation of this run and await its
+    /// terminal record. Other runs are not canceled. Blocking operations must
+    /// cooperate through [`OpCtx::is_cancelled`](crate::OpCtx::is_cancelled).
+    /// Startup validation and resource construction finish before cancellation
+    /// is observed; the caller must keep polling this future until it returns.
+    pub async fn run_once_until(
+        self,
+        job: &str,
+        params: Value,
+        cancel: impl std::future::Future<Output = ()>,
+    ) -> Result<Run, Error> {
         // the op-subprocess guard, first: see `up`
         #[cfg(unix)]
         if let Some(req) = crate::isolate::requested() {
@@ -1055,7 +1071,17 @@ impl Hestan {
         }
         let notification_budget = self.notification_flush;
         let built = self.role(Role::All).build().await?;
-        let run = built.runner.run(job, params, Trigger::Manual).await;
+        let run = async {
+            let id = built.runner.launch(job, params, Trigger::Manual)?;
+            tokio::select! {
+                result = built.runner.settle(&id) => result,
+                () = cancel => {
+                    built.runner.cancel(&id)?;
+                    built.runner.settle(&id).await
+                }
+            }
+        }
+        .await;
         delivered(
             &built.runner,
             run.as_ref().ok().map(|r| r.id.as_str()),
@@ -1887,6 +1913,148 @@ mod tests {
             .op(Op::new("render", |_| async { Ok(json!(null)) }).params::<Window>())
             .build()
             .unwrap()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancellable_one_shot_recovers_interruptions_and_preserves_other_work() {
+        use crate::OpStatus;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("runs.db").display().to_string();
+        let store = Store::open(&path).unwrap();
+        let scheduler = Runner::new([windowed("retained")], store.clone())
+            .unwrap()
+            .with_role(Role::Scheduler, 1);
+        let mut interruptions = Vec::new();
+        let mut preserved = Vec::new();
+        for state in ["unclaimed", "expired", "live", "queued"] {
+            let id = scheduler
+                .launch("retained", json!({"days": 1}), Trigger::Manual)
+                .unwrap();
+            if state != "queued" {
+                store.run_started(&id, chrono::Utc::now()).unwrap();
+                store.op_started(&id, "render", 1).unwrap();
+            }
+            if matches!(state, "expired" | "live") {
+                let offset = if state == "expired" { -60 } else { 60 };
+                store
+                    .plant_claim(
+                        &id,
+                        "worker",
+                        Some(chrono::Utc::now() + chrono::Duration::seconds(offset)),
+                    )
+                    .unwrap();
+            }
+            if matches!(state, "unclaimed" | "expired") {
+                interruptions.push(id);
+            } else {
+                preserved.push(store.run(&id).unwrap().unwrap());
+            }
+        }
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let started = entered.clone();
+        let exited = Arc::new(AtomicBool::new(false));
+        let observed = exited.clone();
+        let job = Job::builder("calculate")
+            .op(Op::new("work", move |ctx: crate::OpCtx| {
+                let started = started.clone();
+                let observed = observed.clone();
+                async move {
+                    tokio::task::spawn_blocking(move || {
+                        started.notify_one();
+                        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+                        while !ctx.is_cancelled() && std::time::Instant::now() < deadline {
+                            std::thread::sleep(Duration::from_millis(5));
+                        }
+                        observed.store(ctx.is_cancelled(), Ordering::SeqCst);
+                    })
+                    .await?;
+                    Ok(json!(null))
+                }
+            }))
+            .build()
+            .unwrap();
+        let run = tokio::time::timeout(
+            Duration::from_secs(5),
+            Hestan::new().db(&path).job(job).run_once_until(
+                "calculate",
+                json!({}),
+                entered.notified(),
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(run.status, RunStatus::Canceled);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !exited.load(Ordering::SeqCst) {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        for id in interruptions {
+            let interrupted = store.run(&id).unwrap().unwrap();
+            assert_eq!(interrupted.status, RunStatus::Failed);
+            assert_eq!(
+                interrupted.error.as_deref(),
+                Some("interrupted: process exited")
+            );
+            let op = store.op_run(&id, "render").unwrap().unwrap();
+            assert_eq!(op.status, OpStatus::Failed);
+            assert_eq!(op.error.as_deref(), Some("interrupted: process exited"));
+        }
+        for original in preserved {
+            assert_eq!(
+                serde_json::to_value(store.run(&original.id).unwrap().unwrap()).unwrap(),
+                serde_json::to_value(original).unwrap()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn cancellable_one_shot_cancels_its_queued_run_without_canceling_the_owner() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("runs.db").display().to_string();
+        let store = Store::open(&path).unwrap();
+        let job = Job::builder("limited")
+            .max_concurrent_runs(1)
+            .op(Op::new("work", |_| async {
+                panic!("queued work executed")
+            }))
+            .build()
+            .unwrap();
+        let scheduler = Runner::new([job.clone()], store.clone())
+            .unwrap()
+            .with_role(Role::Scheduler, 1);
+        let owner = scheduler
+            .launch("limited", json!({}), Trigger::Manual)
+            .unwrap();
+        store.run_started(&owner, chrono::Utc::now()).unwrap();
+        store
+            .plant_claim(
+                &owner,
+                "worker",
+                Some(chrono::Utc::now() + chrono::Duration::minutes(1)),
+            )
+            .unwrap();
+        let before = serde_json::to_value(store.run(&owner).unwrap().unwrap()).unwrap();
+        let run = tokio::time::timeout(
+            Duration::from_secs(5),
+            Hestan::new()
+                .db(&path)
+                .job(job)
+                .run_once_until("limited", json!({}), async {}),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_ne!(run.id, owner);
+        assert_eq!(run.status, RunStatus::Canceled);
+        assert_eq!(
+            before,
+            serde_json::to_value(store.run(&owner).unwrap().unwrap()).unwrap()
+        );
     }
 
     // the half of a restore that has to be a refusal rather than a warning. a

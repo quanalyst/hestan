@@ -28,7 +28,9 @@ pruning history. Existing pauses and cursors remain unchanged even when the comm
 uses a smaller registry or different settings. Concurrency controls still apply.
 `serve` and `work` refuse this mode before binding a socket or opening the store.
 
-`run_once` and `build_asset` install no signal handlers.
+`run_once` and `build_asset` install no signal handlers. Use
+`run_once_until(job, params, cancel)` to supply a cancellation future; it cancels
+only that run, awaits its terminal record and retains normal startup recovery.
 
 Configure [retention](storage.md#retention) to prune history; by default it is
 kept. A serving process performs periodic sweeps in addition to startup work.

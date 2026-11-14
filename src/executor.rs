@@ -1562,7 +1562,7 @@ impl Runner {
     /// wake. the timeout beside it covers the two cases no local notification
     /// can: another process claimed the run, and a limit freed up somewhere
     /// nothing here was watching.
-    async fn settle(&self, id: &str) -> Result<Run, Error> {
+    pub(crate) async fn settle(&self, id: &str) -> Result<Run, Error> {
         let mut leases = tokio::time::interval(HEARTBEAT);
         leases.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
