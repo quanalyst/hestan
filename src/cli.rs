@@ -5135,7 +5135,9 @@ mod tests {
         // process that died the instant after claiming leaves behind
         let defined = std::collections::HashSet::from(["etl".to_string()]);
         store
-            .claim_next("gone", Duration::from_secs(0), &Limits::new(), &defined)
+            .claim_next("gone", Duration::from_secs(0), &Limits::new(), |run| {
+                defined.contains(&run.job)
+            })
             .unwrap()
             .expect("the run was there to claim");
         let findings = check_leases(&store, Utc::now() + chrono::Duration::seconds(1)).unwrap();
@@ -5205,7 +5207,9 @@ mod tests {
         let defined = std::collections::HashSet::from(["etl".to_string()]);
         let one = Limits::new().global(1);
         store
-            .claim_next("worker", Duration::from_secs(60), &one, &defined)
+            .claim_next("worker", Duration::from_secs(60), &one, |run| {
+                defined.contains(&run.job)
+            })
             .unwrap()
             .expect("one of the two was claimable");
         app.limits = one;

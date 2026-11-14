@@ -621,6 +621,8 @@ struct Active {
 #[derive(Clone)]
 pub struct Runner {
     jobs: Arc<HashMap<String, Job>>,
+    // Explicit one-shots may claim only the runs launched through this runner.
+    local_runs: Option<Arc<Mutex<HashSet<String>>>>,
     store: Store,
     // one entry per in-flight run: what a cancel flips, and the task doing
     // the work
@@ -713,6 +715,11 @@ impl Runner {
         Runner::with_failure_hooks(jobs, store, Vec::new())
     }
 
+    pub(crate) fn with_local_dispatch(mut self) -> Self {
+        self.local_runs = Some(Arc::new(Mutex::new(HashSet::new())));
+        self
+    }
+
     /// like [`Runner::new`] with failure hooks attached: each is invoked on
     /// its own task whenever a run finishes failed. canceled runs don't fire.
     ///
@@ -745,6 +752,7 @@ impl Runner {
         Ok(Runner {
             jobs: Arc::new(map),
             store,
+            local_runs: None,
             active: Arc::new(Mutex::new(HashMap::new())),
             abandoned: Arc::new(Mutex::new(HashSet::new())),
             hooks: Arc::new(Hooks {
@@ -1616,7 +1624,14 @@ impl Runner {
         // which is the only place it can be done
         let _pass = self.dispatching.lock().unwrap();
         let limits = self.limits.lock().unwrap().clone();
-        let defined: HashSet<String> = self.jobs.keys().cloned().collect();
+        let local = self
+            .local_runs
+            .as_ref()
+            .map(|runs| runs.lock().unwrap().clone());
+        let eligible = |run: &Run| {
+            self.jobs.contains_key(&run.job)
+                && local.as_ref().is_none_or(|ids| ids.contains(&run.id))
+        };
         loop {
             // a worker takes what it can run, not what it can see. without this
             // the first process to look claims the whole queue and the worker
@@ -1626,7 +1641,7 @@ impl Runner {
             }
             match self
                 .store
-                .claim_next(self.claimer, LEASE, &limits, &defined)
+                .claim_next(self.claimer, LEASE, &limits, eligible)
             {
                 Ok(Some((run, plan))) => self.start(run, plan),
                 Ok(None) => return,
@@ -1878,6 +1893,10 @@ impl Runner {
                 self.store.secrets().release(&id);
                 self.settled.notify_waiters();
             }
+        }
+        // One-shot lease renewal owns its children, not recovery of another worker.
+        if self.local_runs.is_some() {
+            return;
         }
         let durable = self.durable;
         let taken = match self.store.reclaim_expired(self.reclaim, |run| {
@@ -2649,6 +2668,9 @@ impl Runner {
                 secrets.release(&run.id);
                 return Ok(Launched::Overlaps { what, run: held });
             }
+        }
+        if let Some(local) = &self.local_runs {
+            local.lock().unwrap().insert(run.id.clone());
         }
         // enqueued and on disk; whether it starts now is the dispatcher's
         // business, and with no limits declared "now" is this call
@@ -5982,7 +6004,9 @@ mod tests {
                 tokio::task::spawn_blocking(move || {
                     let store = Store::open(&path).unwrap();
                     store
-                        .claim_next(claimer, LEASE, &Limits::new(), &defined)
+                        .claim_next(claimer, LEASE, &Limits::new(), |run| {
+                            defined.contains(&run.job)
+                        })
                         .unwrap()
                         .map(|(run, _)| (claimer, run.id))
                 })

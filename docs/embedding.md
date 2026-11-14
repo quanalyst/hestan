@@ -25,7 +25,10 @@ Use `.execution_only()` before `run_once` or `build_asset` when a command shares
 an existing scheduler's database. This mode records and executes the selected work
 without synchronizing schedules, sensors or presets, recovering other runs, or
 pruning history. Existing pauses and cursors remain unchanged even when the command
-uses a smaller registry or different settings. Concurrency controls still apply.
+uses a smaller registry or different settings. Dispatch claims only runs launched
+by this invocation, including when the registry also contains queued work for the
+same job or assets. Lease renewal does not reclaim another worker's expired run.
+Concurrency controls still apply.
 `serve` and `work` refuse this mode before binding a socket or opening the store.
 
 `run_once` and `build_asset` install no signal handlers. Use

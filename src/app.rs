@@ -1039,7 +1039,8 @@ impl Hestan {
     /// sensors or presets, recovering other runs, or pruning retained history.
     /// Use this for explicit one-shot commands sharing a live scheduler's store.
     /// The selected job still validates, records its run and honors concurrency
-    /// controls. Serving or working in this mode is refused.
+    /// controls. Queued runs, including other builds of the same asset, are left
+    /// to their owner. Serving or working in this mode is refused.
     pub fn execution_only(mut self) -> Self {
         self.maintain_store = false;
         self
@@ -1716,6 +1717,9 @@ impl Hestan {
         .with_reclaim(self.reclaim)
         .with_role(self.role, self.slots)
         .with_max_instances(self.max_instances);
+        if !self.maintain_store {
+            runner = runner.with_local_dispatch();
+        }
         if self.durable {
             runner = runner.with_durable_notifications();
         }
@@ -2839,6 +2843,70 @@ mod execution_only_tests {
             store.preset("recurring", "daily").unwrap().unwrap().params,
             json!({"day":"2026-09-22"})
         );
+    }
+
+    #[tokio::test]
+    async fn execution_only_leaves_registered_queue_and_expired_claims_untouched() {
+        for build in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let db = dir.path().join("runs.db").display().to_string();
+            let store = Store::open(&db).unwrap();
+            let job = |name| {
+                Job::builder(name)
+                    .op(Op::new("work", |_| async {
+                        tokio::time::sleep(Duration::from_millis(30)).await;
+                        Ok(json!({}))
+                    }))
+                    .build()
+                    .unwrap()
+            };
+            let scheduler = Runner::new(
+                [job("manual"), job("other"), job(crate::asset::ASSETS_JOB)],
+                store.clone(),
+            )
+            .unwrap()
+            .with_role(Role::Scheduler, 1);
+            let mut preserved = Vec::new();
+            for name in ["manual", "other", crate::asset::ASSETS_JOB] {
+                let id = scheduler.launch(name, json!({}), Trigger::Manual).unwrap();
+                preserved.push(store.run(&id).unwrap().unwrap());
+            }
+            let expired = scheduler
+                .launch("other", json!({}), Trigger::Manual)
+                .unwrap();
+            store.run_started(&expired, chrono::Utc::now()).unwrap();
+            store
+                .plant_claim(
+                    &expired,
+                    "absent-worker",
+                    Some(chrono::Utc::now() - chrono::Duration::seconds(60)),
+                )
+                .unwrap();
+            preserved.push(store.run(&expired).unwrap().unwrap());
+            let app = Hestan::new()
+                .db(&db)
+                .jobs([job("manual"), job("other")])
+                .assets([crate::Asset::new("target", |_| async {
+                    tokio::time::sleep(Duration::from_millis(30)).await;
+                    Ok(json!({}))
+                })])
+                .execution_only();
+            let result = if build {
+                app.build_asset("target").await
+            } else {
+                app.run_once("manual", json!({})).await
+            }
+            .unwrap();
+            assert_eq!(result.status, RunStatus::Success);
+            for run in preserved {
+                assert_eq!(
+                    serde_json::to_value(store.run(&run.id).unwrap().unwrap()).unwrap(),
+                    serde_json::to_value(&run).unwrap(),
+                    "changed unrelated run {}",
+                    run.id
+                );
+            }
+        }
     }
 
     #[tokio::test]

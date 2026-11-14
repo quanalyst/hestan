@@ -2943,7 +2943,7 @@ impl Store {
         claimer: &str,
         lease: Duration,
         limits: &Limits,
-        defined: &HashSet<String>,
+        eligible: impl Fn(&Run) -> bool,
     ) -> Result<Option<(Run, Option<Value>)>, Error> {
         let mut conn = self.conn();
         let mut tx = conn.begin_immediate()?;
@@ -2966,7 +2966,7 @@ impl Store {
             }
             after = candidates.last().map(|(run, _)| run.clone());
             for (mut run, plan) in candidates {
-                if !defined.contains(&run.job) {
+                if !eligible(&run) {
                     continue;
                 }
                 if counts.blocker(limits, &run.job, &run.tags).is_some() {
@@ -7134,7 +7134,9 @@ mod tests {
                 .create_run(&mk_run("claimed", "etl", waited), &["a".into()])
                 .unwrap();
             store
-                .claim_next("worker", Duration::from_secs(60), &Limits::new(), &defined)
+                .claim_next("worker", Duration::from_secs(60), &Limits::new(), |run| {
+                    defined.contains(&run.job)
+                })
                 .unwrap()
                 .expect("the run was there to claim");
             assert_eq!(count(&store, "claims"), 1);
@@ -11825,7 +11827,9 @@ mod tests {
             assert_eq!(order, ["r1", "r0", "r2"]);
 
             let (claimed, plan) = store
-                .claim_next("alpha", lease, &Limits::new(), &defined)
+                .claim_next("alpha", lease, &Limits::new(), |run| {
+                    defined.contains(&run.job)
+                })
                 .unwrap()
                 .unwrap();
             assert_eq!(claimed.id, "r1", "priority did not order the claim");
@@ -11850,7 +11854,7 @@ mod tests {
             let one = Limits::new().global(1);
             assert!(
                 store
-                    .claim_next("beta", lease, &one, &defined)
+                    .claim_next("beta", lease, &one, |run| defined.contains(&run.job))
                     .unwrap()
                     .is_none()
             );
@@ -12264,7 +12268,9 @@ mod tests {
                     let me = format!("claimer-{i}");
                     gate.wait();
                     let claimed = store
-                        .claim_next(&me, Duration::from_secs(30), &limits, &defined)
+                        .claim_next(&me, Duration::from_secs(30), &limits, |run| {
+                            defined.contains(&run.job)
+                        })
                         .unwrap();
                     claimed.map(|(run, _)| (me, run.id))
                 })
@@ -12965,7 +12971,9 @@ mod tests {
             let (store, defined) = (pg.store(), HashSet::from(["etl".to_string()]));
             std::thread::spawn(move || {
                 store
-                    .claim_next("beta", Duration::from_secs(30), &Limits::new(), &defined)
+                    .claim_next("beta", Duration::from_secs(30), &Limits::new(), |run| {
+                        defined.contains(&run.job)
+                    })
                     .unwrap()
             })
         };
@@ -12995,7 +13003,9 @@ mod tests {
         holding.commit().unwrap();
         let defined = HashSet::from(["etl".to_string()]);
         let (claimed, _) = store
-            .claim_next("gamma", Duration::from_secs(30), &Limits::new(), &defined)
+            .claim_next("gamma", Duration::from_secs(30), &Limits::new(), |run| {
+                defined.contains(&run.job)
+            })
             .unwrap()
             .unwrap();
         assert_eq!(claimed.id, "r0");
@@ -14594,7 +14604,9 @@ mod tests {
                     .create_run(&mk_run(id, "job", Utc::now()), &["op".into()])
                     .unwrap();
                 let (run, _) = store
-                    .claim_next("owner", Duration::from_secs(60), &Limits::new(), &defined)
+                    .claim_next("owner", Duration::from_secs(60), &Limits::new(), |run| {
+                        defined.contains(&run.job)
+                    })
                     .unwrap()
                     .unwrap();
                 let execution = store.for_execution(&run);
@@ -14622,7 +14634,9 @@ mod tests {
                 if matches!(policy, Reclaim::Requeue) {
                     // Even reacquisition by the same owner is a different execution.
                     let (new, _) = store
-                        .claim_next("owner", Duration::from_secs(60), &Limits::new(), &defined)
+                        .claim_next("owner", Duration::from_secs(60), &Limits::new(), |run| {
+                            defined.contains(&run.job)
+                        })
                         .unwrap()
                         .unwrap();
                     assert_ne!(run.claimed_at, new.claimed_at);
@@ -14687,12 +14701,9 @@ mod tests {
                 .create_run(&mk_run("ready", "local", Utc::now()), &[])
                 .unwrap();
             let (run, _) = store
-                .claim_next(
-                    "worker",
-                    Duration::from_secs(60),
-                    &Limits::new(),
-                    &HashSet::from(["local".into()]),
-                )
+                .claim_next("worker", Duration::from_secs(60), &Limits::new(), |run| {
+                    run.job == "local"
+                })
                 .unwrap()
                 .expect("eligible work beyond the first page");
             assert_eq!(run.id, "ready");
