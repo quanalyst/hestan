@@ -1645,10 +1645,28 @@ impl Hestan {
             }
         }
         let mut sensor_names = HashSet::new();
+        let mut adopted_controls = HashSet::new();
         for e in &sensor_entries {
             crate::whose::check_namespace("sensor", &e.name, e.namespace.as_deref())?;
             if !sensor_names.insert(e.name.clone()) {
                 return Err(Error::Graph(format!("duplicate sensor {}", e.name)));
+            }
+            if let Some((job, name)) = &e.schedule_pause
+                && (job.trim().is_empty()
+                    || name.trim().is_empty()
+                    || !adopted_controls.insert((job, name))
+                    || schedules.iter().any(|schedule| {
+                        schedule.id() == *job
+                            && schedule
+                                .logical_name
+                                .as_ref()
+                                .is_none_or(|purpose| purpose == name)
+                    }))
+            {
+                return Err(Error::Graph(format!(
+                    "sensor {} requires one retired schedule control: {job}/{name}",
+                    e.name
+                )));
             }
         }
 
@@ -1684,14 +1702,12 @@ impl Hestan {
         }
         if self.maintain_store {
             store.fail_interrupted()?;
-            store.sync_schedules(&schedules)?;
+            store.sync_declarations(&schedules, Some(&sensor_entries))?;
             // seeded, not synced: the launchpad's presets share the table, so
             // there is nothing here to sweep away
             for (job, name, params) in &self.presets {
                 store.put_preset(job, name, params)?;
             }
-            let sensor_names: Vec<String> = sensor_entries.iter().map(|e| e.name.clone()).collect();
-            store.sync_sensors(&sensor_names)?;
             let trimmed = store.prune_materializations(self.asset_history)?;
             let trimmed = trimmed + store.prune_asset_checks(self.asset_history)?;
             if trimmed > 0 {
@@ -2921,5 +2937,51 @@ mod execution_only_tests {
             .unwrap_err();
         assert!(error.to_string().contains("execution_only"));
         assert!(!db.exists());
+    }
+}
+
+#[cfg(test)]
+mod schedule_sensor_tests {
+    use super::*;
+    use crate::{Job, Op};
+    use serde_json::json;
+
+    #[tokio::test]
+    async fn invalid_pause_transfer_leaves_registered_controls_untouched() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("runs.db").display().to_string();
+        let store = Store::open(&path).unwrap();
+        let schedule = || Schedule::new("report", "0 9 * * *").named("morning");
+        store.sync_schedules(&[schedule()]).unwrap();
+        store
+            .set_schedule_paused("report", "0 9 * * *", true, None)
+            .unwrap();
+        let retained = serde_json::to_value(store.schedules().unwrap()).unwrap();
+        let sensor = |name, purpose| {
+            Sensor::new(name, Duration::from_secs(3600), |_| async { Ok(vec![]) })
+                .adopt_schedule_pause("report", purpose)
+        };
+        for fault in ["retained", "duplicate", "empty"] {
+            let job = Job::builder("report")
+                .op(Op::new("inspect", |_| async { Ok(json!({})) }))
+                .build()
+                .unwrap();
+            let mut app = Hestan::new().db(&path).job(job).sensor(sensor(
+                "inputs",
+                if fault == "empty" { "" } else { "morning" },
+            ));
+            if fault == "retained" {
+                app = app.add_schedule(schedule());
+            }
+            if fault == "duplicate" {
+                app = app.sensor(sensor("duplicate", "morning"));
+            }
+            assert!(app.build().await.is_err());
+            assert_eq!(
+                serde_json::to_value(store.schedules().unwrap()).unwrap(),
+                retained
+            );
+            assert!(store.sensors().unwrap().is_empty());
+        }
     }
 }

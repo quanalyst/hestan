@@ -2898,6 +2898,20 @@ impl Store {
         Ok(found.is_some())
     }
 
+    /// Whether this job has a retained run in the selected state. The database
+    /// filters before returning, without decoding or paging through run history.
+    /// This is an observation, not a reservation or a launch-admission guarantee.
+    pub fn has_run_status(&self, job: &str, status: RunStatus) -> Result<bool, Error> {
+        Ok(self
+            .conn()
+            .query_opt(
+                "SELECT 1 FROM runs WHERE job = ?1 AND status = ?2 LIMIT 1",
+                args![job, status.as_str()],
+                |_| Ok(()),
+            )?
+            .is_some())
+    }
+
     /// Running execution count for presentation, excluding queued work.
     pub(crate) fn running_count(&self, job: &str) -> Result<i64, Error> {
         self.conn()
@@ -4149,7 +4163,16 @@ impl Store {
     /// prefix rather than the job the build runs as. one column for both kinds
     /// keeps one row per schedule, one pause flag, one cursor and one
     /// one-fire-per-occurrence index.
+    #[cfg(test)]
     pub(crate) fn sync_schedules(&self, defined: &[Schedule]) -> Result<(), Error> {
+        self.sync_declarations(defined, None)
+    }
+
+    pub(crate) fn sync_declarations(
+        &self,
+        defined: &[Schedule],
+        sensors: Option<&[crate::sensor::SensorEntry]>,
+    ) -> Result<(), Error> {
         crate::schedule::validate_names(defined)?;
         let mut conn = self.conn();
         let (insert, ignore) = conn.dialect().insert_or_ignore();
@@ -4168,6 +4191,23 @@ impl Store {
             args![],
             |r| Ok((r.text(0)?, r.text(1)?, r.flag(2)?, r.opt_text(3)?)),
         )?;
+        if let Some(sensors) = sensors {
+            tx.execute("UPDATE sensors SET declared = 0", args![])?;
+            let now = Utc::now().to_rfc3339();
+            for sensor in sensors {
+                let paused = match &sensor.schedule_pause {
+                    Some((job, name)) => tx.query_opt(
+                        &format!("SELECT paused FROM schedule_controls WHERE job = ?1 AND name = ?2 {lock}"),
+                        args![job, name],
+                        |row| row.flag(0),
+                    )?.unwrap_or_else(|| prior.iter().any(|(id, _, paused, purpose)| {
+                        id == job && *paused && purpose.is_none()
+                    })),
+                    None => false,
+                };
+                declare_sensor(&mut tx, &sensor.name, paused, &now)?;
+            }
+        }
         for (s, id) in defined.iter().zip(&ids) {
             let declared = self.params_col(id, &s.params);
             let catchup = s.catchup.to_string();
@@ -5705,17 +5745,14 @@ impl Store {
 
     /// Retain operator controls and progress for temporarily absent declarations.
     /// Only declared sensors participate in current listings and controls.
+    #[cfg(test)]
     pub(crate) fn sync_sensors(&self, defined: &[String]) -> Result<(), Error> {
         let mut conn = self.conn();
         let mut tx = conn.begin()?;
         tx.execute("UPDATE sensors SET declared = 0", args![])?;
         let now = Utc::now().to_rfc3339();
         for name in defined {
-            tx.execute(
-                "INSERT INTO sensors (name, updated_at, declared) VALUES (?1, ?2, 1)
-                 ON CONFLICT (name) DO UPDATE SET declared = 1",
-                args![name, &now],
-            )?;
+            declare_sensor(&mut tx, name, false, &now)?;
         }
         tx.commit()?;
         Ok(())
@@ -5983,6 +6020,15 @@ fn in_flight(db: &mut impl Exec, limits: &Limits) -> Result<InFlight, Error> {
         counts.take(limits, &job, &tags);
     }
     Ok(counts)
+}
+
+fn declare_sensor(db: &mut impl Exec, name: &str, paused: bool, at: &str) -> Result<(), Error> {
+    db.execute(
+        "INSERT INTO sensors (name, updated_at, declared, paused) VALUES (?1, ?2, 1, ?3)
+         ON CONFLICT (name) DO UPDATE SET declared = 1",
+        args![name, at, paused],
+    )?;
+    Ok(())
 }
 
 /// the queue itself: runs nobody has claimed, in the order a dispatcher takes
@@ -11234,6 +11280,138 @@ mod tests {
         });
     }
 
+    fn adopting_sensor(name: &str, job: &str) -> crate::sensor::SensorEntry {
+        crate::sensor::SensorEntry::user(
+            crate::Sensor::new(name, Duration::from_secs(3600), |_| async { Ok(vec![]) })
+                .adopt_schedule_pause(job, "morning"),
+        )
+    }
+
+    #[test]
+    fn sensor_adopts_retired_pause_once_and_keeps_its_cursor_after_absence() {
+        both(|db| {
+            for kind in ["named", "absent", "unnamed", "empty", "existing"] {
+                for paused in [false, true] {
+                    let store = db.store();
+                    let job = format!("report-{kind}-{paused}");
+                    let sensor = adopting_sensor(&job, &job);
+                    if kind != "empty" {
+                        let mut schedule = Schedule::new(&job, "0 9 * * *");
+                        if kind != "unnamed" {
+                            schedule = schedule.named("morning");
+                        }
+                        store.sync_schedules(&[schedule]).unwrap();
+                        store
+                            .set_schedule_paused(&job, "0 9 * * *", paused, None)
+                            .unwrap();
+                    }
+                    if kind == "absent" {
+                        store.sync_schedules(&[]).unwrap();
+                    }
+                    if kind == "existing" {
+                        store.sync_sensors(std::slice::from_ref(&job)).unwrap();
+                        store.set_sensor_paused(&job, !paused, None).unwrap();
+                    }
+                    let events =
+                        serde_json::to_value(store.event_log(&EventQuery::default(), 50).unwrap())
+                            .unwrap();
+                    store
+                        .sync_declarations(&[], Some(std::slice::from_ref(&sensor)))
+                        .unwrap();
+                    assert!(store.schedules().unwrap().is_empty());
+                    let expected = if kind == "existing" {
+                        !paused
+                    } else {
+                        paused && kind != "empty"
+                    };
+                    assert_eq!(store.sensors().unwrap()[0].paused, expected, "{kind}");
+                    assert_eq!(
+                        serde_json::to_value(store.event_log(&EventQuery::default(), 50).unwrap())
+                            .unwrap(),
+                        events
+                    );
+                    store.set_sensor_paused(&job, !expected, None).unwrap();
+                    store
+                        .set_sensor_cursor(&job, &json!({"accepted": 42}))
+                        .unwrap();
+                    let retained = serde_json::to_value(store.sensors().unwrap()).unwrap();
+                    store.sync_declarations(&[], Some(&[])).unwrap();
+                    assert!(store.sensors().unwrap().is_empty());
+                    drop(store);
+                    let store = db.store();
+                    store.sync_declarations(&[], Some(&[sensor])).unwrap();
+                    assert_eq!(
+                        serde_json::to_value(store.sensors().unwrap()).unwrap(),
+                        retained
+                    );
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn failed_pause_adoption_rolls_back_both_declarations() {
+        let store = Store::open(":memory:").unwrap();
+        store
+            .sync_schedules(&[Schedule::new("report", "0 9 * * *").named("morning")])
+            .unwrap();
+        store
+            .set_schedule_paused("report", "0 9 * * *", true, None)
+            .unwrap();
+        let schedules = serde_json::to_value(store.schedules().unwrap()).unwrap();
+        store
+            .conn()
+            .batch(
+                "CREATE TRIGGER refuse_retirement BEFORE DELETE ON schedules
+            BEGIN SELECT RAISE(ABORT, 'retained schedule'); END;",
+            )
+            .unwrap();
+        let sensor = adopting_sensor("inputs", "report");
+        assert!(
+            store
+                .sync_declarations(&[], Some(std::slice::from_ref(&sensor)))
+                .is_err()
+        );
+        assert!(store.sensors().unwrap().is_empty());
+        assert_eq!(
+            serde_json::to_value(store.schedules().unwrap()).unwrap(),
+            schedules
+        );
+        store
+            .conn()
+            .batch("DROP TRIGGER refuse_retirement;")
+            .unwrap();
+        store.sync_declarations(&[], Some(&[sensor])).unwrap();
+        assert!(store.sensors().unwrap()[0].paused);
+    }
+
+    #[test]
+    fn run_state_observation_filters_job_and_state() {
+        both(|db| {
+            let store = db.store();
+            for status in [
+                RunStatus::Queued,
+                RunStatus::Running,
+                RunStatus::Success,
+                RunStatus::Failed,
+                RunStatus::Canceled,
+            ] {
+                let job = status.as_str();
+                let mut run = mk_run(job, job, Utc::now());
+                run.status = status;
+                store.create_run(&run, &[]).unwrap();
+                assert!(store.has_run_status(job, status).unwrap());
+                assert!(!store.has_run_status("absent", status).unwrap());
+                let other = if status == RunStatus::Queued {
+                    RunStatus::Running
+                } else {
+                    RunStatus::Queued
+                };
+                assert!(!store.has_run_status(job, other).unwrap());
+            }
+        });
+    }
+
     #[test]
     fn sensor_sync_preserves_paused_and_cursor() {
         both(|db| {
@@ -11631,44 +11809,54 @@ mod tests {
 
     #[test]
     fn schedule_sync_waits_for_a_concurrent_pause_before_adopting_it() {
-        both(|db| {
-            let store = db.store();
-            store
-                .sync_schedules(&[Schedule::new("report", "0 9 * * *")])
-                .unwrap();
-            let writer = db.store();
-            let mut connection = writer.conn();
-            let mut transaction = connection.begin_immediate().unwrap();
-            transaction
-                .execute(
-                    "UPDATE schedules SET paused = 1 WHERE job = 'report'",
-                    args![],
-                )
-                .unwrap();
-            let concurrent = store.clone();
-            let (sent, received) = std::sync::mpsc::channel();
-            let worker = std::thread::spawn(move || {
-                sent.send(
-                    concurrent
-                        .sync_schedules(&[Schedule::new("report", "15 9 * * *").named("morning")]),
-                )
-                .unwrap();
+        for sensor_target in [false, true] {
+            both(|db| {
+                let store = db.store();
+                store
+                    .sync_schedules(&[Schedule::new("report", "0 9 * * *")])
+                    .unwrap();
+                let writer = db.store();
+                let mut connection = writer.conn();
+                let mut transaction = connection.begin_immediate().unwrap();
+                transaction
+                    .execute(
+                        "UPDATE schedules SET paused = 1 WHERE job = 'report'",
+                        args![],
+                    )
+                    .unwrap();
+                let concurrent = store.clone();
+                let (sent, received) = std::sync::mpsc::channel();
+                let worker = std::thread::spawn(move || {
+                    sent.send(if sensor_target {
+                        concurrent
+                            .sync_declarations(&[], Some(&[adopting_sensor("inputs", "report")]))
+                    } else {
+                        concurrent.sync_schedules(&[
+                            Schedule::new("report", "15 9 * * *").named("morning")
+                        ])
+                    })
+                    .unwrap();
+                });
+                assert!(
+                    matches!(
+                        received.recv_timeout(Duration::from_millis(100)),
+                        Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+                    ),
+                    "registration must wait for the writer, not fail or read a stale pause"
+                );
+                transaction.commit().unwrap();
+                received
+                    .recv_timeout(Duration::from_secs(5))
+                    .unwrap()
+                    .unwrap();
+                worker.join().unwrap();
+                if sensor_target {
+                    assert!(store.sensors().unwrap()[0].paused);
+                } else {
+                    assert!(store.schedules().unwrap()[0].paused);
+                }
             });
-            assert!(
-                matches!(
-                    received.recv_timeout(Duration::from_millis(100)),
-                    Err(std::sync::mpsc::RecvTimeoutError::Timeout)
-                ),
-                "registration must wait for the writer, not fail or read a stale pause"
-            );
-            transaction.commit().unwrap();
-            received
-                .recv_timeout(Duration::from_secs(5))
-                .unwrap()
-                .unwrap();
-            worker.join().unwrap();
-            assert!(store.schedules().unwrap()[0].paused);
-        });
+        }
     }
 
     #[test]

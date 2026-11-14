@@ -1,5 +1,12 @@
 # Changes
 
+## 0.2.7
+
+- Sensors can adopt a retired schedule's pause during atomic declaration registration.
+  Retained sensor pauses and cursors take precedence on subsequent starts.
+- `Store::has_run_status` checks a job's state without decoding run-history pages.
+  It observes state; native launch admission still owns concurrency and deduplication.
+
 ## 0.2.6
 
 - Named notification destinations retain delivery attempts, retry policy and operator controls.

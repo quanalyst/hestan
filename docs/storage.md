@@ -39,6 +39,10 @@ directly, the two constructors are `Store::open(path)` and
 `Store::connect(url)`. `Store::open(":memory:")` gives a throwaway store for
 tests, private to the connection that made it.
 
+`Store::has_run_status(job, status)` checks for a retained run in that state without
+returning run-history pages. It is a read-only observation; another worker can change
+the state afterwards. Use native launch admission for concurrency guarantees.
+
 ## sqlite
 
 File databases use WAL mode and a five-second busy timeout. Each process holds

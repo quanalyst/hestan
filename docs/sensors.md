@@ -254,10 +254,21 @@ sensors table shows them all against each sensor's last tick.
 [retention sweep](storage.md#retention) prunes the table to the newest 5000 on
 every pass, the same policy as schedule ticks.
 
-at startup the sensors table is synced to the code like schedules are: new
-names inserted, undeclared rows dropped, surviving rows keeping their paused
-flag and cursor across restarts. renaming a sensor is not a rename to the
-store: it is a new row, and the old cursor goes with the old name.
+Startup registers declared sensors and hides absent declarations from listings and
+controls. Their stored pauses and cursors survive absence and re-registration.
+Renaming a sensor creates a separate identity; it does not transfer the cursor.
+
+`Sensor::adopt_schedule_pause(job, name)` seeds the first registration from a retired
+named schedule control, including a control retained while that schedule was absent.
+Before schedule naming was adopted, any paused unnamed recurrence on the job holds
+the sensor. With neither control, it starts unpaused. A retained sensor keeps its
+own pause and cursor; registration never reapplies the source's historical pause.
+
+Retire the source recurrence in the same registration. Schedule removal and sensor
+registration commit together; declaring both controls or assigning the same source
+to several sensors refuses startup. This transfers no schedule cursor, pending fire
+or run history. Subsequent sensor pauses do not update the retained source control;
+reintroducing that schedule requires reviewing its own pause.
 
 `GET /api/sensors` lists each sensor with its interval, paused flag, cursor,
 filter and last tick; shapes in [http api](http-api.md), tables in

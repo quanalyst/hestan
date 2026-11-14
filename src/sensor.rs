@@ -121,6 +121,7 @@ type SensorFn = dyn Fn(
 /// of ingesting the same file every thirty seconds.
 pub struct Sensor {
     name: String,
+    schedule_pause: Option<(String, String)>,
     every: Duration,
     timeout: Duration,
     namespace: Option<String>,
@@ -158,6 +159,7 @@ impl Sensor {
     {
         Sensor {
             name: name.into(),
+            schedule_pause: None,
             every,
             timeout: DEFAULT_SENSOR_TIMEOUT,
             namespace: None,
@@ -190,6 +192,27 @@ impl Sensor {
     /// job's. see `docs/namespaces.md`.
     pub fn namespace(mut self, name: impl Into<String>) -> Sensor {
         self.namespace = Some(name.into());
+        self
+    }
+
+    /// Seed this sensor's first stored pause from a retired named schedule.
+    ///
+    /// Registration transfers the control in the same transaction that removes
+    /// the recurrence. A retained sensor keeps its own pause and cursor instead;
+    /// later registration never reapplies the schedule's historical pause.
+    /// Named controls survive temporarily absent schedules. Before naming was
+    /// adopted, any paused unnamed recurrence on `job` seeds a paused sensor.
+    /// A store with neither control starts unpaused.
+    ///
+    /// The source recurrence must not also be declared, and one source control
+    /// can seed only one sensor in a registration. This does not copy schedule
+    /// cursors, pending fires or run history, or synchronize subsequent controls.
+    pub fn adopt_schedule_pause(
+        mut self,
+        job: impl Into<String>,
+        name: impl Into<String>,
+    ) -> Sensor {
+        self.schedule_pause = Some((job.into(), name.into()));
         self
     }
 
@@ -458,6 +481,7 @@ pub(crate) enum SensorEval {
 
 pub(crate) struct SensorEntry {
     pub name: String,
+    pub schedule_pause: Option<(String, String)>,
     pub every: Duration,
     pub timeout: Duration,
     /// which slice of the deployment it is in: what a user sensor or a run
@@ -473,6 +497,7 @@ impl SensorEntry {
     pub(crate) fn user(sensor: Sensor) -> SensorEntry {
         SensorEntry {
             name: sensor.name,
+            schedule_pause: sensor.schedule_pause,
             every: sensor.every,
             timeout: sensor.timeout,
             namespace: sensor.namespace,
@@ -484,6 +509,7 @@ impl SensorEntry {
     pub(crate) fn runs(sensor: RunStatusSensor) -> SensorEntry {
         SensorEntry {
             name: sensor.sensor_name(),
+            schedule_pause: None,
             every: sensor.every,
             timeout: sensor.timeout,
             namespace: sensor.namespace,
@@ -506,6 +532,7 @@ impl SensorEntry {
     ) -> SensorEntry {
         SensorEntry {
             name: format!("probe:{asset}"),
+            schedule_pause: None,
             every,
             timeout: DEFAULT_SENSOR_TIMEOUT,
             // a probe is not declared, so there is nothing to declare a
